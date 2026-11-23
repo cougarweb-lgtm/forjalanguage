@@ -1,0 +1,284 @@
+// nativo/bir/analises_vivo.fj - porte de compiler/nativo/bir/analises_vivo.c
+// sha256 de nativo/bir/analises_vivo.c: 58993bff1bed22aa260f0a41c6a5285b698225a94d67f28ea21976add906c38a
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "common"
+
+struct Trabalho {
+    vivo: ?[]u8
+    na_lista: ?[]u8
+    lista: ?[]u32
+    n: u32
+    entra: ConjuntoVivo
+    sai: ConjuntoVivo
+}
+
+struct Fila {
+    v: [dynamic]u32
+    em_fila: ?[]u8
+    cap: u32
+    ini: u32
+    n: u32
+}
+
+const VIVO_INSERCAO_MAX: u32 = 24
+
+// C: nativo/bir/analises_vivo.c:17
+proc eh_conta_ov_2(op: u8) -> bool {
+    return (((op == (BIR_ADD_OV as u8)) or (op == (BIR_SUB_OV as u8))) or (op == (BIR_MUL_OV as u8))) or (op == (BIR_NEG_OV as u8))
+}
+
+// C: nativo/bir/analises_vivo.c:22
+// C2F-VOID: x, y
+// C2F-VOID: x, y (qsort): vregs sao u32 direto
+proc comparar_vreg(x: u32, y: u32) -> i32 {
+    if x < y {
+        return -1
+    }
+    if x > y {
+        return 1
+    }
+    return 0
+}
+
+// C2F-13: v fundido em n (len). O C usa insercao ate 24 e qsort acima; aqui acima de 24 o sort embutido (O(n log n)). Os vregs de um conjunto sao unicos (na_lista barra repeticao), entao a ordem e a mesma.
+proc ordenar_vregs(v: []u32) {
+    if len(v) > (VIVO_INSERCAO_MAX as int) {
+        sort(v)
+        return
+    }
+    for i in (1 as u32)..<(len(v) as u32) {
+        let x: u32 = v[i]
+        var j: u32 = i
+        while (j > 0) and (comparar_vreg(v[j - 1], x) > 0) {
+            v[j] = v[j - 1]
+            j -= 1
+        }
+        v[j] = x
+    }
+}
+
+// C: nativo/bir/analises_vivo.c:47
+proc adicionar(t: ^Trabalho, v: u32) {
+    let p_1 = t.vivo or_else {}
+    p_1[v] = 1
+    if not ((t.na_lista or_else {})[v] != 0) {
+        let p_2 = t.na_lista or_else {}
+        p_2[v] = 1
+        let antes_1: u32 = t.n
+        t.n += 1
+        let p_3 = t.lista or_else {}
+        p_3[antes_1] = v
+    }
+}
+
+// C: nativo/bir/analises_vivo.c:56
+proc unir_conjunto(t: ^Trabalho, s: ^ConjuntoVivo) {
+    for k in (0 as u32)..<s.n {
+        adicionar(t, (s.v or_else {})[k])
+    }
+}
+
+// C: nativo/bir/analises_vivo.c:62
+proc usar_operando(a: ^AnalisesBir, t: ^Trabalho, o: ^BirOperando) {
+    if (o.tipo == (BO_VREG as u8)) and (o.id < a.nvregs) {
+        adicionar(t, o.id)
+    }
+}
+
+// C: nativo/bir/analises_vivo.c:69
+proc passo_para_tras(a: ^AnalisesBir, i: ^BirInstr, t: ^Trabalho) {
+    if (i.dst != BIR_SEM_VREG) and (i.dst < a.nvregs) {
+        let p_1 = t.vivo or_else {}
+        p_1[i.dst] = 0
+    }
+    if (common.c2f_b2i32(eh_conta_ov_2(i.op)) != 0) and (i.alvo[0] < a.nblocos) {
+        unir_conjunto(t, &(a.vivo_entra or_else {})[i.alvo[0]])
+    }
+    usar_operando(a, t, &i.a)
+    usar_operando(a, t, &i.b)
+    for k in (0 as u32)..<i.nargs {
+        usar_operando(a, t, &(i.args or_else {})[k])
+    }
+}
+
+// C: nativo/bir/analises_vivo.c:82
+proc unir_sucessores_do_terminador(a: ^AnalisesBir, blk: ^BirBloco, t: ^Trabalho) {
+    let i: ^BirInstr = &blk.instrs[blk.n - 1]
+    if (i.op != (BIR_SALTA as u8)) and (i.op != (BIR_DESVIA as u8)) {
+        return
+    }
+    if i.alvo[0] < a.nblocos {
+        unir_conjunto(t, &(a.vivo_entra or_else {})[i.alvo[0]])
+    }
+    if (i.op == (BIR_DESVIA as u8)) and (i.alvo[1] < a.nblocos) {
+        unir_conjunto(t, &(a.vivo_entra or_else {})[i.alvo[1]])
+    }
+}
+
+// C: nativo/bir/analises_vivo.c:95
+proc coletar(a: ^AnalisesBir, t: ^Trabalho, zerar: bool) -> ConjuntoVivo {
+    var s = ConjuntoVivo{}
+    let vivo: []u8 = t.vivo or_else {}
+    let lista: []u32 = t.lista or_else {}
+    let na_lista: []u8 = t.na_lista or_else {}
+    for k in (0 as u32)..<t.n {
+        s.n += vivo[lista[k]] as u32
+    }
+    if s.n > 0 {
+        s.v = analises_vetor32(a, s.n as u64)
+        let sv: []u32 = s.v or_else {}
+        var w: u32 = 0
+        for k in (0 as u32)..<t.n {
+            if vivo[lista[k]] != 0 {
+                sv[w] = lista[k]
+                w += 1
+            }
+        }
+        ordenar_vregs(sv[0..<(s.n as int)])
+    }
+    if zerar {
+        for k in (0 as u32)..<t.n {
+            vivo[lista[k]] = 0
+            na_lista[lista[k]] = 0
+        }
+        t.n = 0
+    }
+    return s
+}
+
+// C: nativo/bir/analises_vivo.c:117
+proc mesmo_conjunto(x: ^ConjuntoVivo, y: ^ConjuntoVivo) -> bool {
+    if x.n != y.n {
+        return false
+    }
+    if x.n == 0 {
+        return true
+    }
+    let xv: []u32 = x.v or_else {}
+    let yv: []u32 = y.v or_else {}
+    for k in (0 as u32)..<x.n {
+        if xv[k] != yv[k] {
+            return false
+        }
+    }
+    return true
+}
+
+// Trabalho de uma conta de vivacidade: vetores zerados na arena (ArenaAlocar do C), como em AnalisesCalcularVivo.
+proc trabalho_novo(a: ^AnalisesBir) -> Trabalho {
+    return Trabalho{vivo = common.arena_fatia_u8(&a.arena, (a.nvregs + 1) as int), na_lista = common.arena_fatia_u8(&a.arena, (a.nvregs + 1) as int), lista = analises_vetor32(a, a.nvregs as u64), n = 0, entra = ConjuntoVivo{}, sai = ConjuntoVivo{}}
+}
+
+// C: nativo/bir/analises_vivo.c:123
+proc recalcular_bloco(a: ^AnalisesBir, f: ^BirFuncao, b: u32, t: ^Trabalho) {
+    let blk: ^BirBloco = &f.blocos[b]
+    if blk.n > 0 {
+        unir_sucessores_do_terminador(a, blk, t)
+    }
+    t.sai = coletar(a, t, false)
+    var k: u32 = blk.n
+    while k > 0 {
+        passo_para_tras(a, &blk.instrs[k - 1], t)
+        k -= 1
+    }
+    t.entra = coletar(a, t, true)
+}
+
+// C: nativo/bir/analises_vivo.c:138
+proc empurrar(q: ^Fila, b: u32) {
+    if (q.em_fila or_else {})[b] != 0 {
+        return
+    }
+    let p_1 = q.em_fila or_else {}
+    p_1[b] = 1
+    let antes_1: u32 = q.n
+    q.n += 1
+    q.v[(q.ini + antes_1) % q.cap] = b
+}
+
+// C: nativo/bir/analises_vivo.c:146
+proc retirar(q: ^Fila) -> u32 {
+    let b: u32 = q.v[q.ini]
+    q.ini = (q.ini + 1) % q.cap
+    q.n -= 1
+    let p_1 = q.em_fila or_else {}
+    p_1[b] = 0
+    return b
+}
+
+// C: nativo/bir/analises_vivo.c:156
+proc analises_calcular_vivo(a: ^AnalisesBir, f: ^BirFuncao) {
+    var t = trabalho_novo(a)
+    var q = Fila{v = make([dynamic]u32, alloc = common.arena_mem(&a.arena), cap = (a.nblocos + 1) as int), em_fila = common.arena_fatia_u8(&a.arena, (a.nblocos + 1) as int), cap = a.nblocos + 1, ini = 0, n = 0}
+    for i in (0 as u32)..<(a.nblocos + 1) {
+        append(&q.v, item = 0)
+    }
+    a.vivo_entra = arena_fatia_conjunto_vivo(&a.arena, (a.nblocos + 1) as int)
+    a.vivo_sai = arena_fatia_conjunto_vivo(&a.arena, (a.nblocos + 1) as int)
+    let rpo: []u32 = a.rpo or_else {}
+    var i: u32 = a.nrpo
+    while i > 0 {
+        empurrar(&q, rpo[i - 1])
+        i -= 1
+    }
+    while q.n > 0 {
+        let b: u32 = retirar(&q)
+        recalcular_bloco(a, f, b, &t)
+        let vivo_sai: []ConjuntoVivo = a.vivo_sai or_else {}
+        vivo_sai[b] = t.sai
+        let vivo_entra: []ConjuntoVivo = a.vivo_entra or_else {}
+        if mesmo_conjunto(&t.entra, &vivo_entra[b]) {
+            continue
+        }
+        vivo_entra[b] = t.entra
+        let pred_ini: []u32 = a.pred_ini or_else {}
+        let pred: []u32 = a.pred or_else {}
+        let pos_rpo: []u32 = a.pos_rpo or_else {}
+        var k: u32 = pred_ini[b]
+        while k < pred_ini[b + 1] {
+            if pos_rpo[pred[k]] != BIR_SEM_BLOCO {
+                empurrar(&q, pred[k])
+            }
+            k += 1
+        }
+    }
+}
+
+// C: nativo/bir/analises_vivo.c:181
+proc analises_vivo_confere(a: ^AnalisesBir, f: ^BirFuncao, b: u32) -> bool {
+    var t = trabalho_novo(a)
+    recalcular_bloco(a, f, b, &t)
+    let vivo_entra: []ConjuntoVivo = a.vivo_entra or_else {}
+    let vivo_sai: []ConjuntoVivo = a.vivo_sai or_else {}
+    return mesmo_conjunto(&t.entra, &vivo_entra[b]) and mesmo_conjunto(&t.sai, &vivo_sai[b])
+}
+
+// C: nativo/bir/analises_vivo.c:190
+proc tem_vreg(s: ^ConjuntoVivo, vreg: u32) -> bool {
+    var lo: u32 = 0
+    var hi: u32 = s.n
+    while lo < hi {
+        let meio: u32 = lo + ((hi - lo) / 2)
+        if (s.v or_else {})[meio] == vreg {
+            return true
+        }
+        if (s.v or_else {})[meio] < vreg {
+            lo = meio + 1
+        } else {
+            hi = meio
+        }
+    }
+    return false
+}
+
+// C: nativo/bir/analises_vivo.c:207
+pub proc analises_vivo_entra(a: ^AnalisesBir, bloco: u32, vreg: u32) -> bool {
+    return ((bloco < a.nblocos) and (vreg < a.nvregs)) and (common.c2f_b2i32(tem_vreg(&(a.vivo_entra or_else {})[bloco], vreg)) != 0)
+}
+
+// C: nativo/bir/analises_vivo.c:212
+proc analises_vivo_sai(a: ^AnalisesBir, bloco: u32, vreg: u32) -> bool {
+    return ((bloco < a.nblocos) and (vreg < a.nvregs)) and (common.c2f_b2i32(tem_vreg(&(a.vivo_sai or_else {})[bloco], vreg)) != 0)
+}

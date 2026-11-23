@@ -1,0 +1,770 @@
+// nativo/optimizer/numeracao.fj - porte de compiler/nativo/optimizer/numeracao.c, compiler/nativo/optimizer/numeracao.h
+// sha256 de nativo/optimizer/numeracao.c: 7a13a16ee0913a431259410073e42baf1c05b987ada0077ef7d8d184e8de84f6
+// sha256 de nativo/optimizer/numeracao.h: 8d1e8d816f9868781a89224de4dad8f02dd3c1654c7e028cd0779fed0c962b12
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "common"
+import "nativo/bir"
+
+struct Visita {
+    bloco: u32
+    indice: u32
+    ebb: u32
+    carga_base: u32
+    pos: u32
+}
+
+struct Quadro {
+    bloco: u32
+    prox_filho: u32
+    ebb: u32
+    carga_base: u32
+    marca: NumMarca
+    entrou: bool
+}
+
+struct Filhos {
+    ini: []u32 // C2F-INDECIDIVEL
+    filho: []u32 // C2F-INDECIDIVEL
+}
+
+// C2F-82 macro PALAVRAS_DO_QUADRO = ( ( sizeof ( Quadro ) + sizeof ( uint32_t ) - 1u ) / sizeof ( uint32_t ) )  (expandida no uso)
+// C2F-70 global mutavel ini (uint32_t[2]) -> parametro/struct de estado (plano C2F-70)
+// C2F-70 global mutavel um (uint32_t) -> parametro/struct de estado (plano C2F-70)
+// C2F-70 global mutavel zero (uint32_t) -> parametro/struct de estado (plano C2F-70)
+
+// C: nativo/optimizer/numeracao.c:35
+proc define_vreg_3(i: ^bir.BirInstr) -> bool {
+    if i.dst == bir.BIR_SEM_VREG {
+        return false
+    }
+    return ((((((i.op != (bir.BIR_SALTA as u8)) and (i.op != (bir.BIR_DESVIA as u8))) and (i.op != (bir.BIR_RETORNA as u8))) and (i.op != (bir.BIR_ARMADILHA as u8))) and (i.op != (bir.BIR_GRAVA as u8))) and (i.op != (bir.BIR_COPIA_MEM as u8))) and (i.op != (bir.BIR_ZERA_MEM as u8))
+}
+
+// C: nativo/optimizer/numeracao.c:43
+proc eh_ov_2(op: u8) -> bool {
+    return ((op as i32) >= bir.BIR_ADD_OV) and ((op as i32) <= bir.BIR_NEG_OV)
+}
+
+// C: nativo/optimizer/numeracao.c:48
+proc eh_conta_pura(op: u8) -> bool {
+    let sw_1 = op as i32
+    if sw_1 == bir.BIR_ADD or sw_1 == bir.BIR_SUB or sw_1 == bir.BIR_MUL or sw_1 == bir.BIR_AND or sw_1 == bir.BIR_OR or sw_1 == bir.BIR_XOR or sw_1 == bir.BIR_NEG or sw_1 == bir.BIR_NOT or sw_1 == bir.BIR_EXT_S or sw_1 == bir.BIR_EXT_Z or sw_1 == bir.BIR_TRUNC or sw_1 == bir.BIR_DIV or sw_1 == bir.BIR_REM or sw_1 == bir.BIR_SHL or sw_1 == bir.BIR_SHR or sw_1 == bir.BIR_I_PARA_F or sw_1 == bir.BIR_F_PARA_F or sw_1 == bir.BIR_RAIZ {
+        return true
+    } else {
+        return false
+    }
+    return false
+}
+
+// C: nativo/optimizer/numeracao.c:61
+proc contar_defs(c: ^NumCtx) {
+    let f: ^bir.BirFuncao = c.f as ^bir.BirFuncao
+    c.ndefs = num_temp(c, (c.nvregs as u64) + 1, 0)
+    c.def_b = num_temp(c, (c.nvregs as u64) + 1, 255)
+    c.def_k = num_temp(c, (c.nvregs as u64) + 1, 255)
+    let ndefs = c.ndefs or_else {}
+    let def_b = c.def_b or_else {}
+    let def_k = c.def_k or_else {}
+    var v: u32 = 0
+    while (v < f.nparams) and (v < c.nvregs) {
+        ndefs[v] += 1
+        v += 1
+    }
+    var b: u32 = 0
+    while b < f.nblocos {
+        var k: u32 = 0
+        while k < f.blocos[b].n {
+            let i: ^bir.BirInstr = &f.blocos[b].instrs[k]
+            if define_vreg_3(i) and (i.dst < c.nvregs) {
+                ndefs[i.dst] += 1
+                def_b[i.dst] = b
+                def_k[i.dst] = k
+            }
+            k += 1
+        }
+        b += 1
+    }
+}
+
+// C: nativo/optimizer/numeracao.c:83
+proc marcar_uso(c: ^NumCtx, o: ^bir.BirOperando, pos: u32) {
+    if (o.tipo == (bir.BO_VREG as u8)) and (o.id < c.nvregs) {
+        let p_1 = c.ultimo_uso or_else {}
+        p_1[o.id] = pos
+    }
+}
+
+// C: nativo/optimizer/numeracao.c:90
+proc calcular_ultimos_usos(c: ^NumCtx) {
+    let f: ^bir.BirFuncao = c.f as ^bir.BirFuncao
+    let a: ^bir.AnalisesBir = &c.a
+    c.ultimo_uso = num_temp(c, (c.nvregs as u64) + 1, 0)
+    c.pos_bloco = num_temp(c, (f.nblocos as u64) + 1, 0)
+    let rpo = a.rpo or_else {}
+    var pos: u32 = 0
+    var r: u32 = 0
+    while r < a.nrpo {
+        let indice_bloco: u32 = rpo[r]
+        let bloco: ^bir.BirBloco = &f.blocos[indice_bloco]
+        let pos_do_bloco = c.pos_bloco or_else {}
+        pos_do_bloco[indice_bloco] = pos
+        var k: u32 = 0
+        while k < bloco.n {
+            let ins: ^bir.BirInstr = &bloco.instrs[k]
+            marcar_uso(c, &ins.a, pos)
+            marcar_uso(c, &ins.b, pos)
+            let args = ins.args or_else {}
+            var j: u32 = 0
+            while j < ins.nargs {
+                marcar_uso(c, &args[j], pos)
+                j += 1
+            }
+            k += 1
+            pos += 1
+        }
+        r += 1
+    }
+}
+
+// C: nativo/optimizer/numeracao.c:110
+proc unica_def_domina(c: ^NumCtx, v: u32, bloco: u32, k: u32) -> bool {
+    if (v >= c.nvregs) or ((c.ndefs or_else {})[v] != 1) {
+        return false
+    }
+    if v < (c.f as ^bir.BirFuncao).nparams {
+        return true
+    }
+    if (c.def_b or_else {})[v] == NUM_SEM {
+        return false
+    }
+    if (c.def_b or_else {})[v] == bloco {
+        return (c.def_k or_else {})[v] < k
+    }
+    return bir.analises_domina(&c.a, (c.def_b or_else {})[v], bloco)
+}
+
+// C: nativo/optimizer/numeracao.c:125
+proc valor_de(o: ^bir.BirOperando) -> i64 {
+    if o.tipo == (bir.BO_IMED as u8) {
+        return o.imed
+    }
+    if o.tipo == (bir.BO_NADA as u8) {
+        return 0
+    }
+    return o.id as i64
+}
+
+// C: nativo/optimizer/numeracao.c:130
+proc eh_comutativa(i: ^bir.BirInstr) -> bool {
+    let soma_ou_logica: bool = ((((i.op == (bir.BIR_ADD as u8)) or (i.op == (bir.BIR_MUL as u8))) or (i.op == (bir.BIR_AND as u8))) or (i.op == (bir.BIR_OR as u8))) or (i.op == (bir.BIR_XOR as u8))
+    return (common.c2f_b2i32(soma_ou_logica) != 0) and (not bir.bir_classe_eh_real(i.classe as i32))
+}
+
+// C: nativo/optimizer/numeracao.c:137
+proc chave_de(i: ^bir.BirInstr) -> NumChave {
+    var k: NumChave = NumChave{op = i.op, aux = i.aux, classe = i.classe, ta = i.a.tipo, ca = i.a.classe, va = valor_de(&i.a), tb = i.b.tipo, cb = i.b.classe, vb = valor_de(&i.b), desloc = i.desloc}
+    if (common.c2f_b2i32(eh_comutativa(i)) != 0) and (((k.ta as i32) > (k.tb as i32)) or (((k.ta as i32) == (k.tb as i32)) and (k.va > k.vb))) {
+        k.ta = i.b.tipo
+        k.ca = i.b.classe
+        k.va = valor_de(&i.b)
+        k.tb = i.a.tipo
+        k.cb = i.a.classe
+        k.vb = valor_de(&i.a)
+    }
+    return k
+}
+
+// C: nativo/optimizer/numeracao.c:150
+proc chave_da_escrita(i: ^bir.BirInstr) -> NumChave {
+    var g: NumChave = NumChave{op = i.op, ta = i.a.tipo, va = valor_de(&i.a)}
+    if i.op == (bir.BIR_GRAVA as u8) {
+        g.desloc = i.desloc
+        g.vb = num_tamanho_da_classe(i.b.classe) as i64
+    } else {
+        g.vb = i.desloc as i64
+    }
+    return g
+}
+
+// C: nativo/optimizer/numeracao.c:165
+proc operando_reescrevivel(i: ^bir.BirInstr, o: ^bir.BirOperando, lado_b: bool) -> bool {
+    let real: bool = bir.bir_classe_eh_real(i.classe as i32)
+    if (((o.tipo != (bir.BO_VREG as u8)) or (o.tam != 0)) or (o.extensao != (bir.BE_NENHUMA as u8))) or (o.classe == (bir.BC_V128 as u8)) {
+        return false
+    }
+    let sw_1 = i.op as i32
+    if sw_1 == bir.BIR_DESVIA {
+        return false
+    } else if sw_1 == bir.BIR_SPLAT {
+        return false
+    } else if sw_1 == bir.BIR_SELECIONA {
+        return false
+    } else if sw_1 == bir.BIR_CMP {
+        return (common.c2f_b2i32(bir.bir_classe_eh_real(o.classe as i32)) != 0) or (i.b.tipo != (bir.BO_IMED as u8))
+    } else if sw_1 == bir.BIR_DIV or sw_1 == bir.BIR_REM or sw_1 == bir.BIR_SHL or sw_1 == bir.BIR_SHR {
+        return (not lado_b) or (common.c2f_b2i32(real) != 0)
+    } else {
+        return true
+    }
+    return false
+}
+
+// C: nativo/optimizer/numeracao.c:181
+proc reescrever_operando(c: ^NumCtx, v: ^Visita, i: ^bir.BirInstr, lado_b: bool) {
+    var tern_1: ^bir.BirOperando = &i.a
+    if common.c2f_b2i32(lado_b) != 0 {
+        tern_1 = &i.b
+    }
+    let o: ^bir.BirOperando = tern_1
+    var k: u32 = 0
+    var fato: ?^NumFato = none
+    if (not operando_reescrevivel(i, o, lado_b)) or (o.id >= c.nvregs) {
+        return
+    }
+    k = (c.cp or_else {})[o.id]
+    if k == NUM_SEM {
+        return
+    }
+    fato = &c.fatos[k]
+    if not num_fato_valido(c, fato as ^NumFato, v.ebb) {
+        return
+    }
+    var tern_2: i32 = common.c2f_b2i32((c.seq - (fato as ^NumFato).seq) > NUM_JANELA_EXPR)
+    if (c.ndefs or_else {})[(fato as ^NumFato).res] != 1 {
+        tern_2 = common.c2f_b2i32(v.pos > (c.ultimo_uso or_else {})[(fato as ^NumFato).res])
+    }
+    if tern_2 != 0 {
+        return
+    }
+    if (fato as ^NumFato).ebb == v.ebb {
+        c.n.copia.ebb += 1
+    } else {
+        c.n.copia.dom += 1
+    }
+    o.id = (fato as ^NumFato).res
+    o.classe = ((c.f as ^bir.BirFuncao).classe_vreg or_else {})[(fato as ^NumFato).res]
+}
+
+// C: nativo/optimizer/numeracao.c:209
+proc trocar_por_copia(c: ^NumCtx, i: ^bir.BirInstr, origem: u32) {
+    i.op = bir.BIR_COPIA as u8
+    i.aux = 0
+    i.desloc = 0
+    i.a = bir.BirOperando{tipo = bir.BO_VREG as u8, classe = ((c.f as ^bir.BirFuncao).classe_vreg or_else {})[origem], id = origem}
+    i.b = bir.BirOperando{}
+}
+
+// C: nativo/optimizer/numeracao.c:218
+proc tentar_reusar(c: ^NumCtx, v: ^Visita, i: ^bir.BirInstr) {
+    let carga: bool = i.op == (bir.BIR_CARREGA as u8)
+    var chave: NumChave = chave_de(i)
+    let k: u32 = num_buscar(c, &chave, v.ebb)
+    var fato: ?^NumFato = none
+    var tern_1: ^NumPar = &c.n.expr
+    if common.c2f_b2i32(carga) != 0 {
+        tern_1 = &c.n.carga
+    }
+    let par: ^NumPar = tern_1
+    if (k == NUM_SEM) or (i.dst >= c.nvregs) {
+        return
+    }
+    fato = &c.fatos[k]
+    var tern_2: u32 = NUM_JANELA_EXPR
+    if common.c2f_b2i32(carga) != 0 {
+        tern_2 = NUM_JANELA_CARGA
+    }
+    if (((c.seq - (fato as ^NumFato).seq) > tern_2) or ((fato as ^NumFato).res == i.dst)) or ((((c.f as ^bir.BirFuncao).classe_vreg or_else {})[(fato as ^NumFato).res] as i32) != (((c.f as ^bir.BirFuncao).classe_vreg or_else {})[i.dst] as i32)) {
+        return
+    }
+    if (fato as ^NumFato).ebb == v.ebb {
+        par.ebb += 1
+    } else {
+        par.dom += 1
+    }
+    trocar_por_copia(c, i, (fato as ^NumFato).res)
+}
+
+// C: nativo/optimizer/numeracao.c:240
+proc fotografar_operandos(c: ^NumCtx, i: ^bir.BirInstr, s: ^NumSnap) {
+    s.dep[0] = NUM_SEM
+    s.dep[1] = NUM_SEM
+    s.dep[2] = NUM_SEM
+    s.ver[0] = 0
+    s.ver[1] = 0
+    s.ver[2] = 0
+    if (i.a.tipo == (bir.BO_VREG as u8)) and (i.a.id < c.nvregs) {
+        s.dep[1] = i.a.id
+        s.ver[1] = (c.ver or_else {})[i.a.id]
+    }
+    if (i.b.tipo == (bir.BO_VREG as u8)) and (i.b.id < c.nvregs) {
+        s.dep[2] = i.b.id
+        s.ver[2] = (c.ver or_else {})[i.b.id]
+    }
+}
+
+// C: nativo/optimizer/numeracao.c:254
+proc fato_eh_global(c: ^NumCtx, v: ^Visita, s: ^NumSnap) -> bool {
+    if (c.ndefs or_else {})[s.dep[0]] != 1 {
+        return false
+    }
+    for k in (1 as u32)..<3 {
+        if (s.dep[k] != NUM_SEM) and (not unica_def_domina(c, s.dep[k], v.bloco, v.indice)) {
+            return false
+        }
+    }
+    return true
+}
+
+// C: nativo/optimizer/numeracao.c:265
+proc registrar_copia(c: ^NumCtx, v: ^Visita, i: ^bir.BirInstr, s: ^NumSnap) {
+    let d: u32 = i.dst
+    let o: u32 = i.a.id
+    let f: ^bir.BirFuncao = c.f as ^bir.BirFuncao
+    let classes = f.classe_vreg or_else {}
+    if (i.a.tipo != (bir.BO_VREG as u8)) or (o >= c.nvregs) or (o == d) or (i.a.tam != 0) or (i.a.extensao != (bir.BE_NENHUMA as u8)) or (classes[o] != classes[d]) {
+        return
+    }
+    s.dep[0] = d
+    s.ver[0] = (c.ver or_else {})[d]
+    s.dep[2] = NUM_SEM
+    var fato: NumFato = NumFato{res = o, copia = 1, ebb = v.ebb, seq = c.seq}
+    fato.dep[0] = s.dep[0]
+    fato.dep[1] = s.dep[1]
+    fato.dep[2] = NUM_SEM
+    fato.ver[0] = s.ver[0]
+    fato.ver[1] = s.ver[1]
+    if fato_eh_global(c, v, s) {
+        fato.global = 1
+    }
+    num_inserir(c, fato)
+}
+
+// C: nativo/optimizer/numeracao.c:278
+proc registrar_valor(c: ^NumCtx, v: ^Visita, i: ^bir.BirInstr, s: ^NumSnap) {
+    let carga: bool = i.op == (bir.BIR_CARREGA as u8)
+    if (i.dst >= c.nvregs) or (i.dst == s.dep[1]) or (i.dst == s.dep[2]) {
+        return
+    }
+    // a invariante cargas.n >= carga_base vale: a EBB so restaura ate a marca que ela mesma tomou
+    if carga and ((c.cargas.n - v.carga_base) >= NUM_CARGAS_EBB) {
+        return
+    }
+    s.dep[0] = i.dst
+    s.ver[0] = (c.ver or_else {})[i.dst]
+    var fato: NumFato = NumFato{res = i.dst, ebb = v.ebb, seq = c.seq}
+    fato.chave = chave_de(i)
+    fato.dep[0] = s.dep[0]
+    fato.dep[1] = s.dep[1]
+    fato.dep[2] = s.dep[2]
+    fato.ver[0] = s.ver[0]
+    fato.ver[1] = s.ver[1]
+    fato.ver[2] = s.ver[2]
+    if (not carga) and fato_eh_global(c, v, s) {
+        fato.global = 1
+    }
+    num_inserir(c, fato)
+}
+
+// C: nativo/optimizer/numeracao.c:295
+proc matar_cargas(c: ^NumCtx, v: ^Visita, escrita: ?^NumChave) {
+    var j: u32 = v.carga_base
+    while j < c.cargas.n {
+        let k: u32 = c.cargas.v[j]
+        let morta: bool = c.fatos[k].morta != 0
+        if (not morta) and ((escrita == none) or num_pode_sobrepor(c, &c.fatos[k].chave, escrita)) {
+            num_matar(c, k)
+            c.n.mortos += 1
+        }
+        j += 1
+    }
+}
+
+// C: nativo/optimizer/numeracao.c:307
+proc efeito_na_memoria(c: ^NumCtx, v: ^Visita, i: ^bir.BirInstr) {
+    var escrita: NumChave = NumChave{}
+    let sw_1 = i.op as i32
+    if sw_1 == bir.BIR_GRAVA or sw_1 == bir.BIR_COPIA_MEM or sw_1 == bir.BIR_ZERA_MEM {
+        escrita = chave_da_escrita(i)
+        matar_cargas(c, v, &escrita)
+    } else if sw_1 == bir.BIR_CHAMA or sw_1 == bir.BIR_CHAMA_IND {
+        matar_cargas(c, v, none)
+    } else {
+    }
+}
+
+// C: nativo/optimizer/numeracao.c:327
+proc operando_de_conferencia(o: ^bir.BirOperando) -> bool {
+    if o.tipo == (bir.BO_IMED as u8) {
+        return true
+    }
+    return (((o.tipo == (bir.BO_VREG as u8)) and (o.tam == 0)) and (o.extensao == (bir.BE_NENHUMA as u8))) and (o.classe != (bir.BC_V128 as u8))
+}
+
+// C: nativo/optimizer/numeracao.c:335
+proc eh_conferencia_de_indice(c: ^NumCtx, i: ^bir.BirInstr) -> bool {
+    return ((((((((i.op == (bir.BIR_CMP as u8)) and (i.aux == (bir.BCOND_GE_U as u8))) and (i.classe != (bir.BC_V128 as u8))) and (i.dst < c.nvregs)) and (common.c2f_b2i32(operando_de_conferencia(&i.a)) != 0)) and (i.a.tipo == (bir.BO_VREG as u8))) and (i.a.id < c.nvregs)) and (common.c2f_b2i32(operando_de_conferencia(&i.b)) != 0)) and ((i.b.tipo != (bir.BO_VREG as u8)) or (i.b.id < c.nvregs))
+}
+
+// C: nativo/optimizer/numeracao.c:343
+proc dobrar_conferencia_repetida(c: ^NumCtx, v: ^Visita, i: ^bir.BirInstr) -> bool {
+    var chave: NumChave = NumChave{}
+    var k: u32 = 0
+    if not eh_conferencia_de_indice(c, i) {
+        return false
+    }
+    chave = chave_de(i)
+    k = num_buscar(c, &chave, v.ebb)
+    if k == NUM_SEM {
+        return false
+    }
+    if c.fatos[k].ebb == v.ebb {
+        c.n.expr.ebb += 1
+    } else {
+        c.n.expr.dom += 1
+    }
+    i.op = bir.BIR_CONST as u8
+    i.aux = 0
+    i.desloc = 0
+    i.a = bir.BirOperando{tipo = bir.BO_IMED as u8, classe = i.classe, imed = 0}
+    i.b = bir.BirOperando{}
+    return true
+}
+
+// C: nativo/optimizer/numeracao.c:368
+proc fechar_desvio_conhecido(bloco: ^bir.BirBloco, dobrado: u32) {
+    var d: ?^bir.BirInstr = none
+    var c: ?^bir.BirInstr = none
+    if (dobrado == NUM_SEM) or (bloco.n < 2) {
+        return
+    }
+    d = &bloco.instrs[bloco.n - 1]
+    c = &bloco.instrs[bloco.n - 2]
+    if (((((d as ^bir.BirInstr).op != (bir.BIR_DESVIA as u8)) or ((d as ^bir.BirInstr).a.tipo != (bir.BO_VREG as u8))) or ((d as ^bir.BirInstr).a.id != dobrado)) or ((c as ^bir.BirInstr).op != (bir.BIR_CONST as u8))) or ((c as ^bir.BirInstr).dst != dobrado) {
+        return
+    }
+    let ptr_1: ^bir.BirInstr = d as ^bir.BirInstr
+    ptr_1.op = bir.BIR_SALTA as u8
+    let ptr_2: ^bir.BirInstr = d as ^bir.BirInstr
+    ptr_2.alvo[0] = (d as ^bir.BirInstr).alvo[1]
+    let ptr_3: ^bir.BirInstr = d as ^bir.BirInstr
+    ptr_3.a = bir.BirOperando{}
+}
+
+// C: nativo/optimizer/numeracao.c:384
+proc processar_instrucao(c: ^NumCtx, v: ^Visita, i: ^bir.BirInstr) -> bool {
+    var s: NumSnap = NumSnap{}
+    var dobrou: bool = false
+    reescrever_operando(c, v, i, false)
+    reescrever_operando(c, v, i, true)
+    c.seq += 1
+    dobrou = dobrar_conferencia_repetida(c, v, i)
+    if (i.classe != (bir.BC_V128 as u8)) and ((common.c2f_b2i32(eh_conta_pura(i.op)) != 0) or (i.op == (bir.BIR_CARREGA as u8))) {
+        tentar_reusar(c, v, i)
+    }
+    fotografar_operandos(c, i, &s)
+    if (common.c2f_b2i32(define_vreg_3(i)) != 0) and (i.dst < c.nvregs) {
+        num_definir(c, i.dst)
+    }
+    if i.classe != (bir.BC_V128 as u8) {
+        if i.op == (bir.BIR_COPIA as u8) {
+            registrar_copia(c, v, i, &s)
+        } else if (common.c2f_b2i32(eh_conta_pura(i.op)) != 0) or (i.op == (bir.BIR_CARREGA as u8)) {
+            registrar_valor(c, v, i, &s)
+        }
+    }
+    efeito_na_memoria(c, v, i)
+    return dobrou
+}
+
+// C: nativo/optimizer/numeracao.c:408
+proc processar_bloco(c: ^NumCtx, f: ^bir.BirFuncao, q: ^Quadro) {
+    var v: Visita = Visita{bloco = q.bloco, ebb = q.ebb, carga_base = q.carga_base}
+    let bloco: ^bir.BirBloco = &f.blocos[q.bloco]
+    var marca_ov: NumMarca = NumMarca{nfatos = 0}
+    var tem_ov: bool = false
+    var dobrado: u32 = NUM_SEM
+    var k: u32 = 0
+    while k < bloco.n {
+        if (not tem_ov) and (common.c2f_b2i32(eh_ov_2(bloco.instrs[k].op)) != 0) {
+            tem_ov = true
+            marca_ov = num_marcar(c)
+        }
+        v.indice = k
+        v.pos = (c.pos_bloco or_else {})[q.bloco] + k
+        if processar_instrucao(c, &v, &bloco.instrs[k]) {
+            dobrado = bloco.instrs[k].dst
+        }
+        k += 1
+    }
+    if tem_ov {
+        num_restaurar(c, marca_ov, false)
+    }
+    fechar_desvio_conhecido(bloco, dobrado)
+}
+
+// C: nativo/optimizer/numeracao.c:436
+proc construir_filhos(c: ^NumCtx, a: ^bir.AnalisesBir) -> Filhos {
+    let ini = num_temp(c, (a.nblocos as u64) + 2, 0)
+    let filho = num_temp(c, (a.nblocos as u64) + 1, 0)
+    let pos = num_temp(c, (a.nblocos as u64) + 1, 0)
+    let rpo = a.rpo or_else {}
+    let idom = a.idom or_else {}
+    var r: u32 = 1
+    while r < a.nrpo {
+        ini[idom[rpo[r]] + 1] += 1
+        r += 1
+    }
+    var b: u32 = 0
+    while b < a.nblocos {
+        ini[b + 1] += ini[b]
+        b += 1
+    }
+    b = 0
+    while b < a.nblocos {
+        pos[b] = ini[b]
+        b += 1
+    }
+    r = 1
+    while r < a.nrpo {
+        let pai: u32 = idom[rpo[r]]
+        filho[pos[pai]] = rpo[r]
+        pos[pai] += 1
+        r += 1
+    }
+    return Filhos{ini = ini, filho = filho}
+}
+
+// C: nativo/optimizer/numeracao.c:452
+proc predecessor_unico(a: ^bir.AnalisesBir, b: u32) -> bool {
+    return ((a.pred_ini or_else {})[b + 1] - (a.pred_ini or_else {})[b]) == 1
+}
+
+// C: nativo/optimizer/numeracao.c:459
+proc fato_do_desvio_falso(c: ^NumCtx, f: ^bir.BirFuncao, bloco: u32, ebb: u32) {
+    let a: ^bir.AnalisesBir = &c.a
+    if (bloco == 0) or (not predecessor_unico(a, bloco)) {
+        return
+    }
+    let idom = a.idom or_else {}
+    let pai: ^bir.BirBloco = &f.blocos[idom[bloco]]
+    if pai.n < 2 {
+        return
+    }
+    let d: ^bir.BirInstr = &pai.instrs[pai.n - 1]
+    let cmp: ^bir.BirInstr = &pai.instrs[pai.n - 2]
+    if (d.op != (bir.BIR_DESVIA as u8)) or (d.alvo[1] != bloco) or (d.alvo[0] == bloco) or (d.a.tipo != (bir.BO_VREG as u8)) or (d.a.id != cmp.dst) or (not eh_conferencia_de_indice(c, cmp)) {
+        return
+    }
+    var s: NumSnap = NumSnap{}
+    fotografar_operandos(c, cmp, &s)
+    s.dep[0] = cmp.dst
+    s.ver[0] = (c.ver or_else {})[cmp.dst]
+    var v: Visita = Visita{bloco = bloco}
+    var fato: NumFato = NumFato{res = cmp.dst, ebb = ebb, seq = c.seq}
+    fato.chave = chave_de(cmp)
+    fato.dep[0] = s.dep[0]
+    fato.dep[1] = s.dep[1]
+    fato.dep[2] = s.dep[2]
+    fato.ver[0] = s.ver[0]
+    fato.ver[1] = s.ver[1]
+    fato.ver[2] = s.ver[2]
+    if fato_eh_global(c, &v, &s) {
+        fato.global = 1
+    }
+    num_inserir(c, fato)
+}
+
+// C: nativo/optimizer/numeracao.c:482
+proc percorrer(c: ^NumCtx, f: ^bir.BirFuncao) {
+    let a: ^bir.AnalisesBir = &c.a
+    let filhos: Filhos = construir_filhos(c, a)
+    var pilha = make([dynamic]Quadro, alloc = heap, cap = (a.nblocos + 1) as int)
+    defer delete(pilha)
+    var k: u32 = 0
+    while k <= a.nblocos {
+        append(&pilha, item = Quadro{})
+        k += 1
+    }
+    var topo: u32 = 1
+    pilha[0] = Quadro{bloco = 0, ebb = 0, carga_base = 0}
+    while topo > 0 {
+        let qi: u32 = topo - 1
+        if not pilha[qi].entrou {
+            pilha[qi].entrou = true
+            pilha[qi].marca = num_marcar(c)
+            fato_do_desvio_falso(c, f, pilha[qi].bloco, pilha[qi].ebb)
+            processar_bloco(c, f, &pilha[qi])
+        }
+        let bloco_q: u32 = pilha[qi].bloco
+        if filhos.ini[bloco_q] + pilha[qi].prox_filho < filhos.ini[bloco_q + 1] {
+            let filho: u32 = filhos.filho[filhos.ini[bloco_q] + pilha[qi].prox_filho]
+            pilha[qi].prox_filho += 1
+            var ebb_filho: u32 = filho
+            var cb_filho: u32 = c.cargas.n
+            if predecessor_unico(a, filho) {
+                ebb_filho = pilha[qi].ebb
+                cb_filho = pilha[qi].carga_base
+            }
+            pilha[topo] = Quadro{bloco = filho, ebb = ebb_filho, carga_base = cb_filho}
+            topo += 1
+            continue
+        }
+        num_restaurar(c, pilha[qi].marca, true)
+        topo -= 1
+    }
+}
+
+// C: nativo/optimizer/numeracao.c:511
+proc relatar(p: ^bir.BirPrograma, f: ^bir.BirFuncao, n: ^NumContagem, relato: ^[dynamic]u8) {
+    if ((((((n.copia.ebb + n.copia.dom) + n.expr.ebb) + n.expr.dom) + n.carga.ebb) + n.carga.dom) + n.mortos) == 0 {
+        return
+    }
+    let txt_1 = p.simbolos[f.simbolo].nome or_else "(null)"
+    format(f"numeracao {txt_1}: copia ebb={n.copia.ebb} dom={n.copia.dom}, expr ebb={n.expr.ebb} dom={n.expr.dom}, carga ebb={n.carga.ebb} dom={n.carga.dom}, mortos={n.mortos}\n", into = relato)
+}
+
+// C: nativo/optimizer/numeracao.c:520
+// O5: sem a pilha do percurso (heap) e com tirada em u32 por instrucao: 2*total (baldes) + (total + 1) (tirada) + vetores por vreg/bloco.
+proc palavras_de_trabalho(f: ^bir.BirFuncao, total: u32) -> u64 {
+    let nv: u64 = (f.nvregs as u64) + 1
+    let nb: u64 = (f.nblocos as u64) + 1
+    let t: u64 = total as u64
+    return (7 * nv) + (6 * nb) + (3 * t) + 64 + 1 + 2 + 16
+}
+
+// C: nativo/optimizer/numeracao.c:527
+proc numeracao_corpo(c: ^NumCtx, p: ^bir.BirPrograma, f: ^bir.BirFuncao, relato: ^[dynamic]u8) {
+    var total: u32 = 0
+    var b: u32 = 0
+    while b < f.nblocos {
+        total += f.blocos[b].n
+        b += 1
+    }
+    num_preparar(c, palavras_de_trabalho(f, total))
+    contar_defs(c)
+    calcular_ultimos_usos(c)
+    num_fatos_iniciar(c, total)
+    percorrer(c, f)
+    if not p.simbolos_dbg {
+        c.n.mortos += num_remover_mortos(f, c)
+    }
+    relatar(p, f, &c.n, relato)
+}
+
+// C: nativo/optimizer/numeracao.c:545
+// Analises de funcao de 1 bloco que termina em RETORNA, sem o calculo geral (o C aponta para estaticos; aqui as fatias vivem na arena da saida).
+proc analises_de_um_bloco(f: ^bir.BirFuncao, saida: ^bir.AnalisesBir) -> bool {
+    if (f.nblocos != 1) or (f.blocos[0].n == 0) or (f.blocos[0].instrs[f.blocos[0].n - 1].op != (bir.BIR_RETORNA as u8)) {
+        return false
+    }
+    saida^ = bir.AnalisesBir{}
+    saida.nblocos = 1
+    saida.nvregs = f.nvregs
+    saida.nrpo = 1
+    saida.pred_ini = common.arena_fatia_u32(&saida.arena, 2)
+    saida.rpo = common.arena_fatia_u32(&saida.arena, 1)
+    saida.pos_rpo = common.arena_fatia_u32(&saida.arena, 1)
+    saida.idom = common.arena_fatia_u32(&saida.arena, 1)
+    saida.dom_pre = common.arena_fatia_u32(&saida.arena, 1)
+    let dom_tam = common.arena_fatia_u32(&saida.arena, 1)
+    dom_tam[0] = 1
+    saida.dom_tam = dom_tam
+    return true
+}
+
+// C: nativo/optimizer/numeracao.c:561
+proc numeracao_funcao(c: ^NumCtx, p: ^bir.BirPrograma, f: ^bir.BirFuncao, relato: ^[dynamic]u8) {
+    if (f.sintetica) or (f.nblocos == 0) or (f.nvregs == 0) {
+        return
+    }
+    c.a = bir.AnalisesBir{}
+    let sintetizada: bool = analises_de_um_bloco(f, &c.a)
+    if not sintetizada {
+        bir.analises_calcular_lacos_apenas(f, &c.a)
+    }
+    let ini_preds = c.a.pred_ini or_else {}
+    if ini_preds[1] - ini_preds[0] == 0 {
+        c.f = f
+        c.nvregs = f.nvregs
+        numeracao_corpo(c, p, f, relato)
+    }
+    bir.analises_liberar(&c.a)
+}
+
+// C: nativo/optimizer/numeracao.c:581
+proc otim_numeracao_aplicar(programa: ^bir.BirPrograma, relato: ^[dynamic]u8) {
+    var contexto: NumCtx = NumCtx{f = none}
+    for i in (0 as u32)..<programa.nfuncoes {
+        numeracao_funcao(&contexto, programa, &(programa.funcoes or_else {})[i], relato)
+    }
+    num_fatos_liberar(&contexto)
+}
+
+test "num_valor_de_e_chave_comutativa_do_c" {
+    var imed = bir.BirOperando{tipo = bir.BO_IMED as u8, imed = -5}
+    expect(valor_de(&imed) == -5)
+    var nada = bir.BirOperando{tipo = bir.BO_NADA as u8}
+    expect(valor_de(&nada) == 0)
+    var reg = bir.BirOperando{tipo = bir.BO_VREG as u8, id = 9}
+    expect(valor_de(&reg) == 9)
+    var soma = bir.BirInstr{op = bir.BIR_ADD as u8, classe = bir.BC_I64 as u8, a = bir.BirOperando{tipo = bir.BO_IMED as u8, imed = 3}, b = bir.BirOperando{tipo = bir.BO_VREG as u8, id = 7}}
+    let k = chave_de(&soma)
+    expect(k.ta == (bir.BO_VREG as u8) and k.va == 7 and k.tb == (bir.BO_IMED as u8) and k.vb == 3)
+    var sub = bir.BirInstr{op = bir.BIR_SUB as u8, classe = bir.BC_I64 as u8, a = bir.BirOperando{tipo = bir.BO_IMED as u8, imed = 3}, b = bir.BirOperando{tipo = bir.BO_VREG as u8, id = 7}}
+    let ks = chave_de(&sub)
+    expect(ks.ta == (bir.BO_IMED as u8) and ks.va == 3)
+}
+
+test "num_define_ov_e_conta_pura_do_c" {
+    var salta = bir.BirInstr{op = bir.BIR_SALTA as u8, dst = 0}
+    expect(not define_vreg_3(&salta))
+    var soma = bir.BirInstr{op = bir.BIR_ADD as u8, dst = 4}
+    expect(define_vreg_3(&soma))
+    var sem = bir.BirInstr{op = bir.BIR_ADD as u8, dst = bir.BIR_SEM_VREG}
+    expect(not define_vreg_3(&sem))
+    expect(eh_conta_pura(bir.BIR_ADD as u8))
+    expect(not eh_conta_pura(bir.BIR_CARREGA as u8))
+    expect(eh_ov_2(bir.BIR_ADD_OV as u8))
+    expect(not eh_ov_2(bir.BIR_ADD as u8))
+}
+
+test "num_construir_filhos_da_arvore_do_c" {
+    var c = NumCtx{}
+    num_preparar(&c, 32)
+    var a = bir.AnalisesBir{nblocos = 3, nrpo = 3}
+    let rpo = common.arena_fatia_u32(&a.arena, 3)
+    rpo[0] = 0
+    rpo[1] = 1
+    rpo[2] = 2
+    let idom = common.arena_fatia_u32(&a.arena, 3)
+    idom[0] = 0
+    idom[1] = 0
+    idom[2] = 1
+    a.rpo = rpo
+    a.idom = idom
+    let fl = construir_filhos(&c, &a)
+    expect(fl.ini[1] == 1 and fl.ini[2] == 2 and fl.filho[0] == 1 and fl.filho[1] == 2)
+    bir.analises_liberar(&a)
+    num_fatos_liberar(&c)
+}
+
+test "num_relatar_texto_do_c" {
+    var p = bir.BirPrograma{}
+    p.simbolos = make([dynamic]bir.BirSimbolo, alloc = heap, cap = 1)
+    append(&p.simbolos, item = bir.BirSimbolo{nome = "fn"})
+    var f = bir.BirFuncao{}
+    var n = NumContagem{}
+    n.copia = NumPar{ebb = 1, dom = 2}
+    n.expr = NumPar{ebb = 3, dom = 4}
+    n.carga = NumPar{ebb = 5, dom = 6}
+    n.mortos = 7
+    var relato = make([dynamic]u8, alloc = heap, cap = 64)
+    relatar(&p, &f, &n, &relato)
+    let txt: str = from_bytes(relato[..], alloc = heap)
+    expect(txt == "numeracao fn: copia ebb=1 dom=2, expr ebb=3 dom=4, carga ebb=5 dom=6, mortos=7\n")
+    delete(txt)
+    delete(relato)
+    delete(p.simbolos)
+}

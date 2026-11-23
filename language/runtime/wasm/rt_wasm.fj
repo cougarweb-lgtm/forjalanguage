@@ -1,0 +1,1146 @@
+// runtime/wasm/rt_wasm.fj - runtime do alvo wasm32-wasip1 escrito em Forja (injetado como o modulo std:wasm_rt so nesse alvo)
+// Versao: 0.3.4 (0.3.4: caminho release curto nos as_*_de_f64 estreitos e forja_rt_trunc_i32; W2 M3: forja_fmt_* do f"...", format e print; 0.3.1: fmt_bytes para o texto de real de rt_wasm_real.fj; 0.3.2: endereco_de e slice_from; 0.3.3: new/mem_alocar e R0009 em dev)
+// LIMITE: arquivo > 800 linhas porque o heap, as listas, o fmt e o rastro de vazamento dividem o estado do alocador e a memoria baixa; um modulo a parte precisaria de import circular
+// Contrato: cada proc pub X deste modulo atende o simbolo de runtime forja_X da BIR (a ponte esta em wasm_gerar.fj, wasm_tabela_de_funcoes).
+// Falhas (R-codes) saem pelas funcoes em bytecode de nativo/wasm/wasm_rt.fj, declaradas abaixo em foreign sem link.
+// Regra deste modulo: sem make/append/format e sem const de array (o runtime nao pode depender de si mesmo).
+// Verificacao: python tests\nativo\wasm\verificar_wasm.py --modos dev,release --filtro rt_fatia
+
+foreign {
+    proc forja_falha_fatia(lo: int, hi: int, excl: int, n: int, arquivo: cstr, linha: i32)
+    proc forja_falha_indice(i: int, n: int, arquivo: cstr, linha: i32)
+    proc forja_falha_nulo(oque: cstr, arquivo: cstr, linha: i32)
+    proc forja_rt_endereco_de(p: rawptr) -> uint
+    proc forja_rt_ponteiro_de(a: uint) -> rawptr
+    proc forja_rt_heap_base() -> uint
+    proc forja_rt_memoria_paginas() -> int
+    proc forja_rt_memoria_crescer(paginas: int) -> int
+    proc forja_rt_modo_dev() -> bool
+    proc forja_rt_trunc_i32(v: f64) -> i32
+    proc forja_rt_trunc_i64(v: f64) -> int
+    proc forja_rt_floor(x: f64) -> f64
+    proc forja_rt_sair(codigo: int) -> int
+    proc forja_rt_args_tamanhos(argc_ptr: uint, buf_tam_ptr: uint) -> int
+    proc forja_rt_args_obter(argv_ptr: uint, buf_ptr: uint) -> int
+    proc forja_falha_conversao_i(valor: int, alvo: cstr, arquivo: cstr, linha: i32)
+    proc rt_escrever_stdout = "forja_os_write_stdout"(dados: ^u8, n: i64)
+    proc forja_err_escrever(ptr: u32, n: u32)
+}
+
+// a[lo..<hi] ou a[lo..=hi]: dentro de 0..=n; senao R0006 "fatia LO..<HI fora de 0..=N" (mesma regra do rt_nativo.c)
+pub proc fatia_confere(lo: int, hi: int, exclusiva: bool, n: int, arquivo: cstr, linha: i32) {
+    var dentro: bool = false
+    if exclusiva {
+        dentro = (lo >= 0) and (lo <= hi) and (hi <= n)
+    } else {
+        dentro = (lo >= 0) and (hi < n) and ((lo - 1) <= hi)
+    }
+    if dentro {
+        return
+    }
+    var excl: int = 0
+    if exclusiva {
+        excl = 1
+    }
+    forja_falha_fatia(lo, hi, excl, n, arquivo, linha)
+}
+
+// ---- W2 M2: alocador (heap) e funcoes de lista ----
+// Estado do heap em [512,1024): topo do bump (u64; 0 = ainda nao iniciado) e, a partir de 520, a cabeca da lista livre de cada classe (u64).
+// Bloco = cabecalho de 16 B (guarda a classe) + payload alinhado a 16; tamanho = 2^classe (classe 5..31). Na lista livre o 1o u64 do payload e o proximo bloco.
+const HEAP_TOPO: uint = 512
+const HEAP_LIVRES: uint = 520
+const HEAP_CABECALHO: uint = 16
+// 0.36.0: em dev o cabecalho tem 32 B e guarda o rastro do bloco (R0009): [0] classe | [8] origem (bit 63 | linha << 32 | endereco do arquivo; 0 = sem rastro)
+// | [16] bytes pedidos | [24] serie de nascimento (bit 63 = ja relatado). O release segue com 16 B, igual ao de antes.
+const HEAP_CABECALHO_DEV: uint = 32
+// Estado do rastro nos 3 slots livres da memoria baixa (o fmt usa [784,824), o heap [512,776), os args [496,504), o filtro de teste [832,1024)): proxima serie,
+// origem do 1o ponto do ultimo relatorio e a contagem dele (blocos << 32 | bytes)
+const RASTRO_SERIE: uint = 776
+const RASTRO_P_ORIGEM: uint = 824
+const RASTRO_P_CONTAGEM: uint = 504
+const RASTRO_PONTOS_MAX: int = 16 // pontos de alocacao relatados um a um; o resto soma em "(outros)" (FORJA_VAZAMENTOS_MAX do x64)
+const HEAP_CLASSE_MIN: int = 5
+const HEAP_BLOCO_MIN: uint = 32
+const HEAP_PEDIDO_MAX: uint = 1073741824 // 2^30: pedido acima disso falha (devolve 0)
+const PAGINA_BYTES: uint = 65536
+const LISTA_CAP_INICIAL: int = 8
+const LISTA_CAP_LIMIAR: int = 4
+const ALOC_HEAP: u32 = 1
+
+pub proc memoria_ler_u64(endereco: uint) -> uint {
+    let p = forja_rt_ponteiro_de(endereco) as ^u64
+    let valor: u64 = p^
+    return valor as uint
+}
+
+pub proc memoria_escrever_u64(endereco: uint, valor: uint) {
+    let p = forja_rt_ponteiro_de(endereco) as ^u64
+    p^ = valor as u64
+}
+
+proc memoria_escrever_u32(endereco: uint, valor: u32) {
+    let p = forja_rt_ponteiro_de(endereco) as ^u32
+    p^ = valor
+}
+
+pub proc memoria_ler_u8(endereco: uint) -> uint {
+    let p = forja_rt_ponteiro_de(endereco) as ^u8
+    let valor: u8 = p^
+    return valor as uint
+}
+
+pub proc memoria_escrever_u8(endereco: uint, valor: uint) {
+    let p = forja_rt_ponteiro_de(endereco) as ^u8
+    p^ = valor as u8
+}
+
+// Copia n bytes sem sobreposicao: 8 bytes por vez e o resto byte a byte. O alias memory.copy nao serve aqui: o nome e do BIR (COPIA_MEM), nao de runtime.
+proc memoria_copiar(destino: uint, origem: uint, n: uint) {
+    var k: uint = 0
+    while k + 8 <= n {
+        memoria_escrever_u64(destino + k, memoria_ler_u64(origem + k))
+        k += 8
+    }
+    while k < n {
+        memoria_escrever_u8(destino + k, memoria_ler_u8(origem + k))
+        k += 1
+    }
+}
+
+proc heap_tamanho_classe(classe: int) -> uint {
+    return (1 as uint) << (classe as uint)
+}
+
+// Tamanho do cabecalho do bloco: 32 B em dev (com o rastro do R0009), 16 B em release
+proc heap_cabecalho() -> uint {
+    if forja_rt_modo_dev() {
+        return HEAP_CABECALHO_DEV
+    }
+    return HEAP_CABECALHO
+}
+
+// Pega o bloco no topo do bump; se a memoria linear acabou, cresce so o que falta (memory.grow)
+proc heap_bump(tamanho: uint, classe: int) -> uint {
+    var topo: uint = memoria_ler_u64(HEAP_TOPO)
+    if topo == 0 {
+        topo = forja_rt_heap_base()
+    }
+    let fim: uint = topo + tamanho
+    let fim_memoria: uint = (forja_rt_memoria_paginas() as uint) * PAGINA_BYTES
+    if fim > fim_memoria {
+        let faltam: uint = (fim - fim_memoria + PAGINA_BYTES - 1) / PAGINA_BYTES
+        if forja_rt_memoria_crescer(faltam as int) < 0 {
+            return 0
+        }
+    }
+    memoria_escrever_u64(HEAP_TOPO, fim)
+    memoria_escrever_u64(topo, classe as uint)
+    return topo + heap_cabecalho()
+}
+
+// Aloca n bytes: lista livre da classe primeiro, senao o bump. Devolve 0 quando nao ha memoria.
+pub proc heap_alocar(n: uint) -> uint {
+    if n > HEAP_PEDIDO_MAX {
+        return 0
+    }
+    var classe: int = HEAP_CLASSE_MIN
+    var tamanho: uint = HEAP_BLOCO_MIN
+    let cabecalho: uint = heap_cabecalho()
+    var precisa: uint = n + cabecalho
+    if n < 8 {
+        precisa = cabecalho + 8 // o 1o u64 do payload guarda o elo da lista livre: tem de caber no bloco
+    }
+    while tamanho < precisa {
+        tamanho = tamanho * 2
+        classe += 1
+    }
+    let cabeca: uint = HEAP_LIVRES + (classe as uint) * 8
+    let livre: uint = memoria_ler_u64(cabeca)
+    if livre != 0 {
+        memoria_escrever_u64(cabeca, memoria_ler_u64(livre + cabecalho))
+        return livre + cabecalho
+    }
+    return heap_bump(tamanho, classe)
+}
+
+// Empilha o bloco de p na lista livre da sua classe (a classe esta no cabecalho); em dev apaga o rastro (R0009)
+proc heap_liberar(p: uint) {
+    if p == 0 {
+        return
+    }
+    let cabecalho: uint = heap_cabecalho()
+    let bloco: uint = p - cabecalho
+    if forja_rt_modo_dev() {
+        memoria_escrever_u64(bloco + 8, 0)
+    }
+    let cabeca: uint = HEAP_LIVRES + memoria_ler_u64(bloco) * 8
+    memoria_escrever_u64(bloco + cabecalho, memoria_ler_u64(cabeca))
+    memoria_escrever_u64(cabeca, bloco)
+}
+
+// Cabe na classe atual -> mesmo ponteiro; senao aloca, copia o menor dos dois tamanhos e libera o velho
+pub proc heap_realocar(velho: uint, bytes_velho: uint, bytes_novo: uint) -> uint {
+    if velho == 0 {
+        return heap_alocar(bytes_novo)
+    }
+    let cabecalho: uint = heap_cabecalho()
+    let classe: uint = memoria_ler_u64(velho - cabecalho)
+    let capacidade: uint = heap_tamanho_classe(classe as int) - cabecalho
+    if bytes_novo <= capacidade {
+        return velho
+    }
+    let novo: uint = heap_alocar(bytes_novo)
+    if novo == 0 {
+        return 0
+    }
+    var copia: uint = bytes_novo
+    if bytes_velho < bytes_novo {
+        copia = bytes_velho
+    }
+    memoria_copiar(novo, velho, copia)
+    heap_liberar(velho)
+    return novo
+}
+
+// Simbolos de runtime (forja_X) chamados pela BIR; as classes dos parametros casam com o ponto de chamada (i64 = int/uint/ponteiro/cstr, i32 = i32/u32).
+// Sem frame no wasm: epoca e sempre 0 e os alocadores nao-heap tambem caem no heap.
+pub proc lista_criar(alocador: u32, cap: int, tam_elem: int, epoca: uint, arquivo: cstr, linha: i32) -> uint {
+    memoria_escrever_u32(epoca, 0)
+    if (cap <= 0) or (tam_elem <= 0) {
+        return 0
+    }
+    if cap > (HEAP_PEDIDO_MAX as int) / tam_elem {
+        return 0
+    }
+    let bytes: uint = (cap as uint) * (tam_elem as uint)
+    let p: uint = heap_alocar(bytes)
+    if alocador == ALOC_HEAP {
+        rastro_marcar(p, bytes, arquivo, linha)
+    }
+    return p
+}
+
+// LIMITE: 8 parametros posicionais porque a chama da BIR passa os 8 argumentos de forja_lista_crescer em ordem (o C tem a mesma assinatura)
+pub proc lista_crescer(ptr: uint, len: int, cap: uint, tam_elem: int, alocador: u32, epoca: uint, arquivo: cstr, linha: i32) -> uint {
+    // 0.38.0: R0007 como o x64 (rt_aloc.c): lista de valor zero, passou do limite ou sem memoria
+    if tam_elem <= 0 {
+        return 0
+    }
+    if alocador == 0 {
+        falha_alocacao("append numa lista sem alocador (valor zero): crie com make([dynamic]T, em = heap)", alocador as int, arquivo, linha)
+    }
+    let cap_antigo: int = memoria_ler_u64(cap) as int
+    if cap_antigo > (HEAP_PEDIDO_MAX as int) / tam_elem {
+        falha_alocacao("append: a lista passou do limite de memoria com cap", cap_antigo, arquivo, linha)
+    }
+    var novo_cap: int = LISTA_CAP_INICIAL
+    if cap_antigo >= LISTA_CAP_LIMIAR {
+        novo_cap = cap_antigo * 2
+    }
+    let bytes_antigo: uint = (cap_antigo as uint) * (tam_elem as uint)
+    let bytes_novo: uint = (novo_cap as uint) * (tam_elem as uint)
+    // 0.36.0: o bloco novo herda o ponto de alocacao original (como o x64) e ganha serie nova
+    var origem_velha: uint = 0
+    if (alocador == ALOC_HEAP) and (ptr != 0) {
+        origem_velha = rastro_origem_de(ptr)
+    }
+    let p: uint = heap_realocar(ptr, bytes_antigo, bytes_novo)
+    if p == 0 {
+        falha_alocacao("sem memoria no heap para bytes", bytes_novo as int, arquivo, linha)
+    }
+    memoria_escrever_u64(cap, novo_cap as uint)
+    if alocador == ALOC_HEAP {
+        if origem_velha != 0 {
+            rastro_gravar(p, origem_velha, bytes_novo)
+        } else {
+            rastro_marcar(p, bytes_novo, arquivo, linha)
+        }
+    }
+    return p
+}
+
+pub proc lista_liberar(ptr: uint, alocador: u32, arquivo: cstr, linha: i32) {
+    if alocador != ALOC_HEAP {
+        return
+    }
+    heap_liberar(ptr)
+}
+
+pub proc mem_liberar(p: uint, arquivo: cstr, linha: i32) {
+    heap_liberar(p)
+}
+
+// 0.36.0: new(T, alloc = ...) (simbolo forja_mem_alocar). Sem Arena/Pool/frame no wasm: so o heap e rastreado (R0009); os outros caem no heap sem rastro.
+// O lowering zera o bloco quando o tipo pede (IR_ALOCA_ZERADO), entao aqui nao se preenche.
+pub proc mem_alocar(alocador: u32, bytes: int, arquivo: cstr, linha: i32) -> uint {
+    var p: uint = 0
+    if bytes >= 0 {
+        p = heap_alocar(bytes as uint)
+    }
+    if p == 0 {
+        falha_alocacao("sem memoria no heap para bytes", bytes, arquivo, linha)
+    }
+    if alocador == ALOC_HEAP {
+        rastro_marcar(p, bytes as uint, arquivo, linha)
+    }
+    return p
+}
+
+// Sem frame no wasm a epoca e sempre 0: a lista nunca morre por frame_reset, entao nada a validar (nao falha)
+pub proc lista_viva(epoca: u32, arquivo: cstr, linha: i32) {
+}
+
+pub proc indice_lista(i: int, n: int, epoca: u32, arquivo: cstr, linha: i32) -> int {
+    lista_viva(epoca, arquivo, linha)
+    if (i < 0) or (i >= n) {
+        forja_falha_indice(i, n, arquivo, linha)
+    }
+    return i
+}
+
+// ---- W2 M4: real -> inteiro (forja_as_<S>_de_f64) e floor ----
+// Dev: faixa aberta (MIN-1, MAX+1) e trunca para zero; fora dela R0002 (o valor sai como inteiro truncado: sem Display de real no wasm).
+// Release: satura (NaN vira 0). forja_rt_trunc_i64 e o trunc_sat do wasm: serve de truncamento nas duas variantes.
+// LIMITE: 6 parametros posicionais porque o chamador repassa alvo/arquivo/linha da chama da BIR a cada tipo estreito
+proc conv_com_sinal(v: f64, minimo: int, maximo: int, alvo: cstr, arquivo: cstr, linha: i32) -> int {
+    let piso: f64 = minimo as f64
+    let teto: f64 = maximo as f64
+    if forja_rt_modo_dev() {
+        if not ((v > (piso - 1.0)) and (v < (teto + 1.0))) {
+            forja_falha_conversao_i(forja_rt_trunc_i64(v), alvo, arquivo, linha)
+        }
+        return forja_rt_trunc_i64(v)
+    }
+    if v > teto {
+        return maximo
+    }
+    if v >= piso {
+        return forja_rt_trunc_i64(v)
+    }
+    if v < piso {
+        return minimo
+    }
+    return 0
+}
+
+proc conv_sem_sinal(v: f64, maximo: int, alvo: cstr, arquivo: cstr, linha: i32) -> int {
+    let teto: f64 = maximo as f64
+    if forja_rt_modo_dev() {
+        if not ((v > -1.0) and (v < (teto + 1.0))) {
+            forja_falha_conversao_i(forja_rt_trunc_i64(v), alvo, arquivo, linha)
+        }
+        return forja_rt_trunc_i64(v)
+    }
+    if v > teto {
+        return maximo
+    }
+    if v >= 0.0 {
+        return forja_rt_trunc_i64(v)
+    }
+    return 0
+}
+
+// 0.3.4: os 6 estreitos tem o caminho release curto e pequeno (o V8 o embute no laco quente): i32 = i32.trunc_sat_f64_s; os demais =
+// trunc_sat i64 + trava na faixa (mesmo resultado do conv_*: satura, NaN vira 0). O dev segue em conv_com_sinal/conv_sem_sinal (R0002).
+pub proc as_i8_de_f64(v: f64, arquivo: cstr, linha: i32) -> i8 {
+    if forja_rt_modo_dev() {
+        return conv_com_sinal(v, -128, 127, "i8", arquivo, linha) as i8
+    }
+    let t: int = forja_rt_trunc_i64(v)
+    if t > 127 {
+        return 127
+    }
+    if t < -128 {
+        return -128
+    }
+    return t as i8
+}
+
+pub proc as_i16_de_f64(v: f64, arquivo: cstr, linha: i32) -> i16 {
+    if forja_rt_modo_dev() {
+        return conv_com_sinal(v, -32768, 32767, "i16", arquivo, linha) as i16
+    }
+    let t: int = forja_rt_trunc_i64(v)
+    if t > 32767 {
+        return 32767
+    }
+    if t < -32768 {
+        return -32768
+    }
+    return t as i16
+}
+
+proc as_i32_dev(v: f64, arquivo: cstr, linha: i32) -> i32 {
+    return conv_com_sinal(v, -2147483648, 2147483647, "i32", arquivo, linha) as i32
+}
+
+pub proc as_i32_de_f64(v: f64, arquivo: cstr, linha: i32) -> i32 {
+    if forja_rt_modo_dev() {
+        return as_i32_dev(v, arquivo, linha)
+    }
+    return forja_rt_trunc_i32(v)
+}
+
+pub proc as_u8_de_f64(v: f64, arquivo: cstr, linha: i32) -> u8 {
+    if forja_rt_modo_dev() {
+        return conv_sem_sinal(v, 255, "u8", arquivo, linha) as u8
+    }
+    let t: int = forja_rt_trunc_i64(v)
+    if t > 255 {
+        return 255
+    }
+    if t < 0 {
+        return 0
+    }
+    return t as u8
+}
+
+pub proc as_u16_de_f64(v: f64, arquivo: cstr, linha: i32) -> u16 {
+    if forja_rt_modo_dev() {
+        return conv_sem_sinal(v, 65535, "u16", arquivo, linha) as u16
+    }
+    let t: int = forja_rt_trunc_i64(v)
+    if t > 65535 {
+        return 65535
+    }
+    if t < 0 {
+        return 0
+    }
+    return t as u16
+}
+
+pub proc as_u32_de_f64(v: f64, arquivo: cstr, linha: i32) -> u32 {
+    if forja_rt_modo_dev() {
+        return conv_sem_sinal(v, 4294967295, "u32", arquivo, linha) as u32
+    }
+    let t: int = forja_rt_trunc_i64(v)
+    if t > 4294967295 {
+        return 4294967295
+    }
+    if t < 0 {
+        return 0
+    }
+    return t as u32
+}
+
+// i64: faixa [-2^63, 2^63); o trunc_sat ja satura em release e devolve 0 para NaN
+pub proc as_i64_de_f64(v: f64, arquivo: cstr, linha: i32) -> int {
+    if forja_rt_modo_dev() {
+        if not ((v >= -9223372036854775808.0) and (v < 9223372036854775808.0)) {
+            forja_falha_conversao_i(forja_rt_trunc_i64(v), "i64", arquivo, linha)
+        }
+    }
+    return forja_rt_trunc_i64(v)
+}
+
+// u64: faixa (-1, 2^64); a metade alta (>= 2^63) trunca v - 2^63 e soma 2^63 de volta
+pub proc as_u64_de_f64(v: f64, arquivo: cstr, linha: i32) -> uint {
+    let metade: uint = (1 as uint) << 63
+    if forja_rt_modo_dev() {
+        if not ((v > -1.0) and (v < 18446744073709551616.0)) {
+            forja_falha_conversao_i(forja_rt_trunc_i64(v), "u64", arquivo, linha)
+        }
+    }
+    if v >= 18446744073709551616.0 {
+        return ~(0 as uint)
+    }
+    if v >= 9223372036854775808.0 {
+        return (forja_rt_trunc_i64(v - 9223372036854775808.0) as uint) + metade
+    }
+    if v >= 0.0 {
+        return forja_rt_trunc_i64(v) as uint
+    }
+    return 0
+}
+
+pub proc math_floor(x: f64) -> f64 {
+    return forja_rt_floor(x)
+}
+
+// ---- W3 M3: texto formatado (f"...", format, print) - simbolos forja_fmt_* ----
+// Buffer do texto: ptr em 800, len em 808, cap em 816 (u64). Bloco de retorno do str_final: 16 B em 784 (ptr, len).
+// Argumento str = endereco de 16 B (ptr em +0, len em +8). Argumento fmt (u32): largura bits 0..7, zeros bit 13, hexa bit 14.
+// Sem falha de alocacao no wasm: sem memoria o texto sai truncado em silencio (lacuna, relatada).
+const FMT_PTR: uint = 800
+const FMT_LEN: uint = 808
+const FMT_CAP: uint = 816
+const FMT_RETORNO: uint = 784
+const FMT_CAP_MIN: uint = 256
+const FMT_LARGURA: u32 = 255
+const FMT_ZERO: u32 = 8192
+const FMT_HEXA: u32 = 16384
+const FMT_BASE_DEC: uint = 10
+const FMT_BASE_HEX: uint = 16
+const FMT_ASCII_ESPACO: uint = 32
+const FMT_ASCII_MENOS: uint = 45
+const FMT_ASCII_ZERO: uint = 48
+const FMT_ASCII_A: uint = 97
+const FMT_ASCII_LF: uint = 10
+
+proc fmt_escrever_byte(pos: uint, valor: uint) {
+    memoria_escrever_u8(memoria_ler_u64(FMT_PTR) + pos, valor)
+}
+
+// Garante n bytes livres depois do len (cap dobra a partir de 256); devolve false sem memoria
+proc fmt_reservar(n: uint) -> bool {
+    let len: uint = memoria_ler_u64(FMT_LEN)
+    var cap: uint = memoria_ler_u64(FMT_CAP)
+    if len + n <= cap {
+        return true
+    }
+    while len + n > cap {
+        if cap * 2 > FMT_CAP_MIN {
+            cap = cap * 2
+        } else {
+            cap = FMT_CAP_MIN
+        }
+    }
+    let novo: uint = heap_realocar(memoria_ler_u64(FMT_PTR), len, cap)
+    if novo == 0 {
+        return false
+    }
+    memoria_escrever_u64(FMT_PTR, novo)
+    memoria_escrever_u64(FMT_CAP, cap)
+    return true
+}
+
+// Acrescenta n bytes copiados da memoria a partir de origem
+proc fmt_copiar(origem: uint, n: uint) {
+    if (n == 0) or (not fmt_reservar(n)) {
+        return
+    }
+    let len: uint = memoria_ler_u64(FMT_LEN)
+    memoria_copiar(memoria_ler_u64(FMT_PTR) + len, origem, n)
+    memoria_escrever_u64(FMT_LEN, len + n)
+}
+
+// Acrescenta n bytes iguais a valor (1 byte = o LF final ou um espaco/zero de preenchimento)
+proc fmt_preencher(valor: uint, n: uint) {
+    if (n == 0) or (not fmt_reservar(n)) {
+        return
+    }
+    let len: uint = memoria_ler_u64(FMT_LEN)
+    let inicio: uint = memoria_ler_u64(FMT_PTR) + len
+    var k: uint = 0
+    while k < n {
+        memoria_escrever_u8(inicio + k, valor)
+        k += 1
+    }
+    memoria_escrever_u64(FMT_LEN, len + n)
+}
+
+proc fmt_strlen(p: uint) -> uint {
+    var n: uint = 0
+    while memoria_ler_u8(p + n) != 0 {
+        n += 1
+    }
+    return n
+}
+
+// Texto de n bytes em origem com largura: espacos antes; com zeros, zeros depois do '-' (se houver)
+proc fmt_alinhado(origem: uint, n: uint, fmt: u32) {
+    let largura: uint = (fmt & FMT_LARGURA) as uint
+    if n >= largura {
+        fmt_copiar(origem, n)
+        return
+    }
+    let faltam: uint = largura - n
+    if (fmt & FMT_ZERO) == 0 {
+        fmt_preencher(FMT_ASCII_ESPACO, faltam)
+        fmt_copiar(origem, n)
+        return
+    }
+    if (n > 0) and (memoria_ler_u8(origem) == FMT_ASCII_MENOS) {
+        fmt_copiar(origem, 1)
+        fmt_preencher(FMT_ASCII_ZERO, faltam)
+        fmt_copiar(origem + 1, n - 1)
+        return
+    }
+    fmt_preencher(FMT_ASCII_ZERO, faltam)
+    fmt_copiar(origem, n)
+}
+
+// Quantidade de digitos de valor na base (0 tem 1 digito)
+proc fmt_contar_digitos(valor: uint, base: uint) -> uint {
+    var n: uint = 1
+    var resto: uint = valor / base
+    while resto > 0 {
+        n += 1
+        resto = resto / base
+    }
+    return n
+}
+
+// Digito ASCII minusculo de 0..15 (como o %llx)
+proc fmt_digito(valor: uint) -> uint {
+    if valor < 10 {
+        return FMT_ASCII_ZERO + valor
+    }
+    return FMT_ASCII_A + (valor - 10)
+}
+
+// Escreve os n digitos de valor em offsets de buffer a partir de inicio, do menos significativo para a esquerda
+proc fmt_escrever_digitos(inicio: uint, n: uint, valor: uint, base: uint) {
+    var resto: uint = valor
+    var k: uint = n
+    while k > 0 {
+        k -= 1
+        fmt_escrever_byte(inicio + k, fmt_digito(resto % base))
+        resto = resto / base
+    }
+}
+
+// Sinal e digitos com largura: zeros depois do '-' (zero) ou espacos antes do sinal
+proc fmt_numero(magnitude: uint, negativo: bool, base: uint, fmt: u32) {
+    let digitos: uint = fmt_contar_digitos(magnitude, base)
+    var sinal: uint = 0
+    if negativo {
+        sinal = 1
+    }
+    let total: uint = digitos + sinal
+    let largura: uint = (fmt & FMT_LARGURA) as uint
+    var faltam: uint = 0
+    if largura > total {
+        faltam = largura - total
+    }
+    if not fmt_reservar(total + faltam) {
+        return
+    }
+    if (fmt & FMT_ZERO) != 0 {
+        if negativo {
+            fmt_preencher(FMT_ASCII_MENOS, 1)
+        }
+        fmt_preencher(FMT_ASCII_ZERO, faltam)
+    } else {
+        fmt_preencher(FMT_ASCII_ESPACO, faltam)
+        if negativo {
+            fmt_preencher(FMT_ASCII_MENOS, 1)
+        }
+    }
+    let inicio: uint = memoria_ler_u64(FMT_LEN)
+    memoria_escrever_u64(FMT_LEN, inicio + digitos)
+    fmt_escrever_digitos(inicio, digitos, magnitude, base)
+}
+
+// Texto cstr com largura: o endereco vem de forja_rt_endereco_de (copia o i64 no wasm); usado por cstr e pelos literais true/false
+proc fmt_texto_c(texto: cstr, fmt: u32) {
+    let endereco: uint = forja_rt_endereco_de(texto as rawptr)
+    fmt_alinhado(endereco, fmt_strlen(endereco), fmt)
+}
+
+pub proc fmt_inicio() {
+    memoria_escrever_u64(FMT_LEN, 0)
+}
+
+pub proc fmt_str(texto: uint, fmt: u32) {
+    fmt_alinhado(memoria_ler_u64(texto), memoria_ler_u64(texto + 8), fmt)
+}
+
+pub proc fmt_cstr(texto: cstr, fmt: u32) {
+    fmt_texto_c(texto, fmt)
+}
+
+pub proc fmt_bool(valor: bool, fmt: u32) {
+    if valor {
+        fmt_texto_c("true", fmt)
+    } else {
+        fmt_texto_c("false", fmt)
+    }
+}
+
+pub proc fmt_i64(valor: int, fmt: u32) {
+    let negativo: bool = valor < 0
+    var magnitude: uint = transmute(valor, to = uint)
+    if negativo {
+        magnitude = (~transmute(valor, to = uint)) + 1
+    }
+    fmt_numero(magnitude, negativo, FMT_BASE_DEC, fmt)
+}
+
+pub proc fmt_u64(valor: uint, fmt: u32) {
+    var base: uint = FMT_BASE_DEC
+    if (fmt & FMT_HEXA) != 0 {
+        base = FMT_BASE_HEX
+    }
+    fmt_numero(valor, false, base, fmt)
+}
+
+// Copia o buffer para um bloco novo do heap, com NUL no fim (o alocador e sempre o heap no wasm)
+pub proc fmt_cstr_final(alocador: u32, arquivo: cstr, linha: i32) -> uint {
+    let len: uint = memoria_ler_u64(FMT_LEN)
+    let p: uint = heap_alocar(len + 1)
+    if p == 0 {
+        return 0
+    }
+    memoria_copiar(p, memoria_ler_u64(FMT_PTR), len)
+    memoria_escrever_u8(p + len, 0)
+    if alocador == ALOC_HEAP {
+        rastro_marcar(p, len + 1, arquivo, linha)
+    }
+    return p
+}
+
+// Devolve o endereco de 16 B (ptr, len) em FMT_RETORNO: a chamada da BIR copia do endereco para o slot
+pub proc fmt_str_final(alocador: u32, arquivo: cstr, linha: i32) -> uint {
+    let p: uint = fmt_cstr_final(alocador, arquivo, linha)
+    if p == 0 {
+        return 0
+    }
+    memoria_escrever_u64(FMT_RETORNO, p)
+    memoria_escrever_u64(FMT_RETORNO + 8, memoria_ler_u64(FMT_LEN))
+    return FMT_RETORNO
+}
+
+// Buffer + LF em stdout (fd 1)
+pub proc fmt_imprimir() {
+    fmt_preencher(FMT_ASCII_LF, 1)
+    // assinatura igual a de std:os (o mesmo simbolo C em 2 modulos exige parametros identicos, E0202)
+    rt_escrever_stdout(forja_rt_ponteiro_de(memoria_ler_u64(FMT_PTR)) as ^u8, memoria_ler_u64(FMT_LEN) as i64)
+}
+
+// 0.34.0: print(texto) de uma `str` que nao e literal (simbolo forja_print_str; o operando agregado chega como o endereco do str de 16 B)
+pub proc print_str(texto: uint) {
+    fmt_inicio()
+    fmt_str(texto, 0)
+    fmt_imprimir()
+}
+
+// Buffer + LF em stderr (fd 2)
+pub proc fmt_imprimir_erro() {
+    fmt_preencher(FMT_ASCII_LF, 1)
+    forja_err_escrever(memoria_ler_u64(FMT_PTR) as u32, memoria_ler_u64(FMT_LEN) as u32)
+}
+
+// ---- W4: reactor (--modo dll) ----
+// Toda ponte de export chama forja_fio_da_ponte antes de tudo (thread de fora ganha o fio no x64); o wasm tem 1 fio so, entao nao faz nada
+pub proc fio_da_ponte() {
+}
+
+// ---- W4.0: os.exit (simbolo forja_proc_sair de std:os) ----
+// R0012 (codigo fora de 0..255): JSON no stderr com os mesmos campos do x64 (sem pilha, como as demais falhas do wasm) e saida 101
+const SAIDA_FALHA: int = 101
+const SAIDA_MAXIMA: int = 255
+
+proc proc_sair_falha(codigo: int) {
+    fmt_inicio()
+    fmt_cstr("{\"codigo\": \"R0012\", \"tipo\": \"runtime\", \"arquivo\": \"std:proc\", \"linha\": 0, \"causa\": \"exit com codigo ", 0)
+    fmt_i64(codigo, 0)
+    fmt_cstr(" fora de 0..255\"}", 0)
+    fmt_imprimir_erro()
+    _ = forja_rt_sair(SAIDA_FALHA)
+}
+
+// exit(code): o print do wasm escreve na hora (fd_write), entao nao ha nada a descarregar antes de proc_exit
+pub proc proc_sair(codigo: int) {
+    if (codigo < 0) or (codigo > SAIDA_MAXIMA) {
+        proc_sair_falha(codigo)
+    }
+    _ = forja_rt_sair(codigo)
+}
+
+// ---- 0.34.0: os.args (simbolo forja_proc_argumentos de std:os) ----
+// WASI args_sizes_get/args_get (importadas so quando o programa chega aqui, wasm_alcance.fj): argv = i32 para bytes terminados em NUL; o std:os quer []str
+// (ptr u64 + len u64 por argumento). Bloco unico na 1a chamada, guardado em [496,504): [argc u64][pad 8][argc * str 16 B][argc * i32 do argv][bytes].
+const ARGS_BLOCO: uint = 496
+const ARGS_CABECALHO: uint = 16
+const ARGS_STR_BYTES: uint = 16
+const MASCARA_U32: uint = 4294967295
+
+proc memoria_ler_u32(endereco: uint) -> uint {
+    let p = forja_rt_ponteiro_de(endereco) as ^u32
+    let valor: u32 = p^
+    return valor as uint
+}
+
+// Tamanho do texto C (ate o NUL) no endereco
+proc texto_c_tamanho(endereco: uint) -> uint {
+    var n: uint = 0
+    while memoria_ler_u8(endereco + n) != 0 {
+        n += 1
+    }
+    return n
+}
+
+// Monta o bloco; 0 quando a WASI falha ou falta memoria (o chamador devolve uma lista vazia)
+proc args_construir() -> uint {
+    let temp: uint = heap_alocar(16)
+    if temp == 0 {
+        return 0
+    }
+    if forja_rt_args_tamanhos(temp, temp + 4) != 0 {
+        return 0
+    }
+    let dois: uint = memoria_ler_u64(temp)
+    let argc: uint = dois & MASCARA_U32
+    let bytes: uint = dois >> 32
+    let bloco: uint = heap_alocar(ARGS_CABECALHO + argc * (ARGS_STR_BYTES + 4) + bytes)
+    if bloco == 0 {
+        return 0
+    }
+    let argv: uint = bloco + ARGS_CABECALHO + argc * ARGS_STR_BYTES
+    if forja_rt_args_obter(argv, argv + argc * 4) != 0 {
+        return 0
+    }
+    memoria_escrever_u64(bloco, argc)
+    for i in (0 as uint)..<argc {
+        let texto: uint = memoria_ler_u32(argv + i * 4)
+        let destino: uint = bloco + ARGS_CABECALHO + i * ARGS_STR_BYTES
+        memoria_escrever_u64(destino, texto)
+        memoria_escrever_u64(destino + 8, texto_c_tamanho(texto))
+    }
+    return bloco
+}
+
+// std:os args(): *quantos = argc; devolve o vetor de str (vivo ate o fim do programa, nao se da delete)
+pub proc proc_argumentos(quantos: ^int) -> rawptr {
+    var bloco: uint = memoria_ler_u64(ARGS_BLOCO)
+    if bloco == 0 {
+        bloco = args_construir()
+    }
+    if bloco == 0 {
+        quantos^ = 0
+        return forja_rt_ponteiro_de(ARGS_BLOCO)
+    }
+    memoria_escrever_u64(ARGS_BLOCO, bloco)
+    quantos^ = memoria_ler_u64(bloco) as int
+    return forja_rt_ponteiro_de(bloco + ARGS_CABECALHO)
+}
+
+// ---- W5: texto de real (rt_wasm_real.fj) acrescenta bytes ja formatados ----
+// Anexa n bytes do endereco origem ao buffer de formatacao, com largura, alinhamento e zeros de fmt (mesma regra de fmt_alinhado)
+pub proc fmt_bytes(origem: uint, n: uint, fmt: u32) {
+    fmt_alinhado(origem, n, fmt)
+}
+
+// Endereco na memoria linear de um ponteiro: o foreign forja_rt_endereco_de so pode ser declarado aqui (E0202 se repetido em outro modulo)
+pub proc endereco_de(p: rawptr) -> uint {
+    return forja_rt_endereco_de(p)
+}
+
+// Ponteiro de um endereco da memoria linear (0.33.0, rt_wasm_teste.fj): pelo mesmo motivo de endereco_de
+pub proc ponteiro_de(a: uint) -> rawptr {
+    return forja_rt_ponteiro_de(a)
+}
+
+// ---- 0.30.0: slice_from (simbolo forja_vetor_c_confere) ----
+// cstr no JSON do R-code: aspas e barra invertida levam barra antes (o arquivo de um caminho absoluto do Windows tem barras)
+proc fmt_cstr_json(texto: cstr) {
+    fmt_json_de(forja_rt_endereco_de(texto as rawptr))
+}
+
+// O mesmo a partir do endereco do texto C na memoria linear (0.36.0: o R0009 guarda o arquivo como endereco)
+proc fmt_json_de(base: uint) {
+    var i: uint = 0
+    while memoria_ler_u8(base + i) != 0 {
+        let byte: uint = memoria_ler_u8(base + i)
+        if byte == 10 { // LF da mensagem de um panic/assert: \n no JSON
+            fmt_cstr("\\n", 0)
+            i += 1
+            continue
+        }
+        if (byte == 34) or (byte == 92) {
+            fmt_cstr("\\", 0)
+        }
+        fmt_copiar(base + i, 1)
+        i += 1
+    }
+}
+
+// R0006 do slice_from com len negativo: JSON no stderr com os campos do x64 (sem pilha, como as demais falhas do wasm), saida 101
+proc vetor_c_falha_negativo(n: int, arquivo: cstr, linha: i32) {
+    fmt_inicio()
+    fmt_cstr("{\"codigo\": \"R0006\", \"tipo\": \"runtime\", \"arquivo\": \"", 0)
+    fmt_cstr_json(arquivo)
+    fmt_cstr("\", \"linha\": ", 0)
+    fmt_i64(linha as int, 0)
+    fmt_cstr(", \"causa\": \"slice_from com len ", 0)
+    fmt_i64(n, 0)
+    fmt_cstr(" negativo\"}", 0)
+    fmt_imprimir_erro()
+    _ = forja_rt_sair(SAIDA_FALHA)
+}
+
+// 0.35.0: R0007 (resize com len negativo, pop/heap_pop e dedup passam por aqui): causa "<oque> (<valor>)", JSON no stderr como as demais falhas do wasm, saida 101
+pub proc falha_alocacao(oque: cstr, valor: int, arquivo: cstr, linha: i32) {
+    fmt_inicio()
+    fmt_cstr("{\"codigo\": \"R0007\", \"tipo\": \"runtime\", \"arquivo\": \"", 0)
+    fmt_cstr_json(arquivo)
+    fmt_cstr("\", \"linha\": ", 0)
+    fmt_i64(linha as int, 0)
+    fmt_cstr(", \"causa\": \"", 0)
+    fmt_cstr_json(oque)
+    fmt_cstr(" (", 0)
+    fmt_i64(valor, 0)
+    fmt_cstr(")\"}", 0)
+    fmt_imprimir_erro()
+    _ = forja_rt_sair(SAIDA_FALHA)
+}
+
+// R0016: estouro da pilha sombra (prologo de wasm_pilha chama aqui antes do unreachable): JSON no stderr, saida 101
+pub proc falha_pilha() {
+    fmt_inicio()
+    fmt_cstr("{\"codigo\": \"R0016\", \"tipo\": \"runtime\", \"causa\": \"estouro de pilha: recursao funda demais\"}", 0)
+    fmt_imprimir_erro()
+    _ = forja_rt_sair(SAIDA_FALHA)
+}
+
+// slice_from(p, len = n): n < 0 e R0006; p nulo com n > 0 e R0005 (nulo com n == 0 e a fatia vazia); mesma regra do rt_nativo.c
+pub proc vetor_c_confere(p: uint, n: int, arquivo: cstr, linha: i32) {
+    if n < 0 {
+        vetor_c_falha_negativo(n, arquivo, linha)
+    }
+    if (p == 0) and (n > 0) {
+        forja_falha_nulo("slice_from", arquivo, linha)
+    }
+}
+
+// ---- 0.33.0: panic e assert (simbolos forja_panic e forja_assert; os nomes panico e afirmar nao colidem com os embutidos panic/assert) ----
+// R0003 no stderr com os campos do x64 (sem pilha, como as demais falhas do wasm), saida 101
+pub proc panico(msg: cstr, arquivo: cstr, linha: i32) {
+    fmt_inicio()
+    fmt_cstr("{\"codigo\": \"R0003\", \"tipo\": \"runtime\", \"arquivo\": \"", 0)
+    fmt_cstr_json(arquivo)
+    fmt_cstr("\", \"linha\": ", 0)
+    fmt_i64(linha as int, 0)
+    fmt_cstr(", \"causa\": \"", 0)
+    fmt_cstr_json(msg)
+    fmt_cstr("\"}", 0)
+    fmt_imprimir_erro()
+    _ = forja_rt_sair(SAIDA_FALHA)
+}
+
+// assert(cond, msg = "texto"): vale em dev e release; falso = panico
+pub proc afirmar(cond: bool, msg: cstr, arquivo: cstr, linha: i32) {
+    if not cond {
+        panico(msg, arquivo, linha)
+    }
+}
+
+// ---- 0.36.0: R0009 (vazamento de heap) em dev ----
+// Cada bloco alocado com alloc = heap (new, make/append, format/to_str) leva no cabecalho de 32 B o ponto de alocacao, os bytes e a serie de nascimento; delete apaga
+// o rastro. O relatorio anda pelo heap todo (do heap_base ao topo do bump, bloco a bloco pela classe): sem lista e sem memoria extra. Ordem das linhas = serie de
+// nascimento (o mais antigo primeiro), como a lista de vivos do x64; sem pilha .fj (como as demais falhas do wasm). Release: nada disto roda.
+proc rastro_bit() -> uint {
+    return (1 as uint) << 63
+}
+
+// Origem gravada no cabecalho do bloco de p (0 em release ou sem rastro)
+proc rastro_origem_de(p: uint) -> uint {
+    if not forja_rt_modo_dev() {
+        return 0
+    }
+    return memoria_ler_u64(p - HEAP_CABECALHO_DEV + 8)
+}
+
+// Grava origem, bytes e uma serie nova no bloco de p (so dev)
+proc rastro_gravar(p: uint, origem: uint, bytes: uint) {
+    if (p == 0) or (not forja_rt_modo_dev()) {
+        return
+    }
+    let bloco: uint = p - HEAP_CABECALHO_DEV
+    let serie: uint = memoria_ler_u64(RASTRO_SERIE)
+    memoria_escrever_u64(bloco + 8, origem)
+    memoria_escrever_u64(bloco + 16, bytes)
+    memoria_escrever_u64(bloco + 24, serie)
+    memoria_escrever_u64(RASTRO_SERIE, serie + 1)
+}
+
+// Marca o bloco de p como alocado em arquivo:linha com `bytes` pedidos
+proc rastro_marcar(p: uint, bytes: uint, arquivo: cstr, linha: i32) {
+    if (p == 0) or (not forja_rt_modo_dev()) {
+        return
+    }
+    let posicao: uint = ((linha as uint) & MASCARA_U32) << 32
+    rastro_gravar(p, rastro_bit() | posicao | forja_rt_endereco_de(arquivo as rawptr), bytes)
+}
+
+// Bloco rastreado, vivo, ainda nao relatado e nascido a partir da serie `desde`?
+proc rastro_elegivel(bloco: uint, desde: uint) -> bool {
+    if memoria_ler_u64(bloco + 8) == 0 {
+        return false
+    }
+    let serie: uint = memoria_ler_u64(bloco + 24)
+    if (serie & rastro_bit()) != 0 {
+        return false
+    }
+    return serie >= desde
+}
+
+// O mais antigo (menor serie) dos blocos elegiveis; 0 se nao ha nenhum
+proc rastro_mais_antigo(desde: uint) -> uint {
+    let topo: uint = memoria_ler_u64(HEAP_TOPO)
+    var bloco: uint = forja_rt_heap_base()
+    var achado: uint = 0
+    var serie_achada: uint = 0
+    while bloco < topo {
+        if rastro_elegivel(bloco, desde) {
+            let serie: uint = memoria_ler_u64(bloco + 24)
+            if (achado == 0) or (serie < serie_achada) {
+                achado = bloco
+                serie_achada = serie
+            }
+        }
+        bloco = bloco + heap_tamanho_classe(memoria_ler_u64(bloco) as int)
+    }
+    return achado
+}
+
+// O bloco entra no ponto? (elegivel e de mesma origem; origem 0 = todos os que restam)
+proc rastro_do_ponto(bloco: uint, origem: uint, desde: uint) -> bool {
+    return rastro_elegivel(bloco, desde) and ((origem == 0) or (memoria_ler_u64(bloco + 8) == origem))
+}
+
+// Soma dos blocos do ponto: a quantidade (bytes = false) ou os bytes pedidos (bytes = true)
+proc rastro_somar(origem: uint, desde: uint, bytes: bool) -> uint {
+    let topo: uint = memoria_ler_u64(HEAP_TOPO)
+    var bloco: uint = forja_rt_heap_base()
+    var soma: uint = 0
+    while bloco < topo {
+        if rastro_do_ponto(bloco, origem, desde) {
+            if bytes {
+                soma = soma + memoria_ler_u64(bloco + 16)
+            } else {
+                soma = soma + 1
+            }
+        }
+        bloco = bloco + heap_tamanho_classe(memoria_ler_u64(bloco) as int)
+    }
+    return soma
+}
+
+// Marca como relatados os blocos do ponto (o proximo rastro_mais_antigo passa a outro ponto)
+proc rastro_relatado(origem: uint, desde: uint) {
+    let topo: uint = memoria_ler_u64(HEAP_TOPO)
+    var bloco: uint = forja_rt_heap_base()
+    while bloco < topo {
+        if rastro_do_ponto(bloco, origem, desde) {
+            memoria_escrever_u64(bloco + 24, memoria_ler_u64(bloco + 24) | rastro_bit())
+        }
+        bloco = bloco + heap_tamanho_classe(memoria_ler_u64(bloco) as int)
+    }
+}
+
+// Linha de numero do ponto: bits 32..62 da origem
+proc rastro_linha_de(origem: uint) -> uint {
+    return (origem >> 32) & 2147483647
+}
+
+// Uma linha R0009 de um ponto: `blocos` e `bytes` somados; origem 0 = "(outros)"
+proc rastro_linha(origem: uint, blocos: uint, bytes: uint, no_teste: bool) {
+    fmt_inicio()
+    fmt_cstr("{\"codigo\": \"R0009\", \"tipo\": \"runtime\", \"arquivo\": \"", 0)
+    var linha: uint = 0
+    if origem == 0 {
+        fmt_cstr("(outros)", 0)
+    } else {
+        if (origem & MASCARA_U32) != 0 {
+            fmt_json_de(origem & MASCARA_U32)
+        }
+        linha = rastro_linha_de(origem)
+    }
+    fmt_cstr("\", \"linha\": ", 0)
+    fmt_u64(linha, 0)
+    fmt_cstr(", \"causa\": \"vazamento: ", 0)
+    fmt_u64(blocos, 0)
+    fmt_cstr(" blocos (", 0)
+    fmt_u64(bytes, 0)
+    fmt_cstr(" bytes) ", 0)
+    if origem == 0 {
+        fmt_cstr("em outros pontos de alocacao", 0)
+    } else if no_teste {
+        fmt_cstr("alocados aqui seguem vivos no fim do teste", 0)
+    } else {
+        fmt_cstr("alocados aqui seguem vivos no fim do programa", 0)
+    }
+    fmt_cstr("\"}", 0)
+    fmt_imprimir_erro()
+}
+
+// Esquece (origem = 0) os blocos ja relatados: o relatorio do fim do programa nao os repete
+proc rastro_esquecer() {
+    let topo: uint = memoria_ler_u64(HEAP_TOPO)
+    var bloco: uint = forja_rt_heap_base()
+    while bloco < topo {
+        if (memoria_ler_u64(bloco + 24) & rastro_bit()) != 0 {
+            memoria_escrever_u64(bloco + 8, 0)
+        }
+        bloco = bloco + heap_tamanho_classe(memoria_ler_u64(bloco) as int)
+    }
+}
+
+// Guarda o 1o ponto do relatorio (o forja test --json o usa como a falha do teste): a origem e a contagem (blocos << 32 | bytes)
+proc rastro_guardar_primeiro(origem: uint, blocos: uint, bytes: uint) {
+    memoria_escrever_u64(RASTRO_P_ORIGEM, origem)
+    memoria_escrever_u64(RASTRO_P_CONTAGEM, (blocos << 32) | (bytes & MASCARA_U32))
+}
+
+// Relata uma linha R0009 por ponto de alocacao dos blocos vivos nascidos a partir da serie `desde` (ate 16 pontos, o resto em "(outros)") e os esquece;
+// devolve quantas linhas sairam. desde = 0 e o fim do programa; no teste, desde = rastro_serie() de antes dele.
+pub proc rastro_relatar(desde: uint, no_teste: bool) -> int {
+    if not forja_rt_modo_dev() {
+        return 0
+    }
+    var pontos: int = 0
+    while true {
+        let bloco: uint = rastro_mais_antigo(desde)
+        if bloco == 0 {
+            break
+        }
+        var origem: uint = 0
+        if pontos < RASTRO_PONTOS_MAX {
+            origem = memoria_ler_u64(bloco + 8)
+        }
+        let blocos: uint = rastro_somar(origem, desde, false)
+        let bytes: uint = rastro_somar(origem, desde, true)
+        if pontos == 0 {
+            rastro_guardar_primeiro(origem, blocos, bytes)
+        }
+        rastro_linha(origem, blocos, bytes, no_teste)
+        rastro_relatado(origem, desde)
+        pontos += 1
+    }
+    rastro_esquecer()
+    return pontos
+}
+
+// Serie de nascimento do proximo bloco rastreado (dev): o forja test a guarda ao entrar no teste
+pub proc rastro_serie() -> uint {
+    return memoria_ler_u64(RASTRO_SERIE)
+}
+
+// 1o ponto do ultimo relatorio: campo 0 = endereco do arquivo, 1 = linha, 2 = blocos, 3 = bytes
+pub proc rastro_primeiro(campo: int) -> uint {
+    let origem: uint = memoria_ler_u64(RASTRO_P_ORIGEM)
+    let contagem: uint = memoria_ler_u64(RASTRO_P_CONTAGEM)
+    if campo == 0 {
+        return origem & MASCARA_U32
+    }
+    if campo == 1 {
+        return rastro_linha_de(origem)
+    }
+    if campo == 2 {
+        return contagem >> 32
+    }
+    return contagem & MASCARA_U32
+}
+
+// 0.38.0: reactor em dev (export forja_relatar_vazamentos): relata o R0009 dos blocos vivos no stderr e devolve quantos pontos sairam, sem encerrar o modulo
+pub proc vazamentos_relatar() -> int {
+    return rastro_relatar(0, false)
+}
+
+// Fim do programa (o _start chama depois de forja_programa): em dev, programa que terminou bem e deixou bloco de heap vivo = R0009 por ponto e saida 101;
+// codigo diferente de 0 (main com erro) ou release nao relata, como o x64 (a falha ja saiu e o release nao rastreia)
+pub proc fim_programa(codigo: i32) -> i32 {
+    if codigo != 0 {
+        return codigo
+    }
+    if not forja_rt_modo_dev() {
+        return codigo
+    }
+    if rastro_relatar(0, false) > 0 {
+        return SAIDA_FALHA as i32
+    }
+    return codigo
+}

@@ -1,0 +1,590 @@
+// runtime/a64/rt_a64_mem.fj - alocador do alvo aarch64-linux em Forja (A-E2): modulo std:a64_mem
+// Versao: 0.2.3
+// Changelog: 0.2.3 - I4f: rt_rastro_endereco/rt_rastro_json (fim do arquivo; o passe a64_redirecionar_rastro os poe no rastro_marcar/rastro_linha do wasm_rt: arquivo do R0009 com ponteiro de 64 bits no iOS). 0.2.2 - A3.3f: epoca_frame e alocar_lista_em_handle viram pub (std:a64_mapa usa os dois, como rt_aloc_lista e rt_frame_epoca no C).
+//            0.2.1 -A-E2: R0008 com a causa inteira do x64 (falha_r0008_texto); pool com conferencia de dono em dev (R0008) e contagem sem estouro; format com alloc de Arena/Pool/frame (fmt_str_final e fmt_cstr_final); frame_reset vira frame_resetar (palavra reservada; a ponte traduz).
+//            0.2.0 - A-E2 (parcial): frame de 16 MiB com epoca e frame_reset (R0007 frame cheio); make com cap negativo = R0007; Arena e Pool por handle
+//                    (4096 posicoes, geracao de 20 bits; R0007 alocador desconhecido, Pool com pedido grande, sem memoria; R0008 usado depois do destroy e
+//                    lista do frame velha); listas em frame, Arena e Pool; heap delegado ao std:wasm_rt. Estado nos slots 1088..1127 do estado a64 e
+//                    blocos no heap. Falta: R0008 de delete duplo no heap, R0009 de Arena/Pool vivos no fim, 0xDD do frame em dev.
+//            0.1.0 - A-E1: encanamento (registro em frontend\modulos_std.fj, injecao no alvo a64 pelo driver).
+
+import "std:wasm_rt" as wasm_rt
+import "std:a64_rt" as host
+
+// intrinseco do modo dev (a64_intr.fj): mesmo simbolo e ABI do alias de rt_a64.fj (aceito pelo E0202)
+foreign {
+    proc modo_dev_a64 = "forja_rt_modo_dev"() -> bool
+}
+
+// slots do estado do fmt do std:wasm_rt (rt_wasm.fj: FMT_RETORNO, FMT_PTR, FMT_LEN)
+const FMT_RETORNO_A64: uint = 784
+const FMT_PTR_A64: uint = 800
+const FMT_LEN_A64: uint = 808
+// dev: origem do rastro do bloco de heap fica em [8] do cabecalho de 32 B (o ponteiro esta 32 B depois do inicio)
+const HEAP_ORIGEM_DEV: uint = 24
+
+// alocadores como o x64 (FORJA_ALOC_HEAP / FORJA_ALOC_FRAME); handles de Arena/Pool = (geracao << 12) | indice
+const ALOC_HEAP: u32 = 1
+const ALOC_FRAME: u32 = 2
+const ALOC_RESERVADOS: uint = 3
+const ALOC_LIMITE: uint = 4096
+const ALOC_MASCARA_IDX: uint = 4095
+const ALOC_BITS_GERACAO: uint = 12
+const ALOC_GERACAO_MAX: uint = 1048575
+const ALOC_TIPO_ARENA: uint = 1
+const ALOC_TIPO_POOL: uint = 2
+const ALOC_ENTRADA_BYTES: uint = 56
+const ALOC_OFF_GERACAO: uint = 0
+const ALOC_OFF_TIPO: uint = 8
+const ALOC_OFF_BLOCO: uint = 16
+const ALOC_OFF_USADO: uint = 24
+const ALOC_OFF_BLOCOS: uint = 32
+const ALOC_OFF_SLOT: uint = 40
+const ALOC_OFF_LIVRES: uint = 48
+const ALOC_ALINHAMENTO: uint = 16
+const ALOC_BLOCO_MIN: uint = 64
+const ALOC_POOL_SLOT_MIN: uint = 16
+// estado a64 (rt_a64.fj: slots 1024..1056 ja usados): tabela de alocadores, base do frame, topo e geracao do frame, quantidade de handles usados
+const ALOC_SLOT_TABELA: uint = 1088
+const ALOC_SLOT_QTD: uint = 1120
+const FRAME_SLOT_BASE: uint = 1096
+const FRAME_SLOT_TOPO: uint = 1104
+const FRAME_SLOT_GERACAO: uint = 1112
+const FRAME_BYTES: uint = 16777216
+const FRAME_GERACAO_FIM: uint = 4294967294
+const BLOCO_OFF_PROX: uint = 0
+const BLOCO_OFF_CAP: uint = 8
+const BLOCO_OFF_TOPO: uint = 16
+const BLOCO_CABECALHO: uint = 32
+const LISTA_CAP_INICIAL: uint = 8
+const LISTA_CAP_LIMIAR: uint = 4
+const INT64_MAX_A64: int = 9223372036854775807
+const BITS_POR_BYTE: uint = 8
+const MASCARA_BYTE: uint = 255
+
+// texto do fonte das falhas internas (sem arquivo do usuario), como o FORJA_ARQ_STD do x64
+proc texto_std() -> cstr {
+    return "std:mem"
+}
+
+// o nome do fonte chega como cstr e o host a64 o le como int (mesmo endereco)
+proc arquivo_int(arquivo: cstr) -> int {
+    return transmute(arquivo as rawptr, to = int)
+}
+
+proc a64m_ler(endereco: uint) -> uint {
+    return wasm_rt.memoria_ler_u64(endereco)
+}
+
+proc a64m_escrever(endereco: uint, valor: uint) {
+    wasm_rt.memoria_escrever_u64(endereco, valor)
+}
+
+// *epoca = valor como u32 (4 bytes): o endereco pode nao ser alinhado a 8
+proc escrever_u32_em(endereco: uint, valor: uint) {
+    var k: uint = 0
+    while k < 4 {
+        wasm_rt.memoria_escrever_u8(endereco + k, (valor >> (k * BITS_POR_BYTE)) & MASCARA_BYTE)
+        k += 1
+    }
+}
+
+proc zerar_u64(inicio: uint, quantos: uint) {
+    var k: uint = 0
+    while k < quantos {
+        a64m_escrever(inicio + k * 8, 0)
+        k += 1
+    }
+}
+
+proc copiar_bytes(destino: uint, origem: uint, n: uint) {
+    var k: uint = 0
+    while k < n {
+        wasm_rt.memoria_escrever_u8(destino + k, wasm_rt.memoria_ler_u8(origem + k))
+        k += 1
+    }
+}
+
+proc alinhar(n: uint) -> uint {
+    return ((n + ALOC_ALINHAMENTO - 1) / ALOC_ALINHAMENTO) * ALOC_ALINHAMENTO
+}
+
+// tabela de alocadores (4096 entradas de 56 B), criada na 1a vez no heap do wasm_rt; sem o rastro do R0009 (nao e bloco do usuario)
+proc tabela_alocadores() -> uint {
+    var tabela: uint = a64m_ler(ALOC_SLOT_TABELA)
+    if tabela == 0 {
+        tabela = wasm_rt.heap_alocar(ALOC_LIMITE * ALOC_ENTRADA_BYTES)
+        if tabela == 0 {
+            host.falha_r0007_texto("sem memoria para a tabela de Arena e Pool", (ALOC_LIMITE * ALOC_ENTRADA_BYTES) as int, arquivo_int(texto_std()), 0)
+        }
+        zerar_u64(tabela, ALOC_LIMITE * (ALOC_ENTRADA_BYTES / 8))
+        a64m_escrever(ALOC_SLOT_TABELA, tabela)
+    }
+    return tabela
+}
+
+proc entrada_de(indice: uint) -> uint {
+    return tabela_alocadores() + indice * ALOC_ENTRADA_BYTES
+}
+
+// epoca do quadro atual do frame (a lista guarda a do quadro em que nasceu); geracao 0 = quadro 1
+pub proc epoca_frame() -> uint {
+    return a64m_ler(FRAME_SLOT_GERACAO) + 1
+}
+
+// ---- frame ----
+
+proc frame_base_garantida(arquivo: cstr, linha: i32) -> uint {
+    var base: uint = a64m_ler(FRAME_SLOT_BASE)
+    if base == 0 {
+        base = wasm_rt.heap_alocar(FRAME_BYTES)
+        if base == 0 {
+            host.falha_r0007_texto("sem memoria para o frame em bytes", FRAME_BYTES as int, arquivo_int(arquivo), linha)
+        }
+        a64m_escrever(FRAME_SLOT_BASE, base)
+    }
+    return base
+}
+
+proc frame_alocar(bytes: int, arquivo: cstr, linha: i32) -> uint {
+    if bytes > (FRAME_BYTES as int) {
+        host.falha_r0007_texto("frame cheio: pedido maior que o frame inteiro em bytes", bytes, arquivo_int(arquivo), linha)
+    }
+    let alinhado: uint = alinhar(bytes as uint)
+    let base: uint = frame_base_garantida(arquivo, linha)
+    let topo: uint = a64m_ler(FRAME_SLOT_TOPO)
+    if alinhado > (FRAME_BYTES - topo) {
+        host.falha_r0007_texto("frame cheio: chame frame_reset() a cada quadro; bytes pedidos", bytes, arquivo_int(arquivo), linha)
+    }
+    a64m_escrever(FRAME_SLOT_TOPO, topo + alinhado)
+    return base + topo
+}
+
+proc frame_realocar(velho: uint, bytes_velho: uint, bytes_novo: uint, arquivo: cstr, linha: i32) -> uint {
+    let novo: uint = frame_alocar(bytes_novo as int, arquivo, linha)
+    if (velho != 0) and (bytes_velho > 0) {
+        copiar_bytes(novo, velho, bytes_velho)
+    }
+    return novo
+}
+
+// frame_reset: o topo volta a zero e a geracao sobe (a epoca das listas antigas fica para tras)
+pub proc frame_resetar() {
+    a64m_escrever(FRAME_SLOT_TOPO, 0)
+    let geracao: uint = a64m_ler(FRAME_SLOT_GERACAO)
+    if geracao == FRAME_GERACAO_FIM {
+        a64m_escrever(FRAME_SLOT_GERACAO, 0)
+    } else {
+        a64m_escrever(FRAME_SLOT_GERACAO, geracao + 1)
+    }
+}
+
+// ponteiro dentro do frame: delete nao faz nada nele
+proc no_frame(p: uint) -> bool {
+    let base: uint = a64m_ler(FRAME_SLOT_BASE)
+    return (base != 0) and (p >= base) and (p < base + FRAME_BYTES)
+}
+
+// ---- Arena e Pool: handle -> entrada da tabela ----
+
+// registra um alocador livre (indice >= 3) e devolve o handle; a geracao sobe a cada reuso do indice
+proc alocador_registrar(tipo: uint, bloco: uint) -> uint {
+    let qtd: uint = a64m_ler(ALOC_SLOT_QTD)
+    var indice: uint = ALOC_RESERVADOS
+    while (indice < ALOC_LIMITE) and (a64m_ler(entrada_de(indice) + ALOC_OFF_TIPO) != 0) {
+        indice += 1
+    }
+    if indice >= ALOC_LIMITE {
+        host.falha_r0007_texto("alocadores demais vivos ao mesmo tempo (limite)", ALOC_LIMITE as int, arquivo_int(texto_std()), 0)
+    }
+    let entrada: uint = entrada_de(indice)
+    let antiga: uint = a64m_ler(entrada + ALOC_OFF_GERACAO)
+    var geracao: uint = antiga + 1
+    if antiga >= ALOC_GERACAO_MAX {
+        geracao = 1
+    }
+    zerar_u64(entrada, ALOC_ENTRADA_BYTES / 8)
+    a64m_escrever(entrada + ALOC_OFF_GERACAO, geracao)
+    a64m_escrever(entrada + ALOC_OFF_TIPO, tipo)
+    a64m_escrever(entrada + ALOC_OFF_BLOCO, bloco)
+    if indice >= qtd {
+        a64m_escrever(ALOC_SLOT_QTD, indice + 1)
+    }
+    return (geracao << ALOC_BITS_GERACAO) | indice
+}
+
+// handle -> entrada; indice nunca criado = R0007; entrada livre ou de outra geracao (usado depois do destroy) = R0008
+proc alocador_valido(h: uint, arquivo: cstr, linha: i32) -> uint {
+    let indice: uint = h & ALOC_MASCARA_IDX
+    if (indice < ALOC_RESERVADOS) or (indice >= a64m_ler(ALOC_SLOT_QTD)) {
+        host.falha_r0007_texto("alocador desconhecido (id): crie com arena_create ou pool_create", h as int, arquivo_int(arquivo), linha)
+    }
+    let entrada: uint = entrada_de(indice)
+    let geracao: uint = h >> ALOC_BITS_GERACAO
+    if (a64m_ler(entrada + ALOC_OFF_TIPO) == 0) or (a64m_ler(entrada + ALOC_OFF_GERACAO) != geracao) {
+        let causa: str = format(f"Arena ou Pool usado depois do destroy (id {h})", alloc = heap)
+        defer delete(causa)
+        host.falha_r0008_texto(causa, arquivo_int(arquivo), linha)
+    }
+    return entrada
+}
+
+// bloco novo do heap do wasm_rt (cabecalho de 32 B: proximo, capacidade, topo; os dados vem depois)
+proc bloco_novo(prox: uint, cap: uint) -> uint {
+    let bloco: uint = wasm_rt.heap_alocar(BLOCO_CABECALHO + cap)
+    if bloco == 0 {
+        host.falha_r0007_texto("sem memoria para o bloco do alocador em bytes", cap as int, arquivo_int(texto_std()), 0)
+    }
+    a64m_escrever(bloco + BLOCO_OFF_PROX, prox)
+    a64m_escrever(bloco + BLOCO_OFF_CAP, cap)
+    a64m_escrever(bloco + BLOCO_OFF_TOPO, 0)
+    return bloco
+}
+
+proc blocos_soltar(inicio: uint) {
+    var bloco: uint = inicio
+    while bloco != 0 {
+        let prox: uint = a64m_ler(bloco + BLOCO_OFF_PROX)
+        wasm_rt.mem_liberar(bloco, texto_std(), 0)
+        bloco = prox
+    }
+}
+
+proc desfazer_entrada(entrada: uint) {
+    zerar_u64(entrada + ALOC_OFF_TIPO, (ALOC_ENTRADA_BYTES / 8) - 1)
+}
+
+// ---- Arena ----
+
+proc arena_bloco(entrada: uint, alinhado: uint) -> uint {
+    let atual: uint = a64m_ler(entrada + ALOC_OFF_BLOCOS)
+    if atual != 0 {
+        if alinhado <= (a64m_ler(atual + BLOCO_OFF_CAP) - a64m_ler(atual + BLOCO_OFF_TOPO)) {
+            return atual
+        }
+    }
+    var cap: uint = a64m_ler(entrada + ALOC_OFF_BLOCO)
+    if alinhado > cap {
+        cap = alinhado
+    }
+    let novo: uint = bloco_novo(atual, cap)
+    a64m_escrever(entrada + ALOC_OFF_BLOCOS, novo)
+    return novo
+}
+
+proc arena_alocar(entrada: uint, bytes: int, arquivo: cstr, linha: i32) -> uint {
+    if (bytes < 0) or (bytes > (INT64_MAX_A64 / 2)) {
+        host.falha_r0007_texto("sem memoria na Arena para bytes", bytes, arquivo_int(arquivo), linha)
+    }
+    let pedido: uint = bytes as uint
+    let alinhado: uint = alinhar(pedido)
+    let bloco: uint = arena_bloco(entrada, alinhado)
+    let topo: uint = a64m_ler(bloco + BLOCO_OFF_TOPO)
+    a64m_escrever(bloco + BLOCO_OFF_TOPO, topo + alinhado)
+    a64m_escrever(entrada + ALOC_OFF_USADO, a64m_ler(entrada + ALOC_OFF_USADO) + alinhado)
+    return bloco + BLOCO_CABECALHO + topo
+}
+
+pub proc arena_criar(bloco: int) -> u32 {
+    var tamanho: uint = ALOC_BLOCO_MIN
+    if bloco > (ALOC_BLOCO_MIN as int) {
+        tamanho = bloco as uint
+    }
+    return alocador_registrar(ALOC_TIPO_ARENA, tamanho) as u32
+}
+
+// limpar: solta todos os blocos menos o da cabeca (o mais novo), que volta a zero
+pub proc arena_limpar(h: u32) {
+    let entrada: uint = alocador_valido(h as uint, texto_std(), 0)
+    let cabeca: uint = a64m_ler(entrada + ALOC_OFF_BLOCOS)
+    if cabeca != 0 {
+        blocos_soltar(a64m_ler(cabeca + BLOCO_OFF_PROX))
+        a64m_escrever(cabeca + BLOCO_OFF_PROX, 0)
+        a64m_escrever(cabeca + BLOCO_OFF_TOPO, 0)
+    }
+    a64m_escrever(entrada + ALOC_OFF_USADO, 0)
+}
+
+pub proc arena_destruir(h: u32) {
+    let entrada: uint = alocador_valido(h as uint, texto_std(), 0)
+    blocos_soltar(a64m_ler(entrada + ALOC_OFF_BLOCOS))
+    desfazer_entrada(entrada)
+}
+
+pub proc arena_usado(h: u32) -> int {
+    let entrada: uint = alocador_valido(h as uint, texto_std(), 0)
+    return a64m_ler(entrada + ALOC_OFF_USADO) as int
+}
+
+// ---- Pool: o tamanho do slot fixa no 1o pedido; a lista livre (LIFO) guarda o proximo no proprio slot ----
+
+proc pool_fixar_slot(entrada: uint, bytes: int, arquivo: cstr, linha: i32) {
+    let slot: uint = a64m_ler(entrada + ALOC_OFF_SLOT)
+    if slot == 0 {
+        if bytes > (INT64_MAX_A64 / 2) {
+            host.falha_r0007_texto("sem memoria no Pool para bytes", bytes, arquivo_int(arquivo), linha)
+        }
+        var tamanho: uint = alinhar(bytes as uint)
+        if tamanho < ALOC_POOL_SLOT_MIN {
+            tamanho = ALOC_POOL_SLOT_MIN
+        }
+        a64m_escrever(entrada + ALOC_OFF_SLOT, tamanho)
+        return
+    }
+    if bytes > (slot as int) {
+        let causa: str = format(f"pool de {slot} bytes por objeto recebeu um pedido maior", alloc = heap)
+        defer delete(causa)
+        host.falha_r0007_texto(causa, bytes, arquivo_int(arquivo), linha)
+    }
+}
+
+// bloco novo com por_bloco slots, todos na lista livre (o slot 0 fica no topo da lista)
+proc pool_bloco(entrada: uint) {
+    let passo: uint = a64m_ler(entrada + ALOC_OFF_SLOT)
+    let por: uint = a64m_ler(entrada + ALOC_OFF_BLOCO)
+    if por > ((INT64_MAX_A64 as uint) / 2) / passo {
+        host.falha_r0007_texto("Pool com slots demais por bloco", por as int, arquivo_int(texto_std()), 0)
+    }
+    let bloco: uint = bloco_novo(a64m_ler(entrada + ALOC_OFF_BLOCOS), por * passo)
+    a64m_escrever(entrada + ALOC_OFF_BLOCOS, bloco)
+    var k: uint = 0
+    while k < por {
+        let indice: uint = por - 1 - k
+        let slot: uint = bloco + BLOCO_CABECALHO + indice * passo
+        a64m_escrever(slot, a64m_ler(entrada + ALOC_OFF_LIVRES))
+        a64m_escrever(entrada + ALOC_OFF_LIVRES, slot)
+        k += 1
+    }
+}
+
+proc pool_alocar(entrada: uint, bytes: int, arquivo: cstr, linha: i32) -> uint {
+    pool_fixar_slot(entrada, bytes, arquivo, linha)
+    if a64m_ler(entrada + ALOC_OFF_LIVRES) == 0 {
+        pool_bloco(entrada)
+    }
+    let slot: uint = a64m_ler(entrada + ALOC_OFF_LIVRES)
+    a64m_escrever(entrada + ALOC_OFF_LIVRES, a64m_ler(slot))
+    a64m_escrever(entrada + ALOC_OFF_USADO, a64m_ler(entrada + ALOC_OFF_USADO) + 1)
+    return slot
+}
+
+pub proc pool_criar(por_bloco: int) -> u32 {
+    var por: uint = 1
+    if por_bloco > 1 {
+        por = por_bloco as uint
+    }
+    return alocador_registrar(ALOC_TIPO_POOL, por) as u32
+}
+
+// o bloco devolvido tem de ser de um bloco deste Pool; so em dev confere (R0008), como o x64
+pub proc pool_devolver(h: u32, p: uint, arquivo: cstr, linha: i32) {
+    let entrada: uint = alocador_valido(h as uint, arquivo, linha)
+    if p == 0 {
+        return
+    }
+    if modo_dev_a64() and (not pool_contem(entrada, p)) {
+        host.falha_r0008_texto("delete(p, em = pool): o objeto nao veio deste Pool", arquivo_int(arquivo), linha)
+    }
+    if a64m_ler(entrada + ALOC_OFF_USADO) > 0 {
+        a64m_escrever(entrada + ALOC_OFF_USADO, a64m_ler(entrada + ALOC_OFF_USADO) - 1)
+    }
+    a64m_escrever(p, a64m_ler(entrada + ALOC_OFF_LIVRES))
+    a64m_escrever(entrada + ALOC_OFF_LIVRES, p)
+}
+
+// o endereco p cai nos slots de algum bloco do Pool
+proc pool_contem(entrada: uint, p: uint) -> bool {
+    var bloco: uint = a64m_ler(entrada + ALOC_OFF_BLOCOS)
+    while bloco != 0 {
+        let inicio: uint = bloco + BLOCO_CABECALHO
+        if (p >= inicio) and (p < inicio + a64m_ler(bloco + BLOCO_OFF_CAP)) {
+            return true
+        }
+        bloco = a64m_ler(bloco + BLOCO_OFF_PROX)
+    }
+    return false
+}
+
+pub proc pool_destruir(h: u32) {
+    let entrada: uint = alocador_valido(h as uint, texto_std(), 0)
+    blocos_soltar(a64m_ler(entrada + ALOC_OFF_BLOCOS))
+    desfazer_entrada(entrada)
+}
+
+pub proc pool_vivos(h: u32) -> int {
+    let entrada: uint = alocador_valido(h as uint, texto_std(), 0)
+    return a64m_ler(entrada + ALOC_OFF_USADO) as int
+}
+
+// ---- despacho de forja_mem_alocar / forja_mem_liberar e listas ----
+
+// Arena (cresce) ou Pool (nao cresce: lista so em Arena)
+proc alocar_em_handle(h: uint, bytes: int, arquivo: cstr, linha: i32) -> uint {
+    let entrada: uint = alocador_valido(h, arquivo, linha)
+    if a64m_ler(entrada + ALOC_OFF_TIPO) == ALOC_TIPO_ARENA {
+        return arena_alocar(entrada, bytes, arquivo, linha)
+    }
+    return pool_alocar(entrada, bytes, arquivo, linha)
+}
+
+// new(T, alloc = ...): heap delegado ao wasm_rt (com o rastro do R0009); frame e handles aqui
+pub proc mem_alocar(alocador: u32, bytes: int, arquivo: cstr, linha: i32) -> uint {
+    if alocador == ALOC_HEAP {
+        return wasm_rt.mem_alocar(alocador, bytes, arquivo, linha)
+    }
+    if alocador == ALOC_FRAME {
+        return frame_alocar(bytes, arquivo, linha)
+    }
+    return alocar_em_handle(alocador as uint, bytes, arquivo, linha)
+}
+
+// delete: NULL e ponteiro do frame nao fazem nada; o resto e o heap do wasm_rt
+// em dev, o rastro do cabecalho (origem em [8], zerada pelo delete) confere o bloco vivo: delete duplo = R0008, como o x64
+pub proc mem_liberar(p: uint, arquivo: cstr, linha: i32) {
+    if (p == 0) or no_frame(p) {
+        return
+    }
+    if modo_dev_a64() and (a64m_ler(p - HEAP_ORIGEM_DEV) == 0) {
+        host.falha_r0008_texto("delete: o ponteiro nao veio de new(em = heap) ou ja passou por delete", arquivo_int(arquivo), linha)
+    }
+    wasm_rt.mem_liberar(p, arquivo, linha)
+}
+
+// make([dynamic]T): cap negativo = R0007; cap 0 = ponto nulo; so o frame guarda a epoca
+pub proc lista_criar(alocador: u32, cap: int, tam_elem: int, epoca: uint, arquivo: cstr, linha: i32) -> uint {
+    escrever_u32_em(epoca, 0)
+    if cap < 0 {
+        host.falha_r0007_texto("make com cap negativo", cap, arquivo_int(arquivo), linha)
+    }
+    if (cap == 0) or (tam_elem <= 0) {
+        return 0
+    }
+    if cap > (INT64_MAX_A64 / tam_elem) {
+        host.falha_r0007_texto("make com cap grande demais para a memoria", cap, arquivo_int(arquivo), linha)
+    }
+    if alocador == ALOC_HEAP {
+        return wasm_rt.lista_criar(alocador, cap, tam_elem, epoca, arquivo, linha)
+    }
+    if alocador == ALOC_FRAME {
+        escrever_u32_em(epoca, epoca_frame())
+    }
+    return mem_alocar(alocador, cap * tam_elem, arquivo, linha)
+}
+
+// append: a lista cresce pelo dobro (8 de cara); Pool recusa; heap delegado ao wasm_rt
+// LIMITE: 8 parametros posicionais porque a chama da BIR passa os 8 argumentos de forja_lista_crescer em ordem (o C tem a mesma assinatura)
+pub proc lista_crescer(ptr: uint, len: int, cap: uint, tam_elem: int, alocador: u32, epoca: uint, arquivo: cstr, linha: i32) -> uint {
+    if alocador == 0 {
+        host.falha_r0007_texto("append numa lista sem alocador (valor zero): crie com make([dynamic]T, em = heap)", 0, arquivo_int(arquivo), linha)
+    }
+    if alocador == ALOC_HEAP {
+        return wasm_rt.lista_crescer(ptr, len, cap, tam_elem, alocador, epoca, arquivo, linha)
+    }
+    let cap_antigo: uint = a64m_ler(cap)
+    if cap_antigo > ((INT64_MAX_A64 as uint) / 2) / (tam_elem as uint) {
+        host.falha_r0007_texto("append: a lista passou do limite de memoria com cap", cap_antigo as int, arquivo_int(arquivo), linha)
+    }
+    var novo_cap: uint = LISTA_CAP_INICIAL
+    if cap_antigo >= LISTA_CAP_LIMIAR {
+        novo_cap = cap_antigo * 2
+    }
+    let tam: uint = tam_elem as uint
+    let bytes_velho: uint = (len as uint) * tam
+    let bytes_novo: uint = novo_cap * tam
+    var p: uint = 0
+    if alocador == ALOC_FRAME {
+        p = frame_realocar(ptr, bytes_velho, bytes_novo, arquivo, linha)
+        escrever_u32_em(epoca, epoca_frame())
+    } else {
+        p = alocar_lista_em_handle(alocador as uint, bytes_novo, arquivo, linha)
+        if (ptr != 0) and (bytes_velho > 0) {
+            copiar_bytes(p, ptr, bytes_velho)
+        }
+    }
+    a64m_escrever(cap, novo_cap)
+    return p
+}
+
+pub proc alocar_lista_em_handle(h: uint, bytes: uint, arquivo: cstr, linha: i32) -> uint {
+    let entrada: uint = alocador_valido(h, arquivo, linha)
+    if a64m_ler(entrada + ALOC_OFF_TIPO) == ALOC_TIPO_POOL {
+        host.falha_r0007_texto("lista nao cresce em Pool", 0, arquivo_int(arquivo), linha)
+    }
+    return arena_alocar(entrada, bytes as int, arquivo, linha)
+}
+
+// lista do frame usada depois do frame_reset() = R0008 (epoca 0 = lista sem frame)
+pub proc lista_viva(epoca: u32, arquivo: cstr, linha: i32) {
+    let e: uint = epoca as uint
+    if (e == 0) or (e == epoca_frame()) {
+        return
+    }
+    let causa: str = format(f"lista do frame usada depois do frame_reset() (quadro {e}, agora {epoca_frame()})", alloc = heap)
+    defer delete(causa)
+    host.falha_r0008_texto(causa, arquivo_int(arquivo), linha)
+}
+
+// indice de lista: a validade da epoca e conferida aqui; o limite fica com o wasm_rt (epoca 0 = sem frame)
+pub proc indice_lista(i: int, n: int, epoca: u32, arquivo: cstr, linha: i32) -> int {
+    lista_viva(epoca, arquivo, linha)
+    return wasm_rt.indice_lista(i, n, 0, arquivo, linha)
+}
+
+// ---- format(..., alloc = A): o texto montado no buffer do fmt vai para o alocador pedido (heap delegado) ----
+
+// copia o texto do buffer do fmt para um bloco novo do alocador, com 0 no fim (como o cstr do x64)
+proc fmt_copiar_para(alocador: u32, arquivo: cstr, linha: i32) -> uint {
+    let len: uint = a64m_ler(FMT_LEN_A64)
+    let p: uint = mem_alocar(alocador, (len + 1) as int, arquivo, linha)
+    copiar_bytes(p, a64m_ler(FMT_PTR_A64), len)
+    wasm_rt.memoria_escrever_u8(p + len, 0)
+    return p
+}
+
+pub proc fmt_cstr_final(alocador: u32, arquivo: cstr, linha: i32) -> uint {
+    if alocador == ALOC_HEAP {
+        return wasm_rt.fmt_cstr_final(alocador, arquivo, linha)
+    }
+    return fmt_copiar_para(alocador, arquivo, linha)
+}
+
+// devolve o endereco de 16 B (ptr, len) em FMT_RETORNO_A64, como o wasm_rt
+pub proc fmt_str_final(alocador: u32, arquivo: cstr, linha: i32) -> uint {
+    if alocador == ALOC_HEAP {
+        return wasm_rt.fmt_str_final(alocador, arquivo, linha)
+    }
+    let p: uint = fmt_copiar_para(alocador, arquivo, linha)
+    a64m_escrever(FMT_RETORNO_A64, p)
+    a64m_escrever(FMT_RETORNO_A64 + 8, a64m_ler(FMT_LEN_A64))
+    return FMT_RETORNO_A64
+}
+
+// I4f: parte alta (bits 32..63) do endereco do arquivo do ultimo rastro_marcar (o rastro do wasm_rt guarda so 32 bits)
+const RASTRO_ALTO_A64: uint = 1192
+
+// I4f: no lugar de forja_rt_endereco_de dentro do rastro_marcar do wasm_rt: guarda os bits altos do endereco do arquivo e devolve os 32 baixos
+// (a linha vai nos bits 32..62 da origem; a imagem do iOS fica acima de 4 GiB e o `as u32` do wasm_rt perdia o endereco). Nos alvos Linux a parte alta e 0.
+pub proc rt_rastro_endereco(p: rawptr) -> uint {
+    let a: uint = transmute(p, to = uint)
+    a64m_escrever(RASTRO_ALTO_A64, a >> 32)
+    return a & 4294967295
+}
+
+// I4f: no lugar de fmt_json_de dentro do rastro_linha do wasm_rt: o cstr do arquivo em (alto << 32) | baixo, com aspas e barra invertida escapadas
+pub proc rt_rastro_json(baixo: uint) {
+    let base: uint = (a64m_ler(RASTRO_ALTO_A64) << 32) | baixo
+    var i: uint = 0
+    while host.rt_ler_u8(base + i) != 0 {
+        let byte: u8 = host.rt_ler_u8(base + i)
+        if byte == 10 {
+            wasm_rt.fmt_cstr("\\n", 0)
+            i += 1
+            continue
+        }
+        if (byte == 34) or (byte == 92) {
+            wasm_rt.fmt_cstr("\\", 0)
+        }
+        wasm_rt.fmt_bytes(base + i, 1, 0)
+        i += 1
+    }
+}

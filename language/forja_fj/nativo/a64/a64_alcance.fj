@@ -1,0 +1,347 @@
+// nativo/a64/a64_alcance.fj - poda tardia do alvo aarch64-linux: so as funcoes da BIR alcancaveis de forja_programa (e de entrada/fim do runtime a64) entram no .text
+// Versao: 0.2.5
+// Changelog: 0.2.7 - I4f: a64_redirecionar_rastro (rastro_marcar/rastro_linha do wasm_rt passam a std:a64_mem, 64 bits). 0.2.6 - I4: a64_redirecionar_erro_fmt (chamadas ao fmt_imprimir_erro do wasm_rt passam ao do a64_rt, 64 bits).
+//            0.2.5 - I3: a64_alcance_calcular recebe `macho`; no iOS a raiz de entrada do runtime e entrada_main (args do main do dyld).
+//            0.2.4 - J1a: a ponte procura tambem std:a64_es_fs2 (copia e renomeio de std:file) e std:a64_proc (procs do rt_a64_proc.fj) depois de std:a64_es_fs.
+//            0.2.3 - A3.3h: a ponte procura tambem std:a64_es_fs (fs_* e pasta de std:file) depois de std:a64_es.
+//            0.2.2 - A-E2: a ponte procura antes os procs de std:a64_mem, std:a64_mapa e std:a64_es (o prefixo a64_ casa tambem o alias a64_wasm_rt).
+//            0.2.1 - A3.3a: a ponte mapeia panic/assert/expect para panico/afirmar/esperar (como wasm_gerar.fj wasm_proc_do_simbolo_de_runtime).
+//            0.2.0 - A4.3: com exports (.so) as raizes sao os procs `export`, sem forja_programa/entrada/fim.
+//            0.1.3 - A2.2(e): raiz `pilha` (falha_pilha do a64_rt) so em dev com entrada do runtime: a guarda de R0016 do prologo a chama.
+//            0.1.2 - A2.2(c): ARMADILHA tambem puxa o alvo do simbolo (o proc de falha da ponte, como wasm_alcance.fj:39).
+//            0.1.1 - A2.2(b): END_SIMBOLO de proc valor (`fjt_`) liga-se a funcao de mesmo nome (porte de wasm_gerar.fj:405).
+//            0.1.0 - A2.2(b): porte de wasm_alcance.fj (raizes, CHAMA, END_SIMBOLO) e a ponte forja_X -> proc X (std:a64_rt antes, std:wasm_rt depois).
+//                    Sem a poda, o runtime injetado inteiro seria emitido e os seus BS_RUNTIME dariam X0001.
+// Contrato: a tabela `alvo` leva o simbolo da BIR a posicao da funcao que ele chama (BS_FUNCAO pelo proprio simbolo; BS_RUNTIME forja_X pelo proc X);
+// a64_isel_intrinseco.fj usa a mesma ponte para o `bl`, entao o que a poda marca e o que o isel emite sao o mesmo conjunto.
+
+import "nativo/bir"
+
+const A64_ALC_SEM: u32 = 4294967295
+const A64_ALC_PREFIXO_FORJA: str = "forja_"
+const A64_ALC_MODULO_A64: str = "a64_"
+const A64_ALC_MODULO_WASM: str = "wasm_"
+
+// Posicoes em `funcoes` das raizes do runtime a64 (A64_ALC_SEM = ausente)
+struct A64Raizes {
+    programa: u32
+    entrada: u32
+    fim: u32
+    pilha: u32 // falha_pilha do a64_rt (R0016): so em dev com runtime; A64_ALC_SEM = sem guarda
+}
+
+struct A64Grafo {
+    prog: ^bir.BirPrograma
+    funcoes: []bir.BirFuncao
+    alvo: [dynamic]u32 // simbolo da BIR -> posicao da funcao que ele chama (A64_ALC_SEM = nenhuma)
+    vivas: [dynamic]bool
+    pendentes: [dynamic]u32
+    macho: bool // I3: alvo iOS (a raiz de entrada e entrada_main(argc, argv, envp))
+}
+
+// nome_funcao = "fj_<tamanho><modulo>_<proc>": o modulo tem <tamanho> caracteres e comeca por `prefixo`; true quando o proc e `procedimento`
+proc a64_alcance_eh_proc(nome: str, procedimento: str, prefixo: str) -> bool {
+    if (len(nome) < 4) or (nome[0..<3] != "fj_") {
+        return false
+    }
+    var k: int = 3
+    var tamanho: int = 0
+    while (k < len(nome)) and (nome[k] >= 48) and (nome[k] <= 57) {
+        tamanho = (tamanho * 10) + ((nome[k] as int) - 48)
+        k += 1
+    }
+    let fim_modulo: int = k + tamanho
+    if (k == 3) or (len(prefixo) > tamanho) or (len(nome) < (fim_modulo + 1)) {
+        return false
+    }
+    if (nome[k..<(k + len(prefixo))] != prefixo) or (nome[fim_modulo] != 95) {
+        return false
+    }
+    return nome[(fim_modulo + 1)..<len(nome)] == procedimento
+}
+
+// Posicao em `funcoes` do proc `procedimento` do modulo `prefixo`, ou A64_ALC_SEM
+proc a64_alcance_proc_do_modulo(prog: ^bir.BirPrograma, funcoes: []bir.BirFuncao, procedimento: str, prefixo: str) -> u32 {
+    for k in (0 as u32)..<prog.nfuncoes {
+        let nome: str = prog.simbolos[funcoes[k].simbolo].nome or_else ""
+        if a64_alcance_eh_proc(nome, procedimento, prefixo) {
+            return k
+        }
+    }
+    return A64_ALC_SEM
+}
+
+// Nome do proc de runtime de cada simbolo forja_X: panic/assert/expect sao da linguagem e o runtime os chama panico/afirmar/esperar
+// (o mesmo mapa de wasm_gerar.fj wasm_proc_do_simbolo_de_runtime)
+proc a64_alcance_nome_do_proc(procedimento: str) -> str {
+    if procedimento == "panic" {
+        return "panico"
+    }
+    if procedimento == "assert" {
+        return "afirmar"
+    }
+    if procedimento == "expect" {
+        return "esperar"
+    }
+    // frame_reset e palavra reservada da linguagem: o proc de std:a64_mem chama-se frame_resetar (A-E2)
+    if procedimento == "frame_reset" {
+        return "frame_resetar"
+    }
+    return procedimento
+}
+
+// Ponte: simbolo de runtime forja_X -> posicao do proc X (primeiro em std:a64_rt, depois em std:wasm_rt); A64_ALC_SEM se nao ha
+pub proc a64_alcance_do_runtime(prog: ^bir.BirPrograma, funcoes: []bir.BirFuncao, nome: str) -> u32 {
+    if (len(nome) <= 6) or (nome[0..<6] != A64_ALC_PREFIXO_FORJA) {
+        return A64_ALC_SEM
+    }
+    let procedimento: str = a64_alcance_nome_do_proc(nome[6..<len(nome)])
+    let apoio: u32 = a64_alcance_do_modulo_apoio(prog, funcoes, procedimento)
+    if apoio != A64_ALC_SEM {
+        return apoio
+    }
+    let k: u32 = a64_alcance_proc_do_modulo(prog, funcoes, procedimento, A64_ALC_MODULO_A64)
+    if k != A64_ALC_SEM {
+        return k
+    }
+    return a64_alcance_proc_do_modulo(prog, funcoes, procedimento, A64_ALC_MODULO_WASM)
+}
+
+// A-E2: std:a64_mem, std:a64_mapa e std:a64_es vencem o runtime wasm reusado (que tambem casa o prefixo a64_ pelo alias a64_wasm_rt)
+proc a64_alcance_do_modulo_apoio(prog: ^bir.BirPrograma, funcoes: []bir.BirFuncao, procedimento: str) -> u32 {
+    let mem: u32 = a64_alcance_proc_do_modulo(prog, funcoes, procedimento, "a64_mem")
+    if mem != A64_ALC_SEM {
+        return mem
+    }
+    let mapa: u32 = a64_alcance_proc_do_modulo(prog, funcoes, procedimento, "a64_mapa")
+    if mapa != A64_ALC_SEM {
+        return mapa
+    }
+    let es: u32 = a64_alcance_proc_do_modulo(prog, funcoes, procedimento, "a64_es")
+    if es != A64_ALC_SEM {
+        return es
+    }
+    let es_fs: u32 = a64_alcance_proc_do_modulo(prog, funcoes, procedimento, "a64_es_fs")
+    if es_fs != A64_ALC_SEM {
+        return es_fs
+    }
+    let es_fs2: u32 = a64_alcance_proc_do_modulo(prog, funcoes, procedimento, "a64_es_fs2")
+    if es_fs2 != A64_ALC_SEM {
+        return es_fs2
+    }
+    return a64_alcance_proc_do_modulo(prog, funcoes, procedimento, "a64_proc")
+}
+
+// Monta a tabela `alvo` (BS_FUNCAO pelo proprio simbolo; BS_RUNTIME pela ponte) e zera as vivas
+proc a64_grafo_tabela(g: ^A64Grafo) {
+    for _s in 0..<len(g.prog.simbolos) {
+        append(&g.alvo, item = A64_ALC_SEM)
+    }
+    for _k in (0 as u32)..<g.prog.nfuncoes {
+        append(&g.vivas, item = false)
+    }
+    for k in (0 as u32)..<g.prog.nfuncoes {
+        g.alvo[g.funcoes[k].simbolo] = k
+    }
+    for s in 0..<len(g.prog.simbolos) {
+        let tipo: i32 = g.prog.simbolos[s].tipo as i32
+        let nome: str = g.prog.simbolos[s].nome or_else ""
+        if tipo == bir.BS_RUNTIME {
+            g.alvo[s] = a64_alcance_do_runtime(g.prog, g.funcoes, nome)
+        }
+        if (tipo == bir.BS_FUNCAO) and (g.alvo[s] == A64_ALC_SEM) {
+            a64_grafo_trampolim(g, s as u32, nome)
+        }
+    }
+}
+
+// END_SIMBOLO de proc valor aponta um simbolo `fjt_<proc>` a parte do simbolo da funcao de mesmo nome (o ligador casa por nome, como no wasm_gerar.fj)
+proc a64_grafo_trampolim(g: ^A64Grafo, s: u32, nome: str) {
+    if (len(nome) < 4) or (nome[0..<4] != "fjt_") {
+        return
+    }
+    for k in (0 as u32)..<g.prog.nfuncoes {
+        if (g.prog.simbolos[g.funcoes[k].simbolo].nome or_else "") == nome {
+            g.alvo[s] = k
+            return
+        }
+    }
+}
+
+// Marca a funcao k como viva e a poe na fila, se ainda nao estava marcada
+proc a64_grafo_marcar(g: ^A64Grafo, k: u32) {
+    if g.vivas[k] {
+        return
+    }
+    g.vivas[k] = true
+    append(&g.pendentes, item = k)
+}
+
+// Marca o alvo do simbolo s (funcao chamada ou cujo endereco e tomado); simbolo de dado/texto nao tem alvo
+proc a64_grafo_alvo(g: ^A64Grafo, s: u32) {
+    let k: u32 = g.alvo[s]
+    if k != A64_ALC_SEM {
+        a64_grafo_marcar(g, k)
+    }
+}
+
+// CHAMA marca o alvo do simbolo; END_SIMBOLO marca a funcao cujo endereco e tomado (proc como valor)
+proc a64_grafo_instr(g: ^A64Grafo, ins: ^bir.BirInstr) {
+    let op = ins.op as i32
+    if op == bir.BIR_END_SIMBOLO {
+        if (ins.a.tipo as i32) == bir.BO_SIMBOLO {
+            a64_grafo_alvo(g, ins.a.id)
+        }
+        return
+    }
+    if (op == bir.BIR_CHAMA) or (op == bir.BIR_ARMADILHA) {
+        a64_grafo_alvo(g, ins.simbolo)
+    }
+}
+
+// Percorre as instrucoes da funcao k da fila
+proc a64_grafo_funcao(g: ^A64Grafo, k: u32) {
+    let f: ^bir.BirFuncao = &g.funcoes[k]
+    for b in (0 as u32)..<f.nblocos {
+        let bloco: ^bir.BirBloco = &f.blocos[b]
+        for i in (0 as u32)..<bloco.n {
+            a64_grafo_instr(g, &bloco.instrs[i])
+        }
+    }
+}
+
+// .so (--modo dll no android): as raizes sao os procs `export` (como wasm_raizes_do_alcance); sem _start, entrada nem fim do runtime
+proc a64_grafo_raizes_exports(g: ^A64Grafo, raizes: ^A64Raizes) {
+    raizes.programa = A64_ALC_SEM
+    raizes.entrada = A64_ALC_SEM
+    raizes.fim = A64_ALC_SEM
+    raizes.pilha = A64_ALC_SEM
+    let nomes: []str = g.prog.exportados or_else {}
+    for k in (0 as u32)..<g.prog.nfuncoes {
+        let nome: str = g.prog.simbolos[g.funcoes[k].simbolo].nome or_else ""
+        for e in (0 as u32)..<g.prog.nexportados {
+            if nomes[e] == nome {
+                a64_grafo_marcar(g, k)
+            }
+        }
+    }
+}
+
+// Raizes: forja_programa; e, quando o runtime a64 esta no programa, entrada e fim (o _start os chama)
+proc a64_grafo_raizes(g: ^A64Grafo, raizes: ^A64Raizes) {
+    if g.prog.nexportados > 0 {
+        a64_grafo_raizes_exports(g, raizes)
+        return
+    }
+    let programa = a64_achar_programa(g.prog)
+    raizes.programa = A64_ALC_SEM
+    if programa != bir.BIR_SEM_SIMBOLO {
+        raizes.programa = g.alvo[programa]
+    }
+    var nome_entrada: str = "entrada"
+    if g.macho {
+        nome_entrada = "entrada_main"
+    }
+    raizes.entrada = a64_alcance_proc_do_modulo(g.prog, g.funcoes, nome_entrada, A64_ALC_MODULO_A64)
+    raizes.fim = a64_alcance_proc_do_modulo(g.prog, g.funcoes, "fim", A64_ALC_MODULO_A64)
+    if raizes.programa != A64_ALC_SEM {
+        a64_grafo_marcar(g, raizes.programa)
+    }
+    if raizes.entrada != A64_ALC_SEM {
+        a64_grafo_marcar(g, raizes.entrada)
+    }
+    if raizes.fim != A64_ALC_SEM {
+        a64_grafo_marcar(g, raizes.fim)
+    }
+    raizes.pilha = A64_ALC_SEM
+    if (raizes.entrada != A64_ALC_SEM) and ((g.prog.modo as i32) != bir.BM_RELEASE) {
+        raizes.pilha = a64_alcance_proc_do_modulo(g.prog, g.funcoes, "falha_pilha", A64_ALC_MODULO_A64)
+        if raizes.pilha != A64_ALC_SEM {
+            a64_grafo_marcar(g, raizes.pilha)
+        }
+    }
+}
+
+// Calcula o alcance a partir das raizes e grava em `saida` (uma entrada por funcao da BIR: true = emitir)
+pub proc a64_alcance_calcular(prog: ^bir.BirPrograma, saida: ^[dynamic]bool, raizes: ^A64Raizes, macho: bool) {
+    var g = A64Grafo{prog = prog, funcoes = prog.funcoes or_else {}, macho = macho}
+    g.alvo = make([dynamic]u32, alloc = heap)
+    defer delete(g.alvo)
+    g.vivas = make([dynamic]bool, alloc = heap)
+    defer delete(g.vivas)
+    g.pendentes = make([dynamic]u32, alloc = heap)
+    defer delete(g.pendentes)
+    a64_grafo_tabela(&g)
+    a64_grafo_raizes(&g, raizes)
+    while len(g.pendentes) > 0 {
+        let k: u32 = pop(&g.pendentes) or_else 0
+        a64_grafo_funcao(&g, k)
+    }
+    for k in (0 as u32)..<prog.nfuncoes {
+        append(saida, item = g.vivas[k])
+    }
+}
+
+// I4: os procs de falha do rt_wasm (R0003/R0006/R0009/R0012...) chamam o fmt_imprimir_erro do PROPRIO std:wasm_rt, que faz `as u32` do ponteiro do
+// buffer (R0002 em dev quando a janela do heap passa de 4 GiB, caso permanente no iOS). Antes da poda, as chamadas a ele passam ao fmt_imprimir_erro
+// de std:a64_rt (64 bits, mesmos bytes no stderr). O rt_wasm.fj nao muda: os bytes do alvo wasm ficam iguais.
+pub proc a64_redirecionar_erro_fmt(prog: ^bir.BirPrograma) {
+    let funcoes: []bir.BirFuncao = prog.funcoes or_else {}
+    let wasm: u32 = a64_alcance_proc_do_modulo(prog, funcoes, "fmt_imprimir_erro", "wasm_rt")
+    let a64: u32 = a64_alcance_proc_do_modulo(prog, funcoes, "fmt_imprimir_erro", "a64_rt")
+    if (wasm == A64_ALC_SEM) or (a64 == A64_ALC_SEM) {
+        return
+    }
+    let de: u32 = funcoes[wasm].simbolo
+    let para: u32 = funcoes[a64].simbolo
+    for k in (0 as u32)..<prog.nfuncoes {
+        let f: ^bir.BirFuncao = &funcoes[k]
+        for b in (0 as u32)..<f.nblocos {
+            let bloco: ^bir.BirBloco = &f.blocos[b]
+            for i in (0 as u32)..<bloco.n {
+                let ins: ^bir.BirInstr = &bloco.instrs[i]
+                if ((ins.op as i32) == bir.BIR_CHAMA) and (ins.simbolo == de) {
+                    ins.simbolo = para
+                }
+            }
+        }
+    }
+}
+
+// I4f: dentro da funcao `dentro`, as chamadas ao simbolo `de` (BS_RUNTIME de nome `de_nome`, ou a funcao de simbolo `de_simbolo` se de_nome vazio) passam a `para`
+proc a64_redirecionar_em(prog: ^bir.BirPrograma, dentro: ^bir.BirFuncao, de_nome: str, de_simbolo: u32, para: u32) {
+    for b in (0 as u32)..<dentro.nblocos {
+        let bloco: ^bir.BirBloco = &dentro.blocos[b]
+        for i in (0 as u32)..<bloco.n {
+            let ins: ^bir.BirInstr = &bloco.instrs[i]
+            if (ins.op as i32) != bir.BIR_CHAMA {
+                continue
+            }
+            let casa_nome: bool = (de_nome != "") and ((prog.simbolos[ins.simbolo].nome or_else "") == de_nome)
+            if casa_nome or ((de_nome == "") and (ins.simbolo == de_simbolo)) {
+                ins.simbolo = para
+            }
+        }
+    }
+}
+
+// I4f: o R0009 do rt_wasm guarda o arquivo da alocacao como endereco de 32 bits (rastro_marcar) e o relata por ele (rastro_linha -> fmt_json_de); no iOS a imagem
+// fica acima de 4 GiB e o relato lia endereco truncado (SIGSEGV). Dentro dessas duas funcoes as chamadas passam a rt_rastro_endereco/rt_rastro_json de std:a64_mem
+// (guardam os bits altos num slot do estado). Sem rastro_marcar/rastro_linha na BIR (inlinados ou podados) nada muda.
+pub proc a64_redirecionar_rastro(prog: ^bir.BirPrograma) {
+    let funcoes: []bir.BirFuncao = prog.funcoes or_else {}
+    let marcar: u32 = a64_alcance_proc_do_modulo(prog, funcoes, "rastro_marcar", "wasm_rt")
+    let linha: u32 = a64_alcance_proc_do_modulo(prog, funcoes, "rastro_linha", "wasm_rt")
+    let json: u32 = a64_alcance_proc_do_modulo(prog, funcoes, "fmt_json_de", "wasm_rt")
+    let novo_end: u32 = a64_alcance_proc_do_modulo(prog, funcoes, "rt_rastro_endereco", "a64_mem")
+    let novo_json: u32 = a64_alcance_proc_do_modulo(prog, funcoes, "rt_rastro_json", "a64_mem")
+    if (novo_end == A64_ALC_SEM) or (novo_json == A64_ALC_SEM) {
+        return
+    }
+    if marcar != A64_ALC_SEM {
+        a64_redirecionar_em(prog, &funcoes[marcar], "forja_rt_endereco_de", 0, funcoes[novo_end].simbolo)
+    }
+    if (linha != A64_ALC_SEM) and (json != A64_ALC_SEM) {
+        a64_redirecionar_em(prog, &funcoes[linha], "", funcoes[json].simbolo, funcoes[novo_json].simbolo)
+    }
+}

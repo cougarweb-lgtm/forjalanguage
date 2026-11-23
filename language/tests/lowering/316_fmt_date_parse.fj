@@ -1,0 +1,268 @@
+// IA1-S2h (D-FMT): std:fmt, leitura de datas e horas por regiao: parse_pattern, parse_date e parse_time. Primeiro a ida e volta em massa (9 regioes x 8 datas x 7 horas x 3 estilos de data e 2 de hora: parse(format(x)) tem de dar x), depois casos escritos um a um.
+// Cada caso: p regiao [padrao] [texto] -> ok aaaa-mm-dd hh:mm:ss | ERR nome, e `@N` = o `at` (offset em bytes de s do 1o byte ruim; -1 = intocado, o contrato e gravar so no erro). Conferido contra o oraculo Python independente (scratchpad, sem o forja); os casos sao lidos deste arquivo pelo oraculo.
+import "std:fmt" as fmt
+import "std:time" as tm
+
+const YEARS: [8]int = {1970, 2000, 1999, 2024, 1600, 2300, 99, 2100}
+const MONTHS: [8]int = {1, 2, 12, 2, 1, 12, 7, 2}
+const DAYS: [8]int = {1, 29, 31, 29, 1, 31, 15, 28}
+const HOURS: [7]int = {0, 1, 11, 12, 12, 13, 23}
+const MINUTES: [7]int = {0, 5, 59, 0, 30, 0, 59}
+const SECONDS: [7]int = {0, 9, 59, 0, 45, 0, 59}
+
+proc nome_erro(e: fmt.DateError) -> str {
+    switch e {
+    case fmt.DateError.empty:
+        return "empty"
+    case fmt.DateError.invalid_pattern:
+        return "invalid_pattern"
+    case fmt.DateError.mismatch:
+        return "mismatch"
+    case fmt.DateError.out_of_range:
+        return "out_of_range"
+    }
+    return "?"
+}
+
+// Os 6 campos de a e b (a fracao fica de fora) batem?
+proc igual(a: tm.DateTime, b: tm.DateTime) -> bool {
+    return a.year == b.year and a.month == b.month and a.day == b.day and a.hour == b.hour and a.minute == b.minute and a.second == b.second
+}
+
+// Soma 1 a falhas se a leitura nao deu o esperado (erro de leitura vira o ano -1, que nunca e esperado).
+proc confere_data(lido: tm.DateTime, esperado: tm.DateTime, falhas: ^int) {
+    if not igual(lido, esperado) {
+        falhas^ += 1
+    }
+}
+
+// Uma regiao: format -> parse de todas as combinacoes.
+proc ida_e_volta(loc: fmt.Locale) {
+    let estilos: [3]fmt.DateStyle = {fmt.DateStyle.short, fmt.DateStyle.long, fmt.DateStyle.full}
+    let erro = tm.DateTime{year = -1}
+    var total = 0
+    var falhas = 0
+    for di in 0..<8 {
+        for ti in 0..<7 {
+            let dt = tm.DateTime{year = YEARS[di], month = MONTHS[di], day = DAYS[di], hour = HOURS[ti], minute = MINUTES[ti], second = SECONDS[ti]}
+            let so_data = tm.DateTime{year = YEARS[di], month = MONTHS[di], day = DAYS[di]}
+            for si in 0..<3 {
+                let s = fmt.format_date(dt, loc = loc, style = estilos[si], alloc = heap)
+                confere_data(fmt.parse_date(s, loc = loc, style = estilos[si]) or_else erro, so_data, &falhas)
+                delete(s)
+                total += 1
+            }
+            let curta = tm.DateTime{hour = HOURS[ti], minute = MINUTES[ti]}
+            let t1 = fmt.format_time(dt, loc = loc, alloc = heap)
+            confere_data(fmt.parse_time(t1, loc = loc) or_else erro, curta, &falhas)
+            delete(t1)
+            let media = tm.DateTime{hour = HOURS[ti], minute = MINUTES[ti], second = SECONDS[ti]}
+            let t2 = fmt.format_time(dt, loc = loc, seconds = true, alloc = heap)
+            confere_data(fmt.parse_time(t2, loc = loc, seconds = true) or_else erro, media, &falhas)
+            delete(t2)
+            total += 2
+        }
+    }
+    print(f"ida e volta {loc.tag} total={total} falhas={falhas}")
+}
+
+// Leitura boa no builder: "ok aaaa-mm-dd hh:mm:ss @pos".
+proc junta_ok(buf: ^[dynamic]u8, v: tm.DateTime, pos: int) {
+    format(f"ok {v.year:04}-{v.month:02}-{v.day:02} {v.hour:02}:{v.minute:02}:{v.second:02} @{pos}", into = buf)
+}
+
+// Leitura ruim no builder: "ERR nome @pos".
+proc junta_erro(buf: ^[dynamic]u8, e: fmt.DateError, pos: int) {
+    format(f"ERR {nome_erro(e)} @{pos}", into = buf)
+}
+
+proc imprime(buf: ^[dynamic]u8) {
+    let texto = to_str(buf)
+    print(texto)
+    delete(texto)
+}
+
+// parse_pattern.
+proc caso(tag: str, pattern: str, texto: str) {
+    let loc = fmt.find_locale(tag) or_else fmt.ISO
+    var pos = -1
+    var buf = make([dynamic]u8, alloc = heap, cap = 128)
+    defer delete(buf)
+    format(f"p {tag} [{pattern}] [{texto}] -> ", into = &buf)
+    switch v in fmt.parse_pattern(texto, pattern, loc = loc, at = &pos) {
+    case tm.DateTime:
+        junta_ok(&buf, v, pos)
+    case fmt.DateError:
+        junta_erro(&buf, v, pos)
+    }
+    imprime(&buf)
+}
+
+// parse_date no estilo 0 = short, 1 = long, 2 = full.
+proc caso_data(tag: str, estilo: int, texto: str) {
+    let loc = fmt.find_locale(tag) or_else fmt.ISO
+    let estilos: [3]fmt.DateStyle = {fmt.DateStyle.short, fmt.DateStyle.long, fmt.DateStyle.full}
+    var pos = -1
+    var buf = make([dynamic]u8, alloc = heap, cap = 128)
+    defer delete(buf)
+    format(f"d {tag} {estilo} [{texto}] -> ", into = &buf)
+    switch v in fmt.parse_date(texto, loc = loc, style = estilos[estilo], at = &pos) {
+    case tm.DateTime:
+        junta_ok(&buf, v, pos)
+    case fmt.DateError:
+        junta_erro(&buf, v, pos)
+    }
+    imprime(&buf)
+}
+
+// parse_time curto (segundos = false) ou medio (true).
+proc caso_hora(tag: str, segundos: bool, texto: str) {
+    let loc = fmt.find_locale(tag) or_else fmt.ISO
+    var pos = -1
+    var buf = make([dynamic]u8, alloc = heap, cap = 128)
+    defer delete(buf)
+    format(f"t {tag} {segundos} [{texto}] -> ", into = &buf)
+    switch v in fmt.parse_time(texto, loc = loc, seconds = segundos, at = &pos) {
+    case tm.DateTime:
+        junta_ok(&buf, v, pos)
+    case fmt.DateError:
+        junta_erro(&buf, v, pos)
+    }
+    imprime(&buf)
+}
+
+proc main() {
+    for li in 0..<9 {
+        ida_e_volta(fmt.LOCALES[li])
+    }
+    caso("pt-BR", "dd/MM/yyyy", "29/02/2000")
+    caso("pt-BR", "dd/MM/yyyy", "30/02/2000")
+    caso("pt-BR", "dd/MM/yyyy", "31/04/2024")
+    caso("pt-BR", "dd/MM/yyyy", "29/02/2100")
+    caso("pt-BR", "d/M/yyyy", "1/1/2000")
+    caso("pt-BR", "dd/MM/yyyy", "1/1/2000")
+    caso("pt-BR", "d/M/yyyy", "01/01/2000")
+    caso("pt-BR", "d/M/yyyy", "001/1/2000")
+    caso("pt-BR", "dd/MM/yyyy", "32/01/2000")
+    caso("pt-BR", "dd/MM/yyyy", "10/13/2000")
+    caso("pt-BR", "dd/MM/yyyy", "10/00/2000")
+    caso("pt-BR", "dd/MM/yyyy", "10/10/200")
+    caso("pt-BR", "dd/MM/yyyy", "10/10/20000")
+    caso("pt-BR", "dd/MM/yyyy", "")
+    caso("pt-BR", "dd/MM/yyyy", "10-10-2000")
+    caso("pt-BR", "dd/MM/yyyy", "10/10/2000 ")
+    caso("pt-BR", "dd/MM/yyyy", " 10/10/2000")
+    caso("pt-BR", "dd/MM/yyyy", "ab/10/2000")
+    caso("pt-BR", "dd/MM/yyyy", "10/10/200a")
+    caso("pt-BR", "dd/MM/yyyy", "29/02/2000x")
+    caso("pt-BR", "dd/MM/yy", "01/02/24")
+    caso("pt-BR", "dd/MM/yy", "01/01/00")
+    caso("pt-BR", "yy-M-d", "99-12-31")
+    caso("pt-BR", "yyyy-MM-dd", "0099-07-15")
+    caso("pt-BR", "yyyy-MM-dd", "0000-01-01")
+    caso("pt-BR", "yyyy", "2000")
+    caso("pt-BR", "dM", "112")
+    caso("pt-BR", "Md", "112")
+    caso("pt-BR", "HH:mm:ss", "23:59:59")
+    caso("pt-BR", "HH:mm:ss", "24:00:00")
+    caso("pt-BR", "HH:mm:ss", "12:60:00")
+    caso("pt-BR", "HH:mm:ss", "12:00:60")
+    caso("pt-BR", "H:m:s", "1:2:3")
+    caso("pt-BR", "H:m:s", "01:02:03")
+    caso("pt-BR", "hh:mm a", "12:00 AM")
+    caso("pt-BR", "hh:mm a", "12:30 PM")
+    caso("pt-BR", "hh:mm a", "01:05 PM")
+    caso("pt-BR", "h:mm a", "11:59 PM")
+    caso("pt-BR", "hh:mm a", "13:00 PM")
+    caso("pt-BR", "hh:mm a", "00:30 AM")
+    caso("pt-BR", "hh:mm", "10:30")
+    caso("pt-BR", "hh:mm a", "10:30 am")
+    caso("pt-BR", "HH a", "13 PM")
+    caso("pt-BR", "HH a", "13 AM")
+    caso("pt-BR", "HH a", "05 AM")
+    caso("pt-BR", "HH a", "05 PM")
+    caso("pt-BR", "HH hh a", "13 01 PM")
+    caso("pt-BR", "HH hh a", "14 01 PM")
+    caso("pt-BR", "d 'de' MMMM 'de' yyyy", "29 de fevereiro de 2000")
+    caso("pt-BR", "d 'de' MMMM 'de' yyyy", "29 de Fevereiro de 2000")
+    caso("pt-BR", "d 'de' MMMM 'de' yyyy", "29 em fevereiro de 2000")
+    caso("pt-BR", "d MMM yyyy", "5 jan. 2000")
+    caso("pt-BR", "d MMM yyyy", "5 jan 2000")
+    caso("pt-BR", "EEEE, d 'de' MMMM 'de' yyyy", "terça-feira, 29 de fevereiro de 2000")
+    caso("pt-BR", "EEEE, d 'de' MMMM 'de' yyyy", "segunda-feira, 29 de fevereiro de 2000")
+    caso("pt-BR", "EEEE, d 'de' MMMM 'de' yyyy", "terca-feira, 29 de fevereiro de 2000")
+    caso("pt-BR", "E dd/MM/yyyy", "ter. 29/02/2000")
+    caso("pt-BR", "E dd/MM/yyyy", "qua. 29/02/2000")
+    caso("pt-BR", "EEEE", "quinta-feira")
+    caso("pt-BR", "EEEE", "sábado")
+    caso("pt-BR", "MMMM yyyy", "agosto 1999")
+    caso("pt-BR", "MMM", "mar.")
+    caso("en-US", "MMMM d, yyyy", "February 29, 2000")
+    caso("en-US", "MMMM d, yyyy", "february 29, 2000")
+    caso("en-US", "M/d/yyyy", "2/29/2000")
+    caso("en-US", "M/d/yyyy", "13/1/2000")
+    caso("en-US", "h:mm:ss a", "12:00:00 AM")
+    caso("en-US", "h:mm:ss a", "1:02:03 PM")
+    caso("en-US", "EEEE, MMMM d, yyyy", "Tuesday, February 29, 2000")
+    caso("en-US", "EEEE, MMMM d, yyyy", "Wednesday, February 29, 2000")
+    caso("en-GB", "h:mm a", "5:07 pm")
+    caso("en-GB", "h:mm a", "5:07 PM")
+    caso("en-GB", "d MMM yyyy", "5 Sept 2000")
+    caso("es-ES", "h:mm a", "5:07 p. m.")
+    caso("es-ES", "h:mm a", "5:07 a. m.")
+    caso("es-ES", "h:mm a", "5:07 pm")
+    caso("es-ES", "d/M/yyyy", "1/2/2000")
+    caso("es-ES", "d MMM yyyy", "5 sept 2000")
+    caso("es-ES", "d MMM yyyy", "5 mar 2000")
+    caso("es-ES", "E", "jue")
+    caso("es-ES", "E", "mié")
+    caso("de-DE", "d. MMMM yyyy", "29. Februar 2000")
+    caso("de-DE", "EEEE, d. MMMM yyyy", "Dienstag, 29. Februar 2000")
+    caso("de-DE", "d. MMM yyyy", "1. März 2000")
+    caso("de-DE", "d. MMM yyyy", "1. Juni 2000")
+    caso("de-DE", "d. MMM yyyy", "1. Juli 2000")
+    caso("de-DE", "dd.MM.yyyy", "29.02.2000")
+    caso("fr-FR", "d MMMM yyyy", "29 février 2000")
+    caso("fr-FR", "d MMMM yyyy", "1 août 2000")
+    caso("fr-FR", "d MMM yyyy", "1 janv. 2000")
+    caso("fr-FR", "d MMM yyyy", "1 mars 2000")
+    caso("it-IT", "EEEE d MMMM yyyy", "martedì 29 febbraio 2000")
+    caso("it-IT", "EEEE d MMMM yyyy", "martedi 29 febbraio 2000")
+    caso("ISO", "yyyy-MM-dd", "2000-02-29")
+    caso("ISO", "yyyy-MM-dd HH:mm:ss", "2000-02-29 23:59:59")
+    caso("ISO", "MMM", "Sep")
+    caso("ISO", "MMMM", "December")
+    caso("ISO", "yyyy-MM-dd", "2000-2-29")
+    caso("pt-BR", "'o''clock' h a", "o'clock 3 PM")
+    caso("pt-BR", "''d", "'5")
+    caso("pt-BR", "dd'T'HH", "05T07")
+    caso("pt-BR", "'texto' yyyy", "texto 2000")
+    caso("pt-BR", "'texto' yyyy", "texte 2000")
+    caso("pt-BR", "yyyy年MM月dd日", "2000年02月29日")
+    caso("pt-BR", "yyyy年MM月dd日", "2000年02月29")
+    caso("pt-BR", "'a''b' d", "a'b 7")
+    caso("pt-BR", "ddd", "x")
+    caso("pt-BR", "ddd", "")
+    caso("pt-BR", "", "x")
+    caso("pt-BR", "'abc", "abc")
+    caso("pt-BR", "yyy", "2000")
+    caso("pt-BR", "EEE", "ter")
+    caso_data("pt-BR", 0, "29/02/2000")
+    caso_data("pt-BR", 0, "29/02/00")
+    caso_data("pt-BR", 1, "29 de fevereiro de 2000")
+    caso_data("pt-BR", 2, "terça-feira, 29 de fevereiro de 2000")
+    caso_data("pt-BR", 2, "quarta-feira, 29 de fevereiro de 2000")
+    caso_data("en-US", 0, "12/31/1999")
+    caso_data("en-US", 2, "Friday, December 31, 1999")
+    caso_data("ISO", 1, "1999-12-31")
+    caso_data("de-DE", 0, "")
+    caso_hora("pt-BR", false, "13:05")
+    caso_hora("pt-BR", true, "13:05:09")
+    caso_hora("pt-BR", true, "13:05")
+    caso_hora("en-US", false, "1:05 PM")
+    caso_hora("en-US", true, "12:00:00 AM")
+    caso_hora("en-US", false, "13:05")
+    caso_hora("es-ES", true, "7:05:09")
+    caso_hora("es-ES", true, "24:05:09")
+    caso_hora("en-GB", false, "")
+}

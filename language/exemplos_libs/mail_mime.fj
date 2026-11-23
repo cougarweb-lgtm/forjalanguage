@@ -1,0 +1,136 @@
+// Marco rede R6: MIME de vendor:net/mail contra 5 dourados byte a byte em tests\rede\mime\ (caso_1..caso_5.eml) e um CRLF injetado no assunto (erro other).
+// Sem rede: tudo em memoria e em arquivo local. O anexo binario (768 bytes, 0..255 x3) vem de tests\rede\mime\anexo_original.bin.
+// COMPILAR/RODAR: python language\exemplos_libs\verificar_libs.py --so mail_mime --backend x64   (SAIDA ESPERADA: mail_mime.esperado)
+
+import "std:file"
+import "std:mem"
+import "std:time" as tm
+import "vendor:net/mail" as mail
+
+// 2026-11-18 21:05 UTC; no fuso -03:00 o Date sai "Wed, 18 Nov 2026 18:05:00 -0300".
+proc data_fixa() -> tm.DateTime {
+    return tm.DateTime{year = 2026, month = 11, day = 18, hour = 21, minute = 5}
+}
+
+// Compara o texto montado com o golden byte a byte e imprime a prova.
+proc conferir(rotulo: str, montado: str, golden: str) {
+    switch g in file.read_all(golden, alloc = heap) {
+    case [dynamic]u8:
+        let esperado = from_bytes(g[..], alloc = heap)
+        if montado == esperado {
+            print(f"{rotulo} igual")
+        } else {
+            print(f"{rotulo} DIFERENTE")
+        }
+        delete(esperado)
+        delete(g)
+    case file.FileError:
+        print(f"{rotulo} golden ausente")
+    }
+}
+
+// Monta a mensagem e confere com o golden; erro de build vira linha na saida.
+proc conferir_mensagem(rotulo: str, msg: ^mail.Message, limite: str, golden: str) {
+    let a = mem.arena_create()
+    defer mem.arena_destroy(a)
+    switch m in mail.build_message(msg, boundary = limite, alloc = a) {
+    case str:
+        conferir(rotulo, m, golden)
+    case mail.MailError:
+        print(f"{rotulo} erro")
+    }
+}
+
+// Caso 1: ASCII puro, so texto, Message-ID derivado.
+proc caso_1() {
+    var para: [1]str = {"destino@exemplo.com"}
+    var nada: [1]str = {}
+    var sem_anexo: [1]mail.Attachment = {}
+    var msg = mail.Message{from = "remetente@exemplo.com", to = para[..], cc = nada[0..<0], bcc = nada[0..<0], subject = "Teste simples", text = "Linha 1\nLinha 2\n", attachments = sem_anexo[0..<0], date_utc = data_fixa(), offset_s = -10800}
+    conferir_mensagem("caso 1", &msg, "fronteira-1", "../tests/rede/mime/caso_1.eml")
+}
+
+// Caso 2: assunto e texto com acento (RFC 2047 e base64).
+proc caso_2() {
+    var para: [1]str = {"destino@exemplo.com"}
+    var nada: [1]str = {}
+    var sem_anexo: [1]mail.Attachment = {}
+    var msg = mail.Message{from = "remetente@exemplo.com", to = para[..], cc = nada[0..<0], bcc = nada[0..<0], subject = "Olá, mundo", text = "Açúcar e ação\n", attachments = sem_anexo[0..<0], date_utc = data_fixa(), offset_s = -10800, message_id = "<teste-2@exemplo.com>"}
+    conferir_mensagem("caso 2", &msg, "fronteira-2", "../tests/rede/mime/caso_2.eml")
+}
+
+// Caso 3: texto e HTML, multipart/alternative.
+proc caso_3() {
+    var para: [1]str = {"destino@exemplo.com"}
+    var nada: [1]str = {}
+    var sem_anexo: [1]mail.Attachment = {}
+    var msg = mail.Message{from = "remetente@exemplo.com", to = para[..], cc = nada[0..<0], bcc = nada[0..<0], subject = "Texto e HTML", text = "Oi\n", html = "<p>Oi <b>mundo</b></p>\n", attachments = sem_anexo[0..<0], date_utc = data_fixa(), offset_s = -10800, message_id = "<teste-3@exemplo.com>"}
+    conferir_mensagem("caso 3", &msg, "fronteira-3", "../tests/rede/mime/caso_3.eml")
+}
+
+// Caso 4: um anexo binario (multipart/mixed), com Cc.
+proc montar_caso_4(dados: []u8) {
+    var para: [1]str = {"destino@exemplo.com"}
+    var copia: [1]str = {"copia@exemplo.com"}
+    var anexos: [1]mail.Attachment = {mail.Attachment{name = "dados.bin", content_type = "application/octet-stream", data = dados}}
+    var msg = mail.Message{from = "remetente@exemplo.com", to = para[..], cc = copia[..], bcc = copia[0..<0], subject = "Anexo", text = "Segue anexo.\n", attachments = anexos[..], date_utc = data_fixa(), offset_s = -10800}
+    conferir_mensagem("caso 4", &msg, "fronteira-4", "../tests/rede/mime/caso_4.eml")
+}
+
+proc caso_4() {
+    switch d in file.read_all("../tests/rede/mime/anexo_original.bin", alloc = heap) {
+    case [dynamic]u8:
+        montar_caso_4(d[..])
+        delete(d)
+    case file.FileError:
+        print("caso 4 anexo ausente")
+    }
+}
+
+// Caso 5: dois anexos com nome acentuado (RFC 2231 em name* e filename*).
+proc montar_caso_5(dados: []u8) {
+    var para: [1]str = {"destino@exemplo.com"}
+    var nada: [1]str = {}
+    var anexos: [2]mail.Attachment = {mail.Attachment{name = "relatório.txt", content_type = "text/plain", data = as_bytes("Relatório de março\n")}, mail.Attachment{name = "dados-ção.bin", content_type = "application/octet-stream", data = dados}}
+    var msg = mail.Message{from = "remetente@exemplo.com", to = para[..], cc = nada[0..<0], bcc = nada[0..<0], subject = "Dois anexos", text = "Veja os anexos.\n", attachments = anexos[..], date_utc = data_fixa(), offset_s = -10800, message_id = "<teste-5@exemplo.com>"}
+    conferir_mensagem("caso 5", &msg, "fronteira-5", "../tests/rede/mime/caso_5.eml")
+}
+
+proc caso_5() {
+    switch d in file.read_all("../tests/rede/mime/anexo_original.bin", alloc = heap) {
+    case [dynamic]u8:
+        montar_caso_5(d[..])
+        delete(d)
+    case file.FileError:
+        print("caso 5 anexo ausente")
+    }
+}
+
+// Caso 6: CRLF no assunto (injecao de cabecalho) tem de falhar com MailError.other.
+proc caso_6() {
+    let a = mem.arena_create()
+    defer mem.arena_destroy(a)
+    var para: [1]str = {"destino@exemplo.com"}
+    var nada: [1]str = {}
+    var sem_anexo: [1]mail.Attachment = {}
+    var msg = mail.Message{from = "remetente@exemplo.com", to = para[..], cc = nada[0..<0], bcc = nada[0..<0], subject = "oi\r\nBcc: x@exemplo.com", text = "Corpo\n", attachments = sem_anexo[0..<0], date_utc = data_fixa(), offset_s = -10800}
+    switch e in mail.build_message(&msg, boundary = "fronteira-6", alloc = a) {
+    case str:
+        print("caso 6 DEVERIA FALHAR")
+    case mail.MailError:
+        if e == mail.MailError.other {
+            print("caso 6 erro other")
+        } else {
+            print("caso 6 erro outro")
+        }
+    }
+}
+
+proc main() {
+    caso_1()
+    caso_2()
+    caso_3()
+    caso_4()
+    caso_5()
+    caso_6()
+}

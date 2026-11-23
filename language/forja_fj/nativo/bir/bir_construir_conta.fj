@@ -1,0 +1,529 @@
+// nativo/bir/bir_construir_conta.fj - porte de compiler/nativo/bir/bir_construir_conta.c
+// sha256 de nativo/bir/bir_construir_conta.c: 990b0c452e30cdfe47a24a2388d8bfa53b357906bdbfde60418f471044f074a9
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "common"
+import "frontend"
+import "ir"
+import "semantic"
+
+struct BirAritmetica {
+    ov: u8
+    simples: u8
+    texto: ?str
+}
+
+const FALHA_NENHUMA: i32 = 0
+const FALHA_NEGATIVO: i32 = 1
+const FALHA_FAIXA: i32 = 2
+const FALHA_ACIMA: i32 = 3
+const TEXTO_OPERACAO_MAX: i32 = 48
+const CONDS_COM_SINAL: [6]u8 = {0, 1, 2, 3, 4, 5}
+const CONDS_SEM_SINAL: [6]u8 = {0, 1, 6, 7, 8, 9}
+const OPS_DE_VOLTA: [3]u8 = {2, 3, 4}
+const OPS_DE_BIT: [3]u8 = {5, 6, 7}
+
+// C: nativo/bir/bir_construir_conta.c:28
+proc bir_sufixo_inteiro(tipo: u32) -> str {
+    if tipo == (semantic.TIPO_I8 as u32) {
+        return "i8"
+    } else if tipo == (semantic.TIPO_I16 as u32) {
+        return "i16"
+    } else if tipo == (semantic.TIPO_I32 as u32) {
+        return "i32"
+    } else if tipo == (semantic.TIPO_U8 as u32) {
+        return "u8"
+    } else if tipo == (semantic.TIPO_U16 as u32) {
+        return "u16"
+    } else if tipo == (semantic.TIPO_U32 as u32) {
+        return "u32"
+    } else if tipo == (semantic.TIPO_UINT as u32) {
+        return "u64"
+    } else {
+        return "i64"
+    }
+    return ""
+}
+
+// C: nativo/bir/bir_construir_conta.c:42
+proc bir_comparar(c: ^BirCtx, cond: u8, a: BirOperando, b: BirOperando) -> u32 {
+    return bir_conta_nova(c, BC_I8 as u8, BirPedido{op = BIR_CMP as u8, aux = cond, a = a, b = b})
+}
+
+// C: nativo/bir/bir_construir_conta.c:48
+// Os bits baixos do imediato (mascara 2^largura - 1): o 'as' da Forja trava fora da faixa (R0002) e o C envolve; por isso a mascara antes do 'as'.
+proc imediato_bits_baixos(imed: i64, mascara: u64) -> u64 {
+    return transmute(imed, to = u64) & mascara
+}
+
+proc imediato_estendido(imed: i64, classe: u8, sem_sinal: bool) -> i64 {
+    let sw_1 = classe as i32
+    if sw_1 == BC_I8 {
+        let baixo_8: u8 = (imediato_bits_baixos(imed, 255)) as u8
+        let com_sinal_8: i8 = transmute(baixo_8, to = i8)
+        var tern_1: i64 = com_sinal_8 as i64
+        if common.c2f_b2i32(sem_sinal) != 0 {
+            tern_1 = baixo_8 as i64
+        }
+        return tern_1
+    } else if sw_1 == BC_I16 {
+        let baixo_16: u16 = (imediato_bits_baixos(imed, 65535)) as u16
+        let com_sinal_16: i16 = transmute(baixo_16, to = i16)
+        var tern_2: i64 = com_sinal_16 as i64
+        if common.c2f_b2i32(sem_sinal) != 0 {
+            tern_2 = baixo_16 as i64
+        }
+        return tern_2
+    } else {
+        let baixo_32: u32 = (imediato_bits_baixos(imed, 4294967295)) as u32
+        let com_sinal_32: i32 = transmute(baixo_32, to = i32)
+        var tern_3: i64 = com_sinal_32 as i64
+        if common.c2f_b2i32(sem_sinal) != 0 {
+            tern_3 = baixo_32 as i64
+        }
+        return tern_3
+    }
+    return 0
+}
+
+// C: nativo/bir/bir_construir_conta.c:59
+proc bir_estendido64(o: BirOperando, tipo: u32) -> BirOperando {
+    let sem_sinal: bool = semantic.tipo_eh_sem_sinal(tipo)
+    if o.classe == (BC_I64 as u8) {
+        return o
+    }
+    if o.tipo == (BO_VREG as u8) {
+        var tern_1: i32 = BE_SINAL
+        if common.c2f_b2i32(sem_sinal) != 0 {
+            tern_1 = BE_ZERO
+        }
+        return op_com_extensao(o, tern_1 as u8)
+    }
+    return op_imed(imediato_estendido(o.imed, o.classe, sem_sinal), BC_I64 as u8)
+}
+
+// C: nativo/bir/bir_construir_conta.c:70
+// BirArquivoELinha inline (o bir_arquivo_e_linha de bir_construir.fj ainda e stub e tem assinatura ^?^u8; o C e const char **).
+proc bir_vreg_do_arquivo(c: ^BirCtx, pos: u32, linha: ^u32) -> BirOperando {
+    let posicao: common.FontePosicao = common.fonte_localizar_no_arquivo((c.e as ^BirEntrada).fonte, pos)
+    linha^ = posicao.linha
+    let caminho: str = posicao.caminho or_else ""
+    return op_vreg(bir_vreg_do_texto(c, caminho, (len(caminho) as u64) as u32), BC_I64 as u8)
+}
+
+// C: nativo/bir/bir_construir_conta.c:88
+// forja_falha_estouro[_u]("<operacao> <sufixo>", a, b, arquivo, linha), no bloco frio. O texto da operacao (<= 47 bytes) e copiado pela BIR: libera ao sair.
+proc bir_frio_estouro(c: ^BirCtx, frio: u32, operacao: str, ab: [2]BirOperando) {
+    let tipo: u32 = (c.atual as ^ir.IrInstr).a.tipo
+    let texto: str = format(f"{operacao} {bir_sufixo_inteiro(tipo)}", alloc = heap)
+    defer delete(texto)
+    let salvo: u32 = c.cur
+    var linha: u32 = 0
+    var args: [5]BirOperando = {}
+    c.cur = frio
+    args[0] = op_vreg(bir_vreg_do_texto(c, texto, (len(texto) as u64) as u32), BC_I64 as u8)
+    args[1] = bir_estendido64(ab[0], tipo)
+    args[2] = bir_estendido64(ab[1], tipo)
+    args[3] = bir_vreg_do_arquivo(c, (c.atual as ^ir.IrInstr).pos, &linha)
+    args[4] = op_imed(linha as i64, BC_I32 as u8)
+    var nome_rt: str = "forja_falha_estouro"
+    if semantic.tipo_eh_sem_sinal(tipo) {
+        nome_rt = "forja_falha_estouro_u"
+    }
+    bir_armadilha(c, bir_simbolo_runtime(c, nome_rt), args[..])
+    c.cur = salvo
+}
+
+// C: nativo/bir/bir_construir_conta.c:107
+proc conta_checada(c: ^BirCtx, op_ov: i32, operacao: str, ab: [2]BirOperando) -> bool {
+    var dst: u32 = 0
+    var frio: u32 = 0
+    var ins: ?^BirInstr = none
+    if not bir_definir_destino(c, ab[0].classe, &dst) {
+        return false
+    }
+    frio = bir_novo_bloco(c, true)
+    ins = bir_emitir_pedido(c, BirPedido{op = op_ov as u8, dst = dst, a = ab[0], b = ab[1]})
+    let ptr_1: ^BirInstr = ins as ^BirInstr
+    var tern_1: i32 = BIR_SINAL
+    if common.c2f_b2i32(semantic.tipo_eh_sem_sinal((c.atual as ^ir.IrInstr).a.tipo)) != 0 {
+        tern_1 = BIR_SEM_SINAL
+    }
+    ptr_1.aux = tern_1 as u8
+    let ptr_2: ^BirInstr = ins as ^BirInstr
+    ptr_2.alvo[0] = frio
+    bir_frio_estouro(c, frio, operacao, ab)
+    return true
+}
+
+// C: nativo/bir/bir_construir_conta.c:83 (ARITMETICA, na ordem OP_SOMA, OP_SUB, OP_MUL; o indice e op_aux - OP_SOMA)
+proc bir_aritmetica_de(indice: i32) -> BirAritmetica {
+    if indice == 0 {
+        return BirAritmetica{ov = BIR_ADD_OV as u8, simples = BIR_ADD as u8, texto = "soma"}
+    }
+    if indice == 1 {
+        return BirAritmetica{ov = BIR_SUB_OV as u8, simples = BIR_SUB as u8, texto = "subtracao"}
+    }
+    if indice != 2 {
+        panic("bir_construir_conta: aritmetica fora de SOMA, SUB e MUL")
+    }
+    return BirAritmetica{ov = BIR_MUL_OV as u8, simples = BIR_MUL as u8, texto = "multiplicacao"}
+}
+
+// C: nativo/bir/bir_construir_conta.c:122
+proc aritmetica(c: ^BirCtx, i: ^ir.IrInstr, ab: [2]BirOperando) -> bool {
+    let ar: BirAritmetica = bir_aritmetica_de((i.op_aux as i32) - frontend.OP_SOMA)
+    if (c.p as ^BirPrograma).modo == (BM_DEV as u8) {
+        return conta_checada(c, ar.ov as i32, ar.texto or_else "", ab)
+    }
+    var dst: u32 = 0
+    if not bir_definir_destino(c, ab[0].classe, &dst) {
+        return false
+    }
+    _ = bir_emitir_pedido(c, BirPedido{op = ar.simples, dst = dst, a = ab[0], b = ab[1]})
+    return true
+}
+
+// C: nativo/bir/bir_construir_conta.c:139
+proc comparacao(c: ^BirCtx, i: ^ir.IrInstr, ab: [2]BirOperando) -> bool {
+    let sem_sinal: bool = (common.c2f_b2i32(semantic.tipo_eh_sem_sinal(i.a.tipo)) != 0) or (i.a.tipo == (semantic.TIPO_BOOL as u32))
+    var tern_1: [6]u8 = CONDS_COM_SINAL
+    if common.c2f_b2i32(sem_sinal) != 0 {
+        tern_1 = CONDS_SEM_SINAL
+    }
+    let conds: [6]u8 = tern_1
+    var dst: u32 = 0
+    if not bir_definir_destino(c, BC_I8 as u8, &dst) {
+        return false
+    }
+    _ = bir_emitir_pedido(c, BirPedido{op = BIR_CMP as u8, aux = conds[(i.op_aux as i32) - frontend.OP_IGUAL], dst = dst, a = ab[0], b = ab[1]})
+    return true
+}
+
+// C: nativo/bir/bir_construir_conta.c:154
+proc conta_com_volta(c: ^BirCtx, i: ^ir.IrInstr, ab: [2]BirOperando) -> bool {
+    var dst: u32 = 0
+    if not bir_definir_destino(c, ab[0].classe, &dst) {
+        return false
+    }
+    _ = bir_emitir_pedido(c, BirPedido{op = OPS_DE_VOLTA[(i.op_aux as i32) - frontend.OP_SOMA_VOLTA], dst = dst, a = ab[0], b = ab[1]})
+    return true
+}
+
+// C: nativo/bir/bir_construir_conta.c:167
+proc conta_de_bits(c: ^BirCtx, i: ^ir.IrInstr, ab: [2]BirOperando) -> bool {
+    var dst: u32 = 0
+    if not bir_definir_destino(c, ab[0].classe, &dst) {
+        return false
+    }
+    _ = bir_emitir_pedido(c, BirPedido{op = OPS_DE_BIT[(i.op_aux as i32) - frontend.OP_BIT_E], dst = dst, a = ab[0], b = ab[1]})
+    return true
+}
+
+// C: nativo/bir/bir_construir_conta.c:178
+proc conta_logica(c: ^BirCtx, i: ^ir.IrInstr, ab: [2]BirOperando) -> bool {
+    var dst: u32 = 0
+    if not bir_definir_destino(c, BC_I8 as u8, &dst) {
+        return false
+    }
+    var tern_1: i32 = BIR_OR
+    if i.op_aux == (frontend.OP_E as u8) {
+        tern_1 = BIR_AND
+    }
+    _ = bir_emitir_pedido(c, BirPedido{op = tern_1 as u8, dst = dst, a = ab[0], b = ab[1]})
+    return true
+}
+
+// C: nativo/bir/bir_construir_conta.c:188
+proc binario_inteiro(c: ^BirCtx, i: ^ir.IrInstr, ab: [2]BirOperando) -> bool {
+    let sw_1 = i.op_aux as i32
+    if sw_1 == frontend.OP_SOMA or sw_1 == frontend.OP_SUB or sw_1 == frontend.OP_MUL {
+        return aritmetica(c, i, ab)
+    } else if sw_1 == frontend.OP_SOMA_VOLTA or sw_1 == frontend.OP_SUB_VOLTA or sw_1 == frontend.OP_MUL_VOLTA {
+        return conta_com_volta(c, i, ab)
+    } else if sw_1 == frontend.OP_BIT_E or sw_1 == frontend.OP_BIT_OU or sw_1 == frontend.OP_BIT_XOU {
+        return conta_de_bits(c, i, ab)
+    } else if sw_1 == frontend.OP_E or sw_1 == frontend.OP_OU {
+        return conta_logica(c, i, ab)
+    } else {
+        return comparacao(c, i, ab)
+    }
+    return false
+}
+
+// C: nativo/bir/bir_construir_conta.c:204
+proc bir_regra_binario(c: ^BirCtx, i: ^ir.IrInstr) -> bool {
+    var ab: [2]BirOperando = {}
+    if i.a.tipo == (semantic.TIPO_STR as u32) {
+        return bir_regra_str_igual(c, i)
+    }
+    if not bir_operando_de(c, i, &i.a, &ab[0]) {
+        return false
+    }
+    if not bir_operando_de(c, i, &i.b, &ab[1]) {
+        return false
+    }
+    if bir_classe_eh_real(ab[0].classe as i32) {
+        return bir_conta_real(c, i, ab)
+    }
+    return binario_inteiro(c, i, ab)
+}
+
+// C: nativo/bir/bir_construir_conta.c:217
+proc conta_nao(c: ^BirCtx, a: BirOperando) -> bool {
+    var dst: u32 = 0
+    if not bir_definir_destino(c, BC_I8 as u8, &dst) {
+        return false
+    }
+    _ = bir_emitir_pedido(c, BirPedido{op = BIR_XOR as u8, dst = dst, a = a, b = op_imed(1, BC_I8 as u8)})
+    return true
+}
+
+// C: nativo/bir/bir_construir_conta.c:227
+proc unario_inteiro(c: ^BirCtx, i: ^ir.IrInstr, a: BirOperando) -> bool {
+    var dst: u32 = 0
+    if i.op_aux == (frontend.OP_NAO as u8) {
+        return conta_nao(c, a)
+    }
+    if (i.op_aux == (frontend.OP_NEGAR as u8)) and ((c.p as ^BirPrograma).modo == (BM_DEV as u8)) {
+        let ab_neg: [2]BirOperando = {op_imed(0, a.classe), a}
+        return conta_checada(c, BIR_NEG_OV, "subtracao", ab_neg)
+    }
+    if not bir_definir_destino(c, a.classe, &dst) {
+        return false
+    }
+    var op_un: i32 = BIR_NEG
+    if i.op_aux == (frontend.OP_BIT_NAO as u8) {
+        op_un = BIR_NOT
+    }
+    _ = bir_emitir_pedido(c, BirPedido{op = op_un as u8, dst = dst, a = a})
+    return true
+}
+
+// C: nativo/bir/bir_construir_conta.c:242
+proc bir_regra_unario(c: ^BirCtx, i: ^ir.IrInstr) -> bool {
+    var a: BirOperando = BirOperando{}
+    if not bir_operando_de(c, i, &i.a, &a) {
+        return false
+    }
+    if i.op_aux == (frontend.OP_RAIZ as u8) {
+        return bir_raiz_real(c, a)
+    }
+    if bir_classe_eh_real(a.classe as i32) {
+        return bir_negar_real(c, a)
+    }
+    return unario_inteiro(c, i, a)
+}
+
+// C: nativo/bir/bir_construir_conta.c:260
+proc sempre_cabe(c: ^BirCtx, origem: u32, destino: u32) -> bool {
+    let lo: u8 = semantic.tipo_largura_bits((c.e as ^BirEntrada).tipos as ^semantic.Tipos, origem)
+    let ld: u8 = semantic.tipo_largura_bits((c.e as ^BirEntrada).tipos as ^semantic.Tipos, destino)
+    let so: bool = semantic.tipo_eh_sem_sinal(origem)
+    let sd: bool = semantic.tipo_eh_sem_sinal(destino)
+    var tern_1: i32 = common.c2f_b2i32((common.c2f_b2i32(so) != 0) and ((ld as i32) > (lo as i32)))
+    if common.c2f_b2i32(so) == common.c2f_b2i32(sd) {
+        tern_1 = common.c2f_b2i32((ld as i32) >= (lo as i32))
+    }
+    return tern_1 != 0
+}
+
+// C: nativo/bir/bir_construir_conta.c:269
+proc so_negativo_falha(lo: u8, ld: u8, origem_sem_sinal: bool) -> bool {
+    return ((lo as i32) == (ld as i32)) or ((not origem_sem_sinal) and ((ld as i32) > (lo as i32)))
+}
+
+// C: nativo/bir/bir_construir_conta.c:276
+proc falha_da_conversao(c: ^BirCtx, origem: u32, destino: u32) -> i32 {
+    let lo: u8 = semantic.tipo_largura_bits((c.e as ^BirEntrada).tipos as ^semantic.Tipos, origem)
+    let ld: u8 = semantic.tipo_largura_bits((c.e as ^BirEntrada).tipos as ^semantic.Tipos, destino)
+    let origem_sem_sinal: bool = semantic.tipo_eh_sem_sinal(origem)
+    if (origem == destino) or (common.c2f_b2i32(sempre_cabe(c, origem, destino)) != 0) {
+        return FALHA_NENHUMA
+    }
+    if so_negativo_falha(lo, ld, origem_sem_sinal) {
+        return FALHA_NEGATIVO
+    }
+    var tern_1: i32 = FALHA_FAIXA
+    if common.c2f_b2i32(origem_sem_sinal) != 0 {
+        tern_1 = FALHA_ACIMA
+    }
+    return tern_1
+}
+
+// C: nativo/bir/bir_construir_conta.c:289
+proc condicao_de_falha(c: ^BirCtx, falha: u8, v: BirOperando) -> u32 {
+    let destino: u32 = (c.atual as ^ir.IrInstr).tipo
+    let maximo: i64 = transmute(semantic.tipo_inteiro_max(destino), to = i64)
+    var baixo: u32 = 0
+    var alto: u32 = 0
+    if falha == (FALHA_ACIMA as u8) {
+        return bir_comparar(c, BCOND_GT_U as u8, v, op_imed(maximo, v.classe))
+    }
+    if falha == (FALHA_NEGATIVO as u8) {
+        return bir_comparar(c, BCOND_LT_S as u8, v, op_imed(0, v.classe))
+    }
+    let arg_1: u8 = v.classe
+    let arg_2: i64 = semantic.tipo_inteiro_min(destino)
+    baixo = bir_comparar(c, BCOND_LT_S as u8, v, op_imed(arg_2, arg_1))
+    alto = bir_comparar(c, BCOND_GT_S as u8, v, op_imed(maximo, v.classe))
+    return bir_conta_nova(c, BC_I8 as u8, BirPedido{op = BIR_OR as u8, a = op_vreg(baixo, BC_I8 as u8), b = op_vreg(alto, BC_I8 as u8)})
+}
+
+// C: nativo/bir/bir_construir_conta.c:305
+// forja_falha_conversao_i|u(valor, "<alvo>", arquivo, linha) no frio: _u quando a origem e sem sinal.
+proc frio_conversao(c: ^BirCtx, frio: u32, v: BirOperando) {
+    let i: ^ir.IrInstr = c.atual as ^ir.IrInstr
+    let alvo: str = bir_sufixo_inteiro(i.tipo)
+    var args: [4]BirOperando = {}
+    var linha: u32 = 0
+    let salvo: u32 = c.cur
+    c.cur = frio
+    args[0] = bir_estendido64(v, i.a.tipo)
+    args[1] = op_vreg(bir_vreg_do_texto(c, alvo, (len(alvo) as u64) as u32), BC_I64 as u8)
+    args[2] = bir_vreg_do_arquivo(c, i.pos, &linha)
+    args[3] = op_imed(linha as i64, BC_I32 as u8)
+    var nome_rt: str = "forja_falha_conversao_i"
+    if semantic.tipo_eh_sem_sinal(i.a.tipo) {
+        nome_rt = "forja_falha_conversao_u"
+    }
+    bir_armadilha(c, bir_simbolo_runtime(c, nome_rt), args[..])
+    c.cur = salvo
+}
+
+// C: nativo/bir/bir_construir_conta.c:322
+proc conversao_checada(c: ^BirCtx, falha: u8, v: ^BirOperando) -> bool {
+    var frio: u32 = 0
+    var segue: u32 = 0
+    var condicao: u32 = 0
+    if not bir_operando_vreg(c, v^, v) {
+        return false
+    }
+    condicao = condicao_de_falha(c, falha, v^)
+    frio = bir_novo_bloco(c, true)
+    segue = bir_novo_bloco(c, false)
+    bir_desvia(c, op_vreg(condicao, BC_I8 as u8), frio, segue)
+    frio_conversao(c, frio, v^)
+    c.cur = segue
+    return true
+}
+
+// C: nativo/bir/bir_construir_conta.c:338
+proc op_da_conversao(classe_origem: u8, classe_destino: u8, origem_sem_sinal: bool) -> i32 {
+    if (classe_destino as i32) > (classe_origem as i32) {
+        var tern_1: i32 = BIR_EXT_S
+        if common.c2f_b2i32(origem_sem_sinal) != 0 {
+            tern_1 = BIR_EXT_Z
+        }
+        return tern_1
+    }
+    var tern_2: i32 = BIR_COPIA
+    if (classe_destino as i32) < (classe_origem as i32) {
+        tern_2 = BIR_TRUNC
+    }
+    return tern_2
+}
+
+// C: nativo/bir/bir_construir_conta.c:346
+proc conversao_validada(c: ^BirCtx, falha: i32, v: ^BirOperando) -> bool {
+    if ((c.p as ^BirPrograma).modo != (BM_DEV as u8)) or (common.c2f_s2u_32(falha) == (FALHA_NENHUMA as u32)) {
+        return true
+    }
+    return conversao_checada(c, falha as u8, v)
+}
+
+// C: nativo/bir/bir_construir_conta.c:353
+proc conversao_pura(c: ^BirCtx, i: ^ir.IrInstr, v: BirOperando) -> bool {
+    var classe: u8 = BC_NADA as u8
+    var dst: u32 = 0
+    _ = bir_classe_do_tipo((c.e as ^BirEntrada).tipos as ^semantic.Tipos, i.tipo, &classe)
+    if not bir_definir_destino(c, classe, &dst) {
+        return false
+    }
+    let arg_1: bool = semantic.tipo_eh_sem_sinal(i.a.tipo)
+    let arg_2: u8 = classe
+    let arg_3: u8 = v.classe
+    _ = bir_emitir_pedido(c, BirPedido{op = op_da_conversao(arg_3, arg_2, arg_1) as u8, dst = dst, a = v})
+    return true
+}
+
+// C: nativo/bir/bir_construir_conta.c:365
+proc conversao_inteira(c: ^BirCtx, i: ^ir.IrInstr) -> bool {
+    var v: BirOperando = BirOperando{}
+    if (not semantic.tipo_eh_inteiro(i.a.tipo)) or (not semantic.tipo_eh_inteiro(i.tipo)) {
+        var tern_1: u32 = i.a.tipo
+        if common.c2f_b2i32(semantic.tipo_eh_inteiro(i.a.tipo)) != 0 {
+            tern_1 = i.tipo
+        }
+        return bir_falha_tipo(c, i, "-", tern_1)
+    }
+    if not bir_operando_de(c, i, &i.a, &v) {
+        return false
+    }
+    if not conversao_validada(c, falha_da_conversao(c, i.a.tipo, i.tipo), &v) {
+        return false
+    }
+    return conversao_pura(c, i, v)
+}
+
+// C: nativo/bir/bir_construir_conta.c:378
+proc bir_regra_conversao(c: ^BirCtx, i: ^ir.IrInstr) -> bool {
+    if i.tipo == (semantic.TIPO_STR as u32) {
+        return bir_cstr_para_str(c, i)
+    }
+    if bir_eh_conversao_ponteiro(c, i) {
+        return bir_conversao_ponteiro(c, i)
+    }
+    if (common.c2f_b2i32(semantic.tipo_eh_real((c.e as ^BirEntrada).tipos as ^semantic.Tipos, i.a.tipo)) != 0) or (common.c2f_b2i32(semantic.tipo_eh_real((c.e as ^BirEntrada).tipos as ^semantic.Tipos, i.tipo)) != 0) {
+        return bir_conversao_real(c, i)
+    }
+    return conversao_inteira(c, i)
+}
+
+// ---------------------------------------------------------------- testes (puros: tabela, sufixo, extensao, imediato)
+
+test "bir_construir_conta_sufixo_inteiro" {
+    expect(bir_sufixo_inteiro(semantic.TIPO_I8 as u32) == "i8")
+    expect(bir_sufixo_inteiro(semantic.TIPO_I16 as u32) == "i16")
+    expect(bir_sufixo_inteiro(semantic.TIPO_I32 as u32) == "i32")
+    expect(bir_sufixo_inteiro(semantic.TIPO_U8 as u32) == "u8")
+    expect(bir_sufixo_inteiro(semantic.TIPO_U16 as u32) == "u16")
+    expect(bir_sufixo_inteiro(semantic.TIPO_U32 as u32) == "u32")
+    expect(bir_sufixo_inteiro(semantic.TIPO_UINT as u32) == "u64")
+    expect(bir_sufixo_inteiro(semantic.TIPO_STR as u32) == "i64")
+}
+
+test "bir_construir_conta_aritmetica_de" {
+    let soma: BirAritmetica = bir_aritmetica_de(0)
+    expect(soma.ov == (BIR_ADD_OV as u8))
+    expect(soma.simples == (BIR_ADD as u8))
+    expect((soma.texto or_else "") == "soma")
+    let subtracao: BirAritmetica = bir_aritmetica_de(1)
+    expect(subtracao.ov == (BIR_SUB_OV as u8))
+    expect(subtracao.simples == (BIR_SUB as u8))
+    expect((subtracao.texto or_else "") == "subtracao")
+    let multiplicacao: BirAritmetica = bir_aritmetica_de(2)
+    expect(multiplicacao.ov == (BIR_MUL_OV as u8))
+    expect(multiplicacao.simples == (BIR_MUL as u8))
+    expect((multiplicacao.texto or_else "") == "multiplicacao")
+}
+
+test "bir_construir_conta_imediato_estendido" {
+    expect(imediato_estendido(-5, BC_I32 as u8, false) == -5)
+    expect(imediato_estendido(-5, BC_I32 as u8, true) == 4294967291)
+    expect(imediato_estendido(-1, BC_I16 as u8, true) == 65535)
+    expect(imediato_estendido(-1, BC_I16 as u8, false) == -1)
+}
+
+test "bir_construir_conta_estendido64" {
+    let imed = bir_estendido64(op_imed(-5, BC_I32 as u8), semantic.TIPO_I32 as u32)
+    expect(imed.tipo == (BO_IMED as u8))
+    expect(imed.classe == (BC_I64 as u8))
+    expect(imed.imed == -5)
+    let vreg_sinal = bir_estendido64(op_vreg(7, BC_I32 as u8), semantic.TIPO_I32 as u32)
+    expect(vreg_sinal.extensao == (BE_SINAL as u8))
+    expect(vreg_sinal.classe == (BC_I32 as u8))
+    let vreg_zero = bir_estendido64(op_vreg(7, BC_I32 as u8), semantic.TIPO_U32 as u32)
+    expect(vreg_zero.extensao == (BE_ZERO as u8))
+}

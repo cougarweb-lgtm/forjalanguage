@@ -1,0 +1,653 @@
+// driver/edicoes.fj - porte de compiler/driver/edicoes.c, compiler/driver/edicoes.h
+// sha256 de driver/edicoes.c: 1a9788d7ad3aa3209e75432951220f9fc891c1b6edb8567dfc0fafc93dff41e2
+// sha256 de driver/edicoes.h: 3be8c2298c4ec37b49fd4083357d861154098a7d5202670475ba6a5ea56bd412
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "common"
+import "nativo"
+
+struct Edicao {
+    linha: u32
+    coluna: u32
+    coluna_fim: u32
+    antigo: ?str
+    novo: ?str
+    linha_fim: u32
+}
+
+// Texto dividido em linhas: ini[k-1] e o inicio da linha k (k de 1 a nlinhas); ini[nlinhas] = tam.
+// C2F-33: texto era `const char *` (str); aqui []u8, porque o texto novo do diff nasce num [dynamic]u8 (sem visao str de bytes).
+struct Linhas {
+    texto: []u8
+    tam: u64
+    ini: [dynamic]u64
+    nlinhas: u32
+}
+
+struct FaixaDeLinhas {
+    a: u32
+    b: u32
+}
+
+// lista: Edicao *lista + n do C vira a fatia (C2F-13); saida e sempre a do chamador.
+struct Diff {
+    velho: Linhas
+    novo: Linhas
+    lista: []Edicao
+    saida: ^[dynamic]u8
+}
+
+// Posicao de uma edicao na lista ordenada: o C ordenava ponteiros (qsort); aqui o indice na lista + a chave (C2F-B0: o desempate por ponteiro a < b e o indice).
+struct EdicaoOrd {
+    linha: u32
+    coluna: u32
+    coluna_fim: u32
+    idx: u32
+}
+
+const CONTEXTO_DIFF: i32 = 3
+const EDICAO_OK: i32 = 0
+const EDICAO_SEM_LINHA: i32 = 1
+const EDICAO_FAIXA_INVALIDA: i32 = 2
+const EDICAO_ANTIGO_DIFERE: i32 = 3
+const EDICAO_SOBREPOSTA: i32 = 4
+const EDICOES_BOM_TAM: i32 = 3
+
+pub proc arena_fatia_edicao(a: ^common.Arena, n: int) -> []Edicao {
+    var l = make([dynamic]Edicao, alloc = common.arena_mem(a), cap = n)
+    for i in 0..<n {
+        append(&l, item = Edicao{})
+    }
+    return l[..]
+}
+
+// C: driver/edicoes.c:18
+proc edicao_status_texto(status: i32) -> str {
+    let sw_1 = common.c2f_s2u_32(status)
+    if sw_1 == (EDICAO_OK as u32) {
+        return "edicao valida"
+    } else if sw_1 == (EDICAO_SEM_LINHA as u32) {
+        return "a linha da edicao nao existe no arquivo"
+    } else if sw_1 == (EDICAO_FAIXA_INVALIDA as u32) {
+        return "a faixa de colunas da edicao e invalida ou passa do fim da linha"
+    } else if sw_1 == (EDICAO_ANTIGO_DIFERE as u32) {
+        return "o texto do arquivo na faixa nao e o 'antigo' da edicao"
+    } else if sw_1 == (EDICAO_SOBREPOSTA as u32) {
+        return "duas edicoes tocam o mesmo trecho"
+    }
+    return "edicao invalida"
+}
+
+// C: driver/edicoes.c:31
+proc linha_fim_de(e: ^Edicao) -> u32 {
+    return max(e.linha_fim, e.linha)
+}
+
+// C: driver/edicoes.c:37
+proc posicao_antes(linha1: u32, coluna1: u32, linha2: u32, coluna2: u32) -> bool {
+    var tern_1: i32 = common.c2f_b2i32(coluna1 < coluna2)
+    if linha1 != linha2 {
+        tern_1 = common.c2f_b2i32(linha1 < linha2)
+    }
+    return tern_1 != 0
+}
+
+// C: driver/edicoes.c:42
+// antes = a se a vem antes de b, senao b; depois e o outro (a e b sao objetos distintos: o mesmo ponto ja saiu no 1o teste).
+proc edicoes_conflitam(a: ^Edicao, b: ^Edicao) -> bool {
+    if (a.linha == b.linha) and (a.coluna == b.coluna) {
+        return true
+    }
+    if posicao_antes(a.linha, a.coluna, b.linha, b.coluna) {
+        return posicao_antes(b.linha, b.coluna, linha_fim_de(a), a.coluna_fim)
+    }
+    return posicao_antes(a.linha, a.coluna, linha_fim_de(b), b.coluna_fim)
+}
+
+// C: driver/edicoes.c:52
+proc edicoes_iguais(a: ^Edicao, b: ^Edicao) -> bool {
+    return (((((a.linha == b.linha) and (linha_fim_de(a) == linha_fim_de(b))) and (a.coluna == b.coluna)) and (a.coluna_fim == b.coluna_fim)) and ((a.antigo or_else "") == (b.antigo or_else ""))) and ((a.novo or_else "") == (b.novo or_else ""))
+}
+
+// C: driver/edicoes.c:58
+// C2F-13: lista fundido em n (len)
+// As contas de linha sao uint32 do C (podem dar a volta no meio da soma): wrapping_*.
+proc edicoes_linha_nova(lista: []Edicao, linha: u32) -> u32 {
+    var nova: u32 = linha
+    for k in 0..<len(lista) {
+        if lista[k].linha >= linha {
+            continue
+        }
+        let novo: str = lista[k].novo or_else ""
+        var quebras: u32 = 0
+        for i in 0..<len(novo) {
+            if novo[i] == 10 { // '\n'
+                quebras += 1
+            }
+        }
+        nova = wrapping_add(nova, quebras)
+        nova = wrapping_sub(nova, wrapping_sub(linha_fim_de(&lista[k]), lista[k].linha))
+    }
+    return nova
+}
+
+// C: driver/edicoes.c:72
+// C2F-B0: o comparador void * do qsort vira (^T, ^T) -> i32 sobre EdicaoOrd; o desempate `a < b` de ponteiros (a ordem na lista) e o idx.
+proc comparar_edicoes(a: ^EdicaoOrd, b: ^EdicaoOrd) -> i32 {
+    if a.linha != b.linha {
+        if a.linha < b.linha {
+            return -1
+        }
+        return 1
+    }
+    if a.coluna != b.coluna {
+        if a.coluna < b.coluna {
+            return -1
+        }
+        return 1
+    }
+    if a.coluna_fim != b.coluna_fim {
+        if a.coluna_fim < b.coluna_fim {
+            return -1
+        }
+        return 1
+    }
+    if a.idx < b.idx {
+        return -1
+    }
+    if a.idx > b.idx {
+        return 1
+    }
+    return 0
+}
+
+proc comparar_edicoes_menor(a: ^EdicaoOrd, b: ^EdicaoOrd) -> bool {
+    return comparar_edicoes(a, b) < 0
+}
+
+// C: driver/edicoes.c:83
+// Indices das edicoes por (linha, coluna). Quem chama libera com delete. O C devolvia `const Edicao **` (malloc); o ponteiro e o idx (ord[k] - lista).
+proc ordenar(lista: []Edicao) -> [dynamic]EdicaoOrd {
+    var ord = make([dynamic]EdicaoOrd, alloc = heap)
+    for k in 0..<len(lista) {
+        append(&ord, item = EdicaoOrd{linha = lista[k].linha, coluna = lista[k].coluna, coluna_fim = lista[k].coluna_fim, idx = k as u32})
+    }
+    sort_by(ord[..], less = comparar_edicoes_menor)
+    return ord
+}
+
+// C: driver/edicoes.c:94
+// Vizinhas na ordem: se alguma sobrepoe, ha sobreposicao (a de inicio mais cedo cobre a seguinte).
+proc conferir_sobreposicao(lista: []Edicao, ord: []EdicaoOrd, ruim: ^u32) -> i32 {
+    for k in 1..<len(ord) {
+        if not edicoes_conflitam(&lista[ord[k - 1].idx], &lista[ord[k].idx]) {
+            continue
+        }
+        ruim^ = ord[k].idx
+        return EDICAO_SOBREPOSTA
+    }
+    return EDICAO_OK
+}
+
+// C: driver/edicoes.c:105
+// Fim do texto util da linha que comeca em 'ini': sem o '\n' e sem o '\r' que o precede.
+proc fim_util_da_linha(texto: ?str, tam: u64, ini: u64) -> u64 {
+    let b: []u8 = as_bytes(texto or_else "")
+    var fim: u64 = achar_byte_na_faixa(b, ini, tam, 10) // '\n'
+    if (fim < tam) and (fim > ini) and (b[fim - 1] == 13) { // '\r'
+        fim -= 1
+    }
+    return fim
+}
+
+// C: driver/edicoes.c:118
+// Anda de linha em linha ate a de numero 'alvo'; *linha e *ini guardam onde parou. false = o texto acaba antes.
+// LIMITE: parametros 5 (texto+tam sao um buffer; *linha e *ini sao o cursor que o chamador reaproveita de uma edicao para a outra).
+proc ir_para_linha(texto: ?str, tam: u64, alvo: u32, linha: ^u32, ini: ^u64) -> bool {
+    let b: []u8 = as_bytes(texto or_else "")
+    while linha^ < alvo {
+        let nl: u64 = achar_byte_na_faixa(b, ini^, tam, 10) // '\n'
+        if nl == tam {
+            return false
+        }
+        ini^ = nl + 1
+        linha^ += 1
+    }
+    return (ini^ < tam) or ((ini^ == tam) and (alvo == 1))
+}
+
+// C: driver/edicoes.c:133
+// A faixa da edicao cabe no texto e o texto dela e o 'antigo'; a linha inicial comeca em 'ini_linha'. Devolve os offsets [*de, *ate) da faixa.
+// LIMITE: parametros 6 (texto+tam sao um buffer; os dois ultimos sao as saidas da faixa).
+proc conferir_faixa(texto: ?str, tam: u64, ini_linha: u64, e: ^Edicao, de: ^u64, ate: ^u64) -> i32 {
+    var linha: u32 = e.linha
+    var ini_fim: u64 = ini_linha
+    if not ir_para_linha(texto, tam, linha_fim_de(e), &linha, &ini_fim) {
+        return EDICAO_SEM_LINHA
+    }
+    // size_t do C: ini + coluna - 1 da a volta quando coluna == 0 (a conferencia logo abaixo recusa)
+    de^ = wrapping_sub(ini_linha + (e.coluna as u64), 1)
+    ate^ = wrapping_sub(ini_fim + (e.coluna_fim as u64), 1)
+    if (e.coluna < 1) or (e.coluna_fim < 1) or (ate^ > fim_util_da_linha(texto, tam, ini_fim)) {
+        return EDICAO_FAIXA_INVALIDA
+    }
+    var faixa_ruim: bool = false
+    if ini_fim == ini_linha {
+        faixa_ruim = e.coluna_fim < e.coluna
+    } else {
+        faixa_ruim = de^ > fim_util_da_linha(texto, tam, ini_linha)
+    }
+    if faixa_ruim {
+        return EDICAO_FAIXA_INVALIDA
+    }
+    let antigo: str = e.antigo or_else ""
+    let b: []u8 = as_bytes(texto or_else "")
+    let n: u64 = wrapping_sub(ate^, de^)
+    if (len(antigo) as u64) != n {
+        return EDICAO_ANTIGO_DIFERE
+    }
+    if common.c2f_memcmp(b[de^..<ate^], as_bytes(antigo)) != 0 {
+        return EDICAO_ANTIGO_DIFERE
+    }
+    return EDICAO_OK
+}
+
+// C: driver/edicoes.c:148
+// C2F-13: lista fundido em n (len)
+// indice_ruim passa de ^u32 para ?^u32 (o C aceita NULL; quem passa ^u32 continua valendo).
+// LIMITE: parametros 5 (texto+tam e lista+n sao pares de buffer da fronteira publica; saida e indice_ruim sao as duas saidas).
+proc edicoes_aplicar(texto: ?str, tam: u64, lista: ?[]Edicao, saida: ^[dynamic]u8, indice_ruim: ?^u32) -> i32 {
+    let l: []Edicao = lista or_else {}
+    let b: []u8 = as_bytes(texto or_else "")
+    var ord = ordenar(l)
+    defer delete(ord)
+    var ruim: u32 = 0
+    var linha: u32 = 1
+    var ini: u64 = 0
+    var copiado: u64 = 0
+    var de: u64 = 0
+    var ate: u64 = 0
+    var novo = make([dynamic]u8, alloc = heap)
+    var st: i32 = conferir_sobreposicao(l, ord[..], &ruim)
+    var k: int = 0
+    while (k < len(l)) and (st == EDICAO_OK) {
+        let i: u32 = ord[k].idx
+        ruim = i
+        if not ir_para_linha(texto, tam, l[i].linha, &linha, &ini) {
+            st = EDICAO_SEM_LINHA
+            break
+        }
+        st = conferir_faixa(texto, tam, ini, &l[i], &de, &ate)
+        if st != EDICAO_OK {
+            break
+        }
+        append(&novo, items = b[copiado..<de])
+        append(&novo, item = l[i].novo or_else "")
+        copiado = ate
+        k += 1
+    }
+    if st == EDICAO_OK {
+        append(&novo, items = b[copiado..<tam])
+        append(saida, items = novo[..])
+    } else if indice_ruim != none {
+        let alvo_ruim: ^u32 = indice_ruim as ^u32
+        alvo_ruim^ = ruim
+    }
+    delete(novo)
+    return st
+}
+
+// C: driver/edicoes.c:187
+proc linhas_indexar(l: ^Linhas, texto: []u8, tam: u64) {
+    var n: u32 = 0
+    l.texto = texto
+    l.tam = tam
+    for k in (0 as u64)..<tam {
+        if texto[k] == 10 { // '\n'
+            n += 1
+        }
+    }
+    if (tam > 0) and (texto[tam - 1] != 10) {
+        n += 1
+    }
+    l.nlinhas = n
+    l.ini = make([dynamic]u64, alloc = heap)
+    append(&l.ini, item = 0 as u64)
+    for k in (1 as u32)..=n {
+        let de: u64 = l.ini[k - 1]
+        let nl: u64 = achar_byte_na_faixa(texto, de, tam, 10) // '\n'
+        if nl < tam {
+            append(&l.ini, item = nl + 1)
+        } else {
+            append(&l.ini, item = tam)
+        }
+    }
+}
+
+// C: driver/edicoes.c:207
+// A linha k (a partir de 1) com o prefixo do diff (' ', '-' ou '+'); sem '\n' no fim do arquivo, a marca do patch.
+proc emitir_linha(saida: ^[dynamic]u8, prefixo: u8, l: ^Linhas, k: u32) {
+    let ini: u64 = l.ini[k - 1]
+    let fim: u64 = l.ini[k]
+    let tem_nl: bool = (fim > ini) and (l.texto[fim - 1] == 10) // '\n'
+    var corte: u64 = 0
+    if tem_nl {
+        corte = 1
+    }
+    append(saida, item = prefixo)
+    append(saida, items = l.texto[ini..<(fim - corte)])
+    append(saida, item = 10 as u8)
+    if not tem_nl {
+        append(saida, item = "\\ No newline at end of file\n")
+    }
+}
+
+// C: driver/edicoes.c:221
+// Linhas originais a..b (inclusive) que as edicoes tocam, em sequencia sem lacuna. O C preenchia faixas[0..total) e devolvia total; aqui a lista nasce no proc e quem chama a possui.
+proc agrupar_faixas(lista: []Edicao, ord: []EdicaoOrd) -> [dynamic]FaixaDeLinhas {
+    var faixas = make([dynamic]FaixaDeLinhas, alloc = heap)
+    for k in 0..<len(ord) {
+        let linha: u32 = lista[ord[k].idx].linha
+        let ultima: u32 = linha_fim_de(&lista[ord[k].idx])
+        let total: int = len(faixas)
+        if (total > 0) and (linha <= (faixas[total - 1].b + 1)) {
+            if ultima > faixas[total - 1].b {
+                faixas[total - 1].b = ultima
+            }
+            continue
+        }
+        append(&faixas, item = FaixaDeLinhas{a = linha, b = ultima})
+    }
+    return faixas
+}
+
+// C: driver/edicoes.c:248
+// Ultima linha NOVA que a faixa terminada na linha velha `b` ocupa. Limitada ao novo texto (uma edicao que poe '\n' no fim de um arquivo sem '\n' final soma uma linha na conta das edicoes).
+proc linha_nova_final(d: ^Diff, b: u32) -> u32 {
+    let nb: u32 = wrapping_sub(edicoes_linha_nova(d.lista, b + 1), 1)
+    if nb > d.novo.nlinhas {
+        return d.novo.nlinhas
+    }
+    return nb
+}
+
+// C: driver/edicoes.c:256
+// Faixas fx[de..ate] formam um hunk: contexto antes, -antigas +novas de cada faixa com o contexto entre elas, contexto depois.
+proc emitir_hunk(d: ^Diff, fx: []FaixaDeLinhas, de: u32, ate: u32) {
+    var ini: u32 = 1
+    if fx[de].a > (CONTEXTO_DIFF as u32) {
+        ini = fx[de].a - (CONTEXTO_DIFF as u32)
+    }
+    var fim: u32 = d.velho.nlinhas
+    if (fx[ate].b + (CONTEXTO_DIFF as u32)) < d.velho.nlinhas {
+        fim = fx[ate].b + (CONTEXTO_DIFF as u32)
+    }
+    let qtd_velho: u32 = wrapping_add(wrapping_sub(fim, ini), 1)
+    var qtd_novo: u32 = qtd_velho
+    var cursor: u32 = ini
+    for f in de..=ate {
+        let na: u32 = edicoes_linha_nova(d.lista, fx[f].a)
+        let nb: u32 = linha_nova_final(d, fx[f].b)
+        let tira: u32 = wrapping_add(wrapping_sub(fx[f].b, fx[f].a), 1)
+        let poe: u32 = wrapping_sub(wrapping_add(nb, 1), na)
+        qtd_novo = wrapping_add(wrapping_sub(qtd_novo, tira), poe)
+    }
+    let ini_novo: u32 = edicoes_linha_nova(d.lista, ini)
+    let cab = format(f"@@ -{ini},{qtd_velho} +{ini_novo},{qtd_novo} @@\n", alloc = heap)
+    defer delete(cab)
+    append(d.saida, item = cab)
+    for f in de..=ate {
+        let na: u32 = edicoes_linha_nova(d.lista, fx[f].a)
+        let nb: u32 = linha_nova_final(d, fx[f].b)
+        while cursor < fx[f].a {
+            emitir_linha(d.saida, 32, &d.velho, cursor) // ' '
+            cursor += 1
+        }
+        var kv: u32 = fx[f].a
+        while kv <= fx[f].b {
+            emitir_linha(d.saida, 45, &d.velho, kv) // '-'
+            kv += 1
+        }
+        var kn: u32 = na
+        while kn <= nb {
+            emitir_linha(d.saida, 43, &d.novo, kn) // '+'
+            kn += 1
+        }
+        cursor = fx[f].b + 1
+    }
+    while cursor <= fim {
+        emitir_linha(d.saida, 32, &d.velho, cursor) // ' '
+        cursor += 1
+    }
+}
+
+// C: driver/edicoes.c:280
+// Todos os hunks: faixas separadas por no maximo 2 * contexto linhas iguais dividem o mesmo hunk.
+// C2F-13: fx fundido em nfaixas (len)
+proc emitir_hunks(d: ^Diff, fx: []FaixaDeLinhas) {
+    var de: u32 = 0
+    let nfaixas: u32 = len(fx) as u32
+    for k in (1 as u32)..=nfaixas {
+        if (k < nfaixas) and ((((fx[k].a - fx[k - 1].b) - 1) <= common.c2f_s2u_32(2 * CONTEXTO_DIFF))) {
+            continue
+        }
+        emitir_hunk(d, fx, de, k - 1)
+        de = k
+    }
+}
+
+// C: driver/edicoes.c:292
+// Diff unificado (3 linhas de contexto, "--- a/<nome>" e "+++ b/<nome>") do texto contra o texto com as edicoes aplicadas, ANEXADO a *saida.
+// lista + n: o par ponteiro+contagem do C (assinatura mantida); aqui vira a fatia da lista do chamador.
+proc edicoes_diff(texto: ?str, tam: u64, lista: ?^Edicao, n: u32, nome: str, saida: ^[dynamic]u8) -> i32 {
+    var l: []Edicao = {}
+    if n > 0 {
+        l = slice_from(lista as ^Edicao, len = n as int)
+    }
+    var aplicado = make([dynamic]u8, alloc = heap)
+    defer delete(aplicado)
+    let st: i32 = edicoes_aplicar(texto, tam, l, &aplicado, none)
+    if (st != EDICAO_OK) or (n == 0) {
+        return st
+    }
+    var ord = ordenar(l)
+    defer delete(ord)
+    var d: Diff = Diff{lista = l, saida = saida}
+    var faixas = agrupar_faixas(l, ord[..])
+    defer delete(faixas)
+    linhas_indexar(&d.velho, as_bytes(texto or_else "")[0..<(tam as int)], tam)
+    defer delete(d.velho.ini)
+    linhas_indexar(&d.novo, aplicado[..], len(aplicado) as u64)
+    defer delete(d.novo.ini)
+    let cab = format(f"--- a/{nome}\n+++ b/{nome}\n", alloc = heap)
+    defer delete(cab)
+    append(saida, item = cab)
+    emitir_hunks(&d, faixas[..])
+    return EDICAO_OK
+}
+
+// C: driver/edicoes.c:321
+proc edicoes_tem_bom(dados: []u8, tam: u64) -> bool {
+    return (((tam >= (EDICOES_BOM_TAM as u64)) and (dados[0] == 239)) and (dados[1] == 187)) and (dados[2] == 191)
+}
+
+// C: driver/edicoes.c:327
+// ANEXA a *novo o conteudo de um arquivo lido por inteiro ('original', com BOM se tinha) depois de aplicar as edicoes; o BOM do original vai junto.
+// lista + n: mesmo par ponteiro+contagem do edicoes_diff.
+proc edicoes_montar_arquivo(original: str, tam: u64, lista: ?^Edicao, n: u32, novo: ^[dynamic]u8) -> bool {
+    var l: []Edicao = {}
+    if n > 0 {
+        l = slice_from(lista as ^Edicao, len = n as int)
+    }
+    var bom: u64 = 0
+    if edicoes_tem_bom(as_bytes(original), tam) {
+        bom = EDICOES_BOM_TAM as u64
+    }
+    append(novo, items = as_bytes(original)[0..<(bom as int)])
+    return edicoes_aplicar(original[(bom as int)..<len(original)], tam - bom, l, novo, none) == EDICAO_OK
+}
+
+// C: driver/edicoes.c:335
+// C2F-61: ArquivoLerInteiro (cache, saida ^?^u8 sem uso na Forja) -> o shim c2f_ler_arquivo (bytes crus, como "rb"); o teto de 2 GiB do C nao se aplica.
+proc edicoes_desfazer(arquivo: ?str, original: ?str, tam: u64) -> bool {
+    var ok: bool = common.arquivo_gravar_atomico(arquivo, original, tam, none)
+    if ok {
+        var atual = make([dynamic]u8, alloc = heap)
+        var motivo: str = ""
+        ok = common.c2f_ler_arquivo(arquivo or_else "", &atual, &motivo) and ((len(atual) as u64) == tam) and (common.c2f_memcmp(atual[..], as_bytes(original or_else "")[0..<(tam as int)]) == 0)
+        delete(atual)
+    }
+    return ok
+}
+
+// C: driver/edicoes.c:348
+proc escape_curto(ch: u8) -> ?str {
+    let sw_1 = ch as i32
+    if sw_1 == 34 { // '"'
+        return "\\\""
+    } else if sw_1 == 92 { // '\\'
+        return "\\\\"
+    } else if sw_1 == 10 { // '\n'
+        return "\\n"
+    } else if sw_1 == 13 { // '\r'
+        return "\\r"
+    } else if sw_1 == 9 { // '\t'
+        return "\\t"
+    } else {
+        return none
+    }
+    return none
+}
+
+// C: driver/edicoes.c:360
+proc edicoes_json_texto(b: ^[dynamic]u8, texto: ?str, n: u64) {
+    let t: str = texto or_else ""
+    append(b, item = "\"")
+    for k in (0 as u64)..<n {
+        let ch: u8 = t[k]
+        let curto: ?str = escape_curto(ch)
+        if curto != none {
+            append(b, item = curto or_else "")
+            continue
+        }
+        if ch < 32 { // 0x20
+            append(b, item = "\\u")
+            format(f"{ch:04x}", into = b)
+        } else {
+            append(b, item = ch)
+        }
+    }
+    append(b, item = "\"")
+}
+
+// C: driver/edicoes.c:377
+// texto[0] == '\0' do C: um str vazio (o `(texto or_else "")[0]` da promocao dava R0006 no str vazio).
+proc edicoes_json_texto_ou_nulo(b: ^[dynamic]u8, texto: ?str) {
+    if (texto == none) or (len(texto or_else "") == 0) {
+        append(b, item = "null")
+    } else {
+        edicoes_json_texto(b, texto, len((texto or_else "")) as u64)
+    }
+}
+
+// C: driver/edicoes.c:383
+proc edicoes_json_edicao(b: ^[dynamic]u8, e: ^Edicao, arquivo: ?str) {
+    append(b, item = "{\"arquivo\": ")
+    nativo.json_caminho(b, arquivo)
+    format(f", \"linha\": {e.linha}, \"coluna\": {e.coluna}, ", into = b)
+    if e.linha_fim > e.linha {
+        format(f"\"linha_fim\": {e.linha_fim}, ", into = b)
+    }
+    format(f"\"coluna_fim\": {e.coluna_fim}, \"antigo\": ", into = b)
+    let arg_1: u64 = len((e.antigo or_else "")) as u64
+    let arg_2: ?str = e.antigo
+    let arg_3: ^[dynamic]u8 = b
+    edicoes_json_texto(arg_3, arg_2, arg_1)
+    append(b, item = ", \"novo\": ")
+    let arg_4: u64 = len((e.novo or_else "")) as u64
+    let arg_5: ?str = e.novo
+    let arg_6: ^[dynamic]u8 = b
+    edicoes_json_texto(arg_6, arg_5, arg_4)
+    append(b, item = "}")
+}
+
+test "edicoes_aplicar: troca, antigo diferente, sobreposicao e linha inexistente" {
+    let texto = "abcdef\nghi\n"
+    let tam: u64 = len(texto) as u64
+    var saida = make([dynamic]u8, alloc = heap)
+    var l = make([dynamic]Edicao, alloc = heap)
+    append(&l, item = Edicao{linha = 1, coluna = 1, coluna_fim = 4, antigo = "abc", novo = "XY"})
+    append(&l, item = Edicao{linha = 2, coluna = 2, coluna_fim = 3, antigo = "h", novo = ""})
+    var ruim: u32 = 99
+    expect(edicoes_aplicar(texto, tam, l[..], &saida, &ruim) == EDICAO_OK)
+    let r1 = from_bytes(saida[..], alloc = heap)
+    expect(r1 == "XYdef\ngi\n")
+    delete(r1)
+    l[1].antigo = "z"
+    expect(edicoes_aplicar(texto, tam, l[..], &saida, &ruim) == EDICAO_ANTIGO_DIFERE)
+    expect(ruim == 1)
+    l[1].antigo = "h"
+    l[1].linha = 1
+    l[1].coluna = 2
+    l[1].coluna_fim = 3
+    l[1].antigo = "b"
+    expect(edicoes_aplicar(texto, tam, l[..], &saida, &ruim) == EDICAO_SOBREPOSTA)
+    l[1].linha = 9
+    expect(edicoes_aplicar(texto, tam, l[..], &saida, none) == EDICAO_SEM_LINHA)
+    delete(l)
+    delete(saida)
+}
+
+test "edicoes_diff e edicoes_montar_arquivo" {
+    let texto = "a\nb\nc\n"
+    let tam: u64 = len(texto) as u64
+    var l = make([dynamic]Edicao, alloc = heap)
+    append(&l, item = Edicao{linha = 2, coluna = 1, coluna_fim = 2, antigo = "b", novo = "B"})
+    var d = make([dynamic]u8, alloc = heap)
+    expect(edicoes_diff(texto, tam, &l[0], 1, "x.fj", &d) == EDICAO_OK)
+    let dt = from_bytes(d[..], alloc = heap)
+    expect(dt == "--- a/x.fj\n+++ b/x.fj\n@@ -1,3 +1,3 @@\n a\n-b\n+B\n c\n")
+    delete(dt)
+    delete(d)
+    var b = make([dynamic]u8, alloc = heap)
+    append(&b, item = 239 as u8)
+    append(&b, item = 187 as u8)
+    append(&b, item = 191 as u8)
+    append(&b, item = "abc\n")
+    let original = from_bytes(b[..], alloc = heap)
+    var l2 = make([dynamic]Edicao, alloc = heap)
+    append(&l2, item = Edicao{linha = 1, coluna = 1, coluna_fim = 2, antigo = "a", novo = "Z"})
+    var novo = make([dynamic]u8, alloc = heap)
+    expect(edicoes_tem_bom(b[..], len(b) as u64))
+    expect(edicoes_montar_arquivo(original, len(original) as u64, &l2[0], 1, &novo))
+    expect(len(novo) == 7)
+    expect(novo[0] == 239)
+    expect(novo[3] == 90)
+    delete(novo)
+    delete(l2)
+    delete(original)
+    delete(b)
+    delete(l)
+}
+
+test "edicoes_json_texto, edicoes_json_texto_ou_nulo, edicoes_linha_nova, edicoes_conflitam" {
+    var b = make([dynamic]u8, alloc = heap)
+    edicoes_json_texto(&b, "a\"b\\c\n\t", 7)
+    edicoes_json_texto_ou_nulo(&b, none)
+    edicoes_json_texto_ou_nulo(&b, "")
+    edicoes_json_texto_ou_nulo(&b, "x")
+    let j = from_bytes(b[..], alloc = heap)
+    expect(j == "\"a\\\"b\\\\c\\n\\t\"nullnull\"x\"")
+    delete(j)
+    delete(b)
+    let vazia: []Edicao = {}
+    expect(edicoes_linha_nova(vazia, 5) == 5)
+    var e1: Edicao = Edicao{linha = 1, coluna = 1, coluna_fim = 4, antigo = "abc", novo = ""}
+    var e2: Edicao = Edicao{linha = 1, coluna = 3, coluna_fim = 6, antigo = "cde", novo = ""}
+    var e3: Edicao = Edicao{linha = 1, coluna = 4, coluna_fim = 6, antigo = "de", novo = ""}
+    expect(edicoes_conflitam(&e1, &e2))
+    expect(not edicoes_conflitam(&e1, &e3))
+    expect(edicoes_iguais(&e1, &e1))
+    expect(not edicoes_iguais(&e1, &e2))
+}

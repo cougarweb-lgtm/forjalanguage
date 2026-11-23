@@ -1,0 +1,453 @@
+// IA1-S2f (D-FMT): std:fmt, leitura estrita por regiao: parse_number, parse_integer, parse_fixed, parse_money e parse_percent. Cada linha: tipo, regiao, [texto] -> ok valor | nome do erro, e `@N` = o `at` (offset em bytes do 1o byte ruim; -1 = intocado, o contrato e gravar so no erro).
+// No texto: '~' vale U+00A0 e '^' vale U+202F (montados por byte). Real impresso em %.17g (f"{v}"). Cada linha e conferida contra o oraculo Python independente (scratchpad, sem o forja).
+import "std:fmt" as fmt
+
+const NBSP_1: u8 = 0xC2
+const NBSP_2: u8 = 0xA0
+const NNBSP_1: u8 = 0xE2
+const NNBSP_2: u8 = 0x80
+const NNBSP_3: u8 = 0xAF
+const TIL: u8 = 126
+const CIRCUMFLEX: u8 = 94
+
+// O texto do caso com '~' trocado por U+00A0 e '^' por U+202F: texto dono.
+proc real_texto(texto: str) -> str {
+    var b = make([dynamic]u8, alloc = heap, cap = 64)
+    defer delete(b)
+    for i in 0..<len(texto) {
+        let c = texto[i]
+        if c == TIL {
+            append(&b, item = NBSP_1)
+            append(&b, item = NBSP_2)
+        } else if c == CIRCUMFLEX {
+            append(&b, item = NNBSP_1)
+            append(&b, item = NNBSP_2)
+            append(&b, item = NNBSP_3)
+        } else {
+            append(&b, item = c)
+        }
+    }
+    return to_str(&b)
+}
+
+proc nome_erro(e: fmt.ParseError) -> str {
+    switch e {
+    case fmt.ParseError.empty:
+        return "empty"
+    case fmt.ParseError.invalid:
+        return "invalid"
+    case fmt.ParseError.grouping:
+        return "grouping"
+    case fmt.ParseError.overflow:
+        return "overflow"
+    }
+    return "?"
+}
+
+proc imprime(rotulo: str, resultado: str, pos: int) {
+    print(f"{rotulo} -> {resultado} @{pos}")
+}
+
+proc resultado_int(r: int) -> str {
+    return format(f"ok {r}", alloc = heap)
+}
+
+proc resultado_real(r: f64) -> str {
+    return format(f"ok {r}", alloc = heap)
+}
+
+// parse_number
+proc num(tag: str, texto: str) {
+    let loc = fmt.find_locale(tag) or_else fmt.ISO
+    let t = real_texto(texto)
+    defer delete(t)
+    var pos = -1
+    let rotulo = format(f"number {tag} [{texto}]", alloc = heap)
+    defer delete(rotulo)
+    switch r in fmt.parse_number(t, loc = loc, at = &pos) {
+    case f64:
+        let s = resultado_real(r)
+        imprime(rotulo, s, pos)
+        delete(s)
+    case fmt.ParseError:
+        imprime(rotulo, nome_erro(r), pos)
+    }
+}
+
+// parse_integer
+proc inteiro(tag: str, texto: str) {
+    let loc = fmt.find_locale(tag) or_else fmt.ISO
+    let t = real_texto(texto)
+    defer delete(t)
+    var pos = -1
+    let rotulo = format(f"integer {tag} [{texto}]", alloc = heap)
+    defer delete(rotulo)
+    switch r in fmt.parse_integer(t, loc = loc, at = &pos) {
+    case int:
+        let s = resultado_int(r)
+        imprime(rotulo, s, pos)
+        delete(s)
+    case fmt.ParseError:
+        imprime(rotulo, nome_erro(r), pos)
+    }
+}
+
+// parse_fixed
+proc fixo(tag: str, texto: str, scale: int) {
+    let loc = fmt.find_locale(tag) or_else fmt.ISO
+    let t = real_texto(texto)
+    defer delete(t)
+    var pos = -1
+    let rotulo = format(f"fixed {tag} [{texto}] s={scale}", alloc = heap)
+    defer delete(rotulo)
+    switch r in fmt.parse_fixed(t, loc = loc, scale = scale, at = &pos) {
+    case int:
+        let s = resultado_int(r)
+        imprime(rotulo, s, pos)
+        delete(s)
+    case fmt.ParseError:
+        imprime(rotulo, nome_erro(r), pos)
+    }
+}
+
+// parse_money
+proc din(tag: str, texto: str, scale: int) {
+    let loc = fmt.find_locale(tag) or_else fmt.ISO
+    let t = real_texto(texto)
+    defer delete(t)
+    var pos = -1
+    let rotulo = format(f"money {tag} [{texto}] s={scale}", alloc = heap)
+    defer delete(rotulo)
+    switch r in fmt.parse_money(t, loc = loc, scale = scale, at = &pos) {
+    case int:
+        let s = resultado_int(r)
+        imprime(rotulo, s, pos)
+        delete(s)
+    case fmt.ParseError:
+        imprime(rotulo, nome_erro(r), pos)
+    }
+}
+
+// parse_percent
+proc pct(tag: str, texto: str) {
+    let loc = fmt.find_locale(tag) or_else fmt.ISO
+    let t = real_texto(texto)
+    defer delete(t)
+    var pos = -1
+    let rotulo = format(f"percent {tag} [{texto}]", alloc = heap)
+    defer delete(rotulo)
+    switch r in fmt.parse_percent(t, loc = loc, at = &pos) {
+    case f64:
+        let s = resultado_real(r)
+        imprime(rotulo, s, pos)
+        delete(s)
+    case fmt.ParseError:
+        imprime(rotulo, nome_erro(r), pos)
+    }
+}
+
+// Um 1 seguido de `zeros` zeros: texto dono (para estourar o f64).
+proc um_e_zeros(zeros: int) -> str {
+    var b = make([dynamic]u8, alloc = heap, cap = 400)
+    defer delete(b)
+    append(&b, item = "1")
+    for _i in 0..<zeros {
+        append(&b, item = "0")
+    }
+    return to_str(&b)
+}
+
+proc grandes() {
+    let vinte = um_e_zeros(20)
+    let enorme = um_e_zeros(330)
+    defer delete(vinte)
+    defer delete(enorme)
+    var pos = -1
+    switch r in fmt.parse_number(vinte, loc = fmt.ISO, at = &pos) {
+    case f64:
+        print(f"1e20 -> ok {r} @{pos}")
+    case fmt.ParseError:
+        print(f"1e20 -> {nome_erro(r)} @{pos}")
+    }
+    switch r in fmt.parse_number(enorme, loc = fmt.ISO, at = &pos) {
+    case f64:
+        print(f"1e330 -> ok {r} @{pos}")
+    case fmt.ParseError:
+        print(f"1e330 -> {nome_erro(r)} @{pos}")
+    }
+    let enorme_pct = format(f"{enorme}%", alloc = heap)
+    defer delete(enorme_pct)
+    switch r in fmt.parse_percent(enorme_pct, loc = fmt.ISO, at = &pos) {
+    case f64:
+        print(f"1e330% -> ok {r} @{pos}")
+    case fmt.ParseError:
+        print(f"1e330% -> {nome_erro(r)} @{pos}")
+    }
+}
+
+proc main() {
+    num("pt-BR", "1.223,34")
+    num("pt-BR", "1223,34")
+    num("pt-BR", "0,5")
+    num("pt-BR", "12")
+    num("pt-BR", "-1.223,34")
+    num("pt-BR", "1.2.3")
+    num("pt-BR", "1.22")
+    num("pt-BR", ",5")
+    num("pt-BR", "5,")
+    num("pt-BR", "-")
+    num("pt-BR", "")
+    num("pt-BR", "1e5")
+    num("pt-BR", "+5")
+    num("pt-BR", " 5")
+    num("pt-BR", "5 ")
+    num("pt-BR", "1.234.567,891")
+    num("pt-BR", "00012,50")
+    num("pt-BR", "1,2,3")
+    num("pt-BR", "R$1,00")
+    num("pt-BR", "1.000")
+    num("pt-BR", "1.00")
+    num("pt-BR", "12.345")
+    num("pt-BR", "123.456")
+    num("pt-BR", "1234.567")
+    num("pt-BR", "1.2345")
+    num("pt-BR", "--5")
+    num("pt-BR", "5-")
+    num("pt-BR", "1.234,5,6")
+    num("pt-BR", "-0,0")
+    num("pt-BR", "0,000001")
+    num("pt-BR", "123456789012345,5")
+    num("pt-BR", "1234567.890")
+    num("pt-BR", "12 345")
+    num("pt-BR", "1.234.5")
+    num("en-US", "1,234.5")
+    num("en-US", "1,5")
+    num("en-US", "1.234,5")
+    num("en-US", "1234.5")
+    num("en-US", "1,234,567")
+    num("en-US", ".5")
+    num("en-US", "5.")
+    num("en-US", "0.5")
+    num("en-US", "-1,234.56")
+    num("en-US", "12,34")
+    num("en-US", "1,23")
+    num("ISO", "1234.5")
+    num("ISO", "1,234")
+    num("ISO", "-0.25")
+    num("ISO", "1 234")
+    num("ISO", "12")
+    num("ISO", "1.")
+    num("es-ES", "1234")
+    num("es-ES", "1.234")
+    num("es-ES", "12.345")
+    num("es-ES", "1.234.567")
+    num("es-ES", "1234,5")
+    num("es-ES", "123.456,7")
+    num("es-ES", "12345")
+    num("es-ES", "1.23")
+    num("fr-FR", "1 234,5")
+    num("fr-FR", "1~234,5")
+    num("fr-FR", "1^234,5")
+    num("fr-FR", "1  234")
+    num("fr-FR", "12 34")
+    num("fr-FR", "1 234 567,25")
+    num("fr-FR", "1~234^567")
+    num("fr-FR", "12 ")
+    num("fr-FR", " 12")
+    num("fr-FR", "1 ")
+    num("pt-PT", "1 234,5")
+    num("pt-PT", "12 345")
+    num("pt-PT", "12 345,67")
+    num("pt-PT", "12~345,67")
+    num("pt-PT", "1234,5")
+    num("pt-PT", "12^345")
+    num("pt-PT", "1 234 567")
+    num("de-DE", "1.234,5")
+    num("de-DE", "1,234")
+    num("de-DE", "1.234.567,891")
+    inteiro("pt-BR", "1.234")
+    inteiro("pt-BR", "1.234.567")
+    inteiro("pt-BR", "1,5")
+    inteiro("pt-BR", "-9223372036854775808")
+    inteiro("pt-BR", "9223372036854775807")
+    inteiro("pt-BR", "9223372036854775808")
+    inteiro("pt-BR", "-9223372036854775809")
+    inteiro("pt-BR", "9.223.372.036.854.775.807")
+    inteiro("pt-BR", "0")
+    inteiro("pt-BR", "-0")
+    inteiro("pt-BR", "007")
+    inteiro("pt-BR", "12,")
+    inteiro("pt-BR", "1.23")
+    inteiro("pt-BR", "99999999999999999999")
+    inteiro("pt-BR", "-")
+    inteiro("pt-BR", "")
+    inteiro("en-US", "1,234")
+    inteiro("en-US", "1,23")
+    inteiro("en-US", "1.5")
+    inteiro("en-US", "-1,234,567")
+    inteiro("fr-FR", "1 234")
+    inteiro("fr-FR", "1~234")
+    inteiro("fr-FR", "1^234")
+    inteiro("fr-FR", "12 345 678")
+    inteiro("es-ES", "1234")
+    inteiro("es-ES", "1.234")
+    inteiro("es-ES", "12.345")
+    inteiro("ISO", "1234")
+    inteiro("ISO", "1,234")
+    fixo("pt-BR", "1.223,34", 2)
+    fixo("pt-BR", "1.223,3", 2)
+    fixo("pt-BR", "1.223", 2)
+    fixo("pt-BR", "1,001", 2)
+    fixo("pt-BR", "0,05", 2)
+    fixo("pt-BR", "92.233.720.368.547.758,07", 2)
+    fixo("pt-BR", "92.233.720.368.547.758,08", 2)
+    fixo("pt-BR", "-92.233.720.368.547.758,08", 2)
+    fixo("pt-BR", "-92.233.720.368.547.758,09", 2)
+    fixo("pt-BR", "0,", 2)
+    fixo("pt-BR", ",5", 2)
+    fixo("pt-BR", "1.223,345", 2)
+    fixo("pt-BR", "5", 2)
+    fixo("pt-BR", "-5", 2)
+    fixo("pt-BR", "-0,01", 2)
+    fixo("pt-BR", "0,12345", 5)
+    fixo("pt-BR", "1,5", 5)
+    fixo("pt-BR", "1,5000000001", 5)
+    fixo("pt-BR", "12345678901234567890", 5)
+    fixo("pt-BR", "1,5", 9)
+    fixo("pt-BR", "0,000000001", 9)
+    fixo("pt-BR", "9.223.372.036,854775807", 9)
+    fixo("pt-BR", "9.223.372.036,854775808", 9)
+    fixo("pt-BR", "5,899", 3)
+    fixo("pt-BR", "12,5", 3)
+    fixo("pt-BR", "5,8999", 3)
+    fixo("pt-BR", "5", 0)
+    fixo("pt-BR", "5,0", 0)
+    fixo("pt-BR", "922.337.203.685.477.580,7", 0)
+    fixo("en-US", "1,223.34", 2)
+    fixo("en-US", "1,223,34", 2)
+    fixo("en-US", "1,223.3", 2)
+    din("pt-BR", "R$ 1.223,34", 2)
+    din("pt-BR", "R$1.223,34", 2)
+    din("pt-BR", "-R$ 1.223,34", 2)
+    din("pt-BR", "(R$ 1.223,34)", 2)
+    din("pt-BR", "BRL 1.223,34", 2)
+    din("pt-BR", "1.223,34", 2)
+    din("pt-BR", "R$ 1,00", 2)
+    din("pt-BR", "R$", 2)
+    din("pt-BR", "R$ ", 2)
+    din("pt-BR", "(R$ 1,00", 2)
+    din("pt-BR", "()", 2)
+    din("pt-BR", "(1,00)", 2)
+    din("pt-BR", "R$ -1,00", 2)
+    din("pt-BR", "-(R$ 1,00)", 2)
+    din("pt-BR", "R$  1,00", 2)
+    din("pt-BR", "1,00 R$", 2)
+    din("pt-BR", "R$ 1,00 ", 2)
+    din("pt-BR", "-1,00", 2)
+    din("pt-BR", "(-1,00)", 2)
+    din("pt-BR", "R$ 1,001", 2)
+    din("pt-BR", "R$ 1,0", 2)
+    din("pt-BR", "R$ 9.223.372.036.854.775,80", 2)
+    din("pt-BR", "R$ 92.233.720.368.547.758,07", 2)
+    din("pt-BR", "-R$ 92.233.720.368.547.758,08", 2)
+    din("pt-BR", "R$ 92.233.720.368.547.758,08", 2)
+    din("pt-BR", "R$~1,00", 2)
+    din("pt-BR", "R$^1,00", 2)
+    din("pt-BR", "r$ 1,00", 2)
+    din("pt-BR", "USD 1,00", 2)
+    din("pt-BR", "R$ 1.2,00", 2)
+    din("pt-BR", "(", 2)
+    din("pt-BR", ")", 2)
+    din("pt-BR", "-", 2)
+    din("pt-BR", "R$ ,50", 2)
+    din("pt-BR", "R$ 0,50", 2)
+    din("pt-BR", "R$ 5,899", 3)
+    din("pt-BR", "-R$ 0,001", 3)
+    din("pt-BR", "(R$ 12.345,678)", 3)
+    din("pt-BR", "R$ 1.234", 0)
+    din("pt-BR", "R$ 5", 0)
+    din("pt-BR", "1.234", 0)
+    din("en-US", "$1,223.34", 2)
+    din("en-US", "$ 1.00", 2)
+    din("en-US", "USD 1.00", 2)
+    din("en-US", "-$1.00", 2)
+    din("en-US", "($1.00)", 2)
+    din("en-US", "$", 2)
+    din("en-US", "1.00 $", 2)
+    din("en-US", "$1,23", 2)
+    din("en-US", "US$1.00", 2)
+    din("en-US", "1.00", 2)
+    din("en-GB", "£1,000.00", 2)
+    din("en-GB", "-£1.50", 2)
+    din("en-GB", "GBP 2.00", 2)
+    din("es-ES", "12.233,40 €", 2)
+    din("es-ES", "12.233,40€", 2)
+    din("es-ES", "12.233,40 EUR", 2)
+    din("es-ES", "€ 12,00", 2)
+    din("es-ES", "(12,00 €)", 2)
+    din("es-ES", "-12,00 €", 2)
+    din("es-ES", "1.223,40 €", 2)
+    din("es-ES", "1234,50 €", 2)
+    din("es-ES", "12,00 € ", 2)
+    din("es-ES", "12,00  €", 2)
+    din("es-ES", "12,00", 2)
+    din("es-ES", "12,00 $", 2)
+    din("fr-FR", "1 234,56 €", 2)
+    din("fr-FR", "1~234,56~€", 2)
+    din("fr-FR", "1^234,56^€", 2)
+    din("fr-FR", "1 234 €", 2)
+    din("fr-FR", "1~234~€", 2)
+    din("fr-FR", "1 234,56€", 2)
+    din("fr-FR", "-1 234,56 €", 2)
+    din("fr-FR", "(1 234,56 €)", 2)
+    din("fr-FR", "12 34,56 €", 2)
+    din("fr-FR", "1 234,56 EUR", 2)
+    din("pt-PT", "12 345,67 €", 2)
+    din("pt-PT", "1 234,56 €", 2)
+    din("pt-PT", "12~345,67^€", 2)
+    din("pt-PT", "1234,56 €", 2)
+    din("de-DE", "1.234,56 €", 2)
+    din("de-DE", "-1.234,56 €", 2)
+    din("de-DE", "€ 1.234,56", 2)
+    din("it-IT", "1.234,56 €", 2)
+    din("it-IT", "(1.234,56 €)", 2)
+    din("ISO", "¤ 12.50", 2)
+    din("ISO", "XXX 12.50", 2)
+    din("ISO", "12.50", 2)
+    din("ISO", "-¤ 1.00", 2)
+    din("ISO", "¤12.50", 2)
+    din("ISO", "(¤ 1.00)", 2)
+    din("ISO", "1,234.50", 2)
+    din("ISO", "12.50 ¤", 2)
+    pct("pt-BR", "12,5%")
+    pct("pt-BR", "12,5 %")
+    pct("pt-BR", "12,5")
+    pct("pt-BR", "%")
+    pct("pt-BR", "-50%")
+    pct("pt-BR", "1.234%")
+    pct("pt-BR", "0,5 %")
+    pct("pt-BR", "12,5%%")
+    pct("pt-BR", " 12%")
+    pct("pt-BR", "100%")
+    pct("pt-BR", "0%")
+    pct("pt-BR", "-0%")
+    pct("pt-BR", "12,5 % ")
+    pct("pt-BR", "0,0115%")
+    pct("pt-BR", "1.23%")
+    pct("pt-BR", "12,5~%")
+    pct("pt-BR", "12,5^%")
+    pct("pt-BR", "12,5  %")
+    pct("fr-FR", "12,5 %")
+    pct("fr-FR", "12,5%")
+    pct("fr-FR", "1 234 %")
+    pct("fr-FR", "12,5~%")
+    pct("en-US", "12.5%")
+    pct("en-US", "1,234.5%")
+    pct("en-US", "12,5%")
+    pct("ISO", "12.5%")
+    pct("ISO", "100 %")
+    pct("es-ES", "12,5 %")
+    pct("es-ES", "1234 %")
+    pct("es-ES", "1.234 %")
+    grandes()
+}

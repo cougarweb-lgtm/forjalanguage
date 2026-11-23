@@ -1,0 +1,921 @@
+// common/fonte.fj - porte de compiler/common/fonte.c, compiler/common/fonte.h
+// sha256 de common/fonte.c: 15afcdc396e08f5b2a574f46893818015bfb44d86ad38da5fd18941c86ffba49
+// sha256 de common/fonte.h: 7ef29dcd52f37aadb5e6ac8c6c5af5adb30ebbcbf2b33a9532ca4a9ceb554062
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.2.0
+// Changelog: 0.2.0 - G3 P-common C1a: corpo real. Fonte ganha 3 campos dono_* (a lista que e DONA dos bytes; texto, inicio_linha e trechos sao visoes dela, refeitas a cada
+//            mudanca: lista de dono unico nao muda de dono, E0311); texto tem len(texto) = tam + 4 (C2F-18, os 4 zeros de sentinela do lexer).
+//            Leitura por std:file/std:os; mensagens do stderr em modo texto pelo shim (c2f_saida_stderr); gravacao atomica por file.rename com as esperas do C.
+
+import "std:file"
+import "std:os"
+
+pub struct FonteTrecho {
+    inicio: u32
+    fim: u32
+    linha_base: u32
+    caminho: ?str
+}
+
+pub struct Fonte {
+    caminho: ?str
+    texto: []u8
+    tam: u64
+    inicio_linha: ?[]u32
+    ninicios: u32
+    trechos: ?[]FonteTrecho
+    ntrechos: u32
+    dono_texto: [dynamic]u8
+    dono_linhas: [dynamic]u32
+    dono_trechos: [dynamic]FonteTrecho
+}
+
+pub struct FontePosicao {
+    caminho: ?str
+    linha: u32
+    coluna: u32
+}
+
+struct NomesAtomicos {
+    temporario: ?str
+    velho: ?str
+}
+
+struct Conteudo {
+    dados: ?str
+    tam: u64
+    descarregar: bool
+}
+
+pub const FONTE_TAM_MAX: u32 = 1073741824
+const FONTE_BLOCO_STREAM: u32 = 65536
+const ATOMICO_TENTATIVAS: i32 = 8
+const ATOMICO_TENTATIVAS_NEGADO: i32 = 1
+const ATOMICO_ESPERA_INICIAL_MS: i32 = 10
+const ATOMICO_TAM_CAMINHO: i32 = 1100
+
+// errno da UCRT usados aqui
+const ERRNO_ENOENT: i32 = 2
+const ERRNO_EIO: i32 = 5
+const ERRNO_EACCES: i32 = 13
+const ERRNO_EEXIST: i32 = 17
+const ERRNO_EISDIR: i32 = 21
+const ERRNO_ENAMETOOLONG: i32 = 38
+
+// fprintf(stderr, ...): a mensagem ja pronta (format com alloc = heap, que esta proc libera) sai pelo shim em modo texto (\n vira \r\n)
+proc avisar_stderr(msg: str) {
+    let e = c2f_saida_stderr()
+    c2f_saida_formatar(e, msg)
+    _ = c2f_saida_fechar(e)
+    delete(msg)
+}
+
+// strerror da UCRT para os errno que este arquivo produz
+proc texto_do_errno(err: i32) -> str {
+    if err == ERRNO_ENOENT {
+        return "No such file or directory"
+    }
+    if err == ERRNO_EIO {
+        return "Input/output error"
+    }
+    if err == ERRNO_EACCES {
+        return "Permission denied"
+    }
+    if err == ERRNO_EEXIST {
+        return "File exists"
+    }
+    if err == ERRNO_EISDIR {
+        return "Is a directory"
+    }
+    if err == ERRNO_ENAMETOOLONG {
+        return "Filename too long"
+    }
+    return "Unknown error"
+}
+
+// errno que o fopen do C deixaria para o motivo que o std:file devolve (C2F: o erro cru do Windows nao atravessa a std; nota ao main)
+proc errno_do_erro_arquivo(e: file.FileError) -> i32 {
+    if (e == file.FileError.not_found) or (e == file.FileError.not_directory) {
+        return ERRNO_ENOENT
+    }
+    if e == file.FileError.already_exists {
+        return ERRNO_EEXIST
+    }
+    if (e == file.FileError.no_permission) or (e == file.FileError.is_directory) or (e == file.FileError.locked) {
+        return ERRNO_EACCES
+    }
+    return ERRNO_EIO
+}
+
+// C: common/fonte.c:34
+// _fseeki64(fim) + _ftelli64 + _fseeki64(inicio): false se algum falhar
+proc tamanho_do_arquivo(arq: ^file.File, tam: ^i64) -> bool {
+    let fim: int = file.seek(arq, 0, file.SeekFrom.end) or_else -1
+    if fim < 0 {
+        return false
+    }
+    tam^ = fim as i64
+    let inicio: int = file.seek(arq, 0, file.SeekFrom.start) or_else -1
+    return inicio == 0
+}
+
+// C: common/fonte.c:48
+// buf e a visao de texto com os 4 zeros de sentinela (len >= tam + 4); o que sobra depois do corte vira zero (o C so zerava 1 byte)
+proc tirar_bom_utf8(buf: []u8, tam: ^i64) {
+    if (tam^ < 3) or (buf[0] != 239) or (buf[1] != 187) or (buf[2] != 191) { // 0xEF 0xBB 0xBF
+        return
+    }
+    let n: int = tam^ as int
+    copy(buf[0..<(n - 3)], buf[3..<n])
+    fill(buf[(n - 3)..<n], 0)
+    tam^ -= 3
+}
+
+// C: common/fonte.c:58
+// C2F-33: saida e uma lista de bytes (do chamador) com tam + 4 bytes, os 4 ultimos zeros; mensagens de erro no stderr como no C
+proc ler_arquivo(caminho: str, buf: ^[dynamic]u8, saida_tam: ^i64, calado_se_nao_abre: bool) -> bool {
+    switch r in file.open(caminho, file.OpenMode.read) {
+    case file.File:
+        var arq: file.File = r
+        defer file.close(&arq)
+        return ler_arquivo_aberto(&arq, caminho, buf, saida_tam)
+    case file.FileError:
+        if not calado_se_nao_abre {
+            avisar_stderr(format(f"forja: nao consegui abrir '{caminho}' para leitura\n", alloc = heap))
+        }
+        return false
+    }
+    return false
+}
+
+// o corpo de ler_arquivo depois do fopen (o C faz tudo na mesma funcao; separado so para o switch do open)
+proc ler_arquivo_aberto(arq: ^file.File, caminho: str, buf: ^[dynamic]u8, saida_tam: ^i64) -> bool {
+    var tam: i64 = 0
+    if not tamanho_do_arquivo(arq, &tam) {
+        avisar_stderr(format(f"forja: nao consegui medir o tamanho de '{caminho}'\n", alloc = heap))
+        return false
+    }
+    if tam > (FONTE_TAM_MAX as i64) {
+        avisar_stderr(format(f"forja: '{caminho}' tem {tam} bytes; o limite de um .fj e {FONTE_TAM_MAX} bytes (1 GiB): as posicoes sao de 32 bits\n", alloc = heap))
+        return false
+    }
+    let n: int = tam as int
+    resize(buf, n + 4)
+    var lido: int = 0
+    while lido < n {
+        let lidos: int = file.read(arq, buf[lido..<n]) or_else -1
+        if lidos <= 0 {
+            break
+        }
+        lido += lidos
+    }
+    if lido != n {
+        avisar_stderr(format(f"forja: falha lendo '{caminho}' ({tam} bytes)\n", alloc = heap))
+        return false
+    }
+    tirar_bom_utf8(buf[..], &tam)
+    saida_tam^ = tam
+    return true
+}
+
+// C: common/fonte.c:93
+// dados: os bytes lidos (>= tam); a fonte guarda uma copia em dono_texto, com os 4 zeros de sentinela depois do tam
+proc adotar_texto(f: ^Fonte, caminho: ?str, dados: []u8, tam: i64) {
+    if cap(f.dono_texto) == 0 {
+        f.dono_texto = make([dynamic]u8, alloc = heap)
+    }
+    clear(&f.dono_texto)
+    append(&f.dono_texto, items = dados[0..<(tam as int)])
+    resize(&f.dono_texto, (tam as int) + 4)
+    f.caminho = caminho
+    f.texto = f.dono_texto[..]
+    f.tam = c2f_s2u_64(tam)
+    f.inicio_linha = none
+    f.ninicios = 0
+    if cap(f.dono_trechos) == 0 {
+        f.dono_trechos = make([dynamic]FonteTrecho, alloc = heap)
+    }
+    clear(&f.dono_trechos)
+    f.trechos = none
+    f.ntrechos = 0
+    _ = fonte_indexar_linhas(f)
+}
+
+// Poe o prefixo (1 ou mais linhas, cada uma terminada em '\n') antes da raiz (antes de anexar qualquer modulo): o driver o usa para os imports do
+// runtime wasm (import so vale no topo do arquivo, e a 1a linha do usuario pode ser import ou codigo). As linhas do prefixo saem da tabela de linhas:
+// os numeros de linha do texto original nao mudam; so as colunas da linha 1 (o prefixo conta como inicio dela).
+pub proc fonte_prefixar_raiz(f: ^Fonte, prefixo: str) {
+    var junto = make([dynamic]u8, alloc = heap)
+    defer delete(junto)
+    append(&junto, items = as_bytes(prefixo))
+    append(&junto, items = f.texto[0..<(f.tam as int)])
+    adotar_texto(f, f.caminho, junto[..], len(junto) as i64)
+    let bytes_prefixo: []u8 = as_bytes(prefixo)
+    var removeu: bool = false
+    for i in 0..<len(bytes_prefixo) {
+        if (bytes_prefixo[i] == 10) and (len(f.dono_linhas) > 1) {
+            ordered_remove(&f.dono_linhas, 1)
+            removeu = true
+        }
+    }
+    if removeu {
+        f.inicio_linha = f.dono_linhas[..]
+        f.ninicios = len(f.dono_linhas) as u32
+    }
+}
+
+// C: common/fonte.c:105
+pub proc fonte_ler(f: ^Fonte, caminho: ?str) -> bool {
+    var buf = make([dynamic]u8, alloc = heap)
+    defer delete(buf)
+    var tam: i64 = 0
+    if not ler_arquivo(caminho or_else "", &buf, &tam, false) {
+        return false
+    }
+    adotar_texto(f, caminho, buf[..], tam)
+    return true
+}
+
+// C: common/fonte.c:118
+// C2F: crescer_buffer_do_stream e ler_blocos_ate_eof (blocos de 64 KiB que dobram) somem: os.read_all_stdin le tudo. O limite fica em ler_stream_ate_eof: o C falhava
+// quando o stream tinha FONTE_TAM_MAX bytes ou mais (o buffer lotava em 1 GiB e nao crescia)
+
+// C: common/fonte.c:143
+// ASSINATURA (private): o FILE * do C era stdin; a Saida do shim so escreve, entao a leitura e de os.read_all_stdin e arq nao e usado. saida recebe os bytes + 4 zeros
+proc ler_stream_ate_eof(arq: ^Saida, saida: ^[dynamic]u8, saida_tam: ^i64) -> bool {
+    switch r in os.read_all_stdin(alloc = heap) {
+    case [dynamic]u8:
+        let cabe: bool = len(r) < (FONTE_TAM_MAX as int)
+        if cabe {
+            append(saida, items = r[..])
+        }
+        delete(r)
+        if not cabe {
+            return false
+        }
+        var tam: i64 = len(saida) as i64
+        resize(saida, len(saida) + 4)
+        tirar_bom_utf8(saida[..], &tam)
+        saida_tam^ = tam
+        return true
+    case os.InputError:
+        return false
+    }
+    return false
+}
+
+// C: common/fonte.c:162
+// o _setmode(_fileno(arq), _O_BINARY) nao tem o que fazer: os.read_all_stdin le bytes crus
+pub proc fonte_ler_de_stream(f: ^Fonte, arq: ^Saida, caminho: ?str) -> bool {
+    var buf = make([dynamic]u8, alloc = heap)
+    defer delete(buf)
+    var tam: i64 = 0
+    if not ler_stream_ate_eof(arq, &buf, &tam) {
+        let cam: str = caminho or_else ""
+        avisar_stderr(format(f"forja: nao consegui ler o .fj da entrada padrao (--stdin) para '{cam}'\n", alloc = heap))
+        return false
+    }
+    adotar_texto(f, caminho, buf[..], tam)
+    return true
+}
+
+// C: common/fonte.c:181
+pub proc fonte_adotar_texto(f: ^Fonte, caminho: ?str, texto: ?str, tam: u64) -> bool {
+    adotar_texto(f, caminho, as_bytes(texto or_else ""), tam as i64)
+    return true
+}
+
+// C: common/fonte.c:192
+// ASSINATURA igual; o C nao copia nem libera, aqui o texto e copiado para dono_texto (com os 4 zeros de sentinela, que o lexer le) e quem usa chama fonte_liberar.
+// Sem tabela de linhas (inicio_linha = none): FonteLocalizar varre o texto
+proc fonte_de_texto(caminho: str, texto: str) -> Fonte {
+    var f: Fonte = Fonte{}
+    f.dono_texto = make([dynamic]u8, alloc = heap)
+    append(&f.dono_texto, items = as_bytes(texto))
+    resize(&f.dono_texto, len(texto) + 4)
+    f.caminho = caminho
+    f.texto = f.dono_texto[..]
+    f.tam = len(texto) as u64
+    return f
+}
+
+// C: common/fonte.c:198
+pub proc fonte_indexar_linhas(f: ^Fonte) -> bool {
+    if cap(f.dono_linhas) == 0 {
+        f.dono_linhas = make([dynamic]u32, alloc = heap)
+    }
+    clear(&f.dono_linhas)
+    append(&f.dono_linhas, item = 0 as u32)
+    for i in (0 as u64)..<f.tam {
+        if f.texto[i] == 10 { // '\n'
+            append(&f.dono_linhas, item = (i + 1) as u32)
+        }
+    }
+    f.inicio_linha = f.dono_linhas[..]
+    f.ninicios = len(f.dono_linhas) as u32
+    return true
+}
+
+// C: common/fonte.c:217
+proc linha_do_offset_2(f: ?^Fonte, chave: u32) -> u32 {
+    var lo: u32 = 0
+    var hi: u32 = (f as ^Fonte).ninicios - 1
+    while lo < hi {
+        let meio: u32 = lo + (((hi - lo) + 1) / 2)
+        if ((f as ^Fonte).inicio_linha or_else {})[meio] <= chave {
+            lo = meio
+        } else {
+            hi = meio - 1
+        }
+    }
+    return lo
+}
+
+// C: common/fonte.c:229
+pub proc fonte_localizar(f: ?^Fonte, off: u32, linha: ^u32, coluna: ^u32) {
+    if (f as ^Fonte).inicio_linha != none {
+        var tern_1: u32 = 0
+        if (off as u64) < (f as ^Fonte).tam {
+            tern_1 = off
+        } else {
+            tern_1 = c2f_trunc_u32((f as ^Fonte).tam)
+        }
+        let chave: u32 = tern_1
+        let lo: u32 = linha_do_offset_2(f, chave)
+        linha^ = lo + 1
+        coluna^ = (off - ((f as ^Fonte).inicio_linha or_else {})[lo]) + 1
+        return
+    }
+    var l: u32 = 1
+    var ultimo_lf: u32 = 0
+    var viu_lf: bool = false
+    var i: u32 = 0
+    while (i < off) and ((i as u64) < (f as ^Fonte).tam) {
+        if (f as ^Fonte).texto[i] == 10 { // '\n'
+            l += 1
+            ultimo_lf = i
+            viu_lf = true
+        }
+        i += 1
+    }
+    linha^ = l
+    var tern_2: u32 = off + 1
+    if c2f_b2i32(viu_lf) != 0 {
+        tern_2 = off - ultimo_lf
+    }
+    coluna^ = tern_2
+}
+
+// C: common/fonte.c:251
+// ASSINATURA (private): texto passa de ?str para []u8 (os dois chamadores tem bytes)
+proc contar_lfs(texto: []u8, tam: u64) -> u32 {
+    var lfs: u32 = 0
+    for i in (0 as u64)..<tam {
+        lfs += c2f_b2u32(texto[i] == 10) // '\n'
+    }
+    return lfs
+}
+
+// C: common/fonte.c:260
+// realloc de texto, tabela de linhas e trechos = reserve nas tres listas donas (nao falha; o C devolvia false so sem memoria)
+proc reservar_anexo(f: ^Fonte, tam_novo: u64, lfs_novos: u32) -> bool {
+    var cap_trechos: u32 = 2
+    if f.ntrechos != 0 {
+        cap_trechos = f.ntrechos + 1
+    }
+    if cap(f.dono_trechos) == 0 {
+        f.dono_trechos = make([dynamic]FonteTrecho, alloc = heap)
+    }
+    reserve(&f.dono_linhas, ((f.ninicios as int) + (lfs_novos as int)) + 1)
+    reserve(&f.dono_trechos, cap_trechos as int)
+    reserve(&f.dono_texto, (((f.tam as int) + 1) + (tam_novo as int)) + 1 + 4)
+    return true
+}
+
+// o corpo comum de fonte_anexar_texto e fonte_anexar_arquivo (a primeira tem str, a segunda bytes lidos; dados tem >= tam bytes)
+proc anexar_bytes(f: ^Fonte, caminho: str, dados: []u8, tam: u64) -> bool {
+    let tam_velho: u64 = f.tam
+    if ((tam_velho + 1) + tam) > (FONTE_TAM_MAX as u64) {
+        return false
+    }
+    if (f.inicio_linha == none) and (not fonte_indexar_linhas(f)) {
+        return false
+    }
+    if not reservar_anexo(f, tam, contar_lfs(dados, tam) + 1) {
+        return false
+    }
+    if f.ntrechos == 0 {
+        append(&f.dono_trechos, item = FonteTrecho{inicio = 0, fim = tam_velho as u32, linha_base = 0, caminho = f.caminho})
+        f.ntrechos = 1
+    }
+    let nova: u64 = (tam_velho + 1) + tam
+    resize(&f.dono_texto, (nova as int) + 4)
+    f.dono_texto[tam_velho] = 10 // '\n'
+    copy(f.dono_texto[(tam_velho + 1)..<nova], dados[0..<tam])
+    f.tam = nova
+    for i in tam_velho..<nova {
+        if f.dono_texto[i] == 10 { // '\n'
+            append(&f.dono_linhas, item = (i + 1) as u32)
+        }
+    }
+    f.texto = f.dono_texto[..]
+    f.inicio_linha = f.dono_linhas[..]
+    f.ninicios = len(f.dono_linhas) as u32
+    let inicio: u32 = (tam_velho as u32) + 1
+    let linha_base: u32 = linha_do_offset_2(f, inicio)
+    append(&f.dono_trechos, item = FonteTrecho{inicio = inicio, fim = inicio + (tam as u32), linha_base = linha_base, caminho = caminho})
+    f.ntrechos += 1
+    f.trechos = f.dono_trechos[..]
+    return true
+}
+
+// C: common/fonte.c:275
+pub proc fonte_anexar_texto(f: ^Fonte, caminho: str, texto: ?str, tam: u64) -> bool {
+    return anexar_bytes(f, caminho, as_bytes(texto or_else ""), tam)
+}
+
+// C: common/fonte.c:298
+pub proc fonte_anexar_arquivo(f: ^Fonte, caminho: str) -> bool {
+    var buf = make([dynamic]u8, alloc = heap)
+    defer delete(buf)
+    var tam: i64 = 0
+    if not ler_arquivo(caminho, &buf, &tam, true) {
+        return false
+    }
+    return anexar_bytes(f, caminho, buf[..], tam as u64)
+}
+
+// C: common/fonte.c:308
+pub proc fonte_trecho_do_offset(f: ?^Fonte, off: u32) -> u32 {
+    if (f as ^Fonte).ntrechos <= 1 {
+        return 0
+    }
+    var lo: u32 = 0
+    var hi: u32 = (f as ^Fonte).ntrechos
+    while (hi - lo) > 1 {
+        let meio: u32 = lo + ((hi - lo) / 2)
+        if ((f as ^Fonte).trechos or_else {})[meio].inicio <= off {
+            lo = meio
+        } else {
+            hi = meio
+        }
+    }
+    return lo
+}
+
+// C: common/fonte.c:319
+pub proc fonte_localizar_no_arquivo(f: ?^Fonte, off: u32) -> FontePosicao {
+    var pos: FontePosicao = FontePosicao{caminho = (f as ^Fonte).caminho, linha = 0, coluna = 0}
+    fonte_localizar(f, off, &pos.linha, &pos.coluna)
+    if (f as ^Fonte).ntrechos <= 1 {
+        return pos
+    }
+    let achado: ^FonteTrecho = &((f as ^Fonte).trechos or_else {})[fonte_trecho_do_offset(f, off)]
+    pos.caminho = achado.caminho
+    pos.linha -= achado.linha_base
+    return pos
+}
+
+// C: common/fonte.c:330
+pub proc fonte_contar_linhas(f: ^Fonte) -> u64 {
+    var linhas: u64 = 0
+    for i in (0 as u64)..<f.tam {
+        if f.texto[i] == 10 { // '\n'
+            linhas += 1
+        }
+    }
+    if (f.tam > 0) and (f.texto[f.tam - 1] != 10) { // '\n'
+        linhas += 1
+    }
+    return linhas
+}
+
+// C: common/fonte.c:340
+pub proc fonte_liberar(f: ^Fonte) {
+    delete(f.dono_texto)
+    delete(f.dono_linhas)
+    delete(f.dono_trechos)
+    f.texto = {}
+    f.inicio_linha = none
+    f.trechos = none
+    f.ntrechos = 0
+    f.ninicios = 0
+    f.tam = 0
+}
+
+// C: common/fonte.c:353
+pub proc arquivo_gravar(caminho: ?str, dados: ?str, tam: u64) -> bool {
+    let cam: str = caminho or_else ""
+    switch r in file.open(cam, file.OpenMode.write) {
+    case file.File:
+        var arq: file.File = r
+        let ok: bool = file.write(&arq, as_bytes(dados or_else "")[0..<tam]) == none
+        file.close(&arq)
+        if not ok {
+            avisar_stderr(format(f"forja: falha gravando {tam} bytes em '{cam}'\n", alloc = heap))
+        }
+        return ok
+    case file.FileError:
+        avisar_stderr(format(f"forja: nao consegui abrir '{cam}' para gravacao\n", alloc = heap))
+        return false
+    }
+    return false
+}
+
+// C: common/fonte.c:366
+// errno_saida: NULL = nao quer (?^i32 aceita ^i32 e none); o errno vem do motivo do std:file (errno_do_erro_arquivo); falha de escrita = EIO
+pub proc arquivo_gravar_calado(caminho: str, dados: ?str, tam: u64, errno_saida: ?^i32) -> bool {
+    switch r in file.open(caminho, file.OpenMode.write) {
+    case file.File:
+        var arq: file.File = r
+        let ok: bool = file.write(&arq, as_bytes(dados or_else "")[0..<tam]) == none
+        file.close(&arq)
+        if (not ok) and (errno_saida != none) {
+            let alvo_errno: ^i32 = errno_saida as ^i32
+            alvo_errno^ = ERRNO_EIO
+        }
+        return ok
+    case file.FileError:
+        if errno_saida != none {
+            let alvo_errno: ^i32 = errno_saida as ^i32
+            alvo_errno^ = errno_do_erro_arquivo(r)
+        }
+        return false
+    }
+    return false
+}
+
+// C: common/fonte.c:391
+// snprintf(temporario/velho, 1100, "%s.tmp%lu"/"%s.velho%lu", caminho, pid): as duas strings vem do heap (liberar_nomes_atomicos); false se uma nao coube em 1100 com o NUL
+proc montar_nomes_atomicos(caminho: ?str, n: ^NomesAtomicos) -> bool {
+    let pid: u32 = os.pid() as u32
+    let cam: str = caminho or_else ""
+    let tmp: str = format(f"{cam}.tmp{pid}", alloc = heap)
+    let vel: str = format(f"{cam}.velho{pid}", alloc = heap)
+    n.temporario = tmp
+    n.velho = vel
+    return (len(tmp) < (ATOMICO_TAM_CAMINHO as int)) and (len(vel) < (ATOMICO_TAM_CAMINHO as int))
+}
+
+proc liberar_nomes_atomicos(n: ^NomesAtomicos) {
+    delete(n.temporario or_else "")
+    delete(n.velho or_else "")
+}
+
+// C: common/fonte.c:400
+proc eh_pasta(caminho: ?str) -> bool {
+    return file.is_dir(caminho or_else "")
+}
+
+// C: common/fonte.c:408
+// C2F:? o atributo FILE_ATTRIBUTE_READONLY nao tem par em std:file (stat so da tamanho, mtime e tipo). Aproximacao: o arquivo existe e abrir para anexar e
+// recusado por permissao. Candidato a std:file.is_read_only (passo L)
+proc eh_somente_leitura(caminho: ?str) -> bool {
+    let cam: str = caminho or_else ""
+    if not file.exists(cam) {
+        return false
+    }
+    switch r in file.open(cam, file.OpenMode.append) {
+    case file.File:
+        var arq: file.File = r
+        file.close(&arq)
+        return false
+    case file.FileError:
+        return r == file.FileError.no_permission
+    }
+    return false
+}
+
+// C: common/fonte.c:416
+proc erro_de_ocupado(erro: u32) -> bool {
+    return (erro == 32) or (erro == 5)
+}
+
+// C: common/fonte.c:421
+proc errno_do_windows(erro: u32) -> i32 {
+    if (erro == 2) or (erro == 3) {
+        return 2
+    }
+    var tern_1: i32 = 5
+    if c2f_b2i32(erro_de_ocupado(erro)) != 0 {
+        tern_1 = 13
+    }
+    return tern_1
+}
+
+// o GetLastError que o C teria para o motivo do std:file: 2 = nao existe, 5 = acesso negado (a std junta acesso negado e violacao de compartilhamento: 32 e 5 viram
+// no_permission, entao a espera de deve_esperar segue a de ERROR_ACCESS_DENIED, 1 so), 1 = outro
+proc codigo_do_erro(e: file.FileError) -> u32 {
+    if e == file.FileError.not_found {
+        return 2
+    }
+    if (e == file.FileError.no_permission) or (e == file.FileError.is_directory) or (e == file.FileError.locked) {
+        return 5
+    }
+    return 1
+}
+
+// C: common/fonte.c:431
+// fopen "wb" + fwrite + fflush + _commit (file.flush) + fclose. O errno cru de uma falha de escrita nao chega pela std: EIO
+proc gravar_temporario(tmp: str, c: ^Conteudo, err: ^i32) -> bool {
+    switch r in file.open(tmp, file.OpenMode.write) {
+    case file.File:
+        var arq: file.File = r
+        var ok: bool = file.write(&arq, as_bytes(c.dados or_else "")[0..<c.tam]) == none
+        if ok and c.descarregar {
+            ok = file.flush(&arq) == none
+        }
+        if not ok {
+            err^ = ERRNO_EIO
+        }
+        file.close(&arq)
+        return ok
+    case file.FileError:
+        err^ = errno_do_erro_arquivo(r)
+        return false
+    }
+    return false
+}
+
+// C: common/fonte.c:450
+proc deve_esperar(erro: u32, tentativa: i32) -> bool {
+    if erro == 32 {
+        return tentativa < ATOMICO_TENTATIVAS
+    }
+    return (erro == 5) and (tentativa < ATOMICO_TENTATIVAS_NEGADO)
+}
+
+// C: common/fonte.c:457
+// MoveFileExA(REPLACE_EXISTING | descarga) -> file.rename (sem WRITE_THROUGH: o temporario ja foi descarregado em gravar_temporario); Sleep -> os.sleep_ms
+proc trocar_com_espera(tmp: str, destino: ?str, descarga: u32) -> u32 {
+    var espera: i32 = ATOMICO_ESPERA_INICIAL_MS
+    var erro: u32 = 0
+    for tentativa in (0 as i32)..=ATOMICO_TENTATIVAS {
+        let e: ?file.FileError = file.rename(tmp, destino or_else "")
+        if e == none {
+            return 0
+        }
+        erro = codigo_do_erro(e or_else file.FileError.other)
+        if not deve_esperar(erro, tentativa) {
+            break
+        }
+        os.sleep_ms(espera as int)
+        espera = espera * 2
+    }
+    return erro
+}
+
+// C: common/fonte.c:473
+proc substituir_ocupado(n: ^NomesAtomicos, destino: ?str, descarga: u32) -> u32 {
+    let dest: str = destino or_else ""
+    let velho: str = n.velho or_else ""
+    let e1: ?file.FileError = file.rename(dest, velho)
+    if e1 != none {
+        return codigo_do_erro(e1 or_else file.FileError.other)
+    }
+    let e2: ?file.FileError = file.rename(n.temporario or_else "", dest)
+    if e2 == none {
+        return 0
+    }
+    let erro: u32 = codigo_do_erro(e2 or_else file.FileError.other)
+    _ = file.rename(velho, dest) // desfaz: o destino volta a existir
+    return erro
+}
+
+// C: common/fonte.c:484
+proc publicar(n: ^NomesAtomicos, destino: ?str, descarga: u32) -> u32 {
+    var erro: u32 = trocar_com_espera(n.temporario or_else "", destino, descarga)
+    if (erro == 0) or (not erro_de_ocupado(erro)) or (not file.exists(destino or_else "")) {
+        return erro
+    }
+    erro = substituir_ocupado(n, destino, descarga)
+    if erro == 0 {
+        _ = file.remove_file(n.velho or_else "") // falha ignorada: o antigo em uso nao se apaga e fica como .velho
+    }
+    return erro
+}
+
+// C: common/fonte.c:495
+proc gravar_e_publicar(caminho: ?str, c: ^Conteudo) -> i32 {
+    var n: NomesAtomicos = NomesAtomicos{}
+    var err: i32 = 0
+    let cabe: bool = montar_nomes_atomicos(caminho, &n)
+    defer liberar_nomes_atomicos(&n)
+    if not cabe {
+        return ERRNO_ENAMETOOLONG
+    }
+    if eh_pasta(caminho) {
+        return ERRNO_EISDIR
+    }
+    if eh_somente_leitura(caminho) {
+        return ERRNO_EACCES
+    }
+    if not gravar_temporario(n.temporario or_else "", c, &err) {
+        _ = file.remove_file(n.temporario or_else "")
+        if err != 0 {
+            return err
+        }
+        return ERRNO_EIO
+    }
+    var descarga: u32 = 0
+    if c.descarregar {
+        descarga = 8 // MOVEFILE_WRITE_THROUGH
+    }
+    let erro: u32 = publicar(&n, caminho, descarga)
+    if erro == 0 {
+        return 0
+    }
+    _ = file.remove_file(n.temporario or_else "")
+    return errno_do_windows(erro)
+}
+
+// C: common/fonte.c:514
+proc gravar_atomico_com(caminho: ?str, c: ^Conteudo, errno_saida: ?^i32) -> bool {
+    let err: i32 = gravar_e_publicar(caminho, c)
+    if (err != 0) and (errno_saida != none) {
+        let alvo_errno: ^i32 = errno_saida as ^i32
+        alvo_errno^ = err
+    }
+    return err == 0
+}
+
+// C: common/fonte.c:522
+pub proc arquivo_gravar_atomico(caminho: ?str, dados: ?str, tam: u64, errno_saida: ?^i32) -> bool {
+    var c: Conteudo = Conteudo{dados = dados, tam = tam, descarregar = true}
+    return gravar_atomico_com(caminho, &c, errno_saida)
+}
+
+// C: common/fonte.c:529
+// errno_saida passa de ^i32 para ?^i32 (o C aceita NULL; quem passa ^i32 continua valendo)
+pub proc arquivo_gravar_atomico_sem_descarga(caminho: str, dados: ?str, tam: u64, errno_saida: ?^i32) -> bool {
+    var c: Conteudo = Conteudo{dados = dados, tam = tam, descarregar = false}
+    return gravar_atomico_com(caminho, &c, errno_saida)
+}
+
+// C: common/fonte.c:536
+pub proc arquivo_gravar_atomico_aviso(caminho: str, dados: ?str, tam: u64) -> bool {
+    var err: i32 = 0
+    if arquivo_gravar_atomico(caminho, dados, tam, &err) {
+        return true
+    }
+    avisar_stderr(format(f"forja: nao consegui gravar '{caminho}': {texto_do_errno(err)}\n", alloc = heap))
+    return false
+}
+
+// ---------------------------------------------------------------- testes (teste_common.c e teste_common_atomico.c)
+
+// grava os bytes crus em caminho (os literais com BOM e UTF-8 invalido vem de listas de bytes, nao do texto do fonte)
+proc teste_gravar_bytes(caminho: str, bytes: []u8) -> bool {
+    let texto: str = from_bytes(bytes, alloc = heap)
+    let ok: bool = arquivo_gravar(caminho, texto, len(bytes) as u64)
+    delete(texto)
+    return ok
+}
+
+// posicao (linha, coluna) do offset, como o par de ponteiros do C
+proc teste_pos(f: ^Fonte, off: u32) -> u64 {
+    var l: u32 = 0
+    var c: u32 = 0
+    fonte_localizar(f, off, &l, &c)
+    return ((l as u64) << 32) | (c as u64)
+}
+
+test "fonte_localizar" {
+    var f: Fonte = fonte_de_texto("a.fj", "ab\ncd\n")
+    expect(teste_pos(&f, 0) == ((1 as u64) << 32 | 1))
+    expect(teste_pos(&f, 1) == ((1 as u64) << 32 | 2))
+    expect(teste_pos(&f, 3) == ((2 as u64) << 32 | 1))
+    expect(teste_pos(&f, 4) == ((2 as u64) << 32 | 2))
+    expect(fonte_contar_linhas(&f) == 2)
+    expect(len(f.texto) == 10 and f.texto[6] == 0 and f.texto[9] == 0) // sentinela: 4 zeros depois do texto
+    var sem_lf: Fonte = fonte_de_texto("b.fj", "x\ny")
+    expect(fonte_contar_linhas(&sem_lf) == 2)
+    fonte_liberar(&f)
+    fonte_liberar(&sem_lf)
+    expect(f.tam == 0 and len(f.texto) == 0)
+}
+
+// Oraculo: a mesma fonte sem tabela (varredura) e com tabela (busca binaria) tem de dar linha/coluna iguais em todo offset
+test "fonte_tabela_contra_varredura" {
+    let textos: [5]str = {"", "ab\ncd\n", "x\ny", "\n\n", "a\r\nb"}
+    var todos_iguais: bool = true
+    var indexou_todos: bool = true
+    for t in 0..<5 {
+        var varredura: Fonte = fonte_de_texto("o.fj", textos[t])
+        var tabela: Fonte = fonte_de_texto("t.fj", textos[t])
+        indexou_todos = fonte_indexar_linhas(&tabela) and indexou_todos
+        var off: u32 = 0
+        while off <= ((varredura.tam as u32) + 3) {
+            if teste_pos(&varredura, off) != teste_pos(&tabela, off) {
+                todos_iguais = false
+            }
+            off += 1
+        }
+        expect(tabela.ninicios == (len(tabela.dono_linhas) as u32) and tabela.ninicios >= 1)
+        fonte_liberar(&varredura)
+        fonte_liberar(&tabela)
+    }
+    expect(indexou_todos)
+    expect(todos_iguais)
+}
+
+// FonteLer: BOM UTF-8 sai do texto (linha/coluna batem com o editor); sem BOM nada muda; NUL final sempre presente
+test "fonte_ler_bom" {
+    let caminho: str = "teste_common_fonte_tmp.fj"
+    var com_bom: [9]u8 = {239, 187, 191, 97, 98, 10, 99, 100, 10}
+    var sem_bom: [6]u8 = {97, 98, 10, 99, 100, 10}
+    var so_bom: [3]u8 = {239, 187, 191}
+    var bom_curto: [2]u8 = {239, 187}
+    var f: Fonte = Fonte{}
+
+    expect(teste_gravar_bytes(caminho, com_bom[..]) and fonte_ler(&f, caminho))
+    expect(f.tam == 6 and f.texto[0] == 97 and f.texto[6] == 0 and f.texto[9] == 0)
+    expect(teste_pos(&f, 3) == ((2 as u64) << 32 | 1))
+    fonte_liberar(&f)
+
+    expect(teste_gravar_bytes(caminho, sem_bom[..]) and fonte_ler(&f, caminho))
+    expect(f.tam == 6 and c2f_memcmp(f.texto[0..<6], sem_bom[..]) == 0 and f.texto[6] == 0)
+    fonte_liberar(&f)
+
+    expect(teste_gravar_bytes(caminho, so_bom[..]) and fonte_ler(&f, caminho))
+    expect(f.tam == 0 and f.texto[0] == 0)
+    fonte_liberar(&f)
+
+    expect(teste_gravar_bytes(caminho, bom_curto[..]) and fonte_ler(&f, caminho))
+    expect(f.tam == 2 and f.texto[0] == 239)
+    fonte_liberar(&f)
+
+    expect(file.remove_file(caminho) == none)
+    expect(not fonte_ler(&f, caminho)) // arquivo inexistente: recusa, sem travar
+}
+
+test "fonte_trechos" {
+    var f: Fonte = fonte_de_texto("raiz.fj", "ab\ncd\n")
+    expect(fonte_indexar_linhas(&f))
+    expect(fonte_anexar_texto(&f, "mods/x.fj", "x\nyy\n", 5) and f.ntrechos == 2 and (f.trechos or_else {})[1].inicio == 7 and f.tam == 12 and f.texto[6] == 10 and f.texto[12] == 0) // (1)
+    var p: FontePosicao = fonte_localizar_no_arquivo(&f, 7)
+    expect((p.caminho or_else "") == "mods/x.fj" and p.linha == 1 and p.coluna == 1) // (2)
+    p = fonte_localizar_no_arquivo(&f, 9)
+    expect((p.caminho or_else "") == "mods/x.fj" and p.linha == 2 and p.coluna == 1) // (3)
+    p = fonte_localizar_no_arquivo(&f, 4)
+    expect((p.caminho or_else "") == "raiz.fj" and p.linha == 2 and p.coluna == 2) // (4)
+    expect(teste_pos(&f, 9) >> 32 == 5 and (f.trechos or_else {})[1].linha_base == 3) // (5)
+    expect(fonte_trecho_do_offset(&f, 4) == 0 and fonte_trecho_do_offset(&f, 7) == 1 and fonte_trecho_do_offset(&f, 11) == 1)
+    expect(fonte_anexar_texto(&f, "mods/y.fj", "z", 1) and f.ntrechos == 3 and f.tam == 14 and fonte_trecho_do_offset(&f, 13) == 2)
+    fonte_liberar(&f)
+    var g: Fonte = fonte_de_texto("a.fj", "ab\ncd\n")
+    p = fonte_localizar_no_arquivo(&g, 4)
+    expect((p.caminho or_else "") == "a.fj" and p.linha == 2 and p.coluna == 2) // (6)
+    fonte_liberar(&g)
+}
+
+// fonte_adotar_texto copia o texto; fonte_anexar_arquivo le o arquivo; arquivo que nao abre nao escreve nada e devolve false
+test "fonte_adotar_e_anexar_arquivo" {
+    var f: Fonte = Fonte{}
+    expect(fonte_adotar_texto(&f, "<fmt>", "ab\ncd\n", 6) and f.tam == 6 and f.ninicios == 3 and f.texto[6] == 0)
+    let caminho: str = "teste_common_fonte_anexo_tmp.fj"
+    expect(teste_gravar_bytes(caminho, as_bytes("x\nyy\n")) and fonte_anexar_arquivo(&f, caminho))
+    expect(f.ntrechos == 2 and f.tam == 12 and f.ninicios == 6 and fonte_trecho_do_offset(&f, 8) == 1)
+    expect(file.remove_file(caminho) == none)
+    expect(not fonte_anexar_arquivo(&f, caminho) and f.ntrechos == 2)
+    fonte_liberar(&f)
+    expect(fonte_adotar_texto(&f, "<outra>", "q", 1) and f.tam == 1) // fonte liberada pode ser usada de novo
+    fonte_liberar(&f)
+}
+
+// Do teste_common_atomico.c (VerificaGravacao): cria sem deixar <nome>.tmp<pid>, substitui o conteudo e falha em pasta inexistente com ENOENT sem criar o destino.
+// VerificaDestinoEmUso (DLL carregada, LoadLibrary) e VerificaSomenteLeitura (SetFileAttributes) nao tem par em std:file (relatorio do lote)
+test "arquivo_gravar_atomico" {
+    let pasta: str = format(f"forja_atomico_{os.pid()}", alloc = heap)
+    _ = file.remove_dir(pasta, all = true)
+    expect(file.make_dir(pasta) == none)
+    let destino: str = format(f"{pasta}\\saida.bin", alloc = heap)
+    let sobra: str = format(f"{destino}.tmp{os.pid()}", alloc = heap)
+    let inexistente: str = format(f"{pasta}\\nao_existe\\saida.bin", alloc = heap)
+    var err: i32 = 0
+    expect(arquivo_gravar_atomico(destino, "primeiro", 8, none) and teste_fonte_arquivo_tem(destino, "primeiro") and not file.exists(sobra))
+    expect(arquivo_gravar_atomico(destino, "segundo", 7, &err) and teste_fonte_arquivo_tem(destino, "segundo") and not file.exists(sobra))
+    expect(arquivo_gravar_atomico_sem_descarga(destino, "terceiro", 8, none) and teste_fonte_arquivo_tem(destino, "terceiro"))
+    expect(not arquivo_gravar_atomico(inexistente, "x", 1, &err) and err == 2 and not file.exists(inexistente))
+    expect(not arquivo_gravar_atomico(pasta, "x", 1, &err) and err == 21) // destino e uma pasta: EISDIR
+    expect(arquivo_gravar_calado(destino, "calado", 6, none) and teste_fonte_arquivo_tem(destino, "calado"))
+    expect(not arquivo_gravar_calado(inexistente, "x", 1, &err) and err == 2)
+    expect(arquivo_gravar(destino, "cru", 3) and teste_fonte_arquivo_tem(destino, "cru"))
+    expect(file.remove_dir(pasta, all = true) == none)
+    delete(pasta)
+    delete(destino)
+    delete(sobra)
+    delete(inexistente)
+}
+
+proc teste_fonte_arquivo_tem(caminho: str, esperado: str) -> bool {
+    switch r in file.read_all(caminho, alloc = heap) {
+    case [dynamic]u8:
+        let igual: bool = c2f_memcmp(r[..], as_bytes(esperado)) == 0 and len(r) == len(esperado)
+        delete(r)
+        return igual
+    case file.FileError:
+        return false
+    }
+    return false
+}

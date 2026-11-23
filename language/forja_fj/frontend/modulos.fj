@@ -1,0 +1,748 @@
+// frontend/modulos.fj - porte de compiler/frontend/modulos.c, compiler/frontend/modulos.h
+// sha256 de frontend/modulos.c: eddf8ad8b5b6927ed09b6c8f8b1ec6ba5038bd97ecb87c4ce31adf4e9bed2b42
+// sha256 de frontend/modulos.h: a80f9ac42d8976ab01ff23f347fdc44a8198bbf274bb633f90070bc6e7568711
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "common"
+
+pub struct Modulo {
+    caminho: i32
+    apelido: i32
+    origem: u8
+    importador: u8
+    pos_import: u32
+}
+
+pub struct ApelidoDeArquivo {
+    arquivo: u32
+    modulo: u8
+    nome: i32
+    novo: i32
+}
+
+pub struct Modulos {
+    itens: [255]Modulo
+    n: u32
+    apelidos: [dynamic]ApelidoDeArquivo
+    pacotes: [dynamic]u8
+    nomes: ?^common.Interner
+    pasta: ?str
+    ordem: ?[255]u8
+}
+
+struct RegistroImport {
+    texto: i32
+    apelido: i32
+    arquivo: u32
+    pos_texto: u32
+    pos_apelido: u32
+}
+
+struct ContextoImport {
+    m: ?^Modulos
+    d: ?^common.Diag
+    pos: u32
+}
+
+struct Dfs {
+    m: ?^Modulos
+    p: ?^Programa
+    d: ?^common.Diag
+    prof: u32
+    nordem: u32
+    pilha: [255]u8
+    estado: [255]u8
+}
+
+const LISTA_MODULOS_TAM: i32 = 440
+const IMPORT_TAM: i32 = 128
+const ESTADO_NOVO: i32 = 0
+const ESTADO_NA_PILHA: i32 = 1
+const ESTADO_PRONTO: i32 = 2
+pub const MOD_RAIZ: i32 = 0
+pub const MOD_ARQUIVO: i32 = 1
+pub const MOD_STD: i32 = 2
+pub const MOD_VENDOR: i32 = 3
+pub const MOD_ENGINE: i32 = 4
+pub const MODULOS_MAX: u32 = 255
+// C2F-71: os `static const char *const CHUTES[]` locais de ChuteDeStdText e ChuteDeStdFmt viram consts de topo
+const CHUTES: [4]str = {"strings", "strconv", "utf8", "unicode"}
+const CHUTES_2: [4]str = {"locale", "intl", "number", "currency"}
+
+// C: frontend/modulos.c:24
+// Texto depois do ultimo '/' ou ':' (apelido padrao).
+proc apelido_padrao(m: ?^Modulos, texto: str, tam: u32) -> i32 {
+    var ini: u32 = 0
+    for i in (0 as u32)..<tam {
+        if (texto[i] == 47) or (texto[i] == 58) { // '/' ':'
+            ini = i + 1
+        }
+    }
+    return common.internar((m as ^Modulos).nomes as ^common.Interner, texto[ini..<tam], tam - ini)
+}
+
+// C: frontend/modulos.c:33
+// C2F: Modulos.pasta (char[300]) vira str na arena do Interner (o Modulos nao tem arena propria), cortada em 299 bytes como o snprintf
+pub proc modulos_iniciar(m: ^Modulos, nomes: ^common.Interner, caminho_raiz: ?str) {
+    let raiz: str = caminho_raiz or_else ""
+    var tam: u64 = len(raiz) as u64
+    var ini: u64 = 0
+    for i in (0 as u64)..<tam {
+        if (raiz[i] == 47) or (raiz[i] == 92) { // '/' '\\'
+            ini = i + 1
+        }
+    }
+    if ((tam - ini) > 3) and (raiz[(tam - 3)..<tam] == ".fj") {
+        tam -= 3
+    }
+    m.nomes = nomes
+    m.n = 1
+    if ini == 0 {
+        m.pasta = "."
+    } else {
+        let corte: u64 = min(ini - 1, 299) // snprintf(m->pasta, sizeof m->pasta, "%.*s", ini - 1, caminho_raiz)
+        m.pasta = from_bytes(as_bytes(raiz)[0..<corte], alloc = common.arena_mem(nomes.arena as ^common.Arena))
+    }
+    m.itens[0] = Modulo{origem = MOD_RAIZ as u8}
+    m.itens[0].caminho = common.internar(nomes, raiz[ini..<tam], (tam - ini) as u32)
+    m.itens[0].apelido = m.itens[0].caminho
+    m.apelidos = make([dynamic]ApelidoDeArquivo, alloc = heap)
+    m.pacotes = make([dynamic]u8, alloc = heap)
+}
+
+// C: frontend/modulos.c:52
+// Outro ':' fora da 2a posicao, '\', caminho absoluto. false = diagnostico.
+// C2F: t era []u8 no esqueleto; aqui str (so e chamada por conferir_forma, que tem o texto do import em str)
+proc conferir_prefixo(d: ^common.Diag, pos: u32, t: str, tam: u32) -> bool {
+    for i in (0 as u32)..<tam {
+        if (t[i] == 58) and (i != 1) { // ':'
+            return common.diag_relatar(d, common.E1001, pos, "prefixo desconhecido no import: valem std: e caminho relativo")
+        }
+    }
+    for i in (0 as u32)..<tam { // memchr(t, '\\', tam) != NULL
+        if t[i] == 92 { // '\\'
+            return common.diag_relatar(d, common.E1001, pos, "use '/' no caminho do import")
+        }
+    }
+    if (t[0] == 47) or ((tam > 1) and (t[1] == 58)) { // '/' ':'
+        return common.diag_relatar(d, common.E1001, pos, "caminho absoluto nao vale: o caminho e relativo a pasta do arquivo raiz")
+    }
+    return true
+}
+
+// C: frontend/modulos.c:66
+proc segmento_valido(s: str, tam: u32) -> bool {
+    if ((tam == 0) or (common.c2f_char_i32(s[0]) < 97)) or (common.c2f_char_i32(s[0]) > 122) { // 'a' 'z'
+        return false
+    }
+    for i in (1 as u32)..<tam {
+        let ok: bool = (((common.c2f_char_i32(s[i]) >= 97) and (common.c2f_char_i32(s[i]) <= 122)) or ((common.c2f_char_i32(s[i]) >= 48) and (common.c2f_char_i32(s[i]) <= 57))) or (s[i] == 95) // 'a' 'z' '0' '9' '_'
+        if not ok {
+            return false
+        }
+    }
+    return true
+}
+
+// C: frontend/modulos.c:77
+proc proximo_segmento(t: str, tam: u32, i: ^u32) -> u32 {
+    let ini: u32 = i^
+    var fim: u32 = ini
+    while (fim < tam) and (t[fim] != 47) { // '/'
+        fim += 1
+    }
+    i^ = fim + 1
+    return fim - ini
+}
+
+// C: frontend/modulos.c:85
+proc conferir_segmentos(d: ^common.Diag, pos: u32, t: str, tam: u32) -> bool {
+    var i: u32 = 0
+    while i <= tam {
+        let ini: u32 = i
+        let n: u32 = proximo_segmento(t, tam, &i)
+        if ((n == 1) and (t[ini] == 46)) or ((n == 2) and (t[ini] == 46) and (t[ini + 1] == 46)) { // '.'
+            return common.diag_relatar(d, common.E1001, pos, "'.' e '..' nao valem no caminho do import (o caminho parte da pasta do arquivo raiz)")
+        }
+    }
+    if (tam > 3) and (t[(tam - 3)..<tam] == ".fj") {
+        return common.diag_relatar(d, common.E1001, pos, "o caminho do import vai sem extensao")
+    }
+    i = 0
+    while i <= tam {
+        let ini: u32 = i
+        let n: u32 = proximo_segmento(t, tam, &i)
+        if not segmento_valido(t[ini..<(ini + n)], n) {
+            let segmento: str = t[ini..<(ini + n)]
+            let msg = format(f"segmento '{segmento}' fora do padrao snake_case (a-z, 0-9 e _, comecando por letra)", alloc = heap)
+            defer delete(msg)
+            return common.diag_relatar(d, common.E1001, pos, msg)
+        }
+    }
+    return true
+}
+
+// C: frontend/modulos.c:106
+// Nomes que a IA costuma chutar para o que a Forja tem em std:text (IA1-S2b2a).
+proc chute_de_std_text(nome: str, tam: u32) -> bool {
+    for k in 0..<4 {
+        if ((len(CHUTES[k]) as u32) == tam) and (CHUTES[k] == nome[0..<tam]) {
+            return true
+        }
+    }
+    return false
+}
+
+// C: frontend/modulos.c:116
+// Nomes que a IA costuma chutar para a formatacao por regiao, que a Forja tem em std:fmt (IA1-S2e).
+proc chute_de_std_fmt(nome: str, tam: u32) -> bool {
+    for k in 0..<4 {
+        if ((len(CHUTES_2[k]) as u32) == tam) and (CHUTES_2[k] == nome[0..<tam]) {
+            return true
+        }
+    }
+    return false
+}
+
+// C: frontend/modulos.c:132
+// Parecido de um import std: sem o 'std:' este nome nao e chute conhecido (ChuteDeStdText/Fmt): "quis dizer std:text?" pela tabela de ModulosParecido.
+proc relatar_std_parecido(cx: ^ContextoImport, imp: str, lista: str) -> bool {
+    var parecido: [128]u8 = {} // char parecido[IMPORT_TAM]
+    if not modulos_parecido((cx.m as ^Modulos).pasta or_else "", imp, parecido[..], IMPORT_TAM as u64) {
+        let msg_1 = format(f"{imp} nao existe; disponiveis: {lista}", alloc = heap)
+        defer delete(msg_1)
+        return common.diag_relatar(cx.d as ^common.Diag, common.E1001, cx.pos, msg_1)
+    }
+    let achado = from_bytes(parecido[0..<common.c2f_strlen_b(parecido[..])], alloc = heap)
+    defer delete(achado)
+    let msg_2 = format(f"{imp} nao existe; quis dizer {achado}? (disponiveis: {lista})", alloc = heap)
+    defer delete(msg_2)
+    return common.diag_relatar(cx.d as ^common.Diag, common.E1001, cx.pos, msg_2)
+}
+
+// C: frontend/modulos.c:143
+// E1001 de modulo std ausente. "std:proc" foi renomeado (IA1-b01): a causa traz a forma certa, import "std:os".
+proc relatar_std_ausente(cx: ^ContextoImport, nome: str, tam: u32) -> bool {
+    let d = cx.d as ^common.Diag
+    let pos: u32 = cx.pos
+    var lista_buf: [440]u8 = {} // char lista[LISTA_MODULOS_TAM]
+    let nlista: u64 = modulos_listar_disponiveis((cx.m as ^Modulos).pasta or_else "", lista_buf[..], LISTA_MODULOS_TAM as u64)
+    let lista = from_bytes(lista_buf[0..<nlista], alloc = heap)
+    defer delete(lista)
+    let seg: str = nome[0..<tam]
+    let imp_inteiro = format(f"std:{seg}", alloc = heap)
+    defer delete(imp_inteiro)
+    let imp = common.c2f_cortar(imp_inteiro, (IMPORT_TAM - 1) as int) // char imp[IMPORT_TAM]
+    defer delete(imp)
+    if chute_de_std_text(nome, tam) {
+        let msg_1 = format(f"std:{seg} nao existe: texto e bytes ficam em std:text; escreva import \"std:text\" (disponiveis: {lista})", alloc = heap)
+        defer delete(msg_1)
+        _ = common.diag_relatar(d, common.E1001, pos, msg_1)
+        let sug_1 = format(f"troque \"std:{seg}\" por \"std:text\": a Forja tem um so modulo de texto", alloc = heap)
+        defer delete(sug_1)
+        _ = common.diag_sugerir(&d.sug, common.DIAG_CERTA, sug_1)
+        _ = common.diag_editar(&d.sug, pos, (pos + 6) + tam, "\"std:text\"") // aspas + "std:" + nome
+        return false
+    }
+    if chute_de_std_fmt(nome, tam) {
+        let msg_2 = format(f"std:{seg} nao existe: numero, moeda e data por regiao ficam em std:fmt; escreva import \"std:fmt\" (disponiveis: {lista})", alloc = heap)
+        defer delete(msg_2)
+        _ = common.diag_relatar(d, common.E1001, pos, msg_2)
+        let sug_2 = format(f"troque \"std:{seg}\" por \"std:fmt\": a Forja tem um so modulo de formatacao por regiao", alloc = heap)
+        defer delete(sug_2)
+        _ = common.diag_sugerir(&d.sug, common.DIAG_CERTA, sug_2)
+        _ = common.diag_editar(&d.sug, pos, (pos + 6) + tam, "\"std:fmt\"") // aspas + "std:" + nome
+        return false
+    }
+    if (tam == 2) and (nome[0..<2] == "fs") {
+        let msg_3 = format(f"std:fs nao existe: arquivo, pasta e caminho ficam em std:file; escreva import \"std:file\" (disponiveis: {lista})", alloc = heap)
+        defer delete(msg_3)
+        _ = common.diag_relatar(d, common.E1001, pos, msg_3)
+        _ = common.diag_sugerir(&d.sug, common.DIAG_CERTA, "troque \"std:fs\" por \"std:file\": o sistema de arquivos esta no modulo de arquivo")
+        _ = common.diag_editar(&d.sug, pos, (pos + 6) + tam, "\"std:file\"") // aspas + "std:" + nome
+        return false
+    }
+    if (tam == 4) and (nome[0..<4] == "proc") {
+        let msg_4 = format(f"std:proc nao existe mais: o modulo agora e std:os; escreva import \"std:os\" (disponiveis: {lista})", alloc = heap)
+        defer delete(msg_4)
+        _ = common.diag_relatar(d, common.E1001, pos, msg_4)
+        _ = common.diag_sugerir(&d.sug, common.DIAG_CERTA, "troque \"std:proc\" por \"std:os\": o modulo foi renomeado") // IA1-L2: pos = a aspa de abertura do texto
+        _ = common.diag_editar(&d.sug, pos, pos + 10, "\"std:os\"")
+        return false
+    }
+    return relatar_std_parecido(cx, imp, lista)
+}
+
+// C: frontend/modulos.c:179
+// Forma do caminho na ordem do contrato (2.3).
+proc conferir_forma(cx: ^ContextoImport, t: str, tam: u32) -> bool {
+    let d = cx.d as ^common.Diag
+    let pos: u32 = cx.pos
+    if tam == 0 {
+        return common.diag_relatar(d, common.E1001, pos, "caminho de import vazio")
+    }
+    if (tam >= 4) and (t[0..<4] == "std:") {
+        return modulos_std_tem(t[4..<tam], tam - 4) or relatar_std_ausente(cx, t[4..<tam], tam - 4)
+    }
+    if (tam >= 7) and ((t[0..<7] == "vendor:") or (t[0..<7] == "engine:")) {
+        return conferir_segmentos(d, pos, t[7..<tam], tam - 7)
+    }
+    return conferir_prefixo(d, pos, t, tam) and conferir_segmentos(d, pos, t, tam)
+}
+
+// C: frontend/modulos.c:194
+proc origem_do_caminho(t: str) -> i32 {
+    if common.c2f_prefixo_igual(t, "std:", 4) {
+        return MOD_STD
+    }
+    if common.c2f_prefixo_igual(t, "vendor:", 7) {
+        return MOD_VENDOR
+    }
+    if common.c2f_prefixo_igual(t, "engine:", 7) {
+        return MOD_ENGINE
+    }
+    return MOD_ARQUIVO
+}
+
+// C: frontend/modulos.c:203
+// Acha o modulo de mesmo texto (raiz inclusive) ou abre um novo.
+proc achar_ou_criar(m: ?^Modulos, r: ^RegistroImport, d: ^common.Diag, indice: ^u8) -> bool {
+    let mm = m as ^Modulos
+    for k in 0..<(mm.n as int) {
+        if mm.itens[k].caminho == r.texto {
+            indice^ = k as u8
+            return true
+        }
+    }
+    if mm.n == MODULOS_MAX {
+        return common.diag_relatar(d, common.E1001, r.pos_texto, "mais de 254 modulos importados")
+    }
+    let nomes = mm.nomes as ^common.Interner
+    let t: str = common.interner_texto(nomes, r.texto)
+    let n: u32 = mm.n
+    var novo: Modulo = Modulo{caminho = r.texto, importador = common.c2f_trunc_u8(r.arquivo as u64), pos_import = r.pos_texto}
+    novo.origem = origem_do_caminho(t) as u8
+    novo.apelido = apelido_padrao(m, t, common.interner_tam(nomes, r.texto))
+    mm.itens[n] = novo
+    indice^ = n as u8
+    mm.n = n + 1
+    return true
+}
+
+// C: frontend/modulos.c:219
+proc conferir_apelido_padrao(m: ?^Modulos, r: ^RegistroImport, d: ^common.Diag) -> bool {
+    if r.apelido >= 0 {
+        return true
+    }
+    let arg_1: u32 = common.interner_tam((m as ^Modulos).nomes as ^common.Interner, r.texto)
+    let arg_2: str = common.interner_texto((m as ^Modulos).nomes as ^common.Interner, r.texto)
+    let arg_3: ?^Modulos = m
+    let padrao: i32 = apelido_padrao(arg_3, arg_2, arg_1)
+    if padrao >= KW_QTD {
+        return true
+    }
+    let msg_1 = format(f"o ultimo segmento do caminho \"{common.interner_texto((m as ^Modulos).nomes as ^common.Interner, r.texto)}\" e a palavra reservada '{common.interner_texto((m as ^Modulos).nomes as ^common.Interner, padrao)}': escreva import \"{common.interner_texto((m as ^Modulos).nomes as ^common.Interner, r.texto)}\" as <nome>", alloc = heap)
+    defer delete(msg_1)
+    return common.diag_relatar(d, common.E1006, r.pos_texto, msg_1)
+}
+
+// C2F-N2: renomeado_achar/renomeado_buscar devolvem uma copia no heap (o C devolve &RENOMEADOS[k]); quem recebe libera
+proc renomeado_liberar(r: ?^common.Renomeado) {
+    if r != none {
+        delete(r as ^common.Renomeado)
+    }
+}
+
+// C: frontend/modulos.c:229
+// L3c2: a pasta (1o segmento) de um import "vendor:" na forma antiga da tabela (REN_PACOTE: banco -> db) vira a nova; 'saida' leva o texto canonico. Devolve false so no E0110 (recusar).
+proc canonizar_pasta(m: ?^Modulos, r: ^RegistroImport, d: ^common.Diag, saida: ^RegistroImport) -> bool {
+    let nomes = (m as ^Modulos).nomes as ^common.Interner
+    let t: str = common.interner_texto(nomes, r.texto)
+    let tam: u32 = common.interner_tam(nomes, r.texto)
+    var fim: u32 = 7
+    var era_antigo: bool = false
+    while (fim < tam) and (t[fim] != 47) { // '/'
+        fim += 1
+    }
+    if ((fim - 7) >= 64) or (tam >= 512) { // char pasta[64], canonico[512]
+        return true
+    }
+    let pasta: str = t[7..<fim]
+    let ren: ?^common.Renomeado = common.renomeado_achar(common.REN_PACOTE, "import", pasta, &era_antigo)
+    defer renomeado_liberar(ren)
+    if (ren == none) or (not era_antigo) {
+        return true
+    }
+    common.renomeado_notar_tabela(d, r.pos_texto + 1 + 7, fim - 7, ren)
+    if common.renomeado_recusa_em(d, ren) {
+        return common.renomeado_recusar(d, r.pos_texto + 1 + 7, fim - 7, ren)
+    }
+    let novo: str = (ren as ^common.Renomeado).novo or_else ""
+    let resto: str = t[fim..<tam]
+    let inteiro = format(f"vendor:{novo}{resto}", alloc = heap)
+    defer delete(inteiro)
+    let canonico = common.c2f_cortar(inteiro, 511) // snprintf trunca em sizeof canonico - 1
+    defer delete(canonico)
+    saida.texto = common.internar(nomes, canonico, len(canonico) as u32)
+    return true
+}
+
+// C: frontend/modulos.c:250
+proc canonizar_import(m: ?^Modulos, r: ^RegistroImport, d: ^common.Diag, saida: ^RegistroImport) -> bool {
+    let t: str = common.interner_texto((m as ^Modulos).nomes as ^common.Interner, r.texto)
+    var era_antigo: bool = false
+    let de_modulo: bool = common.c2f_prefixo_igual(t, "std:", 4) or common.c2f_prefixo_igual(t, "vendor:", 7)
+    var tern_1: ?^common.Renomeado = none
+    if common.c2f_b2i32(de_modulo) != 0 {
+        tern_1 = common.renomeado_achar(common.REN_MODULO, "import", t, &era_antigo)
+    }
+    let ren: ?^common.Renomeado = tern_1
+    defer renomeado_liberar(ren)
+    saida^ = r^
+    if (ren == none) and common.c2f_prefixo_igual(t, "vendor:", 7) {
+        return canonizar_pasta(m, r, d, saida)
+    }
+    if (ren == none) or (not era_antigo) {
+        return true
+    }
+    let arg_1: ?^common.Renomeado = ren
+    let arg_2: u32 = common.interner_tam((m as ^Modulos).nomes as ^common.Interner, r.texto)
+    let arg_3: u32 = r.pos_texto + 1
+    let arg_4: ^common.Diag = d
+    common.renomeado_notar_tabela(arg_4, arg_3, arg_2, arg_1)
+    if common.renomeado_recusa_em(d, ren) {
+        let arg_5: ?^common.Renomeado = ren
+        let arg_6: u32 = common.interner_tam((m as ^Modulos).nomes as ^common.Interner, r.texto)
+        let arg_7: u32 = r.pos_texto + 1
+        let arg_8: ^common.Diag = d
+        return common.renomeado_recusar(arg_8, arg_7, arg_6, arg_5)
+    }
+    let arg_9: u32 = (len(((ren as ^common.Renomeado).novo or_else "")) as u64) as u32
+    let arg_10: ?str = (ren as ^common.Renomeado).novo
+    let arg_11: ^common.Interner = (m as ^Modulos).nomes as ^common.Interner
+    saida.texto = common.internar(arg_11, arg_10, arg_9)
+    return true
+}
+
+// C: frontend/modulos.c:267
+proc conferir_qualificador(m: ?^Modulos, r: ^RegistroImport, d: ^common.Diag) -> bool {
+    let t: str = common.interner_texto((m as ^Modulos).nomes as ^common.Interner, r.texto)
+    let tam: u32 = common.interner_tam((m as ^Modulos).nomes as ^common.Interner, r.texto)
+    var era_antigo: bool = false
+    var padrao: i32 = 0
+    if r.apelido >= 0 {
+        return true
+    }
+    let buscado: ?^common.Renomeado = common.renomeado_buscar(common.REN_MODULO, t)
+    defer renomeado_liberar(buscado)
+    if buscado == none {
+        return true
+    }
+    padrao = apelido_padrao(m, t, tam)
+    let q: ?^common.Renomeado = common.renomeado_achar(common.REN_QUALIFICADOR, none, common.interner_texto((m as ^Modulos).nomes as ^common.Interner, padrao), &era_antigo)
+    defer renomeado_liberar(q)
+    if ((q == none) or (not era_antigo)) or (not common.renomeado_recusa_em(d, q)) {
+        return true
+    }
+    let arg_1: ?^common.Renomeado = q
+    let arg_2: u32 = common.interner_tam((m as ^Modulos).nomes as ^common.Interner, padrao)
+    let arg_3: u32 = (r.pos_texto + 1) + (tam - common.interner_tam((m as ^Modulos).nomes as ^common.Interner, padrao))
+    let arg_4: ^common.Diag = d
+    return common.renomeado_recusar(arg_4, arg_3, arg_2, arg_1)
+}
+
+// C: frontend/modulos.c:284
+proc apelido_da_forma_nova(m: ?^Modulos, escrito: ^RegistroImport, canonico: ^RegistroImport, apelido: i32) -> i32 {
+    var novo: i32 = 0
+    if (escrito.apelido >= 0) or (canonico.texto == escrito.texto) {
+        return -1
+    }
+    let arg_1: u32 = common.interner_tam((m as ^Modulos).nomes as ^common.Interner, canonico.texto)
+    let arg_2: str = common.interner_texto((m as ^Modulos).nomes as ^common.Interner, canonico.texto)
+    let arg_3: ?^Modulos = m
+    novo = apelido_padrao(arg_3, arg_2, arg_1)
+    var tern_1: i32 = novo
+    if novo == apelido {
+        tern_1 = -1
+    }
+    return tern_1
+}
+
+// C: frontend/modulos.c:293
+proc modulos_registrar(m: ?^Modulos, escrito: ^RegistroImport, d: ^common.Diag, indice: ^u8) -> bool {
+    var canonico: RegistroImport = RegistroImport{}
+    let r: ^RegistroImport = &canonico
+    if not canonizar_import(m, escrito, d, &canonico) {
+        return false
+    }
+    var cx: ContextoImport = ContextoImport{m = m, d = d, pos = r.pos_texto}
+    let arg_1: u32 = common.interner_tam((m as ^Modulos).nomes as ^common.Interner, r.texto)
+    let arg_2: str = common.interner_texto((m as ^Modulos).nomes as ^common.Interner, r.texto)
+    let arg_3: ^ContextoImport = &cx
+    if not conferir_forma(arg_3, arg_2, arg_1) {
+        return false
+    }
+    if (not conferir_apelido_padrao(m, escrito, d)) or (not conferir_qualificador(m, escrito, d)) {
+        return false
+    }
+    if not achar_ou_criar(m, r, d, indice) {
+        return false
+    }
+    var apelido: i32 = escrito.apelido
+    if apelido < 0 {
+        let arg_4: u32 = common.interner_tam((m as ^Modulos).nomes as ^common.Interner, escrito.texto)
+        let arg_5: str = common.interner_texto((m as ^Modulos).nomes as ^common.Interner, escrito.texto)
+        let arg_6: ?^Modulos = m
+        apelido = apelido_padrao(arg_6, arg_5, arg_4)
+        let ptr_1: ^Modulos = m as ^Modulos
+        ptr_1.itens[indice^].apelido = apelido
+    }
+    var i: u64 = 0
+    while i < (len((m as ^Modulos).apelidos) as u64) {
+        let a: ^ApelidoDeArquivo = &(m as ^Modulos).apelidos[i]
+        if a.arquivo != r.arquivo {
+            i += 1
+            continue
+        }
+        if (a.modulo as i32) == (indice^ as i32) {
+            let msg_1 = format(f"o modulo \"{common.interner_texto((m as ^Modulos).nomes as ^common.Interner, r.texto)}\" ja foi importado neste arquivo", alloc = heap)
+            defer delete(msg_1)
+            return common.diag_relatar(d, common.E1001, r.pos_texto, msg_1)
+        }
+        if a.nome == apelido {
+            let msg_2 = format(f"apelido '{common.interner_texto((m as ^Modulos).nomes as ^common.Interner, apelido)}' ja usado neste arquivo; troque com 'as'", alloc = heap)
+            defer delete(msg_2)
+            return common.diag_relatar(d, common.E1001, r.pos_apelido, msg_2)
+        }
+        i += 1
+    }
+    append(&(m as ^Modulos).apelidos, item = ApelidoDeArquivo{})
+    let novo: ^ApelidoDeArquivo = &(m as ^Modulos).apelidos[len((m as ^Modulos).apelidos) - 1]
+    novo^ = ApelidoDeArquivo{arquivo = r.arquivo, modulo = indice^, nome = apelido, novo = apelido_da_forma_nova(m, escrito, r, apelido)}
+    return true
+}
+
+// C: frontend/modulos.c:324
+pub proc modulos_apelido(m: ?^Modulos, arquivo: u32, nome: i32) -> u8 {
+    for i in (0 as u64)..<(len((m as ^Modulos).apelidos) as u64) {
+        let a: ^ApelidoDeArquivo = &(m as ^Modulos).apelidos[i]
+        if (a.nome == nome) and (a.arquivo == arquivo) {
+            return a.modulo
+        }
+    }
+    return 0
+}
+
+// C: frontend/modulos.c:333
+pub proc modulos_registrar_arquivo(m: ^Modulos, arquivo: u32, pacote: u8) {
+    while (len(m.pacotes) as u64) <= (arquivo as u64) {
+        append(&m.pacotes, item = 0)
+    }
+    m.pacotes[arquivo as u64] = pacote
+}
+
+// C: frontend/modulos.c:339
+pub proc modulos_pacote_do_arquivo(m: ?^Modulos, arquivo: u32) -> u8 {
+    var tern_1: i32 = 0
+    if (arquivo as u64) < (len((m as ^Modulos).pacotes) as u64) {
+        tern_1 = (m as ^Modulos).pacotes[arquivo as u64] as i32
+    }
+    return tern_1 as u8
+}
+
+// C: frontend/modulos.c:344
+pub proc modulos_trechos_do_pacote(m: ^Modulos, ntrechos: u32, pacote: u8, primeiro: ^u32) -> u32 {
+    var n: u32 = 0
+    primeiro^ = 0
+    if ntrechos == 0 {
+        var tern_1: i32 = 0
+        if pacote == 0 {
+            tern_1 = 1
+        }
+        return common.c2f_s2u_32(tern_1)
+    }
+    for t in (0 as u32)..<ntrechos {
+        if (modulos_pacote_do_arquivo(m, t) as i32) != (pacote as i32) {
+            continue
+        }
+        let antes_1: u32 = n
+        n += 1
+        if antes_1 == 0 {
+            primeiro^ = t
+        }
+    }
+    return n
+}
+
+// C: frontend/modulos.c:357
+pub proc modulos_apelido_no_pacote(m: ?^Modulos, pacote: u8, nome: i32) -> bool {
+    var i: u64 = 0
+    while i < (len((m as ^Modulos).apelidos) as u64) {
+        let a: ^ApelidoDeArquivo = &(m as ^Modulos).apelidos[i]
+        if (a.nome == nome) and ((modulos_pacote_do_arquivo(m, a.arquivo) as i32) == (pacote as i32)) {
+            return true
+        }
+        i += 1
+    }
+    return false
+}
+
+// C: frontend/modulos.c:366
+proc modulos_apelido_novo(m: ?^Modulos, arquivo: u32, nome: i32) -> i32 {
+    for i in (0 as u64)..<(len((m as ^Modulos).apelidos) as u64) {
+        let a: ^ApelidoDeArquivo = &(m as ^Modulos).apelidos[i]
+        if (a.nome == nome) and (a.arquivo == arquivo) {
+            return a.novo
+        }
+    }
+    return -1
+}
+
+// C: frontend/modulos.c:388
+// "a -> b -> a": da posicao de 'alvo' na pilha ate o topo, e o alvo de novo (E1002 no texto do import que fecha o ciclo).
+proc relatar_ciclo(g: ^Dfs, imp: ?^Decl, alvo: u8) -> bool {
+    let mm = g.m as ^Modulos
+    let nomes = mm.nomes as ^common.Interner
+    var cadeia = make([dynamic]u8, alloc = heap)
+    defer delete(cadeia)
+    var ini: u32 = 0
+    while g.pilha[ini] != alvo {
+        ini += 1
+    }
+    for i in ini..<g.prof {
+        append(&cadeia, item = common.interner_texto(nomes, mm.itens[g.pilha[i]].caminho))
+        append(&cadeia, item = " -> ")
+    }
+    append(&cadeia, item = common.interner_texto(nomes, mm.itens[alvo].caminho))
+    let texto = from_bytes(cadeia[..], alloc = heap)
+    defer delete(texto)
+    let msg = format(f"ciclo de import: {texto}", alloc = heap)
+    defer delete(msg)
+    _ = common.diag_relatar(g.d as ^common.Diag, common.E1002, (imp as ^Decl).pos_a, msg)
+    return false
+}
+
+// C: frontend/modulos.c:406
+// Segue uma aresta k -> imp->indice. false = ciclo (diagnostico ja gravado).
+proc seguir_import(g: ^Dfs, imp: ?^Decl) -> bool {
+    let alvo: u8 = (imp as ^Decl).indice as u8
+    if g.estado[alvo] == (ESTADO_NA_PILHA as u8) {
+        return relatar_ciclo(g, imp, alvo)
+    }
+    return (g.estado[alvo] == (ESTADO_PRONTO as u8)) or visitar(g, alvo)
+}
+
+// C: frontend/modulos.c:413
+// LIMITE: recursao em profundidade <= 254 (MODULOS_MAX), igual ao C; a pilha do Dfs e o proprio limite.
+proc visitar(g: ^Dfs, k: u8) -> bool {
+    g.estado[k] = ESTADO_NA_PILHA as u8
+    g.pilha[g.prof] = k
+    g.prof += 1
+    var cur: ?^Decl = (g.p as ^Programa).primeira
+    while cur != none {
+        let dd = cur as ^Decl
+        if (dd.tipo_no == (D_IMPORT as u8)) and (dd.modulo == k) and (not seguir_import(g, dd)) {
+            return false
+        }
+        cur = dd.prox
+    }
+    g.prof -= 1
+    g.estado[k] = ESTADO_PRONTO as u8
+    let gm = g.m as ^Modulos
+    var ord: [255]u8 = gm.ordem or_else {}
+    ord[g.nordem] = k
+    gm.ordem = ord
+    g.nordem += 1
+    return true
+}
+
+// C: frontend/modulos.c:426
+pub proc modulos_conferir_ciclos(m: ^Modulos, p: ^Programa, d: ^common.Diag) -> bool {
+    var g: Dfs = Dfs{m = m, p = p, d = d}
+    return visitar(&g, 0)
+}
+
+// C: frontend/modulos.c:432
+// Reagrupa as declaracoes por modulo, na ordem de dependencia (pos-ordem do DFS), mantendo a ordem relativa dentro de cada modulo.
+pub proc modulos_ordenar_decls(m: ^Modulos, p: ^Programa) {
+    var cabeca: [255]?^Decl = {}
+    var cauda: [255]?^Decl = {}
+    var ultima: ?^Decl = none
+    var cur: ?^Decl = p.primeira
+    while cur != none {
+        let dd = cur as ^Decl
+        let prox: ?^Decl = dd.prox
+        dd.prox = none
+        let k: u8 = dd.modulo
+        if cauda[k] == none {
+            cabeca[k] = dd
+        } else {
+            let anterior = cauda[k] as ^Decl
+            anterior.prox = dd
+        }
+        cauda[k] = dd
+        cur = prox
+    }
+    p.primeira = none
+    let ordem: [255]u8 = m.ordem or_else {}
+    for i in 0..<(m.n as int) {
+        let k: u8 = ordem[i]
+        if cabeca[k] == none {
+            continue
+        }
+        if ultima == none {
+            p.primeira = cabeca[k]
+        } else {
+            let fim_atual = ultima as ^Decl
+            fim_atual.prox = cabeca[k]
+        }
+        ultima = cauda[k]
+    }
+    p.ultima = ultima
+}
+
+// C: frontend/modulos.c:451
+pub proc modulos_liberar(m: ^Modulos) {
+    delete(m.apelidos)
+    delete(m.pacotes)
+}
+
+// G3 P-front A: registro de imports (std ok, chute std:strings com sugestao, repetido, forma antiga recusada) e DFS de ciclo; mensagens conferidas no diferencial C x Forja
+test "modulos: registrar import e ciclo" {
+    var a: common.Arena = common.Arena{}
+    var nomes: common.Interner = common.Interner{}
+    common.interner_iniciar(&nomes, &a)
+    lexer_nomes_iniciais(&nomes)
+    var m: Modulos = Modulos{}
+    modulos_iniciar(&m, &nomes, "dir/main.fj")
+    expect(m.n == 1 and (m.pasta or_else "") == "dir")
+    var idx: u8 = 0
+    var d: common.Diag = common.Diag{}
+    var r: RegistroImport = RegistroImport{texto = common.internar(&nomes, "std:text", 8), apelido = -1, arquivo = 0, pos_texto = 10, pos_apelido = 20}
+    expect(modulos_registrar(&m, &r, &d, &idx) and idx == 1 and m.n == 2 and m.itens[1].origem == (MOD_STD as u8))
+    var d2: common.Diag = common.Diag{}
+    expect(not modulos_registrar(&m, &r, &d2, &idx))
+    expect(d2.tem and (d2.causa or_else "") == "o modulo \"std:text\" ja foi importado neste arquivo")
+    var d3: common.Diag = common.Diag{}
+    var chute: RegistroImport = RegistroImport{texto = common.internar(&nomes, "std:strings", 11), apelido = -1, arquivo = 0, pos_texto = 5, pos_apelido = 0}
+    expect(not modulos_registrar(&m, &chute, &d3, &idx))
+    expect(d3.tem and d3.sug.n == 1)
+    var d4: common.Diag = common.Diag{}
+    var antigo: RegistroImport = RegistroImport{texto = common.internar(&nomes, "std:arquivo", 11), apelido = -1, arquivo = 0, pos_texto = 5, pos_apelido = 0}
+    expect(not modulos_registrar(&m, &antigo, &d4, &idx))
+    expect(d4.tem and d4.codigo == 144)
+    var da: Decl = Decl{tipo_no = D_IMPORT as u8, modulo = 0, indice = 1, pos_a = 10}
+    var dc: Decl = Decl{tipo_no = D_IMPORT as u8, modulo = 1, indice = 0, pos_a = 77}
+    da.prox = &dc
+    var p: Programa = Programa{}
+    p.primeira = &da
+    p.ultima = &dc
+    var d5: common.Diag = common.Diag{}
+    let ciclo: bool = modulos_conferir_ciclos(&m, &p, &d5)
+    expect(not ciclo)
+    expect(d5.tem and d5.codigo == common.E1002 and (d5.causa or_else "") == "ciclo de import: main -> std:text -> main")
+    modulos_liberar(&m)
+    common.interner_liberar(&nomes)
+    common.arena_liberar(&a)
+}

@@ -1,0 +1,453 @@
+// driver/editar_plano.fj - porte de compiler/driver/editar_plano.c
+// sha256 de driver/editar_plano.c: 7fb0a64078587e085fb31748458fcf550571cf3e54649e1c087886fbb94a57b4
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "cache"
+import "common"
+
+// Copia 'texto' para a arena do plano: o texto sobrevive a quem o passou (que pode apagar o dele logo depois).
+proc copia_na_arena(p: ^Plano, texto: str) -> str {
+    return from_bytes(as_bytes(texto), alloc = common.arena_mem(p.arena as ^common.Arena))
+}
+
+// A frase de erro cabe em EDITAR_TEXTO_MAX - 1 bytes (o snprintf do C cortava nesse ponto).
+proc limitar_frase(texto: str) -> str {
+    return texto[0..<min(len(texto), ((EDITAR_TEXTO_MAX - 1) as int))]
+}
+
+// C: driver/editar_plano.c:16
+// C2F-37: `fmt, ...` virou `msg: str` (mensagem ja pronta). Guarda a 1a frase, como o C.
+proc plano_erro(p: ^Plano, msg: str) -> bool {
+    if (p.erro or_else "") != "" {
+        return false
+    }
+    p.erro = copia_na_arena(p, limitar_frase(msg))
+    return false
+}
+
+// C: driver/editar_plano.c:29
+proc caminho_eh_da_std(caminho: ?str) -> bool {
+    return common.c2f_prefixo_igual((caminho or_else ""), "std:", 4)
+}
+
+// C: driver/editar_plano.c:35
+// O arquivo do plano (lido na 1a vez que e tocado). none = erro em p.erro (std embutida ou arquivo ilegivel).
+proc achar_arquivo(p: ^Plano, caminho: ?str) -> ?^ArquivoEditado {
+    let alvo: str = caminho or_else ""
+    var k: u32 = 0
+    while k < p.narquivos {
+        if (p.arquivos[k].caminho or_else "") == alvo {
+            return &p.arquivos[k]
+        }
+        k += 1
+    }
+    if caminho_eh_da_std(caminho) {
+        let msg_std = format(f"'{alvo}' e da biblioteca padrao embutida no forja: nao se edita", alloc = common.arena_mem(p.arena as ^common.Arena))
+        _ = plano_erro(p, msg_std)
+        return none
+    }
+    var dados: [dynamic]u8 = make([dynamic]u8, alloc = heap)
+    defer delete(dados)
+    if not cache.arquivo_ler_inteiro(alvo, &dados) {
+        let msg_ler = format(f"nao consegui ler '{alvo}'", alloc = common.arena_mem(p.arena as ^common.Arena))
+        _ = plano_erro(p, msg_ler)
+        return none
+    }
+    // arquivo_ler_inteiro acrescenta um NUL depois dos bytes: o tamanho do arquivo e um a menos
+    let tam: u64 = (len(dados) as u64) - 1
+    let original: str = from_bytes(dados[0..<(tam as int)], alloc = common.arena_mem(p.arena as ^common.Arena))
+    let relativo_heap: str = caminho_relativo_texto(p, caminho)
+    defer delete(relativo_heap)
+    append(&p.arquivos, item = ArquivoEditado{caminho = copia_na_arena(p, alvo), relativo = copia_na_arena(p, relativo_heap), original = original, tam = tam, edicoes = make([dynamic]Edicao, alloc = heap), n = 0, cap = 0})
+    p.narquivos += 1
+    return &p.arquivos[((p.narquivos - 1) as int)]
+}
+
+// C: driver/editar_plano.c:65
+// O texto do arquivo sem o BOM (as posicoes das edicoes nao o contam); tam^ recebe o tamanho sem o BOM.
+proc texto_de(a: ?^ArquivoEditado, tam: ^u64) -> str {
+    let arq: ^ArquivoEditado = a as ^ArquivoEditado
+    let original: str = arq.original or_else ""
+    var bom: u64 = 0
+    if edicoes_tem_bom(as_bytes(original), arq.tam) {
+        bom = EDICOES_BOM_TAM as u64
+    }
+    tam^ = arq.tam - bom
+    return original[(bom as int)..<len(original)]
+}
+
+// Posicao do proximo LF a partir de 'ini' e antes de 'tam'; none se nao ha.
+proc proximo_lf(texto: str, ini: u64, tam: u64) -> ?u64 {
+    var k: u64 = ini
+    while k < tam {
+        if texto[k] == 10 { // '\n'
+            return k
+        }
+        k += 1
+    }
+    return none
+}
+
+// C: driver/editar_plano.c:74
+// Offset de (linha, coluna) no texto; none se a linha nao existe ou a coluna passa do fim.
+proc offset_de(texto: str, tam: u64, linha: u32, coluna: u32) -> ?u64 {
+    var ini: u64 = 0
+    var l: u32 = 1
+    while l < linha {
+        let nl: ?u64 = proximo_lf(texto, ini, tam)
+        if nl == none {
+            return none
+        }
+        ini = (nl or_else 0) + 1
+        l += 1
+    }
+    if (ini + (coluna as u64)) == 0 {
+        return none
+    }
+    let off: u64 = ini + (coluna as u64) - 1
+    if off <= tam {
+        return off
+    }
+    return none
+}
+
+// C: driver/editar_plano.c:90
+// O arquivo usa CRLF? (o 1o fim de linha decide)
+proc usa_crlf(texto: str, tam: u64) -> bool {
+    let nl: ?u64 = proximo_lf(texto, 0, tam)
+    if nl == none {
+        return false
+    }
+    let pos: u64 = nl or_else 0
+    if pos == 0 {
+        return false
+    }
+    return texto[pos - 1] == 13
+}
+
+// C: driver/editar_plano.c:98
+// 'novo' com cada LF puro trocado por CRLF (so em arquivo CRLF).
+proc novo_no_fim_de_linha(p: ^Plano, novo: ?str, crlf: bool) -> str {
+    let texto: str = novo or_else ""
+    let tem_lf: ?u64 = proximo_lf(texto, 0, len(texto) as u64)
+    if (not crlf) or (tem_lf == none) {
+        return copia_na_arena(p, texto)
+    }
+    var saida: [dynamic]u8 = make([dynamic]u8, alloc = heap)
+    defer delete(saida)
+    var anterior: u8 = 0
+    for c in (0 as u64)..<(len(texto) as u64) {
+        let b: u8 = texto[c]
+        if (b == 10) and (anterior != 13) {
+            append(&saida, item = 13)
+        }
+        append(&saida, item = b)
+        anterior = b
+    }
+    return from_bytes(saida[..], alloc = common.arena_mem(p.arena as ^common.Arena))
+}
+
+// C: driver/editar_plano.c:115
+proc empurrar_edicao(a: ?^ArquivoEditado, e: ^Edicao) {
+    let arq: ^ArquivoEditado = a as ^ArquivoEditado
+    append(&arq.edicoes, item = e^)
+    arq.n += 1
+}
+
+// C: driver/editar_plano.c:125
+proc ja_tem(a: ?^ArquivoEditado, e: ^Edicao) -> bool {
+    var k: u32 = 0
+    while k < (a as ^ArquivoEditado).n {
+        if edicoes_iguais(&(a as ^ArquivoEditado).edicoes[k], e) {
+            return true
+        }
+        k += 1
+    }
+    return false
+}
+
+// C: driver/editar_plano.c:134
+// Tira o que a faixa e o texto novo tem igual no comeco e no fim: o diff de uma troca de varias linhas so mostra o que mudou.
+proc apara_iguais(texto: str, de: ^u64, ate: ^u64, novo: ^str) {
+    let txt: str = novo^
+    let velho: u64 = ate^ - de^
+    let tam_novo: u64 = len(txt) as u64
+    var ini: u64 = 0
+    var fim: u64 = 0
+    while (ini < velho) and (ini < tam_novo) and (texto[de^ + ini] == txt[ini]) {
+        ini += 1
+    }
+    while (fim < (velho - ini)) and (fim < (tam_novo - ini)) and (texto[ate^ - 1 - fim] == txt[tam_novo - 1 - fim]) {
+        fim += 1
+    }
+    de^ = de^ + ini
+    ate^ = ate^ - fim
+    novo^ = txt[(ini as int)..<((tam_novo - fim) as int)]
+}
+
+// C: driver/editar_plano.c:147
+// Linha e coluna (a partir de 1) do offset no texto.
+proc posicao_de(texto: str, off: u64, linha: ^u32, coluna: ^u32) {
+    var ini_linha: u64 = 0
+    linha^ = 1
+    for k in (0 as u64)..<off {
+        if texto[k] != 10 { // '\n'
+            continue
+        }
+        linha^ += 1
+        ini_linha = k + 1
+    }
+    coluna^ = ((off - ini_linha) as u32) + 1
+}
+
+// C: driver/editar_plano.c:162
+// Edicao de [de, ate) por novo, com as posicoes recalculadas dos offsets (depois de aparar).
+// LIMITE: parametros 5 (texto+de+ate delimitam a faixa e novo o texto novo; sao os mesmos pares de buffer da fronteira do motor de edicoes).
+proc edicao_de_offsets(p: ^Plano, texto: str, de: u64, ate: u64, novo: str) -> Edicao {
+    var e: Edicao = Edicao{}
+    posicao_de(texto, de, &e.linha, &e.coluna)
+    posicao_de(texto, ate, &e.linha_fim, &e.coluna_fim)
+    if e.linha_fim == e.linha {
+        e.linha_fim = 0
+    }
+    e.antigo = copia_na_arena(p, texto[(de as int)..<(ate as int)])
+    e.novo = copia_na_arena(p, novo)
+    return e
+}
+
+// Erro de posicao: a frase traz o arquivo e a linha/coluna pedidas.
+proc erro_posicao_fora(p: ^Plano, caminho: ?str, linha: u32, coluna: u32) -> bool {
+    let cam: str = caminho or_else ""
+    let msg_pos = format(f"posicao fora do arquivo '{cam}' (linha {linha}, coluna {coluna})", alloc = common.arena_mem(p.arena as ^common.Arena))
+    return plano_erro(p, msg_pos)
+}
+
+// C: driver/editar_plano.c:174
+proc plano_trocar_faixa(p: ^Plano, caminho: ?str, faixa: ^Edicao, novo: ?str) -> bool {
+    let a: ?^ArquivoEditado = achar_arquivo(p, caminho)
+    if a == none {
+        return false
+    }
+    var tam: u64 = 0
+    let texto: str = texto_de(a, &tam)
+    var linha_ate: u32 = faixa.linha
+    if faixa.linha_fim > faixa.linha {
+        linha_ate = faixa.linha_fim
+    }
+    let de_o: ?u64 = offset_de(texto, tam, faixa.linha, faixa.coluna)
+    let ate_o: ?u64 = offset_de(texto, tam, linha_ate, faixa.coluna_fim)
+    let valido: bool = (de_o != none) and (ate_o != none) and ((ate_o or_else 0) >= (de_o or_else 0))
+    if not valido {
+        return erro_posicao_fora(p, caminho, faixa.linha, faixa.coluna)
+    }
+    var de: u64 = de_o or_else 0
+    var ate: u64 = ate_o or_else 0
+    let txt_novo: str = novo_no_fim_de_linha(p, novo, usa_crlf(texto, tam))
+    var txt: str = txt_novo
+    var e: Edicao = Edicao{}
+    if faixa.linha_fim > faixa.linha {
+        apara_iguais(texto, &de, &ate, &txt)
+        if (de == ate) and (len(txt) == 0) {
+            return true
+        }
+        e = edicao_de_offsets(p, texto, de, ate, txt)
+    } else {
+        e = faixa^
+        e.antigo = copia_na_arena(p, texto[(de as int)..<(ate as int)])
+        e.novo = copia_na_arena(p, txt)
+    }
+    if not ja_tem(a, &e) {
+        empurrar_edicao(a, &e)
+    }
+    return true
+}
+
+// C: driver/editar_plano.c:201
+proc plano_trocar_offsets(p: ^Plano, ini: u32, fim: u32, novo: ?str) -> bool {
+    let f: ^common.Fonte = &((p.q as ^Consulta).c as ^Compilacao).fonte
+    let de: common.FontePosicao = common.fonte_localizar_no_arquivo(f, ini)
+    var ate: common.FontePosicao = common.fonte_localizar_no_arquivo(f, fim)
+    var faixa: Edicao = Edicao{}
+    if (fim > ini) and (((de.caminho or_else "") != (ate.caminho or_else "")) or (ate.linha < de.linha)) {
+        ate = common.fonte_localizar_no_arquivo(f, fim - 1)
+        ate.coluna += 1
+    }
+    faixa = Edicao{linha = de.linha, coluna = de.coluna, linha_fim = ate.linha, coluna_fim = ate.coluna}
+    if (de.caminho or_else "") != (ate.caminho or_else "") {
+        let msg_1 = format(f"a faixa a editar atravessa dois arquivos", alloc = common.arena_mem(p.arena as ^common.Arena))
+        return plano_erro(p, msg_1)
+    }
+    return plano_trocar_faixa(p, de.caminho, &faixa, novo)
+}
+
+// C: driver/editar_plano.c:219
+// LIMITE: parametros 5 (o plano e o arquivo dizem onde; o par de offsets locais e o texto novo dizem o que trocar; mesma forma do PlanoTrocarFaixa, que ele estende).
+proc plano_trocar_locais(p: ^Plano, caminho: ?str, ini: u32, fim: u32, novo: ?str) -> bool {
+    let a: ?^ArquivoEditado = achar_arquivo(p, caminho)
+    var faixa: Edicao = Edicao{linha = 0}
+    var texto: str = ""
+    var tam: u64 = 0
+    if a == none {
+        return false
+    }
+    texto = texto_de(a, &tam)
+    if (ini > fim) or ((fim as u64) > tam) {
+        let txt_1 = caminho or_else "(null)"
+        let msg_1 = format(f"posicao fora do arquivo '{txt_1}' (offset {fim})", alloc = common.arena_mem(p.arena as ^common.Arena))
+        return plano_erro(p, msg_1)
+    }
+    posicao_de(texto, ini as u64, &faixa.linha, &faixa.coluna)
+    posicao_de(texto, fim as u64, &faixa.linha_fim, &faixa.coluna_fim)
+    return plano_trocar_faixa(p, caminho, &faixa, novo)
+}
+
+// C: driver/editar_plano.c:234
+proc plano_total_edicoes(p: ^Plano) -> u32 {
+    var total: u32 = 0
+    for k in (0 as u32)..<p.narquivos {
+        total += p.arquivos[k].n
+    }
+    return total
+}
+
+// C: driver/editar_plano.c:243
+// LIMITE: parametros 5 (os quatro campos de uma linha do registro mais o plano; agrupar em struct so criaria um tipo de uso unico).
+proc plano_registrar(p: ^Plano, op: str, alvo: ?str, novo: ?str, edicoes_antes: u32) {
+    let total: u32 = plano_total_edicoes(p)
+    append(&p.operacoes, item = Operacao{op = op, alvo = alvo, novo = novo, edicoes = total - edicoes_antes})
+    p.noperacoes += 1
+}
+
+// C: driver/editar_plano.c:252 (CompararEdicoes do qsort): comparacao de texto como strcmp (bytes sem sinal).
+proc texto_menor(a: str, b: str) -> bool {
+    let ba: []u8 = as_bytes(a)
+    let bb: []u8 = as_bytes(b)
+    var k: u64 = 0
+    while (k < (len(ba) as u64)) and (k < (len(bb) as u64)) {
+        if ba[k] != bb[k] {
+            return ba[k] < bb[k]
+        }
+        k += 1
+    }
+    return (len(ba) as u64) < (len(bb) as u64)
+}
+
+// C: CompararEdicoes (linha, coluna, coluna_fim, linha_fim, antigo, novo). Ordem total: duas edicoes que
+// empatam nos seis campos sao identicas, entao o qsort sem estabilidade do C e a sort_by dao a mesma saida.
+proc edicao_menor(a: ^Edicao, b: ^Edicao) -> bool {
+    if a.linha != b.linha {
+        return a.linha < b.linha
+    }
+    if a.coluna != b.coluna {
+        return a.coluna < b.coluna
+    }
+    if a.coluna_fim != b.coluna_fim {
+        return a.coluna_fim < b.coluna_fim
+    }
+    if a.linha_fim != b.linha_fim {
+        return a.linha_fim < b.linha_fim
+    }
+    if (a.antigo or_else "") != (b.antigo or_else "") {
+        return texto_menor(a.antigo or_else "", b.antigo or_else "")
+    }
+    return texto_menor(a.novo or_else "", b.novo or_else "")
+}
+
+// C: CompararArquivos (strcmp do caminho relativo)
+proc arquivo_menor(a: ^ArquivoEditado, b: ^ArquivoEditado) -> bool {
+    return texto_menor(a.relativo or_else "", b.relativo or_else "")
+}
+
+// C: driver/editar_plano.c:271
+// arquivos por caminho (barras normais) e edicoes por posicao
+proc plano_ordenar(p: ^Plano) {
+    sort_by(p.arquivos[..], less = arquivo_menor)
+    var k: u32 = 0
+    while k < p.narquivos {
+        sort_by(p.arquivos[k].edicoes[..], less = edicao_menor)
+        k += 1
+    }
+}
+
+// C: driver/editar_plano.c:277
+// Os textos (original, caminho, relativo) estao na arena do plano; so as listas sao liberadas aqui.
+proc plano_liberar(p: ^Plano) {
+    var k: u32 = 0
+    while k < p.narquivos {
+        delete(p.arquivos[k].edicoes)
+        k += 1
+    }
+    delete(p.arquivos)
+    delete(p.operacoes)
+    if p.sintatica != none {
+        let c: ^Compilacao = p.sintatica as ^Compilacao
+        liberar_compilacao(c)
+        delete(c)
+    }
+    p^ = Plano{}
+}
+
+test "texto_menor compara como strcmp" {
+    expect(texto_menor("a", "b"))
+    expect(not texto_menor("b", "a"))
+    expect(texto_menor("a", "ab"))
+    expect(not texto_menor("ab", "a"))
+    expect(not texto_menor("a", "a"))
+}
+
+test "offset_de acha o offset de linha e coluna" {
+    expect((offset_de("ab\ncd", 5, 1, 1) or_else 99) == 0)
+    expect((offset_de("ab\ncd", 5, 2, 1) or_else 99) == 3)
+    expect((offset_de("ab\ncd", 5, 2, 2) or_else 99) == 4)
+    expect(offset_de("ab\ncd", 5, 3, 1) == none)
+    expect(offset_de("ab\ncd", 5, 1, 7) == none)
+}
+
+test "posicao_de devolve linha e coluna a partir de 1" {
+    var l: u32 = 0
+    var c: u32 = 0
+    posicao_de("ab\ncd", 4, &l, &c)
+    expect(l == 2)
+    expect(c == 2)
+}
+
+test "usa_crlf decide pelo 1o fim de linha" {
+    expect(usa_crlf("a\r\nb", 4))
+    expect(not usa_crlf("a\nb", 3))
+    expect(not usa_crlf("ab", 2))
+}
+
+test "apara_iguais tira o prefixo e o sufixo iguais" {
+    var de: u64 = 3
+    var ate: u64 = 6
+    var novo: str = "XQZ"
+    apara_iguais("abcXYZdef", &de, &ate, &novo)
+    expect(de == 4)
+    expect(ate == 5)
+    expect(novo == "Q")
+}
+
+test "limitar_frase deixa a frase curta como esta" {
+    expect(limitar_frase("abc") == "abc")
+}
+
+test "novo_no_fim_de_linha poe CR antes de cada LF so em arquivo CRLF" {
+    let mem: ^MemoriaDoPlano = new(MemoriaDoPlano, alloc = heap)
+    var p: Plano = Plano{arena = &mem.arena}
+    expect(novo_no_fim_de_linha(&p, "a\nb", true) == "a\r\nb")
+    expect(novo_no_fim_de_linha(&p, "a\r\nb", true) == "a\r\nb")
+    expect(novo_no_fim_de_linha(&p, "a\nb", false) == "a\nb")
+    common.arena_liberar(&mem.arena)
+    delete(mem)
+}
+
+test "plano_erro guarda so a 1a frase" {
+    let mem: ^MemoriaDoPlano = new(MemoriaDoPlano, alloc = heap)
+    var p: Plano = Plano{arena = &mem.arena}
+    expect(not plano_erro(&p, "primeira"))
+    expect(not plano_erro(&p, "segunda"))
+    expect((p.erro or_else "") == "primeira")
+    common.arena_liberar(&mem.arena)
+    delete(mem)
+}

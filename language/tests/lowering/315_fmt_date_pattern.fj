@@ -1,0 +1,136 @@
+// IA1-S2h (D-FMT): std:fmt, padrao livre (subconjunto LDML): format_pattern com 48 padroes validos (todos os tokens, literais, aspas e '') e 28 invalidos, em 4 combinacoes de regiao e data; bordas de yyyy e yy (ano negativo, 0, 99, 100, 9999, 10000), data impossivel e write_pattern que nao toca o builder em erro.
+// Cada linha: padrao | regiao | texto ou "ERR nome". Conferido contra o oraculo Python independente (scratchpad, sem o forja).
+import "std:fmt" as fmt
+import "std:time" as tm
+
+const PATTERNS: [76]str = {
+    "d", "dd", "M", "MM", "MMM", "MMMM", "yy", "yyyy", "E", "EEEE", "H", "HH", "h", "hh", "m", "mm", "s", "ss", "a",
+    "dd/MM/yyyy HH:mm:ss", "yyyy-MM-dd'T'HH:mm:ss", "EEEE, d 'de' MMMM 'de' yyyy", "h:mm a", "hh:mm:ss a", "d.M.yy", "yyyyMMdd", "HHmmss",
+    "'o''clock' h a", "''", "'a''b'", "d 'de' MMM", "MMM d, yyyy", "d MMM yyyy, HH:mm", "E dd/MM", "H'h'mm", "yy/M/d", "  dd  ",
+    "dd/MM/yyyy ñ ü", "'dia' dd", "dd 'de ''abril'' de' yyyy", "[dd] (MM) {yy}", "yyyy年MM月dd日", "'texto sem campo'", "MMMM MMM MM M",
+    "EEEE E", "HH:mm 'h'", "'' d", "d''M",
+    "ddd", "yyy", "y", "EEE", "EE", "aa", "MMMMM", "mmm", "q", "Z", "x", "G", "dd/MM/yyyyy", "", "abc", "'abc", "dd 'de", "'", "'''",
+    "D", "w", "L", "yyyyy", "HHH", "hhh", "sss", "dd-MM-yyyy z", "k"}
+const COMBO_LOC: [4]int = {0, 1, 5, 3}
+const COMBO_Y: [4]int = {2000, 2024, 99, 1999}
+const COMBO_M: [4]int = {2, 12, 7, 12}
+const COMBO_D: [4]int = {29, 31, 15, 31}
+const COMBO_H: [4]int = {13, 0, 12, 23}
+const COMBO_MI: [4]int = {5, 7, 30, 59}
+const COMBO_S: [4]int = {9, 3, 45, 59}
+const BORDER_YEARS: [12]int = {-12345, -100, -44, -1, 0, 5, 99, 100, 1970, 9999, 10000, 12345}
+const BAD_Y: [9]int = {2000, 2000, 2001, 2000, 2000, 2000, 2000, 2000, 2000}
+const BAD_M: [9]int = {13, 0, 2, 4, 1, 1, 1, 1, 1}
+const BAD_D: [9]int = {1, 1, 29, 31, 0, 1, 1, 1, 32}
+const BAD_H: [9]int = {0, 0, 0, 0, 0, 24, 0, 0, 0}
+const BAD_MI: [9]int = {0, 0, 0, 0, 0, 0, 60, 0, 0}
+const BAD_S: [9]int = {0, 0, 0, 0, 0, 0, 0, 60, 0}
+
+proc nome_erro(e: fmt.DateError) -> str {
+    switch e {
+    case fmt.DateError.empty:
+        return "empty"
+    case fmt.DateError.invalid_pattern:
+        return "invalid_pattern"
+    case fmt.DateError.mismatch:
+        return "mismatch"
+    case fmt.DateError.out_of_range:
+        return "out_of_range"
+    }
+    return "?"
+}
+
+// O resultado de format_pattern (texto ou "ERR nome") acrescentado ao builder.
+proc junta_resultado(buf: ^[dynamic]u8, dt: tm.DateTime, pattern: str, loc: fmt.Locale) {
+    switch r in fmt.format_pattern(dt, pattern, loc = loc, alloc = heap) {
+    case str:
+        append(buf, item = r)
+        delete(r)
+    case fmt.DateError:
+        append(buf, item = "ERR ")
+        append(buf, item = nome_erro(r))
+    }
+}
+
+proc imprime(buf: ^[dynamic]u8) {
+    let texto = to_str(buf)
+    print(texto)
+    delete(texto)
+}
+
+proc padroes() {
+    for pi in 0..<76 {
+        for ci in 0..<4 {
+            let loc = fmt.LOCALES[COMBO_LOC[ci]]
+            let dt = tm.DateTime{year = COMBO_Y[ci], month = COMBO_M[ci], day = COMBO_D[ci], hour = COMBO_H[ci], minute = COMBO_MI[ci], second = COMBO_S[ci]}
+            var buf = make([dynamic]u8, alloc = heap, cap = 128)
+            defer delete(buf)
+            format(f"{PATTERNS[pi]}|{loc.tag}|", into = &buf)
+            junta_resultado(&buf, dt, PATTERNS[pi], loc)
+            imprime(&buf)
+        }
+    }
+}
+
+proc anos() {
+    for yi in 0..<12 {
+        let dt = tm.DateTime{year = BORDER_YEARS[yi], month = 2, day = 28, hour = 8, minute = 9, second = 10}
+        var buf = make([dynamic]u8, alloc = heap, cap = 128)
+        defer delete(buf)
+        format(f"ano {BORDER_YEARS[yi]}|", into = &buf)
+        junta_resultado(&buf, dt, "yyyy", fmt.PT_BR)
+        append(&buf, item = "|")
+        junta_resultado(&buf, dt, "yy", fmt.PT_BR)
+        append(&buf, item = "|")
+        junta_resultado(&buf, dt, "EEEE, dd/MM/yyyy", fmt.EN_US)
+        imprime(&buf)
+    }
+}
+
+// Data impossivel: com padrao bom e out_of_range; com padrao ruim e invalid_pattern (o padrao e conferido antes).
+proc impossiveis() {
+    for i in 0..<9 {
+        let dt = tm.DateTime{year = BAD_Y[i], month = BAD_M[i], day = BAD_D[i], hour = BAD_H[i], minute = BAD_MI[i], second = BAD_S[i]}
+        var buf = make([dynamic]u8, alloc = heap, cap = 128)
+        defer delete(buf)
+        format(f"impossivel {i}|", into = &buf)
+        junta_resultado(&buf, dt, "yyyy-MM-dd HH:mm:ss", fmt.ISO)
+        append(&buf, item = "|")
+        junta_resultado(&buf, dt, "ddd", fmt.ISO)
+        imprime(&buf)
+    }
+}
+
+// Em erro o builder fica como estava: 1 byte "X" antes e depois.
+proc intacto() {
+    var buf = make([dynamic]u8, alloc = heap, cap = 32)
+    defer delete(buf)
+    append(&buf, item = "X")
+    let bom = tm.DateTime{year = 2000, month = 1, day = 1}
+    let ruim = tm.DateTime{year = 2000, month = 2, day = 30}
+    var falhas = 0
+    switch fmt.write_pattern(bom, "yyy", buf = &buf, loc = fmt.PT_BR) {
+    case fmt.DateError:
+        falhas += 1
+    default:
+    }
+    switch fmt.write_pattern(ruim, "yyyy", buf = &buf, loc = fmt.PT_BR) {
+    case fmt.DateError:
+        falhas += 1
+    default:
+    }
+    print(f"intacto len={len(buf)} falhas={falhas}")
+    switch fmt.write_pattern(bom, "yyyy", buf = &buf, loc = fmt.PT_BR) {
+    case fmt.DateError:
+        print("falhou")
+    default:
+        print(f"escreveu len={len(buf)}")
+    }
+}
+
+proc main() {
+    padroes()
+    anos()
+    impossiveis()
+    intacto()
+}

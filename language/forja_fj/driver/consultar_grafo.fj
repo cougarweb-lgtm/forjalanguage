@@ -1,0 +1,173 @@
+// driver/consultar_grafo.fj - porte de compiler/driver/consultar_grafo.c
+// sha256 de driver/consultar_grafo.c: df16fc60483df91be239de05033f41149a4f21286356de4758030fd164e0b642
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "frontend"
+import "semantic"
+
+struct Chamado {
+    alvo: ?^frontend.Decl
+    nome: i32
+    pos: u32
+    chamadas: u32
+}
+
+// C: driver/consultar_grafo.c:13
+proc chama_proc(u: ^semantic.IndUso, proc_c: ?^frontend.Decl) -> bool {
+    return u.chamada and ((u.alvo_tipo as i32) == semantic.IND_PROC) and (u.alvo == proc_c)
+}
+
+// C: driver/consultar_grafo.c:18
+proc chamada_json(q: ^Consulta, u: ^semantic.IndUso) {
+    consulta_abrir_obj(q)
+    if u.dono != none {
+        consulta_chave_id(q, "em", u.dono)
+    } else {
+        consulta_chave_texto(q, "em", none, 0)
+    }
+    if u.dono != none {
+        let arg_1: u64 = len(semantic.indice_categoria(u.dono)) as u64
+        let arg_2: str = semantic.indice_categoria(u.dono)
+        let arg_3: str = "categoria"
+        let arg_4: ^Consulta = q
+        consulta_chave_texto(arg_4, arg_3, arg_2, arg_1)
+    }
+    consulta_chave_arquivo(q, u.pos)
+    consulta_chave_pos(q, "pos", u.pos)
+    consulta_chave_pos(q, "pos_nome", u.pos_nome)
+    consulta_fechar_obj(q)
+}
+
+// C: driver/consultar_grafo.c:31
+proc chamadores_json(q: ^Consulta, proc_c: ?^frontend.Decl) {
+    var ultimo: ?^frontend.Decl = none
+    consulta_abrir_lista(q, "chamadores")
+    var i: u64 = 0
+    while i < (len(q.indice.usos) as u64) {
+        let u: ^semantic.IndUso = &q.indice.usos[i]
+        i += 1
+        if (not chama_proc(u, proc_c)) or (u.dono == none) or (u.dono == ultimo) {
+            continue
+        }
+        ultimo = u.dono
+        var id = make([dynamic]u8, alloc = heap)
+        semantic.ast_id_base_da_decl(&id, &(q.c as ^Compilacao).modulos, &(q.c as ^Compilacao).nomes, u.dono)
+        let s = to_str(&id)
+        consulta_item_texto(q, s, len(s) as u64)
+        delete(s)
+        delete(id)
+    }
+    consulta_fechar_lista(q)
+}
+
+// C: driver/consultar_grafo.c:48
+proc consultar_callers(q: ^Consulta, p: ^PedidoConsulta) -> i32 {
+    let proc_c: ?^frontend.Decl = consulta_achar_decl(q, p.arg)
+    var total: i64 = 0
+    if proc_c == none {
+        return consulta_uso_errado("callers", p.arg, "nao existe no projeto")
+    }
+    if (proc_c as ^frontend.Decl).tipo_no != (frontend.D_PROC as u8) {
+        return consulta_uso_errado("callers", p.arg, "nao e proc (callers vale para proc e foreign)")
+    }
+    consulta_abrir(q, "callers")
+    consulta_chave_nome(q, "nome", (proc_c as ^frontend.Decl).nome)
+    consulta_chave_id(q, "id", proc_c)
+    consulta_abrir_lista(q, "chamadas")
+    var i: u64 = 0
+    while i < (len(q.indice.usos) as u64) {
+        let u: ^semantic.IndUso = &q.indice.usos[i]
+        if not chama_proc(u, proc_c) {
+            i += 1
+            continue
+        }
+        chamada_json(q, u)
+        total += 1
+        i += 1
+    }
+    consulta_fechar_lista(q)
+    chamadores_json(q, proc_c)
+    consulta_chave_int(q, "total", total)
+    consulta_fechar(q)
+    return CONSULTAR_OK
+}
+
+// C: driver/consultar_grafo.c:81
+proc chamada_de_dentro(u: ^semantic.IndUso, dono: ?^frontend.Decl) -> bool {
+    let tipo: i32 = u.alvo_tipo as i32
+    return u.chamada and (u.dono == dono) and ((tipo == semantic.IND_PROC) or (tipo == semantic.IND_EMBUTIDO))
+}
+
+// C: driver/consultar_grafo.c:87
+proc somar_chamado(chamados: ^[dynamic]Chamado, u: ^semantic.IndUso) {
+    var alvo: ?^frontend.Decl = none
+    if (u.alvo_tipo as i32) == semantic.IND_PROC {
+        alvo = u.alvo
+    }
+    var i: u64 = 0
+    while i < (len(chamados^) as u64) {
+        let existente: ^Chamado = &(chamados^)[i]
+        if (existente.alvo == alvo) and ((alvo != none) or (existente.nome == u.nome)) {
+            existente.chamadas += 1
+            return
+        }
+        i += 1
+    }
+    append(chamados, item = Chamado{alvo = alvo, nome = u.nome, pos = u.pos_nome, chamadas = 1})
+}
+
+// C: driver/consultar_grafo.c:103
+proc chamado_json(q: ^Consulta, c: ^Chamado) {
+    var tern_1: str = "embutido"
+    if c.alvo != none {
+        tern_1 = semantic.indice_categoria(c.alvo)
+    }
+    let categoria: str = tern_1
+    consulta_abrir_obj(q)
+    consulta_chave_nome(q, "nome", c.nome)
+    consulta_chave_texto(q, "categoria", categoria, len(categoria) as u64)
+    if c.alvo != none {
+        consulta_chave_id(q, "id", c.alvo)
+    } else {
+        consulta_chave_texto(q, "id", none, 0)
+    }
+    consulta_chave_int(q, "chamadas", c.chamadas as i64)
+    consulta_chave_pos(q, "pos", c.pos)
+    consulta_fechar_obj(q)
+}
+
+// C: driver/consultar_grafo.c:117
+proc consultar_callees(q: ^Consulta, p: ^PedidoConsulta) -> i32 {
+    let dono: ?^frontend.Decl = consulta_achar_decl(q, p.arg)
+    if dono == none {
+        return consulta_uso_errado("callees", p.arg, "nao existe no projeto")
+    }
+    let tipo_dono: i32 = (dono as ^frontend.Decl).tipo_no as i32
+    if (tipo_dono != frontend.D_PROC) and (tipo_dono != frontend.D_TEST) {
+        return consulta_uso_errado("callees", p.arg, "nao e proc nem test")
+    }
+    var chamados: [dynamic]Chamado = make([dynamic]Chamado, alloc = heap)
+    defer delete(chamados)
+    var i: u64 = 0
+    while i < (len(q.indice.usos) as u64) {
+        let u: ^semantic.IndUso = &q.indice.usos[i]
+        i += 1
+        if chamada_de_dentro(u, dono) {
+            somar_chamado(&chamados, u)
+        }
+    }
+    consulta_abrir(q, "callees")
+    consulta_chave_nome(q, "nome", (dono as ^frontend.Decl).nome)
+    consulta_chave_id(q, "id", dono)
+    consulta_abrir_lista(q, "chamados")
+    var j: u64 = 0
+    while j < (len(chamados) as u64) {
+        chamado_json(q, &chamados[j])
+        j += 1
+    }
+    consulta_fechar_lista(q)
+    consulta_chave_int(q, "total", len(chamados) as i64)
+    consulta_fechar(q)
+    return CONSULTAR_OK
+}

@@ -1,0 +1,631 @@
+// common/c2f.fj - substitutos da libc e dos casts do C (corpo real do P-c2f)
+// origem: plano do G3 (D-T1-8, C2F-C0), nao ha C de origem; o oraculo e o C do E0 (gcc 16, UCRT), provado por diferencial
+// Posse: hex_maiusc, pad_esq, pad_dir, com_sinal, cortar e byte_texto devolvem str NOVA no heap; o chamador faz delete (a raiz sai por os.exit, que nao relata vazamento).
+// Versao: 0.2.1
+// Changelog: 0.2.1 - ERRATA 3 (N1/N7): c2f_nul_em, c2f_nul_em_b, c2f_strlen_b, c2f_snprintf. 0.2.0 - P-c2f: corpo real de todos os procs, bits com sinal por transmute (C2F-53), strto* com a regra de parada da UCRT, strtod por text.parse_float, ler_arquivo por file.read_all. 0.1.0 - esqueleto.
+
+import "std:text"
+import "std:file"
+
+// ---------------------------------------------------------------- char e sinal (C2F-02, C2F-50)
+
+// char do mingw tem sinal: byte >= 0x80 vira negativo (C2F-02).
+pub proc c2f_char_i32(c: u8) -> i32 {
+    if c >= 128 {
+        return (c as i32) - 256
+    }
+    return c as i32
+}
+
+pub proc c2f_s2u_8(x: i8) -> u8 {
+    return transmute(x, to = u8)
+}
+
+pub proc c2f_s2u_16(x: i16) -> u16 {
+    return transmute(x, to = u16)
+}
+
+pub proc c2f_s2u_32(x: i32) -> u32 {
+    return transmute(x, to = u32)
+}
+
+pub proc c2f_s2u_64(x: i64) -> u64 {
+    return transmute(x, to = u64)
+}
+
+// ---------------------------------------------------------------- estreitamento sem trap (C2F-51)
+
+pub proc c2f_trunc_u8(x: u64) -> u8 {
+    return (x & 0xFF) as u8
+}
+
+pub proc c2f_trunc_u16(x: u64) -> u16 {
+    return (x & 0xFFFF) as u16
+}
+
+pub proc c2f_trunc_u32(x: u64) -> u32 {
+    return (x & 0xFFFFFFFF) as u32
+}
+
+pub proc c2f_trunc_i8(x: u64) -> i8 {
+    return transmute((x & 0xFF) as u8, to = i8)
+}
+
+pub proc c2f_trunc_i16(x: u64) -> i16 {
+    return transmute((x & 0xFFFF) as u16, to = i16)
+}
+
+pub proc c2f_trunc_i32(x: u64) -> i32 {
+    return transmute((x & 0xFFFFFFFF) as u32, to = i32)
+}
+
+// ---------------------------------------------------------------- bits com sinal (C2F-53, C2F-54)
+
+pub proc c2f_e_i32(a: i32, b: i32) -> i32 {
+    return transmute(transmute(a, to = u32) & transmute(b, to = u32), to = i32)
+}
+
+pub proc c2f_ou_i32(a: i32, b: i32) -> i32 {
+    return transmute(transmute(a, to = u32) | transmute(b, to = u32), to = i32)
+}
+
+pub proc c2f_xou_i32(a: i32, b: i32) -> i32 {
+    return transmute(transmute(a, to = u32) ~ transmute(b, to = u32), to = i32)
+}
+
+pub proc c2f_nao_i32(a: i32) -> i32 {
+    return transmute(~transmute(a, to = u32), to = i32)
+}
+
+// Deslocamento ARITMETICO; a quantidade e mascarada como no x86 (n & 31), C2F-54.
+pub proc c2f_sar_i32(x: i32, n: u32) -> i32 {
+    let s = n & 31
+    let u = transmute(x, to = u32)
+    if x < 0 {
+        return transmute(~((~u) >> s), to = i32)
+    }
+    return transmute(u >> s, to = i32)
+}
+
+pub proc c2f_shl_i32(x: i32, n: u32) -> i32 {
+    return transmute(transmute(x, to = u32) << (n & 31), to = i32)
+}
+
+pub proc c2f_e_i64(a: i64, b: i64) -> i64 {
+    return transmute(transmute(a, to = u64) & transmute(b, to = u64), to = i64)
+}
+
+pub proc c2f_ou_i64(a: i64, b: i64) -> i64 {
+    return transmute(transmute(a, to = u64) | transmute(b, to = u64), to = i64)
+}
+
+pub proc c2f_xou_i64(a: i64, b: i64) -> i64 {
+    return transmute(transmute(a, to = u64) ~ transmute(b, to = u64), to = i64)
+}
+
+pub proc c2f_nao_i64(a: i64) -> i64 {
+    return transmute(~transmute(a, to = u64), to = i64)
+}
+
+// Deslocamento ARITMETICO; a quantidade e mascarada como no x86 (n & 63), C2F-54.
+pub proc c2f_sar_i64(x: i64, n: u32) -> i64 {
+    let s = (n & 63) as u64
+    let u = transmute(x, to = u64)
+    if x < 0 {
+        return transmute(~((~u) >> s), to = i64)
+    }
+    return transmute(u >> s, to = i64)
+}
+
+pub proc c2f_shl_i64(x: i64, n: u32) -> i64 {
+    return transmute(transmute(x, to = u64) << ((n & 63) as u64), to = i64)
+}
+
+// ---------------------------------------------------------------- bool <-> inteiro (C2F-57)
+
+pub proc c2f_b2i32(c: bool) -> i32 {
+    if c {
+        return 1
+    }
+    return 0
+}
+
+pub proc c2f_b2u32(c: bool) -> u32 {
+    if c {
+        return 1
+    }
+    return 0
+}
+
+// ---------------------------------------------------------------- formatacao (C2F-31, C2F-32)
+
+// Digito hexadecimal maiusculo de 0..15 (48 = '0', 55 + 10 = 'A').
+proc c2f_digito_maiusc(d: u8) -> u8 {
+    if d < 10 {
+        return 48 + d
+    }
+    return 55 + d
+}
+
+// %0*llX: hexadecimal maiusculo, com zeros a esquerda ate larg digitos (larg <= 0 = sem enchimento); 0 sai "0".
+pub proc c2f_hex_maiusc(x: u64, larg: int) -> str {
+    var tmp: [16]u8 = {}
+    var n = 0
+    var v = x
+    while v > 0 {
+        tmp[n] = c2f_digito_maiusc((v & 15) as u8)
+        n += 1
+        v = v >> 4
+    }
+    if n == 0 {
+        tmp[0] = 48
+        n = 1
+    }
+    var out = make([dynamic]u8, alloc = heap, cap = max(larg, n))
+    defer delete(out)
+    var zeros = larg - n
+    while zeros > 0 {
+        append(&out, item = 48 as u8)
+        zeros -= 1
+    }
+    var k = n
+    while k > 0 {
+        k -= 1
+        append(&out, item = tmp[k])
+    }
+    let texto = to_str(&out)
+    return texto
+}
+
+// Espacos a esquerda ate n BYTES (como %*s): s mais comprido que n sai inteiro.
+pub proc c2f_pad_esq(s: str, n: int) -> str {
+    var out = make([dynamic]u8, alloc = heap, cap = max(n, len(s)))
+    defer delete(out)
+    var falta = n - len(s)
+    while falta > 0 {
+        append(&out, item = 32 as u8)
+        falta -= 1
+    }
+    append(&out, item = s)
+    let texto = to_str(&out)
+    return texto
+}
+
+// Espacos a direita ate n BYTES (como %-*s).
+pub proc c2f_pad_dir(s: str, n: int) -> str {
+    var out = make([dynamic]u8, alloc = heap, cap = max(n, len(s)))
+    defer delete(out)
+    append(&out, item = s)
+    var falta = n - len(s)
+    while falta > 0 {
+        append(&out, item = 32 as u8)
+        falta -= 1
+    }
+    let texto = to_str(&out)
+    return texto
+}
+
+// %+lld: sinal sempre presente ("+0", "+5", "-5").
+pub proc c2f_com_sinal(x: i64) -> str {
+    if x >= 0 {
+        return format(f"+{x}", alloc = heap)
+    }
+    return format(f"{x}", alloc = heap)
+}
+
+// Os n primeiros bytes de s (snprintf com cap = n + 1); n <= 0 da "", n >= len(s) da copia inteira. Pode cortar no meio de UTF-8, como o C.
+pub proc c2f_cortar(s: str, n: int) -> str {
+    let m = min(max(n, 0), len(s))
+    let b = as_bytes(s)
+    return from_bytes(b[0..<m], alloc = heap)
+}
+
+// %c: o byte cru como texto de 1 byte (inclusive o 0).
+pub proc c2f_byte_texto(c: u8) -> str {
+    var um: [1]u8 = {c}
+    return from_bytes(um[..], alloc = heap)
+}
+
+// ---------------------------------------------------------------- comparacao (C2F-30)
+
+// strcmp: bytes SEM sinal, sinal -1/0/1 (o C devolve a diferenca; so o sinal conta); o prefixo vem antes.
+pub proc c2f_strcmp(a: str, b: str) -> i32 {
+    let n = min(len(a), len(b))
+    for i in 0..<n {
+        if a[i] != b[i] {
+            if a[i] < b[i] {
+                return -1
+            }
+            return 1
+        }
+    }
+    if len(a) < len(b) {
+        return -1
+    }
+    if len(a) > len(b) {
+        return 1
+    }
+    return 0
+}
+
+// Minuscula ASCII (65..90 -> 97..122); o resto, inclusive >= 0x80, igual (locale "C").
+proc c2f_minuscula(c: u8) -> u8 {
+    if c >= 65 and c <= 90 {
+        return c + 32
+    }
+    return c
+}
+
+// _stricmp: compara byte a byte depois da minuscula ASCII; sinal -1/0/1.
+pub proc c2f_stricmp(a: str, b: str) -> i32 {
+    let n = min(len(a), len(b))
+    for i in 0..<n {
+        let x = c2f_minuscula(a[i])
+        let y = c2f_minuscula(b[i])
+        if x != y {
+            if x < y {
+                return -1
+            }
+            return 1
+        }
+    }
+    if len(a) < len(b) {
+        return -1
+    }
+    if len(a) > len(b) {
+        return 1
+    }
+    return 0
+}
+
+// strncmp(a, b, n) == 0: os n primeiros bytes iguais, parando no fim de uma das duas (o NUL do C). n <= 0 e verdadeiro.
+pub proc c2f_prefixo_igual(a: str, b: str, n: int) -> bool {
+    for i in 0..<n {
+        if i >= len(a) or i >= len(b) {
+            return len(a) == len(b)
+        }
+        if a[i] != b[i] {
+            return false
+        }
+    }
+    return true
+}
+
+// memcmp sobre as duas fatias: bytes sem sinal, sinal -1/0/1; prefixo comum igual desempata pelo tamanho. Com fatias do mesmo tamanho e o memcmp do C.
+pub proc c2f_memcmp(a: []u8, b: []u8) -> i32 {
+    let n = min(len(a), len(b))
+    for i in 0..<n {
+        if a[i] != b[i] {
+            if a[i] < b[i] {
+                return -1
+            }
+            return 1
+        }
+    }
+    if len(a) < len(b) {
+        return -1
+    }
+    if len(a) > len(b) {
+        return 1
+    }
+    return 0
+}
+
+// ---------------------------------------------------------------- sentinela e tamanho de C (ERRATA 3, N1/N7)
+
+// s[i] como o C le a string: o byte em i, ou 0 (o NUL) fora de 0 <= i < len(s). Nunca R0006.
+pub proc c2f_nul_em(s: str, i: int) -> u8 {
+    if i >= 0 and i < len(s) {
+        return s[i]
+    }
+    return 0
+}
+
+// Igual para fatia de bytes ([]u8).
+pub proc c2f_nul_em_b(b: []u8, i: int) -> u8 {
+    if i >= 0 and i < len(b) {
+        return b[i]
+    }
+    return 0
+}
+
+// strlen de buffer []u8: tamanho ate o 1o byte 0; sem NUL, len(b) (o limite da fatia faz o papel do NUL).
+pub proc c2f_strlen_b(b: []u8) -> int {
+    for i in 0..<len(b) {
+        if b[i] == 0 {
+            return i
+        }
+    }
+    return len(b)
+}
+
+// snprintf(dst, len(dst), "%s", t): grava no maximo len(dst) - 1 bytes de t e um NUL no fim (so se len(dst) > 0); devolve o tamanho que o C devolveria.
+// Como o %s do C, para no 1o NUL de t: um NUL embutido corta o texto ali, e o retorno e o strlen de t ate esse NUL. len(dst) == 0 nao grava nada.
+pub proc c2f_snprintf(dst: []u8, t: str) -> i32 {
+    var n = 0
+    while n < len(t) and t[n] != 0 {
+        n += 1
+    }
+    if len(dst) == 0 {
+        return n as i32
+    }
+    let k = min(n, len(dst) - 1)
+    for i in 0..<k {
+        dst[i] = t[i]
+    }
+    dst[k] = 0
+    return n as i32
+}
+
+// ---------------------------------------------------------------- texto -> numero (C2F-30)
+
+// isspace do locale "C": espaco e 9..13.
+proc c2f_e_espaco(c: u8) -> bool {
+    return c == 32 or (c >= 9 and c <= 13)
+}
+
+// Valor do digito de c em qualquer base (0-9, a-z, A-Z); 99 se nao e digito.
+proc c2f_valor_digito(c: u8) -> i32 {
+    if c >= 48 and c <= 57 {
+        return (c as i32) - 48
+    }
+    if c >= 97 and c <= 122 {
+        return (c as i32) - 87
+    }
+    if c >= 65 and c <= 90 {
+        return (c as i32) - 55
+    }
+    return 99
+}
+
+// Resultado do leitor de inteiros: neg = sinal '-', mag = valor absoluto (saturado em 2^64 - 1), estourou = passou de 64 bits,
+// fim = indice do 1o byte nao lido (0 se nao leu numero nenhum, como o endptr do C).
+struct LeituraInteiro {
+    neg: bool
+    mag: u64
+    estourou: bool
+    fim: int
+}
+
+// Base 0 ou 16 e "0x"/"0X": o prefixo e consumido. Sem digito hexadecimal depois, a UCRT NAO le o "0" (como o glibc faria): nao converte nada e fim = 0 (provado por diferencial).
+proc c2f_tem_prefixo_hex(s: str, i: int, base: i32) -> bool {
+    if base != 0 and base != 16 {
+        return false
+    }
+    return i + 1 < len(s) and s[i] == 48 and (s[i + 1] == 120 or s[i + 1] == 88)
+}
+
+// Nucleo de strtoull/strtol: espacos, sinal, prefixo, digitos (regra de parada da UCRT).
+proc c2f_ler_inteiro(s: str, base_pedida: i32) -> LeituraInteiro {
+    var r = LeituraInteiro{}
+    if base_pedida == 1 or base_pedida < 0 or base_pedida > 36 {
+        return r
+    }
+    var i = 0
+    while i < len(s) and c2f_e_espaco(s[i]) {
+        i += 1
+    }
+    if i < len(s) and (s[i] == 43 or s[i] == 45) {
+        r.neg = s[i] == 45
+        i += 1
+    }
+    var base = base_pedida
+    if c2f_tem_prefixo_hex(s, i, base) {
+        i += 2
+        base = 16
+    } else if base == 0 {
+        base = 10
+        if i < len(s) and s[i] == 48 {
+            base = 8
+        }
+    }
+    let ini = i
+    let lim = ~(0 as u64)
+    while i < len(s) {
+        let d = c2f_valor_digito(s[i])
+        if d >= base {
+            break
+        }
+        let du = d as u64
+        let bu = base as u64
+        if r.mag > (lim - du) / bu {
+            r.estourou = true
+            r.mag = lim
+        } else if not r.estourou {
+            r.mag = r.mag * bu + du
+        }
+        i += 1
+    }
+    if i == ini {
+        r.mag = 0
+        r.neg = false
+        return r
+    }
+    r.fim = i
+    return r
+}
+
+// strtoull: valor sem sinal; "-" nega modulo 2^64; estouro = 2^64 - 1. fim recebe o indice (0 se nao leu numero).
+pub proc c2f_strtoull(s: str, base: i32, fim: ^int) -> u64 {
+    let r = c2f_ler_inteiro(s, base)
+    fim^ = r.fim
+    if r.estourou {
+        return r.mag
+    }
+    if r.neg {
+        return wrapping_sub(0 as u64, r.mag)
+    }
+    return r.mag
+}
+
+// strtol com long de 32 bits (Windows): satura em INT32_MAX / INT32_MIN.
+pub proc c2f_strtol(s: str, base: i32, fim: ^int) -> i32 {
+    let r = c2f_ler_inteiro(s, base)
+    fim^ = r.fim
+    if r.neg {
+        if r.estourou or r.mag > 2147483648 {
+            return -2147483648
+        }
+        return transmute(wrapping_sub(0 as u32, r.mag as u32), to = i32)
+    }
+    if r.estourou or r.mag > 2147483647 {
+        return 2147483647
+    }
+    return r.mag as i32
+}
+
+// atoi: strtol em base 10 sem endptr (para no 1o nao-digito; sem numero da 0).
+pub proc c2f_atoi(s: str) -> i32 {
+    var fim = 0
+    return c2f_strtol(s, 10, &fim)
+}
+
+// ---------------------------------------------------------------- strtod (C2F-36: text.parse_float e exato)
+
+// Quantos bytes seguidos de s[i..] sao digitos decimais.
+proc c2f_contar_digitos(s: str, i: int) -> int {
+    var j = i
+    while j < len(s) and s[j] >= 48 and s[j] <= 57 {
+        j += 1
+    }
+    return j - i
+}
+
+// Fim (indice) do real decimal que comeca em s[ini] ("[+-]d*[.d*][e[+-]d+]" com 1+ digito de mantissa); ini se nao ha numero.
+proc c2f_fim_real(s: str, ini: int) -> int {
+    var i = ini
+    if i < len(s) and (s[i] == 43 or s[i] == 45) {
+        i += 1
+    }
+    var dig = c2f_contar_digitos(s, i)
+    i += dig
+    if i < len(s) and s[i] == 46 {
+        let frac = c2f_contar_digitos(s, i + 1)
+        if dig + frac > 0 {
+            i += 1 + frac
+            dig += frac
+        }
+    }
+    if dig == 0 {
+        return ini
+    }
+    if i < len(s) and (s[i] == 101 or s[i] == 69) {
+        var j = i + 1
+        if j < len(s) and (s[j] == 43 or s[j] == 45) {
+            j += 1
+        }
+        let ed = c2f_contar_digitos(s, j)
+        if ed > 0 {
+            i = j + ed
+        }
+    }
+    return i
+}
+
+// "inf", "infinity" ou "nan" (sem caixa) em s[i..]: tamanho do que casou, 0 se nada. valor recebe o real.
+proc c2f_especial(s: str, i: int, valor: ^f64) -> int {
+    let resto = s[i..<len(s)]
+    if len(resto) >= 3 and text.equal_fold(resto[0..<3], "inf") {
+        valor^ = transmute(0x7FF0000000000000 as u64, to = f64)
+        if len(resto) >= 8 and text.equal_fold(resto[0..<8], "infinity") {
+            return 8
+        }
+        return 3
+    }
+    if len(resto) >= 3 and text.equal_fold(resto[0..<3], "nan") {
+        valor^ = transmute(0x7FF8000000000000 as u64, to = f64)
+        return 3
+    }
+    return 0
+}
+
+// strtod: espacos, depois decimal (sinal, mantissa, expoente), "inf"/"infinity"/"nan"; arredondamento exato (round-half-even) e overflow = +-inf.
+// Sem numero: 0.0 e fim = 0. NAO le real hexadecimal ("0x1p3" le o "0"): o compilador nao usa.
+pub proc c2f_strtod(s: str, fim: ^int) -> f64 {
+    fim^ = 0
+    var i = 0
+    while i < len(s) and c2f_e_espaco(s[i]) {
+        i += 1
+    }
+    let neg = i < len(s) and s[i] == 45
+    let sinal = i < len(s) and (s[i] == 43 or s[i] == 45)
+    let ini = i
+    if sinal {
+        i += 1
+    }
+    var esp: f64 = 0.0
+    let n = c2f_especial(s, i, &esp)
+    if n > 0 {
+        fim^ = i + n
+        if neg {
+            return -esp
+        }
+        return esp
+    }
+    let f = c2f_fim_real(s, ini)
+    if f == ini {
+        return 0.0
+    }
+    fim^ = f
+    // so o overflow chega aqui como erro (a forma ja foi conferida): vira +-inf
+    var inf = transmute(0x7FF0000000000000 as u64, to = f64)
+    if neg {
+        inf = -inf
+    }
+    return text.parse_float(s[ini..<f]) or_else inf
+}
+
+// ---------------------------------------------------------------- bytes little-endian
+
+pub proc c2f_ler_u16_le(b: []u8, at: int) -> u16 {
+    return (b[at] as u16) | ((b[at + 1] as u16) << 8)
+}
+
+pub proc c2f_gravar_u16_le(b: []u8, at: int, v: u16) {
+    b[at] = (v & 0xFF) as u8
+    b[at + 1] = (v >> 8) as u8
+}
+
+pub proc c2f_ler_u32_le(b: []u8, at: int) -> u32 {
+    return (b[at] as u32) | ((b[at + 1] as u32) << 8) | ((b[at + 2] as u32) << 16) | ((b[at + 3] as u32) << 24)
+}
+
+pub proc c2f_gravar_u32_le(b: []u8, at: int, v: u32) {
+    b[at] = (v & 0xFF) as u8
+    b[at + 1] = ((v >> 8) & 0xFF) as u8
+    b[at + 2] = ((v >> 16) & 0xFF) as u8
+    b[at + 3] = (v >> 24) as u8
+}
+
+pub proc c2f_ler_u64_le(b: []u8, at: int) -> u64 {
+    let baixo = c2f_ler_u32_le(b, at) as u64
+    let alto = c2f_ler_u32_le(b, at + 4) as u64
+    return baixo | (alto << 32)
+}
+
+pub proc c2f_gravar_u64_le(b: []u8, at: int, v: u64) {
+    c2f_gravar_u32_le(b, at, (v & 0xFFFFFFFF) as u32)
+    c2f_gravar_u32_le(b, at + 4, (v >> 32) as u32)
+}
+
+// ---------------------------------------------------------------- arquivo (C2F-61)
+
+// Le o arquivo inteiro (bytes crus, como "rb") para dados, que perde o conteudo anterior. Falha: false e motivo = "nao_abre" (nao existe, sem permissao,
+// pasta...) ou "falha_leitura" (o resto); dados fica intacto. O texto do stderr e do chamador (o do C diz "nao consegui abrir 'X' para leitura").
+pub proc c2f_ler_arquivo(caminho: str, dados: ^[dynamic]u8, motivo: ^str) -> bool {
+    switch r in file.read_all(caminho, alloc = heap) {
+    case [dynamic]u8:
+        clear(dados)
+        append(dados, items = r[..])
+        delete(r)
+        return true
+    case file.FileError:
+        if r == file.FileError.other or r == file.FileError.not_empty {
+            motivo^ = "falha_leitura"
+        } else {
+            motivo^ = "nao_abre"
+        }
+        return false
+    }
+    return false
+}

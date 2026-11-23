@@ -1,0 +1,575 @@
+// std:text (antes std:texto, D0587) - converter texto em numero, separar e juntar (IA1-L6, L-07), buscar, aparar, cortar e classificar bytes (IA1-L10a), separar em linhas/campos, trocar, repetir e concatenar (IA1-L10b). API em ingles; escrito em Forja pura (sem foreign), igual nos 2 backends e nos 2 sistemas.
+// Versao: 0.5.1. Changelog: 0.5.1 - G3-L3: parse_float com arredondamento correto (pedaco text\parse.fj 0.3.0; tabela no novo pedaco text\parse_float_tabela.fj, depois de text\parse.fj); este arquivo so mudou o cabecalho; 0.5.0 - B01e1: split, join, split_lines, fields, split_n, split_any, to_upper, to_lower, replace_n, replace, replace_table, repeat e concat ganham `alloc: Allocator` (ultimo parametro, sem padrao); o resultado vai para o alocador do chamador, os temporarios de juntar_faixa continuam no heap; 0.4.1 - IA1-S2c: o 3o pedaco, std\text\utf8.fj (decode, encode, rune_count, valid_utf8, next_rune, from_rune, pad_left, pad_right, center, str_reverse), entra depois de text\parse.fj; este arquivo so mudou o cabecalho; 0.4.0 - IA1-S2b2b: to_upper, to_lower, equal_fold e compare (caixa e ordem ASCII, em bytes); parse_bool, parse_int_base, parse_uint e parse_uint_base em text\parse.fj; 0.3.1 -IA1-S2b2a: parse_int/parse_float/ParseError e seus auxiliares foram para std\text\parse.fj (sem mudar comportamento); 0.3.0 - IA1-L10b: split_lines, fields, split_n, split_any (listas de vistas), replace, replace_n, replace_table (texto dono, montado no builder), repeat e concat. 0.2.0 - IA1-L10a: busca (str_contains, str_index_of, str_last_index_of, index_byte, index_any, starts_with, ends_with, str_count), trim, cut, next_line, next_field e is_*. 0.1.0 - IA1-L6: parse_int, parse_float, split, join.
+// parse_int e parse_float aceitam so o numero: sem espaco antes ou depois, sem separador de milhar. Texto vazio = ParseError.empty; qualquer outra coisa fora da forma = ParseError.invalid; nao cabe no tipo = ParseError.overflow.
+// parse_float le [+-] digitos [. digitos] [e|E [+-] digitos] (ao menos um digito na mantissa) e devolve o f64 MAIS PROXIMO do valor exato do texto (IEEE 754 binary64, empate para o par, subnormais incluidos; igual ao float() do Python e ao strtod correto do C), para qualquer quantidade de digitos e qualquer expoente. Passa de f64 (o limite e o ponto medio entre o maior f64 e 2^1024) = ParseError.overflow; abaixo do menor subnormal vira 0 (com o sinal: "-1e-400" da -0).
+// Posse (B01e1): toda proc que devolve lista ou texto novo recebe `alloc: Allocator` por ULTIMO e aloca o resultado nele. split devolve a lista DONA do alocador que o chamador passou, de partes EMPRESTADAS do texto original (vivas enquanto ele viver): delete(partes) so se o alloc foi heap, sem delete nas partes. join devolve o texto DONO do alocador que o chamador passou: delete(texto) so se o alloc foi heap.
+// Convencao de pedacos: os arquivos em std\<mod>\*.fj sao pedacos de std:<mod>, na ordem escrita em frontend\modulos_std.c; so este arquivo tem import e guarda as constantes dividas entre pedacos; a linha que aparece em std:text:L conta a sequencia inteira. Ordem dos pedacos de std:text: text.fj, text\parse.fj (parse_int, parse_float, ParseError), text\parse_float_tabela.fj (tabela de potencias de 10 do parse_float), text\utf8.fj (UTF-8 por runa, preenchimento, inverter; constantes proprias).
+const DIGITO_ZERO: u8 = 48
+const DIGITO_NOVE: u8 = 57
+const MAIOR_INT: int = 9223372036854775807
+const TABULACAO: u8 = 9
+const RETORNO: u8 = 13
+const ESPACO: u8 = 32
+const TIL: u8 = 126
+const LETRA_A_MAIUSCULA: u8 = 65
+const LETRA_F_MAIUSCULA: u8 = 70
+const LETRA_Z_MAIUSCULA: u8 = 90
+const LETRA_A_MINUSCULA: u8 = 97
+const LETRA_F_MINUSCULA: u8 = 102
+const LETRA_Z_MINUSCULA: u8 = 122
+const DIFERENCA_CAIXA: u8 = 32
+
+// Parte s nos pontos onde aparece sep: "a,,b" com "," da ["a", "", "b"]; s vazio da [""]; sep vazio nao separa (devolve [s]). As partes sao emprestadas de s.
+pub proc split(s: str, sep: str, alloc: Allocator) -> [dynamic]str {
+    var partes = make([dynamic]str, alloc = alloc)
+    let n = len(s)
+    let m = len(sep)
+    if m == 0 {
+        append(&partes, item = s)
+        return partes
+    }
+    var inicio = 0
+    var i = 0
+    while i + m <= n {
+        if s[i] == sep[0] and s[i..<i + m] == sep {
+            append(&partes, item = s[inicio..<i])
+            i += m
+            inicio = i
+        } else {
+            i += 1
+        }
+    }
+    append(&partes, item = s[inicio..<n])
+    return partes
+}
+
+// Junta partes[de..<ate] (ate > de) com sep entre elas, dividindo ao meio: cada byte e copiado O(log n) vezes, e nao O(n) como num acumulador.
+proc juntar_faixa(partes: []str, sep: str, de: int, ate: int, alloc: Allocator) -> str {
+    if ate - de == 1 {
+        return format(f"{partes[de]}", alloc = alloc)
+    }
+    let meio = de + (ate - de) / 2
+    // As metades sao temporarios deletados aqui: ficam no heap; so o texto final vai para o alloc do chamador.
+    let esquerda = juntar_faixa(partes, sep, de = de, ate = meio, alloc = heap)
+    let direita = juntar_faixa(partes, sep, de = meio, ate = ate, alloc = heap)
+    let junto = format(f"{esquerda}{sep}{direita}", alloc = alloc)
+    delete(esquerda)
+    delete(direita)
+    return junto
+}
+
+// Junta as partes com sep entre elas: join(["a", "b"], "-", alloc = heap) da "a-b"; lista vazia da texto vazio. O texto e dono do alocador que o chamador passou: delete(texto) so se o alloc foi heap.
+pub proc join(partes: []str, sep: str, alloc: Allocator) -> str {
+    if len(partes) == 0 {
+        // Vazio feito de uma fatia vazia: format(f"") fixo faz o gcc recusar o C gerado (array-bounds falso positivo).
+        let nada = sep[0..<0]
+        return format(f"{nada}", alloc = alloc)
+    }
+    return juntar_faixa(partes, sep, de = 0, ate = len(partes), alloc = alloc)
+}
+
+// ---- Busca (IA1-L10a, T01). Tudo em BYTES (UTF-8 multibyte e tratado como bytes); nada aloca. Os nomes str_contains, str_index_of, str_last_index_of e str_count levam o prefixo str_ porque contains, index_of, last_index_of e count sao embutidos de lista (nome reservado, E0202).
+// Substring vazia (convencao do Go, em bytes): str_contains = true, str_index_of = 0, str_last_index_of = len(s), starts_with = ends_with = true, str_count = len(s) + 1.
+
+// Posicao da 1a ocorrencia de sub em s a partir de start (0..len(s)); -1 se nao ha. sub vazio acha start.
+proc find_from(s: str, sub: str, start: int) -> int {
+    let m = len(sub)
+    if m == 0 {
+        return start
+    }
+    var i = start
+    while i + m <= len(s) {
+        if s[i] == sub[0] and s[i..<i + m] == sub {
+            return i
+        }
+        i += 1
+    }
+    return -1
+}
+
+// true se sub aparece em s; sub vazio sempre aparece.
+pub proc str_contains(s: str, sub: str) -> bool {
+    return find_from(s, sub, start = 0) >= 0
+}
+
+// Posicao (em bytes) da 1a ocorrencia de sub em s, ou none se nao ha; sub vazio da 0.
+pub proc str_index_of(s: str, sub: str) -> ?int {
+    let i = find_from(s, sub, start = 0)
+    if i < 0 {
+        return none
+    }
+    return i
+}
+
+// Posicao (em bytes) da ultima ocorrencia de sub em s, ou none se nao ha; sub vazio da len(s).
+pub proc str_last_index_of(s: str, sub: str) -> ?int {
+    let m = len(sub)
+    var i = len(s) - m
+    while i >= 0 {
+        if m == 0 or (s[i] == sub[0] and s[i..<i + m] == sub) {
+            return i
+        }
+        i -= 1
+    }
+    return none
+}
+
+// Posicao do 1o byte de s igual a b, ou none.
+pub proc index_byte(s: str, b: u8) -> ?int {
+    for i in 0..<len(s) {
+        if s[i] == b {
+            return i
+        }
+    }
+    return none
+}
+
+// true se o byte b aparece em set.
+proc byte_in(set: str, b: u8) -> bool {
+    for i in 0..<len(set) {
+        if set[i] == b {
+            return true
+        }
+    }
+    return false
+}
+
+// Posicao do 1o byte de s que aparece em set (qualquer um deles), ou none; set vazio da none.
+pub proc index_any(s: str, set: str) -> ?int {
+    for i in 0..<len(s) {
+        if byte_in(set, b = s[i]) {
+            return i
+        }
+    }
+    return none
+}
+
+// true se s comeca com prefix; prefix vazio sempre vale.
+pub proc starts_with(s: str, prefix: str) -> bool {
+    let m = len(prefix)
+    return m <= len(s) and s[0..<m] == prefix
+}
+
+// true se s termina com suffix; suffix vazio sempre vale.
+pub proc ends_with(s: str, suffix: str) -> bool {
+    let m = len(suffix)
+    let n = len(s)
+    return m <= n and s[n - m..<n] == suffix
+}
+
+// Quantas vezes sub aparece em s SEM sobreposicao, da esquerda para a direita: "aaaa" com "aa" da 2; sub vazio da len(s) + 1.
+pub proc str_count(s: str, sub: str) -> int {
+    let m = len(sub)
+    if m == 0 {
+        return len(s) + 1
+    }
+    var total = 0
+    var pos = 0
+    while true {
+        let i = find_from(s, sub, start = pos)
+        if i < 0 {
+            break
+        }
+        total += 1
+        pos = i + m
+    }
+    return total
+}
+
+// ---- Corte (IA1-L10a, T02). Todas devolvem VISTA de s (sem alocar): vale enquanto o texto original viver, e nao se da delete. Espaco = ' ' \t \n \r \v \f (ASCII).
+
+// true para o espaco ASCII: ' ', \t, \n, \v, \f ou \r.
+pub proc is_space(b: u8) -> bool {
+    return b == ESPACO or (b >= TABULACAO and b <= RETORNO)
+}
+
+// s sem os espacos ASCII do comeco.
+pub proc trim_left(s: str) -> str {
+    var i = 0
+    while i < len(s) and is_space(s[i]) {
+        i += 1
+    }
+    return s[i..<len(s)]
+}
+
+// s sem os espacos ASCII do fim.
+pub proc trim_right(s: str) -> str {
+    var fim = len(s)
+    while fim > 0 and is_space(s[fim - 1]) {
+        fim -= 1
+    }
+    return s[0..<fim]
+}
+
+// s sem os espacos ASCII do comeco e do fim; so espacos da vazio.
+pub proc trim(s: str) -> str {
+    return trim_right(trim_left(s))
+}
+
+// s sem prefix se comecar com ele (uma vez so); senao o proprio s.
+pub proc trim_prefix(s: str, prefix: str) -> str {
+    if starts_with(s, prefix = prefix) {
+        return s[len(prefix)..<len(s)]
+    }
+    return s
+}
+
+// s sem suffix se terminar com ele (uma vez so); senao o proprio s.
+pub proc trim_suffix(s: str, suffix: str) -> str {
+    if ends_with(s, suffix = suffix) {
+        return s[0..<len(s) - len(suffix)]
+    }
+    return s
+}
+
+// s sem os bytes de set no comeco e no fim (qualquer ordem, quantos houver); set vazio devolve s.
+pub proc trim_chars(s: str, set: str) -> str {
+    var inicio = 0
+    var fim = len(s)
+    while inicio < fim and byte_in(set, b = s[inicio]) {
+        inicio += 1
+    }
+    while fim > inicio and byte_in(set, b = s[fim - 1]) {
+        fim -= 1
+    }
+    return s[inicio..<fim]
+}
+
+// ---- Corte em dois e cursores (IA1-L10a, T03 e T05). Vistas de s; nada aloca.
+
+// Corta s na 1a ocorrencia de sep (Go strings.Cut): "k=v" com "=" da ("k", "v", true); sem sep da (s, "", false); sep vazio da ("", s, true).
+pub proc cut(s: str, sep: str) -> (before: str, after: str, found: bool) {
+    let n = len(s)
+    let i = find_from(s, sep, start = 0)
+    if i < 0 {
+        return s, s[n..<n], false
+    }
+    return s[0..<i], s[i + len(sep)..<n], true
+}
+
+// Cursor de linhas: devolve a proxima linha de rest sem o terminador (\n ou \r\n) e avanca rest para depois dele; none quando rest esta vazio. A ultima linha sem terminador conta ("a\nb" da "a" e "b"); "a\n" da so "a"; um \r solto no fim fica na linha. Vistas de rest; nada aloca.
+pub proc next_line(rest: ^str) -> ?str {
+    let texto = rest^
+    let n = len(texto)
+    if n == 0 {
+        return none
+    }
+    let i = find_from(texto, "\n", start = 0)
+    if i < 0 {
+        rest^ = texto[n..<n]
+        return texto
+    }
+    rest^ = texto[i + 1..<n]
+    if i > 0 and texto[i - 1] == RETORNO {
+        return texto[0..<i - 1]
+    }
+    return texto[0..<i]
+}
+
+// Cursor de campos: devolve o proximo campo de rest (ate sep, que e um str) e avanca rest para depois do separador; none quando rest esta vazio. "a,,b" com "," da "a", "" e "b"; um separador no fim nao gera campo vazio final ("a," da so "a"), ao contrario de split; sep vazio devolve rest inteiro de uma vez. Vistas de rest; nada aloca.
+pub proc next_field(rest: ^str, sep: str) -> ?str {
+    let texto = rest^
+    let n = len(texto)
+    if n == 0 {
+        return none
+    }
+    let i = find_from(texto, sep, start = 0)
+    if i < 0 or len(sep) == 0 {
+        rest^ = texto[n..<n]
+        return texto
+    }
+    rest^ = texto[i + len(sep)..<n]
+    return texto[0..<i]
+}
+
+// ---- Classes de byte ASCII (IA1-L10a, T09). Acima de 127 (UTF-8 multibyte) nada e classe: todas dao false.
+
+// true para '0'..'9'.
+pub proc is_digit(b: u8) -> bool {
+    return b >= DIGITO_ZERO and b <= DIGITO_NOVE
+}
+
+// true para 'A'..'Z'.
+pub proc is_upper(b: u8) -> bool {
+    return b >= LETRA_A_MAIUSCULA and b <= LETRA_Z_MAIUSCULA
+}
+
+// true para 'a'..'z'.
+pub proc is_lower(b: u8) -> bool {
+    return b >= LETRA_A_MINUSCULA and b <= LETRA_Z_MINUSCULA
+}
+
+// true para letra ASCII (A-Z, a-z).
+pub proc is_alpha(b: u8) -> bool {
+    return is_upper(b) or is_lower(b)
+}
+
+// true para letra ASCII ou digito.
+pub proc is_alnum(b: u8) -> bool {
+    return is_alpha(b) or is_digit(b)
+}
+
+// true para 0-9, a-f e A-F.
+pub proc is_hex_digit(b: u8) -> bool {
+    return is_digit(b) or (b >= LETRA_A_MINUSCULA and b <= LETRA_F_MINUSCULA) or (b >= LETRA_A_MAIUSCULA and b <= LETRA_F_MAIUSCULA)
+}
+
+// true para os imprimiveis do ASCII: de ' ' (32) a '~' (126).
+pub proc is_print(b: u8) -> bool {
+    return b >= ESPACO and b <= TIL
+}
+
+// ---- Caixa e ordem (IA1-S2b2b, T08). So ASCII: apenas A-Z e a-z mudam de caixa; os demais bytes (inclusive os >= 128 do UTF-8) ficam como estao. Tudo em BYTES.
+
+// b em minuscula se for A-Z; qualquer outro byte volta igual.
+proc byte_minusculo(b: u8) -> u8 {
+    if is_upper(b) {
+        return b + DIFERENCA_CAIXA
+    }
+    return b
+}
+
+// b em maiuscula se for a-z; qualquer outro byte volta igual.
+proc byte_maiusculo(b: u8) -> u8 {
+    if is_lower(b) {
+        return b - DIFERENCA_CAIXA
+    }
+    return b
+}
+
+// s com todo a-z trocado por A-Z (bytes >= 128 e os demais iguais): "abc\xC3\xA9" da "ABC\xC3\xA9" (o "e" acentuado em UTF-8 nao muda). Texto DONO do alocador que o chamador passou, 1 alocacao do tamanho exato: delete(texto) so se o alloc foi heap, sempre, mesmo quando nada mudou.
+pub proc to_upper(s: str, alloc: Allocator) -> str {
+    var saida = make([dynamic]u8, alloc = alloc, cap = len(s))
+    defer delete(saida)
+    for i in 0..<len(s) {
+        append(&saida, item = byte_maiusculo(s[i]))
+    }
+    return to_str(&saida)
+}
+
+// s com todo A-Z trocado por a-z (bytes >= 128 e os demais iguais): "ABC\xC3\xA9" da "abc\xC3\xA9". Texto DONO do alocador que o chamador passou, 1 alocacao do tamanho exato: delete(texto) so se o alloc foi heap, sempre.
+pub proc to_lower(s: str, alloc: Allocator) -> str {
+    var saida = make([dynamic]u8, alloc = alloc, cap = len(s))
+    defer delete(saida)
+    for i in 0..<len(s) {
+        append(&saida, item = byte_minusculo(s[i]))
+    }
+    return to_str(&saida)
+}
+
+// true se a e b sao iguais ignorando a caixa ASCII (A-Z = a-z, byte a byte; bytes >= 128 so casam se forem iguais); tamanhos diferentes = false. Nao aloca.
+pub proc equal_fold(a: str, b: str) -> bool {
+    if len(a) != len(b) {
+        return false
+    }
+    for i in 0..<len(a) {
+        if byte_minusculo(a[i]) != byte_minusculo(b[i]) {
+            return false
+        }
+    }
+    return true
+}
+
+// Ordem lexicografica por BYTES sem sinal (um byte >= 128 vem depois de qualquer ASCII; o prefixo vem antes): -1 se a < b, 0 se iguais, 1 se a > b. Nao aloca.
+pub proc compare(a: str, b: str) -> int {
+    let comum = min(len(a), len(b))
+    for i in 0..<comum {
+        if a[i] < b[i] {
+            return -1
+        }
+        if a[i] > b[i] {
+            return 1
+        }
+    }
+    if len(a) < len(b) {
+        return -1
+    }
+    if len(a) > len(b) {
+        return 1
+    }
+    return 0
+}
+
+// ---- Separar em listas (IA1-L10b, T04). Mesma posse de split: a lista e DONA do alocador que o chamador passou, de VISTAS emprestadas do texto original (vivas enquanto ele viver): delete(partes) so se o alloc foi heap, sem delete nas partes. Como split, recebem alloc por ultimo.
+
+// As linhas de s sem o terminador (\n ou \r\n), como next_line: "a\r\nb\n" da ["a", "b"] (sem linha vazia final); s vazio da lista vazia; "\n" da [""].
+pub proc split_lines(s: str, alloc: Allocator) -> [dynamic]str {
+    var partes = make([dynamic]str, alloc = alloc)
+    var resto = s
+    while true {
+        let linha = next_line(&resto)
+        if linha == none {
+            break
+        }
+        append(&partes, item = linha or_else "")
+    }
+    return partes
+}
+
+// Os campos de s separados por sequencias de espaco ASCII (is_space), sem campos vazios: "  a  b\t\nc " da ["a", "b", "c"]; s vazio ou so espacos da lista vazia.
+pub proc fields(s: str, alloc: Allocator) -> [dynamic]str {
+    var partes = make([dynamic]str, alloc = alloc)
+    let n = len(s)
+    var i = 0
+    while i < n {
+        while i < n and is_space(s[i]) {
+            i += 1
+        }
+        let inicio = i
+        while i < n and not is_space(s[i]) {
+            i += 1
+        }
+        if i > inicio {
+            append(&partes, item = s[inicio..<i])
+        }
+    }
+    return partes
+}
+
+// Como split, mas com no maximo n partes: a ultima leva o resto de s sem separar ("a,b,c" com "," e n = 2 da ["a", "b,c"]); n = 1 da [s]; n maior que as ocorrencias separa tudo; n <= 0 da lista VAZIA; sep vazio nao separa (da [s] se n >= 1).
+pub proc split_n(s: str, sep: str, n: int, alloc: Allocator) -> [dynamic]str {
+    var partes = make([dynamic]str, alloc = alloc)
+    if n <= 0 {
+        return partes
+    }
+    let m = len(sep)
+    var inicio = 0
+    while m > 0 and len(partes) < n - 1 {
+        let i = find_from(s, sep, start = inicio)
+        if i < 0 {
+            break
+        }
+        append(&partes, item = s[inicio..<i])
+        inicio = i + m
+    }
+    append(&partes, item = s[inicio..<len(s)])
+    return partes
+}
+
+// Parte s em cada byte que aparece em set (qualquer um deles separa); campos vazios ficam, como em split: "a,b;;c" com ",;" da ["a", "b", "", "c"]; s vazio da [""]; set vazio nao separa (da [s]).
+pub proc split_any(s: str, set: str, alloc: Allocator) -> [dynamic]str {
+    var partes = make([dynamic]str, alloc = alloc)
+    var inicio = 0
+    for i in 0..<len(s) {
+        if byte_in(set, b = s[i]) {
+            append(&partes, item = s[inicio..<i])
+            inicio = i + 1
+        }
+    }
+    append(&partes, item = s[inicio..<len(s)])
+    return partes
+}
+
+// ---- Montar texto (IA1-L10b, T06 e T07). Devolvem str DONA do alocador que o chamador passou: delete(texto) so se o alloc foi heap, sempre, mesmo quando nada mudou. A saida e montada no builder com a capacidade exata (1 alocacao, bytes movidos por to_str).
+
+// Quantas ocorrencias de old (nao vazio) em s, sem sobreposicao, contando ate limite.
+proc contar_ate(s: str, old: str, limite: int) -> int {
+    var total = 0
+    var pos = 0
+    while total < limite {
+        let i = find_from(s, old, start = pos)
+        if i < 0 {
+            break
+        }
+        total += 1
+        pos = i + len(old)
+    }
+    return total
+}
+
+// Troca as n primeiras ocorrencias de old em s por new (sem sobreposicao, da esquerda para a direita): replace_n("aaa", "a", "b", n = 2) da "bba"; n = 1 troca so a primeira; n maior que as ocorrencias troca todas; n <= 0 nao troca nada. old vazio NAO troca nada (diferente do Go, que insere new entre os bytes: isso picaria UTF-8 e multiplicaria o texto). Sem troca devolve uma COPIA de s.
+pub proc replace_n(s: str, old: str, new: str, n: int, alloc: Allocator) -> str {
+    let m = len(old)
+    var trocas = 0
+    if m > 0 {
+        trocas = contar_ate(s, old, limite = n)
+    }
+    if trocas == 0 {
+        return clone(s, alloc = alloc)
+    }
+    var saida = make([dynamic]u8, alloc = alloc, cap = len(s) + trocas * (len(new) - m))
+    defer delete(saida)
+    var pos = 0
+    for _troca in 0..<trocas {
+        let i = find_from(s, old, start = pos)
+        append(&saida, item = s[pos..<i])
+        append(&saida, item = new)
+        pos = i + m
+    }
+    append(&saida, item = s[pos..<len(s)])
+    return to_str(&saida)
+}
+
+// Troca TODAS as ocorrencias de old em s por new (sem sobreposicao, da esquerda para a direita): replace("aaa", "aa", "b") da "ba"; old vazio ou sem ocorrencia devolve uma COPIA de s.
+pub proc replace(s: str, old: str, new: str, alloc: Allocator) -> str {
+    return replace_n(s, old, new, n = len(s) + 1, alloc = alloc)
+}
+
+// Um par de replace_table: onde aparecer old, entra new.
+pub struct Replacement {
+    old: str
+    new: str
+}
+
+// Indice do 1o par de pairs (na ordem da tabela) cujo old, nao vazio, aparece em s na posicao pos; -1 se nenhum.
+proc par_em(s: str, pairs: []Replacement, pos: int) -> int {
+    for k in 0..<len(pairs) {
+        let m = len(pairs[k].old)
+        if m > 0 and pos + m <= len(s) and s[pos..<pos + m] == pairs[k].old {
+            return k
+        }
+    }
+    return -1
+}
+
+// Varias trocas numa passada so, da esquerda para a direita: em cada posicao vale o 1o par da tabela que casa (nao o mais longo) e o texto trocado nao e relido (as trocas nao se encadeiam); old vazio e ignorado. replace_table("abc", pairs) com a->b e b->c da "bcc". Sem troca devolve uma COPIA de s.
+pub proc replace_table(s: str, pairs: []Replacement, alloc: Allocator) -> str {
+    var saida = make([dynamic]u8, alloc = alloc, cap = len(s))
+    defer delete(saida)
+    var pos = 0
+    var inicio = 0
+    while pos < len(s) {
+        let k = par_em(s, pairs, pos = pos)
+        if k < 0 {
+            pos += 1
+            continue
+        }
+        append(&saida, item = s[inicio..<pos])
+        append(&saida, item = pairs[k].new)
+        pos += len(pairs[k].old)
+        inicio = pos
+    }
+    append(&saida, item = s[inicio..<len(s)])
+    return to_str(&saida)
+}
+
+// repeat(s, n): s concatenado n vezes; n <= 0 ou s vazio da texto vazio. Se len(s) * n nao cabe em int, panic com a mensagem (nunca devolve texto truncado).
+pub proc repeat(s: str, n: int, alloc: Allocator) -> str {
+    let m = len(s)
+    if n <= 0 or m == 0 {
+        return clone(s[0..<0], alloc = alloc)
+    }
+    if n > MAIOR_INT / m {
+        panic("repeat: len(s) * n estoura int")
+    }
+    var saida = make([dynamic]u8, alloc = alloc, cap = m * n)
+    defer delete(saida)
+    for _vez in 0..<n {
+        append(&saida, item = s)
+    }
+    return to_str(&saida)
+}
+
+// Junta todas as partes em sequencia, sem separador (join com sep vazio, mas numa so alocacao): concat(["a", "b"]) da "ab"; lista vazia da texto vazio.
+pub proc concat(parts: []str, alloc: Allocator) -> str {
+    var total = 0
+    for parte in parts {
+        total += len(parte)
+    }
+    var saida = make([dynamic]u8, alloc = alloc, cap = total)
+    defer delete(saida)
+    for parte in parts {
+        append(&saida, item = parte)
+    }
+    return to_str(&saida)
+}

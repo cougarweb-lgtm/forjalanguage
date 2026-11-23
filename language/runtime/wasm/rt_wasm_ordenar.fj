@@ -1,0 +1,623 @@
+// runtime/wasm/rt_wasm_ordenar.fj - sort, sort_by, sort_by_key, binary_search e heap_* do alvo wasm32-wasip1, porte para Forja pura do runtime do x64
+// Versao: 0.1.0 (0.35.0)
+// Contrato: os simbolos forja_ordenar, forja_ordenar_estavel, forja_ordc_ordenar, forja_ordc_posicao, forja_ordc_achou, forja_heap_subir e
+// forja_heap_retira_topo da BIR sao atendidos pelos procs pub ordenar, ordenar_estavel, ordc_ordenar, ordc_posicao, ordc_achou, heap_subir e
+// heap_retira_topo deste modulo; o driver o injeta so no alvo wasm.
+// Fonte C (mesmo algoritmo do x64 = mesma ordem dos elementos iguais): runtime/forja_rt_ordenar.h (quicksort mediana de 3 + insercao nas pontas
+// de ate 16 + heapsort no fundo 2*log2 n), forja_rt_ordenar_estavel.h e forja_rt_ordenar_chave.h (blocos de 20 + SymMerge com rotacao, sem buffer)
+// e forja_rt_heap.h. O C gera uma funcao por tipo (macro); aqui UM codigo trabalha em bytes: o elemento i fica em base + i * tam e o tipo ORDENA_*
+// (0 i8, 1 i16, 2 i32, 3 i64, 4 u8, 5 u16, 6 u32, 7 u64, 8 f32, 9 f64, 10 str) escolhe como ler e comparar. O valor de pivo/insercao vive num
+// rascunho de 16 bytes na pilha de ordenar (o C usa uma variavel local do tipo T).
+// O comparador do usuario (sort_by, heap_*_by) chega como o valor do proc (i64; 0 = sem comparador no heap) e e chamado por call_indirect.
+// Regra do modulo: sem alocacao e sem estado global; so a memoria linear lida e escrita pelo std:wasm_rt.
+// Verificacao: python -X utf8 -I tests\nativo\wasm\verificar_wasm.py --modos dev,release --filtro ordena
+
+import "std:wasm_rt"
+
+// Contexto de uma ordenacao: elemento i = base + i * tam; a chave e o campo em desloc, do tipo tipo; menor = proc do usuario (0 = por tipo);
+// pivo = endereco do rascunho de 16 bytes
+struct Ord {
+    base: uint
+    tam: uint
+    desloc: uint
+    tipo: int
+    menor: uint
+    pivo: uint
+}
+
+struct CaixaMenor {
+    f: proc(x: uint, y: uint) -> bool
+}
+
+const TAM_ESTAVEL_BLOCO: int = 20
+const TAM_RAPIDO_PONTA: int = 16
+
+// ---- leitura e comparacao por tipo ORDENA_* ----
+proc ler_i8(a: uint) -> i8 {
+    let p = wasm_rt.ponteiro_de(a) as ^i8
+    return p^
+}
+
+proc ler_i16(a: uint) -> i16 {
+    let p = wasm_rt.ponteiro_de(a) as ^i16
+    return p^
+}
+
+proc ler_i32(a: uint) -> i32 {
+    let p = wasm_rt.ponteiro_de(a) as ^i32
+    return p^
+}
+
+proc ler_i64(a: uint) -> int {
+    let p = wasm_rt.ponteiro_de(a) as ^int
+    return p^
+}
+
+proc ler_u8(a: uint) -> u8 {
+    let p = wasm_rt.ponteiro_de(a) as ^u8
+    return p^
+}
+
+proc ler_u16(a: uint) -> u16 {
+    let p = wasm_rt.ponteiro_de(a) as ^u16
+    return p^
+}
+
+proc ler_u32(a: uint) -> u32 {
+    let p = wasm_rt.ponteiro_de(a) as ^u32
+    return p^
+}
+
+proc ler_u64(a: uint) -> uint {
+    let p = wasm_rt.ponteiro_de(a) as ^uint
+    return p^
+}
+
+proc ler_f32(a: uint) -> f32 {
+    let p = wasm_rt.ponteiro_de(a) as ^f32
+    return p^
+}
+
+proc ler_f64(a: uint) -> f64 {
+    let p = wasm_rt.ponteiro_de(a) as ^f64
+    return p^
+}
+
+// Tamanho em bytes do elemento de um tipo ORDENA_* (str = ponteiro + tamanho = 16)
+proc tamanho_do_tipo(tipo: int) -> uint {
+    if (tipo == 0) or (tipo == 4) {
+        return 1
+    }
+    if (tipo == 1) or (tipo == 5) {
+        return 2
+    }
+    if (tipo == 2) or (tipo == 6) or (tipo == 8) {
+        return 4
+    }
+    if (tipo == 10) {
+        return 16
+    }
+    return 8
+}
+
+// NaN e maior que todo numero (FORJA_ORD_MENOR_REAL do C)
+proc menor_f32(x: f32, y: f32) -> bool {
+    return (x < y) or ((x == x) and (y != y))
+}
+
+proc menor_f64(x: f64, y: f64) -> bool {
+    return (x < y) or ((x == x) and (y != y))
+}
+
+// str em x e y (16 bytes: ponteiro, tamanho): x < y por bytes sem sinal; empate nos bytes comuns: o mais curto vem antes
+proc menor_str(x: uint, y: uint) -> bool {
+    let px: uint = ler_u64(x)
+    let lx: uint = ler_u64(x + 8)
+    let py: uint = ler_u64(y)
+    let ly: uint = ler_u64(y + 8)
+    var comum: uint = ly
+    if lx < ly {
+        comum = lx
+    }
+    var k: uint = 0
+    while k < comum {
+        let bx: uint = wasm_rt.memoria_ler_u8(px + k)
+        let by: uint = wasm_rt.memoria_ler_u8(py + k)
+        if bx != by {
+            return bx < by
+        }
+        k += 1
+    }
+    return lx < ly
+}
+
+proc igual_str(x: uint, y: uint) -> bool {
+    let px: uint = ler_u64(x)
+    let lx: uint = ler_u64(x + 8)
+    let py: uint = ler_u64(y)
+    let ly: uint = ler_u64(y + 8)
+    if lx != ly {
+        return false
+    }
+    var k: uint = 0
+    while k < lx {
+        if wasm_rt.memoria_ler_u8(px + k) != wasm_rt.memoria_ler_u8(py + k) {
+            return false
+        }
+        k += 1
+    }
+    return true
+}
+
+// `a == b` de str (simbolo forja_str_igual da BIR, que passa o ENDERECO de cada str): mesmos bytes e mesmo tamanho. Mora aqui por reaproveitar igual_str
+pub proc str_igual(x: uint, y: uint) -> bool {
+    return igual_str(x, y)
+}
+
+// x < y na ordem do sort: x e y apontam para valores do tipo ORDENA_* tipo (forja_ordc_menor do C)
+proc menor_tipo(tipo: int, x: uint, y: uint) -> bool {
+    if tipo == 0 {
+        return ler_i8(x) < ler_i8(y)
+    }
+    if tipo == 1 {
+        return ler_i16(x) < ler_i16(y)
+    }
+    if tipo == 2 {
+        return ler_i32(x) < ler_i32(y)
+    }
+    if tipo == 3 {
+        return ler_i64(x) < ler_i64(y)
+    }
+    if tipo == 4 {
+        return ler_u8(x) < ler_u8(y)
+    }
+    if tipo == 5 {
+        return ler_u16(x) < ler_u16(y)
+    }
+    if tipo == 6 {
+        return ler_u32(x) < ler_u32(y)
+    }
+    if tipo == 7 {
+        return ler_u64(x) < ler_u64(y)
+    }
+    if tipo == 8 {
+        return menor_f32(ler_f32(x), ler_f32(y))
+    }
+    if tipo == 9 {
+        return menor_f64(ler_f64(x), ler_f64(y))
+    }
+    return menor_str(x, y)
+}
+
+// x == y na ordem do sort (NaN nunca e igual a nada, como o == do C)
+proc igual_tipo(tipo: int, x: uint, y: uint) -> bool {
+    if tipo == 0 {
+        return ler_i8(x) == ler_i8(y)
+    }
+    if tipo == 1 {
+        return ler_i16(x) == ler_i16(y)
+    }
+    if tipo == 2 {
+        return ler_i32(x) == ler_i32(y)
+    }
+    if tipo == 3 {
+        return ler_i64(x) == ler_i64(y)
+    }
+    if tipo == 4 {
+        return ler_u8(x) == ler_u8(y)
+    }
+    if tipo == 5 {
+        return ler_u16(x) == ler_u16(y)
+    }
+    if tipo == 6 {
+        return ler_u32(x) == ler_u32(y)
+    }
+    if tipo == 7 {
+        return ler_u64(x) == ler_u64(y)
+    }
+    if tipo == 8 {
+        return ler_f32(x) == ler_f32(y)
+    }
+    if tipo == 9 {
+        return ler_f64(x) == ler_f64(y)
+    }
+    return igual_str(x, y)
+}
+
+// ---- bytes ----
+// Troca os tam bytes de dois elementos
+proc troca_bytes(a: uint, b: uint, tam: uint) {
+    var k: uint = 0
+    while k + 8 <= tam {
+        let guardado: uint = wasm_rt.memoria_ler_u64(a + k)
+        wasm_rt.memoria_escrever_u64(a + k, wasm_rt.memoria_ler_u64(b + k))
+        wasm_rt.memoria_escrever_u64(b + k, guardado)
+        k += 8
+    }
+    while k < tam {
+        let guardado: uint = wasm_rt.memoria_ler_u8(a + k)
+        wasm_rt.memoria_escrever_u8(a + k, wasm_rt.memoria_ler_u8(b + k))
+        wasm_rt.memoria_escrever_u8(b + k, guardado)
+        k += 1
+    }
+}
+
+// Copia tam bytes (origem e destino distintos)
+proc copia_bytes(destino: uint, origem: uint, tam: uint) {
+    var k: uint = 0
+    while k + 8 <= tam {
+        wasm_rt.memoria_escrever_u64(destino + k, wasm_rt.memoria_ler_u64(origem + k))
+        k += 8
+    }
+    while k < tam {
+        wasm_rt.memoria_escrever_u8(destino + k, wasm_rt.memoria_ler_u8(origem + k))
+        k += 1
+    }
+}
+
+// Endereco do elemento i de uma faixa que comeca em a
+proc el(a: uint, i: int, tam: uint) -> uint {
+    return a + (i as uint) * tam
+}
+
+// ---- sort(fatia): quicksort (mediana de 3, Hoare) + insercao nas pontas de ate 16 + heapsort no fundo ----
+proc ord_desce(o: ^Ord, a: uint, raiz0: int, fim: int) {
+    var raiz: int = raiz0
+    while true {
+        var filho: int = 2 * raiz + 1
+        if filho >= fim {
+            return
+        }
+        if ((filho + 1) < fim) and menor_tipo(o.tipo, el(a, filho, o.tam), el(a, filho + 1, o.tam)) {
+            filho += 1
+        }
+        if not menor_tipo(o.tipo, el(a, raiz, o.tam), el(a, filho, o.tam)) {
+            return
+        }
+        troca_bytes(el(a, raiz, o.tam), el(a, filho, o.tam), o.tam)
+        raiz = filho
+    }
+}
+
+proc ord_heap(o: ^Ord, a: uint, n: int) {
+    var k: int = n / 2 - 1
+    while k >= 0 {
+        ord_desce(o, a, k, n)
+        k -= 1
+    }
+    k = n - 1
+    while k > 0 {
+        troca_bytes(el(a, 0, o.tam), el(a, k, o.tam), o.tam)
+        ord_desce(o, a, 0, k)
+        k -= 1
+    }
+}
+
+// Insercao: o valor de a[k] vai ao rascunho, os maiores descem um lugar e o valor entra na posicao livre
+proc ord_insere(o: ^Ord, a: uint, n: int) {
+    var k: int = 1
+    while k < n {
+        copia_bytes(o.pivo, el(a, k, o.tam), o.tam)
+        var j: int = k
+        while (j > 0) and menor_tipo(o.tipo, o.pivo, el(a, j - 1, o.tam)) {
+            copia_bytes(el(a, j, o.tam), el(a, j - 1, o.tam), o.tam)
+            j -= 1
+        }
+        copia_bytes(el(a, j, o.tam), o.pivo, o.tam)
+        k += 1
+    }
+}
+
+// Particao de Hoare com mediana de 3; o pivo e o valor de a[m] copiado para o rascunho
+proc ord_parte(o: ^Ord, a: uint, n: int) -> int {
+    let m: int = (n - 1) / 2
+    if menor_tipo(o.tipo, el(a, m, o.tam), el(a, 0, o.tam)) {
+        troca_bytes(el(a, m, o.tam), el(a, 0, o.tam), o.tam)
+    }
+    if menor_tipo(o.tipo, el(a, n - 1, o.tam), el(a, 0, o.tam)) {
+        troca_bytes(el(a, n - 1, o.tam), el(a, 0, o.tam), o.tam)
+    }
+    if menor_tipo(o.tipo, el(a, n - 1, o.tam), el(a, m, o.tam)) {
+        troca_bytes(el(a, n - 1, o.tam), el(a, m, o.tam), o.tam)
+    }
+    copia_bytes(o.pivo, el(a, m, o.tam), o.tam)
+    var i: int = -1
+    var j: int = n
+    while true {
+        i += 1
+        while menor_tipo(o.tipo, el(a, i, o.tam), o.pivo) {
+            i += 1
+        }
+        j -= 1
+        while menor_tipo(o.tipo, o.pivo, el(a, j, o.tam)) {
+            j -= 1
+        }
+        if i >= j {
+            return j
+        }
+        troca_bytes(el(a, i, o.tam), el(a, j, o.tam), o.tam)
+    }
+    return j
+}
+
+proc ord_rapido(o: ^Ord, a0: uint, n0: int, fundo0: int) {
+    var a: uint = a0
+    var n: int = n0
+    var fundo: int = fundo0
+    while n > TAM_RAPIDO_PONTA {
+        if fundo == 0 {
+            ord_heap(o, a, n)
+            return
+        }
+        fundo -= 1
+        let j: int = ord_parte(o, a, n)
+        if (j + 1) < (n - j - 1) {
+            ord_rapido(o, a, j + 1, fundo)
+            a = el(a, j + 1, o.tam)
+            n -= j + 1
+        } else {
+            ord_rapido(o, el(a, j + 1, o.tam), n - j - 1, fundo)
+            n = j + 1
+        }
+    }
+    ord_insere(o, a, n)
+}
+
+// sort(fatia): p = base, n = quantos, tipo = ORDENA_*
+pub proc ordenar(p: uint, n: int, tipo: i32) {
+    var rascunho: [2]u64 = {}
+    rascunho[0] = 0
+    var o: Ord = Ord{base = p, tam = tamanho_do_tipo(tipo as int), tipo = tipo as int, pivo = wasm_rt.endereco_de(&rascunho as rawptr)}
+    var fundo: int = 0
+    var m: int = n
+    while m > 1 {
+        fundo += 2
+        m = m / 2
+    }
+    ord_rapido(&o, p, n, fundo)
+}
+
+// ---- sort_by / sort_by_key: estavel, blocos de 20 por insercao + SymMerge com rotacao, sem buffer ----
+// O comparador do usuario: o valor do proc (i64) volta a ser proc pela memoria e e chamado por call_indirect com os enderecos dos elementos
+proc chamar_menor(menor: uint, x: uint, y: uint) -> bool {
+    var cru: u64 = 0
+    cru = menor as u64
+    let caixa = (&cru as rawptr) as ^CaixaMenor
+    return caixa.f(x, y)
+}
+
+proc menor_el(o: ^Ord, i: int, j: int) -> bool {
+    let x: uint = el(o.base, i, o.tam)
+    let y: uint = el(o.base, j, o.tam)
+    if o.menor != 0 {
+        return chamar_menor(o.menor, x, y)
+    }
+    return menor_tipo(o.tipo, x + o.desloc, y + o.desloc)
+}
+
+proc troca_el(o: ^Ord, i: int, j: int) {
+    troca_bytes(el(o.base, i, o.tam), el(o.base, j, o.tam), o.tam)
+}
+
+proc troca_faixa(o: ^Ord, a: int, b: int, n: int) {
+    var k: int = 0
+    while k < n {
+        troca_el(o, a + k, b + k)
+        k += 1
+    }
+}
+
+// Insercao estavel de [a, b): so troca com o vizinho estritamente menor
+proc insere_bloco(o: ^Ord, a: int, b: int) {
+    var i: int = a + 1
+    while i < b {
+        var j: int = i
+        while (j > a) and menor_el(o, j, j - 1) {
+            troca_el(o, j, j - 1)
+            j -= 1
+        }
+        i += 1
+    }
+}
+
+// Gira [a, m) e [m, b) por troca de faixas: no fim [m, b) vem antes de [a, m)
+proc rotaciona(o: ^Ord, a: int, m: int, b: int) {
+    var i: int = m - a
+    var j: int = b - m
+    while i != j {
+        if i > j {
+            troca_faixa(o, m - i, m, j)
+            i -= j
+        } else {
+            troca_faixa(o, m - i, m + j - i, i)
+            j -= i
+        }
+    }
+    troca_faixa(o, m - i, m, i)
+}
+
+// [a, m) tem um so elemento: desce por trocas ate a posicao dele dentro de [m, b)
+proc funde_um(o: ^Ord, a: int, m: int, b: int) {
+    var i: int = m
+    var j: int = b
+    while i < j {
+        let h: int = (i + j) / 2
+        if menor_el(o, h, a) {
+            i = h + 1
+        } else {
+            j = h
+        }
+    }
+    var k: int = a
+    while k < (i - 1) {
+        troca_el(o, k, k + 1)
+        k += 1
+    }
+}
+
+// [m, b) tem um so elemento: sobe por trocas ate a posicao dele dentro de [a, m); so passa os maiores estritos
+proc funde_ultimo(o: ^Ord, a: int, m: int) {
+    var i: int = a
+    var j: int = m
+    while i < j {
+        let h: int = (i + j) / 2
+        if not menor_el(o, m, h) {
+            i = h + 1
+        } else {
+            j = h
+        }
+    }
+    var k: int = m
+    while k > i {
+        troca_el(o, k, k - 1)
+        k -= 1
+    }
+}
+
+// Funde [a, m) e [m, b), ja ordenados (SymMerge do Go)
+proc funde(o: ^Ord, a: int, m: int, b: int) {
+    if (m - a) == 1 {
+        funde_um(o, a, m, b)
+        return
+    }
+    if (b - m) == 1 {
+        funde_ultimo(o, a, m)
+        return
+    }
+    let mid: int = (a + b) / 2
+    let n: int = mid + m
+    var inicio: int = a
+    var r: int = m
+    if m > mid {
+        inicio = n - b
+        r = mid
+    }
+    while inicio < r {
+        let c: int = (inicio + r) / 2
+        if not menor_el(o, n - 1 - c, c) {
+            inicio = c + 1
+        } else {
+            r = c
+        }
+    }
+    let fim: int = n - inicio
+    if (inicio < m) and (m < fim) {
+        rotaciona(o, inicio, m, fim)
+    }
+    if (a < inicio) and (inicio < mid) {
+        funde(o, a, inicio, mid)
+    }
+    if (mid < fim) and (fim < b) {
+        funde(o, mid, fim, b)
+    }
+}
+
+// Ordena estavel os n elementos: blocos de 20 por insercao; depois funde pares de blocos, dobrando o bloco
+proc estavel_rodar(o: ^Ord, n: int) {
+    var bloco: int = TAM_ESTAVEL_BLOCO
+    var a: int = 0
+    var b: int = TAM_ESTAVEL_BLOCO
+    while b <= n {
+        insere_bloco(o, a, b)
+        a = b
+        b += TAM_ESTAVEL_BLOCO
+    }
+    insere_bloco(o, a, n)
+    while bloco < n {
+        a = 0
+        b = 2 * bloco
+        while b <= n {
+            funde(o, a, a + bloco, b)
+            a = b
+            b += 2 * bloco
+        }
+        if (a + bloco) < n {
+            funde(o, a, a + bloco, n)
+        }
+        bloco = bloco * 2
+    }
+}
+
+// sort_by(s, less = p): menor = valor do proc (^T, ^T) -> bool
+pub proc ordenar_estavel(base: uint, n: int, tam: int, menor: uint) {
+    var o: Ord = Ord{base = base, tam = tam as uint, menor = menor}
+    estavel_rodar(&o, n)
+}
+
+// sort_by_key(s, key = Struct.campo): a chave e o campo em desloc, do tipo ORDENA_* tipo
+pub proc ordc_ordenar(base: uint, n: int, tam: int, desloc: int, tipo: int) {
+    var o: Ord = Ord{base = base, tam = tam as uint, desloc = desloc as uint, tipo = tipo}
+    estavel_rodar(&o, n)
+}
+
+// ---- binary_search: LOWER BOUND e se achou ----
+pub proc ordc_posicao(base: uint, n: int, tam: int, valor: uint, tipo: int) -> int {
+    var lo: int = 0
+    var hi: int = n
+    while lo < hi {
+        let meio: int = lo + (hi - lo) / 2
+        if menor_tipo(tipo, el(base, meio, tam as uint), valor) {
+            lo = meio + 1
+        } else {
+            hi = meio
+        }
+    }
+    return lo
+}
+
+pub proc ordc_achou(base: uint, n: int, tam: int, valor: uint, tipo: int) -> bool {
+    let p: int = ordc_posicao(base, n, tam, valor, tipo)
+    return (p < n) and igual_tipo(tipo, el(base, p, tam as uint), valor)
+}
+
+// ---- heap_push / heap_pop (min-heap em lista dona) ----
+// x < y: com menor (less de heap_push_by / heap_pop_by) ou, sem ele (0), pela ordem do sort no tipo ORDENA_*
+proc heap_menor(menor: uint, tipo: int, x: uint, y: uint) -> bool {
+    if menor != 0 {
+        return chamar_menor(menor, x, y)
+    }
+    return menor_tipo(tipo, x, y)
+}
+
+// heap_push: o elemento n - 1 (o que acabou de entrar pelo append) sobe enquanto for menor que o pai
+// LIMITE: 5 parametros posicionais (a mesma forma plana do C; a BIR passa um valor por parametro)
+pub proc heap_subir(base: uint, n: int, tam: int, menor: uint, tipo: int) {
+    var i: int = n - 1
+    while i > 0 {
+        let pai: int = (i - 1) / 2
+        if not heap_menor(menor, tipo, el(base, i, tam as uint), el(base, pai, tam as uint)) {
+            return
+        }
+        troca_bytes(el(base, i, tam as uint), el(base, pai, tam as uint), tam as uint)
+        i = pai
+    }
+}
+
+// Desce o elemento da raiz sobre os n primeiros: troca com o menor filho enquanto o filho for menor que ele
+proc heap_desce(base: uint, n: int, tam: int, menor: uint, tipo: int) {
+    var i: int = 0
+    while true {
+        var filho: int = 2 * i + 1
+        if filho >= n {
+            return
+        }
+        if ((filho + 1) < n) and heap_menor(menor, tipo, el(base, filho + 1, tam as uint), el(base, filho, tam as uint)) {
+            filho += 1
+        }
+        if not heap_menor(menor, tipo, el(base, filho, tam as uint), el(base, i, tam as uint)) {
+            return
+        }
+        troca_bytes(el(base, i, tam as uint), el(base, filho, tam as uint), tam as uint)
+        i = filho
+    }
+}
+
+// heap_pop: o topo vai para o indice n - 1 e o heap de n - 1 elementos se refaz a partir da raiz
+// LIMITE: 5 parametros posicionais (mesma razao de heap_subir)
+pub proc heap_retira_topo(base: uint, n: int, tam: int, menor: uint, tipo: int) {
+    if n <= 0 {
+        return
+    }
+    troca_bytes(base, el(base, n - 1, tam as uint), tam as uint)
+    heap_desce(base, n - 1, tam, menor, tipo)
+}

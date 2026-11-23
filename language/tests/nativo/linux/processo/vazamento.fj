@@ -1,0 +1,106 @@
+// std:process no Linux (M5 P28b-2) - nada vaza entre casos: 600 execucoes (`true`), 40 falhas de exec (not_found) e o limite de 8 filhos abertos nao deixam fd aberto nem zumbi no pai.
+// O proprio filho mede o pai pelo /proc (so o programa de teste olha o /proc; o runtime nao usa): numero de fds abertos do pai e de filhos dele em estado Z.
+// O `cat ... 2>/dev/null |` antes do awk e de proposito: com outros lotes do WSL em paralelo um /proc/<pid>/stat some entre o glob e a leitura e o awk (busybox) aborta sem imprimir o END,
+// deixando a medida sem o campo dos zumbis ("5" em vez de "5 0"); o cat pula o arquivo que sumiu e o awk sempre imprime o numero.
+// Os fds saem como o MENOR de 3 amostras espacadas: o filho mede o pai logo depois do exec, e o pai ainda pode estar fechando a ponta de leitura do pipe de controle do spawn (1 fd a mais,
+// transitorio, visto com o pai descalonado sob carga); um vazamento de verdade fica em todas as amostras, entao o minimo o pega do mesmo jeito.
+// Equivalente Windows: nenhum (o Windows nao tem zumbi nem fd herdado; o limite de 8 e o mesmo).
+import "std:process" as pr
+
+const MEDIR: str = "F=999; for I in 1 2 3; do N=$(ls /proc/$PPID/fd | wc -l); if [ $N -lt $F ]; then F=$N; fi; sleep 0.02; done; echo $F $(cat /proc/[0-9]*/stat 2>/dev/null | awk -v p=$PPID '$4==p && $3==\"Z\" {n++} END {print n+0}')"
+
+// Roda o script de medida e anexa o stdout em destino ("<fds> <zumbis>\n").
+proc medir(destino: ^[dynamic]u8) {
+    var args: [2]str = {"-c", MEDIR}
+    let cmd = pr.Command{program = "/bin/sh", args = args[..], env = {}, cwd = "", timeout_ms = 0}
+    switch r in pr.run(cmd, alloc = heap) {
+    case pr.Output:
+        append(destino, items = r.stdout[..])
+        delete(r.stdout)
+        delete(r.stderr)
+    case pr.ProcessError:
+        print("erro ao medir")
+    }
+}
+
+// Roda `n` vezes o programa e conta quantas sairam com codigo 0 (ou, para um programa que nao existe, quantas deram not_found).
+proc repetir(programa: str, n: int) -> int {
+    var certas = 0
+    let cmd = pr.Command{program = programa, args = {}, env = {}, cwd = "", timeout_ms = 0}
+    for _i in 0..<n {
+        switch r in pr.run(cmd, alloc = heap) {
+        case pr.Output:
+            if r.code == 0 {
+                certas += 1
+            }
+            delete(r.stdout)
+            delete(r.stderr)
+        case pr.ProcessError:
+            if r == pr.ProcessError.not_found {
+                certas += 1
+            }
+        }
+    }
+    return certas
+}
+
+proc bytes_iguais(a: []u8, b: []u8) -> bool {
+    if len(a) != len(b) {
+        return false
+    }
+    for i in 0..<len(a) {
+        if a[i] != b[i] {
+            return false
+        }
+    }
+    return true
+}
+
+// Abre 8 filhos que dormem (o limite do runtime), confere que o 9o e recusado (io) e fecha todos (o fechar mata o grupo e colhe o filho).
+proc limite_de_filhos() {
+    var args: [2]str = {"-c", "sleep 30"}
+    let cmd = pr.Command{program = "/bin/sh", args = args[..], env = {}, cwd = "", timeout_ms = 0}
+    var abertos: [8]pr.Process = {}
+    var n = 0
+    for _i in 0..<8 {
+        switch p in pr.spawn(cmd) {
+        case pr.Process:
+            abertos[n] = p
+            n += 1
+        case pr.ProcessError:
+            print("spawn recusado cedo demais")
+        }
+    }
+    switch p in pr.spawn(cmd) {
+    case pr.Process:
+        print("9o spawn aceito")
+        pr.close(p)
+    case pr.ProcessError:
+        print(f"9o spawn recusado io={p == pr.ProcessError.io}")
+    }
+    for i in 0..<n {
+        pr.close(abertos[i])
+    }
+    print(f"abertos={n}")
+}
+
+proc main() {
+    var antes = make([dynamic]u8, alloc = heap)
+    var depois = make([dynamic]u8, alloc = heap)
+    var apos_limite = make([dynamic]u8, alloc = heap)
+    medir(&antes)
+    let certas_true = repetir("/bin/true", 600)
+    let certas_nao_achou = repetir("forja_programa_que_nao_existe_p28b2", 40)
+    print(f"true: {certas_true}/600")
+    print(f"not_found: {certas_nao_achou}/40")
+    medir(&depois)
+    limite_de_filhos()
+    medir(&apos_limite)
+    let n = len(depois)
+    print(f"fds e zumbis iguais depois das execucoes={bytes_iguais(antes[..], depois[..])}")
+    print(f"zero zumbis={n >= 3 and depois[n - 3] == 32 and depois[n - 2] == 48}")
+    print(f"iguais depois do limite={bytes_iguais(antes[..], apos_limite[..])}")
+    delete(antes)
+    delete(depois)
+    delete(apos_limite)
+}

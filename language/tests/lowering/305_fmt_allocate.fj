@@ -1,0 +1,163 @@
+// IA1-S2g (D-FMT): std:fmt, allocate(total, weights): rateio proporcional a pesos pelo metodo do MAIOR RESTO: cota = trunc(|total| * peso / soma) (produto em 128 bits), as unidades que sobram vao de 1 em 1 aos maiores restos fracionarios (empate: menor indice), o sinal de total vem no fim e a soma fecha EXATAMENTE em total.
+// Tabela de casos (pesos {1,1,1}, {1,2,3}, {0,5,0}, {3,3,3,1} para -100, empates, pesos perto de 2^62, o menor e o maior int como total) e 1500 sorteios (xorshift64*, ate 9 pesos de ate 59 bits) com soma conferida e hash. Oraculo Python independente (scratchpad, sem o forja).
+import "std:fmt" as fmt
+
+const MAIOR: int = 9223372036854775807
+const MENOR: int = -9223372036854775807 - 1
+const MODULO_HASH: int = 1000003
+const SEMENTE: u64 = 88172645463325252
+const MULTIPLICADOR: u64 = 2685821657736338717
+const SORTEIOS: int = 1500
+
+struct Sorteio {
+    estado: u64 = 0
+}
+
+// xorshift64*: proximo u64 da sequencia.
+proc proximo(s: ^Sorteio) -> u64 {
+    var x = s.estado
+    x = x ~ (x >> 12)
+    x = x ~ (x << 25)
+    x = x ~ (x >> 27)
+    s.estado = x
+    return wrapping_mul(x, b = MULTIPLICADOR)
+}
+
+// Inteiro de 0 a 63 bits de comprimento sorteado, com sinal sorteado.
+proc sorteia_int(s: ^Sorteio) -> int {
+    let bruto = proximo(s)
+    let largura = proximo(s) % 64
+    let valor = (bruto >> largura) >> 1
+    let sinal = proximo(s) & 1
+    if sinal == 1 {
+        return -(valor as int)
+    }
+    return valor as int
+}
+
+// total, os pesos, a lista devolvida e se a soma fecha.
+proc mostra(total: int, pesos: []int) {
+    var cotas = fmt.allocate(total, pesos, alloc = heap)
+    defer delete(cotas)
+    var buf = make([dynamic]u8, alloc = heap, cap = 128)
+    defer delete(buf)
+    format(f"{total} [", into = &buf)
+    for i, w in pesos {
+        if i > 0 {
+            append(&buf, item = " ")
+        }
+        format(f"{w}", into = &buf)
+    }
+    append(&buf, item = "] ->")
+    var soma = 0
+    for c in cotas {
+        format(f" {c}", into = &buf)
+        soma += c
+    }
+    if soma == total {
+        append(&buf, item = " soma ok")
+    } else {
+        append(&buf, item = " SOMA ERRADA")
+    }
+    let texto = to_str(&buf)
+    print(texto)
+    delete(texto)
+}
+
+// Casos de pesos pequenos: proporcao, zeros, empates de resto e sinal.
+proc casos_pequenos() {
+    var a: [3]int = {1, 1, 1}
+    var b: [3]int = {1, 2, 3}
+    var c: [3]int = {0, 5, 0}
+    var d: [4]int = {3, 3, 3, 1}
+    var e: [2]int = {1, 2}
+    var f: [7]int = {1, 1, 1, 1, 1, 1, 1}
+    var g: [3]int = {2, 2, 3}
+    var h: [1]int = {1}
+    var i: [3]int = {0, 0, 1}
+    var j: [7]int = {3, 3, 3, 1, 0, 0, 2}
+    mostra(100, a[..])
+    mostra(-100, a[..])
+    mostra(100, b[..])
+    mostra(100, c[..])
+    mostra(-100, d[..])
+    mostra(0, e[..])
+    mostra(1, a[..])
+    mostra(-1, a[..])
+    mostra(2, a[..])
+    mostra(10, f[..])
+    mostra(-10, f[..])
+    mostra(7, g[..])
+    mostra(100, h[..])
+    mostra(5, i[..])
+    mostra(1000000, j[..])
+    mostra(99, d[..])
+}
+
+// Totais e pesos perto de 2^62 e 2^63: o produto passa de 64 bits; o menor int como total.
+proc casos_grandes() {
+    var a: [2]int = {4611686018427387903, 4611686018427387903}
+    var b: [2]int = {1, 1}
+    var c: [1]int = {5}
+    var d: [3]int = {4611686018427387000, 1, 4611686018427387000}
+    var e: [1]int = {MAIOR}
+    var f: [3]int = {1, 1, 1}
+    var g: [2]int = {3037000500, 3037000500}
+    mostra(1000, a[..])
+    mostra(MAIOR, b[..])
+    mostra(MENOR, b[..])
+    mostra(MENOR, c[..])
+    mostra(MAIOR, c[..])
+    mostra(9223372036854775000, d[..])
+    mostra(-9223372036854775000, d[..])
+    mostra(MAIOR, e[..])
+    mostra(MENOR, e[..])
+    mostra(MAIOR, f[..])
+    mostra(MENOR, f[..])
+    mostra(MENOR + 1, f[..])
+    mostra(MAIOR, g[..])
+}
+
+// Um peso de ate 59 bits (de 0 a 2^59 - 1).
+proc sorteia_peso(s: ^Sorteio) -> int {
+    let bruto = proximo(s)
+    let largura = proximo(s) % 64
+    return (((bruto >> largura) >> 5) as int)
+}
+
+// 1500 sorteios: total sorteado, 1 a 9 pesos sorteados; soma conferida e hash das cotas.
+proc sorteios() {
+    var s = Sorteio{estado = SEMENTE}
+    var falhas = 0
+    var hash = 0
+    var pesos: [9]int = {}
+    for _k in 0..<SORTEIOS {
+        let total = sorteia_int(&s)
+        let n = (proximo(&s) % 9 + 1) as int
+        var soma_pesos = 0
+        for i in 0..<n {
+            pesos[i] = sorteia_peso(&s)
+            soma_pesos += pesos[i]
+        }
+        if soma_pesos == 0 {
+            pesos[0] = 1
+        }
+        var cotas = fmt.allocate(total, pesos[0..<n], alloc = heap)
+        var soma = 0
+        for c in cotas {
+            soma += c
+            hash = (hash * 31 + (c % MODULO_HASH) + MODULO_HASH) % MODULO_HASH
+        }
+        if soma != total {
+            falhas += 1
+        }
+        delete(cotas)
+    }
+    print(f"{SORTEIOS} sorteios: {falhas} falhas, hash {hash}")
+}
+
+proc main() {
+    casos_pequenos()
+    casos_grandes()
+    sorteios()
+}

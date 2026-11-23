@@ -1,0 +1,350 @@
+// nativo/bir/bir_construir_ptr.fj - porte de compiler/nativo/bir/bir_construir_ptr.c
+// sha256 de nativo/bir/bir_construir_ptr.c: 14fe39423266944998c1b9ee3d7bedf52ce7af56e5632fc7013dbd503f8cbce3
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "common"
+import "ir"
+import "semantic"
+
+const TEXTO_NAO_NULO: str = "conversao 'as' para ponteiro nao nulo"
+
+// C: nativo/bir/bir_construir_ptr.c:23
+proc bir_regra_endereco(c: ^BirCtx, i: ^ir.IrInstr) -> bool {
+    var endereco: u32 = 0
+    var dst: u32 = 0
+    if i.a.tipo_no != (ir.V_LOCAL as u8) {
+        return bir_falha_inconsistente(c, "& de algo que nao e local")
+    }
+    if not bir_vreg_local(c, i.a.id, &endereco) {
+        return false
+    }
+    if (not bir_eh_agregado((c.e as ^BirEntrada).tipos as ^semantic.Tipos, i.a.tipo)) and (not ((c.em_memoria or_else {})[i.a.id] != 0)) {
+        return bir_falha_tipo(c, i, "ENDERECO", i.a.tipo)
+    }
+    if not bir_definir_destino(c, BC_I64 as u8, &dst) {
+        return false
+    }
+    _ = bir_emitir_pedido(c, BirPedido{op = BIR_COPIA as u8, dst = dst, a = op_vreg(endereco, BC_I64 as u8)})
+    return true
+}
+
+// C: nativo/bir/bir_construir_ptr.c:39
+proc deref_struct(c: ^BirCtx, i: ^ir.IrInstr, ponteiro: u32) -> bool {
+    var pedido: BirPedidoSlot = BirPedidoSlot{temporario = true, id = i.destino}
+    var dst: u32 = 0
+    if (not bir_forma(c, i.tipo, &pedido.forma)) or (not bir_definir_slot(c, &pedido, &dst)) {
+        return false
+    }
+    bir_copia_bloco(c, dst, ponteiro, pedido.forma.tam)
+    return true
+}
+
+// C: nativo/bir/bir_construir_ptr.c:50
+proc bir_regra_deref(c: ^BirCtx, i: ^ir.IrInstr) -> bool {
+    var ponteiro: BirOperando = BirOperando{}
+    var classe: u8 = BC_NADA as u8
+    var dst: u32 = 0
+    if (not bir_operando_de(c, i, &i.a, &ponteiro)) or (not bir_operando_vreg(c, ponteiro, &ponteiro)) {
+        return false
+    }
+    if bir_eh_agregado((c.e as ^BirEntrada).tipos as ^semantic.Tipos, i.tipo) {
+        return deref_struct(c, i, ponteiro.id)
+    }
+    if not bir_classe_do_tipo((c.e as ^BirEntrada).tipos as ^semantic.Tipos, i.tipo, &classe) {
+        return bir_falha_tipo(c, i, "DEREF", i.tipo)
+    }
+    if not bir_definir_destino(c, classe, &dst) {
+        return false
+    }
+    bir_emitir_carrega(c, dst, ponteiro.id, 0)
+    return true
+}
+
+// C: nativo/bir/bir_construir_ptr.c:70
+proc bir_regra_grava_ponteiro(c: ^BirCtx, i: ^ir.IrInstr) -> bool {
+    let tipos: ?^semantic.Tipos = (c.e as ^BirEntrada).tipos
+    var ponteiro: BirOperando = BirOperando{}
+    var campo: BirCampoInfo = BirCampoInfo{}
+    var alvo: BirAlvoMem = BirAlvoMem{}
+    if common.c2f_s2u_32(semantic.tipo_classe_de(tipos as ^semantic.Tipos, i.a.tipo)) != (semantic.TC_PONTEIRO as u32) {
+        return bir_falha_tipo(c, i, "-", i.a.tipo)
+    }
+    if (not bir_operando_de(c, i, &i.a, &ponteiro)) or (not bir_operando_vreg(c, ponteiro, &ponteiro)) {
+        return false
+    }
+    alvo = BirAlvoMem{base = ponteiro.id, offset = 0, tipo = semantic.tipo_de(tipos as ^semantic.Tipos, i.a.tipo).a}
+    if i.nome >= 0 {
+        if not bir_campo_de(c, alvo.tipo, i.nome, &campo) {
+            return false
+        }
+        alvo.offset = campo.offset
+        alvo.tipo = campo.tipo
+    }
+    return bir_gravar_em(c, i, &alvo, &i.b)
+}
+
+// C: nativo/bir/bir_construir_ptr.c:91
+proc eh_ponteiro_para_struct(c: ^BirCtx, tipo: u32) -> bool {
+    let tipos: ?^semantic.Tipos = (c.e as ^BirEntrada).tipos
+    return (common.c2f_s2u_32(semantic.tipo_classe_de(tipos as ^semantic.Tipos, tipo)) == (semantic.TC_PONTEIRO as u32)) and (common.c2f_b2i32(bir_eh_struct(c, semantic.tipo_de(tipos as ^semantic.Tipos, tipo).a)) != 0)
+}
+
+// C: nativo/bir/bir_construir_ptr.c:99
+proc emitir_endereco_do_campo(c: ^BirCtx, dst: u32, ponteiro: BirOperando, offset: u32) {
+    var pedido: BirPedido = BirPedido{op = BIR_COPIA as u8, dst = dst, a = op_vreg(ponteiro.id, BC_I64 as u8)}
+    if offset != 0 {
+        pedido.op = BIR_ADD as u8
+        pedido.b = op_imed(offset as i64, BC_I64 as u8)
+    }
+    _ = bir_emitir_pedido(c, pedido)
+}
+
+// C: nativo/bir/bir_construir_ptr.c:110
+proc bir_regra_endereco_campo(c: ^BirCtx, i: ^ir.IrInstr) -> bool {
+    let tipos: ?^semantic.Tipos = (c.e as ^BirEntrada).tipos
+    var ponteiro: BirOperando = BirOperando{}
+    var campo: BirCampoInfo = BirCampoInfo{}
+    var dst: u32 = 0
+    if not eh_ponteiro_para_struct(c, i.a.tipo) {
+        return bir_falha_tipo(c, i, "-", i.a.tipo)
+    }
+    if (not bir_operando_de(c, i, &i.a, &ponteiro)) or (not bir_operando_vreg(c, ponteiro, &ponteiro)) {
+        return false
+    }
+    let arg_1: ^BirCampoInfo = &campo
+    let arg_2: i32 = i.nome
+    let arg_3: u32 = semantic.tipo_de(tipos as ^semantic.Tipos, i.a.tipo).a
+    let arg_4: ^BirCtx = c
+    if (not bir_campo_de(arg_4, arg_3, arg_2, arg_1)) or (not bir_definir_destino(c, BC_I64 as u8, &dst)) {
+        return false
+    }
+    emitir_endereco_do_campo(c, dst, ponteiro, campo.offset)
+    return true
+}
+
+// C: nativo/bir/bir_construir_ptr.c:130
+proc forma_da_transmuta(c: ^BirCtx, i: ^ir.IrInstr, forma: ^BirSlot) -> bool {
+    var forma_origem: BirSlot = BirSlot{}
+    if (not bir_forma(c, i.tipo, forma)) or (not bir_forma(c, i.a.tipo, &forma_origem)) {
+        return false
+    }
+    if forma.tam != forma_origem.tam {
+        return bir_falha_inconsistente(c, "transmute entre tamanhos diferentes")
+    }
+    return true
+}
+
+// C: nativo/bir/bir_construir_ptr.c:142
+proc transmuta_agregado(c: ^BirCtx, i: ^ir.IrInstr) -> bool {
+    var pedido: BirPedidoSlot = BirPedidoSlot{temporario = true, id = i.destino}
+    var forma_origem: BirSlot = BirSlot{}
+    var origem: u32 = 0
+    var dst: u32 = 0
+    if (not bir_forma(c, i.tipo, &pedido.forma)) or (not bir_forma(c, i.a.tipo, &forma_origem)) {
+        return false
+    }
+    if pedido.forma.tam != forma_origem.tam {
+        return bir_falha_inconsistente(c, "transmute entre tamanhos diferentes")
+    }
+    if (not bir_endereco_de(c, i, &i.a, &origem)) or (not bir_definir_slot(c, &pedido, &dst)) {
+        return false
+    }
+    bir_copia_bloco(c, dst, origem, pedido.forma.tam)
+    return true
+}
+
+// C: nativo/bir/bir_construir_ptr.c:158
+proc bir_regra_transmuta(c: ^BirCtx, i: ^ir.IrInstr) -> bool {
+    var origem: BirOperando = BirOperando{}
+    var forma: BirSlot = BirSlot{}
+    var classe: u8 = BC_NADA as u8
+    var dst: u32 = 0
+    var endereco: u32 = 0
+    if bir_eh_agregado((c.e as ^BirEntrada).tipos as ^semantic.Tipos, i.tipo) {
+        return transmuta_agregado(c, i)
+    }
+    if not bir_operando_de(c, i, &i.a, &origem) {
+        return false
+    }
+    if not bir_classe_do_tipo((c.e as ^BirEntrada).tipos as ^semantic.Tipos, i.tipo, &classe) {
+        return bir_falha_tipo(c, i, "-", i.tipo)
+    }
+    if not forma_da_transmuta(c, i, &forma) {
+        return false
+    }
+    if not bir_definir_destino(c, classe, &dst) {
+        return false
+    }
+    if (origem.classe as i32) == (classe as i32) {
+        bir_mover(c, dst, origem)
+        return true
+    }
+    let arg_1: u32 = bir_novo_vreg(c, BC_I64 as u8)
+    let arg_2: u32 = bir_novo_slot(c, forma.tam, forma.alinhamento)
+    let arg_3: ^BirCtx = c
+    endereco = bir_emitir_end_slot(arg_3, arg_2, arg_1)
+    bir_emitir_grava(c, endereco, 0, origem)
+    bir_emitir_carrega(c, dst, endereco, 0)
+    return true
+}
+
+// C: nativo/bir/bir_construir_ptr.c:187
+proc alargar64(c: ^BirCtx, v: BirOperando, tipo: u32) -> BirOperando {
+    if v.classe == (BC_I64 as u8) {
+        return v
+    }
+    var tern_1: i32 = BIR_EXT_S
+    if common.c2f_b2i32(semantic.tipo_eh_sem_sinal(tipo)) != 0 {
+        tern_1 = BIR_EXT_Z
+    }
+    return op_vreg(bir_conta_nova(c, BC_I64 as u8, BirPedido{op = tern_1 as u8, a = v}), BC_I64 as u8)
+}
+
+// C: nativo/bir/bir_construir_ptr.c:195
+proc condicao_fora(c: ^BirCtx, i: ^ir.IrInstr, v: BirOperando) -> u32 {
+    let sem_sinal: bool = semantic.tipo_eh_sem_sinal(i.a.tipo)
+    var menor: u8 = BCOND_LT_S as u8
+    if sem_sinal {
+        menor = BCOND_LT_U as u8
+    }
+    var maior: u8 = BCOND_GT_S as u8
+    if sem_sinal {
+        maior = BCOND_GT_U as u8
+    }
+    if i.faixa_excl {
+        maior = BCOND_GE_S as u8
+        if sem_sinal {
+            maior = BCOND_GE_U as u8
+        }
+    }
+    let baixo: u32 = bir_comparar(c, menor, v, op_imed(i.faixa_min, BC_I64 as u8))
+    let alto: u32 = bir_comparar(c, maior, v, op_imed(i.faixa_max, BC_I64 as u8))
+    return bir_conta_nova(c, BC_I8 as u8, BirPedido{op = BIR_OR as u8, a = op_vreg(baixo, BC_I8 as u8), b = op_vreg(alto, BC_I8 as u8)})
+}
+
+// C: nativo/bir/bir_construir_ptr.c:207
+proc frio_faixa(c: ^BirCtx, i: ^ir.IrInstr, frio: u32, v: BirOperando) {
+    let campo: str = common.interner_texto((c.e as ^BirEntrada).nomes as ^common.Interner, i.nome)
+    let salvo: u32 = c.cur
+    var linha: u32 = 0
+    c.cur = frio
+    var args: [7]BirOperando = {}
+    args[0] = v
+    args[1] = op_imed(i.faixa_min, BC_I64 as u8)
+    args[2] = op_imed(i.faixa_max, BC_I64 as u8)
+    var excl: i64 = 0
+    if i.faixa_excl {
+        excl = 1
+    }
+    args[3] = op_imed(excl, BC_I8 as u8)
+    args[4] = op_vreg(bir_vreg_do_texto(c, campo, common.interner_tam((c.e as ^BirEntrada).nomes as ^common.Interner, i.nome)), BC_I64 as u8)
+    args[5] = bir_vreg_do_arquivo(c, i.pos, &linha)
+    args[6] = op_imed(linha as i64, BC_I32 as u8)
+    var nome_frio: str = "forja_faixa"
+    if semantic.tipo_eh_sem_sinal(i.a.tipo) {
+        nome_frio = "forja_faixa_u64"
+    }
+    bir_armadilha(c, bir_simbolo_runtime(c, nome_frio), args[..])
+    c.cur = salvo
+}
+
+// C: nativo/bir/bir_construir_ptr.c:225
+proc bir_regra_verifica_faixa(c: ^BirCtx, i: ^ir.IrInstr) -> bool {
+    var v: BirOperando = BirOperando{}
+    var fora: u32 = 0
+    var frio: u32 = 0
+    var segue: u32 = 0
+    if (c.p as ^BirPrograma).modo != (BM_DEV as u8) {
+        return true
+    }
+    if (not bir_operando_de(c, i, &i.a, &v)) or (not bir_operando_vreg(c, v, &v)) {
+        return false
+    }
+    v = alargar64(c, v, i.a.tipo)
+    fora = condicao_fora(c, i, v)
+    frio = bir_novo_bloco(c, true)
+    segue = bir_novo_bloco(c, false)
+    bir_desvia(c, op_vreg(fora, BC_I8 as u8), frio, segue)
+    frio_faixa(c, i, frio, v)
+    c.cur = segue
+    return true
+}
+
+// C: nativo/bir/bir_construir_ptr.c:246
+proc eh_ponteiro(c: ^BirCtx, tipo: u32) -> bool {
+    let k: i32 = semantic.tipo_classe_de((c.e as ^BirEntrada).tipos as ^semantic.Tipos, tipo)
+    return ((((common.c2f_s2u_32(k) == (semantic.TC_PONTEIRO as u32)) or (common.c2f_s2u_32(k) == (semantic.TC_ANULAVEL as u32))) or (common.c2f_s2u_32(k) == (semantic.TC_RAWPTR as u32))) or (common.c2f_s2u_32(k) == (semantic.TC_CSTR as u32))) or (common.c2f_s2u_32(k) == (semantic.TC_PROC as u32))
+}
+
+// C: nativo/bir/bir_construir_ptr.c:253
+proc bir_eh_conversao_ponteiro(c: ^BirCtx, i: ^ir.IrInstr) -> bool {
+    return (common.c2f_b2i32(eh_ponteiro(c, i.a.tipo)) != 0) and (common.c2f_b2i32(eh_ponteiro(c, i.tipo)) != 0)
+}
+
+// C: nativo/bir/bir_construir_ptr.c:259
+proc guarda_nao_nulo(c: ^BirCtx, i: ^ir.IrInstr, ponteiro: BirOperando) {
+    let nulo: u32 = bir_comparar(c, BCOND_EQ as u8, ponteiro, op_imed(0, BC_I64 as u8))
+    let frio: u32 = bir_novo_bloco(c, true)
+    let segue: u32 = bir_novo_bloco(c, false)
+    var linha: u32 = 0
+    bir_desvia(c, op_vreg(nulo, BC_I8 as u8), frio, segue)
+    c.cur = frio
+    var args: [3]BirOperando = {}
+    args[0] = op_vreg(bir_vreg_do_texto(c, TEXTO_NAO_NULO, (len(TEXTO_NAO_NULO) as u64) as u32), BC_I64 as u8)
+    args[1] = bir_vreg_do_arquivo(c, i.pos, &linha)
+    args[2] = op_imed(linha as i64, BC_I32 as u8)
+    bir_armadilha(c, bir_simbolo_runtime(c, "forja_falha_nulo"), args[..])
+    c.cur = segue
+}
+
+// C: nativo/bir/bir_construir_ptr.c:277
+proc destino_nao_nulo(destino: i32) -> bool {
+    let sw_1 = common.c2f_s2u_32(destino)
+    if sw_1 == (semantic.TC_PONTEIRO as u32) or sw_1 == (semantic.TC_CSTR as u32) or sw_1 == (semantic.TC_PROC as u32) {
+        return true
+    } else {
+        return false
+    }
+    return false
+}
+
+// C: nativo/bir/bir_construir_ptr.c:287
+proc origem_pode_ser_nula(origem: i32) -> bool {
+    return (common.c2f_s2u_32(origem) == (semantic.TC_RAWPTR as u32)) or (common.c2f_s2u_32(origem) == (semantic.TC_ANULAVEL as u32))
+}
+
+// C: nativo/bir/bir_construir_ptr.c:293
+proc conversao_checada_2(c: ^BirCtx, i: ^ir.IrInstr) -> bool {
+    let tipos: ^semantic.Tipos = (c.e as ^BirEntrada).tipos as ^semantic.Tipos
+    let conferindo: bool = ((c.p as ^BirPrograma).modo == (BM_DEV as u8)) or (c.p as ^BirPrograma).checagem
+    return conferindo and destino_nao_nulo(semantic.tipo_classe_de(tipos, i.tipo)) and origem_pode_ser_nula(semantic.tipo_classe_de(tipos, i.a.tipo))
+}
+
+// C: nativo/bir/bir_construir_ptr.c:298
+proc bir_conversao_ponteiro(c: ^BirCtx, i: ^ir.IrInstr) -> bool {
+    let checada: bool = conversao_checada_2(c, i)
+    var ponteiro: BirOperando = BirOperando{}
+    var dst: u32 = 0
+    if (not bir_operando_de(c, i, &i.a, &ponteiro)) or (not bir_operando_vreg(c, ponteiro, &ponteiro)) {
+        return false
+    }
+    if checada {
+        guarda_nao_nulo(c, i, ponteiro)
+    }
+    if not bir_definir_destino(c, BC_I64 as u8, &dst) {
+        return false
+    }
+    _ = bir_emitir_pedido(c, BirPedido{op = BIR_COPIA as u8, dst = dst, a = ponteiro})
+    return true
+}
+
+test "bir_construir_ptr: destino e origem que conferem o nulo" {
+    expect(destino_nao_nulo(semantic.TC_PONTEIRO))
+    expect(destino_nao_nulo(semantic.TC_CSTR))
+    expect(destino_nao_nulo(semantic.TC_PROC))
+    expect(not destino_nao_nulo(semantic.TC_ARRAY))
+    expect(origem_pode_ser_nula(semantic.TC_RAWPTR))
+    expect(origem_pode_ser_nula(semantic.TC_ANULAVEL))
+    expect(not origem_pode_ser_nula(semantic.TC_PONTEIRO))
+}

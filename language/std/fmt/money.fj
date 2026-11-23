@@ -1,0 +1,333 @@
+// std:fmt, pedaco money (parte do modulo std:fmt: veja fmt.fj)
+// Versao: 0.3.0. Changelog: 0.3.0 - B01e2: fixed, money, split_even e allocate ganham `alloc: Allocator` (ultimo parametro, sem padrao); o resultado vai para o alocador do chamador, o temporario de allocate continua no heap. 0.2.0 - IA1-S2g: MoneyError, mul_div_round, split_even e allocate (conta de dinheiro exata, intermediario de 128 bits). 0.1.0 - IA1-S2f: fixed, money e as variantes write_fixed, write_money.
+// Conta de dinheiro (S2g): mul_div_round(a, num, den, rounding) = round(a * num / den) EXATO (a * num passa de 64 bits sem estourar: mul_hi_u64 + divisao longa 128/64 sobre os modulos). `rounding` e OBRIGATORIO, sem padrao (regra fiscal explicita). Os 5 modos olham so o modulo do quociente exato e sao simetricos no sinal (-5/2 em half_up = -3). den = 0 = panic (R0003). Resultado fora do int = MoneyError.overflow (o menor int e valido).
+// split_even(total, n) e allocate(total, weights) devolvem lista DONA (heap: delete) cuja soma e EXATAMENTE total. split_even: o resto vai de 1 em 1 para os primeiros indices. allocate: rateio proporcional por maior resto (cota = trunc(|total| * peso / soma); as unidades que sobram vao aos maiores restos, empate = menor indice). n <= 0, peso negativo, lista vazia, soma 0 ou soma que estoura o int = panic (R0003).
+// Dinheiro e inteiro: cents/n e a conta INTEIRA com `scale` casas decimais implicitas (122334 com scale 2 = 1.223,34), exata em todo o i64 (menor e maior int inclusive). Nada e arredondado: o valor ja e exato. scale vai de 0 a 9; fora disso = panic R0003 (erro de quem chama).
+// Posse: fixed e money devolvem texto DONO do alocador que o chamador passou (delete(texto) so se o alloc foi heap); split_even e allocate devolvem lista DONA do alloc passado. write_* acrescentam ao builder do chamador (buf = &b), na ordem valor, buf, regiao; as formas donas chamam as write_*.
+// money: "R$ 1.223,34"; negativo "-R$ 1.223,34" (sinal na frente de tudo); accounting = true poe o negativo entre parenteses "(R$ 1.223,34)". Posicao e espaco do simbolo vem da regiao (currency_before, currency_space). `code` nao vazio troca o simbolo pelo codigo ("USD 1.223,34"); symbol = false omite o texto da moeda (o codigo tambem). Combustivel: scale = 3, 5899 = "R$ 5,899". Espaco da saida = U+0020.
+const MAX_SCALE: int = 9
+
+// Onde fica o texto da moeda e se leva espaco; label vazio = sem moeda.
+struct Placement {
+    label: str
+    before: bool
+    space: bool
+}
+
+// scale fora de 0..9 e erro de quem chama: panic (R0003), igual a decimals de number.
+proc check_scale(scale: int) {
+    if scale < 0 or scale > MAX_SCALE {
+        panic("fmt: scale fora de 0..9")
+    }
+}
+
+// Spec de um valor com scale casas implicitas.
+proc fixed_spec(loc: Locale, scale: int) -> Spec {
+    check_scale(scale)
+    return make_spec(loc, decimals = scale, rounding = Rounding.down, shift = 0)
+}
+
+// Carrega o int n em dg como valor n / 10^scale (so desloca o expoente decimal; nao ha conta, entao nao estoura).
+proc load_fixed_digits(n: int, scale: int, dg: ^Digits) {
+    load_int_digits(n, dg)
+    dg.point -= scale
+}
+
+// Escreve o numero de dg (sem sinal) com o texto da moeda antes ou depois, conforme place.
+proc write_amount(dg: ^Digits, buf: ^[dynamic]u8, spec: Spec, place: Placement) {
+    let has_label = len(place.label) > 0
+    if has_label and place.before {
+        append(buf, item = place.label)
+        if place.space {
+            append(buf, item = " ")
+        }
+    }
+    write_digits(dg, buf, spec)
+    if has_label and not place.before {
+        if place.space {
+            append(buf, item = " ")
+        }
+        append(buf, item = place.label)
+    }
+}
+
+// O inteiro n com scale casas implicitas na regiao loc.
+pub proc write_fixed(n: int, buf: ^[dynamic]u8, loc: Locale, scale: int = 2) {
+    let spec = fixed_spec(loc, scale)
+    var dg = Digits{}
+    load_fixed_digits(n, scale, &dg)
+    write_digits(&dg, buf, spec)
+}
+
+// O inteiro n com scale casas implicitas na regiao loc: texto dono. fixed(122334, loc = PT_BR) = "1.223,34".
+pub proc fixed(n: int, loc: Locale, scale: int = 2, alloc: Allocator) -> str {
+    var buf = make([dynamic]u8, alloc = alloc, cap = 32)
+    defer delete(buf)
+    write_fixed(n, buf = &buf, loc = loc, scale = scale)
+    return to_str(&buf)
+}
+
+// O texto da moeda pedido: o simbolo da regiao, o code se nao vazio, ou nada com symbol = false.
+proc money_label(loc: Locale, symbol: bool, code: str) -> str {
+    if not symbol {
+        return ""
+    }
+    if len(code) > 0 {
+        return code
+    }
+    return loc.currency_symbol
+}
+
+// cents (a conta inteira com scale casas implicitas) como dinheiro da regiao loc.
+pub proc write_money(cents: int, buf: ^[dynamic]u8, loc: Locale, scale: int = 2, symbol: bool = true, accounting: bool = false, code: str = "") {
+    let spec = fixed_spec(loc, scale)
+    var dg = Digits{}
+    load_fixed_digits(cents, scale, &dg)
+    let negative = dg.negative
+    dg.negative = false
+    if negative and accounting {
+        append(buf, item = "(")
+    } else if negative {
+        append(buf, item = "-")
+    }
+    write_amount(&dg, buf, spec, Placement{label = money_label(loc, symbol, code), before = loc.currency_before, space = loc.currency_space})
+    if negative and accounting {
+        append(buf, item = ")")
+    }
+}
+
+// cents como dinheiro da regiao loc: texto dono. money(122334, loc = PT_BR) = "R$ 1.223,34"; money(-122334, loc = PT_BR, accounting = true) = "(R$ 1.223,34)".
+pub proc money(cents: int, loc: Locale, scale: int = 2, symbol: bool = true, accounting: bool = false, code: str = "", alloc: Allocator) -> str {
+    var buf = make([dynamic]u8, alloc = alloc, cap = 32)
+    defer delete(buf)
+    write_money(cents, buf = &buf, loc = loc, scale = scale, symbol = symbol, accounting = accounting, code = code)
+    return to_str(&buf)
+}
+
+// Unico erro de mul_div_round: o resultado nao cabe no int.
+pub enum MoneyError { overflow }
+
+const TWO_POW_63: u64 = 9223372036854775808
+const MAX_U64: u64 = 18446744073709551615
+const WORD_BITS: int = 64
+const ONE_U64: u64 = 1
+
+// Quociente de 128 bits (q_hi, q_lo) e resto de uma divisao 128/64.
+struct WideQuot {
+    q_hi: u64 = 0
+    q_lo: u64 = 0
+    rem: u64 = 0
+}
+
+// O modulo de x como u64 (o menor int vale 2^63, sem estouro).
+proc magnitude(x: int) -> u64 {
+    if x >= 0 {
+        return x as u64
+    }
+    let bits = transmute(x, to = u64)
+    return ~bits + 1
+}
+
+// Um passo da divisao longa: desce o proximo bit do dividendo para o resto e, se o resto alcanca d, subtrai e acende o bit do quociente (so a palavra baixa: a alta ja saiu pronta de hi / d). O vai-um (resto >= 2^63 antes de dobrar) conta como "alcanca".
+proc div_step(st: ^WideQuot, bit: u64, d: u64) {
+    let carry = st.rem >> 63
+    st.rem = (st.rem << 1) | bit
+    st.q_lo = st.q_lo << 1
+    if carry == 1 or st.rem >= d {
+        st.rem = wrapping_sub(st.rem, b = d)
+        st.q_lo = st.q_lo | 1
+    }
+}
+
+// (hi * 2^64 + lo) / d com d != 0: o quociente de 128 bits e o resto. A parte alta ja da q_hi e o resto inicial; os 64 bits de lo descem um a um.
+proc divide_wide(hi: u64, lo: u64, d: u64) -> WideQuot {
+    var st = WideQuot{q_hi = hi / d, q_lo = 0, rem = hi % d}
+    var word = lo
+    for _step in 0..<WORD_BITS {
+        div_step(&st, bit = word >> 63, d = d)
+        word = word << 1
+    }
+    return st
+}
+
+// Onde o resto rem (menor que d) fica em relacao a metade de d.
+proc division_tail(rem: u64, d: u64) -> int {
+    if rem == 0 {
+        return TAIL_ZERO
+    }
+    let other = d - rem
+    if rem > other {
+        return TAIL_ABOVE_HALF
+    }
+    if rem == other {
+        return TAIL_HALF
+    }
+    return TAIL_BELOW_HALF
+}
+
+// O inteiro de modulo m (m <= 2^63 se negativo, m <= 2^63 - 1 se positivo) com o sinal pedido.
+proc signed_from_magnitude(m: u64, negative: bool) -> int {
+    if not negative {
+        return m as int
+    }
+    if m == TWO_POW_63 {
+        return MIN_INT
+    }
+    return -(m as int)
+}
+
+// true se o resultado de sinal negative e modulo m cabe no int.
+proc magnitude_fits(m: u64, negative: bool) -> bool {
+    if negative {
+        return m <= TWO_POW_63
+    }
+    return m < TWO_POW_63
+}
+
+// Aplica o modo ao quociente q de 128 bits e resto rem e devolve o int com o sinal; fora do int = overflow.
+proc round_quotient(q: WideQuot, d: u64, negative: bool, rounding: Rounding) -> int ! MoneyError {
+    var m = q.q_lo
+    if q.q_hi != 0 {
+        return MoneyError.overflow
+    }
+    let odd = (q.q_lo & ONE_U64) == 1
+    if rounds_up(division_tail(q.rem, d), rounding, odd) {
+        if m == MAX_U64 {
+            return MoneyError.overflow
+        }
+        m += 1
+    }
+    if not magnitude_fits(m, negative) {
+        return MoneyError.overflow
+    }
+    return signed_from_magnitude(m, negative)
+}
+
+// true se o produto de a, num e den e negativo (conta os fatores negativos).
+proc product_negative(a: int, num: int, den: int) -> bool {
+    var negatives = 0
+    if a < 0 {
+        negatives += 1
+    }
+    if num < 0 {
+        negatives += 1
+    }
+    if den < 0 {
+        negatives += 1
+    }
+    return negatives % 2 == 1
+}
+
+// round(a * num / den) exato, com o modo `rounding` (obrigatorio). mul_div_round(5, 1, 2, rounding = Rounding.half_up) = 3; (-5, 1, 2) = -3. den = 0 e panic (R0003); resultado fora do int = MoneyError.overflow.
+pub proc mul_div_round(a: int, num: int, den: int, rounding: Rounding) -> int ! MoneyError {
+    if den == 0 {
+        panic("fmt: mul_div_round com den igual a 0")
+    }
+    let ma = magnitude(a)
+    let mn = magnitude(num)
+    let q = divide_wide(mul_hi_u64(ma, b = mn), wrapping_mul(ma, b = mn), magnitude(den))
+    let result = try round_quotient(q, magnitude(den), product_negative(a, num, den), rounding)
+    return result
+}
+
+// total em n partes que somam exatamente total: o resto (|total| mod n) vai de 1 em 1 para os primeiros indices, com o sinal de total. split_even(10, 3) = [4, 3, 3]; split_even(-10, 3) = [-4, -3, -3]. n <= 0 e panic (R0003). Lista dona: delete.
+pub proc split_even(total: int, n: int, alloc: Allocator) -> [dynamic]int {
+    if n <= 0 {
+        panic("fmt: split_even com n <= 0")
+    }
+    var parts = make([dynamic]int, alloc = alloc, cap = n)
+    let base = total / n
+    let rest = total % n
+    var extra = 1
+    var count = rest
+    if rest < 0 {
+        extra = -1
+        count = -rest
+    }
+    for i in 0..<n {
+        if i < count {
+            append(&parts, item = base + extra)
+        } else {
+            append(&parts, item = base)
+        }
+    }
+    return parts
+}
+
+// A soma dos pesos; peso negativo, lista vazia, soma 0 ou soma que estoura o int = panic (R0003).
+proc weights_total(weights: []int) -> int {
+    if len(weights) == 0 {
+        panic("fmt: allocate sem pesos")
+    }
+    var sum = 0
+    for w in weights {
+        if w < 0 {
+            panic("fmt: allocate com peso negativo")
+        }
+        let next, over = overflowing_add(sum, b = w)
+        if over {
+            panic("fmt: allocate com soma dos pesos fora do int")
+        }
+        sum = next
+    }
+    if sum == 0 {
+        panic("fmt: allocate com soma dos pesos igual a 0")
+    }
+    return sum
+}
+
+// Uma cota do rateio: a parte inteira (cota) e o resto fracionario (rest, menor que a soma dos pesos; -1 = unidade extra ja dada).
+struct Share {
+    cota: u64 = 0
+    rest: int = 0
+}
+
+// Cota inteira de cada peso (trunc(m * w / soma)) e o resto da divisao; devolve a soma das cotas.
+proc fill_shares(m: u64, weights: []int, sum: u64, shares: ^[dynamic]Share) -> u64 {
+    var given: u64 = 0
+    for w in weights {
+        let mw = w as u64
+        let q = divide_wide(mul_hi_u64(m, b = mw), wrapping_mul(m, b = mw), sum)
+        append(shares, item = Share{cota = q.q_lo, rest = q.rem as int})
+        given += q.q_lo
+    }
+    return given
+}
+
+// Indice do maior resto ainda nao usado (empate: o menor indice).
+proc largest_rest(shares: []Share) -> int {
+    var best = 0
+    for i, s in shares {
+        if s.rest > shares[best].rest {
+            best = i
+        }
+    }
+    return best
+}
+
+// Reparte as left unidades que sobraram, uma a cada maior resto.
+proc give_leftover(shares: []Share, left: u64) {
+    var remaining = left
+    while remaining > 0 {
+        let best = largest_rest(shares)
+        shares[best].cota += 1
+        shares[best].rest = -1
+        remaining -= 1
+    }
+}
+
+// Rateio de total pelos pesos pelo metodo do maior resto: soma == total sempre. allocate(100, {1, 1, 1}) = [34, 33, 33]. Peso negativo, lista vazia, soma 0 ou soma fora do int = panic (R0003). Lista dona: delete.
+pub proc allocate(total: int, weights: []int, alloc: Allocator) -> [dynamic]int {
+    let sum = weights_total(weights)
+    let n = len(weights)
+    let m = magnitude(total)
+    var shares = make([dynamic]Share, alloc = heap, cap = n)
+    defer delete(shares)
+    let given = fill_shares(m, weights, sum as u64, &shares)
+    give_leftover(shares[..], left = m - given)
+    var parts = make([dynamic]int, alloc = alloc, cap = n)
+    for s in shares {
+        append(&parts, item = signed_from_magnitude(s.cota, total < 0))
+    }
+    return parts
+}

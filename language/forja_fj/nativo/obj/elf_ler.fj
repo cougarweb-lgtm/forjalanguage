@@ -1,0 +1,937 @@
+// nativo/obj/elf_ler.fj - porte de compiler/nativo/obj/elf_ler.c, compiler/nativo/obj/elf_ler.h
+// sha256 de nativo/obj/elf_ler.c: d0640aea8c76d47b58301ad84545b764278dbcf06e46df4bb96e8b6564005419
+// sha256 de nativo/obj/elf_ler.h: 2a2c6360019d49b43588804d89f1e4226c8a593bb907c4c23082b55bfd6f717e
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.2.0
+// Changelog: 0.2.0 - V4-W3: stubs zerados. ElfLObjeto e ElfLConversao passam a ter listas donas ([dynamic]) e
+//            arena de textos (nomes copiados, sem view de parametro: E0706); elf_l_alocar sai (calloc vira make);
+//            elf_l_texto recebe a tabela ja fatiada; leituras de secao recebem o buffer inteiro (n = len do buffer).
+
+import "common"
+
+pub struct ElfLErro {
+    codigo: i32
+    tipo_reloc: u32
+    mensagem: ?str
+}
+
+struct ElfLSecao {
+    nome: ?str
+    tipo: u32
+    link: u32
+    info: u32
+    off: u64
+    tam: u64
+    entsize: u64
+    flags: u64
+    alinhamento: u64
+}
+
+struct ElfLSimbolo {
+    nome: ?str
+    valor: u64
+    tam: u64
+    info: u8
+    secao: u16
+}
+
+struct ElfLRelocacao {
+    off: u64
+    addend: i64
+    tipo: u32
+    simbolo: u32
+}
+
+struct ElfLObjeto {
+    n_secoes: u64
+    secoes: [dynamic]ElfLSecao
+    n_simbolos: u64
+    simbolos: [dynamic]ElfLSimbolo
+    n_relocacoes: u64
+    relocacoes: [dynamic]ElfLRelocacao
+    textos: common.Arena
+}
+
+struct ElfLDestinoNomes {
+    arena: ?^common.Arena
+    lista: ?^[dynamic]str
+}
+
+struct ElfLTipoReloc {
+    tipo: u32
+    nome: ?str
+}
+
+struct ElfLConversao {
+    bytes: []u8
+    raw: ^ElfLObjeto
+    o: ^Objeto
+    erro: ^ElfLErro
+    secao_obj: [dynamic]u32
+    simbolo_obj: [dynamic]i64
+}
+
+pub const ELFL_OK: i32 = 0
+const ELFL_FORMATO: i32 = 1
+const ELFL_RELOC_FORA_DO_CENSO: i32 = 2
+const ELFL_MEMORIA: i32 = 3
+const ELFL_TAM_EHDR: u32 = 64
+const ELFL_TAM_SHDR: u32 = 64
+const ELFL_TAM_SIMBOLO: u32 = 24
+const ELFL_TAM_RELA: u32 = 24
+const ELFL_TAM_REL: u32 = 16
+const ELFL_ET_REL: u32 = 1
+const ELFL_EM_X86_64: u32 = 62
+const ELFL_SHT_SYMTAB: u32 = 2
+const ELFL_SHT_STRTAB: u32 = 3
+const ELFL_SHT_RELA: u32 = 4
+const ELFL_SHT_REL: u32 = 9
+const ELFL_SHT_NOBITS: u32 = 8
+
+// Censo do link estatico do musl (D-R2/D-R3): tipos fora desta lista sao erro. Mesma ordem do C (ELFL_CENSO).
+const ELFL_TAM_CENSO: u64 = 10
+const ELFL_TIPOS_CENSO: [10]u32 = {1, 2, 4, 10, 11, 9, 41, 42, 23, 22}
+const ELFL_NOMES_CENSO: [10]str = {"R_X86_64_64", "R_X86_64_PC32", "R_X86_64_PLT32", "R_X86_64_32", "R_X86_64_32S", "R_X86_64_GOTPCREL", "R_X86_64_GOTPCRELX", "R_X86_64_REX_GOTPCRELX", "R_X86_64_TPOFF32", "R_X86_64_GOTTPOFF"}
+
+const ELFL_SHF_WRITE: u32 = 1
+const ELFL_SHF_ALLOC: u32 = 2
+const ELFL_SHF_EXECINSTR: u32 = 4
+const ELFL_SHF_TLS: u32 = 1024
+const ELFL_SHT_NULL: u32 = 0
+const ELFL_SHT_NOTE: u32 = 7
+const ELFL_SHT_INIT_ARRAY: u32 = 14
+const ELFL_SHT_FINI_ARRAY: u32 = 15
+const ELFL_SHT_GROUP: u32 = 17
+const ELFL_SHT_UNWIND: u32 = 1879048193
+const ELFL_STB_LOCAL: u32 = 0
+const ELFL_STB_GLOBAL: u32 = 1
+const ELFL_STB_WEAK: u32 = 2
+const ELFL_STT_SECTION: u32 = 3
+const ELFL_STT_FILE: u32 = 4
+const ELFL_SHN_UNDEF: u32 = 0
+const ELFL_SHN_LORESERVE: u32 = 65280
+const ELFL_SECAO_DESCARTADA: u32 = 4294967295
+const ELFL_SIMBOLO_FORA: i32 = -1
+const ELFL_R_64: u32 = 1
+const ELFL_R_PC32: u32 = 2
+const ELFL_R_PLT32: u32 = 4
+const ELFL_R_32: u32 = 10
+const ELFL_R_32S: u32 = 11
+const ELFL_R_GOTPCREL: u32 = 9
+const ELFL_R_GOTPCRELX: u32 = 41
+const ELFL_R_REX_GOTPCRELX: u32 = 42
+const ELFL_R_TPOFF32: u32 = 23
+const ELFL_R_GOTTPOFF: u32 = 22
+const ASSINATURA: [4]u8 = {127, 69, 76, 70}
+
+// C: nativo/obj/elf_ler.c:47
+// C2F-INDECIDIVEL: p
+proc elf_lu16(p: []u8) -> u16 {
+    return common.c2f_trunc_u16(common.c2f_s2u_64(common.c2f_ou_i32(p[0] as i32, common.c2f_shl_i32(p[1] as i32, 8)) as i64))
+}
+
+// C: nativo/obj/elf_ler.c:52
+// C2F-INDECIDIVEL: p
+proc elf_lu32(p: []u8) -> u32 {
+    return (((p[0] as u32) | ((p[1] as u32) << 8)) | ((p[2] as u32) << 16)) | ((p[3] as u32) << 24)
+}
+
+// C: nativo/obj/elf_ler.c:57
+// C2F: p tem de ter 8 bytes (o C le 8 a partir do ponteiro); o slice [4..<8] mostra a falta como R-code
+proc elf_lu64(p: []u8) -> u64 {
+    let baixo: u64 = elf_lu32(p) as u64
+    let alto: u64 = elf_lu32(p[4..<8]) as u64
+    return baixo | (alto << 32)
+}
+
+// C: nativo/obj/elf_ler.c:63
+proc elf_l_cabe(n: u64, off: u64, tam: u64) -> bool {
+    return (off <= n) and (tam <= (n - off))
+}
+
+// C: nativo/obj/elf_ler.c:68
+// C2F: a mensagem vai para alloc = frame (o erro e lido depois da chamada e nao tem dono)
+proc elf_l_falha(erro: ^ElfLErro, motivo: str, off: u64) -> i32 {
+    erro.codigo = ELFL_FORMATO
+    erro.tipo_reloc = 0
+    erro.mensagem = format(f"ELF invalido no offset {off}: {motivo}", alloc = frame)
+    return ELFL_FORMATO
+}
+
+// C: nativo/obj/elf_ler.c:76
+proc elf_l_sem_memoria(erro: ^ElfLErro) -> i32 {
+    erro.codigo = ELFL_MEMORIA
+    erro.tipo_reloc = 0
+    erro.mensagem = "sem memoria para as tabelas do ELF"
+    return ELFL_MEMORIA
+}
+
+// C: nativo/obj/elf_ler.c:91
+// C2F: a tabela chega ja fatiada (tab = bytes[tab_off..<tab_off+tab_tam]); o texto e copiado na arena do leitor
+// (view de parametro guardada em struct = E0706). Indice fora ou sem NUL dentro da tabela = none.
+proc elf_l_texto(tab: []u8, idx: u64, arena: ^common.Arena) -> ?str {
+    let tam: u64 = len(tab) as u64
+    if idx >= tam {
+        return none
+    }
+    var fim: u64 = idx
+    while fim < tam {
+        if tab[fim] == 0 {
+            return from_bytes(tab[idx..<fim], alloc = common.arena_mem(arena))
+        }
+        fim += 1
+    }
+    return none
+}
+
+// C: nativo/obj/elf_ler.c:102
+// C2F-13: bytes fundido em n (len); bytes e o buffer inteiro do arquivo
+proc elf_l_conferir_identidade(bytes: []u8, erro: ^ElfLErro) -> i32 {
+    if not elf_l_cabe(len(bytes) as u64, 0, ELFL_TAM_EHDR as u64) {
+        return elf_l_falha(erro, "menor que o cabecalho ELF de 64 bytes", 0)
+    }
+    if (bytes[0] != 127) or (bytes[1] != 69) or (bytes[2] != 76) or (bytes[3] != 70) {
+        return elf_l_falha(erro, "falta a assinatura 7f 'E' 'L' 'F'", 0)
+    }
+    if bytes[4] != 2 {
+        return elf_l_falha(erro, "nao e ELF64 (EI_CLASS)", 4)
+    }
+    if bytes[5] != 1 {
+        return elf_l_falha(erro, "nao e little-endian (EI_DATA)", 5)
+    }
+    if (elf_lu16(bytes[16..<18]) as u32) != ELFL_ET_REL {
+        return elf_l_falha(erro, "nao e objeto relocavel (e_type diferente de ET_REL)", 16)
+    }
+    if (elf_lu16(bytes[18..<20]) as u32) != ELFL_EM_X86_64 {
+        return elf_l_falha(erro, "nao e x86-64 (e_machine)", 18)
+    }
+    return ELFL_OK
+}
+
+// C: nativo/obj/elf_ler.c:102 (continuacao: e_shentsize, e_shnum, e_shstrndx e a faixa da tabela)
+proc elf_l_conferir_tabela(bytes: []u8, erro: ^ElfLErro) -> i32 {
+    let n: u64 = len(bytes) as u64
+    if (elf_lu16(bytes[58..<60]) as u32) != ELFL_TAM_SHDR {
+        return elf_l_falha(erro, "e_shentsize diferente de 64", 58)
+    }
+    let shnum: u64 = elf_lu16(bytes[60..<62]) as u64
+    if shnum == 0 {
+        return elf_l_falha(erro, "sem secoes (e_shnum = 0)", 60)
+    }
+    let shstrndx: u64 = elf_lu16(bytes[62..<64]) as u64
+    if (shstrndx == 0) or (shstrndx >= shnum) {
+        return elf_l_falha(erro, "e_shstrndx fora da tabela de secoes", 62)
+    }
+    if not elf_l_cabe(n, elf_lu64(bytes[40..<48]), shnum * (ELFL_TAM_SHDR as u64)) {
+        return elf_l_falha(erro, "tabela de secoes fora do buffer", 40)
+    }
+    return ELFL_OK
+}
+
+// C: nativo/obj/elf_ler.c:102
+// Cabecalho ELF: ELF64 little-endian, ET_REL, x86-64, tabela de secoes inteira dentro do buffer e e_shstrndx valido.
+proc elf_l_conferir_ehdr(bytes: []u8, erro: ^ElfLErro) -> i32 {
+    let cod: i32 = elf_l_conferir_identidade(bytes, erro)
+    if cod != ELFL_OK {
+        return cod
+    }
+    return elf_l_conferir_tabela(bytes, erro)
+}
+
+// C: nativo/obj/elf_ler.c:129
+// C2F-13: sh_off e o inicio do Shdr no buffer inteiro (o C recebia o ponteiro e o n do arquivo)
+proc elf_l_ler_secao(bytes: []u8, sh_off: u64, s: ^ElfLSecao, erro: ^ElfLErro) -> i32 {
+    let sh: []u8 = bytes[sh_off..<(sh_off + (ELFL_TAM_SHDR as u64))]
+    s.nome = none
+    s.tipo = elf_lu32(sh[4..<8])
+    s.off = elf_lu64(sh[24..<32])
+    s.tam = elf_lu64(sh[32..<40])
+    s.link = elf_lu32(sh[40..<44])
+    s.info = elf_lu32(sh[44..<48])
+    s.entsize = elf_lu64(sh[56..<64])
+    s.flags = elf_lu64(sh[8..<16])
+    s.alinhamento = elf_lu64(sh[48..<56])
+    if s.tipo != ELFL_SHT_NOBITS {
+        if not elf_l_cabe(len(bytes) as u64, s.off, s.tam) {
+            return elf_l_falha(erro, "secao fora do buffer", s.off)
+        }
+    }
+    return ELFL_OK
+}
+
+// C: nativo/obj/elf_ler.c:145
+// C2F-13: bytes fundido em n (len)
+proc elf_l_ler_secoes(bytes: []u8, obj_c: ^ElfLObjeto, erro: ^ElfLErro) -> i32 {
+    let shoff: u64 = elf_lu64(bytes[40..<48])
+    let shnum: u64 = elf_lu16(bytes[60..<62]) as u64
+    obj_c.secoes = make([dynamic]ElfLSecao, alloc = heap, cap = shnum as int)
+    obj_c.n_secoes = shnum
+    var i: u64 = 0
+    while i < shnum {
+        append(&obj_c.secoes, item = ElfLSecao{})
+        let cod: i32 = elf_l_ler_secao(bytes, shoff + (i * (ELFL_TAM_SHDR as u64)), &obj_c.secoes[i], erro)
+        if cod != ELFL_OK {
+            return cod
+        }
+        i += 1
+    }
+    return ELFL_OK
+}
+
+// C: nativo/obj/elf_ler.c:162
+proc elf_l_nomear_secoes(bytes: []u8, obj_c: ^ElfLObjeto, erro: ^ElfLErro) -> i32 {
+    let shoff: u64 = elf_lu64(bytes[40..<48])
+    let ix: u64 = elf_lu16(bytes[62..<64]) as u64
+    if obj_c.secoes[ix].tipo != ELFL_SHT_STRTAB {
+        return elf_l_falha(erro, "tabela de nomes de secao (e_shstrndx) nao e STRTAB", 62)
+    }
+    let ini: u64 = obj_c.secoes[ix].off
+    let tab: []u8 = bytes[ini..<(ini + obj_c.secoes[ix].tam)]
+    var i: u64 = 0
+    while i < obj_c.n_secoes {
+        let off_sh: u64 = shoff + (i * (ELFL_TAM_SHDR as u64))
+        let nome: ?str = elf_l_texto(tab, elf_lu32(bytes[off_sh..<(off_sh + 4)]) as u64, &obj_c.textos)
+        if nome == none {
+            return elf_l_falha(erro, "nome de secao fora da tabela de nomes", off_sh)
+        }
+        obj_c.secoes[i].nome = nome
+        i += 1
+    }
+    return ELFL_OK
+}
+
+// C: nativo/obj/elf_ler.c:178
+proc elf_l_achar_symtab(obj_c: ^ElfLObjeto) -> u64 {
+    for i in (0 as u64)..<obj_c.n_secoes {
+        if obj_c.secoes[i].tipo == ELFL_SHT_SYMTAB {
+            return i
+        }
+    }
+    return obj_c.n_secoes
+}
+
+// C: nativo/obj/elf_ler.c:188
+proc elf_l_ler_simbolos(bytes: []u8, obj_c: ^ElfLObjeto, erro: ^ElfLErro) -> i32 {
+    let it: u64 = elf_l_achar_symtab(obj_c)
+    if it == obj_c.n_secoes {
+        obj_c.n_simbolos = 0
+        obj_c.simbolos = make([dynamic]ElfLSimbolo, alloc = heap)
+        return ELFL_OK
+    }
+    let tab: ^ElfLSecao = &obj_c.secoes[it]
+    if (tab.entsize != (ELFL_TAM_SIMBOLO as u64)) or ((tab.tam % (ELFL_TAM_SIMBOLO as u64)) != 0) {
+        return elf_l_falha(erro, "symtab com entsize diferente de 24 ou tamanho nao multiplo", tab.off)
+    }
+    if (tab.link >= (obj_c.n_secoes as u32)) or (obj_c.secoes[tab.link].tipo != ELFL_SHT_STRTAB) {
+        return elf_l_falha(erro, "symtab sem strtab valida (sh_link)", tab.off)
+    }
+    let ini_str: u64 = obj_c.secoes[tab.link].off
+    let str_tab: []u8 = bytes[ini_str..<(ini_str + obj_c.secoes[tab.link].tam)]
+    obj_c.n_simbolos = tab.tam / (ELFL_TAM_SIMBOLO as u64)
+    obj_c.simbolos = make([dynamic]ElfLSimbolo, alloc = heap, cap = obj_c.n_simbolos as int)
+    var i: u64 = 0
+    while i < obj_c.n_simbolos {
+        let pos: u64 = tab.off + (i * (ELFL_TAM_SIMBOLO as u64))
+        let e: []u8 = bytes[pos..<(pos + (ELFL_TAM_SIMBOLO as u64))]
+        append(&obj_c.simbolos, item = ElfLSimbolo{})
+        let s: ^ElfLSimbolo = &obj_c.simbolos[i]
+        s.nome = elf_l_texto(str_tab, elf_lu32(e[0..<4]) as u64, &obj_c.textos)
+        if s.nome == none {
+            return elf_l_falha(erro, "nome de simbolo fora da strtab", pos)
+        }
+        s.info = e[4]
+        s.secao = elf_lu16(e[6..<8])
+        s.valor = elf_lu64(e[8..<16])
+        s.tam = elf_lu64(e[16..<24])
+        i += 1
+    }
+    return ELFL_OK
+}
+
+// C: nativo/obj/elf_ler.c:220
+proc elf_l_eh_reloc(s: ^ElfLSecao) -> bool {
+    return (s.tipo == ELFL_SHT_RELA) or (s.tipo == ELFL_SHT_REL)
+}
+
+// C: nativo/obj/elf_ler.c:226
+proc elf_l_conferir_secao_reloc(s: ^ElfLSecao, erro: ^ElfLErro) -> i32 {
+    var tern_1: u32 = ELFL_TAM_REL
+    if s.tipo == ELFL_SHT_RELA {
+        tern_1 = ELFL_TAM_RELA
+    }
+    let esperado: u64 = tern_1 as u64
+    if (s.entsize != esperado) or ((s.tam % esperado) != 0) {
+        return elf_l_falha(erro, "secao de relocacao com entsize errado ou tamanho nao multiplo", s.off)
+    }
+    return ELFL_OK
+}
+
+// C: nativo/obj/elf_ler.c:235
+proc elf_l_contar_relocacoes(obj_c: ^ElfLObjeto, total: ^u64, erro: ^ElfLErro) -> i32 {
+    total^ = 0
+    var i: u64 = 0
+    while i < obj_c.n_secoes {
+        let s: ^ElfLSecao = &obj_c.secoes[i]
+        if not elf_l_eh_reloc(s) {
+            i += 1
+            continue
+        }
+        let cod: i32 = elf_l_conferir_secao_reloc(s, erro)
+        if cod != ELFL_OK {
+            return cod
+        }
+        total^ += s.tam / s.entsize
+        i += 1
+    }
+    return ELFL_OK
+}
+
+// C: nativo/obj/elf_ler.c:250
+// C2F-13: e e a entrada inteira (16 ou 24 bytes); r_info = simbolo (32 altos) e tipo (32 baixos)
+proc elf_l_ler_reloc_entrada(e: []u8, tipo_secao: u32, r: ^ElfLRelocacao) {
+    let info: u64 = elf_lu64(e[8..<16])
+    r.off = elf_lu64(e[0..<8])
+    r.simbolo = (info >> 32) as u32
+    r.tipo = (info & (4294967295 as u64)) as u32
+    if tipo_secao == ELFL_SHT_RELA {
+        r.addend = transmute(elf_lu64(e[16..<24]), to = i64)
+    } else {
+        r.addend = 0
+    }
+}
+
+// C: nativo/obj/elf_ler.c:260
+proc elf_l_indice_censo(tipo: u32) -> u64 {
+    var i: u64 = 0
+    while i < ELFL_TAM_CENSO {
+        if ELFL_TIPOS_CENSO[i] == tipo {
+            return i
+        }
+        i += 1
+    }
+    return ELFL_TAM_CENSO
+}
+
+// C: nativo/obj/elf_ler.c:269
+proc elf_l_no_censo(tipo: u32) -> bool {
+    return elf_l_indice_censo(tipo) < ELFL_TAM_CENSO
+}
+
+// C: nativo/obj/elf_ler.c:296
+proc elf_l_nome_reloc(tipo: u32) -> str {
+    let i: u64 = elf_l_indice_censo(tipo)
+    if i < ELFL_TAM_CENSO {
+        return ELFL_NOMES_CENSO[i]
+    }
+    return "?"
+}
+
+// C: nativo/obj/elf_ler.c:274
+// C2F: secao NULL no C vira "(null)" (o C tem UB com printf de NULL)
+proc elf_l_reloc_fora(erro: ^ElfLErro, tipo: u32, secao: ?str) -> i32 {
+    let txt: str = secao or_else "(null)"
+    erro.codigo = ELFL_RELOC_FORA_DO_CENSO
+    erro.tipo_reloc = tipo
+    erro.mensagem = format(f"relocacao de tipo {tipo} ({elf_l_nome_reloc(tipo)}) na secao {txt} fora do censo", alloc = frame)
+    return ELFL_RELOC_FORA_DO_CENSO
+}
+
+// C: nativo/obj/elf_ler.c:283
+// Preenche todas as relocacoes. O 1o tipo fora do censo vira erro, mas a leitura segue ate o fim: a contagem do membro sai inteira.
+proc elf_l_preencher_relocacoes(bytes: []u8, obj_c: ^ElfLObjeto, erro: ^ElfLErro) -> i32 {
+    var k: u64 = 0
+    var resultado: i32 = ELFL_OK
+    var i: u64 = 0
+    while i < obj_c.n_secoes {
+        let s: ^ElfLSecao = &obj_c.secoes[i]
+        if elf_l_eh_reloc(s) {
+            let quantas: u64 = s.tam / s.entsize
+            var j: u64 = 0
+            while j < quantas {
+                let ini: u64 = s.off + (j * s.entsize)
+                elf_l_ler_reloc_entrada(bytes[ini..<(ini + s.entsize)], s.tipo, &obj_c.relocacoes[k])
+                if (resultado == ELFL_OK) and (not elf_l_no_censo(obj_c.relocacoes[k].tipo)) {
+                    resultado = elf_l_reloc_fora(erro, obj_c.relocacoes[k].tipo, s.nome)
+                }
+                j += 1
+                k += 1
+            }
+        }
+        i += 1
+    }
+    return resultado
+}
+
+// C: nativo/obj/elf_ler.c:302
+// C2F-13: bytes fundido em n (len)
+proc elf_l_ler_relocacoes(bytes: []u8, obj_c: ^ElfLObjeto, erro: ^ElfLErro) -> i32 {
+    var total: u64 = 0
+    let cod: i32 = elf_l_contar_relocacoes(obj_c, &total, erro)
+    if cod != ELFL_OK {
+        return cod
+    }
+    obj_c.n_relocacoes = total
+    obj_c.relocacoes = make([dynamic]ElfLRelocacao, alloc = heap, cap = total as int)
+    var m: u64 = 0
+    while m < total {
+        append(&obj_c.relocacoes, item = ElfLRelocacao{})
+        m += 1
+    }
+    return elf_l_preencher_relocacoes(bytes, obj_c, erro)
+}
+
+// C: nativo/obj/elf_ler.c:315
+// C2F: o C zera o objeto com memset; aqui o objeto chega zerado (ElfLObjeto{} de quem chama) e o erro e limpo.
+// bytes NULL (nulo) e tratado como buffer de 0 bytes: a falha do cabecalho sai igual a do C com (NULL, 0).
+proc elf_ler(bytes: ?^u8, n: u64, obj_c: ^ElfLObjeto, erro: ^ElfLErro) -> i32 {
+    erro.codigo = ELFL_OK
+    erro.tipo_reloc = 0
+    erro.mensagem = none
+    if bytes == none {
+        return elf_l_falha(erro, "menor que o cabecalho ELF de 64 bytes", 0)
+    }
+    let buf: []u8 = slice_from(bytes as ^u8, len = n as int)
+    var cod: i32 = elf_l_conferir_ehdr(buf, erro)
+    if cod == ELFL_OK {
+        cod = elf_l_ler_secoes(buf, obj_c, erro)
+    }
+    if cod == ELFL_OK {
+        cod = elf_l_nomear_secoes(buf, obj_c, erro)
+    }
+    if cod == ELFL_OK {
+        cod = elf_l_ler_simbolos(buf, obj_c, erro)
+    }
+    if cod == ELFL_OK {
+        cod = elf_l_ler_relocacoes(buf, obj_c, erro)
+    }
+    return cod
+}
+
+// C: nativo/obj/elf_ler.c:334
+proc elf_l_liberar(obj_c: ^ElfLObjeto) {
+    delete(obj_c.secoes)
+    delete(obj_c.simbolos)
+    delete(obj_c.relocacoes)
+    common.arena_liberar(&obj_c.textos)
+    obj_c.n_secoes = 0
+    obj_c.n_simbolos = 0
+    obj_c.n_relocacoes = 0
+}
+
+// C: nativo/obj/elf_ler.c:391
+proc elf_l_secao_descartada(s: ^ElfLSecao) -> bool {
+    if ((s.tipo == ELFL_SHT_NULL) or (s.tipo == ELFL_SHT_SYMTAB)) or (s.tipo == ELFL_SHT_STRTAB) or elf_l_eh_reloc(s) {
+        return true
+    }
+    if (s.tipo == ELFL_SHT_NOTE) or (s.tipo == ELFL_SHT_GROUP) or (s.tipo == ELFL_SHT_UNWIND) {
+        return true
+    }
+    if (s.flags & (ELFL_SHF_ALLOC as u64)) == 0 {
+        return true
+    }
+    return (s.nome or_else "") == ".eh_frame"
+}
+
+// C: nativo/obj/elf_ler.c:402
+proc elf_l_tipo_secao(s: ^ElfLSecao) -> i32 {
+    if s.tipo == ELFL_SHT_INIT_ARRAY {
+        return OS_INIT_ARRAY
+    }
+    if (s.flags & (ELFL_SHF_TLS as u64)) != 0 {
+        var tern_1: i32 = OS_TDATA
+        if s.tipo == ELFL_SHT_NOBITS {
+            tern_1 = OS_TBSS
+        }
+        return tern_1
+    }
+    if (s.flags & (ELFL_SHF_EXECINSTR as u64)) != 0 {
+        return OS_TEXTO
+    }
+    if s.tipo == ELFL_SHT_NOBITS {
+        return OS_BSS
+    }
+    if (s.flags & (ELFL_SHF_WRITE as u64)) != 0 {
+        return OS_DATA
+    }
+    return OS_RDATA
+}
+
+// C: nativo/obj/elf_ler.c:418
+proc elf_l_alinhamento(erro: ^ElfLErro, s: ^ElfLSecao, alinha: ^u32) -> i32 {
+    let a: u64 = max(1, s.alinhamento)
+    if ((a & (a - 1)) != 0) or (a > 65536) {
+        return elf_l_falha(erro, "alinhamento de secao nao e potencia de 2 ou passa de 65536", s.off)
+    }
+    alinha^ = a as u32
+    return ELFL_OK
+}
+
+// C: nativo/obj/elf_ler.c:428
+proc elf_l_preencher_secao(c: ^ElfLConversao, s: ^ElfLSecao, idx: u32) -> i32 {
+    let sec_obj: ^ObjSecao = &c.o.secoes[idx as u64]
+    if s.tam > (4294967295 as u64) {
+        return elf_l_falha(c.erro, "secao maior que 4 GiB", s.off)
+    }
+    if s.tipo == ELFL_SHT_NOBITS {
+        sec_obj.tam_bss = s.tam as u32
+        return ELFL_OK
+    }
+    if s.tam > 0 {
+        append(&sec_obj.bytes, items = c.bytes[s.off..<(s.off + s.tam)])
+    }
+    return ELFL_OK
+}
+
+// C: nativo/obj/elf_ler.c:442
+proc elf_l_abrir_secao(c: ^ElfLConversao, k: u64) -> i32 {
+    let s: ^ElfLSecao = &c.raw.secoes[k]
+    var alinha: u32 = 1
+    if elf_l_secao_descartada(s) {
+        c.secao_obj[k] = ELFL_SECAO_DESCARTADA
+        return ELFL_OK
+    }
+    if s.tipo == ELFL_SHT_FINI_ARRAY {
+        return elf_l_falha(c.erro, "secao .fini_array ainda nao tratada pelo ligador nativo", s.off)
+    }
+    let cod: i32 = elf_l_alinhamento(c.erro, s, &alinha)
+    if cod != ELFL_OK {
+        return cod
+    }
+    c.secao_obj[k] = obj_secao_abrir(c.o, s.nome, elf_l_tipo_secao(s), alinha)
+    return elf_l_preencher_secao(c, s, c.secao_obj[k])
+}
+
+// C: nativo/obj/elf_ler.c:460
+proc elf_l_abrir_secoes(c: ^ElfLConversao) -> i32 {
+    var k: u64 = 0
+    while k < c.raw.n_secoes {
+        let cod: i32 = elf_l_abrir_secao(c, k)
+        if cod != ELFL_OK {
+            return cod
+        }
+        k += 1
+    }
+    return ELFL_OK
+}
+
+// C: nativo/obj/elf_ler.c:470
+// C2F-13: bind vira u32 (o C compara com ELFL_STB_WEAK, uint8 promovido)
+proc elf_l_marcar_fraco(o: ^Objeto, idx: u32, bind: u32) {
+    if bind == ELFL_STB_WEAK {
+        o.simbolos[idx as u64].fraco = true
+    }
+}
+
+// C: nativo/obj/elf_ler.c:477
+// C2F: nome ".secao<k>" montado com format (heap, liberado logo depois: o Objeto copia o nome no interner)
+proc elf_l_simbolo_secao(c: ^ElfLConversao, i: u64) {
+    let sec: u64 = c.raw.simbolos[i].secao as u64
+    if (sec >= c.raw.n_secoes) or (c.secao_obj[sec] == ELFL_SECAO_DESCARTADA) {
+        return
+    }
+    let nome = format(f".secao{sec}", alloc = heap)
+    defer delete(nome)
+    c.simbolo_obj[i] = obj_simbolo_definir(c.o, nome, c.secao_obj[sec] as i32, 0) as i64
+}
+
+// C: nativo/obj/elf_ler.c:487
+// C2F-13: bind vira u32
+proc elf_l_simbolo_indefinido(c: ^ElfLConversao, i: u64, bind: u32) -> i32 {
+    let s: ^ElfLSimbolo = &c.raw.simbolos[i]
+    if bind == ELFL_STB_LOCAL {
+        return elf_l_falha(c.erro, "simbolo local indefinido (o offset e o indice da symtab)", i)
+    }
+    let idx: u32 = obj_simbolo_referir(c.o, s.nome)
+    elf_l_marcar_fraco(c.o, idx, bind)
+    c.simbolo_obj[i] = idx as i64
+    return ELFL_OK
+}
+
+// C: nativo/obj/elf_ler.c:499
+proc elf_l_ja_definido(o: ^Objeto, nome: ?str) -> bool {
+    let j: i64 = obj_achar_simbolo(o, nome)
+    if j < 0 {
+        return false
+    }
+    return o.simbolos[j as u64].secao != OBJ_SECAO_INDEFINIDA
+}
+
+// C: nativo/obj/elf_ler.c:506
+// C2F: nome ".<nome>#<indice>" montado com format (heap, liberado depois; o Objeto copia no interner)
+proc elf_l_simbolo_local(c: ^ElfLConversao, i: u64, secao: u32) {
+    let s: ^ElfLSimbolo = &c.raw.simbolos[i]
+    let txt: str = s.nome or_else ""
+    let nome = format(f".{txt}#{i}", alloc = heap)
+    defer delete(nome)
+    c.simbolo_obj[i] = obj_simbolo_definir(c.o, nome, secao as i32, s.valor as u32) as i64
+}
+
+// C: nativo/obj/elf_ler.c:515
+proc elf_l_simbolo_definido(c: ^ElfLConversao, i: u64) -> i32 {
+    let s: ^ElfLSimbolo = &c.raw.simbolos[i]
+    let bind: u32 = (s.info as u32) >> 4
+    let secao: u32 = c.secao_obj[s.secao as u64]
+    if bind == ELFL_STB_LOCAL {
+        elf_l_simbolo_local(c, i, secao)
+        return ELFL_OK
+    }
+    if elf_l_ja_definido(c.o, s.nome) {
+        return elf_l_falha(c.erro, "simbolo global definido duas vezes no mesmo membro", i)
+    }
+    c.simbolo_obj[i] = obj_simbolo_definir(c.o, s.nome, secao as i32, s.valor as u32) as i64
+    elf_l_marcar_fraco(c.o, c.simbolo_obj[i] as u32, bind)
+    return ELFL_OK
+}
+
+// C: nativo/obj/elf_ler.c:531
+proc elf_l_simbolo_um(c: ^ElfLConversao, i: u64) -> i32 {
+    let s: ^ElfLSimbolo = &c.raw.simbolos[i]
+    let tipo: u32 = (s.info as u32) & 15
+    let bind: u32 = (s.info as u32) >> 4
+    if tipo == ELFL_STT_FILE {
+        return ELFL_OK
+    }
+    if tipo == ELFL_STT_SECTION {
+        elf_l_simbolo_secao(c, i)
+        return ELFL_OK
+    }
+    if (s.nome or_else "") == "" {
+        return ELFL_OK
+    }
+    if s.secao == (ELFL_SHN_UNDEF as u16) {
+        return elf_l_simbolo_indefinido(c, i, bind)
+    }
+    if (s.secao as u32) >= ELFL_SHN_LORESERVE {
+        return elf_l_falha(c.erro, "simbolo absoluto, comum ou reservado ainda nao tratado pelo ligador nativo", i)
+    }
+    if (s.secao as u64) >= c.raw.n_secoes {
+        return elf_l_falha(c.erro, "simbolo com secao fora da tabela de secoes", i)
+    }
+    if c.secao_obj[s.secao as u64] == ELFL_SECAO_DESCARTADA {
+        return ELFL_OK
+    }
+    return elf_l_simbolo_definido(c, i)
+}
+
+// C: nativo/obj/elf_ler.c:555
+proc elf_l_simbolos(c: ^ElfLConversao) -> i32 {
+    var i: u64 = 0
+    while i < c.raw.n_simbolos {
+        c.simbolo_obj[i] = ELFL_SIMBOLO_FORA as i64
+        let cod: i32 = elf_l_simbolo_um(c, i)
+        if cod != ELFL_OK {
+            return cod
+        }
+        i += 1
+    }
+    return ELFL_OK
+}
+
+// C: nativo/obj/elf_ler.c:568
+proc elf_l_tipo_neutro(tipo: u32, out: ^i32) -> bool {
+    if tipo == ELFL_R_64 {
+        out^ = OR_ADDR64
+        return true
+    } else if (tipo == ELFL_R_PC32) or (tipo == ELFL_R_PLT32) {
+        out^ = OR_REL32
+        return true
+    } else if tipo == ELFL_R_32 {
+        out^ = OR_ABS32
+        return true
+    } else if tipo == ELFL_R_32S {
+        out^ = OR_ABS32S
+        return true
+    } else if tipo == ELFL_R_GOTPCREL {
+        out^ = OR_GOTPCREL
+        return true
+    } else if (tipo == ELFL_R_GOTPCRELX) or (tipo == ELFL_R_REX_GOTPCRELX) {
+        out^ = OR_GOTPCRELX
+        return true
+    } else if tipo == ELFL_R_TPOFF32 {
+        out^ = OR_TPOFF32
+        return true
+    } else if tipo == ELFL_R_GOTTPOFF {
+        out^ = OR_GOTTPOFF
+        return true
+    }
+    return false
+}
+
+// C: nativo/obj/elf_ler.c:584
+proc elf_l_tamanho_campo(tipo: i32) -> u64 {
+    if tipo == OR_ADDR64 {
+        return 8
+    }
+    return 4
+}
+
+// C: nativo/obj/elf_ler.c:589
+proc elf_l_reloc_um(c: ^ElfLConversao, r: ^ElfLRelocacao, secao: u32) -> i32 {
+    var tipo: i32 = 0
+    let os_c: ^ObjSecao = &c.o.secoes[secao as u64]
+    var sym: i64 = ELFL_SIMBOLO_FORA as i64
+    if (r.simbolo as u64) < c.raw.n_simbolos {
+        sym = c.simbolo_obj[r.simbolo as u64]
+    }
+    if not elf_l_tipo_neutro(r.tipo, &tipo) {
+        return elf_l_reloc_fora(c.erro, r.tipo, os_c.nome)
+    }
+    if sym == (ELFL_SIMBOLO_FORA as i64) {
+        return elf_l_falha(c.erro, "relocacao contra simbolo sem equivalente no ligador (nulo, sem nome ou de secao descartada)", r.off)
+    }
+    if (r.off + elf_l_tamanho_campo(tipo)) > (len(os_c.bytes) as u64) {
+        return elf_l_falha(c.erro, "relocacao com campo fora da secao", r.off)
+    }
+    obj_relocar(c.o, ObjAlvoReloc{secao = secao, off = r.off as u32}, ObjCorrecao{tipo = tipo, simbolo = sym as u32, adendo = r.addend})
+    return ELFL_OK
+}
+
+// C: nativo/obj/elf_ler.c:605
+proc elf_l_relocs_de_secao(c: ^ElfLConversao, i: u64, k: ^u64) -> i32 {
+    let s: ^ElfLSecao = &c.raw.secoes[i]
+    let quantas: u64 = s.tam / s.entsize
+    let alvo: u32 = s.info
+    if (alvo as u64) >= c.raw.n_secoes {
+        return elf_l_falha(c.erro, "secao de relocacao aponta para secao fora da tabela", s.off)
+    }
+    if c.secao_obj[alvo as u64] == ELFL_SECAO_DESCARTADA {
+        k^ += quantas
+        return ELFL_OK
+    }
+    if s.tipo == ELFL_SHT_REL {
+        return elf_l_falha(c.erro, "secao de relocacao REL (addend no byte) ainda nao tratada pelo ligador nativo", s.off)
+    }
+    var j: u64 = 0
+    while j < quantas {
+        let cod: i32 = elf_l_reloc_um(c, &c.raw.relocacoes[k^], c.secao_obj[alvo as u64])
+        if cod != ELFL_OK {
+            return cod
+        }
+        j += 1
+        k^ += 1
+    }
+    return ELFL_OK
+}
+
+// C: nativo/obj/elf_ler.c:626
+proc elf_l_relocacoes(c: ^ElfLConversao) -> i32 {
+    var k: u64 = 0
+    var i: u64 = 0
+    while i < c.raw.n_secoes {
+        if not elf_l_eh_reloc(&c.raw.secoes[i]) {
+            i += 1
+            continue
+        }
+        let cod: i32 = elf_l_relocs_de_secao(c, i, &k)
+        if cod != ELFL_OK {
+            return cod
+        }
+        i += 1
+    }
+    return ELFL_OK
+}
+
+// C: nativo/obj/elf_ler.c:640
+proc elf_l_converter(c: ^ElfLConversao) -> i32 {
+    let cod_secoes: i32 = elf_l_abrir_secoes(c)
+    if cod_secoes != ELFL_OK {
+        return cod_secoes
+    }
+    let cod_simbolos: i32 = elf_l_simbolos(c)
+    if cod_simbolos != ELFL_OK {
+        return cod_simbolos
+    }
+    return elf_l_relocacoes(c)
+}
+
+// C: nativo/obj/elf_ler.c:650
+// C2F: o C libera o leitor cru (raw) no fim; aqui o defer elf_l_liberar(&raw) faz isso, na ordem inversa das listas de conversao
+pub proc elf_ler_objeto(bytes: ?^u8, n: u64, o: ^Objeto, erro: ^ElfLErro) -> i32 {
+    var raw = ElfLObjeto{}
+    defer elf_l_liberar(&raw)
+    let cod: i32 = elf_ler(bytes, n, &raw, erro)
+    if cod != ELFL_OK {
+        return cod
+    }
+    var c = ElfLConversao{bytes = slice_from(bytes as ^u8, len = n as int), raw = &raw, o = o, erro = erro}
+    c.secao_obj = make([dynamic]u32, alloc = heap)
+    c.simbolo_obj = make([dynamic]i64, alloc = heap)
+    defer delete(c.secao_obj)
+    defer delete(c.simbolo_obj)
+    resize(&c.secao_obj, raw.n_secoes as int)
+    resize(&c.simbolo_obj, raw.n_simbolos as int)
+    return elf_l_converter(&c)
+}
+
+// C: nativo/obj/elf_ler.c:669
+// Indefinido GLOBAL de verdade: secao 0, ligacao GLOBAL (fraco nao puxa membro, como o COFF), nome nao vazio.
+proc elf_l_eh_indefinido_global(s: ^ElfLSimbolo) -> bool {
+    let tipo: u32 = (s.info as u32) & 15
+    let bind: u32 = (s.info as u32) >> 4
+    return (s.secao == (ELFL_SHN_UNDEF as u16)) and (bind == ELFL_STB_GLOBAL) and (tipo != ELFL_STT_SECTION) and (tipo != ELFL_STT_FILE) and ((s.nome or_else "") != "")
+}
+
+// C: nativo/obj/elf_ler.c:676
+// C2F-13: bytes e o buffer inteiro; destino guarda os nomes copiados na arena do chamador (ArenaCopiarTexto)
+proc elf_listar_indefinidos(bytes: ^u8, n: u64, destino: ^ElfLDestinoNomes, erro: ^ElfLErro) -> i32 {
+    var raw = ElfLObjeto{}
+    defer elf_l_liberar(&raw)
+    var cod: i32 = elf_ler(bytes, n, &raw, erro)
+    if cod == ELFL_RELOC_FORA_DO_CENSO {
+        erro.codigo = ELFL_OK
+        cod = ELFL_OK
+    }
+    var i: u64 = 0
+    while (cod == ELFL_OK) and (i < raw.n_simbolos) {
+        if elf_l_eh_indefinido_global(&raw.simbolos[i]) {
+            let nome: str = raw.simbolos[i].nome or_else ""
+            let copia = from_bytes(as_bytes(nome)[0..<len(nome)], alloc = common.arena_mem(destino.arena as ^common.Arena))
+            append(destino.lista as ^[dynamic]str, item = copia)
+        }
+        i += 1
+    }
+    return cod
+}
+
+test "elf_lu64 le 8 bytes em little-endian" {
+    var b: [8]u8 = {1, 2, 3, 4, 5, 6, 7, 8}
+    expect(elf_lu64(b[..]) == 0x0807060504030201)
+}
+
+test "elf_lu16 e elf_lu32 le little-endian" {
+    var b: [4]u8 = {0x34, 0x12, 0x78, 0x56}
+    expect(elf_lu16(b[..]) == 0x1234)
+    expect(elf_lu32(b[..]) == 0x56781234)
+}
+
+test "elf_l_cabe recusa faixa que estoura" {
+    expect(elf_l_cabe(10, 4, 6))
+    expect(not elf_l_cabe(10, 4, 7))
+    expect(not elf_l_cabe(10, 11, 0))
+}
+
+test "elf_l_indice_censo e nome do censo" {
+    expect(elf_l_indice_censo(1) == 0)
+    expect(elf_l_indice_censo(22) == 9)
+    expect(elf_l_indice_censo(99) == ELFL_TAM_CENSO)
+    expect(elf_l_nome_reloc(9) == "R_X86_64_GOTPCREL")
+    expect(elf_l_nome_reloc(99) == "?")
+}
+
+test "elf_l_tipo_neutro e tamanho do campo" {
+    var t: i32 = -1
+    expect(elf_l_tipo_neutro(4, &t))
+    expect(t == OR_REL32)
+    expect(not elf_l_tipo_neutro(99, &t))
+    expect(elf_l_tamanho_campo(OR_ADDR64) == 8)
+    expect(elf_l_tamanho_campo(OR_ABS32) == 4)
+}
+
+test "elf_l_texto corta no NUL e recusa indice fora" {
+    var tab: [6]u8 = {97, 98, 0, 99, 0, 0}
+    var a = common.Arena{}
+    defer common.arena_liberar(&a)
+    expect((elf_l_texto(tab[..], 0, &a) or_else "x") == "ab")
+    expect((elf_l_texto(tab[..], 3, &a) or_else "x") == "c")
+    expect(elf_l_texto(tab[..], 9, &a) == none)
+}

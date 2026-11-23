@@ -1,0 +1,136 @@
+// nativo/a64/a64_isel_fluxo.fj - SALTA DESVIA RETORNA CHAMA e o despacho das ops de memoria/intrinseco (so-slots, contrato_a64 §3.1 e §4)
+// Versao: 0.4.0
+// Changelog: 0.4.0 - A4.3: CHAMA de BS_IMPORT no alvo android = GOT (adrp/ldr x16 + blr x16, relocs GOT_PAGE e LD64_GOT_LO12).
+//            0.3.0 - A1.3(iii): argumentos por posicao (A64Alocacao) com reais em v0-v7; RETORNA de real em v0.
+//            0.2.0 - A1.3(ii): RETORNA de agregado (a64_retorna_agregado) e CHAMA com retorno agregado (a64_chamar_funcao); argumento
+//                    agregado de registrador por valor (a64_carregar_argumento). CHAMA de runtime com retorno agregado = X0001.
+//            0.1.0 - A1.3(i): DESVIA sem fusao: `uxtb w9 ; cb(n)z w9,.+8 ; b alvo` (o B cobre +-128 MiB, sem relaxacao); SALTA some quando o alvo
+//                    e o proximo bloco; CHAMA de funcao por BL (CALL26) com args em x0-x7 e pilha [sp+8*(k-8)], resultado de x0; RETORNA em x0 + epilogo.
+//                    Chamada a runtime/foreign: so o intrinseco syscall (a64_intr.fj); o resto = X0001/X0003. CHAMA com retorno agregado = X0001.
+
+import "nativo/bir"
+import "nativo/obj"
+
+const A64_TAM_PREFIXO_IMP: u32 = 6 // "__imp_" do simbolo BS_IMPORT da BIR
+
+// SALTA: b alvo (omitido se for o proximo bloco)
+proc a64_isel_salta(c: ^A64Ctx, ins: ^bir.BirInstr) -> bool {
+    if ins.alvo[0] != a64_proximo_bloco(c) {
+        a64_b_bloco(c, ins.alvo[0])
+    }
+    return true
+}
+
+// DESVIA a, verdadeiro, falso: so o byte baixo de `a` vale (uxtb ; cbnz/cbz pulando o B seguinte)
+proc a64_isel_desvia(c: ^A64Ctx, ins: ^bir.BirInstr) -> bool {
+    if not a64_operando(c, R_T0, &ins.a) {
+        return false
+    }
+    a64_estender(c, R_T0, ins.a.classe, false)
+    let proximo = a64_proximo_bloco(c)
+    let verdadeiro = ins.alvo[0]
+    let falso = ins.alvo[1]
+    if verdadeiro == proximo {
+        a64_op(c, A64F_CBNZ, false, A64Ops{rd = R_T0, imm = 2})
+        a64_b_bloco(c, falso)
+        return true
+    }
+    a64_op(c, A64F_CBZ, false, A64Ops{rd = R_T0, imm = 2})
+    a64_b_bloco(c, verdadeiro)
+    if falso != proximo {
+        a64_b_bloco(c, falso)
+    }
+    return true
+}
+
+// RETORNA [a]: valor em x0 e epilogo (cada RETORNA repete o epilogo)
+proc a64_isel_retorna(c: ^A64Ctx, ins: ^bir.BirInstr) -> bool {
+    if c.f.retorno_tam != 0 {
+        return a64_retorna_agregado(c, ins)
+    }
+    if (ins.a.tipo as i32) != bir.BO_NADA {
+        if a64_classe_real(ins.a.classe) {
+            if not a64_carregar_real(c, 0, &ins.a) {
+                return false
+            }
+        } else if not a64_operando(c, 0, &ins.a) {
+            return false
+        }
+    }
+    a64_epilogo(c)
+    return true
+}
+
+// argumentos da chamada: os 8 primeiros em x0-x7, os demais em [sp + 8*(k-8)] via x9; agregado de registrador vai por valor (a64_isel_agregado.fj)
+proc a64_passar_argumentos(c: ^A64Ctx, ins: ^bir.BirInstr) -> bool {
+    let args: []bir.BirOperando = ins.args or_else {}
+    var st = A64Alocacao{}
+    for k in (0 as u32)..<ins.nargs {
+        if not a64_classe_escalar(args[k].classe) {
+            return a64_recusa(c, "argumento vetorial")
+        }
+        let pos = a64_alocar_arg(&st, a64_classe_real(args[k].classe))
+        if not a64_carregar_argumento(c, pos, &args[k]) {
+            return false
+        }
+        if pos.pilha {
+            a64_acesso(c, A64F_STR_X, R_T0, R_SP, (8 * pos.pilha_k) as i64)
+        }
+    }
+    return true
+}
+
+// foreign de lib externa (alvo android): argumentos AAPCS64 e `adrp x16,:got:S ; ldr x16,[x16,:got_lo12:S] ; blr x16` (GLOB_DAT na GOT, sem PLT)
+proc a64_chamar_import(c: ^A64Ctx, ins: ^bir.BirInstr, sim: ^bir.BirSimbolo) -> bool {
+    let nome: str = sim.nome or_else ""
+    let s: u32 = obj.obj_simbolo_referir(c.o, nome[(A64_TAM_PREFIXO_IMP as int)..<len(nome)])
+    if (not a64_passar_argumentos(c, ins)) or (not a64_preparar_retorno(c, ins)) {
+        return false
+    }
+    let off_adrp = a64_offset(c)
+    a64_palavra(c, a64_cod_adr(A64F_ADRP, 0 as i64, R_TA))
+    obj.obj_relocar(c.o, obj.ObjAlvoReloc{secao = c.texto, off = off_adrp}, obj.ObjCorrecao{tipo = obj.OR_A64_GOT_PAGE, simbolo = s, adendo = 0})
+    let off_ldr = a64_offset(c)
+    a64_op(c, A64F_LDR_X, true, A64Ops{rd = R_TA, rn = R_TA, imm = 0})
+    obj.obj_relocar(c.o, obj.ObjAlvoReloc{secao = c.texto, off = off_ldr}, obj.ObjCorrecao{tipo = obj.OR_A64_LD64_GOT_LO12, simbolo = s, adendo = 0})
+    a64_op(c, A64F_BLR, false, A64Ops{rn = R_TA})
+    return a64_recebe_retorno(c, ins)
+}
+
+// CHAMA: funcao Forja por BL (retorno agregado incluso); intrinseco por nome (a64_intr.fj); o resto recusa com a causa
+proc a64_isel_chama(c: ^A64Ctx, ins: ^bir.BirInstr) -> bool {
+    let sim: ^bir.BirSimbolo = &c.p.simbolos[ins.simbolo]
+    let tipo = sim.tipo as i32
+    if tipo == bir.BS_FUNCAO {
+        return a64_chamar_funcao(c, ins)
+    }
+    // retorno agregado vale na ponte (a64_chamar_simbolo recebe x0/x8); intrinseco e so escalar, e o resto recusa em a64_isel_intrinseco
+    if (ins.a.tam != 0) and (tipo != bir.BS_RUNTIME) {
+        return a64_recusa(c, "chamada com retorno agregado fora de funcao Forja")
+    }
+    if (tipo == bir.BS_IMPORT) and c.dinamico and (not a64_eh_syscall(sim)) {
+        return a64_chamar_import(c, ins, sim)
+    }
+    return a64_isel_intrinseco(c, ins, sim)
+}
+
+// ops que nao sao aritmetica escalar: fluxo, memoria, chamada; as demais (SELECIONA, OV, real, ...) = X0001
+proc a64_selecionar_fluxo(c: ^A64Ctx, ins: ^bir.BirInstr) -> bool {
+    let op = ins.op as i32
+    if op == bir.BIR_SALTA {
+        return a64_isel_salta(c, ins)
+    }
+    if op == bir.BIR_DESVIA {
+        return a64_isel_desvia(c, ins)
+    }
+    if op == bir.BIR_RETORNA {
+        return a64_isel_retorna(c, ins)
+    }
+    if op == bir.BIR_CHAMA {
+        return a64_isel_chama(c, ins)
+    }
+    if (op == bir.BIR_END_SLOT) or (op == bir.BIR_CARREGA) or (op == bir.BIR_GRAVA) {
+        return a64_selecionar_memoria(c, ins)
+    }
+    return a64_recusa(c, a64_nome_do_op(ins.op))
+}

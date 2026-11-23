@@ -1,0 +1,197 @@
+// nativo/x64/x64_formatar.fj - porte de compiler/nativo/x64/x64_formatar.c
+// sha256 de nativo/x64/x64_formatar.c: 77bb7933b8268d78848bd04798f611e105e35909be57c641cb95694e74c539b3
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.2.0
+// Changelog: 0.2.0 - L0b (V3/G3): anexar_operando e x64_formatar portados; anexar_memoria libera o texto de
+//                    c2f_com_sinal (heap) com defer delete. Octal ausente; %k e %0..%2 no molde como no C.
+//            0.1.0 - esqueleto c2forja com nomes e tamanho_texto.
+
+import "common"
+
+const NOMES_REG_64: [16]str = {"rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15"}
+const NOMES_REG_32: [16]str = {"eax", "ecx", "edx", "ebx", "esp", "ebp", "esi", "edi", "r8d", "r9d", "r10d", "r11d", "r12d", "r13d", "r14d", "r15d"}
+const NOMES_REG_16: [16]str = {"ax", "cx", "dx", "bx", "sp", "bp", "si", "di", "r8w", "r9w", "r10w", "r11w", "r12w", "r13w", "r14w", "r15w"}
+const NOMES_REG_8: [16]str = {"al", "cl", "dl", "bl", "spl", "bpl", "sil", "dil", "r8b", "r9b", "r10b", "r11b", "r12b", "r13b", "r14b", "r15b"}
+const NOMES_COND: [16]str = {"o", "no", "b", "ae", "e", "ne", "be", "a", "s", "ns", "p", "np", "l", "ge", "le", "g"}
+
+// C: nativo/x64/x64_formatar.c:40
+proc x64_nome_registro(reg: i32, largura: u8) -> str {
+    if common.c2f_s2u_32(reg) == (X64_RIP as u32) {
+        return "rip"
+    }
+    if common.c2f_s2u_32(reg) > (X64_R15 as u32) {
+        return "?"
+    }
+    let sw_1 = largura as i32
+    if sw_1 == 64 {
+        return NOMES_REG_64[reg]
+    } else if sw_1 == 32 {
+        return NOMES_REG_32[reg]
+    } else if sw_1 == 16 {
+        return NOMES_REG_16[reg]
+    } else if sw_1 == 8 {
+        return NOMES_REG_8[reg]
+    } else {
+        return "?"
+    }
+    return ""
+}
+
+// C: nativo/x64/x64_formatar.c:55
+proc tamanho_texto(largura: u8) -> str {
+    let sw_1 = largura as i32
+    if sw_1 == 8 {
+        return "byte "
+    } else if sw_1 == 16 {
+        return "word "
+    } else if sw_1 == 32 {
+        return "dword "
+    } else if sw_1 == 64 {
+        return "qword "
+    } else if sw_1 == 128 {
+        return "xmmword "
+    } else {
+        return ""
+    }
+    return ""
+}
+
+// C: nativo/x64/x64_formatar.c:67
+proc anexar_memoria(saida: ^[dynamic]u8, o: ^MOperando, largura: u8) {
+    append(saida, item = tamanho_texto(largura))
+    append(saida, item = "[")
+    append(saida, item = x64_nome_registro(o.base, 64))
+    if o.escala != 0 {
+        format(f"+{x64_nome_registro(o.indice, 64)}*{o.escala as u32}", into = saida)
+    }
+    if o.desloc != 0 {
+        let deslocamento = common.c2f_com_sinal(o.desloc as i64)
+        defer delete(deslocamento)
+        append(saida, item = deslocamento)
+    }
+    append(saida, item = "]")
+}
+
+// C: nativo/x64/x64_formatar.c:79 (AnexarOperando). Tipo fora dos casos do C vira "?".
+proc anexar_operando(saida: ^[dynamic]u8, mi: ^MInstr, indice: u8) {
+    let o: ^MOperando = &mi.op[indice]
+    if o.tipo == MO_REG {
+        append(saida, item = x64_nome_registro(o.base, o.largura))
+    } else if o.tipo == MO_XMM {
+        format(f"xmm{o.base as u32}", into = saida)
+    } else if o.tipo == MO_MEM {
+        let larguras: [3]u8 = FORMAS_X64[mi.forma as int].largura or_else {0, 0, 0}
+        anexar_memoria(saida, o, larguras[indice])
+    } else if o.tipo == MO_IMED {
+        format(f"{o.imed}", into = saida)
+    } else if o.tipo == MO_BLOCO {
+        format(f"b{o.imed as u64}", into = saida)
+    } else if o.tipo == MO_SIMBOLO {
+        format(f"s{o.simbolo}", into = saida)
+    } else {
+        append(saida, item = "?")
+    }
+}
+
+// C: nativo/x64/x64_formatar.c:107. Molde da FORMAS_X64: %k = sufixo da condicao, %0..%2 = operandos.
+proc x64_formatar(mi: ^MInstr, saida: ^[dynamic]u8) {
+    if (mi.forma as i32) >= FX_QTD {
+        append(saida, item = "?")
+        return
+    }
+    let molde = FORMAS_X64[mi.forma as int].molde or_else ""
+    var i: int = 0
+    while i < len(molde) {
+        let c = common.c2f_nul_em(molde, i)
+        i += 1
+        if (c != 37) or (i >= len(molde)) {
+            append(saida, item = c)
+            continue
+        }
+        let d = common.c2f_nul_em(molde, i)
+        i += 1
+        if d == 107 {
+            append(saida, item = NOMES_COND[common.c2f_e_i32(mi.cond, 15) as int])
+        } else {
+            anexar_operando(saida, mi, d - 48)
+        }
+    }
+}
+
+// Teste: MInstr sem operandos, com forma e condicao; os operandos entram depois, campo a campo.
+proc teste_formatar_instr(forma: i32, nops: u8, cond: i32) -> MInstr {
+    let zero = MOperando{tipo = MO_NADA, largura = 0, base = 0, desloc = 0, imed = 0, simbolo = 0, indice = 0, escala = 0}
+    return MInstr{forma = forma as u16, cond = cond, nops = nops, op = {zero, zero, zero}, pos = 0, bir = 0}
+}
+
+// Teste: o texto de x64_formatar bate com o texto do oraculo C (mesmo molde, mesmos operandos).
+proc teste_formatar_texto(mi: ^MInstr, esperado: str) -> bool {
+    var saida = make([dynamic]u8, alloc = heap, cap = 96)
+    defer delete(saida)
+    x64_formatar(mi, &saida)
+    if len(saida) != len(esperado) {
+        return false
+    }
+    return common.c2f_memcmp(saida[..], as_bytes(esperado)) == 0
+}
+
+test "x64_formatar: ret, mov, add negativo, memoria com base/indice/deslocamento, rip, setcc, jcc, xmm, simbolo, shufps e forma fora batem com o C" {
+    var mi = teste_formatar_instr(FX_RET, 0, 0)
+    expect(teste_formatar_texto(&mi, "ret"))
+
+    mi = teste_formatar_instr(FX_MOV64_RR, 2, 0)
+    mi.op[0] = MOperando{tipo = MO_REG, largura = 64, base = X64_RAX, desloc = 0, imed = 0, simbolo = 0, indice = 0, escala = 0}
+    mi.op[1] = MOperando{tipo = MO_REG, largura = 64, base = X64_RCX, desloc = 0, imed = 0, simbolo = 0, indice = 0, escala = 0}
+    expect(teste_formatar_texto(&mi, "mov rax, rcx"))
+
+    mi = teste_formatar_instr(FX_MOV32_RR, 2, 0)
+    mi.op[0] = MOperando{tipo = MO_REG, largura = 32, base = X64_R12, desloc = 0, imed = 0, simbolo = 0, indice = 0, escala = 0}
+    mi.op[1] = MOperando{tipo = MO_REG, largura = 32, base = X64_RSP, desloc = 0, imed = 0, simbolo = 0, indice = 0, escala = 0}
+    expect(teste_formatar_texto(&mi, "mov r12d, esp"))
+
+    mi = teste_formatar_instr(FX_ADD64_RI, 2, 0)
+    mi.op[0] = MOperando{tipo = MO_REG, largura = 64, base = X64_RAX, desloc = 0, imed = 0, simbolo = 0, indice = 0, escala = 0}
+    mi.op[1] = MOperando{tipo = MO_IMED, largura = 0, base = 0, desloc = 0, imed = -5, simbolo = 0, indice = 0, escala = 0}
+    expect(teste_formatar_texto(&mi, "add rax, -5"))
+
+    mi = teste_formatar_instr(FX_MOV64_RM, 2, 0)
+    mi.op[0] = MOperando{tipo = MO_REG, largura = 64, base = X64_RCX, desloc = 0, imed = 0, simbolo = 0, indice = 0, escala = 0}
+    mi.op[1] = MOperando{tipo = MO_MEM, largura = 64, base = X64_RBP, desloc = -8, imed = 0, simbolo = 0, indice = 0, escala = 0}
+    expect(teste_formatar_texto(&mi, "mov rcx, qword [rbp-8]"))
+
+    mi = teste_formatar_instr(FX_MOV32_RM, 2, 0)
+    mi.op[0] = MOperando{tipo = MO_REG, largura = 32, base = X64_RAX, desloc = 0, imed = 0, simbolo = 0, indice = 0, escala = 0}
+    mi.op[1] = MOperando{tipo = MO_MEM, largura = 32, base = X64_RBX, desloc = 8, imed = 0, simbolo = 0, indice = X64_RCX, escala = 4}
+    expect(teste_formatar_texto(&mi, "mov eax, dword [rbx+rcx*4+8]"))
+
+    mi = teste_formatar_instr(FX_LEA64_RM, 2, 0)
+    mi.op[0] = MOperando{tipo = MO_REG, largura = 64, base = X64_RAX, desloc = 0, imed = 0, simbolo = 0, indice = 0, escala = 0}
+    mi.op[1] = MOperando{tipo = MO_MEM, largura = 0, base = X64_RIP, desloc = 16, imed = 0, simbolo = 0, indice = 0, escala = 0}
+    expect(teste_formatar_texto(&mi, "lea rax, [rip+16]"))
+
+    mi = teste_formatar_instr(FX_SETCC8_R, 1, X64_CC_NE)
+    mi.op[0] = MOperando{tipo = MO_REG, largura = 8, base = X64_RAX, desloc = 0, imed = 0, simbolo = 0, indice = 0, escala = 0}
+    expect(teste_formatar_texto(&mi, "setne al"))
+
+    mi = teste_formatar_instr(FX_JCC_REL32, 1, X64_CC_L)
+    mi.op[0] = MOperando{tipo = MO_BLOCO, largura = 0, base = 0, desloc = 0, imed = 7, simbolo = 0, indice = 0, escala = 0}
+    expect(teste_formatar_texto(&mi, "jl b7"))
+
+    mi = teste_formatar_instr(FX_CVTSI2SD_XR64, 2, 0)
+    mi.op[0] = MOperando{tipo = MO_XMM, largura = 0, base = 3, desloc = 0, imed = 0, simbolo = 0, indice = 0, escala = 0}
+    mi.op[1] = MOperando{tipo = MO_REG, largura = 64, base = X64_R9, desloc = 0, imed = 0, simbolo = 0, indice = 0, escala = 0}
+    expect(teste_formatar_texto(&mi, "cvtsi2sd xmm3, r9"))
+
+    mi = teste_formatar_instr(FX_CALL_REL32, 1, 0)
+    mi.op[0] = MOperando{tipo = MO_SIMBOLO, largura = 0, base = 0, desloc = 0, imed = 0, simbolo = 42, indice = 0, escala = 0}
+    expect(teste_formatar_texto(&mi, "call s42"))
+
+    mi = teste_formatar_instr(FX_SHUFPS_XXI, 3, 0)
+    mi.op[0] = MOperando{tipo = MO_XMM, largura = 0, base = 1, desloc = 0, imed = 0, simbolo = 0, indice = 0, escala = 0}
+    mi.op[1] = MOperando{tipo = MO_XMM, largura = 0, base = 2, desloc = 0, imed = 0, simbolo = 0, indice = 0, escala = 0}
+    mi.op[2] = MOperando{tipo = MO_IMED, largura = 0, base = 0, desloc = 0, imed = 200, simbolo = 0, indice = 0, escala = 0}
+    expect(teste_formatar_texto(&mi, "shufps xmm1, xmm2, 200"))
+
+    mi = teste_formatar_instr(FX_QTD, 0, 0)
+    expect(teste_formatar_texto(&mi, "?"))
+}

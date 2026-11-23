@@ -1,0 +1,1130 @@
+// nativo/optimizer/sroa.fj - porte de compiler/nativo/optimizer/sroa.c, compiler/nativo/optimizer/sroa.h
+// sha256 de nativo/optimizer/sroa.c: a2490d138ec2271483a4e46a1c4f2671edbf6f74e19fb015f3c3e76d6c4be6a8
+// sha256 de nativo/optimizer/sroa.h: bf124f7f045c3ed94c12122d2866ca871bb84226a47d4e56ce8aac07db4505eb
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.2.0
+// Changelog: 0.2.0 - G3 O4: stubs completados; Vetor (rawptr) virou [dynamic] tipado; tabelas do Sroa sao donos [dynamic] (liberar_tudo);
+//            classe_vreg cresce pela arena do programa (sroa_reescrever). Comportamento do C igual.
+
+import "common"
+import "nativo/bir"
+
+struct Acesso {
+    slot: u32
+    tam: u32
+    off: i32
+    classe: u8
+}
+
+struct Copia {
+    slot_a: u32
+    slot_b: u32
+    off_a: i32
+    off_b: i32
+    n: u32
+}
+
+struct Indice {
+    ini: [dynamic]u32
+    ord: [dynamic]u32
+}
+
+struct NoGrupo {
+    pai: u32
+    tam: u32
+    prox: u32
+    cabeca: u32
+    desl: i32
+    sh: i32
+    conflito: bool
+    feito: bool
+}
+
+struct Sroa {
+    f: ^bir.BirFuncao
+    simbolos: bool
+    nvregs: u32
+    nslots: u32
+    ndefs: [dynamic]u32
+    raiz: [dynamic]SroaRaiz
+    slot: [dynamic]SroaSlot
+    acessos: [dynamic]Acesso
+    copias: [dynamic]Copia
+    por_slot: Indice
+    por_dono: Indice
+    no: [dynamic]NoGrupo
+}
+
+struct Intervalo {
+    c: i32
+    tam: u32
+    classe: u8
+}
+
+struct Conjunto {
+    v: [64]Intervalo
+    n: u32
+}
+
+const RAIZ_OFF_MAX: i32 = 16777216
+const NOME_MOTIVO_2: [10]str = {"", "escapa", "endereco_multiplo", "indice_dinamico", "classe", "sobreposicao", "tamanho", "campos", "grupo", "orcamento"}
+const TAMANHOS: [4]u8 = {8, 4, 2, 1}
+
+// C: nativo/optimizer/sroa.c:74
+proc define_vreg_4(i: ^bir.BirInstr) -> bool {
+    if i.dst == bir.BIR_SEM_VREG {
+        return false
+    }
+    return ((((((i.op != (bir.BIR_SALTA as u8)) and (i.op != (bir.BIR_DESVIA as u8))) and (i.op != (bir.BIR_RETORNA as u8))) and (i.op != (bir.BIR_ARMADILHA as u8))) and (i.op != (bir.BIR_GRAVA as u8))) and (i.op != (bir.BIR_COPIA_MEM as u8))) and (i.op != (bir.BIR_ZERA_MEM as u8))
+}
+
+// C: nativo/optimizer/sroa.c:82
+proc contar_defs_2(s: ^Sroa) {
+    var k: u32 = 0
+    while (k < s.f.nparams) and (k < s.nvregs) {
+        s.ndefs[k] += 1
+        k += 1
+    }
+    var b: u32 = 0
+    while b < s.f.nblocos {
+        var j: u32 = 0
+        while j < s.f.blocos[b].n {
+            let i: ^bir.BirInstr = &s.f.blocos[b].instrs[j]
+            if define_vreg_4(i) and (i.dst < s.nvregs) {
+                s.ndefs[i.dst] += 1
+            }
+            j += 1
+        }
+        b += 1
+    }
+}
+
+// C: nativo/optimizer/sroa.c:98
+proc raiz_de_2(s: ^Sroa, o: ^bir.BirOperando) -> ?^SroaRaiz {
+    if (o.tipo != (bir.BO_VREG as u8)) or (o.id >= s.nvregs) {
+        return none
+    }
+    if s.raiz[o.id].slot == SROA_SEM {
+        return none
+    }
+    return &s.raiz[o.id]
+}
+
+// C: nativo/optimizer/sroa.c:106
+// Soma com transbordo (wrapping_add) onde o C soma int64/int32 sem checagem: o deslocamento e comparado com o teto depois.
+proc deriva_raiz(s: ^Sroa, i: ^bir.BirInstr, r: ^SroaRaiz) -> bool {
+    let teto: i64 = RAIZ_OFF_MAX as i64
+    if i.op == (bir.BIR_END_SLOT as u8) {
+        if (i.a.tipo != (bir.BO_IMED as u8)) or (i.a.imed < 0) {
+            return false
+        }
+        if (i.a.imed as u64) >= (s.nslots as u64) {
+            return false
+        }
+        r^ = SroaRaiz{slot = i.a.imed as u32, off = 0}
+        return true
+    }
+    if (i.op != (bir.BIR_COPIA as u8)) and (i.op != (bir.BIR_ADD as u8)) {
+        return false
+    }
+    var base: ?^SroaRaiz = raiz_de_2(s, &i.a)
+    var imed: ^bir.BirOperando = &i.b
+    if (base == none) and (i.op == (bir.BIR_ADD as u8)) {
+        base = raiz_de_2(s, &i.b)
+        imed = &i.a
+    }
+    if base == none {
+        return false
+    }
+    if (i.op == (bir.BIR_ADD as u8)) and (imed.tipo != (bir.BO_IMED as u8)) {
+        return false
+    }
+    var deslocamento: i64 = 0
+    if i.op == (bir.BIR_ADD as u8) {
+        deslocamento = imed.imed
+    }
+    let total: i64 = wrapping_add((base as ^SroaRaiz).off as i64, deslocamento)
+    if (total < (0 - teto)) or (total > teto) {
+        return false
+    }
+    r^ = SroaRaiz{slot = (base as ^SroaRaiz).slot, off = total as i32}
+    return true
+}
+
+// C: nativo/optimizer/sroa.c:135
+proc raizes_do_bloco(s: ^Sroa, b: ^bir.BirBloco) -> bool {
+    var mudou: bool = false
+    var j: u32 = 0
+    while j < b.n {
+        let i: ^bir.BirInstr = &b.instrs[j]
+        j += 1
+        if not define_vreg_4(i) {
+            continue
+        }
+        if i.dst >= s.nvregs {
+            continue
+        }
+        if s.raiz[i.dst].slot != SROA_SEM {
+            continue
+        }
+        if s.ndefs[i.dst] != 1 {
+            continue
+        }
+        var r: SroaRaiz = SroaRaiz{}
+        if not deriva_raiz(s, i, &r) {
+            continue
+        }
+        s.raiz[i.dst] = r
+        mudou = true
+    }
+    return mudou
+}
+
+// C: nativo/optimizer/sroa.c:152
+// Ponto fixo: a definicao de uma raiz pode vir depois do uso na ordem dos blocos.
+proc calcular_raizes(s: ^Sroa) {
+    var mudou: bool = true
+    while mudou {
+        mudou = false
+        var b: u32 = 0
+        while b < s.f.nblocos {
+            if raizes_do_bloco(s, &s.f.blocos[b]) {
+                mudou = true
+            }
+            b += 1
+        }
+    }
+}
+
+// C: nativo/optimizer/sroa.c:165
+proc recusar_2(s: ^Sroa, slot: u32, m: i32) {
+    if s.slot[slot].motivo == (SM_OK as u8) {
+        s.slot[slot].motivo = m as u8
+    }
+}
+
+// C: nativo/optimizer/sroa.c:171
+proc escapar(s: ^Sroa, o: ^bir.BirOperando) {
+    let r: ?^SroaRaiz = raiz_de_2(s, o)
+    if r != none {
+        recusar_2(s, (r as ^SroaRaiz).slot, SM_ESCAPA)
+    }
+}
+
+// C: nativo/optimizer/sroa.c:179
+proc bytes_da_classe(classe: u8) -> u32 {
+    let sw_1 = classe as i32
+    if sw_1 == bir.BC_I8 {
+        return 1
+    } else if sw_1 == bir.BC_I16 {
+        return 2
+    } else if sw_1 == bir.BC_I32 or sw_1 == bir.BC_F32 {
+        return 4
+    } else {
+        return 8
+    }
+    return 0
+}
+
+// C: nativo/optimizer/sroa.c:190
+// [desloc, desloc+n) a partir da raiz cabe no slot? Senao recusa por tamanho.
+proc dentro_do_slot(s: ^Sroa, r: ^SroaRaiz, desloc: i64, n: u32) -> bool {
+    let off: i64 = (r.off as i64) + desloc
+    if (off >= 0) and ((off + (n as i64)) <= (s.f.slots[r.slot].tam as i64)) {
+        return true
+    }
+    recusar_2(s, r.slot, SM_TAMANHO)
+    return false
+}
+
+// C: nativo/optimizer/sroa.c:201
+proc acessar(s: ^Sroa, i: ^bir.BirInstr) {
+    let r: ?^SroaRaiz = raiz_de_2(s, &i.a)
+    if r == none {
+        return
+    }
+    let rr: ^SroaRaiz = r as ^SroaRaiz
+    if i.classe == (bir.BC_V128 as u8) {
+        recusar_2(s, rr.slot, SM_CLASSE)
+        return
+    }
+    let n: u32 = bytes_da_classe(i.classe)
+    if s.slot[rr.slot].motivo != (SM_OK as u8) {
+        return
+    }
+    if not dentro_do_slot(s, rr, i.desloc as i64, n) {
+        return
+    }
+    append(&s.acessos, item = Acesso{slot = rr.slot, off = wrapping_add(rr.off, i.desloc), tam = n, classe = i.classe})
+}
+
+// C: nativo/optimizer/sroa.c:217
+proc guardar_copia(s: ^Sroa, ra: ?^SroaRaiz, rb: ?^SroaRaiz, n: u32) {
+    var slot_a: u32 = SROA_SEM
+    var off_a: i32 = 0
+    var slot_b: u32 = SROA_SEM
+    var off_b: i32 = 0
+    if ra != none {
+        slot_a = (ra as ^SroaRaiz).slot
+        off_a = (ra as ^SroaRaiz).off
+    }
+    if rb != none {
+        slot_b = (rb as ^SroaRaiz).slot
+        off_b = (rb as ^SroaRaiz).off
+    }
+    append(&s.copias, item = Copia{slot_a = slot_a, slot_b = slot_b, off_a = off_a, off_b = off_b, n = n})
+}
+
+// C: nativo/optimizer/sroa.c:226
+// COPIA_MEM e ZERA_MEM: uma faixa que o particionamento precisa cobrir. Copia dentro do mesmo slot recusa.
+// As duas checagens de tamanho rodam antes do teste de sobreposicao, como no C (a 1a recusa vence).
+proc registrar_copia_2(s: ^Sroa, i: ^bir.BirInstr) {
+    let ra: ?^SroaRaiz = raiz_de_2(s, &i.a)
+    var rb: ?^SroaRaiz = none
+    if i.op == (bir.BIR_COPIA_MEM as u8) {
+        rb = raiz_de_2(s, &i.b)
+    }
+    let n: u32 = common.c2f_s2u_32(i.desloc)
+    var ok_a: bool = true
+    var ok_b: bool = true
+    if ra != none {
+        ok_a = dentro_do_slot(s, ra as ^SroaRaiz, 0, n)
+    }
+    if rb != none {
+        ok_b = dentro_do_slot(s, rb as ^SroaRaiz, 0, n)
+    }
+    if (ra == none) and (rb == none) {
+        return
+    }
+    if (ra != none) and (rb != none) and ((ra as ^SroaRaiz).slot == (rb as ^SroaRaiz).slot) {
+        recusar_2(s, (ra as ^SroaRaiz).slot, SM_SOBREPOSICAO)
+        return
+    }
+    if ok_a and ok_b {
+        guardar_copia(s, ra, rb, n)
+    }
+}
+
+// C: nativo/optimizer/sroa.c:242
+// COPIA ou ADD cujo operando e raiz: derivacao reconhecida (dst ja e raiz) ou escape/endereco multiplo/indice dinamico.
+proc classificar_derivacao(s: ^Sroa, i: ^bir.BirInstr) {
+    let ra: ?^SroaRaiz = raiz_de_2(s, &i.a)
+    var rb: ?^SroaRaiz = none
+    if i.op == (bir.BIR_ADD as u8) {
+        rb = raiz_de_2(s, &i.b)
+    }
+    var r: ?^SroaRaiz = rb
+    var outro: ^bir.BirOperando = &i.a
+    if ra != none {
+        r = ra
+        outro = &i.b
+    }
+    if r == none {
+        return
+    }
+    let rr: ^SroaRaiz = r as ^SroaRaiz
+    let multiplo: bool = (i.dst < s.nvregs) and (s.ndefs[i.dst] != 1)
+    if (ra != none) and (rb != none) {
+        recusar_2(s, (ra as ^SroaRaiz).slot, SM_ESCAPA)
+        recusar_2(s, (rb as ^SroaRaiz).slot, SM_ESCAPA)
+    } else if (i.op == (bir.BIR_ADD as u8)) and (outro.tipo == (bir.BO_VREG as u8)) {
+        recusar_2(s, rr.slot, SM_INDICE_DINAMICO)
+    } else if (i.op == (bir.BIR_ADD as u8)) and (outro.tipo != (bir.BO_IMED as u8)) {
+        recusar_2(s, rr.slot, SM_ESCAPA)
+    } else if (i.dst >= s.nvregs) or (s.raiz[i.dst].slot == SROA_SEM) {
+        var motivo: i32 = SM_ESCAPA
+        if multiplo {
+            motivo = SM_ENDERECO_MULTIPLO
+        }
+        recusar_2(s, rr.slot, motivo)
+    }
+}
+
+// C: nativo/optimizer/sroa.c:262
+proc classificar_instr(s: ^Sroa, i: ^bir.BirInstr) {
+    let sw_1 = i.op as i32
+    if sw_1 == bir.BIR_CARREGA {
+        acessar(s, i)
+        return
+    } else if sw_1 == bir.BIR_GRAVA {
+        acessar(s, i)
+        escapar(s, &i.b)
+        return
+    } else if sw_1 == bir.BIR_ZERA_MEM or sw_1 == bir.BIR_COPIA_MEM {
+        registrar_copia_2(s, i)
+        return
+    } else if sw_1 == bir.BIR_END_SLOT {
+        if (i.dst >= s.nvregs) or (s.ndefs[i.dst] != 1) {
+            recusar_2(s, common.c2f_trunc_u32(common.c2f_s2u_64(i.a.imed)), SM_ENDERECO_MULTIPLO)
+        }
+        return
+    } else if sw_1 == bir.BIR_COPIA or sw_1 == bir.BIR_ADD {
+        classificar_derivacao(s, i)
+        return
+    } else {
+        escapar(s, &i.a)
+        escapar(s, &i.b)
+        for m in (0 as u32)..<i.nargs {
+            escapar(s, &(i.args or_else {})[m])
+        }
+    }
+}
+
+// C: nativo/optimizer/sroa.c:290
+proc classificar_2(s: ^Sroa) {
+    var b: u32 = 0
+    while b < s.f.nblocos {
+        for j in (0 as u32)..<s.f.blocos[b].n {
+            classificar_instr(s, &s.f.blocos[b].instrs[j])
+        }
+        b += 1
+    }
+}
+
+// C: nativo/optimizer/sroa.c:300
+proc achar(s: ^Sroa, k: u32, desl: ^i32) -> u32 {
+    var k_v: u32 = k
+    var d: i32 = 0
+    while s.no[k_v].pai != k_v {
+        d += s.no[k_v].desl
+        k_v = s.no[k_v].pai
+    }
+    desl^ = d
+    return k_v
+}
+
+// C: nativo/optimizer/sroa.c:312
+proc vivo(s: ^Sroa, slot: u32) -> bool {
+    if slot == SROA_SEM {
+        return false
+    }
+    return s.slot[slot].motivo == (SM_OK as u8)
+}
+
+// C: nativo/optimizer/sroa.c:318
+// Une os dois lados da copia: o byte x do slot a e o byte x + off_b - off_a do slot b tem a mesma coordenada canonica.
+// Ciclo inconsistente marca conflito (recusa o grupo).
+proc unir(s: ^Sroa, c: ^Copia) {
+    var da: i32 = 0
+    var db: i32 = 0
+    var ra: u32 = achar(s, c.slot_a, &da)
+    var rb: u32 = achar(s, c.slot_b, &db)
+    var t: i32 = ((da - db) + c.off_a) - c.off_b
+    if ra == rb {
+        if t != 0 {
+            s.no[ra].conflito = true
+        }
+        return
+    }
+    if s.no[ra].tam < s.no[rb].tam {
+        let menor: u32 = ra
+        ra = rb
+        rb = menor
+        t = -t
+    }
+    s.no[rb].pai = ra
+    s.no[rb].desl = t
+    s.no[ra].tam += s.no[rb].tam
+    s.no[ra].conflito = s.no[ra].conflito or s.no[rb].conflito
+}
+
+// C: nativo/optimizer/sroa.c:342
+proc unir_copias(s: ^Sroa) {
+    var k: u32 = 0
+    while k < s.nslots {
+        s.no[k] = NoGrupo{pai = k, tam = 1, prox = SROA_SEM, cabeca = SROA_SEM}
+        k += 1
+    }
+    var x: u32 = 0
+    while x < (len(s.copias) as u32) {
+        var c: Copia = s.copias[x]
+        if vivo(s, c.slot_a) and vivo(s, c.slot_b) {
+            unir(s, &c)
+        }
+        x += 1
+    }
+    var y: u32 = s.nslots
+    while y > 0 {
+        y -= 1
+        if s.slot[y].motivo != (SM_OK as u8) {
+            continue
+        }
+        var sh: i32 = 0
+        let r: u32 = achar(s, y, &sh)
+        s.no[y].sh = sh
+        s.no[y].prox = s.no[r].cabeca
+        s.no[r].cabeca = y
+    }
+}
+
+// C: nativo/optimizer/sroa.c:366
+// Ordenacao por contagem: ini[k]..ini[k+1] sao os itens de chave k em ord; chave == nslots descarta o item.
+proc agrupar(x: ^Indice, chave: []u32, n: u32, nslots: u32) {
+    var cur = make([dynamic]u32, alloc = heap, cap = (nslots as int) + 1)
+    defer delete(cur)
+    x.ini = make([dynamic]u32, alloc = heap, cap = (nslots as int) + 2)
+    x.ord = make([dynamic]u32, alloc = heap, cap = (n as int) + 1)
+    var k: u32 = 0
+    while k < nslots + 2 {
+        append(&x.ini, item = 0)
+        k += 1
+    }
+    k = 0
+    while k < n {
+        append(&x.ord, item = 0)
+        k += 1
+    }
+    k = 0
+    while k < n {
+        x.ini[chave[k] + 1] += 1
+        k += 1
+    }
+    k = 0
+    while k <= nslots {
+        x.ini[k + 1] += x.ini[k]
+        k += 1
+    }
+    k = 0
+    while k <= nslots {
+        append(&cur, item = x.ini[k])
+        k += 1
+    }
+    k = 0
+    while k < n {
+        let c: u32 = chave[k]
+        x.ord[cur[c]] = k
+        cur[c] += 1
+        k += 1
+    }
+}
+
+// C: nativo/optimizer/sroa.c:382
+proc indexar_acessos_e_copias(s: ^Sroa) {
+    let na: u32 = len(s.acessos) as u32
+    let nc: u32 = len(s.copias) as u32
+    var total: u32 = na
+    if nc > total {
+        total = nc
+    }
+    var chave = make([dynamic]u32, alloc = heap, cap = (total as int) + 1)
+    defer delete(chave)
+    var k: u32 = 0
+    while k < total {
+        append(&chave, item = 0)
+        k += 1
+    }
+    k = 0
+    while k < na {
+        chave[k] = s.acessos[k].slot
+        k += 1
+    }
+    agrupar(&s.por_slot, chave[..], na, s.nslots)
+    k = 0
+    while k < nc {
+        let c: Copia = s.copias[k]
+        if vivo(s, c.slot_a) {
+            chave[k] = c.slot_a
+        } else if vivo(s, c.slot_b) {
+            chave[k] = c.slot_b
+        } else {
+            chave[k] = s.nslots
+        }
+        k += 1
+    }
+    agrupar(&s.por_dono, chave[..], nc, s.nslots)
+}
+
+// C: nativo/optimizer/sroa.c:403
+proc primeiro_nao_menor(k: ^Conjunto, c: i32) -> u32 {
+    var i: u32 = 0
+    while (i < k.n) and (k.v[i].c < c) {
+        i += 1
+    }
+    return i
+}
+
+// C: nativo/optimizer/sroa.c:412
+proc inserir_intervalo(k: ^Conjunto, novo: Intervalo) -> i32 {
+    let i: u32 = primeiro_nao_menor(k, novo.c)
+    if (i > 0) and ((k.v[i - 1].c + transmute(k.v[i - 1].tam, to = i32)) > novo.c) {
+        return SM_SOBREPOSICAO
+    }
+    if (i < k.n) and (k.v[i].c == novo.c) {
+        if k.v[i].tam != novo.tam {
+            return SM_SOBREPOSICAO
+        }
+        if k.v[i].classe == novo.classe {
+            return SM_OK
+        }
+        return SM_CLASSE
+    }
+    if (i < k.n) and (k.v[i].c < (novo.c + transmute(novo.tam, to = i32))) {
+        return SM_SOBREPOSICAO
+    }
+    if k.n == SROA_CAMPOS_GRUPO {
+        return SM_CAMPOS
+    }
+    var j: u32 = k.n
+    while j > i {
+        k.v[j] = k.v[j - 1]
+        j -= 1
+    }
+    k.v[i] = novo
+    k.n += 1
+    return SM_OK
+}
+
+// C: nativo/optimizer/sroa.c:434
+// Maior pedaco natural (8, 4, 2, 1) alinhado em pos que cabe em resto bytes. O C testa so 8, 4 e 2; 1 e o fallback.
+proc tamanho_natural(pos: i32, resto: u32) -> u32 {
+    var k: u32 = 0
+    while k < 3 {
+        let t: u32 = TAMANHOS[k] as u32
+        if (resto >= t) and ((pos % (t as i32)) == 0) {
+            return t
+        }
+        k += 1
+    }
+    return 1
+}
+
+// C: nativo/optimizer/sroa.c:447
+proc classe_natural(tam: u32) -> u8 {
+    if tam == 8 {
+        return bir.BC_I64 as u8
+    }
+    if tam == 4 {
+        return bir.BC_I32 as u8
+    }
+    if tam == 2 {
+        return bir.BC_I16 as u8
+    }
+    return bir.BC_I8 as u8
+}
+
+// C: nativo/optimizer/sroa.c:452
+proc preencher_buraco(k: ^Conjunto, pos: ^i32, limite: i32) -> i32 {
+    while pos^ < limite {
+        let t: u32 = tamanho_natural(pos^, common.c2f_s2u_32(limite - pos^))
+        let m: i32 = inserir_intervalo(k, Intervalo{c = pos^, tam = t, classe = classe_natural(t)})
+        if m != SM_OK {
+            return m
+        }
+        pos^ += transmute(t, to = i32)
+    }
+    return SM_OK
+}
+
+// C: nativo/optimizer/sroa.c:466
+// A faixa [lo, lo+n) tem de ser coberta exatamente por intervalos: os que ja existem e pedacos naturais nos buracos.
+proc preencher_faixa(k: ^Conjunto, lo: i32, n: u32) -> i32 {
+    var pos: i32 = lo
+    let fim: i32 = lo + transmute(n, to = i32)
+    while pos < fim {
+        let i: u32 = primeiro_nao_menor(k, pos)
+        if (i > 0) and ((k.v[i - 1].c + transmute(k.v[i - 1].tam, to = i32)) > pos) {
+            return SM_SOBREPOSICAO
+        }
+        if (i < k.n) and (k.v[i].c == pos) {
+            pos += transmute(k.v[i].tam, to = i32)
+            if pos > fim {
+                return SM_SOBREPOSICAO
+            }
+            continue
+        }
+        var limite: i32 = fim
+        if (i < k.n) and (k.v[i].c < fim) {
+            limite = k.v[i].c
+        }
+        let m: i32 = preencher_buraco(k, &pos, limite)
+        if m != SM_OK {
+            return m
+        }
+    }
+    return SM_OK
+}
+
+// C: nativo/optimizer/sroa.c:489
+proc inserir_acessos_do_slot(s: ^Sroa, k: ^Conjunto, slot: u32) -> i32 {
+    var x: u32 = s.por_slot.ini[slot]
+    while x < s.por_slot.ini[slot + 1] {
+        let a: Acesso = s.acessos[s.por_slot.ord[x]]
+        let m: i32 = inserir_intervalo(k, Intervalo{c = wrapping_add(a.off, s.no[slot].sh), tam = a.tam, classe = a.classe})
+        if m != SM_OK {
+            return m
+        }
+        x += 1
+    }
+    return SM_OK
+}
+
+// C: nativo/optimizer/sroa.c:501
+proc preencher_copias_do_slot(s: ^Sroa, k: ^Conjunto, slot: u32) -> i32 {
+    var x: u32 = s.por_dono.ini[slot]
+    while x < s.por_dono.ini[slot + 1] {
+        let c: Copia = s.copias[s.por_dono.ord[x]]
+        var base: i32 = c.off_b
+        if c.slot_a == slot {
+            base = c.off_a
+        }
+        let m: i32 = preencher_faixa(k, wrapping_add(base, s.no[slot].sh), c.n)
+        if m != SM_OK {
+            return m
+        }
+        x += 1
+    }
+    return SM_OK
+}
+
+// C: nativo/optimizer/sroa.c:514
+// Os intervalos do grupo que cabem inteiros no slot viram os campos dele (offset em bytes do slot).
+proc montar_campos(s: ^Sroa, k: ^Conjunto, slot: u32) -> i32 {
+    let ini: i32 = s.no[slot].sh
+    let fim: i32 = wrapping_add(ini, transmute(s.f.slots[slot].tam, to = i32))
+    s.slot[slot].nf = 0
+    var x: u32 = 0
+    while x < k.n {
+        let v: Intervalo = k.v[x]
+        x += 1
+        if (v.c < ini) or ((v.c + transmute(v.tam, to = i32)) > fim) {
+            continue
+        }
+        if s.slot[slot].nf == (ORC_SROA_CAMPOS_SLOT as u8) {
+            return SM_CAMPOS
+        }
+        let antes: u8 = s.slot[slot].nf
+        s.slot[slot].nf += 1
+        s.slot[slot].campo[antes] = SroaCampo{off = v.c - ini, tam = v.tam, classe = v.classe}
+    }
+    return SM_OK
+}
+
+// C: nativo/optimizer/sroa.c:533
+// Decide o grupo de cabeca `cabeca` (raiz `raiz`): particao comum, depois os campos de cada membro.
+proc decidir_grupo(s: ^Sroa, raiz: u32, cabeca: u32) -> i32 {
+    var k: Conjunto = Conjunto{n = 0}
+    var m: i32 = SM_OK
+    if s.no[raiz].conflito {
+        m = SM_GRUPO
+    }
+    var x: u32 = cabeca
+    while (x != SROA_SEM) and (m == SM_OK) {
+        m = inserir_acessos_do_slot(s, &k, x)
+        x = s.no[x].prox
+    }
+    x = cabeca
+    while (x != SROA_SEM) and (m == SM_OK) {
+        m = preencher_copias_do_slot(s, &k, x)
+        x = s.no[x].prox
+    }
+    x = cabeca
+    while (x != SROA_SEM) and (m == SM_OK) {
+        m = montar_campos(s, &k, x)
+        x = s.no[x].prox
+    }
+    return m
+}
+
+// C: nativo/optimizer/sroa.c:548
+// Numera os vregs dos campos do grupo a partir de *usado (nvregs + *usado); false se estoura o orcamento da funcao.
+proc numerar_grupo(s: ^Sroa, cabeca: u32, usado: ^u32) -> bool {
+    var total: u32 = 0
+    var x: u32 = cabeca
+    while x != SROA_SEM {
+        total += (s.slot[x].nf as u32)
+        x = s.no[x].prox
+    }
+    if (usado^ + total) > ORC_SROA_VREGS_FUNCAO {
+        return false
+    }
+    x = cabeca
+    while x != SROA_SEM {
+        var m: u32 = 0
+        while m < (s.slot[x].nf as u32) {
+            s.slot[x].campo[m].vreg = s.nvregs + usado^
+            usado^ += 1
+            m += 1
+        }
+        x = s.no[x].prox
+    }
+    return true
+}
+
+// C: nativo/optimizer/sroa.c:563
+proc recusar_grupo(s: ^Sroa, cabeca: u32, m: i32) {
+    var x: u32 = cabeca
+    while x != SROA_SEM {
+        s.slot[x].motivo = m as u8
+        s.slot[x].nf = 0
+        x = s.no[x].prox
+    }
+}
+
+// C: nativo/optimizer/sroa.c:572
+// Decide todos os grupos na ordem do menor slot de cada um. Devolve os vregs novos.
+proc decidir_grupos(s: ^Sroa) -> u32 {
+    var usado: u32 = 0
+    var k: u32 = 0
+    while k < s.nslots {
+        if s.slot[k].motivo == (SM_OK as u8) {
+            var sh: i32 = 0
+            let r: u32 = achar(s, k, &sh)
+            if not s.no[r].feito {
+                s.no[r].feito = true
+                var m: i32 = decidir_grupo(s, r, s.no[r].cabeca)
+                if (m == SM_OK) and (not numerar_grupo(s, s.no[r].cabeca, &usado)) {
+                    m = SM_ORCAMENTO
+                }
+                if m != SM_OK {
+                    recusar_grupo(s, s.no[r].cabeca, m)
+                }
+            }
+        }
+        k += 1
+    }
+    return usado
+}
+
+// C: nativo/optimizer/sroa.c:599
+// Aresta para o bloco 0? Entao o CONST 0 de entrada rodaria a cada volta: a funcao nao e tocada.
+proc bloco0_tem_predecessor(f: ^bir.BirFuncao) -> bool {
+    var b: u32 = 0
+    while b < f.nblocos {
+        var j: u32 = 0
+        while j < f.blocos[b].n {
+            let i: ^bir.BirInstr = &f.blocos[b].instrs[j]
+            let desvio: bool = (i.op == (bir.BIR_DESVIA as u8)) and (i.alvo[1] == 0)
+            let alvo0: bool = (((i.op == (bir.BIR_SALTA as u8)) or (i.op == (bir.BIR_DESVIA as u8))) or (((i.op as i32) >= bir.BIR_ADD_OV) and ((i.op as i32) <= bir.BIR_NEG_OV))) and (i.alvo[0] == 0)
+            if desvio or alvo0 {
+                return true
+            }
+            j += 1
+        }
+        b += 1
+    }
+    return false
+}
+
+// C: nativo/optimizer/sroa.c:615
+// Campo vivo na entrada do bloco 0 e lido antes de escrito: o vreg ganha CONST 0 no inicio do bloco 0.
+// Bloco 0 sem instrucao nao ocorre no BIR valido (todo bloco termina em terminador); o C leria lixo, a Forja para em R0006.
+proc zerar_campos_vivos_na_entrada(f: ^bir.BirFuncao, info: []SroaSlot) {
+    var an: bir.AnalisesBir = bir.AnalisesBir{}
+    var vregs: [256]u32 = {}
+    var classes: [256]u8 = {}
+    var n: u32 = 0
+    bir.analises_calcular(f, &an)
+    var k: u32 = 0
+    while k < f.nslots {
+        var m: u32 = 0
+        while (info[k].motivo == (SM_OK as u8)) and (m < (info[k].nf as u32)) {
+            let campo: SroaCampo = info[k].campo[m]
+            if bir.analises_vivo_entra(&an, 0, campo.vreg) {
+                vregs[n] = campo.vreg
+                classes[n] = campo.classe
+                n += 1
+            }
+            m += 1
+        }
+        k += 1
+    }
+    bir.analises_liberar(&an)
+    if n == 0 {
+        return
+    }
+    let b0: ^bir.BirBloco = &f.blocos[0]
+    let modelo: bir.BirInstr = b0.instrs[0]
+    var velhos: u32 = b0.n
+    k = 0
+    while k < n {
+        append(&b0.instrs, item = modelo)
+        k += 1
+    }
+    while velhos > 0 {
+        velhos -= 1
+        b0.instrs[velhos + n] = b0.instrs[velhos]
+    }
+    k = 0
+    while k < n {
+        b0.instrs[k] = bir.BirInstr{op = bir.BIR_CONST as u8, classe = classes[k], dst = vregs[k], a = bir.BirOperando{tipo = bir.BO_IMED as u8, classe = classes[k]}, simbolo = bir.BIR_SEM_SIMBOLO, alvo = {bir.BIR_SEM_BLOCO, bir.BIR_SEM_BLOCO}, pos = modelo.pos, ir = modelo.ir}
+        k += 1
+    }
+    b0.n += n
+    b0.cap = (cap(b0.instrs) as u64) as u32
+}
+
+// C: nativo/optimizer/sroa.c:650
+// Slots que nem entram na conta: de depuracao (--simbolos) e maiores que o limite. Devolve quantos ficam candidatos.
+proc filtrar_slots(s: ^Sroa, f: ^bir.BirFuncao) -> u32 {
+    var n: u32 = 0
+    var k: u32 = 0
+    while k < s.nslots {
+        var motivo_inicial: i32 = SM_OK
+        if f.slots[k].tam > (ORC_SROA_SLOT_BYTES) {
+            motivo_inicial = SM_TAMANHO
+        }
+        s.slot[k].motivo = motivo_inicial as u8
+        if s.slot[k].motivo == (SM_OK as u8) {
+            n += 1
+        }
+        k += 1
+    }
+    var k_2: u32 = 0
+    while s.simbolos and (k_2 < f.ncasas) {
+        let casa_slot_i: i32 = (f.casas or_else {})[k_2].slot
+        if (casa_slot_i >= 0) and (common.c2f_s2u_32(casa_slot_i) < s.nslots) {
+            let casa_slot: u32 = casa_slot_i as u32
+            if s.slot[casa_slot].motivo == (SM_OK as u8) {
+                n -= 1
+            }
+            s.slot[casa_slot].motivo = SM_PULADO as u8
+        }
+        k_2 += 1
+    }
+    return n
+}
+
+// C: nativo/optimizer/sroa.c:667
+// Relato: nome nulo sai "(null)" (como o glibc no %s do C); a Forja nao tem NULL no texto do simbolo.
+proc relatar_2(p: ^bir.BirPrograma, f: ^bir.BirFuncao, info: []SroaSlot, relato: ^[dynamic]u8) {
+    let nome: ?str = p.simbolos[f.simbolo].nome
+    var k: u32 = 0
+    while k < f.nslots {
+        if info[k].motivo == (SM_PULADO as u8) {
+            k += 1
+            continue
+        }
+        if info[k].motivo == (SM_OK as u8) {
+            let txt_1 = nome or_else "(null)"
+            format(f"sroa {txt_1} k{k}: {f.slots[k].tam} B, {info[k].nf as u32} campos\n", into = relato)
+        } else {
+            let txt_2 = nome or_else "(null)"
+            format(f"sroa recusa {txt_2} k{k}: {NOME_MOTIVO_2[info[k].motivo]}\n", into = relato)
+        }
+        k += 1
+    }
+}
+
+// C: nativo/optimizer/sroa.c:681
+// Libera as tabelas do Sroa (donos). Seguro tambem sem nenhuma alocacao feita (campos vazios).
+proc liberar_tudo(s: ^Sroa) {
+    delete(s.ndefs)
+    delete(s.raiz)
+    delete(s.slot)
+    delete(s.acessos)
+    delete(s.copias)
+    delete(s.por_slot.ini)
+    delete(s.por_slot.ord)
+    delete(s.por_dono.ini)
+    delete(s.por_dono.ord)
+    delete(s.no)
+}
+
+// C: nativo/optimizer/sroa.c (SroaFuncao, slot): tabela de slots, um SroaSlot zerado por slot da funcao.
+proc alocar_slots(s: ^Sroa) {
+    s.slot = make([dynamic]SroaSlot, alloc = heap, cap = (s.nslots as int) + 1)
+    var k: u32 = 0
+    while k < s.nslots {
+        append(&s.slot, item = SroaSlot{})
+        k += 1
+    }
+}
+
+// C: nativo/optimizer/sroa.c (DecidirFuncao, tabelas): ndefs, raiz (SEM), no, acessos e copias.
+proc alocar_tabelas(s: ^Sroa) {
+    s.ndefs = make([dynamic]u32, alloc = heap, cap = (s.nvregs as int) + 1)
+    s.raiz = make([dynamic]SroaRaiz, alloc = heap, cap = (s.nvregs as int) + 1)
+    s.no = make([dynamic]NoGrupo, alloc = heap, cap = (s.nslots as int) + 1)
+    s.acessos = make([dynamic]Acesso, alloc = heap, cap = 16)
+    s.copias = make([dynamic]Copia, alloc = heap, cap = 16)
+    var k: u32 = 0
+    while k < s.nvregs {
+        append(&s.ndefs, item = 0)
+        append(&s.raiz, item = SroaRaiz{slot = SROA_SEM})
+        k += 1
+    }
+    k = 0
+    while k < s.nslots {
+        append(&s.no, item = NoGrupo{})
+        k += 1
+    }
+}
+
+// C: nativo/optimizer/sroa.c:695
+// Filtro, fatos e decisao de uma funcao (s->slot ja alocado); nao toca na BIR. true se algum slot fica SM_OK (escalariza); *usado = vregs novos que a reescrita pede.
+proc decidir_funcao(s: ^Sroa, usado: ^u32) -> bool {
+    var candidatos: u32 = filtrar_slots(s, s.f)
+    usado^ = 0
+    if (candidatos > 0) and bloco0_tem_predecessor(s.f) {
+        var k: u32 = 0
+        while k < s.nslots {
+            if s.slot[k].motivo == (SM_OK as u8) {
+                s.slot[k].motivo = SM_ORCAMENTO as u8
+            }
+            k += 1
+        }
+        candidatos = 0
+    }
+    if candidatos == 0 {
+        return false
+    }
+    alocar_tabelas(s)
+    contar_defs_2(s)
+    calcular_raizes(s)
+    classificar_2(s)
+    unir_copias(s)
+    indexar_acessos_e_copias(s)
+    usado^ = decidir_grupos(s)
+    var y: u32 = 0
+    while y < s.nslots {
+        if s.slot[y].motivo == (SM_OK as u8) {
+            return true
+        }
+        y += 1
+    }
+    return false
+}
+
+// C: nativo/optimizer/sroa.c:724
+proc funcao_elegivel(f: ^bir.BirFuncao) -> bool {
+    return ((f.nslots != 0) and (f.nblocos != 0)) and (not f.sintetica)
+}
+
+// C: nativo/optimizer/sroa.c:729
+proc sroa_funcao(p: ^bir.BirPrograma, f: ^bir.BirFuncao, relato: ^[dynamic]u8) {
+    if not funcao_elegivel(f) {
+        return
+    }
+    var s = Sroa{f = f, simbolos = p.simbolos_dbg, nvregs = f.nvregs, nslots = f.nslots}
+    alocar_slots(&s)
+    var usado: u32 = 0
+    if decidir_funcao(&s, &usado) {
+        var plano: SroaPlano = SroaPlano{info = s.slot[..], raiz = s.raiz[..], nvregs_antigo = s.nvregs, nvregs_novo = s.nvregs + usado}
+        sroa_reescrever(f, &plano, &p.arena)
+        zerar_campos_vivos_na_entrada(f, s.slot[..])
+    }
+    relatar_2(p, f, s.slot[..], relato)
+    liberar_tudo(&s)
+}
+
+// C: nativo/optimizer/sroa.c:747
+// So a decisao, sem tocar na BIR. escalariza[k] (f.nslots posicoes, do chamador) = o sroa escalarizaria o slot k de f agora.
+// Funcao que o sroa nao olha: escalariza fica como esta (o chamador zera).
+proc otim_sroa_veredito(p: ^bir.BirPrograma, f: ^bir.BirFuncao, escalariza: []bool) {
+    if not funcao_elegivel(f) {
+        return
+    }
+    var s = Sroa{f = f, simbolos = p.simbolos_dbg, nvregs = f.nvregs, nslots = f.nslots}
+    alocar_slots(&s)
+    var usado: u32 = 0
+    _ = decidir_funcao(&s, &usado)
+    var k: u32 = 0
+    while k < f.nslots {
+        escalariza[k] = s.slot[k].motivo == (SM_OK as u8)
+        k += 1
+    }
+    liberar_tudo(&s)
+}
+
+// C: nativo/optimizer/sroa.c:762
+proc otim_sroa_aplicar(programa: ^bir.BirPrograma, relato: ^[dynamic]u8) {
+    var i: u32 = 0
+    while i < programa.nfuncoes {
+        sroa_funcao(programa, &(programa.funcoes or_else {})[i], relato)
+        i += 1
+    }
+}
+
+test "sroa_tamanho_natural_e_classe" {
+    expect(tamanho_natural(0, 8) == 8)
+    expect(tamanho_natural(4, 8) == 4)
+    expect(tamanho_natural(2, 8) == 2)
+    expect(tamanho_natural(1, 8) == 1)
+    expect(tamanho_natural(0, 3) == 2)
+    expect(tamanho_natural(-4, 8) == 4)
+    expect(classe_natural(8) == (bir.BC_I64 as u8))
+    expect(classe_natural(4) == (bir.BC_I32 as u8))
+    expect(classe_natural(2) == (bir.BC_I16 as u8))
+    expect(classe_natural(1) == (bir.BC_I8 as u8))
+}
+
+test "sroa_inserir_intervalo_ordena_e_recusa" {
+    var k = Conjunto{n = 0}
+    expect(inserir_intervalo(&k, Intervalo{c = 0, tam = 4, classe = (bir.BC_I32 as u8)}) == SM_OK)
+    expect(inserir_intervalo(&k, Intervalo{c = 2, tam = 4, classe = (bir.BC_I32 as u8)}) == SM_SOBREPOSICAO)
+    expect(inserir_intervalo(&k, Intervalo{c = 8, tam = 8, classe = (bir.BC_I64 as u8)}) == SM_OK)
+    expect(inserir_intervalo(&k, Intervalo{c = 4, tam = 4, classe = (bir.BC_I32 as u8)}) == SM_OK)
+    expect(k.n == 3)
+    expect(k.v[1].c == 4)
+    expect(inserir_intervalo(&k, Intervalo{c = 4, tam = 4, classe = (bir.BC_F32 as u8)}) == SM_CLASSE)
+}
+
+test "sroa_preencher_faixa_cobre_buracos" {
+    var k = Conjunto{n = 0}
+    expect(inserir_intervalo(&k, Intervalo{c = 4, tam = 4, classe = (bir.BC_I32 as u8)}) == SM_OK)
+    expect(preencher_faixa(&k, 0, 12) == SM_OK)
+    expect(k.n == 3)
+    expect(k.v[0].c == 0)
+    expect(k.v[2].c == 8)
+}
+
+test "sroa_agrupar_ordena_por_chave" {
+    var x = Indice{}
+    var chave: [4]u32 = {1, 0, 1, 2}
+    agrupar(&x, chave[..], 4, 2)
+    expect(x.ini[1] == 1)
+    expect(x.ini[2] == 3)
+    expect(x.ord[0] == 1)
+    expect(x.ord[1] == 0)
+    expect(x.ord[2] == 2)
+    delete(x.ini)
+    delete(x.ord)
+}
+
+test "sroa_deriva_raiz_end_slot_e_soma" {
+    var bf = bir.BirFuncao{}
+    var s = Sroa{f = &bf, nvregs = 4, nslots = 2}
+    alocar_tabelas(&s)
+    var fim_slot = bir.BirInstr{op = (bir.BIR_END_SLOT as u8), dst = 1}
+    fim_slot.a = bir.BirOperando{tipo = (bir.BO_IMED as u8), imed = 1}
+    var r: SroaRaiz = SroaRaiz{}
+    expect(deriva_raiz(&s, &fim_slot, &r))
+    expect(r.slot == 1)
+    expect(r.off == 0)
+    s.raiz[1] = r
+    var soma = bir.BirInstr{op = (bir.BIR_ADD as u8), dst = 2}
+    soma.a = bir.BirOperando{tipo = (bir.BO_VREG as u8), id = 1}
+    soma.b = bir.BirOperando{tipo = (bir.BO_IMED as u8), imed = 16}
+    expect(deriva_raiz(&s, &soma, &r))
+    expect(r.off == 16)
+    soma.b.imed = 16777217
+    expect(not deriva_raiz(&s, &soma, &r))
+    liberar_tudo(&s)
+}
+
+test "sroa_unir_copia_marca_conflito" {
+    var bf = bir.BirFuncao{}
+    var s = Sroa{f = &bf, nvregs = 0, nslots = 2}
+    alocar_tabelas(&s)
+    var c1 = Copia{slot_a = 0, slot_b = 1, off_a = 0, off_b = 0, n = 4}
+    unir(&s, &c1)
+    expect(s.no[1].pai == 0)
+    expect(not s.no[0].conflito)
+    var c2 = Copia{slot_a = 0, slot_b = 1, off_a = 0, off_b = 4, n = 4}
+    unir(&s, &c2)
+    expect(s.no[0].conflito)
+    liberar_tudo(&s)
+}
+
+test "sroa_liberar_tudo_sem_alocar" {
+    var bf = bir.BirFuncao{}
+    var s = Sroa{f = &bf}
+    liberar_tudo(&s)
+    expect(len(s.acessos) == 0)
+}
+
+test "sroa_nomes_de_motivo_iguais_ao_c" {
+    expect(NOME_MOTIVO_2[1] == "escapa")
+    expect(NOME_MOTIVO_2[4] == "classe")
+    expect(NOME_MOTIVO_2[9] == "orcamento")
+}

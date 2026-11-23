@@ -1,0 +1,63 @@
+// nativo/a64/a64_dados.fj - simbolos de texto e dado da BIR (BS_TEXTO / BS_DADO) no .rdata do ELF aarch64 (contrato_a64 §2.1)
+// Versao: 0.1.0
+// Changelog: 0.1.0 - A1.3(ii): copia de x64\x64_gerar.fj:163-219 (alinhamento_do_rdata, definir_em_rdata, definir_simbolos) para nao
+//                    tocar o x64 (R2). Os dados entram antes das funcoes; a64_simbolo le o indice pronto em c.obj_sim e o resto
+//                    (funcoes) continua sob demanda.
+
+import "nativo/bir"
+import "nativo/obj"
+
+// alinhamento do .rdata: o maior alinhamento entre os dados (1 se nao ha dado)
+proc a64_alinhamento_rdata(p: ^bir.BirPrograma) -> u32 {
+    var maior: u32 = 1
+    for k in (0 as u32)..<p.nsimbolos {
+        if (p.simbolos[k].tipo == (bir.BS_DADO as u8)) and (p.simbolos[k].alinhamento > maior) {
+            maior = p.simbolos[k].alinhamento
+        }
+    }
+    return maior
+}
+
+// escreve os bytes do simbolo no .rdata (texto ganha 0 final; dado e alinhado) e devolve o simbolo do Objeto
+proc a64_definir_dado(o: ^obj.Objeto, rdata: u32, s: ^bir.BirSimbolo) -> u32 {
+    let dados: ^obj.ObjSecao = &o.secoes[rdata as u64]
+    let eh_dado: bool = s.tipo == (bir.BS_DADO as u8)
+    if eh_dado {
+        while (len(dados.bytes) as u64) % (s.alinhamento as u64) != 0 {
+            append(&dados.bytes, item = (0 as u8))
+        }
+    }
+    let off = len(dados.bytes) as u32
+    var nome: str = ""
+    if eh_dado {
+        nome = format(f".d{s.ordem}", alloc = frame)
+    } else {
+        nome = format(f".s{s.ordem}", alloc = frame)
+    }
+    let bs = as_bytes(s.bytes or_else "")
+    for k in 0..<(s.tam as int) {
+        append(&dados.bytes, item = bs[k])
+    }
+    if s.tipo == (bir.BS_TEXTO as u8) {
+        append(&dados.bytes, item = (0 as u8))
+    }
+    return obj.obj_simbolo_definir(o, nome, rdata as i32, off)
+}
+
+// define os simbolos de texto e dado do programa e preenche c.obj_sim; funcoes e importes ficam para a64_simbolo
+proc a64_definir_dados(c: ^A64Ctx) {
+    var rdata: u32 = 0
+    var tem_rdata: bool = false
+    var k: u32 = 0
+    while k < c.p.nsimbolos {
+        let s: ^bir.BirSimbolo = &c.p.simbolos[k]
+        if (s.tipo == (bir.BS_TEXTO as u8)) or (s.tipo == (bir.BS_DADO as u8)) {
+            if not tem_rdata {
+                rdata = obj.obj_secao_abrir(c.o, ".rdata", obj.OS_RDATA, a64_alinhamento_rdata(c.p))
+                tem_rdata = true
+            }
+            c.obj_sim[k] = a64_definir_dado(c.o, rdata, s)
+        }
+        k += 1
+    }
+}

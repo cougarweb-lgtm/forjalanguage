@@ -1,0 +1,133 @@
+// std:hash (A80) -fnv1a_64, xxh64 e crc32 (IEEE) sobre []u8. Forja pura (sem foreign), igual nos 2 backends. Nao criptografico: hash de tabela, checksum e conferencia de integridade sem adversario.
+// Versao: 0.1.0. Changelog: 0.1.0 - L3 (A80): fnv1a_64, xxh64 (com seed), crc32 (polinomio 0xEDB88320, refletido, valor inicial e final 0xFFFFFFFF).
+// Vetores publicados: fnv1a_64("") = 0xCBF29CE484222325; xxh64("", 0) = 0xEF46DB3751D8E999; crc32("123456789") = 0xCBF43926.
+// Os inteiros lidos do buffer sao little endian (xxh64 usa esse byte order); os operadores sao sem sinal e a soma com volta e wrapping_*.
+// O crc32 anda bit a bit: basta para o uso de checksum; tabela de 256 entradas fica para quando houver medicao.
+
+const FNV_OFFSET: u64 = 0xCBF29CE484222325
+const FNV_PRIME: u64 = 0x100000001B3
+
+const XXH_PRIMO_1: u64 = 0x9E3779B185EBCA87
+const XXH_PRIMO_2: u64 = 0xC2B2AE3D27D4EB4F
+const XXH_PRIMO_3: u64 = 0x165667B19E3779F9
+const XXH_PRIMO_4: u64 = 0x85EBCA77C2B2AE63
+const XXH_PRIMO_5: u64 = 0x27D4EB2F165667C5
+const XXH_ZERO: u64 = 0
+const XXH_ROTACAO_1: u64 = 1
+const XXH_ROTACAO_7: u64 = 7
+const XXH_ROTACAO_11: u64 = 11
+const XXH_ROTACAO_12: u64 = 12
+const XXH_ROTACAO_18: u64 = 18
+const XXH_ROTACAO_23: u64 = 23
+const XXH_ROTACAO_27: u64 = 27
+const XXH_ROTACAO_31: u64 = 31
+const XXH_DESLOCA_29: u64 = 29
+const XXH_DESLOCA_32: u64 = 32
+const XXH_DESLOCA_33: u64 = 33
+const XXH_LANE_BYTES: int = 32
+const XXH_PALAVRA_BYTES: int = 8
+const XXH_METADE_BYTES: int = 4
+const BITS_POR_BYTE: u64 = 8
+
+const CRC_POLINOMIO: u32 = 0xEDB88320
+const CRC_INICIO: u32 = 0xFFFFFFFF
+const CRC_UM: u32 = 1
+const CRC_BITS_POR_BYTE: int = 8
+
+// Inteiro little endian de n bytes a partir de at (quem chama confere a faixa).
+proc le_n(b: []u8, at: int, n: int) -> u64 {
+    var v: u64 = 0
+    for i in 0..<n {
+        v = v | ((b[at + i] as u64) << ((i as u64) * BITS_POR_BYTE))
+    }
+    return v
+}
+
+// Uma rodada de lane do xxh64: acc += entrada * P2; rotaciona 31; * P1.
+proc xxh_rodada(acc: u64, entrada: u64) -> u64 {
+    let soma = wrapping_add(acc, b = wrapping_mul(entrada, b = XXH_PRIMO_2))
+    return wrapping_mul(rotate_left(soma, n = XXH_ROTACAO_31), b = XXH_PRIMO_1)
+}
+
+// Funde um lane no acumulador de 64 bits da fase final do xxh64.
+proc xxh_fundir(h: u64, lane: u64) -> u64 {
+    let val = xxh_rodada(XXH_ZERO, lane)
+    return wrapping_add(wrapping_mul(h ~ val, b = XXH_PRIMO_1), b = XXH_PRIMO_4)
+}
+
+// FNV-1a 64 bits: para cada byte, xor e depois multiplica pelo primo FNV. fnv1a_64 de vazio = o offset basis.
+pub proc fnv1a_64(b: []u8) -> u64 {
+    var h = FNV_OFFSET
+    for i in 0..<len(b) {
+        h = wrapping_mul(h ~ (b[i] as u64), b = FNV_PRIME)
+    }
+    return h
+}
+
+// xxh64 (Yann Collet, BSD-2): 4 lanes de 32 bytes quando len >= 32, depois palavras de 8, meia palavra de 4 e bytes, e a avalanche final. seed muda toda a saida.
+pub proc xxh64(b: []u8, seed: u64) -> u64 {
+    let n = len(b)
+    var p = 0
+    var h: u64 = 0
+    if n >= XXH_LANE_BYTES {
+        var v1 = wrapping_add(wrapping_add(seed, b = XXH_PRIMO_1), b = XXH_PRIMO_2)
+        var v2 = wrapping_add(seed, b = XXH_PRIMO_2)
+        var v3 = seed
+        var v4 = wrapping_sub(seed, b = XXH_PRIMO_1)
+        while p + XXH_LANE_BYTES <= n {
+            v1 = xxh_rodada(v1, le_n(b, p, n = XXH_PALAVRA_BYTES))
+            v2 = xxh_rodada(v2, le_n(b, p + 8, n = XXH_PALAVRA_BYTES))
+            v3 = xxh_rodada(v3, le_n(b, p + 16, n = XXH_PALAVRA_BYTES))
+            v4 = xxh_rodada(v4, le_n(b, p + 24, n = XXH_PALAVRA_BYTES))
+            p += XXH_LANE_BYTES
+        }
+        h = wrapping_add(rotate_left(v1, n = XXH_ROTACAO_1), b = rotate_left(v2, n = XXH_ROTACAO_7))
+        h = wrapping_add(h, b = rotate_left(v3, n = XXH_ROTACAO_12))
+        h = wrapping_add(h, b = rotate_left(v4, n = XXH_ROTACAO_18))
+        h = xxh_fundir(h, v1)
+        h = xxh_fundir(h, v2)
+        h = xxh_fundir(h, v3)
+        h = xxh_fundir(h, v4)
+    } else {
+        h = wrapping_add(seed, b = XXH_PRIMO_5)
+    }
+    h = wrapping_add(h, b = n as u64)
+    while p + XXH_PALAVRA_BYTES <= n {
+        let k1 = xxh_rodada(XXH_ZERO, le_n(b, p, n = XXH_PALAVRA_BYTES))
+        h = wrapping_add(wrapping_mul(rotate_left(h ~ k1, n = XXH_ROTACAO_27), b = XXH_PRIMO_1), b = XXH_PRIMO_4)
+        p += XXH_PALAVRA_BYTES
+    }
+    if p + XXH_METADE_BYTES <= n {
+        h = h ~ wrapping_mul(le_n(b, p, n = XXH_METADE_BYTES), b = XXH_PRIMO_1)
+        h = wrapping_add(wrapping_mul(rotate_left(h, n = XXH_ROTACAO_23), b = XXH_PRIMO_2), b = XXH_PRIMO_3)
+        p += XXH_METADE_BYTES
+    }
+    while p < n {
+        h = h ~ wrapping_mul(b[p] as u64, b = XXH_PRIMO_5)
+        h = wrapping_mul(rotate_left(h, n = XXH_ROTACAO_11), b = XXH_PRIMO_1)
+        p += 1
+    }
+    h = h ~ (h >> XXH_DESLOCA_33)
+    h = wrapping_mul(h, b = XXH_PRIMO_2)
+    h = h ~ (h >> XXH_DESLOCA_29)
+    h = wrapping_mul(h, b = XXH_PRIMO_3)
+    h = h ~ (h >> XXH_DESLOCA_32)
+    return h
+}
+
+// CRC-32 IEEE (zlib, PNG, gzip): bit a bit, polinomio refletido 0xEDB88320, inicio e fim 0xFFFFFFFF. crc32 de vazio = 0.
+pub proc crc32(b: []u8) -> u32 {
+    var crc = CRC_INICIO
+    for i in 0..<len(b) {
+        crc = crc ~ (b[i] as u32)
+        // for (e nao while com var local) no bit a bit: o backend c perde a atribuicao a crc dentro do while aninhado.
+        for k in 0..<CRC_BITS_POR_BYTE {
+            if (crc & CRC_UM) == CRC_UM {
+                crc = (crc >> 1) ~ CRC_POLINOMIO
+            } else {
+                crc = crc >> 1
+            }
+        }
+    }
+    return crc ~ CRC_INICIO
+}

@@ -1,0 +1,128 @@
+// threads_es.fj (Linux) - M5c-b P63: travas por grupo do runtime Linux (D-R7). 4 threads (std:thread) fazem 1500 voltas cada: gravar o proprio marcador num arquivo proprio
+// (open/write/close), reler (open/read/close) e conferir; set_env/env de uma variavel propria; e as threads 0 e 1 rodam 20 processos /bin/true (std:process). Sem as travas a tabela de handles,
+// o ambiente vivo e a tabela de processos corrompem (marcador trocado, FECHADO, valor trocado). Cada thread imprime "T <id> ok <voltas>" ou "T <id> ERRO <volta> <o que>".
+// Pasta de trabalho = cwd (o harness roda numa pasta propria). Verificacao: python -I verificar_threads_linux.py --forja <forja.exe>
+import "std:os"
+import "std:file"
+import "std:process"
+import "std:thread"
+
+const FIOS: int = 4
+const VOLTAS: int = 1500
+const PROCESSOS: int = 20
+
+struct Carga {
+    id: int
+}
+
+// Grava o marcador no arquivo proprio e le de volta: true se o texto lido e o gravado.
+proc ciclo_arquivo(caminho: str, marcador: str) -> bool {
+    switch f in file.open(caminho, file.OpenMode.write) {
+    case file.File:
+        var g = f
+        let erro = file.write_str(&g, marcador)
+        file.close(&g)
+        if erro != none {
+            return false
+        }
+    case file.FileError:
+        return false
+    }
+    var ok = false
+    switch d in file.read_all(caminho, alloc = heap) {
+    case [dynamic]u8:
+        ok = len(d) == len(marcador) and d[0] == marcador[0] and d[len(d) - 1] == marcador[len(marcador) - 1]
+        delete(d)
+    case file.FileError:
+        ok = false
+    }
+    return ok
+}
+
+// set_env e env da variavel propria: o valor lido tem de ser o gravado.
+proc ciclo_ambiente(nome: str, valor: str) -> bool {
+    if os.set_env(nome, valor) != none {
+        return false
+    }
+    switch v in os.env(nome) {
+    case str:
+        return v == valor
+    case none:
+        return false
+    }
+    return false
+}
+
+proc processo_ok() -> bool {
+    let cmd = process.Command{program = "/bin/true", args = {}, env = {}, cwd = "", timeout_ms = 20000}
+    switch r in process.run(cmd, alloc = heap) {
+    case process.Output:
+        let ok = r.code == 0
+        delete(r.stdout)
+        delete(r.stderr)
+        return ok
+    case process.ProcessError:
+        return false
+    }
+    return false
+}
+
+proc rotina(p: rawptr) -> u32 {
+    let c = p as ^Carga
+    let caminho = format(f"threads_es_{c.id}.tmp", alloc = heap)
+    defer delete(caminho)
+    let nome = format(f"FJ_ES_{c.id}", alloc = heap)
+    defer delete(nome)
+    for i in 0..<VOLTAS {
+        let marcador = format(f"T{c.id}-{i:05}", alloc = heap)
+        let valor = format(f"v{c.id}-{i:05}", alloc = heap)
+        let arquivo_ok = ciclo_arquivo(caminho, marcador)
+        let ambiente_ok = ciclo_ambiente(nome, valor)
+        delete(marcador)
+        delete(valor)
+        if not arquivo_ok {
+            print(f"T {c.id} ERRO {i} arquivo")
+            return 0
+        }
+        if not ambiente_ok {
+            print(f"T {c.id} ERRO {i} ambiente")
+            return 0
+        }
+    }
+    if c.id < 2 {
+        for k in 0..<PROCESSOS {
+            if not processo_ok() {
+                print(f"T {c.id} ERRO {k} processo")
+                return 0
+            }
+        }
+    }
+    _ = file.remove_file(caminho)
+    print(f"T {c.id} ok {VOLTAS}")
+    return 0
+}
+
+proc main() {
+    var cargas = make([dynamic]^Carga, alloc = heap)
+    var fios = make([dynamic]thread.Thread, alloc = heap)
+    os.multithread_on()
+    for k in 0..<FIOS {
+        let c = new(Carga, alloc = heap)
+        c.id = k
+        append(&cargas, item = c)
+        switch t in thread.spawn(rotina, c as rawptr) {
+        case thread.Thread:
+            append(&fios, item = t)
+        case thread.ThreadError:
+            print("FALHA thread")
+        }
+    }
+    for k in 0..<len(fios) {
+        _ = thread.join(fios[k])
+    }
+    for k in 0..<len(cargas) {
+        delete(cargas[k])
+    }
+    delete(cargas)
+    delete(fios)
+}

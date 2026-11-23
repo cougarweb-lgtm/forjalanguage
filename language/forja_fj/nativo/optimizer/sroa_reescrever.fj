@@ -1,0 +1,310 @@
+// nativo/optimizer/sroa_reescrever.fj - porte de compiler/nativo/optimizer/sroa_reescrever.c
+// sha256 de nativo/optimizer/sroa_reescrever.c: 70281c54c00d563b53b06f445b8303da370a1569f66581c83e385b96b41d6245
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.2.0
+// Changelog: 0.2.0 - G3 O4: stubs completados; Saida (v/n/cap) virou [dynamic]BirInstr direto; classe_vreg cresce pela arena do programa.
+
+import "common"
+import "nativo/bir"
+
+struct Contexto {
+    info: []SroaSlot
+    raiz: []SroaRaiz
+    nvregs: u32
+}
+
+struct Nova {
+    op: u8
+    classe: u8
+    dst: u32
+    a: bir.BirOperando
+    b: bir.BirOperando
+    desloc: i32
+}
+
+struct FaixaCampos {
+    ini: u32
+    fim: u32
+}
+
+struct LadoCopia {
+    f: ?^SroaCampo
+    desloc: i32
+    rb: ?^SroaRaiz
+    base: ?^bir.BirOperando
+    dst_vivo: bool
+    off_b: i32
+}
+
+// C: nativo/optimizer/sroa_reescrever.c:22
+proc raiz_viva(c: ^Contexto, o: ^bir.BirOperando) -> ?^SroaRaiz {
+    if (o.tipo != (bir.BO_VREG as u8)) or (o.id >= c.nvregs) {
+        return none
+    }
+    let r: ^SroaRaiz = &c.raiz[o.id]
+    if (r.slot != SROA_SEM) and (c.info[r.slot].motivo == (SM_OK as u8)) {
+        return r
+    }
+    return none
+}
+
+// C: nativo/optimizer/sroa_reescrever.c:32
+proc define_endereco(c: ^Contexto, i: ^bir.BirInstr) -> bool {
+    if (i.op != (bir.BIR_END_SLOT as u8)) and (i.op != (bir.BIR_COPIA as u8)) and (i.op != (bir.BIR_ADD as u8)) {
+        return false
+    }
+    if i.dst >= c.nvregs {
+        return false
+    }
+    let r: ^SroaRaiz = &c.raiz[i.dst]
+    return (r.slot != SROA_SEM) and (c.info[r.slot].motivo == (SM_OK as u8))
+}
+
+// C: nativo/optimizer/sroa_reescrever.c:45
+// A instrucao precisa ser trocada ou apagada?
+proc mexe(c: ^Contexto, i: ^bir.BirInstr) -> bool {
+    let sw_1 = i.op as i32
+    if sw_1 == bir.BIR_CARREGA or sw_1 == bir.BIR_GRAVA or sw_1 == bir.BIR_ZERA_MEM {
+        return raiz_viva(c, &i.a) != none
+    } else if sw_1 == bir.BIR_COPIA_MEM {
+        return (raiz_viva(c, &i.a) != none) or (raiz_viva(c, &i.b) != none)
+    } else {
+        return define_endereco(c, i)
+    }
+    return false
+}
+
+// C: nativo/optimizer/sroa_reescrever.c:71
+// A instrucao nova: op, classe, dst, operandos e deslocamento; pos e ir vem da original.
+proc emitir(s: ^[dynamic]bir.BirInstr, orig: ^bir.BirInstr, n: ^Nova) {
+    append(s, item = bir.BirInstr{op = n.op, classe = n.classe, dst = n.dst, a = n.a, b = n.b, simbolo = bir.BIR_SEM_SIMBOLO, alvo = {bir.BIR_SEM_BLOCO, bir.BIR_SEM_BLOCO}, pos = orig.pos, ir = orig.ir, desloc = n.desloc})
+}
+
+// C: nativo/optimizer/sroa_reescrever.c:79
+proc vreg(id: u32, classe: u8) -> bir.BirOperando {
+    return bir.BirOperando{tipo = bir.BO_VREG as u8, classe = classe, id = id}
+}
+
+// C: nativo/optimizer/sroa_reescrever.c:85
+// O campo do slot que comeca em off (exato); a decisao de sroa.c garante que existe.
+proc campo_em(c: ^Contexto, slot: u32, off: i32) -> ^SroaCampo {
+    var k: u32 = 0
+    while k < (c.info[slot].nf as u32) {
+        if c.info[slot].campo[k].off == off {
+            return &c.info[slot].campo[k]
+        }
+        k += 1
+    }
+    let msg: str = format(f"sroa: campo ausente no slot {slot}, offset {off}", alloc = heap)
+    defer delete(msg)
+    common.falha_interna(msg)
+    return &c.info[slot].campo[0]
+}
+
+// C: nativo/optimizer/sroa_reescrever.c:96
+proc emitir_carrega(c: ^Contexto, s: ^[dynamic]bir.BirInstr, i: ^bir.BirInstr) {
+    let r: ^SroaRaiz = raiz_viva(c, &i.a) as ^SroaRaiz
+    let f: ^SroaCampo = campo_em(c, r.slot, wrapping_add(r.off, i.desloc))
+    var n: Nova = Nova{op = bir.BIR_COPIA as u8, classe = i.classe, dst = i.dst, a = vreg(f.vreg, i.classe)}
+    emitir(s, i, &n)
+}
+
+// C: nativo/optimizer/sroa_reescrever.c:105
+proc emitir_grava(c: ^Contexto, s: ^[dynamic]bir.BirInstr, i: ^bir.BirInstr) {
+    let r: ^SroaRaiz = raiz_viva(c, &i.a) as ^SroaRaiz
+    let f: ^SroaCampo = campo_em(c, r.slot, wrapping_add(r.off, i.desloc))
+    var op_nova: i32 = bir.BIR_COPIA
+    if i.b.tipo == (bir.BO_IMED as u8) {
+        op_nova = bir.BIR_CONST
+    }
+    var n: Nova = Nova{op = op_nova as u8, classe = i.classe, dst = f.vreg, a = i.b}
+    emitir(s, i, &n)
+}
+
+// C: nativo/optimizer/sroa_reescrever.c:117
+// Indices em campo[] [ini, fim) dos campos de um slot dentro de [off, off+n).
+proc faixa_de_campos(s: ^SroaSlot, off: i32, n: u32) -> FaixaCampos {
+    var faixa: FaixaCampos = FaixaCampos{ini = 0, fim = 0}
+    var k: u32 = 0
+    while k < (s.nf as u32) {
+        if s.campo[k].off < off {
+            faixa.ini = k + 1
+        }
+        if (s.campo[k].off + transmute(s.campo[k].tam, to = i32)) <= (off + transmute(n, to = i32)) {
+            faixa.fim = k + 1
+        }
+        k += 1
+    }
+    return faixa
+}
+
+// C: nativo/optimizer/sroa_reescrever.c:130
+proc emitir_zera(c: ^Contexto, s: ^[dynamic]bir.BirInstr, i: ^bir.BirInstr) {
+    let r: ^SroaRaiz = raiz_viva(c, &i.a) as ^SroaRaiz
+    let faixa: FaixaCampos = faixa_de_campos(&c.info[r.slot], r.off, common.c2f_s2u_32(i.desloc))
+    var k: u32 = faixa.ini
+    while k < faixa.fim {
+        let f: SroaCampo = c.info[r.slot].campo[k]
+        var n: Nova = Nova{op = bir.BIR_CONST as u8, classe = f.classe, dst = f.vreg, a = bir.BirOperando{tipo = bir.BO_IMED as u8, classe = f.classe}}
+        emitir(s, i, &n)
+        k += 1
+    }
+}
+
+// C: nativo/optimizer/sroa_reescrever.c:146
+// Um campo da copia: campo f do lado escalarizado. dst_vivo: o escalarizado e o destino da copia. O outro lado e outro slot escalarizado (rb != NULL) ou memoria externa (base).
+proc emitir_campo_copiado(c: ^Contexto, s: ^[dynamic]bir.BirInstr, i: ^bir.BirInstr, l: ^LadoCopia) {
+    let f: ^SroaCampo = l.f as ^SroaCampo
+    var n: Nova = Nova{classe = f.classe}
+    if l.rb != none {
+        let rb: ^SroaRaiz = l.rb as ^SroaRaiz
+        let g: ^SroaCampo = campo_em(c, rb.slot, wrapping_add(l.off_b, l.desloc))
+        n.op = bir.BIR_COPIA as u8
+        n.dst = g.vreg
+        n.a = vreg(f.vreg, f.classe)
+        if l.dst_vivo {
+            n.dst = f.vreg
+            n.a = vreg(g.vreg, f.classe)
+        }
+    } else if l.dst_vivo {
+        n.op = bir.BIR_CARREGA as u8
+        n.dst = f.vreg
+        n.a = (l.base as ^bir.BirOperando)^
+        n.desloc = l.desloc
+    } else {
+        n.op = bir.BIR_GRAVA as u8
+        n.dst = bir.BIR_SEM_VREG
+        n.a = (l.base as ^bir.BirOperando)^
+        n.b = vreg(f.vreg, f.classe)
+        n.desloc = l.desloc
+    }
+    emitir(s, i, &n)
+}
+
+// C: nativo/optimizer/sroa_reescrever.c:172
+// COPIA_MEM contra memoria externa vira CARREGA/GRAVA por campo pela mesma base, em ordem crescente de offset.
+proc emitir_copia_mem(c: ^Contexto, s: ^[dynamic]bir.BirInstr, i: ^bir.BirInstr) {
+    let ra: ?^SroaRaiz = raiz_viva(c, &i.a)
+    let rb: ?^SroaRaiz = raiz_viva(c, &i.b)
+    var dono: ?^SroaRaiz = rb
+    if ra != none {
+        dono = ra
+    }
+    let dr: ^SroaRaiz = dono as ^SroaRaiz
+    let faixa: FaixaCampos = faixa_de_campos(&c.info[dr.slot], dr.off, common.c2f_s2u_32(i.desloc))
+    var l: LadoCopia = LadoCopia{dst_vivo = ra != none}
+    if (ra != none) and (rb != none) {
+        l.rb = rb
+    }
+    var base: ^bir.BirOperando = &i.a
+    if ra != none {
+        base = &i.b
+    }
+    l.base = base
+    if rb != none {
+        l.off_b = (rb as ^SroaRaiz).off
+    }
+    var k: u32 = faixa.ini
+    while k < faixa.fim {
+        l.f = &c.info[dr.slot].campo[k]
+        l.desloc = c.info[dr.slot].campo[k].off - dr.off
+        emitir_campo_copiado(c, s, i, &l)
+        k += 1
+    }
+}
+
+// C: nativo/optimizer/sroa_reescrever.c:189
+proc trocar(c: ^Contexto, s: ^[dynamic]bir.BirInstr, i: ^bir.BirInstr) {
+    let sw_1 = i.op as i32
+    if sw_1 == bir.BIR_CARREGA {
+        emitir_carrega(c, s, i)
+    } else if sw_1 == bir.BIR_GRAVA {
+        emitir_grava(c, s, i)
+    } else if sw_1 == bir.BIR_ZERA_MEM {
+        emitir_zera(c, s, i)
+    } else if sw_1 == bir.BIR_COPIA_MEM {
+        emitir_copia_mem(c, s, i)
+    } else {
+        // END_SLOT, COPIA e ADD de endereco: saem da saida.
+    }
+}
+
+// C: nativo/optimizer/sroa_reescrever.c:200
+// Nenhuma instrucao muda de ordem. Bloco sem acesso a slot escalarizado fica como esta; o resto e copiado para uma saida nova e o bloco recebe a saida.
+proc reescrever_bloco_2(c: ^Contexto, b: ^bir.BirBloco) {
+    var algum: bool = false
+    var j: u32 = 0
+    while (j < b.n) and (not algum) {
+        algum = mexe(c, &b.instrs[j])
+        j += 1
+    }
+    if not algum {
+        return
+    }
+    var saida = make([dynamic]bir.BirInstr, alloc = heap, cap = (b.n as int) + 4)
+    defer delete(saida)
+    j = 0
+    while j < b.n {
+        if mexe(c, &b.instrs[j]) {
+            trocar(c, &saida, &b.instrs[j])
+        } else {
+            append(&saida, item = b.instrs[j])
+        }
+        j += 1
+    }
+    let total: u32 = len(saida) as u32
+    delete(b.instrs)
+    b.instrs = make([dynamic]bir.BirInstr, alloc = heap, cap = (total as int) + 1)
+    var k: u32 = 0
+    while k < total {
+        append(&b.instrs, item = saida[k])
+        k += 1
+    }
+    b.n = total
+    b.cap = (cap(b.instrs) as u64) as u32
+}
+
+// C: nativo/optimizer/sroa_reescrever.c:221
+// Troca, em f, cada acesso a slot escalarizado pelos vregs dos campos. classe_vreg cresce para nvregs_novo pela arena do programa (o C usa realloc).
+proc sroa_reescrever(f: ^bir.BirFuncao, plano: ^SroaPlano, arena: ^common.Arena) {
+    let info: []SroaSlot = plano.info
+    var c = Contexto{info = info, raiz = plano.raiz, nvregs = plano.nvregs_antigo}
+    let velha: []u8 = f.classe_vreg or_else {}
+    let nova: []u8 = common.arena_fatia_u8(arena, plano.nvregs_novo as int)
+    var k: u32 = 0
+    while k < plano.nvregs_antigo {
+        nova[k] = velha[k]
+        k += 1
+    }
+    f.classe_vreg = nova
+    k = 0
+    while k < f.nslots {
+        if info[k].motivo == (SM_OK as u8) {
+            var m: u32 = 0
+            while m < (info[k].nf as u32) {
+                nova[info[k].campo[m].vreg] = info[k].campo[m].classe
+                m += 1
+            }
+        }
+        k += 1
+    }
+    f.nvregs = plano.nvregs_novo
+    var b: u32 = 0
+    while b < f.nblocos {
+        reescrever_bloco_2(&c, &f.blocos[b])
+        b += 1
+    }
+}
+
+test "sroa_reescrever_faixa_de_campos" {
+    var sl = SroaSlot{}
+    sl.nf = 2
+    sl.campo[0] = SroaCampo{off = 0, tam = 4, classe = (bir.BC_I32 as u8), vreg = 10}
+    sl.campo[1] = SroaCampo{off = 4, tam = 4, classe = (bir.BC_I32 as u8), vreg = 11}
+    let todos: FaixaCampos = faixa_de_campos(&sl, 0, 8)
+    expect(todos.ini == 0)
+    expect(todos.fim == 2)
+    let segundo: FaixaCampos = faixa_de_campos(&sl, 4, 4)
+    expect(segundo.ini == 1)
+    expect(segundo.fim == 2)
+}

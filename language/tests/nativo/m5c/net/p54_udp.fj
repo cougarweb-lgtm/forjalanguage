@@ -1,0 +1,203 @@
+// Fixture do std:net UDP (M5 P54): (a) ICMP de porta fechada nao derruba o recv seguinte; (b) datagrama maior que o buffer = datagrama_maior; (c) timeout 0 em 1000 chamadas, medido com std:time.
+// Saida esperada: "reset OK", "seguinte OK", "maior OK", "zero1000 OK ms=<n>".
+import "std:net" as net
+import "std:time" as tempo
+
+proc abrir(addr: str) -> net.UdpSocket {
+    switch r in net.udp_bind(addr) {
+    case net.UdpSocket:
+        return r
+    case net.NetError:
+        return net.UdpSocket{h = 0}
+    }
+    return net.UdpSocket{h = 0}
+}
+
+// (a): manda a uma porta que acabou de fechar; o recv do mesmo emissor com 200 ms tem de dar timeout.
+proc icmp_nao_derruba(ende: str) -> bool {
+    var emissor = abrir("127.0.0.1:0")
+    if emissor.h == 0 {
+        return false
+    }
+    var quadro: [16]u8 = {}
+    switch n in net.udp_send_to(&emissor, ende, quadro[..]) {
+    case int:
+        if n != 16 {
+            _ = net.udp_close(&emissor)
+            return false
+        }
+    case net.NetError:
+        _ = net.udp_close(&emissor)
+        return false
+    }
+    var buf: [16]u8 = {}
+    var resultado = false
+    switch r in net.udp_recv_from(&emissor, buf[..], 200, heap) {
+    case net.UdpRecebido:
+        defer delete(r.de)
+    case net.NetError:
+        resultado = r == net.NetError.timeout
+    }
+    _ = net.udp_close(&emissor)
+    return resultado
+}
+
+// (a2): depois do ICMP, o datagrama valido seguinte sai no 1o recv_from, sem erro antes (so com SIO_UDP_CONNRESET desligado; com o ICMP ligado, o 1o recv daria erro).
+proc icmp_entrega_o_seguinte(ende: str) -> bool {
+    var emissor = abrir("127.0.0.1:0")
+    var outro = abrir("127.0.0.1:0")
+    if emissor.h == 0 or outro.h == 0 {
+        return false
+    }
+    var quadro: [16]u8 = {}
+    var resultado = false
+    var icmp_ok = false
+    switch n in net.udp_send_to(&emissor, ende, quadro[..]) {
+    case int:
+        icmp_ok = n == 16
+    case net.NetError:
+        icmp_ok = false
+    }
+    switch fim in net.udp_local_addr(&emissor, heap) {
+    case str:
+        var valido: [16]u8 = {}
+        valido[0] = 7
+        var enviou = false
+        switch m in net.udp_send_to(&outro, fim, valido[..]) {
+        case int:
+            enviou = m == 16
+        case net.NetError:
+            enviou = false
+        }
+        var buf: [16]u8 = {}
+        switch r in net.udp_recv_from(&emissor, buf[..], 200, heap) {
+        case net.UdpRecebido:
+            defer delete(r.de)
+            resultado = r.quantos == 16
+        case net.NetError:
+            resultado = false
+        }
+        resultado = resultado and icmp_ok and enviou
+        delete(fim)
+    case net.NetError:
+        resultado = false
+    }
+    _ = net.udp_close(&outro)
+    _ = net.udp_close(&emissor)
+    return resultado
+}
+
+// (b): datagrama de 1200 bytes em buffer de 100 = datagrama_maior; o resto do datagrama nao volta depois (timeout).
+proc datagrama_maior_descarta() -> bool {
+    var s = abrir("127.0.0.1:0")
+    var c = abrir("127.0.0.1:0")
+    if s.h == 0 or c.h == 0 {
+        return false
+    }
+    var resultado = false
+    switch ende in net.udp_local_addr(&s, heap) {
+    case str:
+        resultado = enviar_e_conferir(&s, &c, ende)
+        delete(ende)
+    case net.NetError:
+        resultado = false
+    }
+    _ = net.udp_close(&c)
+    _ = net.udp_close(&s)
+    return resultado
+}
+
+// Manda 1200 bytes de c para ende (o proprio s) e confere que s so entrega datagrama_maior e depois timeout.
+proc enviar_e_conferir(s: ^net.UdpSocket, c: ^net.UdpSocket, ende: str) -> bool {
+    var grande: [1200]u8 = {}
+    switch n in net.udp_send_to(c, ende, grande[..]) {
+    case int:
+        if n != 1200 {
+            return false
+        }
+    case net.NetError:
+        return false
+    }
+    var pequeno: [100]u8 = {}
+    var primeiro = false
+    switch r in net.udp_recv_from(s, pequeno[..], 1000, heap) {
+    case net.UdpRecebido:
+        defer delete(r.de)
+    case net.NetError:
+        primeiro = r == net.NetError.datagrama_maior
+    }
+    var segundo = false
+    switch r2 in net.udp_recv_from(s, pequeno[..], 100, heap) {
+    case net.UdpRecebido:
+        defer delete(r2.de)
+    case net.NetError:
+        segundo = r2 == net.NetError.timeout
+    }
+    return primeiro and segundo
+}
+
+// (c): 1000 recv_from com timeout 0 num socket vazio; todos devolvem timeout. Devolve os ms gastos.
+proc zero_mil(s: ^net.UdpSocket) -> int {
+    var buf: [16]u8 = {}
+    var timeouts = 0
+    var chamadas = 0
+    let sw = tempo.stopwatch_start()
+    while chamadas < 1000 {
+        chamadas += 1
+        switch r in net.udp_recv_from(s, buf[..], 0, heap) {
+        case net.UdpRecebido:
+            defer delete(r.de)
+        case net.NetError:
+            if r == net.NetError.timeout {
+                timeouts += 1
+            }
+        }
+    }
+    let ms = tempo.ns_to_ms(tempo.elapsed_ns(sw))
+    if timeouts != 1000 {
+        return -1
+    }
+    return ms
+}
+
+proc main() {
+    var alvo = abrir("127.0.0.1:0")
+    if alvo.h == 0 {
+        print("FALHA abrir")
+        return
+    }
+    switch ende in net.udp_local_addr(&alvo, heap) {
+    case str:
+        _ = net.udp_close(&alvo)
+        if icmp_nao_derruba(ende) {
+            print("reset OK")
+        } else {
+            print("FALHA reset")
+        }
+        if icmp_entrega_o_seguinte(ende) {
+            print("seguinte OK")
+        } else {
+            print("FALHA seguinte")
+        }
+        if datagrama_maior_descarta() {
+            print("maior OK")
+        } else {
+            print("FALHA maior")
+        }
+        delete(ende)
+    case net.NetError:
+        print("FALHA endereco local")
+    }
+    var vazio = abrir("127.0.0.1:0")
+    if vazio.h == 0 {
+        print("FALHA abrir")
+        return
+    }
+    let ms = zero_mil(&vazio)
+    if ms < 0 {
+        print("FALHA zero")
+    } else {
+        print(f"zero1000 OK ms={ms}")
+    }
+    _ = net.udp_close(&vazio)
+}

@@ -1,0 +1,235 @@
+// bot.fj - bots do servidor de prova do M5 P55: UM processo, N sockets em 127.0.0.1 (porta 0), entrada determinista por (semente, bot, tick), sem relogio. Espera o ack de cada tick antes do tick seguinte; sem retransmissao: perda = FALHA.
+// Versao: 0.1.0. Changelog: 0.1.0 - M5 P55: 40 sockets, lockstep com o servidor, PRNG inteiro (Park-Miller), pacote fim ao servidor.
+// Uso: forja run bot.fj -- <porta-do-servidor> <bots> <ticks> <semente>
+// Verificacao: python tests\nativo\m5c\servidor\rodar_servidor.py <forja.exe> (sobe servidor e bot juntos)
+import "std:net" as net
+import "std:os"
+import "std:text"
+
+const BOTS_MAX: int = 64
+const PACOTE_TAM: int = 10
+const ACK_TAM: int = 6
+const TIPO_ENTRADA: u8 = 0
+const TIPO_FIM: u8 = 1
+const TIPO_ACK: u8 = 2
+const ESPERA_ACK_MS: i32 = 3000
+const MODULO_PRNG: int = 2147483647
+const MULT_PRNG: int = 48271
+const FAIXA_ENTRADA: int = 65536
+const DOIS_PONTOS: u8 = 58
+const ZERO_ASCII: int = 48
+const NOVE_ASCII: int = 57
+const MULT_BOT: int = 1000003
+const MULT_TICK: int = 999983
+
+// Estado da rodada: sockets dos bots, porta de cada um (lida do proprio socket), tamanho e destino (servidor).
+struct Rodada {
+    socks: [BOTS_MAX]net.UdpSocket
+    portas: [BOTS_MAX]int
+    bots: int = 0
+    ticks: int = 0
+    semente: int = 0
+    destino: str = ""
+}
+
+// Entrada do bot b no tick t: PRNG inteiro (Park-Miller) sobre semente, bot e tick. Sem float e sem relogio.
+proc entrada_de(semente: int, bot: int, t: int) -> int {
+    var x = (semente + bot * MULT_BOT + t * MULT_TICK) % MODULO_PRNG
+    if x == 0 {
+        x = 1
+    }
+    x = (x * MULT_PRNG) % MODULO_PRNG
+    x = (x * MULT_PRNG) % MODULO_PRNG
+    return x % FAIXA_ENTRADA
+}
+
+// Escreve v em 4 bytes big-endian a partir de pos.
+proc escrever_be32(dest: []u8, pos: int, valor: int) {
+    var v = valor
+    for k in 0..<4 {
+        dest[pos + 3 - k] = (v % 256) as u8
+        v = v / 256
+    }
+}
+
+// Le 4 bytes big-endian a partir de pos.
+proc ler_be32(origem: []u8, pos: int) -> int {
+    var v = 0
+    for k in 0..<4 {
+        v = v * 256 + (origem[pos + k] as int)
+    }
+    return v
+}
+
+// Porta do texto "a.b.c.d:porta": os digitos depois do ultimo ':'.
+proc porta_de(texto: str) -> int {
+    var porta = 0
+    for i in 0..<len(texto) {
+        let c = texto[i] as int
+        if texto[i] == DOIS_PONTOS {
+            porta = 0
+        } else if c >= ZERO_ASCII and c <= NOVE_ASCII {
+            porta = porta * 10 + (c - ZERO_ASCII)
+        }
+    }
+    return porta
+}
+
+// Monta o pacote de entrada: tipo 0, bot, tick (BE32), valor (2 bytes) e a porta local do bot (2 bytes).
+proc montar_entrada(r: ^Rodada, b: int, t: int, pacote: []u8) {
+    let valor = entrada_de(r.semente, b, t)
+    pacote[0] = TIPO_ENTRADA
+    pacote[1] = b as u8
+    escrever_be32(pacote, 2, t)
+    pacote[6] = (valor / 256) as u8
+    pacote[7] = (valor % 256) as u8
+    pacote[8] = (r.portas[b] / 256) as u8
+    pacote[9] = (r.portas[b] % 256) as u8
+}
+
+// Manda a entrada do tick t de cada bot ao servidor (um socket por bot).
+proc enviar_entradas(r: ^Rodada, t: int) -> bool {
+    var pacote: [PACOTE_TAM]u8 = {}
+    for b in 0..<r.bots {
+        montar_entrada(r, b, t, pacote[..])
+        switch n in net.udp_send_to(&r.socks[b], r.destino, pacote[..]) {
+        case int:
+            if n != PACOTE_TAM {
+                print(f"FALHA envio curto bot={b} tick={t}")
+                return false
+            }
+        case net.NetError:
+            print(f"FALHA envio bot={b} tick={t}")
+            return false
+        }
+    }
+    return true
+}
+
+// O ack tem de ser do mesmo bot e do mesmo tick, com o tamanho do pacote.
+proc ack_confere(buf: []u8, n: int, b: int, t: int) -> bool {
+    if n != ACK_TAM or buf[0] != TIPO_ACK or (buf[1] as int) != b or ler_be32(buf, 2) != t {
+        print(f"FALHA ack invalido bot={b} tick={t}")
+        return false
+    }
+    return true
+}
+
+// Espera o ack de um bot; timeout ou pacote errado = FALHA (sem retransmissao).
+proc receber_ack(sock: ^net.UdpSocket, buf: []u8, b: int, t: int) -> bool {
+    switch r in net.udp_recv_from(sock, buf, ESPERA_ACK_MS, heap) {
+    case net.UdpRecebido:
+        defer delete(r.de)
+        return ack_confere(buf, r.quantos, b, t)
+    case net.NetError:
+        print(f"FALHA perdido ack bot={b} tick={t}")
+        return false
+    }
+    return false
+}
+
+// Recebe o ack de cada bot do tick t, na ordem de indice.
+proc receber_acks(r: ^Rodada, t: int) -> bool {
+    var buf: [PACOTE_TAM]u8 = {}
+    for b in 0..<r.bots {
+        if not receber_ack(&r.socks[b], buf[..], b, t) {
+            return false
+        }
+    }
+    return true
+}
+
+// Lockstep do bot: para cada tick, manda as entradas e so segue com o ack de todos.
+proc rodar_ticks(r: ^Rodada) -> bool {
+    for t in 1..=r.ticks {
+        if not enviar_entradas(r, t) {
+            return false
+        }
+        if not receber_acks(r, t) {
+            return false
+        }
+    }
+    return true
+}
+
+// Abre o socket do bot b em 127.0.0.1 porta 0 e guarda a porta local.
+proc abrir_um(r: ^Rodada, b: int) -> bool {
+    switch s in net.udp_bind("127.0.0.1:0") {
+    case net.UdpSocket:
+        r.socks[b] = s
+    case net.NetError:
+        print("FALHA socket bot")
+        return false
+    }
+    switch e in net.udp_local_addr(&r.socks[b], heap) {
+    case str:
+        defer delete(e)
+        r.portas[b] = porta_de(e)
+        return r.portas[b] > 0
+    case net.NetError:
+        print("FALHA endereco local bot")
+        return false
+    }
+    return false
+}
+
+// Abre os sockets de todos os bots.
+proc abrir_sockets(r: ^Rodada) -> bool {
+    for b in 0..<r.bots {
+        if not abrir_um(r, b) {
+            return false
+        }
+    }
+    return true
+}
+
+// Manda o pacote de fim ao servidor. O servidor pode ja ter parado: o aviso e so informativo, nao derruba a rodada.
+proc enviar_fim(r: ^Rodada) {
+    var pacote: [PACOTE_TAM]u8 = {}
+    pacote[0] = TIPO_FIM
+    switch n in net.udp_send_to(&r.socks[0], r.destino, pacote[..]) {
+    case int:
+        let _enviados = n
+    case net.NetError:
+        print("aviso: fim nao enviado (servidor ja parado)")
+    }
+}
+
+// Fecha todos os sockets dos bots.
+proc fechar_sockets(r: ^Rodada) {
+    for b in 0..<r.bots {
+        _ = net.udp_close(&r.socks[b])
+    }
+}
+
+proc main() {
+    let args = os.args()
+    if len(args) < 5 {
+        print("uso: bot <porta> <bots> <ticks> <semente>")
+        os.exit(2)
+    }
+    let porta = text.parse_int(args[1]) or_else 0
+    let bots = text.parse_int(args[2]) or_else 0
+    let ticks = text.parse_int(args[3]) or_else 0
+    let semente = text.parse_int(args[4]) or_else 0
+    if porta < 1 or bots < 1 or bots > BOTS_MAX or ticks < 1 {
+        print("FALHA argumentos")
+        os.exit(2)
+    }
+    let r = new(Rodada, alloc = heap)
+    defer delete(r)
+    r.bots = bots
+    r.ticks = ticks
+    r.semente = semente
+    r.destino = format(f"127.0.0.1:{porta}", alloc = heap)
+    defer delete(r.destino)
+    if not abrir_sockets(r) {
+        os.exit(1)
+    }
+    if not rodar_ticks(r) {
+        os.exit(1)
+    }
+    enviar_fim(r)
+    fechar_sockets(r)
+    print(f"bot OK ticks={ticks} bots={bots} perdidos=0")
+}

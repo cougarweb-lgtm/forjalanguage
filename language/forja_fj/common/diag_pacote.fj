@@ -1,0 +1,491 @@
+// common/diag_pacote.fj - porte de compiler/common/diag_pacote.c, compiler/common/diag_pacote.h
+// sha256 de common/diag_pacote.c: 380726554fa0b324937d046e8ea85f0d5fab9e35c9b7f15b725e28a88b185681
+// sha256 de common/diag_pacote.h: 2d73331d9637fde8186e5f6e8bd2da694f453eded01ec4c708c144c044d76a07
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.2.0
+// Changelog: 0.2.0 - G3 P-common C2: corpo real. Textos do Diag/DiagSugestao/DiagRelacionado sao str imutavel de heap (cada escrita troca o str; nao se libera o antigo:
+//            a copia rasa de Diag pode te-lo). Saida pelo shim c2f_saida_*; DiagPacoteFim/SemSugestao recebem o sd (SaidaDiag, C2F-70) para o spec.
+
+struct FaixaDoArquivo {
+    piso: u32
+    teto: u32
+}
+
+struct Janela {
+    inicio: [JANELA_MAX]u32
+    n: u32
+    alvo: u32
+}
+
+struct Trecho {
+    f: ^Fonte
+    faixa: FaixaDoArquivo
+    janela: Janela
+    linha_alvo: u32
+    largura: i32
+    saida: ^Saida
+}
+
+const CONTEXTO_LINHAS: u32 = 2
+const JANELA_MAX: i32 = 5
+const LINHA_MAX_2: u32 = 200
+const MARCADOR_MAX: u32 = 60
+const NOMES: [3]str = {"certa", "provavel", "so_dica"}
+const NOMES_2: [5]str = {"declaracao", "tipo", "assinatura", "parecido", "uso_anterior"}
+
+// C: common/diag_pacote.c:23
+// C2F-37: `fmt, ...` virou `msg: str` (mensagem ja pronta)
+pub proc diag_sugerir(s: ^DiagSugestoes, confianca: i32, msg: str) -> bool {
+    if (s.n as i32) >= DIAG_SUGESTOES_MAX {
+        return false
+    }
+    let k = s.n
+    s.n += 1
+    s.itens[k].confianca = confianca as u8
+    s.itens[k].nedicoes = 0
+    s.itens[k].descricao = diag_texto_novo(msg,(DIAG_DESCRICAO_MAX - 1) as int) // char descricao[DIAG_DESCRICAO_MAX]
+    return true
+}
+
+// C: common/diag_pacote.c:36
+pub proc diag_editar(s: ^DiagSugestoes, ini: u32, fim: u32, novo: ?str) -> bool {
+    let texto_novo = novo or_else ""
+    if (s.n == 0) or (fim < ini) or ((fim - ini) > (DIAG_ANTIGO_MAX as u32)) or (len(texto_novo) >= (DIAG_NOVO_MAX as int)) {
+        return false
+    }
+    let atual = (s.n - 1) as int
+    if (s.itens[atual].nedicoes as i32) >= DIAG_EDICOES_MAX {
+        return false
+    }
+    let k = s.itens[atual].nedicoes
+    s.itens[atual].nedicoes += 1
+    s.itens[atual].edicoes[k].ini = ini
+    s.itens[atual].edicoes[k].fim = fim
+    s.itens[atual].edicoes[k].novo = diag_texto_novo(texto_novo,(DIAG_NOVO_MAX - 1) as int) // char novo[DIAG_NOVO_MAX]
+    return true
+}
+
+// C: common/diag_pacote.c:48
+// C2F-37: `fmt, ...` virou `msg: str` (mensagem ja pronta)
+pub proc diag_relacionar(d: ^Diag, papel: i32, off: u32, msg: str) -> bool {
+    let r = &d.rel
+    if (r.n as i32) >= DIAG_REL_MAX {
+        return false
+    }
+    for k in (0 as u32)..<(r.n as u32) {
+        if ((r.itens[k].papel as i32) == papel) and (r.itens[k].off == off) {
+            return false
+        }
+    }
+    let novo = r.n
+    r.n += 1
+    r.itens[novo].papel = papel as u8
+    r.itens[novo].off = off
+    r.itens[novo].nota = diag_texto_novo(msg,(DIAG_REL_NOTA_MAX - 1) as int) // char nota[DIAG_REL_NOTA_MAX]
+    return true
+}
+
+// C: common/diag_pacote.c:75
+proc faixa_de(f: ^Fonte, off: u32) -> FaixaDoArquivo {
+    var fx: FaixaDoArquivo = FaixaDoArquivo{piso = 0, teto = f.tam as u32}
+    var k: u32 = 0
+    if f.ntrechos <= 1 {
+        return fx
+    }
+    while ((k + 1) < f.ntrechos) and ((f.trechos or_else {})[k + 1].inicio <= off) {
+        k += 1
+    }
+    fx.piso = (f.trechos or_else {})[k].inicio
+    if (k + 1) < f.ntrechos {
+        fx.teto = (f.trechos or_else {})[k + 1].inicio
+    }
+    return fx
+}
+
+// C: common/diag_pacote.c:86
+proc inicio_da_linha(texto: []u8, piso: u32, off: u32) -> u32 {
+    var inicio: u32 = off
+    while (inicio > piso) and (texto[inicio - 1] != 10) { // '\n'
+        inicio -= 1
+    }
+    return inicio
+}
+
+// C: common/diag_pacote.c:93
+// Posicao do LF que fecha a linha (ou teto).
+proc fim_da_linha(texto: []u8, teto: u32, inicio: u32) -> u32 {
+    var fim: u32 = inicio
+    while (fim < teto) and (texto[fim] != 10) { // '\n'
+        fim += 1
+    }
+    return fim
+}
+
+// C: common/diag_pacote.c:99
+proc eh_continuacao_utf8(c: u8) -> bool {
+    return (c & 192) == 128
+}
+
+// C: common/diag_pacote.c:105
+// A linha do erro, as CONTEXTO_LINHAS de antes (se existem no mesmo arquivo) e as de depois (idem).
+proc montar_janela(j: ^Janela, f: ^Fonte, fx: FaixaDoArquivo, off: u32) {
+    let atual: u32 = inicio_da_linha(f.texto, fx.piso, off)
+    var antes: [2]u32 = {} // CONTEXTO_LINHAS
+    var nant: u32 = 0
+    var s: u32 = atual
+    while (nant < CONTEXTO_LINHAS) and (s > fx.piso) {
+        s = inicio_da_linha(f.texto, fx.piso, s - 1)
+        antes[nant] = s
+        nant += 1
+    }
+    j.n = 0
+    while nant > 0 {
+        nant -= 1
+        j.inicio[j.n] = antes[nant]
+        j.n += 1
+    }
+    j.alvo = j.n
+    j.inicio[j.n] = atual
+    j.n += 1
+    s = atual
+    for k in (0 as u32)..<CONTEXTO_LINHAS {
+        let fim: u32 = fim_da_linha(f.texto, fx.teto, s)
+        if (fim + 1) >= fx.teto {
+            break // sem linha seguinte (o LF final nao abre uma linha vazia)
+        }
+        s = fim + 1
+        j.inicio[j.n] = s
+        j.n += 1
+    }
+}
+
+// C: common/diag_pacote.c:129
+proc digitos(v: u32) -> u32 {
+    var v_v: u32 = v
+    var n: u32 = 1
+    while v_v >= 10 {
+        v_v = v_v / 10
+        n += 1
+    }
+    return n
+}
+
+// C: common/diag_pacote.c:140
+// Bytes da linha que vao para o trecho: sem o CR, no maximo LINHA_MAX_2 e sem cortar um caractere UTF-8 ao meio.
+proc tamanho_da_linha(t: ^Trecho, inicio: u32) -> u32 {
+    let texto = t.f.texto
+    var tam: u32 = fim_da_linha(texto, t.faixa.teto, inicio) - inicio
+    if (tam > 0) and (texto[(inicio + tam) - 1] == 13) { // '\r'
+        tam -= 1
+    }
+    if tam > LINHA_MAX_2 {
+        tam = LINHA_MAX_2
+        while (tam > 0) and eh_continuacao_utf8(texto[inicio + tam]) {
+            tam -= 1
+        }
+    }
+    return tam
+}
+
+// C: common/diag_pacote.c:152
+// "%*u | %.*s": numero a direita na largura, " | " e a linha do fonte (o %.*s para no NUL).
+proc linha_do_trecho(t: ^Trecho, k: u32) {
+    let inicio: u32 = t.janela.inicio[k]
+    let numero: u32 = (t.linha_alvo - t.janela.alvo) + k
+    let tam: u32 = tamanho_da_linha(t, inicio)
+    let corpo = t.f.texto[(inicio as int)..<((inicio + tam) as int)]
+    let digitos_numero = format(f"{numero}", alloc = heap)
+    defer delete(digitos_numero)
+    let prefixo = c2f_pad_esq(digitos_numero, t.largura as int)
+    defer delete(prefixo)
+    var b = make([dynamic]u8, alloc = heap)
+    defer delete(b)
+    append(&b, item = prefixo)
+    append(&b, item = " | ")
+    append(&b, items = corpo[0..<c2f_strlen_b(corpo)])
+    let linha = to_str(&b)
+    defer delete(linha)
+    imprimir_texto_json(t.saida, linha)
+}
+
+// C: common/diag_pacote.c:163
+// A linha "   | <espacos>^~~~": o recuo copia o tab e conta caracteres (nao bytes); a faixa e o token (no maximo MARCADOR_MAX). Coluna fora de LINHA_MAX_2: sem marcador.
+proc linha_do_marcador(t: ^Trecho, off: u32, tam_token: u32) {
+    let texto = t.f.texto
+    let inicio: u32 = t.janela.inicio[t.janela.alvo]
+    let fim_linha: u32 = fim_da_linha(texto, t.faixa.teto, inicio)
+    var fim_token: u32 = fim_linha
+    if (off + tam_token) < fim_linha {
+        fim_token = off + tam_token
+    }
+    var marca: u32 = 0
+    if (off - inicio) > LINHA_MAX_2 {
+        return
+    }
+    var b = make([dynamic]u8, alloc = heap)
+    defer delete(b)
+    var k: i32 = 0
+    while k < t.largura { // "%*s | " com "": a largura em espacos
+        append(&b, item = 32 as u8)
+        k += 1
+    }
+    append(&b, item = " | ")
+    for i in inicio..<off {
+        if not eh_continuacao_utf8(texto[i]) {
+            if texto[i] == 9 { // '\t'
+                append(&b, item = 9 as u8)
+            } else {
+                append(&b, item = 32 as u8)
+            }
+        }
+    }
+    append(&b, item = 94 as u8) // '^'
+    var i: u32 = off
+    while (i < fim_token) and (marca < MARCADOR_MAX) {
+        if not eh_continuacao_utf8(texto[i]) {
+            marca += 1
+        }
+        i += 1
+    }
+    var m: u32 = 1
+    while m < marca {
+        append(&b, item = 126 as u8) // '~'
+        m += 1
+    }
+    let linha = to_str(&b)
+    defer delete(linha)
+    c2f_saida_escrever_texto(t.saida, ", ")
+    imprimir_texto_json(t.saida, linha)
+}
+
+// C: common/diag_pacote.c:188
+proc diag_pacote_trecho(d: ^Diag, f: ^Fonte, tam_token: u32, saida: ^Saida) {
+    var off: u32 = f.tam as u32
+    if (d.off as u64) < f.tam {
+        off = d.off
+    }
+    var t: Trecho = Trecho{f = f, faixa = faixa_de(f, off), saida = saida}
+    t.linha_alvo = fonte_localizar_no_arquivo(f, off).linha
+    montar_janela(&t.janela, f, t.faixa, off)
+    t.largura = transmute(digitos(((t.linha_alvo + t.janela.n) - 1) - t.janela.alvo), to = i32)
+    c2f_saida_escrever_texto(saida, ", \"trecho\": [")
+    var k: u32 = 0
+    while k < t.janela.n {
+        if k > 0 {
+            c2f_saida_escrever_texto(saida, ", ")
+        }
+        linha_do_trecho(&t, k)
+        if k == t.janela.alvo {
+            linha_do_marcador(&t, off, tam_token)
+        }
+        k += 1
+    }
+    c2f_saida_putc(saida, 93) // ']'
+}
+
+// C: common/diag_pacote.c:207
+proc nome_da_confianca(confianca: u8) -> str {
+    if (confianca as i32) <= DIAG_SO_DICA {
+        return NOMES[confianca]
+    }
+    return NOMES[DIAG_SO_DICA]
+}
+
+// C: common/diag_pacote.c:214
+// Caminho com '/' no lugar de '\' (o mesmo que o campo "arquivo" imprime), cortado como snprintf(destino, tam): tam - 1 bytes. Str nova na heap: o chamador faz delete.
+proc caminho_normal(caminho: str, tam: int) -> str {
+    let cortado = c2f_cortar(caminho, tam - 1)
+    defer delete(cortado)
+    var b = make([dynamic]u8, alloc = heap, cap = len(cortado))
+    defer delete(b)
+    for i in 0..<len(cortado) {
+        if cortado[i] == 92 { // '\\'
+            append(&b, item = 47 as u8) // '/'
+        } else {
+            append(&b, item = cortado[i])
+        }
+    }
+    let normal = to_str(&b)
+    return normal
+}
+
+// C: common/diag_pacote.c:222
+proc imprimir_edicao(f: ^Fonte, e: ^DiagEdicao, saida: ^Saida) {
+    let ini = fonte_localizar_no_arquivo(f, e.ini)
+    let fim = fonte_localizar_no_arquivo(f, e.fim)
+    var tam: u32 = 0
+    if (e.fim as u64) <= f.tam {
+        tam = e.fim - e.ini
+    }
+    var corte_ini: int = 0
+    var corte_fim: int = 0
+    if tam > 0 {
+        corte_ini = e.ini as int
+        corte_fim = (e.ini + tam) as int
+    }
+    let antigo = from_bytes(f.texto[corte_ini..<corte_fim], alloc = heap)
+    defer delete(antigo)
+    let caminho = caminho_normal(ini.caminho or_else "", 1024)
+    defer delete(caminho)
+    c2f_saida_escrever_texto(saida, "{\"arquivo\": ")
+    imprimir_texto_json(saida, caminho)
+    let posicao = format(f", \"linha\": {ini.linha}, \"coluna\": {ini.coluna}, \"coluna_fim\": {fim.coluna}, \"antigo\": ", alloc = heap)
+    defer delete(posicao)
+    c2f_saida_formatar(saida, posicao)
+    imprimir_texto_json(saida, antigo)
+    c2f_saida_escrever_texto(saida, ", \"novo\": ")
+    imprimir_texto_json(saida, e.novo)
+    c2f_saida_putc(saida, 125) // '}'
+}
+
+// C: common/diag_pacote.c:242
+proc imprimir_edicoes(f: ^Fonte, s: ^DiagSugestao, saida: ^Saida) {
+    c2f_saida_putc(saida, 91) // '['
+    var k: u32 = 0
+    while k < (s.nedicoes as u32) {
+        if k > 0 {
+            c2f_saida_escrever_texto(saida, ", ")
+        }
+        imprimir_edicao(f, &s.edicoes[k], saida)
+        k += 1
+    }
+    c2f_saida_putc(saida, 93) // ']'
+}
+
+// C: common/diag_pacote.c:253
+// As sugestoes depois da principal: [{confianca, sugestao, correcao}].
+proc imprimir_alternativas(d: ^Diag, f: ^Fonte, saida: ^Saida) {
+    c2f_saida_escrever_texto(saida, ", \"alternativas\": [")
+    var k: u32 = 1
+    while k < (d.sug.n as u32) {
+        let s: ^DiagSugestao = &d.sug.itens[k]
+        if k > 1 {
+            c2f_saida_escrever_texto(saida, ", ")
+        }
+        let msg_1 = format(f"{{\"confianca\": \"{nome_da_confianca(s.confianca)}\", \"sugestao\": ", alloc = heap)
+        defer delete(msg_1)
+        c2f_saida_formatar(saida, msg_1)
+        imprimir_texto_json(saida, s.descricao)
+        c2f_saida_escrever_texto(saida, ", \"correcao\": ")
+        imprimir_edicoes(f, s, saida)
+        c2f_saida_putc(saida, 125) // '}'
+        k += 1
+    }
+    c2f_saida_putc(saida, 93) // ']'
+}
+
+// C: common/diag_pacote.c:270
+proc imprimir_id(d: ^Diag, f: ^Fonte, codigo: str, saida: ^Saida) {
+    let pos = fonte_localizar_no_arquivo(f, d.off)
+    let caminho = caminho_normal(pos.caminho or_else "", 1024)
+    defer delete(caminho)
+    let completo = format(f"{codigo}@{caminho}:{pos.linha}:{pos.coluna}", alloc = heap)
+    defer delete(completo)
+    let id = c2f_cortar(completo, 1099) // char id[1100]
+    defer delete(id)
+    c2f_saida_escrever_texto(saida, ", \"id\": ")
+    imprimir_texto_json(saida, id)
+}
+
+// C: common/diag_pacote.c:284
+proc nome_do_papel(papel: u8) -> str {
+    if (papel as i32) <= DIAG_REL_USO_ANTERIOR {
+        return NOMES_2[papel]
+    }
+    return NOMES_2[DIAG_REL_DECLARACAO]
+}
+
+// C: common/diag_pacote.c:291
+// A linha do offset sem a indentacao, o CR e o '{' que abre o corpo; mais que DIAG_REL_TEXTO_MAX bytes vira o corte (sem partir UTF-8) mais "...". Str nova: o chamador faz delete.
+proc texto_do_relacionado(f: ^Fonte, off: u32) -> str {
+    let fx = faixa_de(f, off)
+    var ini: u32 = inicio_da_linha(f.texto, fx.piso, off)
+    var fim: u32 = fim_da_linha(f.texto, fx.teto, ini)
+    var corte: u32 = (DIAG_REL_TEXTO_MAX as u32) - 3
+    while (ini < fim) and ((f.texto[ini] == 32) or (f.texto[ini] == 9)) { // ' ' '\t'
+        ini += 1
+    }
+    // strchr(" \t\r", c): o NUL tambem casa (o terminador da string de busca)
+    while (fim > ini) and ((f.texto[fim - 1] == 32) or (f.texto[fim - 1] == 9) or (f.texto[fim - 1] == 13) or (f.texto[fim - 1] == 0)) {
+        fim -= 1
+    }
+    if (fim > ini) and (f.texto[fim - 1] == 123) { // '{'
+        fim -= 1
+        while (fim > ini) and (f.texto[fim - 1] == 32) {
+            fim -= 1
+        }
+    }
+    if (fim - ini) <= (DIAG_REL_TEXTO_MAX as u32) {
+        return from_bytes(f.texto[(ini as int)..<(fim as int)], alloc = heap)
+    }
+    while (corte > 0) and eh_continuacao_utf8(f.texto[ini + corte]) {
+        corte -= 1
+    }
+    let cabeca = from_bytes(f.texto[(ini as int)..<((ini + corte) as int)], alloc = heap)
+    defer delete(cabeca)
+    return format(f"{cabeca}...", alloc = heap)
+}
+
+// C: common/diag_pacote.c:314
+proc imprimir_relacionado(f: ^Fonte, r: ^DiagRelacionado, saida: ^Saida) {
+    var off: u32 = f.tam as u32
+    if (r.off as u64) < f.tam {
+        off = r.off
+    }
+    let pos = fonte_localizar_no_arquivo(f, off)
+    let caminho = caminho_normal(pos.caminho or_else "", 1024)
+    defer delete(caminho)
+    let texto = texto_do_relacionado(f, off)
+    defer delete(texto)
+    let papel = format(f"{{\"papel\": \"{nome_do_papel(r.papel)}\", \"arquivo\": ", alloc = heap)
+    defer delete(papel)
+    c2f_saida_formatar(saida, papel)
+    imprimir_texto_json(saida, caminho)
+    let posicao = format(f", \"linha\": {pos.linha}, \"coluna\": {pos.coluna}, \"texto\": ", alloc = heap)
+    defer delete(posicao)
+    c2f_saida_formatar(saida, posicao)
+    imprimir_texto_json(saida, texto)
+    c2f_saida_escrever_texto(saida, ", \"nota\": ")
+    imprimir_texto_json(saida, r.nota)
+    c2f_saida_putc(saida, 125) // '}'
+}
+
+// C: common/diag_pacote.c:332
+proc diag_pacote_relacionados(d: ^Diag, f: ^Fonte, saida: ^Saida) {
+    c2f_saida_escrever_texto(saida, ", \"relacionados\": [")
+    var k: u32 = 0
+    while k < (d.rel.n as u32) {
+        if k > 0 {
+            c2f_saida_escrever_texto(saida, ", ")
+        }
+        imprimir_relacionado(f, &d.rel.itens[k], saida)
+        k += 1
+    }
+    c2f_saida_putc(saida, 93) // ']'
+}
+
+// C: common/diag_pacote.c:342
+// C2F-70: o sd chega ate diag_spec_imprimir (spec x spec_ref).
+proc diag_pacote_fim(d: ^Diag, f: ^Fonte, codigo: str, saida: ^Saida, sd: ^SaidaDiag) {
+    let principal: ^DiagSugestao = &d.sug.itens[0]
+    c2f_saida_escrever_texto(saida, ", \"correcao\": ")
+    imprimir_edicoes(f, principal, saida)
+    let msg_1 = format(f", \"confianca\": \"{nome_da_confianca(principal.confianca)}\", \"sugestao\": ", alloc = heap)
+    defer delete(msg_1)
+    c2f_saida_formatar(saida, msg_1)
+    imprimir_texto_json(saida, principal.descricao)
+    if (d.sug.n as i32) > 1 {
+        imprimir_alternativas(d, f, saida)
+    }
+    diag_pacote_relacionados(d, f, saida)
+    diag_spec_imprimir(d.codigo, saida, sd)
+    imprimir_id(d, f, codigo, saida)
+}
+
+// C: common/diag_pacote.c:356
+proc diag_pacote_sem_sugestao(d: ^Diag, f: ^Fonte, codigo: str, saida: ^Saida, sd: ^SaidaDiag) {
+    c2f_saida_escrever_texto(saida, ", \"correcao\": [], \"confianca\": \"so_dica\"")
+    diag_pacote_relacionados(d, f, saida)
+    diag_spec_imprimir(d.codigo, saida, sd)
+    imprimir_id(d, f, codigo, saida)
+}

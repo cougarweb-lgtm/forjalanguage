@@ -1,0 +1,310 @@
+// common/diag_forma.fj - porte de compiler/common/diag_forma.c, compiler/common/diag_forma.h
+// sha256 de common/diag_forma.c: c11602e9986cd125cc70d0f70c07304aa1f3a84728fee01e6d4abd7f95be2c60
+// sha256 de common/diag_forma.h: cc981d12e312ca58cb85b5717d24cea9dbf2a9c9411336016db9fe017f815fa5
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.2.0
+// Changelog: 0.2.0 - G3 P-common C2: corpo real. FormaTextos, FormaDaCausa e Ocorrencia guardam str (nao ?str: nunca sao NULL no C); a Montagem do C (char[720] + uso)
+//            e um [dynamic]u8 com o mesmo teto (anexar corta em cap - 1 bytes). procurar_regra devolve a regra por copia (N2: &TAB[k] nao existe) e um bool.
+//            linha_do_offset e trecho_do_offset devolvem str (o char[104] / char[64] do C, ja cortado e sem espacos no fim).
+
+import "std:text"
+
+struct FormaTextos {
+    explicacao: str
+    forma: str
+}
+
+struct FormaDaCausa {
+    codigo: i32
+    trecho_da_causa: str
+    explicacao: str
+    forma: str
+}
+
+struct Ocorrencia {
+    onde: str
+    linha: str
+    trecho: str
+    nome1: str
+    nome2: str
+    causa: str
+}
+
+const LINHA_MAX: int = 104
+const TRECHO_MAX: int = 64
+const NOME_MAX_2: int = 64
+const ONDE_MAX: int = 192
+const FORMA_TEXTO_MAX: int = 720
+
+// C: common/diag_forma.c:28
+// Recua n ate cair no inicio de um caractere UTF-8 (nunca corta um caractere no meio); t[n] e lido como no C.
+proc inicio_de_caractere(t: []u8, n: int) -> int {
+    var n_v: int = n
+    while (n_v > 0) and ((t[n_v] & 192) == 128) {
+        n_v -= 1
+    }
+    return n_v
+}
+
+// C: common/diag_forma.c:34
+// O tamanho de s[0..<n] sem os espacos e tabs do fim (o C gravava o NUL ali).
+proc tirar_espacos_do_fim(s: []u8, n: int) -> int {
+    var n_v: int = n
+    while (n_v > 0) and ((s[n_v - 1] == 32) or (s[n_v - 1] == 9)) { // ' ' '\t'
+        n_v -= 1
+    }
+    return n_v
+}
+
+// C: common/diag_forma.c:41
+// A linha do fonte que contem off, sem o recuo e sem o comentario de fim de linha, cortada em LINHA_MAX - 1 bytes. Str nova na heap.
+proc linha_do_offset(f: ^Fonte, off: u32) -> str {
+    let t = f.texto
+    var i: u32 = f.tam as u32
+    if (off as u64) < f.tam {
+        i = off
+    }
+    var saida = make([dynamic]u8, alloc = heap)
+    defer delete(saida)
+    while (i > 0) and (t[i - 1] != 10) { // '\n'
+        i -= 1
+    }
+    while (t[i] == 32) or (t[i] == 9) { // ' ' '\t'
+        i += 1
+    }
+    while (t[i] != 0) and (t[i] != 10) and (t[i] != 13) { // '\0' '\n' '\r'
+        if (t[i] == 47) and (t[i + 1] == 47) { // '/' '/'
+            break
+        }
+        if len(saida) == (LINHA_MAX - 1) {
+            let corte = inicio_de_caractere(t[((i as int) - len(saida))..<len(t)], len(saida))
+            truncate(&saida, corte)
+            break
+        }
+        append(&saida, item = t[i])
+        i += 1
+    }
+    let n = tirar_espacos_do_fim(saida[..], len(saida))
+    return from_bytes(saida[0..<n], alloc = heap)
+}
+
+// C: common/diag_forma.c:61
+// O trecho que comeca em off: ate virgula, fecha-parenteses, fecha-colchete, fecha-chave, '//' ou o fim da linha. Str nova na heap.
+proc trecho_do_offset(f: ^Fonte, off: u32) -> str {
+    let t = f.texto
+    var saida = make([dynamic]u8, alloc = heap)
+    defer delete(saida)
+    if (off as u64) < f.tam {
+        var i: u32 = off
+        while (t[i] != 0) and (t[i] != 10) and (t[i] != 13) and (len(saida) < (TRECHO_MAX - 1)) {
+            // strchr(",)]}", t[i]) != NULL
+            if (t[i] == 44) or (t[i] == 41) or (t[i] == 93) or (t[i] == 125) or ((t[i] == 47) and (t[i + 1] == 47)) {
+                break
+            }
+            append(&saida, item = t[i])
+            i += 1
+        }
+    }
+    let n = tirar_espacos_do_fim(saida[..], len(saida))
+    return from_bytes(saida[0..<n], alloc = heap)
+}
+
+// C: common/diag_forma.c:76
+// O k-esimo (0, 1) texto entre aspas simples da causa, no buffer saida (terminado em NUL, no maximo NOME_MAX - 1 bytes); vazio se nao ha.
+proc diag_nome_entre_aspas(causa: str, k: i32, saida: []u8) {
+    let bytes = as_bytes(causa)
+    var p: int = 0
+    var visto: i32 = 0
+    saida[0] = 0
+    while true {
+        let abre = indice_do_byte(bytes, p, 39) // '\''
+        if abre < 0 {
+            return
+        }
+        let fecha = indice_do_byte(bytes, abre + 1, 39)
+        if fecha < 0 {
+            return
+        }
+        if visto == k {
+            var n: int = (fecha - abre) - 1
+            if n >= NOME_MAX_2 {
+                n = inicio_de_caractere(bytes[(abre + 1)..<len(bytes)], NOME_MAX_2 - 1)
+            }
+            copy(saida[0..<n], bytes[(abre + 1)..<((abre + 1) + n)])
+            saida[n] = 0
+            return
+        }
+        p = fecha + 1
+        visto += 1
+    }
+}
+
+// strchr(bytes + desde, c): o indice do 1o byte c a partir de desde, ou -1.
+proc indice_do_byte(bytes: []u8, desde: int, c: u8) -> int {
+    var i: int = desde
+    while i < len(bytes) {
+        if bytes[i] == c {
+            return i
+        }
+        i += 1
+    }
+    return -1
+}
+
+// C: common/diag_forma.c:96
+// O que as marcas dos textos precisam saber da ocorrencia. Os str de o ficam na heap: o chamador faz delete (menos causa, que e do Diag).
+proc preparar_ocorrencia(o: ^Ocorrencia, d: ^Diag, f: ^Fonte) {
+    let causa = d.causa or_else ""
+    var buffer_onde: [ONDE_MAX]u8 = {}
+    var buffer_nome: [NOME_MAX_2]u8 = {}
+    diag_descrever_onde(f, d.off, buffer_onde[..], ONDE_MAX as u64)
+    o.onde = diag_texto_do_buffer(buffer_onde[..])
+    o.linha = linha_do_offset(f, d.off)
+    o.trecho = trecho_do_offset(f, d.off)
+    diag_nome_entre_aspas(causa, 0, buffer_nome[..])
+    o.nome1 = diag_texto_do_buffer(buffer_nome[..])
+    diag_nome_entre_aspas(causa, 1, buffer_nome[..])
+    o.nome2 = diag_texto_do_buffer(buffer_nome[..])
+    o.causa = causa
+}
+
+// C: common/diag_forma.c:115
+// Acrescenta texto a montagem; nunca passa de cap - 1 bytes.
+proc anexar(m: ^[dynamic]u8, cap: int, texto: []u8) {
+    let cabe = (cap - 1) - len(m^)
+    var n = len(texto)
+    if n > cabe {
+        n = cabe
+    }
+    append(m, items = texto[0..<n])
+}
+
+// C: common/diag_forma.c:125
+proc valor_da_marca_2(o: ^Ocorrencia, marca: u8) -> ?str {
+    if marca == 79 { // 'O'
+        return o.onde
+    }
+    if marca == 76 { // 'L'
+        return o.linha
+    }
+    if marca == 84 { // 'T'
+        return o.trecho
+    }
+    if marca == 67 { // 'C'
+        return o.causa
+    }
+    if marca == 49 { // '1'
+        if len(o.nome1) > 0 {
+            return o.nome1
+        }
+        return o.trecho
+    }
+    if marca == 50 { // '2'
+        if len(o.nome2) > 0 {
+            return o.nome2
+        }
+        return o.trecho
+    }
+    return none
+}
+
+// C: common/diag_forma.c:139
+// Expande as marcas de modelo ($O $L $T $C $1 $2, $$ = '$') e acrescenta o resultado a montagem.
+proc expandir_2(modelo: str, o: ^Ocorrencia, m: ^[dynamic]u8, cap: int) {
+    var i: int = 0
+    while i < len(modelo) {
+        if modelo[i] == 0 {
+            break // o laco do C para no NUL
+        }
+        var valor: ?str = none
+        if modelo[i] == 36 { // '$'
+            valor = valor_da_marca_2(o, c2f_nul_em(modelo, i + 1))
+        }
+        if (modelo[i] == 36) and (c2f_nul_em(modelo, i + 1) == 36) {
+            anexar(m, cap, as_bytes("$"))
+            i += 1
+        } else if valor != none {
+            anexar(m, cap, as_bytes(valor or_else ""))
+            i += 1
+        } else {
+            anexar(m, cap, as_bytes(modelo)[i..<(i + 1)])
+        }
+        i += 1
+    }
+}
+
+// C: common/diag_forma.c:155
+// A 1a regra da tabela (e, no E0110, dos idiomas) que casa com o codigo e com o trecho da causa; devolve a regra por copia em regra.
+proc procurar_regra(d: ^Diag, regra: ^FormaDaCausa) -> bool {
+    let causa = d.causa or_else ""
+    for i in 0..<FORMAS_DA_CAUSA_QTD {
+        let r = FORMAS_DA_CAUSA[i]
+        if (r.codigo == d.codigo) and (text.str_index_of(causa, r.trecho_da_causa) != none) {
+            regra^ = r
+            return true
+        }
+    }
+    if d.codigo != E0110 {
+        return false
+    }
+    for i in 0..<(IDI_QTD as int) { // IA1-L1: os textos dos idiomas de outras linguagens vivem em idiomas.c
+        let forma = IDIOMAS[i].forma
+        if text.str_index_of(causa, forma.trecho_da_causa) != none {
+            regra^ = forma
+            return true
+        }
+    }
+    return false
+}
+
+// C: common/diag_forma.c:169
+// Frase geral (codigo sem regra na tabela): a causa e a linha do .fj na explicacao; a forma do catalogo e a linha na forma.
+proc frases_gerais(o: ^Ocorrencia, forma_catalogo: str, saida: ^FormaTextos) {
+    var explicacao = make([dynamic]u8, alloc = heap)
+    defer delete(explicacao)
+    var forma = make([dynamic]u8, alloc = heap)
+    defer delete(forma)
+    expandir_2("Na $O a Forja recusou a linha '$L': $C.", o, &explicacao, FORMA_TEXTO_MAX)
+    anexar(&forma, FORMA_TEXTO_MAX, as_bytes(forma_catalogo))
+    expandir_2(" (na linha '$L')", o, &forma, FORMA_TEXTO_MAX)
+    saida.explicacao = to_str(&explicacao)
+    saida.forma = to_str(&forma)
+}
+
+// C: common/diag_forma.c:180
+// Monta os dois textos da ocorrencia. f e a fonte onde o offset do diagnostico vale; forma_catalogo e a forma_certa do codigo (a frase geral a usa).
+proc diag_forma_da_ocorrencia(d: ^Diag, f: ^Fonte, forma_catalogo: str, saida: ^FormaTextos) {
+    var o: Ocorrencia = Ocorrencia{onde = "", linha = "", trecho = "", nome1 = "", nome2 = "", causa = ""}
+    var regra: FormaDaCausa = FormaDaCausa{codigo = 0, trecho_da_causa = "", explicacao = "", forma = ""}
+    let achou = procurar_regra(d, &regra)
+    preparar_ocorrencia(&o, d, f)
+    defer delete(o.onde)
+    defer delete(o.linha)
+    defer delete(o.trecho)
+    defer delete(o.nome1)
+    defer delete(o.nome2)
+    if achou {
+        var explicacao = make([dynamic]u8, alloc = heap)
+        defer delete(explicacao)
+        var forma = make([dynamic]u8, alloc = heap)
+        defer delete(forma)
+        expandir_2(regra.explicacao, &o, &explicacao, FORMA_TEXTO_MAX)
+        expandir_2(regra.forma, &o, &forma, FORMA_TEXTO_MAX)
+        saida.explicacao = to_str(&explicacao)
+        saida.forma = to_str(&forma)
+    } else {
+        frases_gerais(&o, forma_catalogo, saida)
+    }
+    // snprintf(saida->explicacao, 720, "%s", d->explicacao): o texto do Diag (<= 255 bytes) vale no lugar
+    let explicacao_do_diag = d.explicacao or_else ""
+    let forma_do_diag = d.forma or_else ""
+    // os dois campos de saida sao sempre texto de heap do chamador (delete): o do Diag entra por copia
+    if c2f_nul_em(explicacao_do_diag, 0) != 0 {
+        delete(saida.explicacao)
+        saida.explicacao = from_bytes(as_bytes(explicacao_do_diag), alloc = heap)
+    }
+    if c2f_nul_em(forma_do_diag, 0) != 0 {
+        delete(saida.forma)
+        saida.forma = from_bytes(as_bytes(forma_do_diag), alloc = heap)
+    }
+}

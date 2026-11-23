@@ -1,0 +1,286 @@
+// std do pacote zip (pcexcel F5, 0.1.0, 20/11/2026): escritor de .zip em FLUXO, Forja pura por cima de vendor:compression.
+// Entradas em deflate raw (o do .zip e do .xlsx) e crc32 da zlib (compression.crc); memoria constante: saida de 64 KiB + a entrada aberta.
+// Layout igual ao do xlsxwriter (Rust, packager.rs): metodo 8, data DOS 1980-01-01, bit 3 (tamanhos no descritor), bit 11 (nome UTF-8).
+// Sem zip64: arquivo ou entrada acima de 4 GiB, ou mais de 65535 entradas = ZipError.grande_demais.
+//
+// USO (o .fj raiz precisa de vendor\ ao lado: junção para language\vendor):
+//     import "vendor:compression/zip"
+//     var w = try zip.abrir("saida.zip")
+//     try zip.adicionar(&w, "xl/workbook.xml", as_bytes("<workbook/>"))   // uma entrada de uma vez
+//     try zip.comecar(&w, "xl/big.bin")                                    // ou em blocos:
+//     try zip.escrever(&w, bloco[..])                                      //   quantas vezes precisar
+//     try zip.terminar(&w)
+//     try zip.fechar(&w)                                                   // grava o diretorio central
+//
+// Changelog: 0.1.0 - abrir, comecar, escrever, terminar, adicionar, fechar.
+
+import "vendor:compression/compression"
+import "std:file"
+import "std:binary"
+
+pub enum ZipError {
+    arquivo
+    deflate
+    entrada_aberta
+    sem_entrada
+    nome_invalido
+    grande_demais
+    fechado
+}
+
+const TAM_SAIDA: int = 65536
+const NIVEL_DEFLATE: i32 = 6
+const LIMITE_NOME: int = 65535
+const LIMITE_ENTRADAS: int = 65535
+const LIMITE_U32: int = 4294967295
+const ASSINATURA_LOCAL: u32 = 0x04034B50
+const ASSINATURA_DESCRITOR: u32 = 0x08074B50
+const ASSINATURA_CENTRAL: u32 = 0x02014B50
+const ASSINATURA_FIM: u32 = 0x06054B50
+const VERSAO_EXTRAIR: u16 = 20
+const VERSAO_FEITA: u16 = 0x0314
+const FLAGS_ENTRADA: u16 = 0x0808
+const METODO_DEFLATE: u16 = 8
+const HORA_DOS_ZERO: u16 = 0
+const DATA_DOS_1980: u16 = 0x0021
+const ATRIB_EXTERNOS: u32 = 0x81800000
+
+pub struct Entrada {
+    nome_ini: int
+    nome_tam: int
+    offset: int
+    crc: u32
+    tam_orig: int
+    tam_comp: int
+}
+
+pub struct Zip {
+    arquivo: file.File
+    fluxo: compression.Stream
+    saida: [TAM_SAIDA]u8
+    nomes: [dynamic]u8
+    entradas: [dynamic]Entrada
+    cab: [dynamic]u8
+    gravados: int
+    aberta: bool
+    fechado: bool
+    atual: Entrada
+}
+
+struct Passo {
+    consumido: int
+    feito: bool
+}
+
+// Cria (ou zera) o arquivo de saida. O Zip e dono do arquivo: feche com fechar.
+pub proc abrir(caminho: str) -> Zip ! ZipError {
+    switch r in file.open(caminho, file.OpenMode.write) {
+    case file.File:
+        return Zip{arquivo = r, nomes = make([dynamic]u8, alloc = heap), entradas = make([dynamic]Entrada, alloc = heap), cab = make([dynamic]u8, alloc = heap)}
+    case file.FileError:
+        return ZipError.arquivo
+    }
+    return ZipError.arquivo
+}
+
+// Abre uma entrada com o nome dado (ex.: "xl/workbook.xml") e grava o cabecalho local.
+pub proc comecar(w: ^Zip, nome: str) -> ! ZipError {
+    if w.fechado {
+        return ZipError.fechado
+    }
+    if w.aberta {
+        return ZipError.entrada_aberta
+    }
+    if len(nome) == 0 or len(nome) > LIMITE_NOME {
+        return ZipError.nome_invalido
+    }
+    if len(w.entradas) >= LIMITE_ENTRADAS {
+        return ZipError.grande_demais
+    }
+    w.fluxo = try fluxo_deflate()
+    w.atual = Entrada{nome_ini = len(w.nomes), nome_tam = len(nome), offset = w.gravados}
+    append(&w.nomes, item = nome)
+    w.aberta = true
+    try cabecalho_local(w, nome)
+    return
+}
+
+// Grava bytes da entrada aberta (deflate em pedacos; crc e tamanhos saem no terminar).
+pub proc escrever(w: ^Zip, dados: []u8) -> ! ZipError {
+    if not w.aberta {
+        return ZipError.sem_entrada
+    }
+    w.atual.crc = compression.crc(dados, w.atual.crc)
+    w.atual.tam_orig += len(dados)
+    var pos: int = 0
+    while pos < len(dados) {
+        let passo = try empurrar(w, dados[pos..<len(dados)], false)
+        pos += passo.consumido
+    }
+    return
+}
+
+// Fecha o deflate da entrada aberta, grava o descritor (crc e tamanhos) e guarda a entrada para o diretorio central.
+pub proc terminar(w: ^Zip) -> ! ZipError {
+    if not w.aberta {
+        return ZipError.sem_entrada
+    }
+    var feito = false
+    while not feito {
+        let passo = try empurrar(w, w.cab[0..<0], true)
+        feito = passo.feito
+    }
+    compression.stream_close(&w.fluxo)
+    if w.atual.tam_orig > LIMITE_U32 or w.atual.tam_comp > LIMITE_U32 {
+        return ZipError.grande_demais
+    }
+    try gravar_descritor(w)
+    append(&w.entradas, item = w.atual)
+    w.aberta = false
+    return
+}
+
+// Atalho: uma entrada inteira de uma vez (comecar + escrever + terminar).
+pub proc adicionar(w: ^Zip, nome: str, dados: []u8) -> ! ZipError {
+    try comecar(w, nome)
+    try escrever(w, dados)
+    try terminar(w)
+    return
+}
+
+// Grava o diretorio central e o fim do arquivo, fecha o arquivo e libera as listas. Depois disto o Zip nao serve mais.
+pub proc fechar(w: ^Zip) -> ! ZipError {
+    if w.fechado {
+        return ZipError.fechado
+    }
+    if w.aberta {
+        return ZipError.entrada_aberta
+    }
+    let inicio = w.gravados
+    for i in 0..<len(w.entradas) {
+        try gravar_central(w, w.entradas[i])
+    }
+    let tamanho = w.gravados - inicio
+    try gravar_fim(w, inicio, tamanho)
+    file.close(&w.arquivo)
+    delete(w.nomes)
+    delete(w.entradas)
+    delete(w.cab)
+    w.fechado = true
+    return
+}
+
+// Compressor raw do nivel padrao. O erro da zlib vira ZipError.deflate.
+proc fluxo_deflate() -> compression.Stream ! ZipError {
+    switch r in compression.stream_deflate(NIVEL_DEFLATE, compression.StreamFormat.raw) {
+    case compression.Stream:
+        return r
+    case compression.ZlibError:
+        return ZipError.deflate
+    }
+    return ZipError.deflate
+}
+
+// Empurra um pedaco ao deflate e grava a saida pronta. Devolve quantos bytes da entrada foram lidos e se o fluxo acabou.
+proc empurrar(w: ^Zip, entrada: []u8, finalizar: bool) -> Passo ! ZipError {
+    switch r in compression.stream_push(&w.fluxo, entrada, w.saida[..], finalizar) {
+    case compression.StreamStep:
+        if r.consumed == 0 and r.written == 0 and not r.done {
+            return ZipError.deflate
+        }
+        try gravar_comprimido(w, r.written as int)
+        return Passo{consumido = r.consumed as int, feito = r.done}
+    case compression.ZlibError:
+        return ZipError.deflate
+    }
+    return ZipError.deflate
+}
+
+proc gravar_comprimido(w: ^Zip, n: int) -> ! ZipError {
+    w.atual.tam_comp += n
+    try gravar(w, w.saida[0..<n])
+    return
+}
+
+// Acrescenta bytes ao arquivo de saida. O limite de 4 GiB (sem zip64) e checado aqui.
+proc gravar(w: ^Zip, bytes: []u8) -> ! ZipError {
+    if w.gravados + len(bytes) > LIMITE_U32 {
+        return ZipError.grande_demais
+    }
+    if file.write(&w.arquivo, bytes) != none {
+        return ZipError.arquivo
+    }
+    w.gravados += len(bytes)
+    return
+}
+
+// Cabecalho local: tamanhos e crc zerados, porque vao no descritor depois dos dados.
+proc cabecalho_local(w: ^Zip, nome: str) -> ! ZipError {
+    clear(&w.cab)
+    binary.write_u32_le(&w.cab, ASSINATURA_LOCAL)
+    binary.write_u16_le(&w.cab, VERSAO_EXTRAIR)
+    binary.write_u16_le(&w.cab, FLAGS_ENTRADA)
+    binary.write_u16_le(&w.cab, METODO_DEFLATE)
+    binary.write_u16_le(&w.cab, HORA_DOS_ZERO)
+    binary.write_u16_le(&w.cab, DATA_DOS_1980)
+    binary.write_u32_le(&w.cab, 0)
+    binary.write_u32_le(&w.cab, 0)
+    binary.write_u32_le(&w.cab, 0)
+    binary.write_u16_le(&w.cab, len(nome) as u16)
+    binary.write_u16_le(&w.cab, 0)
+    try gravar(w, w.cab[..])
+    try gravar(w, as_bytes(nome))
+    return
+}
+
+// Descritor de dados (assinatura, crc, tamanho comprimido, tamanho original), depois dos dados da entrada.
+proc gravar_descritor(w: ^Zip) -> ! ZipError {
+    clear(&w.cab)
+    binary.write_u32_le(&w.cab, ASSINATURA_DESCRITOR)
+    binary.write_u32_le(&w.cab, w.atual.crc)
+    binary.write_u32_le(&w.cab, w.atual.tam_comp as u32)
+    binary.write_u32_le(&w.cab, w.atual.tam_orig as u32)
+    try gravar(w, w.cab[..])
+    return
+}
+
+// Registro do diretorio central de uma entrada; o nome sai do buffer de nomes.
+proc gravar_central(w: ^Zip, e: Entrada) -> ! ZipError {
+    clear(&w.cab)
+    binary.write_u32_le(&w.cab, ASSINATURA_CENTRAL)
+    binary.write_u16_le(&w.cab, VERSAO_FEITA)
+    binary.write_u16_le(&w.cab, VERSAO_EXTRAIR)
+    binary.write_u16_le(&w.cab, FLAGS_ENTRADA)
+    binary.write_u16_le(&w.cab, METODO_DEFLATE)
+    binary.write_u16_le(&w.cab, HORA_DOS_ZERO)
+    binary.write_u16_le(&w.cab, DATA_DOS_1980)
+    binary.write_u32_le(&w.cab, e.crc)
+    binary.write_u32_le(&w.cab, e.tam_comp as u32)
+    binary.write_u32_le(&w.cab, e.tam_orig as u32)
+    binary.write_u16_le(&w.cab, e.nome_tam as u16)
+    binary.write_u16_le(&w.cab, 0)
+    binary.write_u16_le(&w.cab, 0)
+    binary.write_u16_le(&w.cab, 0)
+    binary.write_u16_le(&w.cab, 0)
+    binary.write_u32_le(&w.cab, ATRIB_EXTERNOS)
+    binary.write_u32_le(&w.cab, e.offset as u32)
+    try gravar(w, w.cab[..])
+    try gravar(w, w.nomes[e.nome_ini..<(e.nome_ini + e.nome_tam)])
+    return
+}
+
+// Registro de fim do diretorio central: quantas entradas, tamanho e posicao do diretorio.
+proc gravar_fim(w: ^Zip, inicio: int, tamanho: int) -> ! ZipError {
+    let total = len(w.entradas)
+    clear(&w.cab)
+    binary.write_u32_le(&w.cab, ASSINATURA_FIM)
+    binary.write_u16_le(&w.cab, 0)
+    binary.write_u16_le(&w.cab, 0)
+    binary.write_u16_le(&w.cab, total as u16)
+    binary.write_u16_le(&w.cab, total as u16)
+    binary.write_u32_le(&w.cab, tamanho as u32)
+    binary.write_u32_le(&w.cab, inicio as u32)
+    binary.write_u16_le(&w.cab, 0)
+    try gravar(w, w.cab[..])
+    return
+}

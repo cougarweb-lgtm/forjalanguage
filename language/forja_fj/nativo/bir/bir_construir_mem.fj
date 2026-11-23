@@ -1,0 +1,568 @@
+// nativo/bir/bir_construir_mem.fj - porte de compiler/nativo/bir/bir_construir_mem.c
+// sha256 de nativo/bir/bir_construir_mem.c: f1b06ab89c5b5dea6aa197d491c33f56bb8e1136eedb7cb6a64829a25831ceab
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "common"
+import "frontend"
+import "ir"
+import "semantic"
+
+struct TabelasDoSlot {
+    vregs: ?[]i32
+    slots: ?[]i32
+    n: u32
+}
+
+// C: nativo/bir/bir_construir_mem.c:28
+proc bir_layouts(c: ^BirCtx) -> ^ir.Layouts {
+    if not c.lay_pronto {
+        ir.layout_calcular((c.e as ^BirEntrada).tipos as ^semantic.Tipos, (c.e as ^BirEntrada).ir as ^ir.IrPrograma, &(c.p as ^BirPrograma).arena, &c.lay)
+        c.lay_pronto = true
+    }
+    return &c.lay
+}
+
+// C: nativo/bir/bir_construir_mem.c:37
+proc bir_eh_struct(c: ^BirCtx, tipo: u32) -> bool {
+    return common.c2f_s2u_32(semantic.tipo_classe_de((c.e as ^BirEntrada).tipos as ^semantic.Tipos, tipo)) == (semantic.TC_STRUCT as u32)
+}
+
+// C: nativo/bir/bir_construir_mem.c:44
+proc bir_eh_agregado(tipos: ^semantic.Tipos, tipo: u32) -> bool {
+    let classe: i32 = semantic.tipo_classe_de(tipos, tipo)
+    if common.c2f_s2u_32(classe) == (semantic.TC_OPCIONAL as u32) {
+        return not bir_eh_ponteiro_opcional(tipos, tipo)
+    }
+    let sw_1 = common.c2f_s2u_32(classe)
+    if sw_1 == (semantic.TC_STRUCT as u32) or sw_1 == (semantic.TC_RESULTADO as u32) or sw_1 == (semantic.TC_TEXTO as u32) or sw_1 == (semantic.TC_ARRAY as u32) or sw_1 == (semantic.TC_FATIA as u32) or sw_1 == (semantic.TC_DINAMICO as u32) or sw_1 == (semantic.TC_UNIAO as u32) or sw_1 == (semantic.TC_TUPLA as u32) or sw_1 == (semantic.TC_MATRIZ as u32) or sw_1 == (semantic.TC_SOA as u32) or sw_1 == (semantic.TC_MAPA as u32) {
+        return true
+    } else {
+        return false
+    }
+    return false
+}
+
+// C: nativo/bir/bir_construir_mem.c:58
+proc bir_forma(c: ^BirCtx, tipo: u32, forma: ^BirSlot) -> bool {
+    let l: ^ir.Layouts = bir_layouts(c)
+    if (tipo >= l.qtd) or ((l.tipos or_else {})[tipo].tam == 0) {
+        return bir_falha_inconsistente(c, "tipo sem forma em C no layout")
+    }
+    forma^ = BirSlot{tam = (l.tipos or_else {})[tipo].tam, alinhamento = (l.tipos or_else {})[tipo].ali}
+    return true
+}
+
+// C: nativo/bir/bir_construir_mem.c:68
+proc bir_campo_de(c: ^BirCtx, tipo_struct: u32, nome: i32, info: ^BirCampoInfo) -> bool {
+    let s: ?^ir.IrStruct = ir.layout_estrutura((c.e as ^BirEntrada).tipos as ^semantic.Tipos, (c.e as ^BirEntrada).ir as ^ir.IrPrograma, tipo_struct)
+    if s == none {
+        return bir_falha_inconsistente(c, "struct sem definicao na IR")
+    }
+    var k: u32 = 0
+    while k < (s as ^ir.IrStruct).ncampos {
+        if ((s as ^ir.IrStruct).campos or_else {})[k].nome != nome {
+            k += 1
+            continue
+        }
+        info^ = BirCampoInfo{offset = ir.layout_offset_campo(bir_layouts(c), tipo_struct, k), tipo = ((s as ^ir.IrStruct).campos or_else {})[k].tipo}
+        return true
+    }
+    return bir_falha_inconsistente(c, "campo inexistente na struct")
+}
+
+// C: nativo/bir/bir_construir_mem.c:85
+// C2F-13: mapa fundido em n (len); mora na arena do programa (o C fazia realloc), todo a -1 nos n primeiros
+proc mapa_de_slots(c: ^BirCtx, n: u32) -> []i32 {
+    var mapa: []i32 = common.arena_fatia_i32(&(c.p as ^BirPrograma).arena, (n + 1) as int)
+    for k in (0 as u32)..<n {
+        mapa[k] = -1
+    }
+    return mapa
+}
+
+// C: nativo/bir/bir_construir_mem.c:95
+proc eh_endereco_de_local(i: ?^ir.IrInstr) -> bool {
+    return (((i as ^ir.IrInstr).op == (ir.IR_UNARIO as u8)) and ((i as ^ir.IrInstr).op_aux == (frontend.OP_ENDERECO as u8))) and ((i as ^ir.IrInstr).a.tipo_no == (ir.V_LOCAL as u8))
+}
+
+// C: nativo/bir/bir_construir_mem.c:101
+proc marcar_enderecos(c: ^BirCtx, bloco: ^ir.IrBloco) {
+    var i: ?^ir.IrInstr = bloco.primeira
+    while i != none {
+        if ((common.c2f_b2i32(eh_endereco_de_local(i)) != 0) and ((i as ^ir.IrInstr).a.id >= 0)) and (common.c2f_s2u_32((i as ^ir.IrInstr).a.id) < c.n_local) {
+            let ptr_1: ^ir.IrInstr = i as ^ir.IrInstr
+            let p_1 = c.em_memoria or_else {}
+            p_1[ptr_1.a.id] = 1
+        }
+        marcar_enderecos(c, &(i as ^ir.IrInstr).cond)
+        marcar_enderecos(c, &(i as ^ir.IrInstr).corpo)
+        marcar_enderecos(c, &(i as ^ir.IrInstr).senao)
+        for k in (0 as u32)..<(i as ^ir.IrInstr).ncasos {
+            marcar_enderecos(c, &((i as ^ir.IrInstr).casos or_else {})[k].corpo)
+        }
+        i = (i as ^ir.IrInstr).prox
+    }
+}
+
+// C: nativo/bir/bir_construir_mem.c:114
+proc bir_mem_preparar_funcao(c: ^BirCtx, irf: ^ir.IrFuncao) {
+    let p: ^BirPrograma = c.p as ^BirPrograma
+    c.slot_local = mapa_de_slots(c, irf.nlocais)
+    c.slot_temp = mapa_de_slots(c, irf.ntemps)
+    c.tipo_local = common.arena_fatia_u32(&p.arena, (irf.nlocais + 1) as int)
+    c.em_memoria = common.arena_fatia_u8(&p.arena, (irf.nlocais + 1) as int)
+    let tipos_local: []u32 = c.tipo_local or_else {}
+    let nparams_locais: u32 = min(irf.nparams, irf.nlocais)
+    for k in (0 as u32)..<nparams_locais {
+        tipos_local[k] = ((irf.params or_else {})[k]).tipo
+    }
+    marcar_enderecos(c, &irf.corpo)
+}
+
+// C: nativo/bir/bir_construir_mem.c:129
+// Os mapas moram na arena do programa (liberada no fim): aqui so se solta a referencia, como o free do C
+proc bir_mem_liberar(c: ^BirCtx) {
+    c.slot_local = none
+    c.slot_temp = none
+    c.tipo_local = none
+    c.em_memoria = none
+}
+
+// C: nativo/bir/bir_construir_mem.c:137
+proc bir_registrar_tipo_local(c: ^BirCtx, local: i32, tipo: u32) {
+    if (local >= 0) and (common.c2f_s2u_32(local) < c.n_local) {
+        let p_1 = c.tipo_local or_else {}
+        p_1[local] = tipo
+    }
+}
+
+// C: nativo/bir/bir_construir_mem.c:145
+proc bir_emitir_end_slot(c: ^BirCtx, slot: u32, dst: u32) -> u32 {
+    let m: ^BirInstr = bir_emitir(c, BIR_END_SLOT, BC_I64 as u8)
+    m.dst = dst
+    m.a = op_imed(slot as i64, BC_I64 as u8)
+    return dst
+}
+
+// C: nativo/bir/bir_construir_mem.c:154
+proc bir_emitir_carrega(c: ^BirCtx, dst: u32, base: u32, desloc: i32) {
+    let m: ^BirInstr = bir_emitir(c, BIR_CARREGA, ((c.f as ^BirFuncao).classe_vreg or_else {})[dst])
+    m.dst = dst
+    m.a = op_vreg(base, BC_I64 as u8)
+    m.desloc = desloc
+}
+
+// C: nativo/bir/bir_construir_mem.c:163
+proc bir_emitir_grava(c: ^BirCtx, base: u32, desloc: i32, valor: BirOperando) {
+    let m: ^BirInstr = bir_emitir(c, BIR_GRAVA, valor.classe)
+    m.a = op_vreg(base, BC_I64 as u8)
+    m.b = valor
+    m.desloc = desloc
+}
+
+// C: nativo/bir/bir_construir_mem.c:173
+proc chamar_bloco(c: ^BirCtx, funcao: ?str, args: [3]BirOperando) {
+    var copia: []BirOperando = arena_fatia_bir_operando(&(c.p as ^BirPrograma).arena, 3)
+    for k in 0..<3 {
+        copia[k] = args[k]
+    }
+    let chama: ^BirInstr = bir_emitir(c, BIR_CHAMA, BC_NADA as u8)
+    chama.simbolo = bir_simbolo_runtime(c, funcao)
+    chama.args = copia
+    chama.nargs = 3
+}
+
+// C: nativo/bir/bir_construir_mem.c:185
+proc bir_copia_bloco(c: ^BirCtx, destino: u32, origem: u32, tam: u32) {
+    if tam > BIR_COPIA_MEM_MAX {
+        let args: [3]BirOperando = {op_vreg(destino, BC_I64 as u8), op_vreg(origem, BC_I64 as u8), op_imed(tam as i64, BC_I64 as u8)}
+        chamar_bloco(c, (c.p as ^BirPrograma).nomes_mem.copia, args)
+        return
+    }
+    let m: ^BirInstr = bir_emitir(c, BIR_COPIA_MEM, BC_NADA as u8)
+    m.a = op_vreg(destino, BC_I64 as u8)
+    m.b = op_vreg(origem, BC_I64 as u8)
+    m.desloc = tam as i32
+}
+
+// C: nativo/bir/bir_construir_mem.c:199
+proc bir_zera_bloco(c: ^BirCtx, destino: u32, tam: u32) {
+    if tam > BIR_COPIA_MEM_MAX {
+        let args: [3]BirOperando = {op_vreg(destino, BC_I64 as u8), op_imed(0, BC_I32 as u8), op_imed(tam as i64, BC_I64 as u8)}
+        chamar_bloco(c, (c.p as ^BirPrograma).nomes_mem.zera, args)
+        return
+    }
+    let m: ^BirInstr = bir_emitir(c, BIR_ZERA_MEM, BC_NADA as u8)
+    m.a = op_vreg(destino, BC_I64 as u8)
+    m.desloc = tam as i32
+}
+
+// C: nativo/bir/bir_construir_mem.c:213
+// IA1-L5b: memset/memcpy do runtime com o numero de bytes so conhecido na execucao
+proc bir_zera_dinamico(c: ^BirCtx, destino: u32, bytes: BirOperando) {
+    let args: [3]BirOperando = {op_vreg(destino, BC_I64 as u8), op_imed(0, BC_I32 as u8), bytes}
+    chamar_bloco(c, (c.p as ^BirPrograma).nomes_mem.zera, args)
+}
+
+// C: nativo/bir/bir_construir_mem.c:218
+proc bir_copia_dinamica(c: ^BirCtx, destino: u32, origem: u32, bytes: BirOperando) {
+    let args: [3]BirOperando = {op_vreg(destino, BC_I64 as u8), op_vreg(origem, BC_I64 as u8), bytes}
+    chamar_bloco(c, (c.p as ^BirPrograma).nomes_mem.copia, args)
+}
+
+// C: nativo/bir/bir_construir_mem.c:224
+proc bir_endereco_mais(c: ^BirCtx, base: u32, off: u32) -> u32 {
+    if off == 0 {
+        return base
+    }
+    return bir_conta_nova(c, BC_I64 as u8, BirPedido{op = BIR_ADD as u8, a = op_vreg(base, BC_I64 as u8), b = op_imed(off as i64, BC_I64 as u8)})
+}
+
+// C: nativo/bir/bir_construir_mem.c:236
+proc tabelas_do_pedido(c: ^BirCtx, pedido: ^BirPedidoSlot) -> TabelasDoSlot {
+    if pedido.temporario {
+        return TabelasDoSlot{vregs = c.vreg_temp, slots = c.slot_temp, n = c.n_temp}
+    }
+    return TabelasDoSlot{vregs = c.vreg_local, slots = c.slot_local, n = c.n_local}
+}
+
+// C: nativo/bir/bir_construir_mem.c:244
+proc slot_redefinido(c: ^BirCtx, slot: i32, tam: u32) -> bool {
+    return (slot < 0) or ((c.f as ^BirFuncao).slots[slot].tam != tam)
+}
+
+// C: nativo/bir/bir_construir_mem.c:250
+proc bir_definir_slot(c: ^BirCtx, pedido: ^BirPedidoSlot, vreg: ^u32) -> bool {
+    let t: TabelasDoSlot = tabelas_do_pedido(c, pedido)
+    let id: i32 = pedido.id
+    if (id < 0) or (common.c2f_s2u_32(id) >= t.n) {
+        return bir_falha_inconsistente(c, "numero de agregado fora da funcao")
+    }
+    if (t.vregs or_else {})[id] < 0 {
+        let p_1 = t.vregs or_else {}
+        p_1[id] = transmute(bir_novo_vreg(c, BC_I64 as u8), to = i32)
+        let p_2 = t.slots or_else {}
+        p_2[id] = transmute(bir_novo_slot(c, pedido.forma.tam, pedido.forma.alinhamento), to = i32)
+    } else if slot_redefinido(c, (t.slots or_else {})[id], pedido.forma.tam) {
+        return bir_falha_inconsistente(c, "numero redefinido com outro agregado")
+    }
+    vreg^ = common.c2f_s2u_32((t.vregs or_else {})[id])
+    _ = bir_emitir_end_slot(c, common.c2f_s2u_32((t.slots or_else {})[id]), vreg^)
+    return true
+}
+
+// C: nativo/bir/bir_construir_mem.c:268
+proc eh_nome_agregado(c: ^BirCtx, v: ^ir.Valor) -> bool {
+    return ((v.tipo_no == (ir.V_LOCAL as u8)) or (v.tipo_no == (ir.V_TEMP as u8))) and (common.c2f_b2i32(bir_eh_agregado((c.e as ^BirEntrada).tipos as ^semantic.Tipos, v.tipo)) != 0)
+}
+
+// C: nativo/bir/bir_construir_mem.c:273
+proc endereco_do_nome(c: ^BirCtx, v: ^ir.Valor, endereco: ^u32) -> bool {
+    var tern_1: i32 = 0
+    if v.tipo_no == (ir.V_TEMP as u8) {
+        tern_1 = common.c2f_b2i32(bir_vreg_temp(c, v.id, endereco))
+    } else {
+        tern_1 = common.c2f_b2i32(bir_vreg_local(c, v.id, endereco))
+    }
+    return tern_1 != 0
+}
+
+// F4 (0.26.0): V_DADO = const de array em .rdata (so leitura por indice). O endereco e o do simbolo BS_DADO;
+// o simbolo de cada IrDado e criado 1x e guardado em dado_simbolo (bir_simbolo_dado dedup por bytes, mas hasheia).
+proc bir_endereco_do_dado(c: ^BirCtx, v: ^ir.Valor, endereco: ^u32) -> bool {
+    let prog: ^ir.IrPrograma = (c.e as ^BirEntrada).ir as ^ir.IrPrograma
+    let dados: []ir.IrDado = prog.dados or_else {}
+    if (v.id < 0) or ((v.id as int) >= len(dados)) {
+        return bir_falha_inconsistente(c, "V_DADO fora de IrPrograma.dados")
+    }
+    if c.dado_simbolo == none {
+        c.dado_simbolo = common.arena_fatia_u32(&(c.p as ^BirPrograma).arena, len(dados))
+    }
+    let marcas: []u32 = c.dado_simbolo or_else {}
+    var simbolo: u32 = marcas[v.id as int]
+    if simbolo == 0 {
+        let d: ^ir.IrDado = &dados[v.id as int]
+        let bytes: str = from_bytes(d.bytes or_else {}, alloc = heap)
+        simbolo = bir_simbolo_dado(c, bytes, d.tam, d.ali) + 1
+        delete(bytes)
+        marcas[v.id as int] = simbolo
+    }
+    endereco^ = bir_novo_vreg(c, BC_I64 as u8)
+    _ = bir_emitir_pedido(c, BirPedido{op = BIR_END_SIMBOLO as u8, dst = endereco^, a = op_simbolo(simbolo - 1)})
+    return true
+}
+
+// C: nativo/bir/bir_construir_mem.c:278
+proc bir_endereco_de(c: ^BirCtx, i: ^ir.IrInstr, v: ^ir.Valor, endereco: ^u32) -> bool {
+    if v.tipo_no == (ir.V_DADO as u8) {
+        return bir_endereco_do_dado(c, v, endereco)
+    }
+    if (v.tipo_no == (ir.V_TEXTO as u8)) and (v.tipo == (semantic.TIPO_STR as u32)) {
+        return bir_texto_literal(c, v, endereco)
+    }
+    if (v.tipo_no == (ir.V_NULO as u8)) and (common.c2f_b2i32(bir_eh_agregado((c.e as ^BirEntrada).tipos as ^semantic.Tipos, v.tipo)) != 0) {
+        return bir_nulo_agregado(c, v.tipo, endereco)
+    }
+    if not eh_nome_agregado(c, v) {
+        let arg_1: u32 = v.tipo
+        let arg_2: str = bir_variante_de(c, i)
+        let arg_3: ^ir.IrInstr = i
+        let arg_4: ^BirCtx = c
+        return bir_falha_tipo(arg_4, arg_3, arg_2, arg_1)
+    }
+    return endereco_do_nome(c, v, endereco)
+}
+
+// C: nativo/bir/bir_construir_mem.c:289
+proc bir_ler_local_em_memoria(c: ^BirCtx, v: ^ir.Valor, saida: ^BirOperando) -> bool {
+    var classe: u8 = BC_NADA as u8
+    var endereco: u32 = 0
+    var dst: u32 = 0
+    if not bir_vreg_local(c, v.id, &endereco) {
+        return false
+    }
+    _ = bir_classe_do_tipo((c.e as ^BirEntrada).tipos as ^semantic.Tipos, v.tipo, &classe)
+    dst = bir_novo_vreg(c, classe)
+    bir_emitir_carrega(c, dst, endereco, 0)
+    saida^ = op_vreg(dst, classe)
+    return true
+}
+
+// C: nativo/bir/bir_construir_mem.c:304
+proc bir_base_do_campo(c: ^BirCtx, i: ^ir.IrInstr, base: ^ir.Valor, saida: ^BirBaseCampo) -> bool {
+    let tipos: ?^semantic.Tipos = (c.e as ^BirEntrada).tipos
+    var ponteiro: BirOperando = BirOperando{}
+    if bir_eh_struct(c, base.tipo) {
+        saida.tipo_struct = base.tipo
+        return bir_endereco_de(c, i, base, &saida.endereco)
+    }
+    if (common.c2f_s2u_32(semantic.tipo_classe_de(tipos as ^semantic.Tipos, base.tipo)) != (semantic.TC_PONTEIRO as u32)) or (not bir_eh_struct(c, semantic.tipo_de(tipos as ^semantic.Tipos, base.tipo).a)) {
+        return bir_falha_tipo(c, i, "-", base.tipo)
+    }
+    saida.tipo_struct = semantic.tipo_de(tipos as ^semantic.Tipos, base.tipo).a
+    if (not bir_operando_de(c, i, base, &ponteiro)) or (not bir_operando_vreg(c, ponteiro, &ponteiro)) {
+        return false
+    }
+    saida.endereco = ponteiro.id
+    return true
+}
+
+// C: nativo/bir/bir_construir_mem.c:323
+proc bir_gravar_em(c: ^BirCtx, i: ^ir.IrInstr, alvo: ^BirAlvoMem, valor: ^ir.Valor) -> bool {
+    var operando: BirOperando = BirOperando{}
+    var forma: BirSlot = BirSlot{}
+    var origem: u32 = 0
+    if bir_eh_agregado((c.e as ^BirEntrada).tipos as ^semantic.Tipos, alvo.tipo) {
+        if (not bir_forma(c, alvo.tipo, &forma)) or (not bir_endereco_de(c, i, valor, &origem)) {
+            return false
+        }
+        let arg_1: u32 = forma.tam
+        let arg_2: u32 = origem
+        let arg_3: u32 = bir_endereco_mais(c, alvo.base, alvo.offset)
+        let arg_4: ^BirCtx = c
+        bir_copia_bloco(arg_4, arg_3, arg_2, arg_1)
+        return true
+    }
+    if not bir_operando_de(c, i, valor, &operando) {
+        return false
+    }
+    bir_emitir_grava(c, alvo.base, transmute(alvo.offset, to = i32), operando)
+    return true
+}
+
+// C: nativo/bir/bir_construir_mem.c:343
+proc bir_local_em_memoria(c: ^BirCtx, i: ^ir.IrInstr) -> bool {
+    var classe: u8 = 0
+    if bir_eh_agregado((c.e as ^BirEntrada).tipos as ^semantic.Tipos, i.tipo) {
+        return true
+    }
+    if ((i.destino < 0) or (common.c2f_s2u_32(i.destino) >= c.n_local)) or (not ((c.em_memoria or_else {})[i.destino] != 0)) {
+        return false
+    }
+    return bir_classe_do_tipo((c.e as ^BirEntrada).tipos as ^semantic.Tipos, i.tipo, &classe)
+}
+
+// C: nativo/bir/bir_construir_mem.c:354
+proc local_agregado(c: ^BirCtx, i: ^ir.IrInstr) -> bool {
+    var pedido: BirPedidoSlot = BirPedidoSlot{id = i.destino}
+    var dst: u32 = 0
+    var origem: u32 = 0
+    if (not bir_forma(c, i.tipo, &pedido.forma)) or (not bir_definir_slot(c, &pedido, &dst)) {
+        return false
+    }
+    if i.a.tipo_no == (ir.V_NENHUM as u8) {
+        bir_zera_bloco(c, dst, pedido.forma.tam)
+        return true
+    }
+    if not bir_endereco_de(c, i, &i.a, &origem) {
+        return false
+    }
+    bir_copia_bloco(c, dst, origem, pedido.forma.tam)
+    return true
+}
+
+// C: nativo/bir/bir_construir_mem.c:371
+proc local_escalar_em_memoria(c: ^BirCtx, i: ^ir.IrInstr) -> bool {
+    var pedido: BirPedidoSlot = BirPedidoSlot{id = i.destino}
+    var classe: u8 = BC_NADA as u8
+    var valor: BirOperando = BirOperando{}
+    var endereco: u32 = 0
+    _ = bir_classe_do_tipo((c.e as ^BirEntrada).tipos as ^semantic.Tipos, i.tipo, &classe)
+    valor = op_imed(0, classe)
+    if (not bir_forma(c, i.tipo, &pedido.forma)) or (not bir_definir_slot(c, &pedido, &endereco)) {
+        return false
+    }
+    if (i.a.tipo_no != (ir.V_NENHUM as u8)) and (not bir_operando_de(c, i, &i.a, &valor)) {
+        return false
+    }
+    bir_emitir_grava(c, endereco, 0, valor)
+    return true
+}
+
+// C: nativo/bir/bir_construir_mem.c:388
+proc bir_regra_local_mem(c: ^BirCtx, i: ^ir.IrInstr) -> bool {
+    var tern_1: i32 = 0
+    if common.c2f_b2i32(bir_eh_agregado((c.e as ^BirEntrada).tipos as ^semantic.Tipos, i.tipo)) != 0 {
+        tern_1 = common.c2f_b2i32(local_agregado(c, i))
+    } else {
+        tern_1 = common.c2f_b2i32(local_escalar_em_memoria(c, i))
+    }
+    return tern_1 != 0
+}
+
+// C: nativo/bir/bir_construir_mem.c:395
+proc bir_atribuicao_em_memoria(c: ^BirCtx, i: ^ir.IrInstr) -> bool {
+    if i.nome >= 0 {
+        return true
+    }
+    if (i.destino < 0) or (common.c2f_s2u_32(i.destino) >= c.n_local) {
+        return false
+    }
+    return (((c.em_memoria or_else {})[i.destino] as i32) != 0) or (common.c2f_b2i32(bir_eh_agregado((c.e as ^BirEntrada).tipos as ^semantic.Tipos, (c.tipo_local or_else {})[i.destino])) != 0)
+}
+
+// C: nativo/bir/bir_construir_mem.c:404
+proc atribui_campo(c: ^BirCtx, i: ^ir.IrInstr) -> bool {
+    var local: ir.Valor = ir.Valor{tipo_no = ir.V_LOCAL as u8, id = i.destino, tipo = (c.tipo_local or_else {})[i.destino]}
+    var base: BirBaseCampo = BirBaseCampo{}
+    var campo: BirCampoInfo = BirCampoInfo{}
+    if (not bir_base_do_campo(c, i, &local, &base)) or (not bir_campo_de(c, base.tipo_struct, i.nome, &campo)) {
+        return false
+    }
+    var lit_1 = BirAlvoMem{base = base.endereco, offset = campo.offset, tipo = campo.tipo}
+    let arg_1: ^ir.Valor = &i.a
+    let arg_2: ^BirAlvoMem = &lit_1
+    let arg_3: ^ir.IrInstr = i
+    let arg_4: ^BirCtx = c
+    return bir_gravar_em(arg_4, arg_3, arg_2, arg_1)
+}
+
+// C: nativo/bir/bir_construir_mem.c:415
+proc atribui_struct(c: ^BirCtx, i: ^ir.IrInstr) -> bool {
+    let tipo: u32 = (c.tipo_local or_else {})[i.destino]
+    var forma: BirSlot = BirSlot{}
+    var dst: u32 = 0
+    var origem: u32 = 0
+    if ((not bir_forma(c, tipo, &forma)) or (not bir_vreg_local(c, i.destino, &dst))) or (not bir_endereco_de(c, i, &i.a, &origem)) {
+        return false
+    }
+    bir_copia_bloco(c, dst, origem, forma.tam)
+    return true
+}
+
+// C: nativo/bir/bir_construir_mem.c:427
+proc atribui_escalar_em_memoria(c: ^BirCtx, i: ^ir.IrInstr) -> bool {
+    var valor: BirOperando = BirOperando{}
+    var endereco: u32 = 0
+    if (not bir_vreg_local(c, i.destino, &endereco)) or (not bir_operando_de(c, i, &i.a, &valor)) {
+        return false
+    }
+    bir_emitir_grava(c, endereco, 0, valor)
+    return true
+}
+
+// C: nativo/bir/bir_construir_mem.c:438
+proc bir_regra_atribuicao_mem(c: ^BirCtx, i: ^ir.IrInstr) -> bool {
+    if i.nome >= 0 {
+        return atribui_campo(c, i)
+    }
+    var tern_1: i32 = 0
+    if common.c2f_b2i32(bir_eh_agregado((c.e as ^BirEntrada).tipos as ^semantic.Tipos, (c.tipo_local or_else {})[i.destino])) != 0 {
+        tern_1 = common.c2f_b2i32(atribui_struct(c, i))
+    } else {
+        tern_1 = common.c2f_b2i32(atribui_escalar_em_memoria(c, i))
+    }
+    return tern_1 != 0
+}
+
+// C: nativo/bir/bir_construir_mem.c:447
+proc campo_agregado(c: ^BirCtx, i: ^ir.IrInstr, endereco: u32, campo: ^BirCampoInfo) -> bool {
+    var pedido: BirPedidoSlot = BirPedidoSlot{temporario = true, id = i.destino}
+    var dst: u32 = 0
+    if (not bir_forma(c, campo.tipo, &pedido.forma)) or (not bir_definir_slot(c, &pedido, &dst)) {
+        return false
+    }
+    let arg_1: u32 = pedido.forma.tam
+    let arg_2: u32 = bir_endereco_mais(c, endereco, campo.offset)
+    let arg_3: u32 = dst
+    let arg_4: ^BirCtx = c
+    bir_copia_bloco(arg_4, arg_3, arg_2, arg_1)
+    return true
+}
+
+// C: nativo/bir/bir_construir_mem.c:458
+proc bir_regra_campo(c: ^BirCtx, i: ^ir.IrInstr) -> bool {
+    var base: BirBaseCampo = BirBaseCampo{}
+    var campo: BirCampoInfo = BirCampoInfo{}
+    var classe: u8 = BC_NADA as u8
+    var dst: u32 = 0
+    if (not bir_base_do_campo(c, i, &i.a, &base)) or (not bir_campo_de(c, base.tipo_struct, i.nome, &campo)) {
+        return false
+    }
+    if bir_eh_agregado((c.e as ^BirEntrada).tipos as ^semantic.Tipos, campo.tipo) {
+        return campo_agregado(c, i, base.endereco, &campo)
+    }
+    if not bir_classe_do_tipo((c.e as ^BirEntrada).tipos as ^semantic.Tipos, campo.tipo, &classe) {
+        return bir_falha_tipo(c, i, "-", campo.tipo)
+    }
+    if not bir_definir_destino(c, classe, &dst) {
+        return false
+    }
+    bir_emitir_carrega(c, dst, base.endereco, transmute(campo.offset, to = i32))
+    return true
+}
+
+// C: nativo/bir/bir_construir_mem.c:478
+proc gravar_campos_da_struct(c: ^BirCtx, i: ^ir.IrInstr, s: ?^ir.IrStruct, dst: u32) -> bool {
+    var k: u32 = 0
+    while k < (s as ^ir.IrStruct).ncampos {
+        let arg_1: u32 = k
+        let arg_2: u32 = i.tipo
+        let arg_3: ^ir.Layouts = bir_layouts(c)
+        var alvo: BirAlvoMem = BirAlvoMem{base = dst, offset = ir.layout_offset_campo(arg_3, arg_2, arg_1), tipo = ((s as ^ir.IrStruct).campos or_else {})[k].tipo}
+        if not bir_gravar_em(c, i, &alvo, &(i.args or_else {})[k]) {
+            return false
+        }
+        k += 1
+    }
+    return true
+}
+
+// C: nativo/bir/bir_construir_mem.c:489
+proc bir_regra_struct(c: ^BirCtx, i: ^ir.IrInstr) -> bool {
+    let s: ?^ir.IrStruct = ir.layout_estrutura((c.e as ^BirEntrada).tipos as ^semantic.Tipos, (c.e as ^BirEntrada).ir as ^ir.IrPrograma, i.tipo)
+    var pedido: BirPedidoSlot = BirPedidoSlot{temporario = true, id = i.destino}
+    var dst: u32 = 0
+    if (s == none) or (i.nargs != (s as ^ir.IrStruct).ncampos) {
+        return bir_falha_inconsistente(c, "IR_STRUCT com valores diferentes dos campos")
+    }
+    if (not bir_forma(c, i.tipo, &pedido.forma)) or (not bir_definir_slot(c, &pedido, &dst)) {
+        return false
+    }
+    if (s as ^ir.IrStruct).ncampos == 0 {
+        bir_zera_bloco(c, dst, pedido.forma.tam)
+        return true
+    }
+    return gravar_campos_da_struct(c, i, s, dst)
+}

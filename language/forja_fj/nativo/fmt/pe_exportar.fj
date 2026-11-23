@@ -1,0 +1,167 @@
+// nativo/fmt/pe_exportar.fj - porte de compiler/nativo/fmt/pe_exportar.c
+// sha256 de nativo/fmt/pe_exportar.c: 2aa316659a39e782d142d40c18313777a67886c389f57db1674c99adfdf84a6b
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "common"
+
+struct ExpPlano {
+    eat: u32
+    enpt: u32
+    eot: u32
+    textos: u32
+}
+
+struct ExpPedido {
+    base: u32
+    nome_dll: ?str
+    ordenados: ?[]PeExporta
+    n: u32
+}
+
+const EXP_TAM_DIRETORIO: u32 = 40
+const EXP_TAM_RVA: u32 = 4
+const EXP_TAM_ORDINAL: u32 = 2
+const EXP_ORDINAL_BASE: u32 = 1
+const EXP_BITS_BYTE: u32 = 8
+
+// C: nativo/fmt/pe_exportar.c:23
+proc exp_anexar_le(b: ^[dynamic]u8, v: u64, n: u32) {
+    for k in (0 as u32)..<n {
+        append(b, item = common.c2f_trunc_u8(v >> (((k * EXP_BITS_BYTE) & 63) as u64)))
+    }
+}
+
+// C: nativo/fmt/pe_exportar.c:31
+// C2F-INDECIDIVEL: o C compara com strcmp via qsort (void*); aqui str x str devolve <0, 0, >0 (bytes sem sinal)
+proc exp_compara_nome(a: str, b: str) -> i32 {
+    let ba: []u8 = as_bytes(a)
+    let bb: []u8 = as_bytes(b)
+    let comum: u64 = min(len(ba) as u64, len(bb) as u64)
+    for k in (0 as u64)..<comum {
+        if ba[k] < bb[k] {
+            return -1
+        }
+        if ba[k] > bb[k] {
+            return 1
+        }
+    }
+    if len(ba) < len(bb) {
+        return -1
+    }
+    if len(ba) > len(bb) {
+        return 1
+    }
+    return 0
+}
+
+// C2F-INDECIDIVEL: qsort do C (nao estavel) trocado por insercao estavel na mesma ordem por strcmp;
+// com nomes repetidos a saida e recusada (exp_tem_repetido), entao o desempate nao muda o resultado
+proc exp_ordenar_nomes(lista: []PeExporta) {
+    let total: u64 = len(lista) as u64
+    for k in (1 as u64)..<total {
+        var j: u64 = k
+        while (j > 0) and (exp_compara_nome(lista[j - 1].nome or_else "", lista[j].nome or_else "") > 0) {
+            let troca: PeExporta = lista[j]
+            lista[j] = lista[j - 1]
+            lista[j - 1] = troca
+            j -= 1
+        }
+    }
+}
+
+// C: nativo/fmt/pe_exportar.c:36
+// C2F-13: ordenados fundido em n (len)
+proc exp_tem_repetido(ordenados: ?[]PeExporta) -> bool {
+    for k in (1 as u32)..<(len((ordenados or_else {})) as u32) {
+        if ((ordenados or_else {})[k - 1].nome or_else "") == ((ordenados or_else {})[k].nome or_else "") {
+            return true
+        }
+    }
+    return false
+}
+
+// C: nativo/fmt/pe_exportar.c:45
+proc exp_planejar(base: u32, n: u32) -> ExpPlano {
+    var p: ExpPlano = ExpPlano{}
+    p.eat = base + EXP_TAM_DIRETORIO
+    p.enpt = p.eat + (n * EXP_TAM_RVA)
+    p.eot = p.enpt + (n * EXP_TAM_RVA)
+    p.textos = p.eot + (n * EXP_TAM_ORDINAL)
+    return p
+}
+
+// C: nativo/fmt/pe_exportar.c:57
+proc exp_diretorio(b: ^[dynamic]u8, p: ^ExpPlano, rva_nome_dll: u32, n: u32) {
+    exp_anexar_le(b, 0, 4)
+    exp_anexar_le(b, 0, 4)
+    exp_anexar_le(b, 0, 4)
+    exp_anexar_le(b, rva_nome_dll as u64, 4)
+    exp_anexar_le(b, EXP_ORDINAL_BASE as u64, 4)
+    exp_anexar_le(b, n as u64, 4)
+    exp_anexar_le(b, n as u64, 4)
+    exp_anexar_le(b, p.eat as u64, 4)
+    exp_anexar_le(b, p.enpt as u64, 4)
+    exp_anexar_le(b, p.eot as u64, 4)
+}
+
+// C: nativo/fmt/pe_exportar.c:80
+proc exp_montar(b: ^[dynamic]u8, e: ^ExpPedido) {
+    let lista: []PeExporta = (e.ordenados or_else {})[0..<e.n]
+    var p: ExpPlano = exp_planejar(e.base, e.n)
+    var rva_texto: u32 = p.textos
+    for k in (0 as u32)..<e.n {
+        rva_texto = wrapping_add(rva_texto, (((len(lista[k].nome or_else "") as u64) as u32) + 1))
+    }
+    exp_diretorio(b, &p, rva_texto, e.n)
+    for k in (0 as u32)..<e.n {
+        exp_anexar_le(b, lista[k].rva as u64, EXP_TAM_RVA)
+    }
+    rva_texto = p.textos
+    for k in (0 as u32)..<e.n {
+        exp_anexar_le(b, rva_texto as u64, EXP_TAM_RVA)
+        rva_texto = wrapping_add(rva_texto, (((len(lista[k].nome or_else "") as u64) as u32) + 1))
+    }
+    for k in (0 as u32)..<e.n {
+        exp_anexar_le(b, k as u64, EXP_TAM_ORDINAL)
+    }
+    for k in (0 as u32)..<e.n {
+        append(b, items = as_bytes(lista[k].nome or_else ""))
+        exp_anexar_le(b, 0, 1)
+    }
+    append(b, items = as_bytes(e.nome_dll or_else ""))
+    exp_anexar_le(b, 0, 1)
+}
+
+// C: nativo/fmt/pe_exportar.c:102
+// C2F-13: simbolos + n fundidos em simbolos: []PeExporta (n = len); o chamador do C passa o array de n
+pub proc pe_reservar_exportacoes(im: ^Imagem, nome_dll: str, simbolos: []PeExporta) -> bool {
+    let n: u32 = (len(simbolos) as u64) as u32
+    if n == 0 {
+        return false
+    }
+    var ordenados: [dynamic]PeExporta = make([dynamic]PeExporta, alloc = heap)
+    append(&ordenados, items = simbolos)
+    exp_ordenar_nomes(ordenados[..])
+    let base: u32 = imagem_proximo_rva(im)
+    let repetido: bool = exp_tem_repetido(ordenados[..])
+    if repetido {
+        delete(ordenados)
+        return false
+    }
+    var edata: [dynamic]u8 = make([dynamic]u8, alloc = heap)
+    var pedido: ExpPedido = ExpPedido{base = base, nome_dll = nome_dll, ordenados = ordenados[..], n = n}
+    exp_montar(&edata, &pedido)
+    var erro: common.Diag = common.Diag{tem = false}
+    var secao: PeSecaoPedido = PeSecaoPedido{nome = ".edata", caracteristicas = PE_SECAO_LEITURA, bytes = &edata, tam_virtual = (len(edata) as u64) as u32}
+    let rva: u32 = imagem_secao(im, &secao, &erro)
+    if rva != base {
+        let causa: str = erro.causa or_else "(null)"
+        common.falha_interna(format(f"pe: .edata recusado ou fora do RVA previsto: {causa}", alloc = frame))
+    }
+    im.dll = true
+    append(&im.exportacoes, items = ordenados[..])
+    delete(edata)
+    delete(ordenados)
+    return true
+}

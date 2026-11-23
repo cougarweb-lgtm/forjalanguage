@@ -1,0 +1,371 @@
+// nativo/obj/ligar_macho.fj - ligador Mach-O dos alvos iOS (I2a): rebase e bind por opcodes, trie de exports, simbolos e funcoes iniciais
+// Versao: 0.3.0
+// Changelog: 0.3.0 - I6: `link` de UIKit/Foundation/CoreFoundation/QuartzCore/CoreGraphics/objc viram LC_LOAD_DYLIB (ordinais 2.. na ordem dos `link`); cada simbolo importado vai ao ordinal da lib pelo prefixo do nome
+//                    (objc_/sel_/class_.. = libobjc, UI = UIKit, NS = Foundation, CF/kCF = CoreFoundation, CA = QuartzCore, CG = CoreGraphics; o resto, libSystem). sqlite3/z/cjson/curl seguem X0001.
+//            0.2.0 - I5: Imagem de --modo dll vira dylib (base 0, segmento de dados 1, exports = trie com um `_nome` por `pub export proc`, simbolos definidos = exports, sem entrada). O exe sai com os mesmos bytes.
+//            0.1.1 - I4f: recusa no build (X0001) o foreign de lib fora da libSystem (c/m/System).
+//            0.1.0 - I2: parte do ligador depois do ligador ELF PIE dinamico (a Imagem ja tem RVA == offset, `relativos` = rebases e `imports_din` = binds
+//                    de libSystem); aqui os rebases viram opcodes (ponteiro = MACHO_BASE + valor), os imports viram bind `_nome` da libSystem
+//                    (ordinal 1), e o escritor (fmt\macho_escrever.fj) grava o arquivo assinado. Sem lazy bind, stubs nem DATA_CONST.
+
+import "common"
+import "nativo/fmt" as pefmt
+
+const LIGAR_MACHO_ESCRITA: u32 = 2147483648
+const LIGAR_MACHO_CODIGO: u32 = 32
+const LIGAR_MACHO_SEG_DADOS: u8 = 2 // PAGEZERO 0, TEXT 1, DATA 2
+const LIGAR_MACHO_REBASE_TIPO_PONTEIRO: u8 = 17 // REBASE_OPCODE_SET_TYPE_IMM | 1
+const LIGAR_MACHO_REBASE_SEG: u8 = 32 // REBASE_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB
+const LIGAR_MACHO_REBASE_UM: u8 = 81 // REBASE_OPCODE_DO_REBASE_IMM_TIMES | 1
+const LIGAR_MACHO_BIND_ORDINAL: u8 = 16 // BIND_OPCODE_SET_DYLIB_ORDINAL_IMM (| ordinal de 1 a 15)
+const LIGAR_MACHO_BIND_SIMBOLO: u8 = 64 // BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM
+const LIGAR_MACHO_BIND_TIPO_PONTEIRO: u8 = 81 // BIND_OPCODE_SET_TYPE_IMM | 1
+const LIGAR_MACHO_BIND_SEG: u8 = 112 // BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB
+const LIGAR_MACHO_BIND_FAZ: u8 = 144 // BIND_OPCODE_DO_BIND
+
+// secao gravavel com bytes que contem o RVA; none se o RVA nao cai em dado do __DATA
+proc ligar_macho_secao_dados(im: ^pefmt.Imagem, rva: u32) -> ?^pefmt.PeSecao {
+    for i in (0 as u32)..<im.qtd_secoes {
+        let s: ^pefmt.PeSecao = &im.secoes[i]
+        if ((s.caracteristicas & LIGAR_MACHO_ESCRITA) != 0) and (rva >= s.rva) and (rva < (s.rva + (len(s.bytes) as u32))) {
+            return s
+        }
+    }
+    return none
+}
+
+// 8 bytes pequenos de ponteiro rebaseado: o slot guarda o endereco sem slide (MACHO_BASE + valor)
+proc ligar_macho_gravar_ponteiro(s: ^pefmt.PeSecao, off: u32, valor: u64) {
+    var v: u64 = valor
+    for k in (0 as u32)..<8 {
+        s.bytes[(off + k) as u64] = (v & 255) as u8
+        v = v >> 8
+    }
+}
+
+// um opcode "segmento + offset" seguido do ULEB do offset dentro do __DATA
+proc ligar_macho_posicao(b: ^[dynamic]u8, opcode: u8, seg: u8, off: u32) {
+    append(b, item = opcode | seg)
+    pefmt.macho_uleb(b, off as u64)
+}
+
+// indice do segmento __DATA nos load commands: PAGEZERO 0, TEXT 1, DATA 2 (exe); no dylib sem PAGEZERO, TEXT 0, DATA 1
+proc ligar_macho_seg_dados(p: ^pefmt.MachoPlano) -> u8 {
+    if p.dylib {
+        return LIGAR_MACHO_SEG_DADOS - 1
+    }
+    return LIGAR_MACHO_SEG_DADOS
+}
+
+// nome do simbolo C na libSystem: `_` na frente
+proc ligar_macho_nome_import(nome: ?str) -> str {
+    let txt: str = nome or_else ""
+    return format(f"_{txt}", alloc = frame)
+}
+
+proc ligar_macho_pad8(b: ^[dynamic]u8) {
+    while ((len(b^) as u64) % 8) != 0 {
+        append(b, item = 0 as u8)
+    }
+}
+
+proc ligar_macho_fora(erro: ^common.Diag, o_que: str) -> bool {
+    let msg = format(f"Mach-O: {o_que} fora de um dado gravavel do __DATA (ponteiro em dado somente leitura ainda nao existe no alvo iOS)", alloc = heap)
+    defer delete(msg)
+    return common.diag_relatar(erro, common.X0903, 0, msg)
+}
+
+// rebases: cada ponteiro absoluto vira opcode e recebe MACHO_BASE + valor no slot
+proc ligar_macho_rebases(im: ^pefmt.Imagem, l: ^pefmt.MachoLayout, p: ^pefmt.MachoPlano, erro: ^common.Diag) -> bool {
+    if len(im.relativos) == 0 {
+        return true
+    }
+    append(&p.rebase, item = LIGAR_MACHO_REBASE_TIPO_PONTEIRO)
+    for k in (0 as u64)..<(len(im.relativos) as u64) {
+        let r: ^pefmt.ImagemRelativa = &im.relativos[k]
+        let s: ?^pefmt.PeSecao = ligar_macho_secao_dados(im, r.rva)
+        if s == none {
+            return ligar_macho_fora(erro, "ponteiro absoluto")
+        }
+        ligar_macho_gravar_ponteiro(s as ^pefmt.PeSecao, r.rva - (s as ^pefmt.PeSecao).rva, l.base + r.valor)
+        ligar_macho_posicao(&p.rebase, LIGAR_MACHO_REBASE_SEG, ligar_macho_seg_dados(p), r.rva - l.dados_ini)
+        append(&p.rebase, item = LIGAR_MACHO_REBASE_UM)
+    }
+    append(&p.rebase, item = 0 as u8)
+    ligar_macho_pad8(&p.rebase)
+    return true
+}
+
+// binds: cada celula da GOT de um import vira `_nome` da libSystem (ordinal 1)
+proc ligar_macho_binds(im: ^pefmt.Imagem, l: ^pefmt.MachoLayout, p: ^pefmt.MachoPlano, erro: ^common.Diag) -> bool {
+    if len(im.imports_din) == 0 {
+        return true
+    }
+    for k in (0 as u64)..<(len(im.imports_din) as u64) {
+        let imp: ^pefmt.ImagemImportDin = &im.imports_din[k]
+        if ligar_macho_secao_dados(im, imp.rva) == none {
+            return ligar_macho_fora(erro, "celula de import")
+        }
+        append(&p.bind, item = LIGAR_MACHO_BIND_ORDINAL | ligar_macho_ordinal_simbolo(p, imp.nome))
+        append(&p.bind, item = LIGAR_MACHO_BIND_SIMBOLO)
+        pefmt.macho_cstr(&p.bind, ligar_macho_nome_import(imp.nome))
+        append(&p.bind, item = LIGAR_MACHO_BIND_TIPO_PONTEIRO)
+        ligar_macho_posicao(&p.bind, LIGAR_MACHO_BIND_SEG, ligar_macho_seg_dados(p), imp.rva - l.dados_ini)
+        append(&p.bind, item = LIGAR_MACHO_BIND_FAZ)
+    }
+    append(&p.bind, item = 0 as u8)
+    ligar_macho_pad8(&p.bind)
+    return true
+}
+
+// trie de exports: `__mh_execute_header` (offset 0) e `_main` (a entrada); todos os offsets de no cabem num byte de ULEB
+proc ligar_macho_exportar(p: ^pefmt.MachoPlano) {
+    let cabecalho: str = "_mh_execute_header"
+    var info = make([dynamic]u8, alloc = heap)
+    defer delete(info)
+    pefmt.macho_uleb(&info, 0) // flags
+    pefmt.macho_uleb(&info, p.entrada as u64)
+    let tam_a: u32 = 2 + ((len(cabecalho) as u32) + 1) + 1 + 5 + 1
+    let off_a: u32 = 5
+    let off_b: u32 = off_a + tam_a
+    let off_c: u32 = off_b + 4
+    append(&p.exporta, item = 0 as u8) // raiz: sem terminal, 1 filho "_"
+    append(&p.exporta, item = 1 as u8)
+    pefmt.macho_cstr(&p.exporta, "_")
+    append(&p.exporta, item = off_a as u8)
+    append(&p.exporta, item = 0 as u8) // no A: sem terminal, 2 filhos
+    append(&p.exporta, item = 2 as u8)
+    pefmt.macho_cstr(&p.exporta, cabecalho)
+    append(&p.exporta, item = off_b as u8)
+    pefmt.macho_cstr(&p.exporta, "main")
+    append(&p.exporta, item = off_c as u8)
+    var no_b: [4]u8 = {2, 0, 0, 0} // no B: terminal de 2 bytes (flags 0, offset 0), sem filhos
+    append(&p.exporta, items = no_b[..])
+    append(&p.exporta, item = len(info) as u8)
+    append(&p.exporta, items = info[..])
+    append(&p.exporta, item = 0 as u8)
+    ligar_macho_pad8(&p.exporta)
+}
+
+// uma entrada nlist_64 (16 bytes)
+proc ligar_macho_nlist(p: ^pefmt.MachoPlano, nome: str, tipo: u8, sect: u8) {
+    pefmt.macho_le(&p.simbolos, len(p.nomes) as u64, 4)
+    append(&p.simbolos, item = tipo)
+    append(&p.simbolos, item = sect)
+    pefmt.macho_cstr(&p.nomes, nome)
+}
+
+// ordinal (a partir de 1) da secao de codigo na ordem dos load commands
+proc ligar_macho_ordinal_texto(im: ^pefmt.Imagem) -> u8 {
+    for i in (0 as u32)..<im.qtd_secoes {
+        if (im.secoes[i].caracteristicas & LIGAR_MACHO_CODIGO) != 0 {
+            return (i + 1) as u8
+        }
+    }
+    return 1
+}
+
+// I5: simbolos definidos externos do dylib = um por `pub export proc` (`_nome`, secao do codigo, valor = RVA porque a base e 0)
+proc ligar_macho_defs_dylib(im: ^pefmt.Imagem, p: ^pefmt.MachoPlano) {
+    let ordinal: u8 = ligar_macho_ordinal_texto(im)
+    for k in (0 as u64)..<(len(im.exportacoes) as u64) {
+        ligar_macho_nlist(p, ligar_macho_nome_import(im.exportacoes[k].nome), 15, ordinal)
+        pefmt.macho_le(&p.simbolos, 0, 2)
+        pefmt.macho_le(&p.simbolos, im.exportacoes[k].rva as u64, 8)
+    }
+    p.n_extdef = len(im.exportacoes) as u32
+}
+
+// I5: trie de exports do dylib: raiz sem terminal e um filho por export (rotulo `_nome` inteiro); cada filho e uma folha terminal (flags 0, offset = RVA).
+// O offset do filho na raiz usa ULEB de 3 bytes fixos (preenchido com 0x80), valido para o dyld e que deixa o tamanho da raiz independente dos offsets.
+proc ligar_macho_trie_raiz(b: ^[dynamic]u8, im: ^pefmt.Imagem, offs: []u32) {
+    append(b, item = 0 as u8)
+    pefmt.macho_uleb(b, len(im.exportacoes) as u64)
+    for k in (0 as u64)..<(len(im.exportacoes) as u64) {
+        pefmt.macho_cstr(b, ligar_macho_nome_import(im.exportacoes[k].nome))
+        append(b, item = ((offs[k] & 127) | 128) as u8)
+        append(b, item = (((offs[k] >> 7) & 127) | 128) as u8)
+        append(b, item = ((offs[k] >> 14) & 127) as u8)
+    }
+}
+
+proc ligar_macho_exportar_dylib(im: ^pefmt.Imagem, p: ^pefmt.MachoPlano) {
+    let n: u64 = len(im.exportacoes) as u64
+    var offs = make([dynamic]u32, alloc = heap)
+    defer delete(offs)
+    for k in (0 as u64)..<n {
+        append(&offs, item = 0 as u32)
+    }
+    var raiz = make([dynamic]u8, alloc = heap)
+    defer delete(raiz)
+    ligar_macho_trie_raiz(&raiz, im, offs[..])
+    let raiz_tam: u32 = len(raiz) as u32
+    var folhas = make([dynamic]u8, alloc = heap)
+    defer delete(folhas)
+    var info = make([dynamic]u8, alloc = heap)
+    defer delete(info)
+    for k in (0 as u64)..<n {
+        offs[k] = raiz_tam + (len(folhas) as u32)
+        clear(&info)
+        pefmt.macho_uleb(&info, 0) // flags
+        pefmt.macho_uleb(&info, im.exportacoes[k].rva as u64)
+        pefmt.macho_uleb(&folhas, len(info) as u64)
+        append(&folhas, items = info[..])
+        append(&folhas, item = 0 as u8) // sem filhos
+    }
+    clear(&raiz)
+    ligar_macho_trie_raiz(&raiz, im, offs[..])
+    append(&p.exporta, items = raiz[..])
+    append(&p.exporta, items = folhas[..])
+    ligar_macho_pad8(&p.exporta)
+}
+
+// tabela de simbolos: 2 definidos externos (cabecalho e `_main`) e os importados (indefinidos, libSystem = ordinal 1)
+proc ligar_macho_simbolos(im: ^pefmt.Imagem, p: ^pefmt.MachoPlano) {
+    var inicio: [2]u8 = {32, 0} // " \0" como o ld64
+    append(&p.nomes, items = inicio[..])
+    if p.dylib {
+        ligar_macho_defs_dylib(im, p)
+    } else {
+        ligar_macho_nlist(p, "__mh_execute_header", 15, 1)
+        pefmt.macho_le(&p.simbolos, 16, 2) // desc REFERENCED_DYNAMICALLY
+        pefmt.macho_le(&p.simbolos, pefmt.MACHO_BASE, 8)
+        ligar_macho_nlist(p, "_main", 15, ligar_macho_ordinal_texto(im))
+        pefmt.macho_le(&p.simbolos, 0, 2)
+        pefmt.macho_le(&p.simbolos, pefmt.MACHO_BASE + (p.entrada as u64), 8)
+        p.n_extdef = 2
+    }
+    for k in (0 as u64)..<(len(im.imports_din) as u64) {
+        ligar_macho_nlist(p, ligar_macho_nome_import(im.imports_din[k].nome), 1, 0)
+        pefmt.macho_le(&p.simbolos, (ligar_macho_ordinal_simbolo(p, im.imports_din[k].nome) as u64) * 256, 2) // desc: ordinal da lib (twolevel)
+        pefmt.macho_le(&p.simbolos, 0, 8)
+    }
+    p.n_undef = len(im.imports_din) as u32
+    ligar_macho_pad8(&p.nomes)
+}
+
+// LC_FUNCTION_STARTS: offset da entrada a partir do cabecalho, terminado em 0
+proc ligar_macho_funcoes(p: ^pefmt.MachoPlano) {
+    if not p.dylib { // dylib: sem entrada; a lista fica so com o terminador
+        pefmt.macho_uleb(&p.funcoes, p.entrada as u64)
+    }
+    append(&p.funcoes, item = 0 as u8)
+    ligar_macho_pad8(&p.funcoes)
+}
+
+proc ligar_macho_comeca(txt: str, prefixo: str) -> bool {
+    return (len(txt) >= len(prefixo)) and (txt[0..<len(prefixo)] == prefixo)
+}
+
+// I6: o `link` dono do simbolo, pelo prefixo do nome C; "" = libSystem
+proc ligar_macho_lib_do_simbolo(nome: str) -> str {
+    if ligar_macho_comeca(nome, "objc_") or ligar_macho_comeca(nome, "sel_") or ligar_macho_comeca(nome, "class_") or ligar_macho_comeca(nome, "object_") or ligar_macho_comeca(nome, "method_") or ligar_macho_comeca(nome, "protocol_") or ligar_macho_comeca(nome, "ivar_") or ligar_macho_comeca(nome, "property_") or ligar_macho_comeca(nome, "imp_") {
+        return "objc"
+    }
+    if ligar_macho_comeca(nome, "UI") {
+        return "UIKit"
+    }
+    if ligar_macho_comeca(nome, "NS") {
+        return "Foundation"
+    }
+    if ligar_macho_comeca(nome, "CF") or ligar_macho_comeca(nome, "kCF") {
+        return "CoreFoundation"
+    }
+    if ligar_macho_comeca(nome, "CA") {
+        return "QuartzCore"
+    }
+    if ligar_macho_comeca(nome, "CG") {
+        return "CoreGraphics"
+    }
+    return ""
+}
+
+// I6: ordinal do dylib de um simbolo importado: 1 = libSystem; 2.. = p.libs na ordem dos `link` (so se a lib foi ligada)
+proc ligar_macho_ordinal_simbolo(p: ^pefmt.MachoPlano, nome: ?str) -> u8 {
+    let lib: str = ligar_macho_lib_do_simbolo(nome or_else "")
+    if lib == "" {
+        return 1
+    }
+    var achou: u8 = 1
+    for k in (0 as u64)..<(len(p.libs) as u64) {
+        if p.libs[k] == lib {
+            achou = (k + 2) as u8
+        }
+    }
+    return achou
+}
+
+// I6: p.libs = os dylibs extras dos `link` do programa, sem repetir, na ordem dos `link`
+proc ligar_macho_coletar_libs(im: ^pefmt.Imagem, p: ^pefmt.MachoPlano) {
+    for k in (0 as u64)..<(len(im.necessarias) as u64) {
+        let lib: str = im.necessarias[k]
+        if pefmt.macho_caminho_lib(lib) == "" {
+            continue
+        }
+        var repetido: bool = false
+        for j in (0 as u64)..<(len(p.libs) as u64) {
+            if p.libs[j] == lib {
+                repetido = true
+            }
+        }
+        if not repetido {
+            append(&p.libs, item = lib)
+        }
+    }
+}
+
+// I4f: libSystem (`link "c"`/"m"/"System"; "msvcrt" e o nome da libc nos fontes de teste do x64) e, desde a I6, os frameworks/libobjc; outra (vendor: sqlite3, z, json...) viraria abort do dyld por simbolo ausente
+proc ligar_macho_libs(im: ^pefmt.Imagem, erro: ^common.Diag) -> bool {
+    for k in (0 as u64)..<(len(im.necessarias) as u64) {
+        let lib: str = im.necessarias[k]
+        if (lib == "c") or (lib == "m") or (lib == "msvcrt") or (lib == "System") or (lib == "libc") or (lib == "libm") or (lib == "libSystem") {
+            continue
+        }
+        if pefmt.macho_caminho_lib(lib) != "" {
+            continue
+        }
+        let msg = format(f"foreign de lib nao-libc ({lib}) ainda nao disponivel no iOS (vendors aarch64: fatia A6)", alloc = heap)
+        defer delete(msg)
+        return common.diag_relatar(erro, common.X0001, 0, msg)
+    }
+    return true
+}
+
+// Liga a Imagem (ja resolvida pelo ligador ELF PIE dinamico) num Mach-O arm64 assinado em `saida`; `nome` = identificador da assinatura
+pub proc ligar_macho(im: ^pefmt.Imagem, nome: str, plataforma: u32, saida: ^[dynamic]u8, erro: ^common.Diag) -> bool {
+    if not ligar_macho_libs(im, erro) {
+        return false
+    }
+    var l = pefmt.MachoLayout{}
+    if not pefmt.macho_layout(im, &l, erro) {
+        return false
+    }
+    var p = pefmt.MachoPlano{plataforma = plataforma, nome = nome, entrada = im.entrada_rva, dylib = l.dylib}
+    p.rebase = make([dynamic]u8, alloc = heap)
+    p.bind = make([dynamic]u8, alloc = heap)
+    p.exporta = make([dynamic]u8, alloc = heap)
+    p.funcoes = make([dynamic]u8, alloc = heap)
+    p.simbolos = make([dynamic]u8, alloc = heap)
+    p.nomes = make([dynamic]u8, alloc = heap)
+    p.libs = make([dynamic]str, alloc = heap)
+    ligar_macho_coletar_libs(im, &p)
+    var ok: bool = ligar_macho_rebases(im, &l, &p, erro) and ligar_macho_binds(im, &l, &p, erro)
+    if ok {
+        if p.dylib {
+            ligar_macho_exportar_dylib(im, &p)
+        } else {
+            ligar_macho_exportar(&p)
+        }
+        ligar_macho_simbolos(im, &p)
+        ligar_macho_funcoes(&p)
+        ok = pefmt.macho_escrever(im, &p, saida, erro)
+    }
+    delete(p.rebase)
+    delete(p.bind)
+    delete(p.exporta)
+    delete(p.funcoes)
+    delete(p.simbolos)
+    delete(p.nomes)
+    delete(p.libs)
+    return ok
+}

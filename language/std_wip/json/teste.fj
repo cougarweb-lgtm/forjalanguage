@@ -1,0 +1,154 @@
+import "json"
+import "std:mem"
+import "std:text" as tx
+
+// Parseia `texto`, imprime o resultado e confere a ida e volta (dump -> parse -> dump).
+// Valido: "N valido <texto>" (ou "N valido len <tamanho>" acima de 60 bytes) + "  ida-volta ok".
+// Invalido: "N invalido <linha>:<coluna> <causa>".
+proc prova(a: mem.Arena, n: int, texto: str) {
+    var pos = json.JsonPos{}
+    switch r in json.parse(texto, where = &pos, alloc = a) {
+    case json.Json:
+        let txt = json.dump(r, false, alloc = a) or_else ""
+        let tam = len(txt)
+        if tam > 60 {
+            print(f"{n} valido len {tam}")
+        } else {
+            print(f"{n} valido {txt}")
+        }
+        switch s in json.parse(txt, alloc = a) {
+        case json.Json:
+            let txt2 = json.dump(s, false, alloc = a) or_else ""
+            if txt2 == txt {
+                print("  ida-volta ok")
+            } else {
+                print("  ida-volta DIFERENTE")
+            }
+        case json.JsonError:
+            print("  ida-volta falhou")
+        }
+    case json.JsonError:
+        print(f"{n} invalido {pos.linha}:{pos.coluna} {pos.causa}")
+    }
+}
+
+// Corpus: validos e invalidos (estilo JSONTestSuite).
+proc corpus(a: mem.Arena) {
+    prova(a, 1, "{}")
+    prova(a, 2, "[]")
+    prova(a, 3, "0")
+    prova(a, 4, "-0")
+    prova(a, 5, "\"\\u00e9\"")
+    prova(a, 6, "\"\\ud83d\\ude00\"")
+    prova(a, 7, "[1,2,3]")
+    prova(a, 8, "{\"a\":{\"b\":[10,20.5]}}")
+    prova(a, 9, "true")
+    prova(a, 10, "false")
+    prova(a, 11, "null")
+    prova(a, 12, "1e2")
+    prova(a, 13, "-1.5E-3")
+    prova(a, 14, "9007199254740993")
+    prova(a, 15, "[[[[]]]]")
+    prova(a, 16, "{\"\":0}")
+    prova(a, 17, "  \n\t[ 1 , 2 ]  \r\n")
+    prova(a, 18, "\"a\\/b\\\\c\\\"d\\b\\f\\n\\r\\t\"")
+    prova(a, 19, "[{\"k\":null},{\"k\":false}]")
+    prova(a, 20, "1e400")
+    prova(a, 21, "123456789012345678901234567890")
+    prova(a, 22, "[1,]")
+    prova(a, 23, "01")
+    prova(a, 24, "[01]")
+    prova(a, 25, "1.")
+    prova(a, 26, ".5")
+    prova(a, 27, "+1")
+    prova(a, 28, "\"\\u00e\"")
+    prova(a, 29, "\"\\ud83d\"")
+    prova(a, 30, "\"\\ude00\"")
+    prova(a, 31, "\"abc")
+    prova(a, 32, "{\"a\" 1}")
+    prova(a, 33, "{\"a\":1,}")
+    prova(a, 34, "[1 2]")
+    prova(a, 35, "nul")
+    prova(a, 36, "tru")
+    prova(a, 37, "{} x")
+    prova(a, 38, "\"\\x41\"")
+    prova(a, 39, "\"a\tb\"")
+    prova(a, 40, "-")
+    prova(a, 41, "1e")
+    prova(a, 42, "[")
+    prova(a, 43, "\"x\"")
+    let abre501 = tx.repeat("[", 501, alloc = a)
+    let fecha501 = tx.repeat("]", 501, alloc = a)
+    prova(a, 44, format(f"{abre501}{fecha501}", alloc = a))
+    let abre500 = tx.repeat("[", 500, alloc = a)
+    let fecha500 = tx.repeat("]", 500, alloc = a)
+    prova(a, 45, format(f"{abre500}{fecha500}", alloc = a))
+    prova(a, 46, "{\n\"a\":\n[1,\n2]\n}")
+    prova(a, 47, "{\n  \"a\": 1,\n  \"b\" 2\n}")
+    prova(a, 48, "1E+2")
+    prova(a, 49, "\"\\u0000\"")
+    prova(a, 50, "[1, 2, 3")
+}
+
+// Consulta: campos, caminhos, erros de caminho e de tipo.
+proc consulta(a: mem.Arena) -> ! json.JsonError {
+    let d = try json.parse("{\"a\":{\"b\":[10,20.5],\"c\":\"oi\"},\"t\":true}", alloc = a)
+    print(json.path_int(d, path = "a.b[0]") or_else -1)
+    print(json.path_number(d, path = "a.b[1]") or_else -1.0)
+    print(json.path_text(d, path = "a.c") or_else "erro")
+    print(json.field_bool(d, name = "t") or_else false)
+    print(json.path_text(d, path = "a.x") or_else "erro")
+    var onde = 0
+    print(json.path_text(d, path = "a.x[0]", at = &onde) or_else "erro")
+    print(onde)
+    var onde2 = 0
+    switch g in json.get_path(d, "a..b", at = &onde2) {
+    case json.Json:
+        print("nao era para achar")
+    case json.JsonError:
+        print(onde2)
+    }
+    switch g2 in json.get_path(d, "a.b") {
+    case json.Json:
+        print(json.size(g2))
+    case json.JsonError:
+        print("erro")
+    }
+    let no_b = try json.get_path(d, "a.b")
+    print(json.kind(no_b) == json.JsonKind.list)
+    print(json.key(d, index = 0) or_else "?")
+    let grande = try json.parse("123456789012345678901234567890", alloc = a)
+    print(json.path_int(grande, path = "") or_else -1)
+}
+
+// Escrita: construir documento, mudar campos e ida e volta.
+proc escrita(a: mem.Arena) -> ! json.JsonError {
+    let o = try json.new_object(a)
+    try json.set_number(o, name = "n", value = 2.5)
+    try json.set_text(o, name = "s", value = "oi")
+    try json.set_bool(o, name = "b", value = true)
+    try json.set_null(o, name = "z")
+    let l = try json.set_list(o, name = "l")
+    try json.push_number(l, value = 7.0)
+    try json.push_text(l, value = "x")
+    print(try json.dump(o, false, alloc = a))
+    try json.remove_field(o, name = "s")
+    print(try json.dump(o, false, alloc = a))
+    print(json.size(o))
+    try json.remove_item(l, 0)
+    print(try json.dump(o, false, alloc = a))
+    let txt = try json.dump(o, false, alloc = a)
+    let de_novo = try json.parse(txt, alloc = a)
+    let txt2 = try json.dump(de_novo, false, alloc = a)
+    if txt2 == txt {
+        print("escrita ida-volta ok")
+    }
+}
+
+proc main() -> ! json.JsonError {
+    let a = mem.arena_create()
+    corpus(a)
+    try consulta(a)
+    try escrita(a)
+    mem.arena_destroy(a)
+}

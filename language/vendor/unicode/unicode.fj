@@ -1,0 +1,215 @@
+// unicode 0.1.0 - Unicode para a Forja, por cima do utf8proc 2.12.0 (MIT) em vendor\libutf8proc.a (Windows) e vendor\linux\libutf8proc.a (Linux).
+// Versao: 0.1.0
+// Changelog: 0.1.0 - primeira versao: version, unicode_version, category (30 categorias gerais), to_lower/to_upper (mapeamento SIMPLES de um codepoint),
+//            normalize_nfc e normalize_nfd (UnicodeError: invalid_utf8, out_of_memory, other).
+//
+// COMO USAR (o .fj raiz do programa precisa de uma pasta vendor\ ao lado; ver MEM-FORJA-GUIA-10):
+//     import "vendor:unicode/unicode"
+//     ...
+//     let cat = unicode.category(233)                           // GeneralCategory.letter_lowercase
+//     let maiuscula = unicode.to_upper(233)                     // 201 (E maiusculo)
+//     let nfd = try unicode.normalize_nfd("Å", alloc = heap)   // texto UTF-8 direto no literal (a Forja nao tem \u)
+//     defer delete(nfd)
+//
+// TEXTO: todo parametro de texto publico e `str` (bytes UTF-8). A lib le o texto pelo tamanho (nao precisa de NUL).
+//
+// DONOS E EMPRESTADOS:
+//   - version e unicode_version devolvem um str EMPRESTADO da propria lib (vive o programa inteiro; nao faca delete).
+//   - normalize_nfc e normalize_nfd devolvem um str NOVO no alloc que o chamador passou: delete so se o alloc foi heap.
+//     Em erro nada fica alocado (o buffer da lib e liberado dentro da proc).
+//
+// LIMITES: category e to_lower/to_upper seguem a tabela do utf8proc (Unicode 18.0.0, ver unicode_version). to_lower/to_upper usam so o
+//   mapeamento simples de um para um do utf8proc: sem sequencia (SpecialCasing, "SS" para o sharp s); to_upper(0xDF) da U+1E9E (divergencia
+//   medida contra o UnicodeData 18.0.0, registrada no oraculo). Codepoint fora de 0..0x10FFFF ou surrogate
+//   sai como unassigned (category) e volta igual (to_lower/to_upper).
+//   Normalizacao: NFC e NFD (forma canonica). NFKC/NFKD nao entram nesta versao.
+//
+// VERIFICAR: python -I language\exemplos_libs\oraculos\unicode.py <pasta dos UCD 18.0.0>   (ou: forja run language\exemplos_libs\unicode_basico.fj)
+
+import "vendor:unicode/unicode_c" as uc
+
+pub enum UnicodeError {
+    invalid_utf8
+    out_of_memory
+    other
+}
+
+pub enum GeneralCategory {
+    letter_uppercase
+    letter_lowercase
+    letter_titlecase
+    letter_modifier
+    letter_other
+    mark_nonspacing
+    mark_spacing_combining
+    mark_enclosing
+    number_decimal_digit
+    number_letter
+    number_other
+    punctuation_connector
+    punctuation_dash
+    punctuation_open
+    punctuation_close
+    punctuation_initial_quote
+    punctuation_final_quote
+    punctuation_other
+    symbol_math
+    symbol_currency
+    symbol_modifier
+    symbol_other
+    separator_space
+    separator_line
+    separator_paragraph
+    other_control
+    other_format
+    other_surrogate
+    other_private_use
+    unassigned
+}
+
+// Opcoes do utf8proc_map (utf8proc.h): UTF8PROC_STABLE = 2, UTF8PROC_COMPOSE = 8, UTF8PROC_DECOMPOSE = 16.
+// Os mesmos valores que utf8proc_NFC e utf8proc_NFD usam, sem o NULLTERM: a entrada vai com o tamanho.
+const OPCOES_NFC: u32 = 10
+const OPCOES_NFD: u32 = 18
+
+// Texto C (?cstr) para str emprestado: a string da lib e estatica e nao sai da memoria.
+proc texto_da_lib(v: ?cstr) -> str {
+    switch c in v {
+    case cstr:
+        return c as str
+    case none:
+        return ""
+    }
+    return ""
+}
+
+// Versao do utf8proc (ex.: "2.12.0"). Emprestado: nao faca delete.
+pub proc version() -> str {
+    return texto_da_lib(uc.utf8proc_version())
+}
+
+// Versao do Unicode que a lib implementa (ex.: "18.0.0"). Emprestado: nao faca delete.
+pub proc unicode_version() -> str {
+    return texto_da_lib(uc.utf8proc_unicode_version())
+}
+
+// Categoria geral do codepoint (30 valores do Unicode; Cn e `unassigned`).
+pub proc category(cp: i32) -> GeneralCategory {
+    switch uc.utf8proc_category(cp) {
+    case uc.Utf8procCategory.lu:
+        return GeneralCategory.letter_uppercase
+    case uc.Utf8procCategory.ll:
+        return GeneralCategory.letter_lowercase
+    case uc.Utf8procCategory.lt:
+        return GeneralCategory.letter_titlecase
+    case uc.Utf8procCategory.lm:
+        return GeneralCategory.letter_modifier
+    case uc.Utf8procCategory.lo:
+        return GeneralCategory.letter_other
+    case uc.Utf8procCategory.mn:
+        return GeneralCategory.mark_nonspacing
+    case uc.Utf8procCategory.mc:
+        return GeneralCategory.mark_spacing_combining
+    case uc.Utf8procCategory.me:
+        return GeneralCategory.mark_enclosing
+    case uc.Utf8procCategory.nd:
+        return GeneralCategory.number_decimal_digit
+    case uc.Utf8procCategory.nl:
+        return GeneralCategory.number_letter
+    case uc.Utf8procCategory.no:
+        return GeneralCategory.number_other
+    case uc.Utf8procCategory.pc:
+        return GeneralCategory.punctuation_connector
+    case uc.Utf8procCategory.pd:
+        return GeneralCategory.punctuation_dash
+    case uc.Utf8procCategory.ps:
+        return GeneralCategory.punctuation_open
+    case uc.Utf8procCategory.pe:
+        return GeneralCategory.punctuation_close
+    case uc.Utf8procCategory.pi:
+        return GeneralCategory.punctuation_initial_quote
+    case uc.Utf8procCategory.pf:
+        return GeneralCategory.punctuation_final_quote
+    case uc.Utf8procCategory.po:
+        return GeneralCategory.punctuation_other
+    case uc.Utf8procCategory.sm:
+        return GeneralCategory.symbol_math
+    case uc.Utf8procCategory.sc:
+        return GeneralCategory.symbol_currency
+    case uc.Utf8procCategory.sk:
+        return GeneralCategory.symbol_modifier
+    case uc.Utf8procCategory.so:
+        return GeneralCategory.symbol_other
+    case uc.Utf8procCategory.zs:
+        return GeneralCategory.separator_space
+    case uc.Utf8procCategory.zl:
+        return GeneralCategory.separator_line
+    case uc.Utf8procCategory.zp:
+        return GeneralCategory.separator_paragraph
+    case uc.Utf8procCategory.cc:
+        return GeneralCategory.other_control
+    case uc.Utf8procCategory.cf:
+        return GeneralCategory.other_format
+    case uc.Utf8procCategory.cs:
+        return GeneralCategory.other_surrogate
+    case uc.Utf8procCategory.co:
+        return GeneralCategory.other_private_use
+    case uc.Utf8procCategory.cn:
+        return GeneralCategory.unassigned
+    }
+    // a Forja exige return no fim mesmo com switch que cobre tudo (E0302); o caminho nao e alcancado
+    return GeneralCategory.unassigned
+}
+
+// Maiuscula simples do codepoint (mapeamento de um para um); sem mapeamento, devolve o proprio codepoint.
+pub proc to_upper(cp: i32) -> i32 {
+    return uc.utf8proc_toupper(cp)
+}
+
+// Minuscula simples do codepoint (mapeamento de um para um); sem mapeamento, devolve o proprio codepoint.
+pub proc to_lower(cp: i32) -> i32 {
+    return uc.utf8proc_tolower(cp)
+}
+
+// Forma NFC do texto. Devolve texto NOVO no alloc passado (delete so se for heap). Erro: invalid_utf8, out_of_memory.
+pub proc normalize_nfc(text: str, alloc: Allocator) -> str ! UnicodeError {
+    return normaliza(text, OPCOES_NFC, alloc)
+}
+
+// Forma NFD do texto. Devolve texto NOVO no alloc passado (delete so se for heap). Erro: invalid_utf8, out_of_memory.
+pub proc normalize_nfd(text: str, alloc: Allocator) -> str ! UnicodeError {
+    return normaliza(text, OPCOES_NFD, alloc)
+}
+
+// Codigo de erro do utf8proc_map (negativo) para o enum da Forja. Os demais codigos (overflow, opcoes invalidas) viram other.
+proc erro_da_lib(codigo: i64) -> UnicodeError {
+    if codigo == uc.UTF8PROC_ERROR_NOMEM as i64 {
+        return UnicodeError.out_of_memory
+    }
+    if codigo == uc.UTF8PROC_ERROR_INVALIDUTF8 as i64 {
+        return UnicodeError.invalid_utf8
+    }
+    return UnicodeError.other
+}
+
+proc normaliza(text: str, opcoes: u32, alloc: Allocator) -> str ! UnicodeError {
+    // texto vazio nao tem byte para apontar: a copia no alloc e a forma normalizada dele
+    if len(text) == 0 {
+        return format(f"{text}", alloc = alloc)
+    }
+    let origem = as_bytes(text)
+    var saida: ?^u8 = none
+    let n = uc.utf8proc_map(&origem[0], strlen = len(text) as i64, dstptr = &saida, options = opcoes)
+    if n < 0 {
+        return erro_da_lib(n)
+    }
+    switch p in saida {
+    case ^u8:
+        // o buffer e da lib (malloc dela): copia para o alloc do chamador e solta o da lib
+        defer uc.utf8proc_free(saida)
+        return from_bytes(slice_from(p, len = n as int), alloc = alloc)
+    case none:
+        return UnicodeError.out_of_memory
+    }
+    return UnicodeError.out_of_memory
+}

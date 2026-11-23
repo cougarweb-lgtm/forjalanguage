@@ -1,0 +1,229 @@
+// unicode_basico 0.1.0 - exemplo do pacote vendor:unicode (utf8proc 2.12.0 sobre o Unicode 18.0.0).
+// Sem argumentos: varre os 1112064 codepoints validos (0..0x10FFFF menos os surrogates), imprime a contagem por categoria,
+//   quantos tem minuscula/maiuscula simples diferente, um hash FNV-1a 64 do registro de cada um, e confere 4 casos de NFC/NFD embutidos.
+// Com caminho: `forja run unicode_basico.fj -- <casos.txt>` confere o arquivo gerado pelo oraculo (uma linha por caso:
+//   entrada_hex TAB nfc_hex TAB nfd_hex, bytes UTF-8 em hex) e imprime as contagens do arquivo.
+// VERIFICAR: python -I language\exemplos_libs\oraculos\unicode.py <pasta dos UCD 18.0.0> --forja <forja.exe>
+import "vendor:unicode/unicode"
+import "std:base64"
+import "std:file"
+import "std:os"
+import "std:text"
+
+struct Contagem {
+    casos: int = 0
+    nfc_ok: int = 0
+    nfd_ok: int = 0
+    erros: int = 0
+}
+
+// FNV-1a 64 do registro de cada codepoint: o oraculo Python calcula o mesmo valor sobre os mesmos bytes.
+const FNV_PRIMO: u64 = 1099511628211
+
+proc fnv_byte(h: u64, b: u64) -> u64 {
+    return wrapping_mul(h ~ b, FNV_PRIMO)
+}
+
+// u32 em 4 bytes little-endian; wrapping_mul porque o estouro em dev e erro e aqui o hash e modular de proposito.
+proc fnv_u32(h: u64, v: i32) -> u64 {
+    let x = v as u32
+    var r = fnv_byte(h, (x & 255) as u64)
+    r = fnv_byte(r, ((x >> 8) & 255) as u64)
+    r = fnv_byte(r, ((x >> 16) & 255) as u64)
+    return fnv_byte(r, ((x >> 24) & 255) as u64)
+}
+
+// Posicao da categoria na ordem de declaracao de unicode.GeneralCategory (0..29); a tabela de nomes de varre_codepoints segue a mesma ordem.
+proc indice_categoria(c: unicode.GeneralCategory) -> int {
+    switch c {
+    case unicode.GeneralCategory.letter_uppercase:
+        return 0
+    case unicode.GeneralCategory.letter_lowercase:
+        return 1
+    case unicode.GeneralCategory.letter_titlecase:
+        return 2
+    case unicode.GeneralCategory.letter_modifier:
+        return 3
+    case unicode.GeneralCategory.letter_other:
+        return 4
+    case unicode.GeneralCategory.mark_nonspacing:
+        return 5
+    case unicode.GeneralCategory.mark_spacing_combining:
+        return 6
+    case unicode.GeneralCategory.mark_enclosing:
+        return 7
+    case unicode.GeneralCategory.number_decimal_digit:
+        return 8
+    case unicode.GeneralCategory.number_letter:
+        return 9
+    case unicode.GeneralCategory.number_other:
+        return 10
+    case unicode.GeneralCategory.punctuation_connector:
+        return 11
+    case unicode.GeneralCategory.punctuation_dash:
+        return 12
+    case unicode.GeneralCategory.punctuation_open:
+        return 13
+    case unicode.GeneralCategory.punctuation_close:
+        return 14
+    case unicode.GeneralCategory.punctuation_initial_quote:
+        return 15
+    case unicode.GeneralCategory.punctuation_final_quote:
+        return 16
+    case unicode.GeneralCategory.punctuation_other:
+        return 17
+    case unicode.GeneralCategory.symbol_math:
+        return 18
+    case unicode.GeneralCategory.symbol_currency:
+        return 19
+    case unicode.GeneralCategory.symbol_modifier:
+        return 20
+    case unicode.GeneralCategory.symbol_other:
+        return 21
+    case unicode.GeneralCategory.separator_space:
+        return 22
+    case unicode.GeneralCategory.separator_line:
+        return 23
+    case unicode.GeneralCategory.separator_paragraph:
+        return 24
+    case unicode.GeneralCategory.other_control:
+        return 25
+    case unicode.GeneralCategory.other_format:
+        return 26
+    case unicode.GeneralCategory.other_surrogate:
+        return 27
+    case unicode.GeneralCategory.other_private_use:
+        return 28
+    case unicode.GeneralCategory.unassigned:
+        return 29
+    }
+    // a Forja exige return no fim mesmo com switch que cobre tudo (E0302); o caminho nao e alcancado
+    return 29
+}
+
+// Varre todos os codepoints validos e imprime o resumo que o oraculo reproduz.
+proc varre_codepoints() {
+    var contagem: [30]int = {}
+    var com_minuscula: int = 0
+    var com_maiuscula: int = 0
+    var total: int = 0
+    var h: u64 = 0xcbf29ce484222325
+    for n in 0..<0x110000 {
+        if n >= 0xD800 and n <= 0xDFFF {
+            continue
+        }
+        let cp = n as i32
+        let indice = indice_categoria(unicode.category(cp))
+        let baixa = unicode.to_lower(cp)
+        let alta = unicode.to_upper(cp)
+        contagem[indice] += 1
+        if baixa != cp {
+            com_minuscula += 1
+        }
+        if alta != cp {
+            com_maiuscula += 1
+        }
+        total += 1
+        h = fnv_u32(h, cp)
+        h = fnv_byte(h, indice as u64)
+        h = fnv_u32(h, baixa)
+        h = fnv_u32(h, alta)
+    }
+    let nomes: [30]str = {"letter_uppercase", "letter_lowercase", "letter_titlecase", "letter_modifier", "letter_other", "mark_nonspacing", "mark_spacing_combining", "mark_enclosing", "number_decimal_digit", "number_letter", "number_other", "punctuation_connector", "punctuation_dash", "punctuation_open", "punctuation_close", "punctuation_initial_quote", "punctuation_final_quote", "punctuation_other", "symbol_math", "symbol_currency", "symbol_modifier", "symbol_other", "separator_space", "separator_line", "separator_paragraph", "other_control", "other_format", "other_surrogate", "other_private_use", "unassigned"}
+    for i in 0..<30 {
+        print(f"{nomes[i]} {contagem[i]}")
+    }
+    print(f"total {total}")
+    print(f"com_minuscula {com_minuscula}")
+    print(f"com_maiuscula {com_maiuscula}")
+    print(f"hash_fnv1a64 {h:016x}")
+}
+
+// Hex de bytes UTF-8 para str NOVO (dono: delete). Hex invalido e erro do proprio caso de teste.
+proc hex_para_texto(h: str) -> str {
+    switch b in base64.hex_decode(h, alloc = heap) {
+    case [dynamic]u8:
+        defer delete(b)
+        return from_bytes(b[..], alloc = heap)
+    case base64.CodecError:
+        panic("hex invalido em caso de unicode")
+    }
+    return ""
+}
+
+// Confere NFC e NFD de uma entrada contra os esperados (todos em hex de bytes UTF-8) e acumula em resumo.
+proc confere_caso(entrada_hex: str, nfc_hex: str, nfd_hex: str, resumo: ^Contagem) {
+    let entrada = hex_para_texto(entrada_hex)
+    defer delete(entrada)
+    let esperado_nfc = hex_para_texto(nfc_hex)
+    defer delete(esperado_nfc)
+    let esperado_nfd = hex_para_texto(nfd_hex)
+    defer delete(esperado_nfd)
+    resumo.casos += 1
+    switch nfc in unicode.normalize_nfc(entrada, alloc = heap) {
+    case str:
+        defer delete(nfc)
+        if nfc == esperado_nfc {
+            resumo.nfc_ok += 1
+        }
+    case unicode.UnicodeError:
+        resumo.erros += 1
+    }
+    switch nfd in unicode.normalize_nfd(entrada, alloc = heap) {
+    case str:
+        defer delete(nfd)
+        if nfd == esperado_nfd {
+            resumo.nfd_ok += 1
+        }
+    case unicode.UnicodeError:
+        resumo.erros += 1
+    }
+}
+
+// Le o arquivo de casos (uma linha por caso, campos separados por TAB) e confere cada linha. Falso se nao abre.
+proc confere_arquivo(caminho: str, resumo: ^Contagem) -> bool {
+    switch dados in file.read_all(caminho, alloc = heap) {
+    case [dynamic]u8:
+        defer delete(dados)
+        let texto = from_bytes(dados[..], alloc = heap)
+        defer delete(texto)
+        var linhas = text.split_lines(texto, alloc = heap)
+        defer delete(linhas)
+        for linha in linhas {
+            if len(linha) == 0 {
+                continue
+            }
+            var campos = text.split(linha, sep = "\t", alloc = heap)
+            defer delete(campos)
+            if len(campos) != 3 {
+                panic("linha de caso sem os 3 campos entrada, nfc e nfd")
+            }
+            confere_caso(campos[0], campos[1], campos[2], resumo)
+        }
+        return true
+    case file.FileError:
+        return false
+    }
+    return false
+}
+
+proc main() {
+    print(f"utf8proc {unicode.version()} / Unicode {unicode.unicode_version()}")
+    varre_codepoints()
+    var resumo = Contagem{}
+    let argumentos = os.args()
+    if len(argumentos) > 1 {
+        if not confere_arquivo(argumentos[1], &resumo) {
+            print("falhou ao ler o arquivo de casos")
+            os.exit(1)
+        }
+    } else {
+        confere_caso("c385", "c385", "41cc8a", &resumo)
+        confere_caso("c3a9", "c3a9", "65cc81", &resumo)
+        confere_caso("e1b88a", "e1b88a", "44cc87", &resumo)
+        confere_caso("cd84", "cc88cc81", "cc88cc81", &resumo)
+    }
+    print(f"nfc ok {resumo.nfc_ok}/{resumo.casos}")
+    print(f"nfd ok {resumo.nfd_ok}/{resumo.casos}")
+    print(f"erros {resumo.erros}")
+}

@@ -1,0 +1,267 @@
+// nativo/wasm/wasm_ov.fj - contas checadas (ADD_OV, SUB_OV, MUL_OV, NEG_OV) do alvo wasm32-wasip1
+// Versao: 0.1.0 (W1.f)
+// Contrato: wasm_ov_flag empilha um i32 (1 = a conta estoura o tipo), calculado so dos operandos; wasm_ov_resultado grava a conta
+// com volta em dst. A flag sai ANTES do resultado: dst pode ser o mesmo local de um operando. NEG_OV chega como 0 - x (a = imediato 0).
+// Faixa por classe: i8/i16 conta em i32 e confere os bits altos; i32 conta em i64; i64 usa o sinal do xor (soma, subtracao) e
+// a divisao de volta (multiplicacao). Sem sinal: BIR_SEM_SINAL em ins.aux.
+
+import "nativo/bir"
+import "nativo/fmt" as pefmt
+
+const OV_I32_NE: u8 = 0x47
+const OV_I64_EQZ: u8 = 0x50
+const OV_I64_EQ: u8 = 0x51
+const OV_I64_NE: u8 = 0x52
+const OV_I64_LT_S: u8 = 0x53
+const OV_I64_LT_U: u8 = 0x54
+const OV_I64_MUL: u8 = 0x7E
+const OV_I64_DIV_S: u8 = 0x7F
+const OV_I64_DIV_U: u8 = 0x80
+const OV_I64_AND: u8 = 0x83
+const OV_I64_XOR: u8 = 0x85
+const OV_I64_SHR_U: u8 = 0x88
+const OV_TIPO_I32: u8 = 0x7F
+
+struct WasmOv {
+    ins: ^bir.BirInstr
+    corpo: ^[dynamic]u8
+    sem_sinal: bool
+    largo: bool // classe i32: a conta de faixa sai em i64
+    em_i64: bool // classe i64
+    indice: u32 // 0 soma, 1 subtracao, 2 multiplicacao (linha das tabelas WOP_*_BIN)
+}
+
+// Prepara a conta checada de ins (ADD_OV..NEG_OV, classe inteira)
+proc wasm_ov_novo(ins: ^bir.BirInstr, corpo: ^[dynamic]u8) -> WasmOv {
+    let op: i32 = ins.op as i32
+    var indice: u32 = 1
+    if op == bir.BIR_ADD_OV {
+        indice = 0
+    } else if op == bir.BIR_MUL_OV {
+        indice = 2
+    }
+    let classe: i32 = ins.classe as i32
+    return WasmOv{ins = ins, corpo = corpo, sem_sinal = (ins.aux as i32) == bir.BIR_SEM_SINAL, largo = classe == bir.BC_I32, em_i64 = classe == bir.BC_I64, indice = indice}
+}
+
+// Empilha o operando na largura da conta: i8/i16 estendidos por sinal ou zeros; classe i32 estendida para i64
+proc wasm_ov_operando(ov: ^WasmOv, op: bir.BirOperando) -> bool {
+    if not wasm_empilhar_ext(op, ov.corpo, not ov.sem_sinal) {
+        return false
+    }
+    if ov.largo {
+        if ov.sem_sinal {
+            append(ov.corpo, item = OP_I64_EXTEND_I32_U)
+        } else {
+            append(ov.corpo, item = OP_I64_EXTEND_I32_S)
+        }
+    }
+    return true
+}
+
+// a OP b na largura da conta (i32 para i8/i16, i64 para classe i32 e i64)
+proc wasm_ov_conta(ov: ^WasmOv) -> bool {
+    if not (wasm_ov_operando(ov, ov.ins.a) and wasm_ov_operando(ov, ov.ins.b)) {
+        return false
+    }
+    if ov.largo or ov.em_i64 {
+        append(ov.corpo, item = WOP_I64_BIN[ov.indice])
+    } else {
+        append(ov.corpo, item = WOP_I32_BIN[ov.indice])
+    }
+    return true
+}
+
+// i64.const 0 e a comparacao final pedida (ne ou lt_s)
+proc wasm_ov_contra_zero(ov: ^WasmOv, comparacao: u8) {
+    append(ov.corpo, item = OP_I64_CONST)
+    pefmt.wasm_leb_s64(ov.corpo, 0)
+    append(ov.corpo, item = comparacao)
+}
+
+// i8/i16: sem sinal = algum bit acima da largura; com sinal = r difere de r estendido do byte/meia palavra baixa
+proc wasm_ov_flag_estreito(ov: ^WasmOv) -> bool {
+    let eh_i8: bool = (ov.ins.classe as i32) == bir.BC_I8
+    if not wasm_ov_conta(ov) {
+        return false
+    }
+    if ov.sem_sinal {
+        var mascara: i32 = -65536
+        if eh_i8 {
+            mascara = -256
+        }
+        append(ov.corpo, item = OP_I32_CONST)
+        pefmt.wasm_leb_s32(ov.corpo, mascara)
+        append(ov.corpo, item = OP_I32_AND)
+        append(ov.corpo, item = OP_I32_CONST)
+        pefmt.wasm_leb_s32(ov.corpo, 0)
+        append(ov.corpo, item = OV_I32_NE)
+        return true
+    }
+    if not wasm_ov_conta(ov) {
+        return false
+    }
+    if eh_i8 {
+        append(ov.corpo, item = OP_I32_EXTEND8_S)
+    } else {
+        append(ov.corpo, item = OP_I32_EXTEND16_S)
+    }
+    append(ov.corpo, item = OV_I32_NE)
+    return true
+}
+
+// i32: a conta sai em i64 (nunca estoura ali); sem sinal = bits acima do 32o; com sinal = r64 difere do i32 baixo estendido
+proc wasm_ov_flag_i32(ov: ^WasmOv) -> bool {
+    if not wasm_ov_conta(ov) {
+        return false
+    }
+    if ov.sem_sinal {
+        append(ov.corpo, item = OP_I64_CONST)
+        pefmt.wasm_leb_s64(ov.corpo, 32)
+        append(ov.corpo, item = OV_I64_SHR_U)
+        wasm_ov_contra_zero(ov, OV_I64_NE)
+        return true
+    }
+    if not wasm_ov_conta(ov) {
+        return false
+    }
+    append(ov.corpo, item = OP_I32_WRAP_I64)
+    append(ov.corpo, item = OP_I64_EXTEND_I32_S)
+    append(ov.corpo, item = OV_I64_NE)
+    return true
+}
+
+// i64 soma: com sinal ((a ^ r) & (b ^ r)) < 0; sem sinal r < a (sem sinal)
+proc wasm_ov_flag_soma(ov: ^WasmOv) -> bool {
+    if ov.sem_sinal {
+        if not wasm_ov_conta(ov) {
+            return false
+        }
+        if not wasm_ov_operando(ov, ov.ins.a) {
+            return false
+        }
+        append(ov.corpo, item = OV_I64_LT_U)
+        return true
+    }
+    if not (wasm_ov_operando(ov, ov.ins.a) and wasm_ov_conta(ov)) {
+        return false
+    }
+    append(ov.corpo, item = OV_I64_XOR)
+    if not (wasm_ov_operando(ov, ov.ins.b) and wasm_ov_conta(ov)) {
+        return false
+    }
+    append(ov.corpo, item = OV_I64_XOR)
+    append(ov.corpo, item = OV_I64_AND)
+    wasm_ov_contra_zero(ov, OV_I64_LT_S)
+    return true
+}
+
+// i64 subtracao: com sinal ((a ^ b) & (a ^ r)) < 0; sem sinal a < b (sem sinal)
+proc wasm_ov_flag_sub(ov: ^WasmOv) -> bool {
+    if not (wasm_ov_operando(ov, ov.ins.a) and wasm_ov_operando(ov, ov.ins.b)) {
+        return false
+    }
+    if ov.sem_sinal {
+        append(ov.corpo, item = OV_I64_LT_U)
+        return true
+    }
+    append(ov.corpo, item = OV_I64_XOR)
+    if not (wasm_ov_operando(ov, ov.ins.a) and wasm_ov_conta(ov)) {
+        return false
+    }
+    append(ov.corpo, item = OV_I64_XOR)
+    append(ov.corpo, item = OV_I64_AND)
+    wasm_ov_contra_zero(ov, OV_I64_LT_S)
+    return true
+}
+
+// (a * b) / a != b; a nunca e 0 nem (com sinal) -1 aqui, entao a divisao nao trapa
+proc wasm_ov_mul_dividido(ov: ^WasmOv) -> bool {
+    if not (wasm_ov_conta(ov) and wasm_ov_operando(ov, ov.ins.a)) {
+        return false
+    }
+    if ov.sem_sinal {
+        append(ov.corpo, item = OV_I64_DIV_U)
+    } else {
+        append(ov.corpo, item = OV_I64_DIV_S)
+    }
+    if not wasm_ov_operando(ov, ov.ins.b) {
+        return false
+    }
+    append(ov.corpo, item = OV_I64_NE)
+    return true
+}
+
+// i64 multiplicacao: a == 0 nao estoura; com sinal a == -1 estoura so se b == INT64_MIN; senao (a * b) / a != b
+proc wasm_ov_flag_mul(ov: ^WasmOv) -> bool {
+    let minimo: i64 = -9223372036854775807 - 1
+    if not wasm_ov_operando(ov, ov.ins.a) {
+        return false
+    }
+    append(ov.corpo, item = OV_I64_EQZ)
+    append(ov.corpo, item = OP_IF)
+    append(ov.corpo, item = OV_TIPO_I32)
+    append(ov.corpo, item = OP_I32_CONST)
+    pefmt.wasm_leb_s32(ov.corpo, 0)
+    append(ov.corpo, item = OP_ELSE)
+    if ov.sem_sinal {
+        if not wasm_ov_mul_dividido(ov) {
+            return false
+        }
+    } else {
+        if not wasm_ov_operando(ov, ov.ins.a) {
+            return false
+        }
+        append(ov.corpo, item = OP_I64_CONST)
+        pefmt.wasm_leb_s64(ov.corpo, -1)
+        append(ov.corpo, item = OV_I64_EQ)
+        append(ov.corpo, item = OP_IF)
+        append(ov.corpo, item = OV_TIPO_I32)
+        if not wasm_ov_operando(ov, ov.ins.b) {
+            return false
+        }
+        append(ov.corpo, item = OP_I64_CONST)
+        pefmt.wasm_leb_s64(ov.corpo, minimo)
+        append(ov.corpo, item = OV_I64_EQ)
+        append(ov.corpo, item = OP_ELSE)
+        if not wasm_ov_mul_dividido(ov) {
+            return false
+        }
+        append(ov.corpo, item = OP_END)
+    }
+    append(ov.corpo, item = OP_END)
+    return true
+}
+
+// Empilha a flag de estouro (i32): 1 = estourou
+proc wasm_ov_flag(ov: ^WasmOv) -> bool {
+    let classe: i32 = ov.ins.classe as i32
+    if classe == bir.BC_I32 {
+        return wasm_ov_flag_i32(ov)
+    }
+    if classe != bir.BC_I64 {
+        return wasm_ov_flag_estreito(ov)
+    }
+    if ov.indice == 0 {
+        return wasm_ov_flag_soma(ov)
+    }
+    if ov.indice == 1 {
+        return wasm_ov_flag_sub(ov)
+    }
+    return wasm_ov_flag_mul(ov)
+}
+
+// dst = a OP b com volta (os bits altos de i8/i16 ficam indefinidos, como nas outras contas)
+proc wasm_ov_resultado(ins: ^bir.BirInstr, corpo: ^[dynamic]u8) -> bool {
+    let ov: WasmOv = wasm_ov_novo(ins, corpo)
+    if not (wasm_empilhar(ins.a, corpo) and wasm_empilhar(ins.b, corpo)) {
+        return false
+    }
+    if ov.em_i64 {
+        append(corpo, item = WOP_I64_BIN[ov.indice])
+    } else {
+        append(corpo, item = WOP_I32_BIN[ov.indice])
+    }
+    wasm_gravar_destino(ins, corpo)
+    return true
+}

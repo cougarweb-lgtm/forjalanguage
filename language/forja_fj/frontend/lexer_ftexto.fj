@@ -1,0 +1,193 @@
+// frontend/lexer_ftexto.fj - porte de compiler/frontend/lexer_ftexto.c
+// sha256 de frontend/lexer_ftexto.c: 2dd01b5fd22ac5a44be875c082a7d00d8c563752b4c53659a78032c6113d6a88
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "common"
+
+struct FTexto {
+    lx: ?^Lexer
+    buf: [dynamic]u8
+    inicio: u32
+    j: u32
+    ini_pedaco: u32
+}
+
+// C: frontend/lexer_ftexto.c:10
+// C2F: copia identica de empurrar_token (lexer.c); o C a repete como static neste arquivo, aqui delega ao mesmo corpo
+proc empurrar_token_2(lx: ^Lexer, tipo: i32, off: u32, len_c: u32, sym: i32) {
+    empurrar_token(lx, tipo, off, len_c, sym)
+}
+
+// C: frontend/lexer_ftexto.c:22
+proc erro_f_texto_sem_fechar(lx: ^Lexer, inicio: u32) -> bool {
+    let msg_1 = format(f"f\"...\" sem fechar na linha: falta a aspa de fechamento", alloc = heap)
+    defer delete(msg_1)
+    return common.diag_relatar(lx.diag as ^common.Diag, common.E0001, inicio, msg_1)
+}
+
+// C: frontend/lexer_ftexto.c:28
+proc fechar_pedaco_do_f_texto(f: ^FTexto, fim: u32) {
+    if len(f.buf) == 0 {
+        return
+    }
+    let t = from_bytes(f.buf[..], alloc = heap) // C2F-33: Internar recebe str
+    defer delete(t)
+    let sym: i32 = common.internar((f.lx as ^Lexer).nomes as ^common.Interner, t, len(f.buf) as u32)
+    empurrar_token_2(f.lx as ^Lexer, TK_FTEXTO_PEDACO, f.ini_pedaco, fim - f.ini_pedaco, sym)
+    clear(&f.buf)
+}
+
+// C: frontend/lexer_ftexto.c:37
+proc ler_formato_da_chave(lx: ^Lexer, k: ^u32) -> bool {
+    let s: []u8 = (lx.fonte as ^common.Fonte).texto
+    var m: u32 = k^ + 1
+    while (s[m] != 125) and (s[m] != 34) and (s[m] != 10) and (s[m] != 0) { // '}' '"' '\n' '\0'
+        m += 1
+    }
+    if s[m] != 125 { // '}'
+        return common.diag_relatar(lx.diag as ^common.Diag, common.E0001, k^, "formato sem '}' no f\"...\"")
+    }
+    let sym: i32 = internar_bytes(lx, s, k^ + 1, (m - k^) - 1)
+    empurrar_token_2(lx, TK_FTEXTO_FORMATO, k^, m - k^, sym)
+    k^ = m
+    return true
+}
+
+// C: frontend/lexer_ftexto.c:49
+proc passo_da_chave(lx: ^Lexer, k: ^u32, inicio: u32) -> i32 {
+    let s: []u8 = (lx.fonte as ^common.Fonte).texto
+    let ch: u8 = s[k^]
+    if ch == 125 { // '}'
+        return 2
+    }
+    if ch == 58 { // ':'
+        if ler_formato_da_chave(lx, k) {
+            return 1
+        }
+        return 0
+    }
+    if (ch == 34) or ((ch == 102) and (s[k^ + 1] == 34)) { // '"' 'f' '"'
+        var onde: u32 = k^ + 1
+        if ch == 34 {
+            onde = k^
+        }
+        if common.diag_relatar(lx.diag as ^common.Diag, common.E0001, onde, "aspas dentro de {...} no f\"...\": guarde o texto numa variavel antes") {
+            return 1
+        }
+        return 0
+    }
+    if ch == 123 { // '{'
+        if common.diag_relatar(lx.diag as ^common.Diag, common.E0001, k^, "'{' dentro de {...} no f\"...\": guarde o literal numa variavel antes") {
+            return 1
+        }
+        return 0
+    }
+    if (ch == 10) or (ch == 0) { // '\n' '\0'
+        if erro_f_texto_sem_fechar(lx, inicio) {
+            return 1
+        }
+        return 0
+    }
+    if lexer_ler_token_simples(lx, k) {
+        return 1
+    }
+    return 0
+}
+
+// C: frontend/lexer_ftexto.c:67
+proc ler_chave_do_f_texto(lx: ^Lexer, j: ^u32, inicio: u32) -> bool {
+    let s: []u8 = (lx.fonte as ^common.Fonte).texto
+    let abre: u32 = j^
+    var k: u32 = abre + 1
+    empurrar_token_2(lx, TK_FTEXTO_CHAVE, abre, 1, -1)
+    while (s[k] == 32) or (s[k] == 9) { // ' ' '\t'
+        k += 1
+    }
+    if s[k] == 125 { // '}'
+        let msg_1 = format(f"{{}} vazio no f\"...\": ponha uma expressao entre as chaves", alloc = heap)
+        defer delete(msg_1)
+        return common.diag_relatar(lx.diag as ^common.Diag, common.E0001, abre, msg_1)
+    }
+    while true {
+        while (s[k] == 32) or (s[k] == 9) { // ' ' '\t'
+            k += 1
+        }
+        let passo: i32 = passo_da_chave(lx, &k, inicio)
+        if passo == 0 {
+            return false
+        }
+        if passo == 2 {
+            break
+        }
+    }
+    empurrar_token_2(lx, TK_FTEXTO_FIM_CHAVE, k, 1, -1)
+    j^ = k + 1
+    return true
+}
+
+// C: frontend/lexer_ftexto.c:86
+proc copiar_do_f_texto(f: ^FTexto) -> bool {
+    let s: []u8 = ((f.lx as ^Lexer).fonte as ^common.Fonte).texto
+    let j: u32 = f.j
+    if (s[j] == 92) and (s[j + 1] != 10) { // '\\' '\n'
+        append(&f.buf, item = s[j])
+        append(&f.buf, item = s[j + 1])
+        f.j += 2
+    } else if ((s[j] == 123) or (s[j] == 125)) and (s[j + 1] == s[j]) { // '{' '}'
+        append(&f.buf, item = s[j])
+        f.j += 2
+    } else if s[j] == 125 { // '}'
+        return common.diag_relatar((f.lx as ^Lexer).diag as ^common.Diag, common.E0001, j, "'}' sozinho no f\"...\": escreva '}}' para uma chave")
+    } else {
+        append(&f.buf, item = s[j])
+        f.j += 1
+    }
+    return true
+}
+
+// C: frontend/lexer_ftexto.c:106
+proc passo_do_f_texto(f: ^FTexto) -> i32 {
+    let s: []u8 = ((f.lx as ^Lexer).fonte as ^common.Fonte).texto
+    if (f.j >= (((f.lx as ^Lexer).fonte as ^common.Fonte).tam as u32)) or (s[f.j] == 10) { // '\n'
+        var tern_1: i32 = 0
+        if common.c2f_b2i32(erro_f_texto_sem_fechar(f.lx as ^Lexer, f.inicio)) != 0 {
+            tern_1 = 1
+        }
+        return tern_1
+    }
+    if s[f.j] == 34 { // '"'
+        return 2
+    }
+    if (s[f.j] == 123) and (s[f.j + 1] != 123) { // '{' '{'
+        fechar_pedaco_do_f_texto(f, f.j)
+        if not ler_chave_do_f_texto(f.lx as ^Lexer, &f.j, f.inicio) {
+            return 0
+        }
+        f.ini_pedaco = f.j
+        return 1
+    }
+    var tern_2: i32 = 0
+    if common.c2f_b2i32(copiar_do_f_texto(f)) != 0 {
+        tern_2 = 1
+    }
+    return tern_2
+}
+
+// C: frontend/lexer_ftexto.c:121
+proc lexer_ler_f_texto(lx: ^Lexer, i: ^u32) -> bool {
+    // N3: Buf zerado no C aceita push; [dynamic] zero da R0007 no 1o append: make onde o C zera
+    var f: FTexto = FTexto{lx = lx, buf = make([dynamic]u8, alloc = heap), inicio = i^, j = i^ + 2, ini_pedaco = i^ + 2}
+    var passo: i32 = 1
+    empurrar_token_2(lx, TK_FTEXTO_INICIO, i^, 2, -1)
+    while passo == 1 {
+        passo = passo_do_f_texto(&f)
+    }
+    if passo == 2 {
+        fechar_pedaco_do_f_texto(&f, f.j)
+        empurrar_token_2(lx, TK_FTEXTO_FIM, f.j, 1, -1)
+        i^ = f.j + 1
+    }
+    delete(f.buf)
+    return passo == 2
+}

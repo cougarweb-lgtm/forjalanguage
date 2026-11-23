@@ -1,0 +1,220 @@
+// flags 0.1.0 (A91) - parser de linha de comando com destino por ponteiro, em Forja pura (sem foreign): igual nos 2 backends.
+// Uso: var p = flags.parser_new("prog", alloc = heap); flags.add_int(&p, &n, name = "n", fallback = 3, help = "..."); erro = flags.parse(&p, args) com args = os.args() (o [0] e o programa e nao conta); p.rest guarda os posicionais; flags.usage(&p, alloc = heap) devolve a ajuda; no fim flags.parser_delete(&p).
+// Registro: add_int, add_str, add_bool e add_f64 (nomes de tipo base nao servem de proc: E1003 dentro da std) gravam o fallback em dest^ no registro e o parse troca o valor. A tabela guarda o destino como rawptr por valor: nunca segura ^T de dentro de lista (lista move ao crescer).
+// Formas aceitas: --nome valor, --nome=valor, -nome valor, -nome=valor; bool sem valor (--nome vira true); -- encerra as opcoes. O parse para na 1a falha (FlagError com o nome); destinos lidos antes ficam gravados.
+// FlagError guarda fatias de args: valem enquanto args viver. Textos de erro e de usage saem no alocador do chamador (delete so se heap).
+import "std:text"
+
+pub enum TipoFlag { inteiro, texto, booleano, real }
+
+pub enum FlagErrorKind { desconhecida, valor_faltando, tipo_invalido }
+
+// Uma flag registrada. destino e o endereco de dest como rawptr; padrao_* guardam o fallback para o usage.
+pub struct Entrada {
+    tipo: TipoFlag
+    nome: str
+    ajuda: str
+    destino: rawptr
+    padrao_inteiro: int = 0
+    padrao_texto: str = ""
+    padrao_booleano: bool = false
+    padrao_real: f64 = 0.0
+}
+
+// Parser: nome do programa (no usage), a tabela de flags e os posicionais da ultima chamada de parse.
+pub struct Parser {
+    nome: str
+    entradas: [dynamic]Entrada
+    rest: [dynamic]str
+}
+
+// Erro do parse: tipo, nome da flag (sem o traco) e o valor recebido quando houver.
+pub struct FlagError {
+    tipo: FlagErrorKind
+    nome: str
+    valor: str
+}
+
+// Parser vazio com o nome do programa. Use alloc = heap e libere com parser_delete.
+pub proc parser_new(nome: str, alloc: Allocator) -> Parser {
+    return Parser{nome = nome, entradas = make([dynamic]Entrada, alloc = alloc), rest = make([dynamic]str, alloc = alloc)}
+}
+
+// Libera a tabela e os posicionais (vale para alloc = heap).
+pub proc parser_delete(p: ^Parser) {
+    delete(p.entradas)
+    delete(p.rest)
+}
+
+// Registra uma flag inteira em dest: grava fallback agora e o parse troca por --nome valor.
+pub proc add_int(p: ^Parser, dest: ^int, name: str, fallback: int = 0, help: str = "") {
+    dest^ = fallback
+    append(&p.entradas, item = Entrada{tipo = TipoFlag.inteiro, nome = name, ajuda = help, destino = dest as rawptr, padrao_inteiro = fallback})
+}
+
+// Registra uma flag de texto em dest (texto emprestado de args; vale enquanto args viver).
+pub proc add_str(p: ^Parser, dest: ^str, name: str, fallback: str = "", help: str = "") {
+    dest^ = fallback
+    append(&p.entradas, item = Entrada{tipo = TipoFlag.texto, nome = name, ajuda = help, destino = dest as rawptr, padrao_texto = fallback})
+}
+
+// Registra uma flag booleana: --nome sozinho vale true; --nome=false tambem vale.
+pub proc add_bool(p: ^Parser, dest: ^bool, name: str, fallback: bool = false, help: str = "") {
+    dest^ = fallback
+    append(&p.entradas, item = Entrada{tipo = TipoFlag.booleano, nome = name, ajuda = help, destino = dest as rawptr, padrao_booleano = fallback})
+}
+
+// Registra uma flag real (f64) em dest; aceita o que text.parse_float aceita.
+pub proc add_f64(p: ^Parser, dest: ^f64, name: str, fallback: f64 = 0.0, help: str = "") {
+    dest^ = fallback
+    append(&p.entradas, item = Entrada{tipo = TipoFlag.real, nome = name, ajuda = help, destino = dest as rawptr, padrao_real = fallback})
+}
+
+// Indice da entrada com esse nome, ou -1.
+proc achar_entrada(p: ^Parser, nome: str) -> int {
+    for i in 0..<len(p.entradas) {
+        if p.entradas[i].nome == nome {
+            return i
+        }
+    }
+    return -1
+}
+
+// Converte valor para o tipo da entrada e grava no destino; FlagError tipo_invalido quando nao converte.
+proc gravar_valor(e: Entrada, valor: str) -> ?FlagError {
+    switch e.tipo {
+    case TipoFlag.inteiro:
+        let destino_inteiro = e.destino as ^int
+        switch lido in text.parse_int(valor) {
+        case int:
+            destino_inteiro^ = lido
+        case text.ParseError:
+            return FlagError{tipo = FlagErrorKind.tipo_invalido, nome = e.nome, valor = valor}
+        }
+    case TipoFlag.texto:
+        let destino_texto = e.destino as ^str
+        destino_texto^ = valor
+    case TipoFlag.booleano:
+        let destino_bool = e.destino as ^bool
+        switch lido in text.parse_bool(valor) {
+        case bool:
+            destino_bool^ = lido
+        case text.ParseError:
+            return FlagError{tipo = FlagErrorKind.tipo_invalido, nome = e.nome, valor = valor}
+        }
+    case TipoFlag.real:
+        let destino_real = e.destino as ^f64
+        switch lido in text.parse_float(valor) {
+        case f64:
+            destino_real^ = lido
+        case text.ParseError:
+            return FlagError{tipo = FlagErrorKind.tipo_invalido, nome = e.nome, valor = valor}
+        }
+    }
+    return none
+}
+
+// Le a flag em args[pos^] (com o traco) e avanca pos^ pelos argumentos usados; none quando deu certo.
+proc ler_flag(p: ^Parser, args: []str, pos: ^int) -> ?FlagError {
+    let arg = args[pos^]
+    var inicio = 1
+    if text.starts_with(arg, "--") {
+        inicio = 2
+    }
+    let cabeca = arg[inicio..<len(arg)]
+    let antes, depois, achou = text.cut(cabeca, "=")
+    var nome = cabeca
+    var valor = ""
+    var tem_valor = false
+    if achou {
+        nome = antes
+        valor = depois
+        tem_valor = true
+    }
+    let indice = achar_entrada(p, nome)
+    if indice < 0 {
+        return FlagError{tipo = FlagErrorKind.desconhecida, nome = nome, valor = ""}
+    }
+    let e = p.entradas[indice]
+    pos^ += 1
+    if e.tipo == TipoFlag.booleano and not tem_valor {
+        return gravar_valor(e, "true")
+    }
+    if not tem_valor {
+        if pos^ >= len(args) {
+            return FlagError{tipo = FlagErrorKind.valor_faltando, nome = nome, valor = ""}
+        }
+        valor = args[pos^]
+        pos^ += 1
+    }
+    return gravar_valor(e, valor)
+}
+
+// Le os argumentos (args[0] e o programa). none = tudo certo; FlagError = a 1a falha. Posicionais vao para p.rest na ordem.
+pub proc parse(p: ^Parser, args: []str) -> ?FlagError {
+    clear(&p.rest)
+    var i = 1
+    var so_posicionais = false
+    while i < len(args) {
+        let arg = args[i]
+        if so_posicionais {
+            append(&p.rest, item = arg)
+            i += 1
+        } else if arg == "--" {
+            so_posicionais = true
+            i += 1
+        } else if arg == "-" or not text.starts_with(arg, "-") {
+            append(&p.rest, item = arg)
+            i += 1
+        } else {
+            let erro = ler_flag(p, args, &i)
+            if erro != none {
+                return erro
+            }
+        }
+    }
+    return none
+}
+
+// Texto de um erro do parse, com o nome da flag. Dono do alocador do chamador.
+pub proc erro_texto(e: FlagError, alloc: Allocator) -> str {
+    switch e.tipo {
+    case FlagErrorKind.desconhecida:
+        return format(f"flag desconhecida: --{e.nome}", alloc = alloc)
+    case FlagErrorKind.valor_faltando:
+        return format(f"falta o valor da flag --{e.nome}", alloc = alloc)
+    case FlagErrorKind.tipo_invalido:
+        return format(f"valor invalido para --{e.nome}: {e.valor}", alloc = alloc)
+    }
+    return format(f"erro de flag", alloc = alloc)
+}
+
+// Uma linha de ajuda por flag, com o padrao; o real sai com duas casas.
+proc linha_ajuda(e: Entrada) -> str {
+    switch e.tipo {
+    case TipoFlag.inteiro:
+        return format(f"  --{e.nome}  {e.ajuda} (padrao {e.padrao_inteiro})\n", alloc = heap)
+    case TipoFlag.texto:
+        return format(f"  --{e.nome}  {e.ajuda} (padrao {e.padrao_texto})\n", alloc = heap)
+    case TipoFlag.booleano:
+        return format(f"  --{e.nome}  {e.ajuda} (padrao {e.padrao_booleano})\n", alloc = heap)
+    case TipoFlag.real:
+        return format(f"  --{e.nome}  {e.ajuda} (padrao {e.padrao_real:.2})\n", alloc = heap)
+    }
+    return format(f"  --{e.nome}\n", alloc = heap)
+}
+
+// Texto de ajuda: a linha de uso e uma linha por flag. Dono do alocador do chamador (delete so se heap).
+pub proc usage(p: ^Parser, alloc: Allocator) -> str {
+    var linhas = make([dynamic]str, alloc = heap)
+    append(&linhas, item = format(f"uso: {p.nome} [opcoes] [argumentos]\n", alloc = heap))
+    for i in 0..<len(p.entradas) {
+        append(&linhas, item = linha_ajuda(p.entradas[i]))
+    }
+    let texto = text.concat(linhas[..], alloc = alloc)
+    for linha in linhas {
+        delete(linha)
+    }
+    delete(linhas)
+    return texto
+}

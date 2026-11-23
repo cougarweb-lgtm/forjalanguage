@@ -1,0 +1,203 @@
+// Fixture do std:net UDP (M5 P54, criterio (e)): 40 sockets cliente x 1000 datagramas de 1200 bytes para UM socket servidor em 127.0.0.1 porta 0.
+// A thread de recepcao drena em paralelo e conta por (socket, seq). Padrao: bytes 0..3 = socket (u32 LE), 4..7 = seq (u32 LE), i >= 8 = (socket*7 + seq + i) mod 256.
+// Saida esperada: "volume 40000 OK" e "volume recebidos=40000 perdidos=0 ms=<n> pacotes_s=<n>".
+import "std:net" as net
+import "std:thread" as thread
+import "std:time" as tempo
+
+const CLIENTES: int = 40
+const SEQUENCIAS: int = 1000
+const TAMANHO: int = 1200
+const TOTAL: int = 40000
+const OCIOSOS_MAXIMOS: int = 3
+
+struct Recepcao {
+    servidor: net.UdpSocket
+    vistos: [40000]u8 = {}
+    total: int = 0
+    unicos: int = 0
+    duplicados: int = 0
+    corrompidos: int = 0
+}
+
+proc abrir(addr: str) -> net.UdpSocket {
+    switch r in net.udp_bind(addr) {
+    case net.UdpSocket:
+        return r
+    case net.NetError:
+        return net.UdpSocket{h = 0}
+    }
+    return net.UdpSocket{h = 0}
+}
+
+// Grava valor em 4 bytes little-endian a partir de q[deslocamento].
+proc gravar32(q: []u8, deslocamento: int, valor: int) {
+    var resto = valor
+    for k in 0..<4 {
+        q[deslocamento + k] = (resto % 256) as u8
+        resto = resto / 256
+    }
+}
+
+// Le 4 bytes little-endian a partir de q[deslocamento].
+proc ler32(q: []u8, deslocamento: int) -> int {
+    var valor = 0
+    var peso = 1
+    for k in 0..<4 {
+        valor += (q[deslocamento + k] as int) * peso
+        peso = peso * 256
+    }
+    return valor
+}
+
+proc montar(socket: int, seq: int, q: []u8) {
+    for i in 0..<len(q) {
+        q[i] = ((socket * 7 + seq + i) % 256) as u8
+    }
+    gravar32(q, 0, socket)
+    gravar32(q, 4, seq)
+}
+
+proc iguais(a: []u8, b: []u8) -> bool {
+    if len(a) != len(b) {
+        return false
+    }
+    for i in 0..<len(a) {
+        if a[i] != b[i] {
+            return false
+        }
+    }
+    return true
+}
+
+// Classifica um datagrama recebido: unico, duplicado ou corrompido (tamanho, cabecalho ou padrao errado).
+proc conferir(rec: ^Recepcao, q: []u8, quantos: int) {
+    rec.total += 1
+    if quantos != TAMANHO {
+        rec.corrompidos += 1
+        return
+    }
+    let socket = ler32(q, 0)
+    let seq = ler32(q, 4)
+    if socket >= CLIENTES or seq >= SEQUENCIAS {
+        rec.corrompidos += 1
+        return
+    }
+    var esperado: [1200]u8 = {}
+    montar(socket, seq, esperado[..])
+    if not iguais(esperado[..], q) {
+        rec.corrompidos += 1
+        return
+    }
+    let indice = socket * SEQUENCIAS + seq
+    if rec.vistos[indice] != 0 {
+        rec.duplicados += 1
+        return
+    }
+    rec.vistos[indice] = 1
+    rec.unicos += 1
+}
+
+// Thread de recepcao: drena ate receber TOTAL datagramas ou ficar OCIOSOS_MAXIMOS timeouts de 1 s seguidos.
+proc filha(p: rawptr) -> u32 {
+    let rec = p as ^Recepcao
+    var buf: [1200]u8 = {}
+    var ociosos = 0
+    while rec.total < TOTAL and ociosos < OCIOSOS_MAXIMOS {
+        switch r in net.udp_recv_from(&rec.servidor, buf[..], 1000, heap) {
+        case net.UdpRecebido:
+            defer delete(r.de)
+            ociosos = 0
+            conferir(rec, buf[..], r.quantos)
+        case net.NetError:
+            if r == net.NetError.timeout {
+                ociosos += 1
+            } else {
+                rec.total += 1
+                rec.corrompidos += 1
+                ociosos = 0
+            }
+        }
+    }
+    return 0
+}
+
+// Uma rodada: 1 datagrama de cada cliente para o servidor. Devolve as falhas de envio.
+proc enviar_rodada(cli: []net.UdpSocket, destino: str, seq: int) -> int {
+    var quadro: [1200]u8 = {}
+    var falhas = 0
+    for s in 0..<CLIENTES {
+        montar(s, seq, quadro[..])
+        switch n in net.udp_send_to(&cli[s], destino, quadro[..]) {
+        case int:
+            if n != TAMANHO {
+                falhas += 1
+            }
+        case net.NetError:
+            falhas += 1
+        }
+    }
+    return falhas
+}
+
+// Rodada a rodada, sem confirmacao (o buffer de 4 MiB do socket segura a rajada). Devolve as falhas de envio.
+proc enviar_tudo(cli: []net.UdpSocket, destino: str) -> int {
+    var falhas = 0
+    for seq in 0..<SEQUENCIAS {
+        falhas += enviar_rodada(cli, destino, seq)
+    }
+    return falhas
+}
+
+proc rodar(servidor: net.UdpSocket, destino: str) {
+    var clientes: [40]net.UdpSocket = {}
+    var abertos = 0
+    for i in 0..<CLIENTES {
+        clientes[i] = abrir("127.0.0.1:0")
+        if clientes[i].h != 0 {
+            abertos += 1
+        }
+    }
+    if abertos != CLIENTES {
+        print("FALHA abrir clientes")
+        return
+    }
+    var rec = Recepcao{servidor = servidor}
+    var falhas = 0
+    let sw = tempo.stopwatch_start()
+    switch t in thread.spawn(filha, &rec as rawptr) {
+    case thread.Thread:
+        falhas = enviar_tudo(clientes[..], destino)
+        _ = thread.join(t)
+    case thread.ThreadError:
+        print("FALHA thread")
+        return
+    }
+    let ms = tempo.ns_to_ms(tempo.elapsed_ns(sw))
+    let pacotes_s = rec.total * 1000 / max(ms, 1)
+    if rec.unicos == TOTAL and rec.duplicados == 0 and rec.corrompidos == 0 and falhas == 0 {
+        print("volume 40000 OK")
+    } else {
+        print(f"FALHA volume unicos={rec.unicos} duplicados={rec.duplicados} corrompidos={rec.corrompidos} falhas_envio={falhas}")
+    }
+    print(f"volume recebidos={rec.unicos} perdidos={TOTAL - rec.unicos} ms={ms} pacotes_s={pacotes_s}")
+    for i in 0..<CLIENTES {
+        _ = net.udp_close(&clientes[i])
+    }
+    _ = net.udp_close(&rec.servidor)
+}
+
+proc main() {
+    var srv = abrir("127.0.0.1:0")
+    if srv.h == 0 {
+        print("FALHA abrir servidor")
+        return
+    }
+    switch ende in net.udp_local_addr(&srv, heap) {
+    case str:
+        rodar(srv, ende)
+        delete(ende)
+    case net.NetError:
+        print("FALHA endereco local")
+    }
+}

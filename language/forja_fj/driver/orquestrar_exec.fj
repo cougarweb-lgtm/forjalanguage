@@ -1,0 +1,1069 @@
+// driver/orquestrar_exec.fj - porte de compiler/driver/orquestrar_exec.c
+// sha256 de driver/orquestrar_exec.c: af693528e1f755e63eb7148d9582426f5cb42627d05032856e7ac91a9087b937
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.2.0
+// Changelog: 0.2.0 - G3 V5-O2: corpo real. Trava = std:file.lock (CreateFile sem compartilhamento + apagar ao fechar); faxina = file.read_dir + remove_file; pastas = file.make_dir;
+//            filhos = processo_win (std:process); jobs = os.cpu_count/os.mem_available; bloco do filho em bytes crus = os.write_stderr (depois de descarregar stdout e stderr do shim).
+//            SaidaDiag local (o principal liga o unico depois). Corrida.motivo/velho viram buffers de bytes (o orq_avaliar_produto escreve neles); Execucao2 guarda os textos
+//            (exe, cache, injecao) no heap e a lista de Corrida num [dynamic] dono; caminho_do_log devolve o texto (heap) em vez de preencher CaminhoLog; escrever_bruto recebe bytes.
+
+import "std:os"
+import "std:file"
+import "cache"
+import "common"
+import "nativo"
+
+// motivo: ORQ_MOTIVO_MAX bytes; velho: ORQ_CAMINHO_MAX bytes (texto C, com NUL no fim)
+struct Corrida {
+    situacao: i32
+    proc_c: Processo
+    inicio_ms: u64
+    ms: u32
+    causa: u32
+    saida: i32
+    motivo: [1164]u8
+    velho: [2200]u8
+}
+
+struct Execucao2 {
+    pl: ?^Plano2
+    corrida: ?[]Corrida
+    corrida_dono: [dynamic]Corrida
+    job: ProcessoJob
+    trava: file.File
+    inicio_ms: u64
+    jobs: u32
+    rodando: u32
+    filhos: u32
+    exe: str
+    cache: str
+    injetar: str
+    injetar_produto: str
+}
+
+struct Contagem {
+    recompilados: u32
+    reusados: u32
+    falharam: u32
+    pulados: u32
+}
+
+struct Violacao {
+    linha: ?^cache.EntradaGravada
+    dono: u32
+}
+
+// v[0..<n] sao os argumentos do filho (o C termina com NULL)
+struct ArgsFilho {
+    v: [20]str
+    n: u64
+}
+
+const SIT_PENDENTE: i32 = 0
+const SIT_PRONTO: i32 = 1
+const SIT_RODANDO: i32 = 2
+const SIT_RECOMPILADO: i32 = 3
+const SIT_REUSADO: i32 = 4
+const SIT_FALHOU: i32 = 5
+const SIT_PULADO: i32 = 6
+const DEPS_ESPERA: i32 = 0
+const DEPS_LIVRES: i32 = 1
+const DEPS_FALHAS: i32 = 2
+const TRAVA_OK: i32 = 0
+const TRAVA_OCUPADA: i32 = 1
+const TRAVA_ERRO: i32 = 2
+const EXEC_JOBS_MAX: i32 = 64
+const EXEC_RAM_POR_FILHO: u64 = 536870912
+const EXEC_VARIAVEL_JOBS: str = "FORJA_JOBS"
+const EXEC_INJETAR: str = "FORJA_TESTE_INJETAR"
+const EXEC_INJETAR_PRODUTO: str = "FORJA_TESTE_INJETAR_PRODUTO"
+const EXEC_SEM_DONO: u32 = 4294967295
+const EXEC_CACHE_MAX: i32 = 1116
+const EXEC_ESTADO_MAX: i32 = 1132
+const EXEC_MODO_MAX: i32 = 1148
+// tamanho dos buffers do C: injetar[32], injetar_produto[PROJETO_NOME_MAX], exe[PROJETO_CAMINHO_MAX] (todos com NUL: o texto cabe em tam - 1)
+const EXEC_INJETAR_TAM: int = 32
+const EXEC_INJETAR_PRODUTO_TAM: int = 64
+const EXEC_EXE_TAM: int = 1100
+
+// Texto C de um buffer de bytes (ate o 1o NUL), EMPRESTADO: vale enquanto o buffer viver.
+proc exec_texto_emprestado(b: []u8) -> str {
+    if (len(b) == 0) or (b[0] == 0) {
+        return ""
+    }
+    return &b[0] as rawptr as cstr as str
+}
+
+// snprintf(destino, sizeof destino, "%s", texto): corta no que cabe e fecha com NUL.
+proc exec_copiar_no_buffer(destino: []u8, texto: str) {
+    if len(destino) == 0 {
+        return
+    }
+    var n: int = len(texto)
+    if n > (len(destino) - 1) {
+        n = len(destino) - 1
+    }
+    for i in 0..<n {
+        destino[i] = texto[i]
+    }
+    destino[n] = 0
+}
+
+// O texto cortado em 'max' bytes (o %s de um buffer menor do C).
+proc exec_truncar_texto(texto: str, max: int) -> str {
+    if len(texto) > max {
+        return texto[0..<max]
+    }
+    return texto
+}
+
+// <a>\<b> no heap (quem chama faz delete).
+proc exec_juntar_caminho(a: str, b: str) -> str {
+    return format(f"{a}\\{b}", alloc = heap)
+}
+
+// stderr em modo texto (LF -> CRLF, como o stdio do C); a Saida e um objeto descartavel (stderr sai na hora): abre, escreve e fecha.
+proc exec_escrever_stderr(msg: str) {
+    let s = common.c2f_saida_stderr()
+    common.c2f_saida_escrever_texto(s, msg)
+    _ = common.c2f_saida_fechar(s)
+}
+
+// stdout sem traducao (o runtime do E1 traduz); fechar a Saida de stdout so descarrega o buffer do runtime (o fflush que o C faz nos blocos).
+proc exec_escrever_stdout(msg: str) {
+    let s = common.c2f_saida_stdout()
+    common.c2f_saida_escrever_texto(s, msg)
+    _ = common.c2f_saida_fechar(s)
+}
+
+// DiagImprimirJsonSemFonte no stderr com um SaidaDiag local (o principal liga o unico depois; estes caminhos so existem sem ModoResumo).
+proc exec_diag_json(codigo: i32, causa: str) {
+    var sd = common.SaidaDiag{}
+    let s = common.c2f_saida_stderr()
+    common.diag_imprimir_json_sem_fonte(codigo, causa, s, &sd)
+    _ = common.c2f_saida_fechar(s)
+}
+
+// C: driver/orquestrar_exec.c:66
+proc ms_agora() -> u64 {
+    return common.relogio_ns() / 1000000
+}
+
+// C: driver/orquestrar_exec.c:71
+proc minimo(a: u32, b: u32) -> u32 {
+    return min(a, b)
+}
+
+// C: driver/orquestrar_exec.c:79
+// Quantos produtos cabem lado a lado na camada mais larga: mais filhos que isso nunca rodam juntos.
+proc largura_maxima(pl: ^Plano2) -> u32 {
+    let n: int = len(pl.projeto.produtos)
+    let camada: []u32 = pl.camada or_else {}
+    var conta = make([dynamic]u32, alloc = heap, cap = n + 1)
+    defer delete(conta)
+    for _i in 0..<(n + 1) {
+        append(&conta, item = 0)
+    }
+    var maior: u32 = 1
+    for k in 0..<n {
+        conta[camada[k]] += 1
+        let largura: u32 = conta[camada[k]]
+        if largura > maior {
+            maior = largura
+        }
+    }
+    return minimo(maior, EXEC_JOBS_MAX as u32)
+}
+
+// C: driver/orquestrar_exec.c:96
+// Processadores logicos, limitado por RAM fisica livre / 512 MiB, pela largura da maior camada e por 64 (minimo 1).
+proc jobs_padrao(pl: ^Plano2) -> u32 {
+    var jobs: u32 = os.cpu_count() as u32
+    // GlobalMemoryStatusEx que falha deixa jobs como esta: sem a leitura, a RAM e "infinita" (jobs nunca passa de u32 max)
+    let sem_leitura: u64 = (4294967295 as u64) * EXEC_RAM_POR_FILHO
+    let livre: u64 = (os.mem_available() or_else (sem_leitura as uint)) as u64
+    jobs = minimo(jobs, common.c2f_trunc_u32(livre / EXEC_RAM_POR_FILHO))
+    jobs = minimo(minimo(jobs, largura_maxima(pl)), EXEC_JOBS_MAX as u32)
+    if jobs > 0 {
+        return jobs
+    }
+    return 1
+}
+
+// C: driver/orquestrar_exec.c:108
+// --jobs vence FORJA_JOBS, que vence o padrao. false = FORJA_JOBS fora de 1..64 (uso errado).
+proc resolver_jobs(pl: ^Plano2, jobs: ^u32) -> bool {
+    let o: ^Opcoes = pl.opcoes as ^Opcoes
+    if o.jobs != none {
+        return opcoes_jobs_texto(o.jobs, jobs)
+    }
+    let variavel: ?str = os.env(EXEC_VARIAVEL_JOBS)
+    if variavel == none {
+        jobs^ = jobs_padrao(pl)
+        return true
+    }
+    if opcoes_jobs_texto(variavel, jobs) {
+        return true
+    }
+    let texto: str = variavel or_else ""
+    let msg = format(f"forja: {EXEC_VARIAVEL_JOBS} invalida '{texto}': use um numero inteiro de 1 a 64\n", alloc = heap)
+    defer delete(msg)
+    exec_escrever_stderr(msg)
+    return false
+}
+
+// C: driver/orquestrar_exec.c:124
+// DIVERGENCIA: junction/symlink de pasta conta como pasta no C (GetFileAttributes) e nao no std:file (nao segue link).
+proc eh_pasta_4(caminho: str) -> bool {
+    return file.is_dir(caminho)
+}
+
+// C: driver/orquestrar_exec.c:132
+// Cria a pasta e as que faltam acima dela (o "C:\" do comeco fica de fora).
+proc pasta_garantir(caminho: str) -> bool {
+    let n: int = len(caminho)
+    if n >= (ORQ_CAMINHO_MAX as int) {
+        return false
+    }
+    var k: int = 3
+    while k < n {
+        if caminho[k] == 92 { // '\\'
+            _ = file.make_dir(caminho[0..<k])
+        }
+        k += 1
+    }
+    _ = file.make_dir(caminho)
+    return eh_pasta_4(caminho)
+}
+
+// C: driver/orquestrar_exec.c:150
+// "x.dll.tmp1234" ou "x.dll.velho1234": o pid do forja que gravou.
+proc sufixo_de_processo(nome: str, pid: ^u32) -> bool {
+    var ponto: int = -1
+    for i in 0..<len(nome) {
+        if nome[i] == 46 { // '.'
+            ponto = i
+        }
+    }
+    if ponto < 0 {
+        return false
+    }
+    let resto: str = nome[(ponto + 1)..<len(nome)]
+    var inicio: int = 0
+    if common.c2f_prefixo_igual(resto, "tmp", 3) {
+        inicio = 3
+    } else if common.c2f_prefixo_igual(resto, "velho", 5) {
+        inicio = 5
+    } else {
+        return false
+    }
+    if (inicio >= len(resto)) or (resto[inicio] < 48) or (resto[inicio] > 57) {
+        return false
+    }
+    // strtoul de 32 bits: passa de 4294967295 = 4294967295
+    var valor: u64 = 0
+    for j in inicio..<len(resto) {
+        let c: u8 = resto[j]
+        if (c < 48) or (c > 57) {
+            return false
+        }
+        if valor < 4294967296 {
+            valor = (valor * 10) + ((c as u64) - 48)
+        }
+    }
+    if valor > 4294967295 {
+        valor = 4294967295
+    }
+    pid^ = valor as u32
+    return true
+}
+
+// C: driver/orquestrar_exec.c:169
+// Apaga os *.tmp<pid> e *.velho<pid> da pasta cujo pid ja morreu (um .velho de DLL ainda carregada nao apaga: o Windows recusa, e a proxima faxina tenta de novo).
+proc faxinar_pasta(pasta: str) {
+    switch lista in file.read_dir(pasta, alloc = heap) {
+    case file.DirList:
+        for i in 0..<len(lista.items) {
+            let e: file.DirEntry = lista.items[i]
+            var pid: u32 = 0
+            if (e.kind == file.FileKind.dir) or (not sufixo_de_processo(e.name, &pid)) or processo_vivo(pid) {
+                continue
+            }
+            let arquivo = exec_juntar_caminho(pasta, e.name)
+            _ = file.remove_file(arquivo)
+            delete(arquivo)
+        }
+        delete(lista.items)
+        delete(lista.data)
+    case file.FileError:
+        return
+    }
+}
+
+// C: driver/orquestrar_exec.c:188
+// Saida, estado\<modo> e log existem (o filho em pasta inexistente daria X0302) e as sobras de build morto saem.
+proc pastas_e_faxina(ex: ^Execucao2) -> bool {
+    let pl: ^Plano2 = ex.pl as ^Plano2
+    let estado = exec_juntar_caminho(ex.cache, "estado")
+    defer delete(estado)
+    let modo = exec_juntar_caminho(estado, pl.modo or_else "")
+    defer delete(modo)
+    let log = exec_juntar_caminho(ex.cache, "log")
+    defer delete(log)
+    if (not pasta_garantir(pl.projeto.saida or_else "")) or (not pasta_garantir(modo)) or (not pasta_garantir(log)) {
+        exec_escrever_stderr("forja: nao consegui criar as pastas de saida, estado e log do projeto\n")
+        return false
+    }
+    faxinar_pasta(pl.projeto.saida or_else "")
+    faxinar_pasta(estado)
+    faxinar_pasta(modo)
+    return true
+}
+
+// C: driver/orquestrar_exec.c:207
+proc preparar_pastas(ex: ^Execucao2) -> bool {
+    let ini: u64 = tempos_agora(&(ex.pl as ^Plano2).tempos)
+    let ok: bool = pastas_e_faxina(ex)
+    tempos_fechar(&(ex.pl as ^Plano2).tempos, "pastas_faxina", none, ini)
+    return ok
+}
+
+// C: driver/orquestrar_exec.c:217
+// <cache>\trava sem compartilhamento e apagada ao fechar: outro orquestrador no projeto nao a abre, e ela some sozinha se este morrer. 'esperas' conta os Sleep(10).
+proc trava_tentar(ex: ^Execucao2, esperas: ^i64) -> i32 {
+    let caminho = exec_juntar_caminho(ex.cache, "trava")
+    defer delete(caminho)
+    var erro: int = 0
+    for _tentativa in 0..<4 {
+        switch r in file.lock(caminho) {
+        case file.File:
+            ex.trava = r
+            return TRAVA_OK
+        case file.FileError:
+            if r == file.FileError.locked { // ERROR_SHARING_VIOLATION
+                return TRAVA_OCUPADA
+            }
+            erro = os.last_error()
+        }
+        esperas^ += 1
+        os.sleep_ms(10) // ACCESS_DENIED: a trava do build anterior ainda esta em "apagar ao fechar"
+    }
+    let msg = format(f"forja: nao consegui abrir a trava '{caminho}' (erro {erro})\n", alloc = heap)
+    defer delete(msg)
+    exec_escrever_stderr(msg)
+    return TRAVA_ERRO
+}
+
+// C: driver/orquestrar_exec.c:236
+proc trava_abrir(ex: ^Execucao2) -> i32 {
+    let ini: u64 = tempos_agora(&(ex.pl as ^Plano2).tempos)
+    var esperas: i64 = 0
+    let trava: i32 = trava_tentar(ex, &esperas)
+    tempos_fechar(&(ex.pl as ^Plano2).tempos, "trava", none, ini)
+    tempos_acrescentar_n(&(ex.pl as ^Plano2).tempos, esperas)
+    return trava
+}
+
+// C: driver/orquestrar_exec.c:252
+// <cache>\log\<nome>.out ou .err: onde o stdout e o stderr do filho caem (heap; quem chama faz delete). O C preenche um CaminhoLog.
+proc caminho_do_log(ex: ^Execucao2, nome: str, extensao: str) -> str {
+    return format(f"{ex.cache}\\log\\{nome}.{extensao}", alloc = heap)
+}
+
+// C: driver/orquestrar_exec.c:260
+// forja build --backend x64 [--modo dll] [--release] <entrada> -o <saida> --entradas <arq> --lib-pasta <saida>.
+proc montar_args(ex: ^Execucao2, pr: ^cache.Produto, entradas: str, a: ^ArgsFilho) {
+    var n: u64 = 0
+    a.v[n] = "build"
+    n += 1
+    a.v[n] = "--backend"
+    n += 1
+    a.v[n] = "x64"
+    n += 1
+    if pr.tipo == cache.PRODUTO_DLL {
+        a.v[n] = "--modo"
+        n += 1
+        a.v[n] = "dll"
+        n += 1
+    }
+    if ((ex.pl as ^Plano2).opcoes as ^Opcoes).release {
+        a.v[n] = "--release"
+        n += 1
+    }
+    a.v[n] = pr.entrada or_else ""
+    n += 1
+    a.v[n] = "-o"
+    n += 1
+    a.v[n] = pr.saida or_else ""
+    n += 1
+    a.v[n] = "--entradas"
+    n += 1
+    a.v[n] = entradas
+    n += 1
+    a.v[n] = "--lib-pasta"
+    n += 1
+    a.v[n] = (ex.pl as ^Plano2).projeto.saida or_else ""
+    n += 1
+    a.n = n
+}
+
+// C: driver/orquestrar_exec.c:283
+// Gancho de teste: a injecao FORJA_TESTE_INJETAR so chega ao filho do produto nomeado em FORJA_TESTE_INJETAR_PRODUTO; os outros a perdem.
+// _putenv_s(nome, "") do C REMOVE a variavel (nao a deixa vazia): por isso unset_env quando o valor e vazio.
+proc aplicar_injecao(ex: ^Execucao2, nome: str) {
+    if len(ex.injetar_produto) == 0 {
+        return
+    }
+    var valor: str = ""
+    if ex.injetar_produto == nome {
+        valor = ex.injetar
+    }
+    if len(valor) == 0 {
+        _ = os.unset_env(EXEC_INJETAR)
+        return
+    }
+    _ = os.set_env(EXEC_INJETAR, valor)
+}
+
+// C: driver/orquestrar_exec.c:289
+proc falhar_no_disparo(ex: ^Execucao2, k: u32) {
+    let c: ^Corrida = &(ex.corrida or_else {})[k]
+    let nome: str = cache.projeto_produto(&(ex.pl as ^Plano2).projeto, k).nome or_else ""
+    let msg = format(f"forja: [{nome}] nao consegui disparar o filho (erro {c.proc_c.erro})\n", alloc = heap)
+    defer delete(msg)
+    exec_escrever_stderr(msg)
+    c.situacao = SIT_FALHOU
+    c.saida = nativo.SAIDA_INTERNO
+}
+
+// C: driver/orquestrar_exec.c:299
+proc fases_se_pedido(ex: ^Execucao2, fases: ^ProcessoFases) -> ?^ProcessoFases {
+    var tern_1: ?^ProcessoFases = none
+    if common.c2f_b2i32((ex.pl as ^Plano2).tempos.ativo) != 0 {
+        tern_1 = fases
+    }
+    return tern_1
+}
+
+// C: driver/orquestrar_exec.c:305
+// As quatro etapas do disparo a partir das marcas: canais (abrir + fechar), criar, job, retomar.
+proc anotar_fases(ex: ^Execucao2, nome: str, f: ^ProcessoFases) {
+    let t: ^Tempos = &(ex.pl as ^Plano2).tempos
+    let m: [6]u64 = f.marca
+    if not t.ativo {
+        return
+    }
+    tempos_anotar_ticks(t, "canais", nome, (m[1] - m[0]) + (m[3] - m[2]))
+    tempos_anotar_ticks(t, "criar", nome, m[2] - m[1])
+    tempos_anotar_ticks(t, "job", nome, m[4] - m[3])
+    tempos_anotar_ticks(t, "retomar", nome, m[5] - m[4])
+}
+
+// C: driver/orquestrar_exec.c:317
+proc disparar_2(ex: ^Execucao2, k: u32) {
+    let pl: ^Plano2 = ex.pl as ^Plano2
+    let pr: ^cache.Produto = cache.projeto_produto(&pl.projeto, k)
+    let c: ^Corrida = &(ex.corrida or_else {})[k]
+    let nome: str = pr.nome or_else ""
+    var buf_entradas: [2200]u8 = {}
+    var args: ArgsFilho = ArgsFilho{}
+    var fases: ProcessoFases = ProcessoFases{}
+    tempos_slot_ocupado(&pl.tempos, nome)
+    orq_caminho_das_entradas(pl, pr, buf_entradas[..], 2200)
+    let out = caminho_do_log(ex, nome, "out")
+    defer delete(out)
+    let err = caminho_do_log(ex, nome, "err")
+    defer delete(err)
+    montar_args(ex, pr, exec_texto_emprestado(buf_entradas[..]), &args)
+    aplicar_injecao(ex, nome)
+    c.inicio_ms = ms_agora()
+    var pedido: ProcessoPedido = ProcessoPedido{exe = ex.exe, args = args.v[0..<args.n], saida_out = out, saida_err = err, job = &ex.job, fases = fases_se_pedido(ex, &fases)}
+    if not processo_disparar(&pedido, &c.proc_c) {
+        falhar_no_disparo(ex, k)
+        return
+    }
+    anotar_fases(ex, nome, &fases)
+    c.situacao = SIT_RODANDO
+    ex.rodando += 1
+    ex.filhos += 1
+}
+
+// C: driver/orquestrar_exec.c:347
+// Bytes crus no stderr do orquestrador, sem a traducao LF -> CRLF: o JSON do filho sai como o filho o escreveu.
+proc escrever_bruto(dados: []u8) {
+    os.write_stderr(dados)
+}
+
+// C: driver/orquestrar_exec.c:360
+// O bloco do filho inteiro (cabecalho, .out e .err), de uma vez so, no instante em que ele termina: dois filhos nunca se intercalam. Vazio = nada sai.
+proc emitir_bloco(ex: ^Execucao2, k: u32) {
+    let nome: str = cache.projeto_produto(&(ex.pl as ^Plano2).projeto, k).nome or_else ""
+    var out = make([dynamic]u8, alloc = heap)
+    defer delete(out)
+    var err = make([dynamic]u8, alloc = heap)
+    defer delete(err)
+    var tam_out: int = 0
+    var tam_err: int = 0
+    let caminho_out = caminho_do_log(ex, nome, "out")
+    defer delete(caminho_out)
+    if cache.arquivo_ler_inteiro(caminho_out, &out) {
+        tam_out = len(out) - 1 // o ultimo byte e o NUL do arquivo_ler_inteiro
+    }
+    let caminho_err = caminho_do_log(ex, nome, "err")
+    defer delete(caminho_err)
+    if cache.arquivo_ler_inteiro(caminho_err, &err) {
+        tam_err = len(err) - 1
+    }
+    if (tam_out + tam_err) > 0 {
+        os.flush_stdout()
+        let msg = format(f"forja: [{nome}] saida do build:\n", alloc = heap)
+        defer delete(msg)
+        exec_escrever_stderr(msg)
+        escrever_bruto(out[0..<tam_out])
+        escrever_bruto(err[0..<tam_err])
+    }
+}
+
+// C: driver/orquestrar_exec.c:384
+proc depende_de(pr: ^cache.Produto, q: u32) -> bool {
+    for j in (0 as u32)..<pr.ndep {
+        if pr.dep[j] == q {
+            return true
+        }
+    }
+    return false
+}
+
+// C: driver/orquestrar_exec.c:393
+// O produto (diferente de k e nao declarado por ele) cuja saida e esse caminho; EXEC_SEM_DONO = nenhum.
+proc dono_nao_declarado(pl: ^Plano2, k: u32, caminho: str) -> u32 {
+    let pr: ^cache.Produto = cache.projeto_produto(&pl.projeto, k)
+    for q in (0 as u32)..<(len(pl.projeto.produtos) as u32) {
+        if (q != k) and (not depende_de(pr, q)) and (common.c2f_stricmp(cache.projeto_produto(&pl.projeto, q).saida or_else "", caminho) == 0) {
+            return q
+        }
+    }
+    return EXEC_SEM_DONO
+}
+
+// C: driver/orquestrar_exec.c:403
+proc achar_violacao(pl: ^Plano2, k: u32, gravadas: ^[dynamic]cache.EntradaGravada, v: ^Violacao) -> bool {
+    var i: u64 = 0
+    while i < (len(gravadas^) as u64) {
+        let g: ^cache.EntradaGravada = &gravadas[i]
+        if (g.tipo or_else "") != "lib" {
+            i += 1
+            continue
+        }
+        v.dono = dono_nao_declarado(pl, k, (g.caminho or_else ""))
+        v.linha = g
+        if v.dono != EXEC_SEM_DONO {
+            return true
+        }
+        i += 1
+    }
+    return false
+}
+
+// C: driver/orquestrar_exec.c:417
+// B0006: o .entradas de k lista a saida de outro produto fora do 'depende' de k. O JSON sai logo depois do bloco do filho.
+proc conferir_declaradas(ex: ^Execucao2, k: u32) -> bool {
+    let pl: ^Plano2 = ex.pl as ^Plano2
+    let pr: ^cache.Produto = cache.projeto_produto(&pl.projeto, k)
+    var buf_entradas: [2200]u8 = {}
+    var v: Violacao = Violacao{linha = none, dono = EXEC_SEM_DONO}
+    let ini: u64 = tempos_agora(&pl.tempos)
+    var gravadas = make([dynamic]cache.EntradaGravada, alloc = heap, cap = 4)
+    orq_caminho_das_entradas(pl, pr, buf_entradas[..], 2200)
+    _ = cache.entradas_ler(exec_texto_emprestado(buf_entradas[..]), &gravadas)
+    let achou: bool = achar_violacao(pl, k, &gravadas, &v)
+    if achou {
+        let dono: str = cache.projeto_produto(&pl.projeto, v.dono).nome or_else ""
+        let linha: ^cache.EntradaGravada = v.linha as ^cache.EntradaGravada
+        let produto: str = pr.nome or_else ""
+        let liga: str = linha.caminho or_else ""
+        let causa = format(f"o produto '{produto}' liga '{liga}', saida do produto '{dono}', sem declarar 'depende {dono}'", alloc = heap)
+        defer delete(causa)
+        exec_diag_json(common.B0006, causa)
+    }
+    delete(gravadas)
+    tempos_fechar(&pl.tempos, "declaradas", pr.nome, ini)
+    return not achou
+}
+
+// C: driver/orquestrar_exec.c:442
+// Troca (ou acrescenta) a linha do produto no estado em memoria: o dependente seguinte ja ve a hash_interface real desta dll.
+proc guardar_linha(e: ^cache.Estado, nova: ^cache.EstadoLinha) {
+    var k: u64 = 0
+    while k < (len(e.linhas) as u64) {
+        let atual: ^cache.EstadoLinha = &e.linhas[k]
+        if (atual.nome or_else "") == (nova.nome or_else "") {
+            atual^ = nova^
+            return
+        }
+        k += 1
+    }
+    append(&e.linhas, item = cache.EstadoLinha{})
+    e.linhas[len(e.linhas) - 1] = nova^
+}
+
+// C: driver/orquestrar_exec.c:455
+proc gravar_estado(ex: ^Execucao2, k: u32) -> bool {
+    let pl: ^Plano2 = ex.pl as ^Plano2
+    var buf_caminho: [2200]u8 = {}
+    let ini: u64 = tempos_agora(&pl.tempos)
+    var err: i32 = 0
+    orq_caminho_do_estado(pl, buf_caminho[..], 2200)
+    let caminho: str = exec_texto_emprestado(buf_caminho[..])
+    let ok: bool = cache.estado_gravar_atomico(caminho, &pl.estado, &err)
+    tempos_fechar(&pl.tempos, "gravar_estado", cache.projeto_produto(&pl.projeto, k).nome, ini)
+    if not ok {
+        let msg = format(f"forja: nao consegui gravar o estado '{caminho}' (errno {err})\n", alloc = heap)
+        defer delete(msg)
+        exec_escrever_stderr(msg)
+    }
+    return ok
+}
+
+// C: driver/orquestrar_exec.c:470
+// A saida antiga de uma DLL em uso fica em <saida>.velho<pid do filho> (ArquivoGravarAtomico): o resumo conta isso.
+proc notar_saida_em_uso(c: ^Corrida, pr: ^cache.Produto) {
+    var tamanho: u64 = 0
+    var mtime: u64 = 0
+    let saida: str = pr.saida or_else ""
+    let velho = format(f"{saida}.velho{c.proc_c.pid}", alloc = heap)
+    defer delete(velho)
+    if cache.arquivo_medir(velho, &tamanho, &mtime) {
+        exec_copiar_no_buffer(c.velho[..], velho)
+    }
+}
+
+// C: driver/orquestrar_exec.c:480
+// Filho com exit 0: confere o B0006, apura a linha do estado e grava o estado inteiro de forma atomica. false = c->saida diz o exit do produto.
+proc conferir_e_guardar(ex: ^Execucao2, k: u32) -> bool {
+    let pr: ^cache.Produto = cache.projeto_produto(&(ex.pl as ^Plano2).projeto, k)
+    let c: ^Corrida = &(ex.corrida or_else {})[k]
+    var linha: cache.EstadoLinha = cache.EstadoLinha{}
+    if not conferir_declaradas(ex, k) {
+        c.saida = nativo.SAIDA_DIAGNOSTICO
+        return false
+    }
+    if not orq_linha_do_estado(ex.pl as ^Plano2, k, &linha) {
+        let txt_1 = pr.nome or_else "(null)"
+        let msg_1 = format(f"forja: [{txt_1}] o filho terminou, mas o .entradas, a saida ou o .h dele nao puderam ser lidos\n", alloc = heap)
+        defer delete(msg_1)
+        exec_escrever_stderr(msg_1)
+        c.saida = nativo.SAIDA_INTERNO
+        return false
+    }
+    guardar_linha(&(ex.pl as ^Plano2).estado, &linha)
+    if not gravar_estado(ex, k) {
+        c.saida = nativo.SAIDA_INTERNO
+        return false
+    }
+    notar_saida_em_uso(c, pr)
+    return true
+}
+
+// C: driver/orquestrar_exec.c:505
+proc notar_filho(ex: ^Execucao2, k: u32) {
+    var criacao: u64 = 0
+    var saida: u64 = 0
+    if (not (ex.pl as ^Plano2).tempos.ativo) or (not processo_tempos(&(ex.corrida or_else {})[k].proc_c, &criacao, &saida)) {
+        return
+    }
+    let arg_1: u64 = saida
+    let arg_2: u64 = criacao
+    let arg_3: str = (cache.projeto_produto(&(ex.pl as ^Plano2).projeto, k).nome or_else "")
+    let arg_4: ^Tempos = &(ex.pl as ^Plano2).tempos
+    tempos_do_filho(arg_4, arg_3, arg_2, arg_1)
+}
+
+// C: driver/orquestrar_exec.c:515
+proc concluir_4(ex: ^Execucao2, k: u32) {
+    let c: ^Corrida = &(ex.corrida or_else {})[k]
+    var ini: u64 = 0
+    notar_filho(ex, k)
+    c.saida = processo_concluir(&c.proc_c)
+    c.ms = (ms_agora() - c.inicio_ms) as u32
+    ex.rodando -= 1
+    while varrer(ex) {
+        continue
+    }
+    ini = tempos_agora(&(ex.pl as ^Plano2).tempos)
+    emitir_bloco(ex, k)
+    let arg_1: u64 = ini
+    let arg_2: ?str = cache.projeto_produto(&(ex.pl as ^Plano2).projeto, k).nome
+    let arg_3: str = "emitir_bloco"
+    let arg_4: ^Tempos = &(ex.pl as ^Plano2).tempos
+    tempos_fechar(arg_4, arg_3, arg_2, arg_1)
+    var tern_1: i32 = SIT_FALHOU
+    if (c.saida == 0) and (common.c2f_b2i32(conferir_e_guardar(ex, k)) != 0) {
+        tern_1 = SIT_RECOMPILADO
+    }
+    c.situacao = tern_1
+}
+
+// C: driver/orquestrar_exec.c:533
+proc prontidao_de(ex: ^Execucao2, k: u32, causa: ^u32) -> i32 {
+    let pr: ^cache.Produto = cache.projeto_produto(&(ex.pl as ^Plano2).projeto, k)
+    var prontidao: i32 = DEPS_LIVRES
+    if common.c2f_s2u_32((ex.corrida or_else {})[k].situacao) == (SIT_PRONTO as u32) {
+        return prontidao
+    }
+    var j: u32 = 0
+    while j < pr.ndep {
+        let s: i32 = (ex.corrida or_else {})[pr.dep[j]].situacao
+        if common.c2f_s2u_32(s) >= (SIT_FALHOU as u32) {
+            causa^ = pr.dep[j]
+            return DEPS_FALHAS
+        }
+        if common.c2f_s2u_32(s) <= (SIT_RODANDO as u32) {
+            prontidao = DEPS_ESPERA
+        }
+        j += 1
+    }
+    return prontidao
+}
+
+// C: driver/orquestrar_exec.c:552
+// Dependencias terminadas: a chave de hoje (com a hash_interface real das dlls que acabaram de ser feitas) manda reusar ou deixa o produto PRONTO para disparar.
+proc avaliar(ex: ^Execucao2, k: u32) {
+    let c: ^Corrida = &(ex.corrida or_else {})[k]
+    let recompila: bool = orq_avaliar_produto(ex.pl as ^Plano2, k, c.motivo[..], 1164)
+    if recompila {
+        c.situacao = SIT_PRONTO
+    } else {
+        c.situacao = SIT_REUSADO
+    }
+}
+
+// C: driver/orquestrar_exec.c:561
+proc tratar_produto(ex: ^Execucao2, k: u32) -> bool {
+    let c: ^Corrida = &(ex.corrida or_else {})[k]
+    var causa: u32 = 0
+    let prontidao: i32 = prontidao_de(ex, k, &causa)
+    let mudou: bool = common.c2f_s2u_32(c.situacao) == (SIT_PENDENTE as u32)
+    if common.c2f_s2u_32(prontidao) == (DEPS_ESPERA as u32) {
+        return false
+    }
+    if common.c2f_s2u_32(prontidao) == (DEPS_FALHAS as u32) {
+        c.situacao = SIT_PULADO
+        c.causa = causa
+        return true
+    }
+    if mudou {
+        avaliar(ex, k)
+    }
+    if (common.c2f_s2u_32(c.situacao) == (SIT_REUSADO as u32)) or (ex.rodando >= ex.jobs) {
+        return mudou
+    }
+    disparar_2(ex, k)
+    return true
+}
+
+// C: driver/orquestrar_exec.c:581
+// Uma varredura em (camada, nome); true = alguma coisa mudou (dispararam, reusaram ou pularam produtos).
+proc varrer(ex: ^Execucao2) -> bool {
+    var mudou: bool = false
+    let ordem: []u32 = (ex.pl as ^Plano2).ordem or_else {}
+    for i in 0..<len((ex.pl as ^Plano2).projeto.produtos) {
+        let k: u32 = ordem[i]
+        let s: i32 = (ex.corrida or_else {})[k].situacao
+        if (s == SIT_PENDENTE) or (s == SIT_PRONTO) {
+            // sem curto-circuito: tratar_produto roda sempre que o produto esta PENDENTE ou PRONTO
+            if tratar_produto(ex, k) {
+                mudou = true
+            }
+        }
+    }
+    return mudou
+}
+
+// C: driver/orquestrar_exec.c:594
+proc esperar_um(ex: ^Execucao2) {
+    var lista: [64]Processo = {}
+    var dono: [64]u32 = {}
+    var n: u32 = 0
+    var qual: u32 = 0
+    for k in (0 as u32)..<(len((ex.pl as ^Plano2).projeto.produtos) as u32) {
+        if (ex.corrida or_else {})[k].situacao != SIT_RODANDO {
+            continue
+        }
+        lista[n] = (ex.corrida or_else {})[k].proc_c
+        dono[n] = k
+        n += 1
+    }
+    if not processo_esperar_qualquer(lista[0..<n], &qual) {
+        let msg = format(f"a espera pelos filhos falhou (erro {os.last_error()})", alloc = heap)
+        defer delete(msg)
+        common.falha_interna(msg)
+    }
+    tempos_acordou(&(ex.pl as ^Plano2).tempos)
+    concluir_4(ex, dono[qual])
+}
+
+// C: driver/orquestrar_exec.c:610
+// Varre ate nada mudar; com filho rodando espera um terminar e varre de novo; sem filho rodando e nada a mudar, acabou.
+proc escalonar(ex: ^Execucao2) {
+    while true {
+        while varrer(ex) {
+        }
+        if ex.rodando == 0 {
+            return
+        }
+        esperar_um(ex)
+    }
+}
+
+// C: driver/orquestrar_exec.c:622
+proc contar(ex: ^Execucao2) -> Contagem {
+    var n: Contagem = Contagem{recompilados = 0, reusados = 0, falharam = 0, pulados = 0}
+    var k: u64 = 0
+    while k < (len((ex.pl as ^Plano2).projeto.produtos) as u64) {
+        let s: i32 = (ex.corrida or_else {})[k].situacao
+        n.recompilados += common.c2f_b2u32(common.c2f_s2u_32(s) == (SIT_RECOMPILADO as u32))
+        n.reusados += common.c2f_b2u32(common.c2f_s2u_32(s) == (SIT_REUSADO as u32))
+        n.falharam += common.c2f_b2u32(common.c2f_s2u_32(s) == (SIT_FALHOU as u32))
+        n.pulados += common.c2f_b2u32(common.c2f_s2u_32(s) == (SIT_PULADO as u32))
+        k += 1
+    }
+    return n
+}
+
+// C: driver/orquestrar_exec.c:637
+proc nome_da_causa(ex: ^Execucao2, c: ^Corrida) -> str {
+    return (cache.projeto_produto(&(ex.pl as ^Plano2).projeto, c.causa).nome or_else "")
+}
+
+// C: driver/orquestrar_exec.c:642
+proc resumo_texto(ex: ^Execucao2, k: u32) {
+    let c: ^Corrida = &(ex.corrida or_else {})[k]
+    let nome: str = cache.projeto_produto(&(ex.pl as ^Plano2).projeto, k).nome or_else ""
+    if c.situacao == SIT_RECOMPILADO {
+        let motivo: str = exec_texto_emprestado(c.motivo[..])
+        let msg = format(f"forja: [{nome}] recompilado ({motivo}) {c.ms} ms", alloc = heap)
+        defer delete(msg)
+        exec_escrever_stdout(msg)
+        if c.velho[0] != 0 {
+            let velho: str = exec_texto_emprestado(c.velho[..])
+            let extra = format(f" | saida em uso: a antiga ficou em {velho}", alloc = heap)
+            defer delete(extra)
+            exec_escrever_stdout(extra)
+        }
+        exec_escrever_stdout("\n")
+    } else if c.situacao == SIT_REUSADO {
+        let msg = format(f"forja: [{nome}] reusado\n", alloc = heap)
+        defer delete(msg)
+        exec_escrever_stdout(msg)
+    } else if c.situacao == SIT_FALHOU {
+        let msg = format(f"forja: [{nome}] falhou (exit {c.saida})\n", alloc = heap)
+        defer delete(msg)
+        exec_escrever_stdout(msg)
+    } else {
+        let causa: str = nome_da_causa(ex, c)
+        let msg = format(f"forja: [{nome}] pulado (depende de {causa})\n", alloc = heap)
+        defer delete(msg)
+        exec_escrever_stdout(msg)
+    }
+}
+
+// C: driver/orquestrar_exec.c:660
+proc acao_de(s: i32) -> str {
+    if common.c2f_s2u_32(s) == (SIT_RECOMPILADO as u32) {
+        return "recompilado"
+    }
+    if common.c2f_s2u_32(s) == (SIT_REUSADO as u32) {
+        return "reusado"
+    }
+    var tern_1: str = "pulado"
+    if common.c2f_s2u_32(s) == (SIT_FALHOU as u32) {
+        tern_1 = "falhou"
+    }
+    return tern_1
+}
+
+// C: driver/orquestrar_exec.c:667
+proc resumo_json(ex: ^Execucao2, k: u32) {
+    let c: ^Corrida = &(ex.corrida or_else {})[k]
+    let nome: str = cache.projeto_produto(&(ex.pl as ^Plano2).projeto, k).nome or_else ""
+    let acao: str = acao_de(c.situacao)
+    let cabeca = format(f"{{\"produto\": \"{nome}\", \"acao\": \"{acao}\", \"motivo\": ", alloc = heap)
+    defer delete(cabeca)
+    exec_escrever_stdout(cabeca)
+    if c.situacao == SIT_PULADO {
+        let depende = format(f"depende de {nome_da_causa(ex, c)}", alloc = heap)
+        defer delete(depende)
+        orq_texto_json(depende)
+    } else if (c.situacao == SIT_RECOMPILADO) or (c.situacao == SIT_FALHOU) {
+        orq_texto_json(exec_texto_emprestado(c.motivo[..]))
+    } else {
+        orq_texto_json("")
+    }
+    let cauda = format(f", \"ms\": {c.ms}, \"exit\": {c.saida}", alloc = heap)
+    defer delete(cauda)
+    exec_escrever_stdout(cauda)
+    if c.velho[0] != 0 {
+        exec_escrever_stdout(", \"antigo\": ")
+        orq_texto_json(exec_texto_emprestado(c.velho[..]))
+    }
+    exec_escrever_stdout("}\n")
+}
+
+// C: driver/orquestrar_exec.c:684
+proc resumo_projeto(ex: ^Execucao2) {
+    let n: Contagem = contar(ex)
+    let total: u32 = len((ex.pl as ^Plano2).projeto.produtos) as u32
+    let ms: u64 = ms_agora() - ex.inicio_ms
+    if ((ex.pl as ^Plano2).opcoes as ^Opcoes).json {
+        let msg = format(f"{{\"projeto\": {{\"produtos\": {total}, \"recompilados\": {n.recompilados}, \"reusados\": {n.reusados}, \"falharam\": {n.falharam}, \"pulados\": {n.pulados}, \"jobs\": {ex.jobs}, \"ms\": {ms}, \"filhos\": {ex.filhos}}}}}\n", alloc = heap)
+        defer delete(msg)
+        exec_escrever_stdout(msg)
+    } else {
+        let msg = format(f"forja: projeto: {total} produtos, {n.recompilados} recompilados, {n.reusados} reusados, {n.falharam} falharam, {n.pulados} pulados, jobs={ex.jobs}, {ms} ms\n", alloc = heap)
+        defer delete(msg)
+        exec_escrever_stdout(msg)
+    }
+    os.flush_stdout()
+}
+
+// C: driver/orquestrar_exec.c:700
+proc imprimir_resumo_2(ex: ^Execucao2) {
+    var i: u64 = 0
+    while i < (len((ex.pl as ^Plano2).projeto.produtos) as u64) {
+        if ((ex.pl as ^Plano2).opcoes as ^Opcoes).json {
+            resumo_json(ex, ((ex.pl as ^Plano2).ordem or_else {})[i])
+        } else {
+            resumo_texto(ex, ((ex.pl as ^Plano2).ordem or_else {})[i])
+        }
+        i += 1
+    }
+    resumo_projeto(ex)
+}
+
+// C: driver/orquestrar_exec.c:712
+proc codigo_agregado(ex: ^Execucao2) -> i32 {
+    var maior: i32 = 0
+    for k in (0 as u64)..<(len((ex.pl as ^Plano2).projeto.produtos) as u64) {
+        var codigo: i32 = (ex.corrida or_else {})[k].saida
+        if common.c2f_s2u_32((ex.corrida or_else {})[k].situacao) != (SIT_FALHOU as u32) {
+            continue
+        }
+        if (codigo < 1) or (codigo > nativo.SAIDA_INTERNO) {
+            codigo = nativo.SAIDA_INTERNO
+        }
+        if codigo > maior {
+            maior = codigo
+        }
+    }
+    return maior
+}
+
+// C: driver/orquestrar_exec.c:728
+// As duas variaveis do gancho copiadas para o heap (o ambiente VIVO muda quando aplicar_injecao mexe em FORJA_TESTE_INJETAR).
+proc ler_injecao(ex: ^Execucao2) {
+    let produto: ?str = os.env(EXEC_INJETAR_PRODUTO)
+    let codigo: ?str = os.env(EXEC_INJETAR)
+    if (produto == none) or (codigo == none) {
+        return
+    }
+    let p: str = exec_truncar_texto(produto or_else "", EXEC_INJETAR_PRODUTO_TAM - 1)
+    let c: str = exec_truncar_texto(codigo or_else "", EXEC_INJETAR_TAM - 1)
+    ex.injetar_produto = format(f"{p}", alloc = heap)
+    ex.injetar = format(f"{c}", alloc = heap)
+}
+
+// C: driver/orquestrar_exec.c:738
+proc iniciar_execucao_2(ex: ^Execucao2, pl: ^Plano2) -> bool {
+    ex.pl = pl
+    if not resolver_jobs(pl, &ex.jobs) {
+        return false
+    }
+    var exe_ok: bool = false
+    switch r in os.exe_path(alloc = heap) {
+    case str:
+        if len(r) < EXEC_EXE_TAM {
+            ex.exe = r
+            exe_ok = true
+        } else {
+            delete(r)
+        }
+    case os.OsError:
+        exe_ok = false
+    }
+    if not exe_ok {
+        exec_escrever_stderr("forja: nao consegui o caminho do proprio forja.exe\n")
+        return false
+    }
+    let n: int = len(pl.projeto.produtos)
+    ex.corrida_dono = make([dynamic]Corrida, alloc = heap, cap = n)
+    for _i in 0..<n {
+        append(&ex.corrida_dono, item = Corrida{})
+    }
+    ex.corrida = ex.corrida_dono[..]
+    let pasta: str = pl.projeto.pasta or_else ""
+    ex.cache = format(f"{pasta}\\.forja_cache", alloc = heap)
+    ler_injecao(ex)
+    if not processo_job_criar(&ex.job) {
+        exec_escrever_stderr("forja: aviso: nao consegui criar o job object; os filhos nao morrem sozinhos se o orquestrador morrer\n")
+    }
+    ex.inicio_ms = ms_agora()
+    return true
+}
+
+// C: driver/orquestrar_exec.c:758
+proc finalizar_execucao(ex: ^Execucao2) {
+    processo_job_fechar(&ex.job)
+    file.close(&ex.trava)
+    delete(ex.corrida_dono)
+    if len(ex.exe) > 0 {
+        delete(ex.exe)
+    }
+    if len(ex.cache) > 0 {
+        delete(ex.cache)
+    }
+    if len(ex.injetar) > 0 {
+        delete(ex.injetar)
+    }
+    if len(ex.injetar_produto) > 0 {
+        delete(ex.injetar_produto)
+    }
+}
+
+// C: driver/orquestrar_exec.c:766
+// Pasta do cache, trava (B0008) e preparo; depois a fila, o resumo e o exit.
+proc trabalhar(ex: ^Execucao2) -> i32 {
+    let pl: ^Plano2 = ex.pl as ^Plano2
+    if not pasta_garantir(ex.cache) {
+        let msg = format(f"forja: nao consegui criar a pasta '{ex.cache}'\n", alloc = heap)
+        defer delete(msg)
+        exec_escrever_stderr(msg)
+        return nativo.SAIDA_USO
+    }
+    let trava: i32 = trava_abrir(ex)
+    if trava == TRAVA_OCUPADA {
+        let pasta: str = pl.projeto.pasta or_else ""
+        let causa = format(f"{pasta}: projeto em build por outro processo", alloc = heap)
+        defer delete(causa)
+        exec_diag_json(common.B0008, causa)
+    }
+    if (trava != TRAVA_OK) or (not preparar_pastas(ex)) or (not orq_preparar_plano(pl)) {
+        return nativo.SAIDA_USO
+    }
+    escalonar(ex)
+    let ini: u64 = tempos_agora(&pl.tempos)
+    imprimir_resumo_2(ex)
+    tempos_fechar(&pl.tempos, "resumo", none, ini)
+    return codigo_agregado(ex)
+}
+
+// C: driver/orquestrar_exec.c:789
+proc orq_construir(pl: ^Plano2) -> i32 {
+    var ex: Execucao2 = Execucao2{pl = none}
+    var codigo: i32 = nativo.SAIDA_USO
+    if iniciar_execucao_2(&ex, pl) {
+        codigo = trabalhar(&ex)
+    }
+    finalizar_execucao(&ex)
+    return codigo
+}

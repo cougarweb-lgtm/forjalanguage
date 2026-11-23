@@ -1,0 +1,298 @@
+// nativo/dbg/pdb_escrever.fj - porte de compiler/nativo/dbg/pdb_escrever.c
+// sha256 de nativo/dbg/pdb_escrever.c: 64cb211f11fd38e7d65fc846fef2ff53b293f25ffed54531eaf176e3ef21d6b6
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.2.0
+// Changelog: 0.2.0 - G3 V4-W6: 11 stubs promovidos; pdb_indices_tpi recebe saida ?^[dynamic]u8 (C: saida NULL so conta);
+//            pdb_balde_inserir recebe nomes []u8 (o bloco de nomes); pdb_arquivo_achar compara o caminho pelo conteudo (str nao tem identidade de ponteiro).
+
+import "common"
+import "ir"
+import "semantic"
+
+const FLUXO_NOMES: i32 = 5
+const PDB_VERSAO_INFO: u32 = 20000404
+const PDB_CARACTERISTICA_VC140: u32 = 20140508
+const PDB_VERSAO_TPI: u32 = 20040203
+const PDB_TAM_CABECALHO_TPI: u32 = 56
+const PDB_FLUXO_NULO_2: u32 = 65535
+const PDB_TPI_TAM_CHAVE: u32 = 4
+const PDB_TPI_BUCKETS: u32 = 262143
+const PDB_TPI_PASSO_INDICE: u32 = 8192
+const PDB_NOMES_ASSINATURA: u32 = 4026462206
+const PDB_NOMES_HASH_V1: u32 = 1
+const PDB_NOMES_CAPACIDADE: u32 = 8
+const PDB_NOMES_BALDES_POR_ARQUIVO: u32 = 2
+const PDB_NOME_DO_FLUXO_NOMES: str = "/names"
+
+// C: nativo/dbg/pdb_escrever.c:37
+// Hash V1 do LLVM/MS sobre a cadeia que comeca em s (ate o NUL, ou o fim da fatia).
+proc pdb_hash_v1(s: []u8) -> u32 {
+    let n: u64 = common.c2f_strlen_b(s) as u64
+    var r: u32 = 0
+    var k: u64 = 0
+    while k + 4 <= n {
+        r = r ~ ((s[k] as u32) | ((s[k + 1] as u32) << 8) | ((s[k + 2] as u32) << 16) | ((s[k + 3] as u32) << 24))
+        k += 4
+    }
+    if n - k >= 2 {
+        r = r ~ ((s[k] as u32) | ((s[k + 1] as u32) << 8))
+        k += 2
+    }
+    if k < n {
+        r = r ~ (s[k] as u32)
+    }
+    r = r | 0x20202020
+    r = r ~ (r >> 11)
+    return r ~ (r >> 16)
+}
+
+// C: nativo/dbg/pdb_escrever.c:57
+// Tabela hash do mapa de fluxos nomeados com uma entrada (nome -> indice de fluxo).
+proc pdb_mapa_nomeado(b: ^[dynamic]u8) {
+    let bucket: u32 = pdb_hash_v1(as_bytes(PDB_NOME_DO_FLUXO_NOMES)) % PDB_NOMES_CAPACIDADE
+    pdb_u32(b, (len(PDB_NOME_DO_FLUXO_NOMES) as u32) + 1)
+    append(b, items = as_bytes(PDB_NOME_DO_FLUXO_NOMES))
+    append(b, item = 0 as u8)
+    pdb_u32(b, 1)
+    pdb_u32(b, PDB_NOMES_CAPACIDADE)
+    pdb_u32(b, 1)
+    pdb_u32(b, (1 as u32) << bucket)
+    pdb_u32(b, 0)
+    pdb_u32(b, 0)
+    pdb_u32(b, FLUXO_NOMES as u32)
+}
+
+// C: nativo/dbg/pdb_escrever.c:72
+proc pdb_fluxo_info(b: ^[dynamic]u8, p: ^PdbParametros) {
+    var guia: [16]u8 = p.guid or_else {}
+    pdb_u32(b, PDB_VERSAO_INFO)
+    pdb_u32(b, 0)
+    pdb_u32(b, p.idade)
+    append(b, items = guia[..])
+    pdb_mapa_nomeado(b)
+    pdb_u32(b, PDB_CARACTERISTICA_VC140)
+}
+
+// C: nativo/dbg/pdb_escrever.c:84
+// Pares (TypeIndex, offset do registro) de um em um passo de 8 KiB de registros; saida nula so conta.
+proc pdb_indices_tpi(t: ?^PdbTipos, saida: ?^[dynamic]u8) -> u32 {
+    let tp: ^PdbTipos = t as ^PdbTipos
+    var n: u32 = 0
+    var proximo_corte: u64 = 0
+    var indice: u32 = PDB_PRIMEIRO_TIPO
+    var pos: u64 = 0
+    while pos < (len(tp.reg) as u64) {
+        if pos >= proximo_corte {
+            if saida != none {
+                let s: ^[dynamic]u8 = saida as ^[dynamic]u8
+                pdb_u32(s, indice)
+                pdb_u32(s, pos as u32)
+            }
+            n += 1
+            proximo_corte = pos + (PDB_TPI_PASSO_INDICE as u64)
+        }
+        let tam_reg: u64 = (tp.reg[pos] as u64) | ((tp.reg[pos + 1] as u64) << 8)
+        pos += 2 + tam_reg
+        indice += 1
+    }
+    return n
+}
+
+// C: nativo/dbg/pdb_escrever.c:105
+// Fluxo de hash do TPI: um hash u32 por tipo (0: nada consulta o hash), depois os pares de PdbIndicesTpi.
+proc pdb_fluxo_hash_tpi(b: ^[dynamic]u8, t: ^PdbTipos) {
+    for _k in (PDB_PRIMEIRO_TIPO as u32)..<t.proximo {
+        pdb_u32(b, 0)
+    }
+    _ = pdb_indices_tpi(t, b)
+}
+
+// C: nativo/dbg/pdb_escrever.c:114
+// TPI (t = os registros) e IPI (t = nulo, sem registros): cabecalho de 56 bytes, TypeIndexEnd e TypeRecordBytes, os registros depois.
+proc pdb_fluxo_tipos(b: ^[dynamic]u8, t: ?^PdbTipos, hash_fluxo: u32) {
+    var tipos: u32 = 0
+    var indices: u32 = 0
+    var proximo: u32 = PDB_PRIMEIRO_TIPO
+    var reg_tam: u32 = 0
+    if t != none {
+        let tp: ^PdbTipos = t as ^PdbTipos
+        proximo = tp.proximo
+        tipos = tp.proximo - PDB_PRIMEIRO_TIPO
+        reg_tam = len(tp.reg) as u32
+        if tipos != 0 {
+            indices = pdb_indices_tpi(t, none)
+        }
+    }
+    var hash_idx: u32 = PDB_FLUXO_NULO_2
+    if tipos != 0 {
+        hash_idx = hash_fluxo
+    }
+    pdb_u32(b, PDB_VERSAO_TPI)
+    pdb_u32(b, PDB_TAM_CABECALHO_TPI)
+    pdb_u32(b, PDB_PRIMEIRO_TIPO)
+    pdb_u32(b, proximo)
+    pdb_u32(b, reg_tam)
+    pdb_u16(b, hash_idx)
+    pdb_u16(b, PDB_FLUXO_NULO_2)
+    pdb_u32(b, PDB_TPI_TAM_CHAVE)
+    pdb_u32(b, PDB_TPI_BUCKETS)
+    pdb_u32(b, 0)
+    pdb_u32(b, 4 * tipos)
+    pdb_u32(b, 4 * tipos)
+    pdb_u32(b, 8 * indices)
+    pdb_u32(b, 4 * tipos + 8 * indices)
+    pdb_u32(b, 0)
+    if t != none {
+        append(b, items = (t as ^PdbTipos).reg[..])
+    }
+}
+
+// C: nativo/dbg/pdb_escrever.c:139
+// Procura o caminho (o cache do ultimo achado poupa a varredura). Comparacao por conteudo: cada caminho vem de uma so Fonte.
+proc pdb_arquivo_achar(a: ^PdbArquivos, caminho: ?str, indice: ^u32) -> bool {
+    let alvo: str = caminho or_else ""
+    if a.ultimo < (len(a.lista) as u64) {
+        if (a.lista[a.ultimo].caminho or_else "") == alvo {
+            indice^ = a.ultimo as u32
+            return true
+        }
+    }
+    var k: u64 = 0
+    while k < (len(a.lista) as u64) {
+        if (a.lista[k].caminho or_else "") == alvo {
+            a.ultimo = k
+            indice^ = k as u32
+            return true
+        }
+        k += 1
+    }
+    return false
+}
+
+// C: nativo/dbg/pdb_escrever.c:155
+// O NUL entra no bloco de nomes: o /names guarda cadeias terminadas.
+proc pdb_arquivo_acrescentar(a: ^PdbArquivos, caminho: ?str) {
+    let texto: str = caminho or_else ""
+    let nome_off: u32 = len(a.nomes) as u32
+    append(&a.lista, item = PdbArquivo{caminho = caminho, nome_off = nome_off})
+    append(&a.nomes, items = as_bytes(texto))
+    append(&a.nomes, item = 0 as u8)
+    a.ultimo = (len(a.lista) as u64) - 1
+}
+
+// C: nativo/dbg/pdb_escrever.c:166
+// Uma passada pelas DbgLinha: a Fonte e consultada aqui, uma vez por linha; o C13 le PdbPosLinha, sem nova busca.
+proc pdb_arquivos_colher(p: ^PdbParametros, a: ^PdbArquivos) {
+    var dica: u32 = 0
+    var indice: u32 = 0
+    a.lista = make([dynamic]PdbArquivo, alloc = heap)
+    a.linhas = make([dynamic]PdbPosLinha, alloc = heap)
+    a.nomes = make([dynamic]u8, alloc = heap)
+    append(&a.nomes, item = 0 as u8)
+    a.ultimo = 0
+    let programa: ^DbgPrograma = p.dbg as ^DbgPrograma
+    var k: u64 = 0
+    while k < (len(programa.linhas) as u64) {
+        let l: ^DbgLinha = &programa.linhas[k]
+        let fp = dbg_posicao_com_dica(p.fonte, l.pos, &dica)
+        if not pdb_arquivo_achar(a, fp.caminho, &indice) {
+            pdb_arquivo_acrescentar(a, fp.caminho)
+            indice = (len(a.lista) as u32) - 1
+        }
+        append(&a.linhas, item = PdbPosLinha{arquivo = indice, linha = fp.linha})
+        k += 1
+    }
+}
+
+// C: nativo/dbg/pdb_escrever.c:189
+proc pdb_arquivos_liberar(a: ^PdbArquivos) {
+    delete(a.lista)
+    delete(a.linhas)
+    delete(a.nomes)
+}
+
+// C: nativo/dbg/pdb_escrever.c:197
+// Grava o offset do nome no 1o balde livre a partir de HashV1 % baldes (sondagem linear); tabela = u32 por balde, 0 = livre.
+proc pdb_balde_inserir(tabela: ^[dynamic]u32, arq: ^PdbArquivo, nomes: []u8) {
+    let baldes: u64 = len(tabela^) as u64
+    var pos: u64 = (pdb_hash_v1(nomes[(arq.nome_off as u64) ..< (len(nomes) as u64)]) as u64) % baldes
+    while tabela^[pos] != 0 {
+        pos = (pos + 1) % baldes
+    }
+    tabela^[pos] = arq.nome_off
+}
+
+// C: nativo/dbg/pdb_escrever.c:208
+// /names: cabecalho 0xEFFEEFFE/1, bloco de strings, baldes (offset do nome; 0 = vazio) e contagem de nomes.
+proc pdb_fluxo_nomes(b: ^[dynamic]u8, a: ^PdbArquivos) {
+    let baldes: u64 = (len(a.lista) as u64) * (PDB_NOMES_BALDES_POR_ARQUIVO as u64) + 1
+    var tabela = make([dynamic]u32, alloc = heap)
+    defer delete(tabela)
+    pdb_u32(b, PDB_NOMES_ASSINATURA)
+    pdb_u32(b, PDB_NOMES_HASH_V1)
+    pdb_u32(b, len(a.nomes) as u32)
+    append(b, items = a.nomes[..])
+    pdb_u32(b, baldes as u32)
+    var k: u64 = 0
+    while k < baldes {
+        append(&tabela, item = 0 as u32)
+        k += 1
+    }
+    k = 0
+    while k < (len(a.lista) as u64) {
+        pdb_balde_inserir(&tabela, &a.lista[k], a.nomes[..])
+        k += 1
+    }
+    k = 0
+    while k < baldes {
+        pdb_u32(b, tabela[k])
+        k += 1
+    }
+    pdb_u32(b, len(a.lista) as u32)
+}
+
+// C: nativo/dbg/pdb_escrever.c:229
+// O PDB inteiro na ordem dos fluxos: 0 antigo (vazio), 1 info, 2 TPI, 3 DBI, 4 IPI, 5 /names, 6 modulo, 7 cabecalhos, 8 hash do TPI.
+pub proc pdb_escrever(entrada: ^PdbParametros, saida: ^[dynamic]u8) -> bool {
+    var pm: PdbParametros = entrada^
+    let p: ^PdbParametros = &pm
+    var tipos = PdbTipos{}
+    var m = PdbMsf{}
+    var secoes = PdbSecoes{}
+    var arquivos = PdbArquivos{}
+    var tam = PdbTamanhosModulo{}
+    let tipos_sem: ^semantic.Tipos = p.tipos as ^semantic.Tipos
+    let ir_prog: ^ir.IrPrograma = p.ir as ^ir.IrPrograma
+    let nomes_int: ^common.Interner = p.nomes as ^common.Interner
+    pdb_tipos_iniciar(&tipos, tipos_sem, ir_prog, nomes_int)
+    pm.tpi = &tipos
+    pdb_secoes_ler(p.exe as ^[dynamic]u8, &secoes)
+    pdb_arquivos_colher(p, &arquivos)
+    pdb_msf_iniciar(&m)
+    _ = pdb_msf_novo_fluxo(&m)
+    pdb_fluxo_info(pdb_msf_novo_fluxo(&m), p)
+    let tpi: ^[dynamic]u8 = pdb_msf_novo_fluxo(&m)
+    let dbi: ^[dynamic]u8 = pdb_msf_novo_fluxo(&m)
+    pdb_fluxo_tipos(pdb_msf_novo_fluxo(&m), none, PDB_FLUXO_NULO_2)
+    pdb_fluxo_nomes(pdb_msf_novo_fluxo(&m), &arquivos)
+    tam = pdb_fluxo_modulo(pdb_msf_novo_fluxo(&m), p, &arquivos, secoes.texto)
+    let cabecalhos: []u8 = secoes.cabecalhos or_else {}
+    append(pdb_msf_novo_fluxo(&m), items = cabecalhos)
+    if tipos.proximo > PDB_PRIMEIRO_TIPO {
+        pdb_fluxo_hash_tpi(pdb_msf_novo_fluxo(&m), &tipos)
+    }
+    pdb_fluxo_tipos(tpi, &tipos, m.qtd - 1)
+    pdb_fluxo_dbi(dbi, p, &secoes, &tam)
+    let ok: bool = pdb_msf_serializar(&m, saida)
+    pdb_msf_liberar(&m)
+    pdb_arquivos_liberar(&arquivos)
+    pdb_tipos_liberar(&tipos)
+    return ok
+}
+
+test "pdb_hash_v1_igual_ao_c" {
+    expect(pdb_hash_v1(as_bytes("/names")) == 1835858977)
+    expect(pdb_hash_v1(as_bytes("abc")) == 539248138)
+    expect(pdb_hash_v1(as_bytes("abcdefghij")) == 740411073)
+    expect(pdb_hash_v1(as_bytes("a")) == 539231297)
+}

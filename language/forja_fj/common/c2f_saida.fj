@@ -1,0 +1,178 @@
+// common/c2f_saida.fj - FILE * do C como ^Saida, modo texto do CRT (CRLF) incluso (C2F-C0)
+// origem: plano do G3 (D-T1-8, C2F-C0), nao ha C de origem; o oraculo e o stdio do C do E0 (gcc 16, UCRT), provado por diferencial
+// Modo texto: "\n" vira "\r\n" NA ESCRITA (um "\r\n" ja escrito vira "\r\r\n", como o CRT). O CRT traduz ao descarregar o buffer e esta Saida traduz ao escrever:
+// as duas coincidem quando o _setmode (c2f_saida_binaria) vem antes da saida ou depois de um flush, que e o uso do driver.
+// stdout e stderr nao tem estado global (a Forja nao tem var de topo): cada c2f_saida_stdout()/c2f_saida_stderr() devolve um objeto NOVO no heap, em modo texto;
+// quem chama guarda UM e passa adiante (o modo binario vale so para o objeto em que c2f_saida_binaria foi chamada). Os bytes dos objetos de stdout seguem
+// pelo mesmo buffer do runtime (std:os), entao a ordem entre objetos se mantem.
+// Arquivo: os bytes ficam em buf ate 64 KiB, c2f_saida_flush ou c2f_saida_fechar. Leitura ("r", "+") nao existe aqui: c2f_saida_abrir devolve none.
+// Versao: 0.2.0
+// Changelog: 0.2.0 - P-c2f: corpo real de todos os procs; c2f_saida_memoria (Saida em memoria, para teste e para open_memstream). 0.1.0 - esqueleto.
+
+import "std:file"
+import "std:os"
+
+pub const SAIDA_STDOUT: u8 = 0
+pub const SAIDA_STDERR: u8 = 1
+pub const SAIDA_ARQUIVO: u8 = 2
+pub const SAIDA_MEMORIA: u8 = 3
+
+// Descarrega o buffer do arquivo quando passa deste tamanho.
+const SAIDA_BUFFER_MAX: int = 65536
+
+pub struct Saida {
+    tipo: u8
+    texto: bool
+    arq: file.File
+    buf: [dynamic]u8
+}
+
+// Objeto novo, no heap, com o buffer vazio.
+proc c2f_saida_nova(tipo: u8, texto: bool) -> ^Saida {
+    let s = new(Saida, alloc = heap)
+    s.tipo = tipo
+    s.texto = texto
+    s.buf = make([dynamic]u8, alloc = heap)
+    return s
+}
+
+pub proc c2f_saida_stdout() -> ^Saida {
+    return c2f_saida_nova(SAIDA_STDOUT, false) // TESTE V4INT: o rt do E1 (variante CRT) ja traduz 0x0A no fwrite
+}
+
+pub proc c2f_saida_stderr() -> ^Saida {
+    return c2f_saida_nova(SAIDA_STDERR, true)
+}
+
+// Saida que junta os bytes em s.buf (open_memstream / teste). texto = true traduz "\n" em "\r\n".
+pub proc c2f_saida_memoria(texto: bool) -> ^Saida {
+    return c2f_saida_nova(SAIDA_MEMORIA, texto)
+}
+
+// fopen de ESCRITA: "w"/"wb" zera, "a"/"ab" anexa; sem 'b' e texto (CRLF). Qualquer outro modo (leitura, '+') ou arquivo que nao abre: none.
+pub proc c2f_saida_abrir(caminho: str, modo: str) -> ?^Saida {
+    var abrir = file.OpenMode.write
+    if modo == "a" or modo == "ab" {
+        abrir = file.OpenMode.append
+    } else if modo != "w" and modo != "wb" {
+        return none
+    }
+    let texto = modo == "w" or modo == "a"
+    switch r in file.open(caminho, abrir) {
+    case file.File:
+        let s = c2f_saida_nova(SAIDA_ARQUIVO, texto)
+        s.arq = r
+        return s
+    case file.FileError:
+        return none
+    }
+    return none
+}
+
+// Entrega os bytes, sem traducao, ao destino do tipo: stdout e stderr na hora, arquivo e memoria no buf.
+proc c2f_saida_empurrar(s: ^Saida, dados: []u8) {
+    if len(dados) == 0 {
+        return
+    }
+    if s.tipo == SAIDA_STDOUT {
+        os.write_stdout(dados)
+        return
+    }
+    if s.tipo == SAIDA_STDERR {
+        os.write_stderr(dados)
+        return
+    }
+    append(&s.buf, items = dados)
+}
+
+// Grava o buf no arquivo e o esvazia; false se a gravacao falhou.
+proc c2f_saida_descarregar(s: ^Saida) -> bool {
+    if s.tipo != SAIDA_ARQUIVO or len(s.buf) == 0 {
+        return true
+    }
+    let erro = file.write(&s.arq, s.buf[..])
+    clear(&s.buf)
+    return erro == none
+}
+
+// fwrite/fputs/fprintf: bytes na Saida; em modo texto cada 0x0A sai como 0x0D 0x0A.
+pub proc c2f_saida_escrever(s: ^Saida, dados: []u8) {
+    if s.texto {
+        var cr_lf: [2]u8 = {13, 10}
+        var ini = 0
+        for i in 0..<len(dados) {
+            if dados[i] == 10 {
+                c2f_saida_empurrar(s, dados[ini..<i])
+                c2f_saida_empurrar(s, cr_lf[..])
+                ini = i + 1
+            }
+        }
+        c2f_saida_empurrar(s, dados[ini..<len(dados)])
+    } else {
+        c2f_saida_empurrar(s, dados)
+    }
+    if s.tipo == SAIDA_ARQUIVO and len(s.buf) >= SAIDA_BUFFER_MAX {
+        _ = c2f_saida_descarregar(s)
+    }
+}
+
+pub proc c2f_saida_escrever_texto(s: ^Saida, texto: str) {
+    c2f_saida_escrever(s, as_bytes(texto))
+}
+
+// fprintf/DiagRelatar: a mensagem ja vem formatada (C2F-31); o resto e como escrever_texto.
+pub proc c2f_saida_formatar(s: ^Saida, msg: str) {
+    c2f_saida_escrever(s, as_bytes(msg))
+}
+
+// putc/fputc: 1 byte.
+pub proc c2f_saida_putc(s: ^Saida, c: u8) {
+    var um: [1]u8 = {c}
+    c2f_saida_escrever(s, um[..])
+}
+
+foreign {
+    link "ucrt"
+    proc c_setmode = "_setmode"(fd: i32, modo: i32) -> i32
+}
+
+// _setmode(_fileno(stdout), _O_BINARY) de verdade (o stdout do E1 passa pelo CRT em modo texto, que traduz 0x0A em CRLF): descarrega antes e muda o modo do processo.
+pub proc c2f_stdout_binario() {
+    os.flush_stdout()
+    _ = c_setmode(1, 32768)
+}
+
+// _setmode(_fileno(f), _O_BINARY): dai em diante os bytes saem crus.
+pub proc c2f_saida_binaria(s: ^Saida) {
+    s.texto = false
+    if s.tipo == SAIDA_STDOUT {
+        c2f_stdout_binario()
+    }
+}
+
+// fflush: stdout descarrega o buffer do runtime; arquivo grava o buf; stderr e memoria nao tem o que fazer.
+pub proc c2f_saida_flush(s: ^Saida) {
+    if s.tipo == SAIDA_STDOUT {
+        os.flush_stdout()
+        return
+    }
+    _ = c2f_saida_descarregar(s)
+}
+
+// fclose: descarrega e fecha o arquivo (stdout/stderr so soltam o objeto; o descritor do processo fica). Devolve 0, ou -1 (EOF) se a gravacao final falhou.
+// A Saida e liberada: nao use mais depois.
+pub proc c2f_saida_fechar(s: ^Saida) -> i32 {
+    var codigo: i32 = 0
+    if s.tipo == SAIDA_STDOUT {
+        os.flush_stdout()
+    }
+    if not c2f_saida_descarregar(s) {
+        codigo = -1
+    }
+    if s.tipo == SAIDA_ARQUIVO {
+        file.close(&s.arq)
+    }
+    delete(s.buf)
+    delete(s)
+    return codigo
+}

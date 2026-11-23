@@ -1,0 +1,693 @@
+// ir/lower_lista.fj - porte de compiler/ir/lower_lista.c, compiler/ir/lower_lista.h
+// sha256 de ir/lower_lista.c: 78e7e906be5ea27d74b631bde52501ebf5bfa2d1a53a3d1136a94d66cc2b5392
+// sha256 de ir/lower_lista.h: fea018eb658c03844648188a6b28fb1f6f149d34c5d459de40acf9b74dd60b39
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "common"
+import "frontend"
+import "semantic"
+
+struct LlBase {
+    valor: Valor
+    elemento: u32 // TipoId
+    lista: bool
+}
+
+// C2F-82 macro de funcao INT_VALOR ( n ) LwValorInt ( ( n ) , TIPO_INT )
+
+// C: ir/lower_lista.c:26
+proc ll_argumento(e: ^frontend.Expr, indice: i32) -> ?^frontend.Expr {
+    for k in (0 as u32)..<e.nargs {
+        if (e.args or_else {})[k].indice == indice {
+            return (e.args or_else {})[k].valor
+        }
+    }
+    return none
+}
+
+// C: ir/lower_lista.c:34
+proc ll_base_de(c: ^LowerCtx, valor: Valor) -> LlBase {
+    let tipos: ^semantic.Tipos = &(c.sem as ^semantic.Semantica).tipos
+    if common.c2f_s2u_32(semantic.tipo_classe_de(tipos, valor.tipo)) == (semantic.TC_FATIA as u32) {
+        return LlBase{valor = valor, elemento = semantic.tipo_de(tipos, valor.tipo).a, lista = false}
+    }
+    let lista: u32 = semantic.tipo_de(tipos, valor.tipo).a
+    return LlBase{valor = valor, elemento = semantic.tipo_de(tipos, lista).a, lista = true}
+}
+
+// C: ir/lower_lista.c:42
+proc ll_indice_int(k: ^LoCtx, e: ?^frontend.Expr) -> Valor {
+    return lo_converte(k, semantic.TIPO_INT as u32, lw_expr(k.c as ^LowerCtx, e))
+}
+
+// C: ir/lower_lista.c:47
+proc temp_de(k: ^LoCtx, op: i32, tipo: u32, a: Valor, b: Valor) -> Valor {
+    let i: ^IrInstr = lw_nova_instr(k.c as ^LowerCtx, op, k.pos)
+    i.destino = lw_novo_temp(k.c as ^LowerCtx)
+    i.tipo = tipo
+    i.a = a
+    i.b = b
+    return lw_valor_temp(i.destino, tipo)
+}
+
+// C: ir/lower_lista.c:57
+proc ll_tamanho(k: ^LoCtx, colecao: Valor) -> Valor {
+    return temp_de(k, IR_TAMANHO_TEXTO, semantic.TIPO_INT as u32, colecao, lw_valor_nenhum())
+}
+
+// C: ir/lower_lista.c:63
+proc ll_le(k: ^LoCtx, b: ^LlBase, indice: Valor, provado: bool) -> Valor {
+    let i: ^IrInstr = lw_nova_instr(k.c as ^LowerCtx, IR_ELEMENTO, k.pos)
+    i.destino = lw_novo_temp(k.c as ^LowerCtx)
+    i.tipo = b.elemento
+    i.a = b.valor
+    i.b = indice
+    var tern_1: i32 = 0
+    if (common.c2f_b2i32(provado) != 0) and (not b.lista) {
+        tern_1 = 1
+    }
+    i.op_aux = tern_1 as u8
+    return lw_valor_temp(i.destino, b.elemento)
+}
+
+// C: ir/lower_lista.c:74
+proc ll_end(k: ^LoCtx, b: ^LlBase, indice: Valor, provado: bool) -> Valor {
+    let ponteiro: u32 = semantic.tipo_ponteiro(&((k.c as ^LowerCtx).sem as ^semantic.Semantica).tipos, b.elemento)
+    let i: ^IrInstr = lw_nova_instr(k.c as ^LowerCtx, IR_ENDERECO_ELEMENTO, k.pos)
+    i.destino = lw_novo_temp(k.c as ^LowerCtx)
+    i.tipo = ponteiro
+    i.a = b.valor
+    i.b = indice
+    var tern_1: i32 = 0
+    if (common.c2f_b2i32(provado) != 0) and (not b.lista) {
+        tern_1 = 1
+    }
+    i.op_aux = tern_1 as u8
+    return lw_valor_temp(i.destino, ponteiro)
+}
+
+// C: ir/lower_lista.c:86
+proc ll_grava(k: ^LoCtx, endereco: Valor, elemento: u32, valor: Valor) {
+    let i: ^IrInstr = lw_nova_instr(k.c as ^LowerCtx, IR_GRAVA_PONTEIRO, k.pos)
+    i.tipo = elemento
+    i.a = endereco
+    i.b = valor
+    i.nome = -1
+}
+
+// C: ir/lower_lista.c:95
+proc ll_embrulha(k: ^LoCtx, opcional: u32, valor: Valor) -> Valor {
+    return temp_de(k, IR_EMBRULHA, opcional, valor, lw_valor_nenhum())
+}
+
+// C: ir/lower_lista.c:100
+proc ll_entra_laco(k: ^LoCtx, inicio: Valor, fim: Valor, externo: ^?^IrBloco) -> Valor {
+    let laco: ^IrInstr = lw_nova_instr(k.c as ^LowerCtx, IR_PARA, k.pos)
+    let contador: i32 = lw_novo_local(k.c as ^LowerCtx)
+    laco.destino = contador
+    laco.tipo = semantic.TIPO_INT as u32
+    laco.a = inicio
+    laco.b = fim
+    laco.faixa_excl = true
+    externo^ = lw_trocar_bloco(k.c as ^LowerCtx, &laco.corpo)
+    return lw_valor_local(contador, semantic.TIPO_INT as u32)
+}
+
+// C: ir/lower_lista.c:113
+proc ll_sai_do_laco(k: ^LoCtx, externo: ^IrBloco) {
+    _ = lw_trocar_bloco(k.c as ^LowerCtx, externo)
+}
+
+// C: ir/lower_lista.c:118
+proc ll_pare(k: ^LoCtx) {
+    _ = lw_nova_instr(k.c as ^LowerCtx, IR_PARE, k.pos)
+}
+
+// C: ir/lower_lista.c:123
+proc ll_redimensiona(k: ^LoCtx, lista: Valor, elemento: u32, novo_len: Valor) {
+    let i: ^IrInstr = lw_nova_instr(k.c as ^LowerCtx, IR_REDIMENSIONA, k.pos)
+    i.tipo = elemento
+    i.a = lista
+    i.b = novo_len
+}
+
+// C: ir/lower_lista.c:131
+proc ll_mais(k: ^LoCtx, a: Valor, b: Valor) -> Valor {
+    return lo_binario(k, frontend.OP_SOMA as u8, semantic.TIPO_INT as u32, a, b)
+}
+
+// C: ir/lower_lista.c:136
+proc ll_menos(k: ^LoCtx, a: Valor, b: Valor) -> Valor {
+    return lo_binario(k, frontend.OP_SUB as u8, semantic.TIPO_INT as u32, a, b)
+}
+
+// C: ir/lower_lista.c:141
+proc ll_igual(k: ^LoCtx, a: Valor, b: Valor) -> Valor {
+    return lo_binario(k, frontend.OP_IGUAL as u8, semantic.TIPO_BOOL as u32, a, b)
+}
+
+// C: ir/lower_lista.c:151
+proc lw_cap(c: ^LowerCtx, e: ^frontend.Expr) -> Valor {
+    let lista: Valor = lw_expr(c, ll_argumento(e, 0))
+    let i: ^IrInstr = lw_nova_instr(c, IR_REDIMENSIONA, e.pos_op)
+    i.op_aux = REDIM_CAP as u8
+    i.destino = lw_novo_temp(c)
+    i.tipo = semantic.TIPO_INT as u32
+    i.a = lista
+    return lw_valor_temp(i.destino, semantic.TIPO_INT as u32)
+}
+
+// C: ir/lower_lista.c:162
+proc lw_clear(c: ^LowerCtx, e: ^frontend.Expr) -> Valor {
+    var k: LoCtx = LoCtx{c = c, pos = e.pos_op}
+    let alvo: u32 = (ll_argumento(e, 0) as ^frontend.Expr).tipo
+    let tipo_alvo: u32 = semantic.tipo_de(&(c.sem as ^semantic.Semantica).tipos, alvo).a
+    if common.c2f_s2u_32(semantic.tipo_classe_de(&(c.sem as ^semantic.Semantica).tipos, tipo_alvo)) == (semantic.TC_MAPA as u32) {
+        return lw_clear_mapa(c, e)
+    }
+    let lista: Valor = lw_expr(c, ll_argumento(e, 0))
+    ll_redimensiona(&k, lista, ll_base_de(c, lista).elemento, lw_valor_int(0, semantic.TIPO_INT as u32))
+    return lw_valor_nenhum()
+}
+
+// C: ir/lower_lista.c:172
+proc lw_reserve(c: ^LowerCtx, e: ^frontend.Expr) -> Valor {
+    var k: LoCtx = LoCtx{c = c, pos = e.pos_op}
+    let lista: Valor = lw_expr(c, ll_argumento(e, 0))
+    let n: Valor = ll_indice_int(&k, ll_argumento(e, 1))
+    let i: ^IrInstr = lw_nova_instr(c, IR_REDIMENSIONA, e.pos_op)
+    i.op_aux = REDIM_RESERVA as u8
+    i.tipo = ll_base_de(c, lista).elemento
+    i.a = lista
+    i.b = n
+    return lw_valor_nenhum()
+}
+
+// C: ir/lower_lista.c:186
+proc lw_truncate(c: ^LowerCtx, e: ^frontend.Expr) -> Valor {
+    var k: LoCtx = LoCtx{c = c, pos = e.pos_op}
+    let lista: Valor = lw_expr(c, ll_argumento(e, 0))
+    let n: Valor = ll_indice_int(&k, ll_argumento(e, 1))
+    var l: LlBase = ll_base_de(c, lista)
+    let fora: ^IrBloco = lo_entra_se(&k, lo_binario(&k, frontend.OP_DIFERENTE as u8, semantic.TIPO_BOOL as u32, n, ll_tamanho(&k, lista)))
+    _ = ll_le(&k, &l, n, false)
+    lo_sai_do_se(&k, fora)
+    ll_redimensiona(&k, lista, l.elemento, n)
+    return lw_valor_nenhum()
+}
+
+// C: ir/lower_lista.c:200
+proc lw_pop(c: ^LowerCtx, e: ^frontend.Expr) -> Valor {
+    var k: LoCtx = LoCtx{c = c, pos = e.pos_op}
+    let lista: Valor = lw_expr(c, ll_argumento(e, 0))
+    var l: LlBase = ll_base_de(c, lista)
+    let resultado: i32 = lo_local(&k, e.tipo, lw_valor_nenhum())
+    let n: Valor = ll_tamanho(&k, lista)
+    let fora: ^IrBloco = lo_entra_se(&k, lo_binario(&k, frontend.OP_MAIOR as u8, semantic.TIPO_BOOL as u32, n, lw_valor_int(0, semantic.TIPO_INT as u32)))
+    let ultimo: Valor = ll_menos(&k, n, lw_valor_int(1, semantic.TIPO_INT as u32))
+    let lido: Valor = ll_le(&k, &l, ultimo, true)
+    lo_atribui(&k, resultado, e.tipo, ll_embrulha(&k, e.tipo, lido))
+    ll_redimensiona(&k, lista, l.elemento, ultimo)
+    lo_sai_do_se(&k, fora)
+    return lw_valor_local(resultado, e.tipo)
+}
+
+// C: ir/lower_lista.c:216
+proc lw_insert_at(c: ^LowerCtx, e: ^frontend.Expr) -> Valor {
+    var k: LoCtx = LoCtx{c = c, pos = e.pos_op}
+    var externo: ?^IrBloco = none
+    let lista: Valor = lw_expr(c, ll_argumento(e, 0))
+    let indice: Valor = ll_indice_int(&k, ll_argumento(e, 1))
+    let item: Valor = lw_expr(c, ll_argumento(e, 2))
+    var l: LlBase = ll_base_de(c, lista)
+    let n: Valor = ll_tamanho(&k, lista)
+    let anexa: ^IrInstr = lw_nova_instr(c, IR_ANEXA, e.pos_op)
+    anexa.tipo = l.elemento
+    anexa.a = lista
+    anexa.b = item
+    let passos: Valor = ll_menos(&k, n, indice)
+    let volta: Valor = ll_entra_laco(&k, lw_valor_int(0, semantic.TIPO_INT as u32), passos, &externo)
+    let j: Valor = ll_menos(&k, n, volta)
+    // E0 (gcc) avalia o argumento da direita antes: o ll_le sai antes do ll_end (N5)
+    let antigo: Valor = ll_le(&k, &l, ll_menos(&k, j, lw_valor_int(1, semantic.TIPO_INT as u32)), false)
+    ll_grava(&k, ll_end(&k, &l, j, true), l.elemento, antigo)
+    ll_sai_do_laco(&k, externo as ^IrBloco)
+    ll_grava(&k, ll_end(&k, &l, indice, false), l.elemento, item)
+    return lw_valor_nenhum()
+}
+
+// C: ir/lower_lista.c:239
+proc remove_fechando(k: ^LoCtx, l: ^LlBase, n: Valor, i: Valor) {
+    var externo: ?^IrBloco = none
+    let ultimo: Valor = ll_menos(k, n, lw_valor_int(1, semantic.TIPO_INT as u32))
+    let volta: Valor = ll_entra_laco(k, lw_valor_int(0, semantic.TIPO_INT as u32), ll_menos(k, ultimo, i), &externo)
+    let j: Valor = ll_mais(k, i, volta)
+    // E0 (gcc) avalia o argumento da direita antes (N5): le l[j + 1] antes de gravar em l[j]
+    let proximo: Valor = ll_le(k, l, ll_mais(k, j, lw_valor_int(1, semantic.TIPO_INT as u32)), true)
+    ll_grava(k, ll_end(k, l, j, true), l.elemento, proximo)
+    ll_sai_do_laco(k, externo as ^IrBloco)
+    ll_redimensiona(k, l.valor, l.elemento, ultimo)
+}
+
+// C: ir/lower_lista.c:250
+proc lw_ordered_remove(c: ^LowerCtx, e: ^frontend.Expr) -> Valor {
+    var k: LoCtx = LoCtx{c = c, pos = e.pos_op}
+    let lista: Valor = lw_expr(c, ll_argumento(e, 0))
+    let indice: Valor = ll_indice_int(&k, ll_argumento(e, 1))
+    var l: LlBase = ll_base_de(c, lista)
+    _ = ll_le(&k, &l, indice, false)
+    remove_fechando(&k, &l, ll_tamanho(&k, lista), indice)
+    return lw_valor_nenhum()
+}
+
+// C: ir/lower_lista.c:262
+proc lw_unordered_remove(c: ^LowerCtx, e: ^frontend.Expr) -> Valor {
+    var k: LoCtx = LoCtx{c = c, pos = e.pos_op}
+    let lista: Valor = lw_expr(c, ll_argumento(e, 0))
+    let indice: Valor = ll_indice_int(&k, ll_argumento(e, 1))
+    var l: LlBase = ll_base_de(c, lista)
+    let alvo: Valor = ll_end(&k, &l, indice, false)
+    let ultimo: Valor = ll_menos(&k, ll_tamanho(&k, lista), lw_valor_int(1, semantic.TIPO_INT as u32))
+    let ultimo_valor: Valor = ll_le(&k, &l, ultimo, true)
+    ll_grava(&k, alvo, l.elemento, ultimo_valor)
+    ll_redimensiona(&k, lista, l.elemento, ultimo)
+    return lw_valor_nenhum()
+}
+
+// C: ir/lower_lista.c:276
+proc lw_remove_value(c: ^LowerCtx, e: ^frontend.Expr) -> Valor {
+    var k: LoCtx = LoCtx{c = c, pos = e.pos_op}
+    var externo: ?^IrBloco = none
+    let lista: Valor = lw_expr(c, ll_argumento(e, 0))
+    let valor: Valor = lw_expr(c, ll_argumento(e, 1))
+    var l: LlBase = ll_base_de(c, lista)
+    let n: Valor = ll_tamanho(&k, lista)
+    let achou: i32 = lo_local(&k, semantic.TIPO_INT as u32, lw_valor_int(-1, semantic.TIPO_INT as u32))
+    let volta: Valor = ll_entra_laco(&k, lw_valor_int(0, semantic.TIPO_INT as u32), n, &externo)
+    let lido: Valor = ll_le(&k, &l, volta, true)
+    var fora: ^IrBloco = lo_entra_se(&k, ll_igual(&k, lido, valor))
+    lo_atribui(&k, achou, semantic.TIPO_INT as u32, volta)
+    ll_pare(&k)
+    lo_sai_do_se(&k, fora)
+    ll_sai_do_laco(&k, externo as ^IrBloco)
+    let resultado: i32 = lo_local(&k, semantic.TIPO_BOOL as u32, lw_valor_bool(false))
+    let posicao: Valor = lw_valor_local(achou, semantic.TIPO_INT as u32)
+    fora = lo_entra_se(&k, lo_binario(&k, frontend.OP_MAIOR_IGUAL as u8, semantic.TIPO_BOOL as u32, posicao, lw_valor_int(0, semantic.TIPO_INT as u32)))
+    remove_fechando(&k, &l, n, posicao)
+    lo_atribui(&k, resultado, semantic.TIPO_BOOL as u32, lw_valor_bool(true))
+    lo_sai_do_se(&k, fora)
+    return lw_valor_local(resultado, semantic.TIPO_BOOL as u32)
+}
+
+// C: ir/lower_lista.c:302
+proc dedup_compacta(k: ^LoCtx, l: ^LlBase, n: Valor, w: i32) {
+    var externo: ?^IrBloco = none
+    let volta: Valor = ll_entra_laco(k, lw_valor_int(1, semantic.TIPO_INT as u32), n, &externo)
+    let atual: Valor = ll_le(k, l, volta, true)
+    let anterior: Valor = ll_le(k, l, ll_menos(k, lw_valor_local(w, semantic.TIPO_INT as u32), lw_valor_int(1, semantic.TIPO_INT as u32)), true)
+    let fora: ^IrBloco = lo_entra_se(k, lo_binario(k, frontend.OP_DIFERENTE as u8, semantic.TIPO_BOOL as u32, atual, anterior))
+    ll_grava(k, ll_end(k, l, lw_valor_local(w, semantic.TIPO_INT as u32), true), l.elemento, atual)
+    lo_atribui(k, w, semantic.TIPO_INT as u32, ll_mais(k, lw_valor_local(w, semantic.TIPO_INT as u32), lw_valor_int(1, semantic.TIPO_INT as u32)))
+    lo_sai_do_se(k, fora)
+    ll_sai_do_laco(k, externo as ^IrBloco)
+}
+
+// C: ir/lower_lista.c:316
+proc lw_dedup(c: ^LowerCtx, e: ^frontend.Expr) -> Valor {
+    var k: LoCtx = LoCtx{c = c, pos = e.pos_op}
+    let lista: Valor = lw_expr(c, ll_argumento(e, 0))
+    var l: LlBase = ll_base_de(c, lista)
+    let n: Valor = ll_tamanho(&k, lista)
+    let w: i32 = lo_local(&k, semantic.TIPO_INT as u32, lw_valor_int(1, semantic.TIPO_INT as u32))
+    let fora: ^IrBloco = lo_entra_se(&k, lo_binario(&k, frontend.OP_MAIOR as u8, semantic.TIPO_BOOL as u32, n, lw_valor_int(0, semantic.TIPO_INT as u32)))
+    dedup_compacta(&k, &l, n, w)
+    ll_redimensiona(&k, lista, l.elemento, lw_valor_local(w, semantic.TIPO_INT as u32))
+    lo_sai_do_se(&k, fora)
+    return lw_valor_nenhum()
+}
+
+// C: ir/lower_lista.c:331
+proc pred_parametros(c: ^LowerCtx, e: ^frontend.Expr, pred: ^Valor, n: ^Valor) -> LlBase {
+    var k: LoCtx = LoCtx{c = c, pos = e.pos_op}
+    let fatia: Valor = lw_expr(c, ll_argumento(e, 0))
+    pred^ = lw_expr(c, ll_argumento(e, 1))
+    n^ = ll_tamanho(&k, fatia)
+    return ll_base_de(c, fatia)
+}
+
+// C: ir/lower_lista.c:341
+proc predicado_em(k: ^LoCtx, pred: Valor, b: ^LlBase, volta: Valor) -> Valor {
+    // O endereco do item e emitido antes da chamada (K09): entra como o unico argumento
+    let endereco: Valor = ll_end(k, b, volta, true)
+    let i: ^IrInstr = lw_nova_instr(k.c as ^LowerCtx, IR_CHAMADA_IND, k.pos)
+    i.a = pred
+    i.tipo = semantic.TIPO_BOOL as u32
+    i.args = lw_args(k.c as ^LowerCtx, 1)
+    let args: []Valor = i.args or_else {}
+    args[0] = endereco
+    i.nargs = 1
+    i.destino = lw_novo_temp(k.c as ^LowerCtx)
+    return lw_valor_temp(i.destino, semantic.TIPO_BOOL as u32)
+}
+
+// C: ir/lower_lista.c:355
+proc lw_index_by(c: ^LowerCtx, e: ^frontend.Expr) -> Valor {
+    var k: LoCtx = LoCtx{c = c, pos = e.pos_op}
+    var pred: Valor = Valor{}
+    var n: Valor = Valor{}
+    var b: LlBase = pred_parametros(c, e, &pred, &n)
+    let posicao: i32 = lo_local(&k, semantic.TIPO_INT as u32, lw_valor_int(-1, semantic.TIPO_INT as u32))
+    let achou: i32 = lo_local(&k, semantic.TIPO_BOOL as u32, lw_valor_nenhum())
+    var externo: ?^IrBloco = none
+    let volta: Valor = ll_entra_laco(&k, lw_valor_int(0, semantic.TIPO_INT as u32), n, &externo)
+    let fora: ^IrBloco = lo_entra_se(&k, predicado_em(&k, pred, &b, volta))
+    lo_atribui(&k, posicao, semantic.TIPO_INT as u32, volta)
+    lo_atribui(&k, achou, semantic.TIPO_BOOL as u32, lw_valor_bool(true))
+    ll_pare(&k)
+    lo_sai_do_se(&k, fora)
+    ll_sai_do_laco(&k, externo as ^IrBloco)
+    let tupla: ^IrInstr = lw_nova_instr(c, IR_TUPLA, e.pos_op)
+    tupla.destino = lw_novo_temp(c)
+    tupla.tipo = e.tipo
+    tupla.args = lw_args(c, 2)
+    let args: []Valor = tupla.args or_else {}
+    args[0] = lw_valor_local(posicao, semantic.TIPO_INT as u32)
+    args[1] = lw_valor_local(achou, semantic.TIPO_BOOL as u32)
+    tupla.nargs = 2
+    return lw_valor_temp(tupla.destino, e.tipo)
+}
+
+// C: ir/lower_lista.c:381
+proc lw_find_by(c: ^LowerCtx, e: ^frontend.Expr) -> Valor {
+    var k: LoCtx = LoCtx{c = c, pos = e.pos_op}
+    var pred: Valor = Valor{}
+    var n: Valor = Valor{}
+    var b: LlBase = pred_parametros(c, e, &pred, &n)
+    let achado: i32 = lo_local(&k, e.tipo, lw_valor_nenhum())
+    var externo: ?^IrBloco = none
+    let volta: Valor = ll_entra_laco(&k, lw_valor_int(0, semantic.TIPO_INT as u32), n, &externo)
+    let fora: ^IrBloco = lo_entra_se(&k, predicado_em(&k, pred, &b, volta))
+    lo_atribui(&k, achado, e.tipo, ll_embrulha(&k, e.tipo, ll_le(&k, &b, volta, true)))
+    ll_pare(&k)
+    lo_sai_do_se(&k, fora)
+    ll_sai_do_laco(&k, externo as ^IrBloco)
+    return lw_valor_local(achado, e.tipo)
+}
+
+// C: ir/lower_lista.c:398
+proc lw_any_all(c: ^LowerCtx, e: ^frontend.Expr, todos: bool) -> Valor {
+    var k: LoCtx = LoCtx{c = c, pos = e.pos_op}
+    var pred: Valor = Valor{}
+    var n: Valor = Valor{}
+    var b: LlBase = pred_parametros(c, e, &pred, &n)
+    let resultado: i32 = lo_local(&k, semantic.TIPO_BOOL as u32, lw_valor_bool(todos))
+    var externo: ?^IrBloco = none
+    let volta: Valor = ll_entra_laco(&k, lw_valor_int(0, semantic.TIPO_INT as u32), n, &externo)
+    let cond: Valor = predicado_em(&k, pred, &b, volta)
+    var condicao_fora: Valor = cond
+    if todos {
+        condicao_fora = lo_nao(&k, cond)
+    }
+    let fora: ^IrBloco = lo_entra_se(&k, condicao_fora)
+    lo_atribui(&k, resultado, semantic.TIPO_BOOL as u32, lw_valor_bool(not todos))
+    ll_pare(&k)
+    lo_sai_do_se(&k, fora)
+    ll_sai_do_laco(&k, externo as ^IrBloco)
+    return lw_valor_local(resultado, semantic.TIPO_BOOL as u32)
+}
+
+// C: ir/lower_lista.c:415
+proc lw_any_by(c: ^LowerCtx, e: ^frontend.Expr) -> Valor {
+    return lw_any_all(c, e, false)
+}
+
+// C: ir/lower_lista.c:416
+proc lw_all_by(c: ^LowerCtx, e: ^frontend.Expr) -> Valor {
+    return lw_any_all(c, e, true)
+}
+
+// C: ir/lower_lista.c:419
+proc lw_count_by(c: ^LowerCtx, e: ^frontend.Expr) -> Valor {
+    var k: LoCtx = LoCtx{c = c, pos = e.pos_op}
+    var pred: Valor = Valor{}
+    var n: Valor = Valor{}
+    var b: LlBase = pred_parametros(c, e, &pred, &n)
+    let quantos: i32 = lo_local(&k, semantic.TIPO_INT as u32, lw_valor_int(0, semantic.TIPO_INT as u32))
+    var externo: ?^IrBloco = none
+    let volta: Valor = ll_entra_laco(&k, lw_valor_int(0, semantic.TIPO_INT as u32), n, &externo)
+    let fora: ^IrBloco = lo_entra_se(&k, predicado_em(&k, pred, &b, volta))
+    lo_atribui(&k, quantos, semantic.TIPO_INT as u32, ll_mais(&k, lw_valor_local(quantos, semantic.TIPO_INT as u32), lw_valor_int(1, semantic.TIPO_INT as u32)))
+    lo_sai_do_se(&k, fora)
+    ll_sai_do_laco(&k, externo as ^IrBloco)
+    return lw_valor_local(quantos, semantic.TIPO_INT as u32)
+}
+
+// C: ir/lower_lista.c:435
+proc conjunto_base(c: ^LowerCtx, arg: ?^frontend.Expr) -> Valor {
+    if common.c2f_s2u_32(semantic.tipo_classe_de(&(c.sem as ^semantic.Semantica).tipos, (arg as ^frontend.Expr).tipo)) == (semantic.TC_PONTEIRO as u32) {
+        return lw_expr(c, arg)
+    }
+    var tern_1: Valor = Valor{}
+    if common.c2f_b2i32(lw_enderecavel(c, arg)) != 0 {
+        tern_1 = lw_endereco(c, arg)
+    } else {
+        tern_1 = lw_expr(c, arg)
+    }
+    return tern_1
+}
+
+// C: ir/lower_lista.c:442
+proc chave_do_conjunto(c: ^LowerCtx, t: u32) -> u32 {
+    var tern_1: u32 = t
+    if common.c2f_s2u_32(semantic.tipo_classe_de(&(c.sem as ^semantic.Semantica).tipos, t)) == (semantic.TC_PONTEIRO as u32) {
+        tern_1 = semantic.tipo_de(&(c.sem as ^semantic.Semantica).tipos, t).a
+    }
+    let m: u32 = tern_1
+    return semantic.tipo_de(&(c.sem as ^semantic.Semantica).tipos, m).a
+}
+
+// C: ir/lower_lista.c:449
+proc conjunto_chave_do(k: ^LoCtx, mapa: Valor, indice: Valor, chave: u32) -> Valor {
+    let i: ^IrInstr = lw_nova_instr(k.c as ^LowerCtx, IR_MAPA_ITEM, k.pos)
+    i.op_aux = 0
+    i.tipo = chave
+    i.a = mapa
+    i.b = indice
+    i.destino = lw_novo_temp(k.c as ^LowerCtx)
+    return lw_valor_temp(i.destino, chave)
+}
+
+// C: ir/lower_lista.c:461
+proc conjunto_tem(k: ^LoCtx, mapa: Valor, chave: Valor) -> Valor {
+    let i: ^IrInstr = lw_nova_instr(k.c as ^LowerCtx, IR_MAPA_TEM, k.pos)
+    i.tipo = semantic.TIPO_BOOL as u32
+    i.a = mapa
+    i.b = chave
+    i.destino = lw_novo_temp(k.c as ^LowerCtx)
+    return lw_valor_temp(i.destino, semantic.TIPO_BOOL as u32)
+}
+
+// C: ir/lower_lista.c:472
+proc conjunto_insere(k: ^LoCtx, mapa: Valor, chave: Valor) {
+    let i: ^IrInstr = lw_nova_instr(k.c as ^LowerCtx, IR_MAPA_INSERE, k.pos)
+    i.tipo = semantic.TIPO_BOOL as u32
+    i.a = mapa
+    i.b = chave
+    i.args = lw_args(k.c as ^LowerCtx, 1)
+    let args: []Valor = i.args or_else {}
+    args[0] = lw_valor_bool(true)
+    i.nargs = 1
+}
+
+// C: ir/lower_lista.c:483
+proc conjunto_remove(k: ^LoCtx, mapa: Valor, chave: Valor) {
+    let i: ^IrInstr = lw_nova_instr(k.c as ^LowerCtx, IR_MAPA_REMOVE, k.pos)
+    i.tipo = semantic.TIPO_BOOL as u32
+    i.a = mapa
+    i.b = chave
+}
+
+// C: ir/lower_lista.c:492
+proc lw_set_union(c: ^LowerCtx, e: ^frontend.Expr) -> Valor {
+    var k: LoCtx = LoCtx{c = c, pos = e.pos_op}
+    let a: Valor = lw_expr(c, ll_argumento(e, 0))
+    let b: Valor = conjunto_base(c, ll_argumento(e, 1))
+    let chave: u32 = chave_do_conjunto(c, (ll_argumento(e, 0) as ^frontend.Expr).tipo)
+    let n: Valor = ll_tamanho(&k, b)
+    var externo: ?^IrBloco = none
+    let volta: Valor = ll_entra_laco(&k, lw_valor_int(0, semantic.TIPO_INT as u32), n, &externo)
+    let cha: Valor = conjunto_chave_do(&k, b, volta, chave)
+    conjunto_insere(&k, a, cha)
+    ll_sai_do_laco(&k, externo as ^IrBloco)
+    return lw_valor_nenhum()
+}
+
+// C: ir/lower_lista.c:508
+proc conjunto_enxuga(c: ^LowerCtx, e: ^frontend.Expr, intersecao: bool) -> Valor {
+    var k: LoCtx = LoCtx{c = c, pos = e.pos_op}
+    var externo: ?^IrBloco = none
+    let a: Valor = lw_expr(c, ll_argumento(e, 0))
+    let b: Valor = conjunto_base(c, ll_argumento(e, 1))
+    let chave: u32 = chave_do_conjunto(c, (ll_argumento(e, 0) as ^frontend.Expr).tipo)
+    let n: Valor = ll_tamanho(&k, a)
+    let volta: Valor = ll_entra_laco(&k, lw_valor_int(0, semantic.TIPO_INT as u32), n, &externo)
+    let cha: Valor = conjunto_chave_do(&k, a, ll_menos(&k, ll_menos(&k, n, lw_valor_int(1, semantic.TIPO_INT as u32)), volta), chave)
+    let em_b: Valor = conjunto_tem(&k, b, cha)
+    var condicao_fora: Valor = em_b
+    if intersecao {
+        condicao_fora = lo_nao(&k, em_b)
+    }
+    let fora: ^IrBloco = lo_entra_se(&k, condicao_fora)
+    conjunto_remove(&k, a, cha)
+    lo_sai_do_se(&k, fora)
+    ll_sai_do_laco(&k, externo as ^IrBloco)
+    return lw_valor_nenhum()
+}
+
+// C: ir/lower_lista.c:526
+proc lw_set_intersect(c: ^LowerCtx, e: ^frontend.Expr) -> Valor {
+    return conjunto_enxuga(c, e, true)
+}
+
+// C: ir/lower_lista.c:527
+proc lw_set_diff(c: ^LowerCtx, e: ^frontend.Expr) -> Valor {
+    return conjunto_enxuga(c, e, false)
+}
+
+// C: ir/lower_lista.c:531
+proc heap_instrucao(c: ^LowerCtx, e: ^frontend.Expr, lista: Valor, elemento: u32, modo: u8, comparador: Valor) {
+    let i: ^IrInstr = lw_nova_instr(c, IR_HEAP, e.pos_op)
+    let com_less: bool = (modo == (HEAP_SUBIR_BY as u8)) or (modo == (HEAP_RETIRA_TOPO_BY as u8))
+    i.tipo = elemento
+    i.a = lista
+    i.b = comparador
+    i.op_aux = modo
+    var tern_1: i32 = 0
+    if common.c2f_b2i32(com_less) != 0 {
+        tern_1 = 0
+    } else {
+        tern_1 = tipo_de_ordenacao(c, elemento) as i32
+    }
+    i.tipo_chave = tern_1 as u8
+    let ptr_1: ^IrPrograma = c.prog as ^IrPrograma
+    ptr_1.usa_heap = true
+    let ptr_2: ^IrPrograma = c.prog as ^IrPrograma
+    ptr_2.usa_ordenar_chave = true
+}
+
+// C: ir/lower_lista.c:545
+proc lw_heap_empurra(c: ^LowerCtx, e: ^frontend.Expr, com_less: bool) -> Valor {
+    let lista: Valor = lw_expr(c, ll_argumento(e, 0))
+    let item: Valor = lw_expr(c, ll_argumento(e, 1))
+    var tern_1: Valor = Valor{}
+    if common.c2f_b2i32(com_less) != 0 {
+        tern_1 = lw_expr(c, ll_argumento(e, 2))
+    } else {
+        tern_1 = lw_valor_nenhum()
+    }
+    let comparador: Valor = tern_1
+    let l: LlBase = ll_base_de(c, lista)
+    let anexa: ^IrInstr = lw_nova_instr(c, IR_ANEXA, e.pos_op)
+    anexa.tipo = l.elemento
+    anexa.a = lista
+    anexa.b = item
+    var tern_2: i32 = HEAP_SUBIR
+    if common.c2f_b2i32(com_less) != 0 {
+        tern_2 = HEAP_SUBIR_BY
+    }
+    heap_instrucao(c, e, lista, l.elemento, tern_2 as u8, comparador)
+    return lw_valor_nenhum()
+}
+
+// C: ir/lower_lista.c:560
+proc lw_heap_tira(c: ^LowerCtx, e: ^frontend.Expr, com_less: bool) -> Valor {
+    var k: LoCtx = LoCtx{c = c, pos = e.pos_op}
+    let lista: Valor = lw_expr(c, ll_argumento(e, 0))
+    var comparador: Valor = lw_valor_nenhum()
+    if com_less {
+        comparador = lw_expr(c, ll_argumento(e, 1))
+    }
+    var l: LlBase = ll_base_de(c, lista)
+    let resultado: i32 = lo_local(&k, e.tipo, lw_valor_nenhum())
+    let n: Valor = ll_tamanho(&k, lista)
+    let fora: ^IrBloco = lo_entra_se(&k, lo_binario(&k, frontend.OP_MAIOR as u8, semantic.TIPO_BOOL as u32, n, lw_valor_int(0, semantic.TIPO_INT as u32)))
+    let ultimo: Valor = ll_menos(&k, n, lw_valor_int(1, semantic.TIPO_INT as u32))
+    var modo: i32 = HEAP_RETIRA_TOPO
+    if com_less {
+        modo = HEAP_RETIRA_TOPO_BY
+    }
+    heap_instrucao(c, e, lista, l.elemento, modo as u8, comparador)
+    let lido: Valor = ll_le(&k, &l, ultimo, true)
+    lo_atribui(&k, resultado, e.tipo, ll_embrulha(&k, e.tipo, lido))
+    ll_redimensiona(&k, lista, l.elemento, ultimo)
+    lo_sai_do_se(&k, fora)
+    return lw_valor_local(resultado, e.tipo)
+}
+
+// C: ir/lower_lista.c:578
+proc lw_heap_push(c: ^LowerCtx, e: ^frontend.Expr) -> Valor {
+    return lw_heap_empurra(c, e, false)
+}
+
+// C: ir/lower_lista.c:579
+proc lw_heap_push_by(c: ^LowerCtx, e: ^frontend.Expr) -> Valor {
+    return lw_heap_empurra(c, e, true)
+}
+
+// C: ir/lower_lista.c:580
+proc lw_heap_pop(c: ^LowerCtx, e: ^frontend.Expr) -> Valor {
+    return lw_heap_tira(c, e, false)
+}
+
+// C: ir/lower_lista.c:581
+proc lw_heap_pop_by(c: ^LowerCtx, e: ^frontend.Expr) -> Valor {
+    return lw_heap_tira(c, e, true)
+}
+
+// C: ir/lower_lista.c:583
+proc lw_lista(c: ^LowerCtx, e: ^frontend.Expr) -> Valor {
+    let sw_1 = e.ref_id
+    if sw_1 == frontend.EMB_CAP {
+        return lw_cap(c, e)
+    } else if sw_1 == frontend.EMB_CLEAR {
+        return lw_clear(c, e)
+    } else if sw_1 == frontend.EMB_RESERVE {
+        return lw_reserve(c, e)
+    } else if sw_1 == frontend.EMB_TRUNCATE {
+        return lw_truncate(c, e)
+    } else if sw_1 == frontend.EMB_POP {
+        return lw_pop(c, e)
+    } else if sw_1 == frontend.EMB_INSERT_AT {
+        return lw_insert_at(c, e)
+    } else if sw_1 == frontend.EMB_ORDERED_REMOVE {
+        return lw_ordered_remove(c, e)
+    } else if sw_1 == frontend.EMB_UNORDERED_REMOVE {
+        return lw_unordered_remove(c, e)
+    } else if sw_1 == frontend.EMB_REMOVE_VALUE {
+        return lw_remove_value(c, e)
+    } else {
+        return lw_busca(c, e)
+    }
+    return Valor{}
+}
+
+// Testes dirigidos (valores do C: lower_lista.c ConjuntoInsere): IR_MAPA_INSERE com o bool true como unico argumento.
+test "lower_lista: conjunto_insere monta IR_MAPA_INSERE" {
+    var a = common.Arena{}
+    var sem = semantic.Semantica{}
+    var lc = LowerCtx{}
+    lc.sem = &sem
+    lc.arena = &a
+    var bloco = IrBloco{}
+    lc.atual = &bloco
+    var k = LoCtx{c = &lc, pos = 5}
+    conjunto_insere(&k, lw_valor_local(2, semantic.TIPO_INT as u32), lw_valor_int(9, semantic.TIPO_INT as u32))
+    let i: ^IrInstr = bloco.primeira as ^IrInstr
+    expect(i.op == IR_MAPA_INSERE as u8 and i.pos == 5 and i.tipo == semantic.TIPO_BOOL as u32)
+    expect(i.a.tipo_no == V_LOCAL as u8 and i.a.id == 2 and i.b.inteiro == 9)
+    expect(i.nargs == 1)
+    let args: []Valor = i.args or_else {}
+    expect(args[0].tipo_no == V_BOOL as u8 and args[0].inteiro == 1)
+    common.arena_liberar(&a)
+}

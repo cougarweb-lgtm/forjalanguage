@@ -1,0 +1,187 @@
+// std:db 0.2.0 - SQLite para a Forja, por cima do SQLite 3.54.1 (dominio publico) em vendor\libsqlite3.a. (antes std:banco; os nomes antigos em portugues dao E0110: rode forja migrar)
+//
+// COMO USAR (o .fj raiz precisa de vendor\ ao lado: libsqlite3.a, db\db.fj, db\sqlite3.fj; ver MEM-FORJA-GUIA-10):
+//     import "vendor:db/db"
+//     let bd = try db.open(":memory:")            // ou um caminho de arquivo (cria se nao existe)
+//     defer db.close(bd)
+//     try db.exec(bd, sql = "CREATE TABLE t(id INTEGER, nome TEXT)")
+//     let q = try db.prepare(bd, sql = "SELECT id, nome FROM t WHERE id > ?")
+//     defer db.finalize(q)
+//     try db.bind_int(q, index = 1, value = 0)          // indices de parametro comecam em 1
+//     while try db.next(q) {
+//         print(f"{db.column_int(q, index = 0)} {db.column_text(q, index = 1)}")   // colunas comecam em 0
+//     }
+//
+// REGRAS: open devolve Db DONO (db.close uma vez); prepare devolve Query DONA (db.finalize uma vez,
+// antes de fechar o banco). column_text devolve str EMPRESTADO: vale ate next/reset/finalize; copie com
+// format(f"{s}", alloc = heap) para guardar. bind_text NAO copia (o SQLite guarda o ponteiro): o cstr passado deve
+// viver ate a consulta andar (next) e ser finalizada ou reiniciada; literal e cstr de format_c valem.
+// Erro: DbError; a mensagem do SQLite sai em db.message(bd). Nada aqui devolve ponteiro cru.
+//
+// NOMES ANTIGOS (dao E0110; rode forja migrar; tabela compiler\common\renomeados.c): import "vendor:banco/banco" e o qualificador banco.; versao, fechar, mensagem, preparar, finalizar, reiniciar,
+// ligar_inteiro/numero/texto/nulo, proxima, colunas, coluna_inteiro/numero/texto, ultimo_id, alteradas, abrir, executar; Banco, Consulta, ErroBanco; os membros nao_abriu, sql_invalido,
+// execucao, parametro, sem_memoria; os rotulos caminho, indice, valor.
+//
+// VERIFICAR: python language\exemplos_libs\verificar_libs.py --so banco_basico   (ou: forja run language\exemplos_libs\banco_basico.fj)
+
+import "vendor:db/sqlite3" as sq
+
+pub enum DbError {
+    not_opened
+    invalid_sql
+    execution
+    parameter
+    out_of_memory
+}
+
+pub struct Db {
+    no: ?^sq.Sqlite3
+}
+
+pub struct Query {
+    no: ?^sq.Sqlite3Stmt
+}
+
+// Destrutor "nao faz nada" exigido pelo sqlite3_bind_text (o SQLite nao copia; ver REGRAS acima).
+proc banco_nao_libera(bloco: rawptr) {
+}
+
+// Retorno de chamada do sqlite3_exec: ignora as linhas (exec e para comandos sem resultado).
+proc banco_ignora_linhas(contexto: rawptr, colunas: i32, valores: ?^cstr, nomes: ?^cstr) -> i32 {
+    return 0
+}
+
+// Versao do SQLite embutido, por exemplo "3.54.1".
+pub proc version() -> str {
+    let v = sq.sqlite3_libversion()
+    return (v or_else "?") as str
+}
+
+// Abre (ou cria) o banco. ":memory:" = banco so em memoria. Erro: not_opened.
+pub proc open(path: cstr) -> Db ! DbError {
+    var aberto: ?^sq.Sqlite3 = none
+    let codigo = sq.sqlite3_open(path, pp_db = &aberto)
+    if codigo != sq.SQLITE_OK {
+        _ = sq.sqlite3_close(aberto)
+        return DbError.not_opened
+    }
+    return Db{no = aberto}
+}
+
+// Fecha o banco (todas as Querys ja finalizadas).
+pub proc close(bd: Db) {
+    _ = sq.sqlite3_close(bd.no)
+}
+
+// Mensagem do ultimo erro do SQLite neste banco (str emprestado).
+pub proc message(bd: Db) -> str {
+    let m = sq.sqlite3_errmsg(bd.no)
+    return (m or_else "?") as str
+}
+
+// Roda um ou mais comandos SQL sem resultado (CREATE, INSERT, UPDATE, BEGIN...). Erro: execution (veja message).
+pub proc exec(bd: Db, sql: cstr) -> ! DbError {
+    switch b in bd.no {
+    case ^sq.Sqlite3:
+        let codigo = sq.sqlite3_exec(b, sql = sql, callback = banco_ignora_linhas, a3 = b as rawptr, errmsg = none)
+        if codigo != sq.SQLITE_OK {
+            return DbError.execution
+        }
+    case none:
+        return DbError.not_opened
+    }
+}
+
+// Prepara um SELECT/INSERT com parametros `?`. Erros: invalid_sql (veja message).
+pub proc prepare(bd: Db, sql: cstr) -> Query ! DbError {
+    var q: ?^sq.Sqlite3Stmt = none
+    let codigo = sq.sqlite3_prepare_v2(bd.no, z_sql = sql, n_byte = -1, pp_stmt = &q, pz_tail = none)
+    if codigo != sq.SQLITE_OK {
+        _ = sq.sqlite3_finalize(q)
+        return DbError.invalid_sql
+    }
+    return Query{no = q}
+}
+
+// Libera a consulta (uma vez).
+pub proc finalize(q: Query) {
+    _ = sq.sqlite3_finalize(q.no)
+}
+
+// Volta a consulta ao inicio e limpa os parametros ligados.
+pub proc reset(q: Query) {
+    _ = sq.sqlite3_reset(q.no)
+    _ = sq.sqlite3_clear_bindings(q.no)
+}
+
+pub proc bind_int(q: Query, index: i32, value: i64) -> ! DbError {
+    if sq.sqlite3_bind_int64(q.no, a1 = index, a2 = value) != sq.SQLITE_OK {
+        return DbError.parameter
+    }
+}
+
+pub proc bind_float(q: Query, index: i32, value: f64) -> ! DbError {
+    if sq.sqlite3_bind_double(q.no, a1 = index, a2 = value) != sq.SQLITE_OK {
+        return DbError.parameter
+    }
+}
+
+// O texto NAO e copiado: precisa viver ate a consulta terminar (ver REGRAS).
+pub proc bind_text(q: Query, index: i32, value: cstr) -> ! DbError {
+    if sq.sqlite3_bind_text(q.no, a1 = index, a2 = value, a3 = -1, a4 = banco_nao_libera) != sq.SQLITE_OK {
+        return DbError.parameter
+    }
+}
+
+pub proc bind_null(q: Query, index: i32) -> ! DbError {
+    if sq.sqlite3_bind_null(q.no, a1 = index) != sq.SQLITE_OK {
+        return DbError.parameter
+    }
+}
+
+// Anda uma linha: true = ha linha para ler; false = acabou. Erro: execution (veja message).
+pub proc next(q: Query) -> bool ! DbError {
+    let codigo = sq.sqlite3_step(q.no)
+    if codigo == sq.SQLITE_ROW {
+        return true
+    }
+    if codigo == sq.SQLITE_DONE {
+        return false
+    }
+    return DbError.execution
+}
+
+// Quantidade de colunas do resultado.
+pub proc columns(q: Query) -> i32 {
+    return sq.sqlite3_column_count(q.no)
+}
+
+pub proc column_int(q: Query, index: i32) -> i64 {
+    return sq.sqlite3_column_int64(q.no, i_col = index)
+}
+
+pub proc column_float(q: Query, index: i32) -> f64 {
+    return sq.sqlite3_column_double(q.no, i_col = index)
+}
+
+// Texto da coluna (NULL vira ""). str EMPRESTADO: vale ate next/reset/finalize.
+pub proc column_text(q: Query, index: i32) -> str {
+    let bruto = sq.sqlite3_column_text(q.no, i_col = index)
+    switch t in bruto {
+    case ^u8:
+        return (t as rawptr as cstr) as str
+    case none:
+        return ""
+    }
+    return ""
+}
+
+// rowid do ultimo INSERT neste banco.
+pub proc last_id(bd: Db) -> i64 {
+    return sq.sqlite3_last_insert_rowid(bd.no)
+}
+
+// Linhas alteradas pelo ultimo INSERT/UPDATE/DELETE.
+pub proc changes(bd: Db) -> i32 {
+    return sq.sqlite3_changes(bd.no)
+}

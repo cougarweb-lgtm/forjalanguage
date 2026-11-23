@@ -1,0 +1,88 @@
+// Fixture do std:mem VirtualArena (M5 P52): 1000 ciclos de va_reset + realocacao de 64 MiB. Prova que o reset nao vaza nem recommita: committed e pico estaveis.
+import "std:mem"
+import "std:os"
+
+const QUATRO_GIB: int = 4294967296
+const BLOCO: int = 1048576
+const TOTAL: int = 67108864
+const CICLOS: int = 1000
+const PAGINA: int = 4096
+
+proc pico() -> int {
+    switch p in os.peak_memory() {
+    case u64:
+        return p as int
+    case os.OsError:
+        return -1
+    }
+    return -1
+}
+
+proc reservar_em(va: ^mem.VirtualArena, bytes: int) -> bool {
+    switch r in mem.va_reserve(bytes) {
+    case mem.VirtualArena:
+        va.base = r.base
+        va.reservado = r.reservado
+        return true
+    case mem.VarenaError:
+        return false
+    }
+    return false
+}
+
+// Um ciclo: volta o bump a 0 e aloca TOTAL bytes em blocos de 1 MiB, tocando uma pagina de 4 KiB por vez (toca todas as paginas). false = alocacao falhou.
+proc ciclo(va: ^mem.VirtualArena) -> bool {
+    mem.va_reset(va)
+    var feito = 0
+    while feito < TOTAL {
+        switch p in mem.va_alloc(va, BLOCO, 8) {
+        case rawptr:
+            let s = slice_from(p as ^u8, len = BLOCO)
+            var i = 0
+            while i < BLOCO {
+                s[i] = 7 as u8
+                i += PAGINA
+            }
+            feito += BLOCO
+        case mem.VarenaError:
+            return false
+        }
+    }
+    return true
+}
+
+proc main() {
+    var va = mem.VirtualArena{base = 0}
+    if not reservar_em(&va, QUATRO_GIB) {
+        print("FALHA reserva de 4 GiB recusada")
+        return
+    }
+    if not ciclo(&va) {
+        print("FALHA ciclo 1")
+        return
+    }
+    let commit1 = mem.va_committed(va)
+    let pico1 = pico()
+    print(f"ciclo1 committed={commit1} peak={pico1}")
+
+    var n = 1
+    while n < CICLOS {
+        if not ciclo(&va) {
+            print(f"FALHA ciclo {n + 1}")
+            return
+        }
+        n += 1
+    }
+    let commit_n = mem.va_committed(va)
+    let pico_n = pico()
+    print(f"ciclo{CICLOS} committed={commit_n} peak={pico_n}")
+
+    let limite = pico1 / 20
+    let variacao = pico_n - pico1
+    if commit_n != commit1 or commit1 != TOTAL or variacao > limite or variacao < 0 - limite {
+        print("FALHA reset vazou ou recommitou")
+        return
+    }
+    print("reset OK")
+    mem.va_release(&va)
+}

@@ -1,0 +1,422 @@
+// std:time - data e hora de calendario em UTC, ISO 8601 e duracao (IA1-LT). API em ingles (ADR-39); Forja pura (so chama std:os), igual nos 2 backends e nos 2 sistemas.
+// Versao: 0.3.0. Changelog: 0.3.0 - R2: fuso e hora local (pedaco time/fuso.fj: local_offset_s, now_local, format_iso_offset, parse_iso_offset, format_rfc5322); Windows pelo kernel32 (forja_os_fuso_s), Linux pelo TZif em Forja pura; time.fj importa std:file. 0.2.0 - B01e2: format_iso ganha `alloc: Allocator` (ultimo parametro, sem padrao); o texto vai para o alocador do chamador, o temporario deletado continua no heap.
+// DateTime e UTC (sem fuso): from_unix_ns/to_unix_ns convertem de/para nanossegundos desde 1970-01-01T00:00:00Z (negativo = antes de 1970); o calendario e o gregoriano proleptico (Howard Hinnant, days_from_civil e civil_from_days).
+// to_unix_ns e now() cobrem de 1677-09-21T00:12:43.145224192Z a 2262-04-11T23:47:16.854775807Z, a faixa do int de 64 bits em nanossegundos.
+// weekday, day_of_year, add_days e add_seconds supoem um DateTime valido (campos nas faixas do calendario); to_unix_ns e parse_iso e que validam.
+// Stopwatch e as conversoes de duracao usam o relogio MONOTONICO de std:os (time_ns), imune a acerto de hora; now() usa a hora de parede (wall_time_ns).
+import "std:os" as os
+import "std:file"
+
+// Deslocamento do fuso local em segundos naquele instante UTC. Windows: kernel32. Linux: devolve o menor i32 (sem fuso nativo) e o pedaco fuso.fj le o TZif.
+foreign {
+    proc forja_os_fuso_s(unix_s: i64) -> i32
+}
+
+// invalid_field: campo fora da faixa (mes 13, 31 de fevereiro, hora 24); invalid_text: parse_iso recebeu texto fora da forma ISO; out_of_range: a data nao cabe em nanossegundos de 64 bits.
+pub enum TimeError { invalid_field, invalid_text, out_of_range }
+
+// Data e hora UTC. nanosecond vai de 0 a 999999999. O valor padrao e a epoca (1970-01-01T00:00:00Z).
+pub struct DateTime {
+    year: int = 1970
+    month: int = 1
+    day: int = 1
+    hour: int = 0
+    minute: int = 0
+    second: int = 0
+    nanosecond: int = 0
+}
+
+// Marca do relogio monotonico: start_ns e o time_ns() de quando o cronometro comecou.
+pub struct Stopwatch {
+    start_ns: int = 0
+}
+
+const NS_PER_MS: int = 1000000
+const NS_PER_US: int = 1000
+const NS_PER_SECOND: int = 1000000000
+const SECONDS_PER_MINUTE: int = 60
+const SECONDS_PER_HOUR: int = 3600
+const SECONDS_PER_DAY: int = 86400
+const DAYS_PER_WEEK: int = 7
+const DAYS_PER_YEAR: int = 365
+const DAYS_PER_4_YEARS: int = 1460
+const DAYS_PER_100_YEARS: int = 36524
+const DAYS_PER_ERA: int = 146097
+const YEARS_PER_ERA: int = 400
+// Dias entre 0000-03-01 (inicio da era do algoritmo) e 1970-01-01.
+const DAYS_ERA_START_TO_EPOCH: int = 719468
+// 1970-01-01 foi quinta-feira; weekday conta de domingo (0).
+const EPOCH_WEEKDAY: int = 4
+const MONTHS_PER_YEAR: int = 12
+const LAST_HOUR: int = 23
+const LAST_MINUTE_OR_SECOND: int = 59
+// Limites do int de 64 bits em segundos inteiros: o segundo minimo so aceita nanosegundos a partir de MIN_NANOS_AT_MIN (o int minimo cai no meio dele); o maximo, ate MAX_NANOS_AT_MAX.
+const MIN_INT: int = -9223372036854775807 - 1
+const MIN_SECONDS: int = -9223372037
+const MIN_NANOS_AT_MIN: int = 145224192
+const MAX_SECONDS: int = 9223372036
+const MAX_NANOS_AT_MAX: int = 854775807
+// Anos fora desta faixa nem entram na conta (os dias por ano estourariam o int); a faixa real de nanossegundos e conferida depois, em segundos.
+const GUARD_MIN_YEAR: int = 1600
+const GUARD_MAX_YEAR: int = 2300
+
+// Posicoes de "YYYY-MM-DDTHH:MM:SS" (ISO 8601 UTC) em parse_iso.
+const DATE_YEAR_AT: int = 0
+const DATE_DASH_1_AT: int = 4
+const DATE_MONTH_AT: int = 5
+const DATE_DASH_2_AT: int = 7
+const DATE_DAY_AT: int = 8
+const DATE_END_AT: int = 10
+const CLOCK_T_AT: int = 10
+const CLOCK_HOUR_AT: int = 11
+const CLOCK_COLON_1_AT: int = 13
+const CLOCK_MINUTE_AT: int = 14
+const CLOCK_COLON_2_AT: int = 16
+const CLOCK_SECOND_AT: int = 17
+const CLOCK_END_AT: int = 19
+const MAX_FRACTION_DIGITS: int = 9
+const CHAR_DASH: u8 = 45
+const CHAR_COLON: u8 = 58
+const CHAR_DOT: u8 = 46
+const CHAR_T: u8 = 84
+const CHAR_Z: u8 = 90
+const CHAR_ZERO: u8 = 48
+const CHAR_NINE: u8 = 57
+
+// a / divisor arredondado para baixo (o / da Forja arredonda para zero); divisor positivo.
+proc floor_div(a: int, divisor: int) -> int {
+    let quotient = a / divisor
+    if a % divisor < 0 {
+        return quotient - 1
+    }
+    return quotient
+}
+
+// Resto de a por divisor, sempre de 0 a divisor - 1 (o % da Forja leva o sinal de a); divisor positivo.
+proc floor_mod(a: int, divisor: int) -> int {
+    let remainder = a % divisor
+    if remainder < 0 {
+        return remainder + divisor
+    }
+    return remainder
+}
+
+// Valor do digito decimal de b, ou -1 se b nao e digito.
+proc digit_of(b: u8) -> int {
+    if b >= CHAR_ZERO and b <= CHAR_NINE {
+        return (b - CHAR_ZERO) as int
+    }
+    return -1
+}
+
+// O ano e bissexto no calendario gregoriano? 2000 sim, 1900 e 2100 nao.
+pub proc is_leap_year(year: int) -> bool {
+    return year % 4 == 0 and (year % 100 != 0 or year % YEARS_PER_ERA == 0)
+}
+
+// Dias do mes (1..12) no ano; 0 se o mes nao existe.
+pub proc days_in_month(year: int, month: int) -> int {
+    if month < 1 or month > MONTHS_PER_YEAR {
+        return 0
+    }
+    if month == 2 {
+        if is_leap_year(year) {
+            return 29
+        }
+        return 28
+    }
+    if month == 4 or month == 6 or month == 9 or month == 11 {
+        return 30
+    }
+    return 31
+}
+
+// Dias desde 1970-01-01 do dia year-month-day (negativo = antes). Algoritmo days_from_civil de Hinnant: o ano comeca em 1o de marco, entao fevereiro (e o dia 29) fica no fim.
+proc days_from_civil(year: int, month: int, day: int) -> int {
+    var shifted_year = year
+    var shifted_month = month - 3
+    if month <= 2 {
+        shifted_year -= 1
+        shifted_month = month + 9
+    }
+    let era = floor_div(shifted_year, divisor = YEARS_PER_ERA)
+    let year_of_era = shifted_year - era * YEARS_PER_ERA
+    let day_of_year = (153 * shifted_month + 2) / 5 + day - 1
+    let day_of_era = year_of_era * DAYS_PER_YEAR + year_of_era / 4 - year_of_era / 100 + day_of_year
+    return era * DAYS_PER_ERA + day_of_era - DAYS_ERA_START_TO_EPOCH
+}
+
+// A data (hora zerada) do dia que fica days dias depois de 1970-01-01. Algoritmo civil_from_days de Hinnant, o inverso de days_from_civil.
+proc civil_from_days(days: int) -> DateTime {
+    let shifted = days + DAYS_ERA_START_TO_EPOCH
+    let era = floor_div(shifted, divisor = DAYS_PER_ERA)
+    let day_of_era = shifted - era * DAYS_PER_ERA
+    let year_of_era = (day_of_era - day_of_era / DAYS_PER_4_YEARS + day_of_era / DAYS_PER_100_YEARS - day_of_era / (DAYS_PER_ERA - 1)) / DAYS_PER_YEAR
+    let day_of_year = day_of_era - (DAYS_PER_YEAR * year_of_era + year_of_era / 4 - year_of_era / 100)
+    let shifted_month = (5 * day_of_year + 2) / 153
+    let day = day_of_year - (153 * shifted_month + 2) / 5 + 1
+    var month = shifted_month - 9
+    var year = year_of_era + era * YEARS_PER_ERA
+    if shifted_month < 10 {
+        month = shifted_month + 3
+    }
+    if month <= 2 {
+        year += 1
+    }
+    return DateTime{year = year, month = month, day = day}
+}
+
+// Segundos desde 1970-01-01T00:00:00Z do dia e da hora de dt (a fracao fica de fora).
+proc unix_seconds(dt: DateTime) -> int {
+    let days = days_from_civil(dt.year, month = dt.month, day = dt.day)
+    return days * SECONDS_PER_DAY + dt.hour * SECONDS_PER_HOUR + dt.minute * SECONDS_PER_MINUTE + dt.second
+}
+
+// DateTime de secs segundos desde 1970 (negativo = antes) mais nanosecond (0..999999999).
+proc from_parts(secs: int, nanosecond: int) -> DateTime {
+    let days = floor_div(secs, divisor = SECONDS_PER_DAY)
+    let seconds_of_day = secs - days * SECONDS_PER_DAY
+    var dt = civil_from_days(days)
+    dt.hour = seconds_of_day / SECONDS_PER_HOUR
+    dt.minute = (seconds_of_day % SECONDS_PER_HOUR) / SECONDS_PER_MINUTE
+    dt.second = seconds_of_day % SECONDS_PER_MINUTE
+    dt.nanosecond = nanosecond
+    return dt
+}
+
+// A hora de dt esta nas faixas (hora 0..23, minuto e segundo 0..59, nanosegundo 0..999999999)?
+proc clock_valid(dt: DateTime) -> bool {
+    if dt.hour < 0 or dt.hour > LAST_HOUR {
+        return false
+    }
+    if dt.minute < 0 or dt.minute > LAST_MINUTE_OR_SECOND {
+        return false
+    }
+    if dt.second < 0 or dt.second > LAST_MINUTE_OR_SECOND {
+        return false
+    }
+    return dt.nanosecond >= 0 and dt.nanosecond < NS_PER_SECOND
+}
+
+// Todos os campos de dt estao nas faixas e o dia existe naquele mes e ano (31 de fevereiro nao existe)?
+proc fields_valid(dt: DateTime) -> bool {
+    if dt.day < 1 or dt.day > days_in_month(dt.year, month = dt.month) {
+        return false
+    }
+    return clock_valid(dt)
+}
+
+// DateTime do instante ns (nanossegundos desde 1970-01-01T00:00:00Z, UTC); negativo e antes de 1970.
+pub proc from_unix_ns(ns: int) -> DateTime {
+    return from_parts(floor_div(ns, divisor = NS_PER_SECOND), nanosecond = floor_mod(ns, divisor = NS_PER_SECOND))
+}
+
+// Nanossegundos desde 1970-01-01T00:00:00Z do instante dt (UTC). TimeError.invalid_field se algum campo esta fora da faixa; out_of_range se nao cabe em 64 bits.
+pub proc to_unix_ns(dt: DateTime) -> int ! TimeError {
+    if not fields_valid(dt) {
+        return TimeError.invalid_field
+    }
+    if dt.year < GUARD_MIN_YEAR or dt.year > GUARD_MAX_YEAR {
+        return TimeError.out_of_range
+    }
+    let secs = unix_seconds(dt)
+    if secs < MIN_SECONDS or secs > MAX_SECONDS {
+        return TimeError.out_of_range
+    }
+    if secs == MAX_SECONDS and dt.nanosecond > MAX_NANOS_AT_MAX {
+        return TimeError.out_of_range
+    }
+    if secs == MIN_SECONDS {
+        if dt.nanosecond < MIN_NANOS_AT_MIN {
+            return TimeError.out_of_range
+        }
+        // O int minimo cai dentro deste segundo e secs * 1000000000 sozinho estouraria.
+        return MIN_INT + (dt.nanosecond - MIN_NANOS_AT_MIN)
+    }
+    return secs * NS_PER_SECOND + dt.nanosecond
+}
+
+// Dia da semana de dt: 0 = domingo, 1 = segunda, ... 6 = sabado.
+pub proc weekday(dt: DateTime) -> int {
+    let days = days_from_civil(dt.year, month = dt.month, day = dt.day)
+    return floor_mod(days + EPOCH_WEEKDAY, divisor = DAYS_PER_WEEK)
+}
+
+// Dia do ano de dt: 1 = 1o de janeiro, 365 (366 em ano bissexto) = 31 de dezembro.
+pub proc day_of_year(dt: DateTime) -> int {
+    let days = days_from_civil(dt.year, month = dt.month, day = dt.day)
+    return days - days_from_civil(dt.year, month = 1, day = 1) + 1
+}
+
+// dt mais seconds segundos (negativo = antes); vira minuto, hora, dia, mes e ano quando passa. A fracao de segundo nao muda.
+pub proc add_seconds(dt: DateTime, seconds: int) -> DateTime {
+    return from_parts(unix_seconds(dt) + seconds, nanosecond = dt.nanosecond)
+}
+
+// dt mais days dias (negativo = antes), na mesma hora do dia.
+pub proc add_days(dt: DateTime, days: int) -> DateTime {
+    return add_seconds(dt, seconds = days * SECONDS_PER_DAY)
+}
+
+// Texto ISO 8601 UTC de dt: "2026-11-13T00:30:05Z"; com nanosecond != 0 entra a fracao ".123", ".123456" ou ".123456789" (3, 6 ou 9 digitos, o menor que mostra tudo) antes do "Z". Anos de 0 a 9999. O texto e DONO do alocador que o chamador passou: delete(texto) so se o alloc foi heap.
+pub proc format_iso(dt: DateTime, alloc: Allocator) -> str {
+    let base = format(f"{dt.year:04}-{dt.month:02}-{dt.day:02}T{dt.hour:02}:{dt.minute:02}:{dt.second:02}", alloc = heap)
+    defer delete(base)
+    let nanos = dt.nanosecond
+    if nanos == 0 {
+        return format(f"{base}Z", alloc = alloc)
+    }
+    if nanos % NS_PER_MS == 0 {
+        let millis = nanos / NS_PER_MS
+        return format(f"{base}.{millis:03}Z", alloc = alloc)
+    }
+    if nanos % NS_PER_US == 0 {
+        let micros = nanos / NS_PER_US
+        return format(f"{base}.{micros:06}Z", alloc = alloc)
+    }
+    return format(f"{base}.{nanos:09}Z", alloc = alloc)
+}
+
+// Inteiro de count digitos a partir de pos em s, ou -1 se faltam bytes ou algum nao e digito.
+proc read_digits(s: str, pos: int, count: int) -> int {
+    let stop = pos + count
+    if stop > len(s) {
+        return -1
+    }
+    var value = 0
+    for i in pos..<stop {
+        let digit = digit_of(s[i])
+        if digit < 0 {
+            return -1
+        }
+        value = value * 10 + digit
+    }
+    return value
+}
+
+// Le "YYYY-MM-DD" do inicio de s para dt; false se o texto nao tem essa forma (as faixas ficam para fields_valid).
+proc read_date(s: str, dt: ^DateTime) -> bool {
+    if len(s) < DATE_END_AT {
+        return false
+    }
+    if s[DATE_DASH_1_AT] != CHAR_DASH or s[DATE_DASH_2_AT] != CHAR_DASH {
+        return false
+    }
+    let year = read_digits(s, pos = DATE_YEAR_AT, count = 4)
+    let month = read_digits(s, pos = DATE_MONTH_AT, count = 2)
+    let day = read_digits(s, pos = DATE_DAY_AT, count = 2)
+    if year < 0 or month < 0 or day < 0 {
+        return false
+    }
+    dt.year = year
+    dt.month = month
+    dt.day = day
+    return true
+}
+
+// Le de 1 a 9 digitos de fracao de segundo a partir de pos, guarda em dt.nanosecond (".5" = 500000000) e devolve a posicao seguinte; -1 se nao ha digito ou passa de 9.
+proc read_fraction(s: str, pos: int, dt: ^DateTime) -> int {
+    var at = pos
+    var nanos = 0
+    var digits = 0
+    while at < len(s) and digit_of(s[at]) >= 0 {
+        if digits == MAX_FRACTION_DIGITS {
+            return -1
+        }
+        nanos = nanos * 10 + digit_of(s[at])
+        digits += 1
+        at += 1
+    }
+    if digits == 0 {
+        return -1
+    }
+    for _step in digits..<MAX_FRACTION_DIGITS {
+        nanos = nanos * 10
+    }
+    dt.nanosecond = nanos
+    return at
+}
+
+// Le o que vem depois de HH:MM:SS: fracao opcional (".123") e "Z" opcional, e nada mais; false se sobra algo ou a fracao e ruim.
+proc read_suffix(s: str, pos: int, dt: ^DateTime) -> bool {
+    var at = pos
+    if at < len(s) {
+        if s[at] == CHAR_DOT {
+            at = read_fraction(s, pos = at + 1, dt = dt)
+            if at < 0 {
+                return false
+            }
+        }
+    }
+    if at < len(s) {
+        if s[at] == CHAR_Z {
+            at += 1
+        }
+    }
+    return at == len(s)
+}
+
+// Le "THH:MM:SS" (mais fracao e "Z" opcionais) de s, que ja tem a data nos 10 primeiros bytes; false se nao tem essa forma.
+proc read_clock(s: str, dt: ^DateTime) -> bool {
+    if len(s) < CLOCK_END_AT {
+        return false
+    }
+    if s[CLOCK_T_AT] != CHAR_T or s[CLOCK_COLON_1_AT] != CHAR_COLON or s[CLOCK_COLON_2_AT] != CHAR_COLON {
+        return false
+    }
+    let hour = read_digits(s, pos = CLOCK_HOUR_AT, count = 2)
+    let minute = read_digits(s, pos = CLOCK_MINUTE_AT, count = 2)
+    let second = read_digits(s, pos = CLOCK_SECOND_AT, count = 2)
+    if hour < 0 or minute < 0 or second < 0 {
+        return false
+    }
+    dt.hour = hour
+    dt.minute = minute
+    dt.second = second
+    return read_suffix(s, pos = CLOCK_END_AT, dt = dt)
+}
+
+// Le ISO 8601 UTC: "YYYY-MM-DD" (meia-noite) ou "YYYY-MM-DDTHH:MM:SS", com fracao (".5" a ".123456789") e "Z" opcionais. Sem fuso (+03:00 e invalido). invalid_text: fora dessa forma ou com byte sobrando; invalid_field: forma certa e valor impossivel (mes 13, 31 de fevereiro, hora 24).
+pub proc parse_iso(s: str) -> DateTime ! TimeError {
+    var dt = DateTime{}
+    if not read_date(s, dt = &dt) {
+        return TimeError.invalid_text
+    }
+    if len(s) > DATE_END_AT and not read_clock(s, dt = &dt) {
+        return TimeError.invalid_text
+    }
+    if not fields_valid(dt) {
+        return TimeError.invalid_field
+    }
+    return dt
+}
+
+// O instante de agora em UTC (hora de parede do sistema, std:os wall_time_ns).
+pub proc now() -> DateTime {
+    return from_unix_ns(os.wall_time_ns())
+}
+
+// Cronometro que comeca agora, sobre o relogio monotonico (nao muda se acertarem a hora do sistema).
+pub proc stopwatch_start() -> Stopwatch {
+    return Stopwatch{start_ns = os.time_ns()}
+}
+
+// Nanossegundos que passaram desde stopwatch_start.
+pub proc elapsed_ns(sw: Stopwatch) -> int {
+    return os.time_ns() - sw.start_ns
+}
+
+// Milissegundos em nanossegundos.
+pub proc ms_to_ns(ms: int) -> int {
+    return ms * NS_PER_MS
+}
+
+// Segundos em nanossegundos.
+pub proc seconds_to_ns(seconds: int) -> int {
+    return seconds * NS_PER_SECOND
+}
+
+// Nanossegundos em milissegundos inteiros (descarta o resto, arredonda para zero).
+pub proc ns_to_ms(ns: int) -> int {
+    return ns / NS_PER_MS
+}

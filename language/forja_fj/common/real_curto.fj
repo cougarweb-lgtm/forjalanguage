@@ -1,0 +1,635 @@
+// common/real_curto.fj - porte de compiler/common/real_curto.c, compiler/common/real_curto.h
+// sha256 de common/real_curto.c: 8dcbe1d121adebf452365fe22512a14344a708dd148e1530835c49657ad0a34a
+// sha256 de common/real_curto.h: 1ae926afda04b92879adbce239f44c2806de5ee92713a94922c185020fd053b8
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.2.0
+// Changelog: 0.2.0 - P-common C1b: corpo real. O C procura o menor P tal que "%.{P-1}e" lido de volta (strtod/strtof) da o mesmo valor; a Forja nao tem snprintf("%.*e") nem strtof,
+//   entao o "%.{P-1}e" sai de digitos decimais EXATOS do valor (inteiro grande em base 1e9, sem libc) arredondados ao mais proximo (empate = par, como a UCRT), e o "volta ao mesmo
+//   valor" e o teste exato "o texto cai no intervalo de arredondamento do valor" (limites = pontos medios para os vizinhos, calculados com a mesma conta exata; a borda conta so se a
+//   mantissa e par, o desempate do strtod/strtof). O resto (ler_cientifico, anexar_posicional, formatar_real_curto) e o do C. NAO usa f-string/Display da Forja (C2F-36 revista).
+//   Mudancas de assinatura internas: RealDigitos.nd/e10 e as const DIGITOS_* em int (sem casts de indice); RealDigitos.dig e [18]u8 (nao ?[18]u8); volta_igual recebe o texto e os
+//   limites; menor_texto_cientifico sem `cap` (o tamanho da fatia); ler_cientifico recebe []u8 (C2F-33) com o NUL como fim. A pub formatar_real_curto nao mudou.
+//   0.1.0 - esqueleto.
+
+// Digitos significativos (sem zeros finais), em ASCII, expoente decimal do 1o digito e sinal.
+struct RealDigitos {
+    dig: [18]u8
+    nd: int
+    e10: int
+    neg: bool
+}
+
+const DIGITOS_MAX_F64: int = 17
+const DIGITOS_MAX_F32: int = 9
+const TEXTO_CIENTIFICO_MAX: int = 40
+
+// Base dos limbs do inteiro grande (9 digitos decimais por limb).
+const BASE_LIMB: u64 = 1000000000
+// 96 limbs = 864 digitos: o maior valor exato (2^-1076 x 55 bits) tem 769 digitos; 2^1024 tem 309.
+const LIMBS_MAX: int = 96
+const DIGITOS_EXATOS_MAX: int = 864
+
+// Digitos EXATOS de um valor (ASCII, sem zeros finais) e expoente decimal do 1o digito. nd = 0 e o valor zero.
+struct Decimal {
+    dig: [864]u8
+    nd: int
+    e10: int
+}
+
+// Valor = m x 2^e2 (m com o bit implicito), assim = o vizinho de baixo e mais perto (potencia de 2 que nao e o menor normal), neg = bit de sinal.
+struct Mantissa {
+    m: u64
+    e2: int
+    assim: bool
+    neg: bool
+}
+
+// Intervalo que arredonda para o valor: lo e hi sao os pontos medios para os vizinhos; par = mantissa par (a borda conta); zero = o valor e +-0.
+struct Limites {
+    lo: Decimal
+    hi: Decimal
+    par: bool
+    zero: bool
+}
+
+// Parte o real em mantissa e expoente binario; e_f32 = o intervalo e o do float (valor e o float alargado a double).
+proc decompor_real(valor: f64, e_f32: bool) -> Mantissa {
+    var r = Mantissa{}
+    let bits = transmute(valor, to = u64)
+    r.neg = (bits >> 63) == 1
+    if e_f32 {
+        let b = transmute(valor as f32, to = u32)
+        let ef = ((b >> 23) & 255) as int
+        let fr = (b & 8388607) as u64
+        r.m = fr
+        r.e2 = -149
+        if ef > 0 {
+            r.m = fr | 8388608
+            r.e2 = ef - 150
+            r.assim = fr == 0 and ef > 1
+        }
+        return r
+    }
+    let ef = ((bits >> 52) & 2047) as int
+    let fr = bits & 4503599627370495
+    r.m = fr
+    r.e2 = -1074
+    if ef > 0 {
+        r.m = fr | 4503599627370496
+        r.e2 = ef - 1075
+        r.assim = fr == 0 and ef > 1
+    }
+    return r
+}
+
+// limbs (nl usados, base 1e9) = limbs x f, com f < 2^32; o vai-um acrescenta limbs.
+proc multiplicar_limbs(limbs: []u64, nl: ^int, f: u64) {
+    var vai: u64 = 0
+    for i in 0..<nl^ {
+        let v = limbs[i] * f + vai
+        limbs[i] = v % BASE_LIMB
+        vai = v / BASE_LIMB
+    }
+    while vai > 0 {
+        limbs[nl^] = vai % BASE_LIMB
+        nl^ += 1
+        vai = vai / BASE_LIMB
+    }
+}
+
+// Escreve os n digitos de v (com zeros a esquerda) em d.dig a partir de d.nd.
+proc escrever_digitos_limb(d: ^Decimal, v: u64, n: int) {
+    var resto = v
+    var k = n - 1
+    while k >= 0 {
+        d.dig[d.nd + k] = (48 + resto % 10) as u8
+        resto = resto / 10
+        k -= 1
+    }
+    d.nd += n
+}
+
+// d = digitos exatos de m x 2^e2: e2 >= 0 multiplica m por 2^e2; e2 < 0 e m x 5^-e2 / 10^-e2 (so desloca a virgula). m = 0 deixa nd = 0.
+proc digitos_exatos(m: u64, e2: int, d: ^Decimal) {
+    d^ = Decimal{}
+    var limbs: [96]u64 = {}
+    var nl = 0
+    var t = m
+    while t > 0 {
+        limbs[nl] = t % BASE_LIMB
+        nl += 1
+        t = t / BASE_LIMB
+    }
+    if nl == 0 {
+        return
+    }
+    var resta = e2
+    var passo = 32
+    var base_f: u64 = 2
+    if e2 < 0 {
+        resta = -e2
+        passo = 13
+        base_f = 5
+    }
+    while resta > 0 {
+        var n = passo
+        if resta < n {
+            n = resta
+        }
+        var f: u64 = 1
+        for _k in 0..<n {
+            f = f * base_f
+        }
+        multiplicar_limbs(limbs[..], &nl, f)
+        resta -= n
+    }
+    var topo = limbs[nl - 1]
+    var ndig_topo = 0
+    while topo > 0 {
+        ndig_topo += 1
+        topo = topo / 10
+    }
+    escrever_digitos_limb(d, limbs[nl - 1], ndig_topo)
+    var i = nl - 2
+    while i >= 0 {
+        escrever_digitos_limb(d, limbs[i], 9)
+        i -= 1
+    }
+    d.e10 = d.nd - 1
+    if e2 < 0 {
+        d.e10 = d.nd - 1 + e2
+    }
+    while d.nd > 1 and d.dig[d.nd - 1] == 48 {
+        d.nd -= 1
+    }
+}
+
+// Limites do intervalo de arredondamento, em unidades de 2^(e2-2): v = 4m, hi = 4m + 2, lo = 4m - 2 (4m - 1 se o vizinho de baixo e mais perto).
+proc montar_limites(base: ^Mantissa, lim: ^Limites) {
+    lim.par = base.m % 2 == 0
+    lim.zero = base.m == 0
+    if lim.zero {
+        return
+    }
+    var menos: u64 = 2
+    if base.assim {
+        menos = 1
+    }
+    digitos_exatos(base.m * 4 - menos, base.e2 - 2, &lim.lo)
+    digitos_exatos(base.m * 4 + 2, base.e2 - 2, &lim.hi)
+}
+
+// Compara dois decimais positivos (digitos sem zeros finais, 1o digito diferente de zero): -1, 0 ou 1.
+proc comparar_decimais(a: []u8, na: int, ea: int, b: ^Decimal) -> i32 {
+    if ea != b.e10 {
+        if ea > b.e10 {
+            return 1
+        }
+        return -1
+    }
+    var n = na
+    if b.nd > n {
+        n = b.nd
+    }
+    for k in 0..<n {
+        var x: u8 = 48
+        if k < na {
+            x = a[k]
+        }
+        var y: u8 = 48
+        if k < b.nd {
+            y = b.dig[k]
+        }
+        if x != y {
+            if x > y {
+                return 1
+            }
+            return -1
+        }
+    }
+    return 0
+}
+
+// O arredondamento de v em p digitos sobe? Resto > meio sobe; exatamente o meio (sem mais digitos) vai para o par (a UCRT).
+proc arredonda_para_cima(v: ^Decimal, p: int) -> bool {
+    let d = v.dig[p]
+    if d > 53 {
+        return true
+    }
+    if d < 53 {
+        return false
+    }
+    if v.nd > p + 1 {
+        return true
+    }
+    return (v.dig[p - 1] - 48) % 2 == 1
+}
+
+// Soma 1 ao ultimo digito de r com vai-um; 99..9 vira 10..0 com o expoente + 1.
+proc subir_digitos(r: ^RealDigitos) {
+    var k = r.nd - 1
+    while k >= 0 {
+        if r.dig[k] == 57 {
+            r.dig[k] = 48
+            k -= 1
+        } else {
+            r.dig[k] += 1
+            return
+        }
+    }
+    r.dig[0] = 49
+    r.e10 += 1
+}
+
+// Os p digitos mais proximos de v (o que o "%.{p-1}e" escreve), sem a forma de texto.
+proc arredondar_digitos(v: ^Decimal, p: int, neg: bool) -> RealDigitos {
+    var r = RealDigitos{neg = neg}
+    for k in 0..<p {
+        r.dig[k] = 48
+        if k < v.nd {
+            r.dig[k] = v.dig[k]
+        }
+    }
+    r.nd = p
+    r.e10 = v.e10
+    if v.nd > p and arredonda_para_cima(v, p) {
+        subir_digitos(&r)
+    }
+    return r
+}
+
+// O "%.{nd-1}e" de r em texto: "[-]d[.ddd]e[+-]xx" (expoente com 2 digitos ou mais) e o NUL.
+proc escrever_texto_cientifico(r: ^RealDigitos, texto: []u8) {
+    var n = 0
+    if r.neg {
+        texto[n] = 45 // '-'
+        n += 1
+    }
+    texto[n] = r.dig[0]
+    n += 1
+    if r.nd > 1 {
+        texto[n] = 46 // '.'
+        n += 1
+        for k in 1..<r.nd {
+            texto[n] = r.dig[k]
+            n += 1
+        }
+    }
+    texto[n] = 101 // 'e'
+    n += 1
+    var e = r.e10
+    texto[n] = 43 // '+'
+    if e < 0 {
+        texto[n] = 45 // '-'
+        e = -e
+    }
+    n += 1
+    if e >= 100 {
+        texto[n] = (48 + e / 100) as u8
+        n += 1
+    }
+    texto[n] = (48 + (e / 10) % 10) as u8
+    texto[n + 1] = (48 + e % 10) as u8
+    texto[n + 2] = 0
+}
+
+// O expoente (atoi: sinal e digitos, para no 1o byte que nao e digito) do texto a partir de ini.
+proc ler_expoente(texto: []u8, ini: int) -> int {
+    var i = ini
+    var neg = false
+    let s = c2f_nul_em_b(texto, i)
+    if s == 43 or s == 45 {
+        neg = s == 45
+        i += 1
+    }
+    var v = 0
+    var c = c2f_nul_em_b(texto, i)
+    while c >= 48 and c <= 57 {
+        v = v * 10 + (c - 48) as int
+        i += 1
+        c = c2f_nul_em_b(texto, i)
+    }
+    if neg {
+        return -v
+    }
+    return v
+}
+
+// C: common/real_curto.c:27
+// O texto "%.{p-1}e" lido de volta e igual ao valor (como f32 ou como f64)? Em vez de strtod/strtof, o texto cai no intervalo exato de arredondamento do valor.
+proc volta_igual(texto: []u8, lim: ^Limites) -> bool {
+    var r = ler_cientifico(texto)
+    if lim.zero or r.dig[0] == 48 {
+        return lim.zero and r.dig[0] == 48
+    }
+    let c_lo = comparar_decimais(r.dig[..], r.nd, r.e10, &lim.lo)
+    let c_hi = comparar_decimais(r.dig[..], r.nd, r.e10, &lim.hi)
+    let acima = c_lo > 0 or (c_lo == 0 and lim.par)
+    let abaixo = c_hi < 0 or (c_hi == 0 and lim.par)
+    return acima and abaixo
+}
+
+// C: common/real_curto.c:33
+// O menor "%.{p-1}e" que volta ao mesmo valor; o de 17 (ou 9) digitos sempre volta. Deixa o texto (com NUL) em 'texto'.
+proc menor_texto_cientifico(valor: f64, f32: bool, texto: []u8) {
+    var base = decompor_real(valor, f32)
+    var exato = Decimal{}
+    digitos_exatos(base.m, base.e2, &exato)
+    var lim = Limites{}
+    montar_limites(&base, &lim)
+    var maximo = DIGITOS_MAX_F64
+    if f32 {
+        maximo = DIGITOS_MAX_F32
+    }
+    for p in 1..=maximo {
+        var r = arredondar_digitos(&exato, p, base.neg)
+        escrever_texto_cientifico(&r, texto)
+        if volta_igual(texto, &lim) {
+            return
+        }
+    }
+}
+
+// C: common/real_curto.c:45
+// "[-]d.ddde[+-]xx" -> digitos sem zeros finais, expoente e sinal.
+proc ler_cientifico(texto: []u8) -> RealDigitos {
+    var r = RealDigitos{}
+    var i = 0
+    if c2f_nul_em_b(texto, i) == 45 { // '-'
+        r.neg = true
+        i += 1
+    }
+    var c = c2f_nul_em_b(texto, i)
+    while c != 0 and c != 101 { // 'e'
+        if c != 46 and r.nd < DIGITOS_MAX_F64 { // '.'
+            r.dig[r.nd] = c
+            r.nd += 1
+        }
+        i += 1
+        c = c2f_nul_em_b(texto, i)
+    }
+    if c == 101 {
+        r.e10 = ler_expoente(texto, i + 1)
+    }
+    while r.nd > 1 and r.dig[r.nd - 1] == 48 {
+        r.nd -= 1
+    }
+    return r
+}
+
+// C: common/real_curto.c:66
+// Posicional para qualquer expoente: "12345.678", "0.0001", "1000000".
+proc anexar_posicional(saida: ^[dynamic]u8, r: ^RealDigitos) {
+    if r.neg {
+        append(saida, item = "-")
+    }
+    if r.e10 >= 0 {
+        for k in 0..=r.e10 {
+            if k < r.nd {
+                append(saida, item = r.dig[k])
+            } else {
+                append(saida, item = "0")
+            }
+        }
+        if r.nd > r.e10 + 1 {
+            append(saida, item = ".")
+            append(saida, items = r.dig[r.e10 + 1..<r.nd])
+        }
+        return
+    }
+    append(saida, item = "0.")
+    for _k in 0..<(-r.e10 - 1) {
+        append(saida, item = "0")
+    }
+    append(saida, items = r.dig[0..<r.nd])
+}
+
+// C: common/real_curto.c:85
+pub proc formatar_real_curto(saida: ^[dynamic]u8, valor: f64, f32: bool) {
+    let bits = transmute(valor, to = u64)
+    if ((bits >> 52) & 2047) == 2047 {
+        if (bits & 4503599627370495) != 0 {
+            append(saida, item = "nan")
+            return
+        }
+        var tern_1: str = "inf"
+        if valor < 0.0 {
+            tern_1 = "-inf"
+        }
+        append(saida, item = tern_1)
+        return
+    }
+    var texto: [40]u8 = {}
+    menor_texto_cientifico(valor, f32, texto[..])
+    var r = ler_cientifico(texto[..])
+    anexar_posicional(saida, &r)
+}
+
+// ---------------------------------------------------------------- testes
+// Oraculo: o real_curto.c original (gcc 16, UCRT) em scratch pc1b\orc\casos.c (tabela) e varre.c (varredura); os esperados abaixo saem dele.
+
+proc real_de_bits64(b: u64) -> f64 {
+    return transmute(b, to = f64)
+}
+
+// O float de bits b, alargado a double (o que o chamador passa com f32 = true).
+proc real_de_bits32(b: u32) -> f64 {
+    return transmute(b, to = f32) as f64
+}
+
+// Os dois textos sao byte a byte iguais?
+proc real_bytes_iguais(a: []u8, b: []u8) -> bool {
+    return len(a) == len(b) and c2f_memcmp(a, b) == 0
+}
+
+// formatar_real_curto(valor, e_f32) escreve exatamente 'esperado'?
+proc teste_texto_igual(valor: f64, e_f32: bool, esperado: str) -> bool {
+    var saida = make([dynamic]u8, alloc = heap)
+    defer delete(saida)
+    formatar_real_curto(&saida, valor, e_f32)
+    return real_bytes_iguais(saida[..], as_bytes(esperado))
+}
+
+// formatar_real_curto(valor, e_f32) escreve cabeca + n zeros + cauda (textos de 300 digitos, sem escrever tudo no fonte)?
+proc teste_texto_zeros(valor: f64, e_f32: bool, cabeca: str, n: int, cauda: str) -> bool {
+    var esperado = make([dynamic]u8, alloc = heap)
+    defer delete(esperado)
+    append(&esperado, item = cabeca)
+    for _k in 0..<n {
+        append(&esperado, item = "0")
+    }
+    append(&esperado, item = cauda)
+    var saida = make([dynamic]u8, alloc = heap)
+    defer delete(saida)
+    formatar_real_curto(&saida, valor, e_f32)
+    return real_bytes_iguais(saida[..], esperado[..])
+}
+
+// 10^j exato em double para j <= 22 (cada produto por 10 e exato).
+proc potencia_dez(j: u64) -> f64 {
+    var p: f64 = 1.0
+    let dez: f64 = 10.0
+    for _k in 0..<j {
+        p = p * dez
+    }
+    return p
+}
+
+// SplitMix64 da amostra i (a mesma conta do varre.c).
+proc sorteio_splitmix(i: u64) -> u64 {
+    var z = wrapping_mul(i + 1, 0x9E3779B97F4A7C15)
+    z = wrapping_mul(z ~ (z >> 30), 0xBF58476D1CE4E5B9)
+    z = wrapping_mul(z ~ (z >> 27), 0x94D049BB133111EB)
+    return z ~ (z >> 31)
+}
+
+// Familias f64 da varredura (cat 0..9): bits aleatorios, potencias de 2, 2^k +-1 ulp, subnormais, n / 10^j e n x 10^j.
+proc amostra_f64(cat: u64, z: u64) -> f64 {
+    let neg = (z >> 62) & 1
+    let e = 1 + (z >> 11) % 2046
+    let n = (z >> 11) % 1000000000
+    let j = (z & 255) % 23
+    if cat < 5 {
+        return real_de_bits64(z)
+    }
+    if cat == 5 {
+        return real_de_bits64((e << 52) | (neg << 63))
+    }
+    if cat == 6 {
+        var b = e << 52
+        if (z & 1) == 1 {
+            b = b + 1
+        } else {
+            b = b - 1
+        }
+        return real_de_bits64(b | (neg << 63))
+    }
+    if cat == 7 {
+        return real_de_bits64((((z >> 12) & 4503599627370495) >> (z & 31)) | (neg << 63))
+    }
+    var v = (n as f64) * potencia_dez(j)
+    if cat == 8 {
+        v = (n as f64) / potencia_dez(j)
+    }
+    return real_de_bits64(transmute(v, to = u64) | (neg << 63))
+}
+
+// Familias f32 da varredura (cat 10..15): bits aleatorios, potencias de 2, 2^k +-1 ulp, subnormais, n / 10^j e inteiro, todas como float alargado.
+proc amostra_f32(cat: u64, z: u64) -> f64 {
+    let neg = ((z >> 62) & 1) as u32
+    let e = 1 + (z >> 11) % 254
+    if cat == 10 {
+        return real_de_bits32((z & 4294967295) as u32)
+    }
+    if cat == 11 {
+        return real_de_bits32((e << 23) as u32 | (neg << 31))
+    }
+    if cat == 12 {
+        var b = e << 23
+        if (z & 1) == 1 {
+            b = b + 1
+        } else {
+            b = b - 1
+        }
+        return real_de_bits32(b as u32 | (neg << 31))
+    }
+    if cat == 13 {
+        return real_de_bits32((((z >> 12) & 8388607) >> (z & 15)) as u32 | (neg << 31))
+    }
+    var f: f32 = (((z >> 11) % 100000000) as f64) as f32
+    if cat == 14 {
+        f = ((((z >> 11) % 1000000000) as f64) / potencia_dez((z & 255) % 23)) as f32
+    }
+    return real_de_bits32(transmute(f, to = u32) | (neg << 31))
+}
+
+// Amostra i da varredura deterministica: o valor (double; os de f32 ja alargados) e se e do tipo f32.
+proc amostra_real(i: u64) -> (valor: f64, e_f32: bool) {
+    let z = sorteio_splitmix(i)
+    let cat = i % 16
+    if cat < 10 {
+        return amostra_f64(cat, z), false
+    }
+    return amostra_f32(cat, z), true
+}
+
+// FNV-1a de 64 bits sobre os bytes de b e o separador de linha.
+proc fnv_texto(h: u64, b: []u8) -> u64 {
+    var r = h
+    for x in b {
+        r = wrapping_mul(r ~ (x as u64), 1099511628211)
+    }
+    return wrapping_mul(r ~ 10, 1099511628211)
+}
+
+test "formatar_real_curto: f64, casos do oraculo (zero, potencias de 2, subnormais, bordas)" {
+    expect(teste_texto_igual(real_de_bits64(0x0000000000000000), false, "0"))
+    expect(teste_texto_igual(real_de_bits64(0x8000000000000000), false, "-0"))
+    expect(teste_texto_igual(real_de_bits64(0x3FF0000000000000), false, "1"))
+    expect(teste_texto_igual(real_de_bits64(0x3FB999999999999A), false, "0.1"))
+    expect(teste_texto_igual(real_de_bits64(0x3FE0000000000000), false, "0.5"))
+    expect(teste_texto_igual(real_de_bits64(0x4415AF1D78B58C40), false, "100000000000000000000"))
+    expect(teste_texto_igual(real_de_bits64(0x3E70000000000000), false, "0.000000059604644775390625"))
+    expect(teste_texto_igual(real_de_bits64(0x3E70000000000001), false, "0.00000005960464477539064"))
+    expect(teste_texto_igual(real_de_bits64(0x3E6FFFFFFFFFFFFF), false, "0.00000005960464477539062"))
+    expect(teste_texto_igual(real_de_bits64(0x40FE240C9FCB0C02), false, "123456.789012"))
+    expect(teste_texto_igual(real_de_bits64(0x44B52D02C7E14AF6), false, "100000000000000000000000"))
+    expect(teste_texto_igual(real_de_bits64(0x4340000000000000), false, "9007199254740992"))
+    expect(teste_texto_igual(real_de_bits64(0x3FD3333333333333), false, "0.3"))
+    expect(teste_texto_igual(real_de_bits64(0x3FD3333333333334), false, "0.30000000000000004"))
+    expect(teste_texto_igual(real_de_bits64(0x3FEFFFFFFFFFFFFF), false, "0.9999999999999999"))
+    expect(teste_texto_igual(real_de_bits64(0x3CA0000000000000), false, "0.00000000000000011102230246251565"))
+    expect(teste_texto_igual(real_de_bits64(0x4024000000000000), false, "10"))
+    expect(teste_texto_igual(real_de_bits64(0xC059000000000000), false, "-100"))
+    expect(teste_texto_igual(real_de_bits64(0x3F50624DD2F1A9FC), false, "0.001"))
+}
+
+test "formatar_real_curto: f64, textos longos (menor subnormal, menor normal, maximo)" {
+    expect(teste_texto_zeros(real_de_bits64(0x0000000000000001), false, "0.", 323, "5"))
+    expect(teste_texto_zeros(real_de_bits64(0x0010000000000000), false, "0.", 307, "22250738585072014"))
+    expect(teste_texto_zeros(real_de_bits64(0x000FFFFFFFFFFFFF), false, "0.", 307, "2225073858507201"))
+    expect(teste_texto_zeros(real_de_bits64(0x7FEFFFFFFFFFFFFF), false, "17976931348623157", 292, ""))
+    expect(teste_texto_zeros(real_de_bits64(0xFFEFFFFFFFFFFFFF), false, "-17976931348623157", 292, ""))
+}
+
+test "formatar_real_curto: nan, inf, -inf" {
+    expect(teste_texto_igual(real_de_bits64(0x7FF8000000000000), false, "nan"))
+    expect(teste_texto_igual(real_de_bits64(0x7FF0000000000000), false, "inf"))
+    expect(teste_texto_igual(real_de_bits64(0xFFF0000000000000), false, "-inf"))
+    expect(teste_texto_igual(real_de_bits32(0x7FC00000), true, "nan"))
+    expect(teste_texto_igual(real_de_bits32(0x7F800000), true, "inf"))
+    expect(teste_texto_igual(real_de_bits32(0xFF800000), true, "-inf"))
+}
+
+test "formatar_real_curto: f32, casos do oraculo" {
+    expect(teste_texto_igual(real_de_bits32(0x00000000), true, "0"))
+    expect(teste_texto_igual(real_de_bits32(0x80000000), true, "-0"))
+    expect(teste_texto_igual(real_de_bits32(0x40400000), true, "3"))
+    expect(teste_texto_igual(real_de_bits32(0x3DCCCCCD), true, "0.1"))
+    expect(teste_texto_igual(real_de_bits32(0x33800000), true, "0.000000059604645"))
+    expect(teste_texto_igual(real_de_bits32(0x4B800000), true, "16777216"))
+    expect(teste_texto_igual(real_de_bits32(0x4B800001), true, "16777218"))
+    expect(teste_texto_igual(real_de_bits32(0x501502F9), true, "10000000000"))
+    expect(teste_texto_igual(real_de_bits32(0x3F800000), true, "1"))
+    expect(teste_texto_igual(real_de_bits32(0x3F7FFFFF), true, "0.99999994"))
+    expect(teste_texto_igual(real_de_bits32(0x34000000), true, "0.00000011920929"))
+    expect(teste_texto_igual(real_de_bits32(0x5F000000), true, "9223372000000000000"))
+    expect(teste_texto_igual(real_de_bits32(0x7E800000), true, "85070590000000000000000000000000000000"))
+    expect(teste_texto_zeros(real_de_bits32(0x00000001), true, "0.", 44, "1"))
+    expect(teste_texto_zeros(real_de_bits32(0x00800000), true, "0.", 37, "11754944"))
+    expect(teste_texto_zeros(real_de_bits32(0x007FFFFF), true, "0.", 37, "11754942"))
+    expect(teste_texto_zeros(real_de_bits32(0x7F7FFFFF), true, "34028235", 31, ""))
+}
+
+test "formatar_real_curto: varredura de 1M valores (f64 e f32) = oraculo C, hash FNV-1a dos textos" {
+    var saida = make([dynamic]u8, alloc = heap)
+    defer delete(saida)
+    var h: u64 = 14695981039346656037
+    for i in (0 as u64)..<(1000000 as u64) {
+        let a, e = amostra_real(i)
+        clear(&saida)
+        formatar_real_curto(&saida, a, e)
+        h = fnv_texto(h, saida[..])
+    }
+    expect(h == 0x7E921A0F9A70E47C)
+}

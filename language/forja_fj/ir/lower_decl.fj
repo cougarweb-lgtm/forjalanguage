@@ -1,0 +1,333 @@
+// ir/lower_decl.fj - porte de compiler/ir/lower_decl.c
+// sha256 de ir/lower_decl.c: 0b4570bac3c83bdf578de0eec90544a1f1de90098010501f7ef34de48e958994
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "common"
+import "frontend"
+import "semantic"
+
+// C2F-1A: LwAlocar tipado das tabelas e dos IR* do programa (zeradas, na arena), como os arena_fatia_<tipo> do pacote.
+proc decl_fatia_valor(a: ^common.Arena, n: int) -> []Valor {
+    var l = make([dynamic]Valor, alloc = common.arena_mem(a), cap = n)
+    for i in 0..<n {
+        append(&l, item = Valor{})
+    }
+    return l[..]
+}
+
+proc decl_fatia_i64(a: ^common.Arena, n: int) -> []i64 {
+    var l = make([dynamic]i64, alloc = common.arena_mem(a), cap = n)
+    for i in 0..<n {
+        append(&l, item = 0)
+    }
+    return l[..]
+}
+
+proc decl_fatia_uniao(a: ^common.Arena, n: int) -> []IrUniao {
+    var l = make([dynamic]IrUniao, alloc = common.arena_mem(a), cap = n)
+    for i in 0..<n {
+        append(&l, item = IrUniao{})
+    }
+    return l[..]
+}
+
+proc decl_fatia_struct(a: ^common.Arena, n: int) -> []IrStruct {
+    var l = make([dynamic]IrStruct, alloc = common.arena_mem(a), cap = n)
+    for i in 0..<n {
+        append(&l, item = IrStruct{})
+    }
+    return l[..]
+}
+
+proc decl_fatia_enum(a: ^common.Arena, n: int) -> []IrEnum {
+    var l = make([dynamic]IrEnum, alloc = common.arena_mem(a), cap = n)
+    for i in 0..<n {
+        append(&l, item = IrEnum{})
+    }
+    return l[..]
+}
+
+proc decl_fatia_campo(a: ^common.Arena, n: int) -> []IrCampo {
+    var l = make([dynamic]IrCampo, alloc = common.arena_mem(a), cap = n)
+    for i in 0..<n {
+        append(&l, item = IrCampo{})
+    }
+    return l[..]
+}
+
+proc decl_fatia_dado(a: ^common.Arena, n: int) -> []IrDado {
+    var l = make([dynamic]IrDado, alloc = common.arena_mem(a), cap = n)
+    for i in 0..<n {
+        append(&l, item = IrDado{})
+    }
+    return l[..]
+}
+
+proc decl_fatia_const(a: ^common.Arena, n: int) -> []IrConst {
+    var l = make([dynamic]IrConst, alloc = common.arena_mem(a), cap = n)
+    for i in 0..<n {
+        append(&l, item = IrConst{})
+    }
+    return l[..]
+}
+
+// C: ir/lower_decl.c:17
+proc alocar_tabelas(c: ^LowerCtx) {
+    let s: ^semantic.Semantica = c.sem as ^semantic.Semantica
+    let prog: ^IrPrograma = c.prog as ^IrPrograma
+    let arena: ^common.Arena = c.arena as ^common.Arena
+    c.procs = frontend.arena_fatia_ptr_decl(arena, s.qtd_proc as int)
+    c.structs = frontend.arena_fatia_ptr_decl(arena, s.qtd_struct as int)
+    c.enums = frontend.arena_fatia_ptr_decl(arena, s.qtd_enum as int)
+    c.consts = frontend.arena_fatia_ptr_decl(arena, s.qtd_const as int)
+    c.const_valor = decl_fatia_valor(arena, s.qtd_const as int)
+    c.const_escalar = common.arena_fatia_bool(arena, s.qtd_const as int)
+    c.dado_idx = common.arena_fatia_i32(arena, s.qtd_const as int)
+    c.const_rdata = lw_const_rdata_ligado()
+    prog.dados = decl_fatia_dado(arena, s.qtd_const as int)
+    prog.ndados = 0
+    prog.nunioes = s.qtd_uniao
+    prog.unioes = decl_fatia_uniao(arena, s.qtd_uniao as int)
+}
+
+// C: ir/lower_decl.c:31 (variantes na ordem do fonte: tag = indice; o TipoId da union ja foi criado pela semantica)
+proc preencher_uniao(c: ^LowerCtx, d: ?^frontend.Decl) {
+    let decl: ^frontend.Decl = d as ^frontend.Decl
+    let s: ^semantic.Semantica = c.sem as ^semantic.Semantica
+    let prog: ^IrPrograma = c.prog as ^IrPrograma
+    let unioes: []IrUniao = prog.unioes or_else {}
+    let saida: ^IrUniao = &unioes[decl.indice as int]
+    saida.nome = decl.chave
+    saida.tipo = semantic.tipo_uniao(&s.tipos, decl.chave)
+    saida.nvariantes = decl.ncampos
+    let campos: []frontend.Campo = decl.campos or_else {}
+    var variantes = common.arena_fatia_u32(c.arena as ^common.Arena, decl.ncampos as int)
+    for k in 0..<decl.ncampos {
+        variantes[k as int] = campos[k as int].tipo.tipo
+    }
+    saida.variantes = variantes
+}
+
+// C: ir/lower_decl.c:41
+proc const_eh_escalar(c: ^LowerCtx, d: ?^frontend.Decl) -> bool {
+    let classe: i32 = semantic.tipo_classe_de(&(c.sem as ^semantic.Semantica).tipos, (d as ^frontend.Decl).tipo.tipo)
+    // L4a: const de tipo proc (endereco de proc, nao um numero dobravel) segue o caminho das compostas: o init e re-lowerado a cada uso
+    return (common.c2f_s2u_32(classe) != (semantic.TC_STRUCT as u32)) and (common.c2f_s2u_32(classe) != (semantic.TC_ARRAY as u32)) and (common.c2f_s2u_32(classe) != (semantic.TC_PROC as u32))
+}
+
+// C: ir/lower_decl.c:47
+proc registrar_const(c: ^LowerCtx, d: ?^frontend.Decl) {
+    let ptr_1: ^frontend.Decl = d as ^frontend.Decl
+    let p_1 = c.consts or_else {}
+    p_1[ptr_1.indice] = d
+    let ptr_2: ^frontend.Decl = d as ^frontend.Decl
+    let p_2 = c.const_escalar or_else {}
+    p_2[ptr_2.indice] = const_eh_escalar(c, d)
+    if (c.const_escalar or_else {})[(d as ^frontend.Decl).indice] {
+        let ptr_3: ^IrPrograma = c.prog as ^IrPrograma
+        ptr_3.nconsts += 1
+    }
+}
+
+// C: ir/lower_decl.c:54
+proc registrar_declaracao(c: ^LowerCtx, d: ?^frontend.Decl) {
+    let sw_1 = (d as ^frontend.Decl).tipo_no as i32
+    if sw_1 == frontend.D_PROC {
+        let ptr_1: ^frontend.Decl = d as ^frontend.Decl
+        let p_1 = c.procs or_else {}
+        p_1[ptr_1.indice] = d
+    } else if sw_1 == frontend.D_STRUCT {
+        let ptr_2: ^frontend.Decl = d as ^frontend.Decl
+        let p_2 = c.structs or_else {}
+        p_2[ptr_2.indice] = d
+    } else if sw_1 == frontend.D_ENUM {
+        let ptr_3: ^frontend.Decl = d as ^frontend.Decl
+        let p_3 = c.enums or_else {}
+        p_3[ptr_3.indice] = d
+    } else if sw_1 == frontend.D_CONST {
+        registrar_const(c, d)
+    } else if sw_1 == frontend.D_UNIAO {
+        preencher_uniao(c, d)
+    } else {
+    }
+}
+
+// C: ir/lower_decl.c:68
+proc preencher_struct(c: ^LowerCtx, saida: ^IrStruct, d: ^frontend.Decl) {
+    saida.nome = d.chave
+    saida.ncampos = d.ncampos
+    saida.opaco = d.externo
+    saida.campos = decl_fatia_campo(c.arena as ^common.Arena, d.ncampos as int)
+    let campos: []IrCampo = saida.campos or_else {}
+    let origem: []frontend.Campo = d.campos or_else {}
+    for k in 0..<d.ncampos {
+        let f: ^frontend.Campo = &origem[k as int]
+        campos[k as int] = IrCampo{nome = f.nome, tipo = f.tipo.tipo, tem_faixa = f.tem_faixa, faixa_min = f.faixa_min, faixa_max = f.faixa_max, faixa_excl = f.faixa_excl}
+    }
+}
+
+// C: ir/lower_decl.c:80
+proc preencher_enum(c: ^LowerCtx, saida: ^IrEnum, d: ^frontend.Decl) {
+    let arena: ^common.Arena = c.arena as ^common.Arena
+    let origem: []frontend.Membro = d.membros or_else {}
+    saida.nome = d.chave
+    saida.nmembros = d.nmembros
+    saida.membros = common.arena_fatia_i32(arena, d.nmembros as int)
+    let membros: []i32 = saida.membros or_else {}
+    for k in 0..<d.nmembros {
+        membros[k as int] = origem[k as int].nome
+    }
+    saida.valores = none
+    if d.op != 1 {
+        return
+    }
+    saida.valores = decl_fatia_i64(arena, d.nmembros as int)
+    let valores: []i64 = saida.valores or_else {}
+    for k in 0..<d.nmembros {
+        valores[k as int] = origem[k as int].valor
+    }
+}
+
+// C: ir/lower_decl.c:92
+proc preencher_structs_e_enums(c: ^LowerCtx) {
+    let prog: ^IrPrograma = c.prog as ^IrPrograma
+    let sem: ^semantic.Semantica = c.sem as ^semantic.Semantica
+    let arena: ^common.Arena = c.arena as ^common.Arena
+    prog.nstructs = sem.qtd_struct
+    prog.nenums = sem.qtd_enum
+    prog.structs = decl_fatia_struct(arena, prog.nstructs as int)
+    prog.enums = decl_fatia_enum(arena, prog.nenums as int)
+    let structs: []IrStruct = prog.structs or_else {}
+    let decls_struct: []?^frontend.Decl = c.structs or_else {}
+    for k in 0..<prog.nstructs {
+        preencher_struct(c, &structs[k as int], decls_struct[k as int] as ^frontend.Decl)
+    }
+    layout_indexar_structs(prog, arena)
+    let enums: []IrEnum = prog.enums or_else {}
+    let decls_enum: []?^frontend.Decl = c.enums or_else {}
+    for k in 0..<prog.nenums {
+        preencher_enum(c, &enums[k as int], decls_enum[k as int] as ^frontend.Decl)
+    }
+}
+
+// C: ir/lower_decl.c:106 (dobra o init da const escalar; init que nao e constante e erro do programa, nao do compilador)
+proc dobrar_constante(c: ^LowerCtx, d: ?^frontend.Decl, saida: ^IrConst) {
+    let decl: ^frontend.Decl = d as ^frontend.Decl
+    var v: Valor = Valor{}
+    if not lw_dobrar(c, decl.init, &v) {
+        let sem: ^semantic.Semantica = c.sem as ^semantic.Semantica
+        let diag: ^common.Diag = sem.diag as ^common.Diag
+        if not diag.tem {
+            let nome: str = common.interner_texto(&(sem.nomes or_else {})[0], decl.nome)
+            let msg = format(f"o inicializador da constante '{nome}' precisa ser um valor constante", alloc = heap)
+            defer delete(msg)
+            _ = common.diag_relatar(diag, common.E0301, (decl.init as ^frontend.Expr).pos, msg)
+        }
+        return
+    }
+    let const_valor: []Valor = c.const_valor or_else {}
+    const_valor[decl.indice as int] = v
+    saida.nome = decl.chave
+    saida.tipo = decl.tipo.tipo
+    saida.valor = v
+}
+
+// C: ir/lower_decl.c:121 (ordem do fonte: uma const pode usar as anteriores; n so avanca nas escalares)
+proc preencher_constantes(c: ^LowerCtx) {
+    let prog: ^IrPrograma = c.prog as ^IrPrograma
+    let sem: ^semantic.Semantica = c.sem as ^semantic.Semantica
+    let diag: ^common.Diag = sem.diag as ^common.Diag
+    prog.consts = decl_fatia_const(c.arena as ^common.Arena, prog.nconsts as int)
+    let consts: []IrConst = prog.consts or_else {}
+    let escalares: []bool = c.const_escalar or_else {}
+    var n: u32 = 0
+    var d: ?^frontend.Decl = (sem.programa as ^frontend.Programa).primeira
+    while d != none and not diag.tem {
+        let decl: ^frontend.Decl = d as ^frontend.Decl
+        if (decl.tipo_no as i32 == frontend.D_CONST) and escalares[decl.indice as int] {
+            dobrar_constante(c, d, &consts[n as int])
+            n += 1
+        }
+        d = decl.prox
+    }
+}
+
+// C: ir/lower_decl.c:130
+proc lw_declaracoes(c: ^LowerCtx) {
+    alocar_tabelas(c)
+    let ptr_1: ^IrPrograma = c.prog as ^IrPrograma
+    ptr_1.nconsts = 0
+    var d: ?^frontend.Decl = ((c.sem as ^semantic.Semantica).programa as ^frontend.Programa).primeira
+    while d != none {
+        registrar_declaracao(c, d)
+        d = (d as ^frontend.Decl).prox
+    }
+    if (c.sem as ^semantic.Semantica).decl_quat != none {
+        registrar_declaracao(c, (c.sem as ^semantic.Semantica).decl_quat)
+    }
+    if (c.sem as ^semantic.Semantica).decl_allocator != none {
+        registrar_declaracao(c, (c.sem as ^semantic.Semantica).decl_allocator)
+    }
+    for k in (0 as u32)..<(c.sem as ^semantic.Semantica).qtd_listas_fixas {
+        registrar_declaracao(c, (c.sem as ^semantic.Semantica).decls_listas_fixas[k])
+    }
+    preencher_structs_e_enums(c)
+    lw_layout_calcular(c)
+    preencher_constantes(c)
+    lw_asserts_de_topo(c)
+}
+
+// Testes dirigidos (valores do C: lower_decl.c). Decl e Campo/Membro montados a mao na arena.
+test "lower_decl: tabelas por contagem" {
+    var a = common.Arena{}
+    var sem = semantic.Semantica{}
+    sem.qtd_proc = 2
+    sem.qtd_struct = 1
+    sem.qtd_enum = 1
+    sem.qtd_const = 3
+    sem.qtd_uniao = 1
+    var prog = IrPrograma{}
+    var c = LowerCtx{}
+    c.sem = &sem
+    c.prog = &prog
+    c.arena = &a
+    alocar_tabelas(&c)
+    expect(len(c.procs or_else {}) == 2 and len(c.const_escalar or_else {}) == 3)
+    expect(prog.nunioes == 1 and len(prog.unioes or_else {}) == 1)
+    common.arena_liberar(&a)
+}
+
+test "lower_decl: struct com campos e enum com valores" {
+    var a = common.Arena{}
+    var c = LowerCtx{}
+    c.arena = &a
+    var lc = make([dynamic]frontend.Campo, alloc = common.arena_mem(&a), cap = 2)
+    append(&lc, item = frontend.Campo{nome = 5, tipo = frontend.TipoRef{tipo = 7}, tem_faixa = true, faixa_min = -3, faixa_max = 9})
+    append(&lc, item = frontend.Campo{nome = 6})
+    var d = frontend.Decl{ncampos = 2, chave = 11, externo = false}
+    d.campos = lc[..]
+    var s = IrStruct{}
+    preencher_struct(&c, &s, &d)
+    expect(s.nome == 11 and s.ncampos == 2 and not s.opaco)
+    let cs: []IrCampo = s.campos or_else {}
+    expect(cs[0].nome == 5 and cs[0].tipo == 7 and cs[0].tem_faixa and cs[0].faixa_min == -3)
+    expect(cs[1].nome == 6 and not cs[1].tem_faixa)
+
+    var ml = make([dynamic]frontend.Membro, alloc = common.arena_mem(&a), cap = 2)
+    append(&ml, item = frontend.Membro{nome = 3, valor = 10})
+    append(&ml, item = frontend.Membro{nome = 4, valor = -2})
+    var de = frontend.Decl{nmembros = 2, chave = 8, op = 1}
+    de.membros = ml[..]
+    var en = IrEnum{}
+    preencher_enum(&c, &en, &de)
+    let mm: []i32 = en.membros or_else {}
+    expect(en.nmembros == 2 and mm[1] == 4)
+    let vv: []i64 = en.valores or_else {}
+    expect(vv[0] == 10 and vv[1] == -2)
+    de.op = 0
+    var sem_valor = IrEnum{}
+    preencher_enum(&c, &sem_valor, &de)
+    expect(sem_valor.valores == none)
+    common.arena_liberar(&a)
+}

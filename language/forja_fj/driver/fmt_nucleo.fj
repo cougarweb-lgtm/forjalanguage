@@ -1,0 +1,718 @@
+// driver/fmt_nucleo.fj - porte de compiler/driver/fmt_nucleo.c, compiler/driver/fmt_nucleo.h
+// sha256 de driver/fmt_nucleo.c: 4454c31cabbe6c9340f921c8f1e2d0005412bcda63ffe535ed33021e20083631
+// sha256 de driver/fmt_nucleo.h: 8312d15bca74851602effc9d27f42b95b236ab7c44a8186406e99103e85c8661
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "std:text"
+import "common"
+import "frontend"
+
+struct FmtDesvio {
+    linha: u32
+    coluna: u32
+    regra: ?str
+}
+
+struct FmtResultado {
+    estado: i32
+    tinha_bom: bool
+    tinha_crlf: bool
+    desvios: u32
+    primeiro: FmtDesvio
+    normalizado: [dynamic]u8
+    formatado: [dynamic]u8
+    edicoes: [dynamic]Edicao
+    regras: [dynamic]str
+    codigo: ?str
+    diag_linha: u32
+    diag_coluna: u32
+    motivo: ?str
+    arena: common.Arena
+}
+
+// A lista das '{' de literal que o parser preenche (Vec chaves do C): num objeto heap porque o parser guarda o endereco dela.
+struct ChavesLiteral {
+    lista: [dynamic]u32
+}
+
+// O estado de uma formatacao. C2F-13/14: tk e a vista da lista dona do fmt_formatar (tk[0..n)); txt e a vista de r.normalizado; r e ^ (nunca NULL).
+struct Ctx {
+    txt: []u8
+    tam: u64
+    tk: []FmtToken
+    n: u64
+    inicios: [dynamic]u32
+    ninicios: u64
+    r: ^FmtResultado
+    pend: bool
+    falhou: bool
+    tudo_apagado: bool
+    pend_ini: u64
+    pend_fim: u64
+    pend_regra: str
+}
+
+struct Vao {
+    g0: u64
+    g1: u64
+    b: u64
+    tem_a: bool
+    tem_b: bool
+    conteudo: bool
+    brancas: u32
+    fim_conteudo: u64
+}
+
+struct PosCrlf {
+    linha: u32
+    coluna: u32
+}
+
+// novo e regra nunca sao NULL no C (literais ou espacos montados): str.
+struct Troca {
+    ini: u64
+    fim: u64
+    novo: str
+    regra: str
+}
+
+struct Seg {
+    s: u64
+    e: u64
+    p: u64
+    termina: bool
+    primeira: bool
+}
+
+const TOKEN_LEN_MAX: i32 = 65535
+const INDENTACAO: i32 = 4
+const FMT_CANONICO: i32 = 0
+const FMT_MUDARIA: i32 = 1
+const FMT_NAO_ANALISADO: i32 = 2
+const SIZE_MAX_U64: u64 = 18446744073709551615
+
+// memchr de um byte em b[de..<ate): o indice do achado, ou `ate` se nao achou (o C devolve NULL; `nl != NULL ? nl - txt : g1`).
+proc achar_byte_na_faixa(b: []u8, de: u64, ate: u64, alvo: u8) -> u64 {
+    var k: u64 = de
+    while k < ate {
+        if b[k] == alvo {
+            return k
+        }
+        k += 1
+    }
+    return ate
+}
+
+// C: driver/fmt_nucleo.c:43
+proc eh_espaco(c: u8) -> bool {
+    return ((c == 32) or (c == 9)) or (c == 13) // ' ' '\t' '\r'
+}
+
+// C: driver/fmt_nucleo.c:54
+// BOM fora e CRLF vira LF. r.normalizado nasce aqui (BufReservarTotal(tam + 1)).
+proc normalizar_2(r: ^FmtResultado, fonte: []u8, tam: u64, crlf: ^PosCrlf) {
+    var i: u64 = 0
+    var linha: u32 = 1
+    var coluna: u32 = 1
+    r.normalizado = make([dynamic]u8, alloc = heap, cap = (tam as int) + 1)
+    if (tam >= 3) and (fonte[0] == 239) and (fonte[1] == 187) and (fonte[2] == 191) { // EF BB BF
+        r.tinha_bom = true
+        i = 3
+    }
+    while i < tam {
+        if (fonte[i] == 13) and ((i + 1) < tam) and (fonte[i + 1] == 10) { // '\r' '\n'
+            if not r.tinha_crlf {
+                r.tinha_crlf = true
+                crlf^ = PosCrlf{linha = linha, coluna = coluna}
+            }
+            i += 1
+            continue
+        }
+        append(&r.normalizado, item = fonte[i])
+        if fonte[i] == 10 { // '\n'
+            coluna = 1
+            linha += 1
+        } else {
+            coluna += 1
+        }
+        i += 1
+    }
+}
+
+// C: driver/fmt_nucleo.c:81
+// codigo e motivo: o C copia para char[8] e char[512] (snprintf); os textos do diagnostico ja cabem (codigo tem 5 bytes, causa tem no maximo 511), o corte fica por garantia.
+proc registrar_erro(r: ^FmtResultado, c: ?^Compilacao) {
+    let cc: ^Compilacao = c as ^Compilacao
+    var d: ^common.Diag = &cc.diag
+    if cc.sem.lista.n > 0 {
+        d = &cc.sem.lista.itens[0]
+    }
+    r.estado = FMT_NAO_ANALISADO
+    if (not d.tem) and (cc.sem.lista.n == 0) {
+        r.motivo = "falha sem diagnostico"
+        return
+    }
+    var codigo: str = common.diag_codigo_texto(d.codigo)
+    if len(codigo) > 7 {
+        codigo = codigo[0..<7]
+    }
+    r.codigo = codigo
+    var motivo: str = d.causa or_else "(null)"
+    if len(motivo) > 511 {
+        motivo = motivo[0..<511]
+    }
+    r.motivo = motivo
+    common.fonte_localizar(&cc.fonte, d.off, &r.diag_linha, &r.diag_coluna)
+}
+
+// C: driver/fmt_nucleo.c:96
+// Indice do token FTEXTO_FIM (1 byte, a aspa) do f"..." que comeca em raw[i]; SIZE_MAX = sem fim ou com pedaco de 65535 bytes ou mais.
+proc achar_fim_do_f_texto(raw: []frontend.Token, i: u64, total: u64) -> u64 {
+    var i_v: u64 = i
+    while i_v < total {
+        if (raw[i_v].len_c as i32) >= TOKEN_LEN_MAX {
+            return SIZE_MAX_U64
+        }
+        if raw[i_v].tipo == (frontend.TK_FTEXTO_FIM as u8) {
+            return i_v
+        }
+        i_v += 1
+    }
+    return SIZE_MAX_U64
+}
+
+// C: driver/fmt_nucleo.c:106
+// Tokens do lexer -> tokens logicos (sem NL e EOF; f"..." inteiro e um). false = token de 65535 bytes ou mais (nao_analisado).
+// C2F-14: o C escrevia em tk[k] (calloc n + 1) e devolvia n em *n; aqui tk e a lista dona (vazia na entrada) e n = len(tk).
+proc montar_tokens(tokens: ^[dynamic]frontend.Token, txt: []u8, tk: ^[dynamic]FmtToken) -> bool {
+    let raw = tokens^[..]
+    let total: u64 = len(raw) as u64
+    var ultimo_fim: u32 = 0
+    var i: u64 = 0
+    while i < total {
+        if (raw[i].tipo == (frontend.TK_NL as u8)) or (raw[i].tipo == (frontend.TK_EOF as u8)) {
+            i += 1
+            continue
+        }
+        if (raw[i].len_c as i32) >= TOKEN_LEN_MAX {
+            return false
+        }
+        var item: FmtToken = FmtToken{ini = raw[i].off, fim = raw[i].off + (raw[i].len_c as u32), tipo = raw[i].tipo}
+        if raw[i].tipo == (frontend.TK_FTEXTO_INICIO as u8) {
+            let fim: u64 = achar_fim_do_f_texto(raw, i, total)
+            if fim == SIZE_MAX_U64 {
+                return false
+            }
+            item.fim = raw[fim].off + 1
+            i = fim
+        }
+        if len(tk^) == 0 {
+            item.primeiro = true
+        } else {
+            let de: u64 = ultimo_fim as u64
+            let ate: u64 = de + ((item.ini - ultimo_fim) as u64)
+            item.primeiro = achar_byte_na_faixa(txt, de, ate, 10) != ate // '\n'
+        }
+        ultimo_fim = item.fim
+        append(tk, item = item)
+        i += 1
+    }
+    return true
+}
+
+// C: driver/fmt_nucleo.c:130
+// Lexer + parser do texto normalizado. true = tokens em tk (lista dona, vazia na entrada). false = r diz por que (nao_analisado).
+// C2F-23: Compilacao e enorme (DiagLista de 100 Diag): heap, como o calloc do C.
+proc ler_tokens(r: ^FmtResultado, tk: ^[dynamic]FmtToken) -> bool {
+    let c = new(Compilacao, alloc = heap)
+    let o = new(Opcoes, alloc = heap) // o endereco entra no heap (c.opcoes): o objeto tem de ser heap
+    defer delete(o)
+    o.comando = "check"
+    o.entrada = "<fmt>"
+    let chaves_dono = new(ChavesLiteral, alloc = heap) // o endereco entra no heap (parser.chaves_literal): o Vec tem de ser heap
+    defer delete(chaves_dono)
+    chaves_dono.lista = make([dynamic]u32, alloc = heap)
+    let texto = from_bytes(r.normalizado[..], alloc = heap)
+    defer delete(texto)
+    _ = common.fonte_adotar_texto(&c.fonte, "<fmt>", texto, len(texto) as u64)
+    iniciar_compilacao(c)
+    c.opcoes = o
+    c.sem.lista.teto = opcoes_max_erros(o)
+    c.parser.chaves_literal = &chaves_dono.lista
+    var ok: bool = analisar_sintaxe(c, false) and (c.sem.lista.n == 0)
+    if not ok {
+        registrar_erro(r, c)
+    } else {
+        ok = montar_tokens(&c.lexer.tokens, r.normalizado[..], tk)
+        if not ok {
+            r.estado = FMT_NAO_ANALISADO
+            r.motivo = "token de 65535 bytes ou mais"
+        } else {
+            fmt_atribuir_papeis(tk^[..], &chaves_dono.lista)
+            fmt_calcular_niveis(tk^[..])
+        }
+    }
+    delete(chaves_dono.lista)
+    liberar_compilacao(c)
+    delete(c)
+    return ok
+}
+
+// C: driver/fmt_nucleo.c:167
+proc localizar(x: ^Ctx, off: u64, linha: ^u32, coluna: ^u32) {
+    var lo: u64 = 0
+    var hi: u64 = x.ninicios
+    while (hi - lo) > 1 {
+        let meio: u64 = (lo + hi) / 2
+        if (x.inicios[meio] as u64) <= off {
+            lo = meio
+        } else {
+            hi = meio
+        }
+    }
+    linha^ = (lo as u32) + 1
+    coluna^ = ((off - (x.inicios[lo] as u64)) as u32) + 1
+}
+
+// C: driver/fmt_nucleo.c:185
+// Uma Edicao; nada se o texto ja e igual. Os textos antigo/novo vao para a arena do resultado (ArenaCopiarTexto).
+proc emitir_faixa(x: ^Ctx, t: Troca) {
+    var ini: u64 = t.ini
+    var fim: u64 = t.fim
+    let nnovo: u64 = len(t.novo) as u64
+    var e: Edicao = Edicao{}
+    var linha_fim: u32 = 0
+    var coluna_fim: u32 = 0
+    if ((fim - ini) == nnovo) and (common.c2f_memcmp(x.txt[ini..<fim], as_bytes(t.novo)) == 0) {
+        return
+    }
+    if (ini == 0) and (fim == x.tam) and (nnovo == 0) {
+        x.tudo_apagado = true
+    }
+    // O motor de edicoes nao enxerga a "linha" vazia depois do ultimo '\n': a faixa que acaba no fim do texto recua 1 byte (apagar "\n\n" ou "\n" do fim da no mesmo texto).
+    if (fim == x.tam) and (ini > 0) and (nnovo == 0) and (x.txt[fim - 1] == 10) and (x.txt[ini - 1] == 10) { // '\n' '\n'
+        ini -= 1
+        fim -= 1
+    }
+    localizar(x, ini, &e.linha, &e.coluna)
+    localizar(x, fim, &linha_fim, &coluna_fim)
+    e.coluna_fim = coluna_fim
+    e.linha_fim = 0
+    if linha_fim > e.linha {
+        e.linha_fim = linha_fim
+    }
+    e.antigo = from_bytes(x.txt[ini..<fim], alloc = common.arena_mem(&x.r.arena))
+    e.novo = from_bytes(as_bytes(t.novo), alloc = common.arena_mem(&x.r.arena))
+    append(&x.r.edicoes, item = e)
+    append(&x.r.regras, item = t.regra)
+}
+
+// C: driver/fmt_nucleo.c:208
+proc descarregar(x: ^Ctx) {
+    if not x.pend {
+        return
+    }
+    x.pend = false
+    emitir_faixa(x, Troca{ini = x.pend_ini, fim = x.pend_fim, novo = "", regra = x.pend_regra})
+}
+
+// C: driver/fmt_nucleo.c:215
+proc emitir_2(x: ^Ctx, t: Troca) {
+    descarregar(x)
+    emitir_faixa(x, t)
+}
+
+// C: driver/fmt_nucleo.c:222
+// Apaga [ini, fim); apagamentos encostados (mesma regra) viram uma Edicao so.
+proc apagar(x: ^Ctx, ini: u64, fim: u64, regra: str) {
+    if ini == fim {
+        return
+    }
+    if x.pend and (x.pend_fim == ini) and (x.pend_regra == regra) {
+        x.pend_fim = fim
+        return
+    }
+    descarregar(x)
+    x.pend = true
+    x.pend_ini = ini
+    x.pend_fim = fim
+    x.pend_regra = regra
+}
+
+// C: driver/fmt_nucleo.c:237
+// A faixa [ini, fim) passa a ter 'nivel' * 4 espacos.
+proc indentar(x: ^Ctx, ini: u64, fim: u64, nivel: u32) {
+    let quer: u64 = (nivel as u64) * (INDENTACAO as u64)
+    if (fim - ini) == quer {
+        var k: u64 = 0
+        while (k < quer) and (x.txt[ini + k] == 32) { // ' '
+            k += 1
+        }
+        if k == quer {
+            return
+        }
+    }
+    let espacos = text.repeat(" ", quer as int, alloc = heap)
+    defer delete(espacos)
+    emitir_2(x, Troca{ini = ini, fim = fim, novo = espacos, regra = "indentacao"})
+}
+
+// C: driver/fmt_nucleo.c:255
+proc char_de_palavra(c: u8) -> bool {
+    return ((((common.c2f_char_i32(c) >= 65) and (common.c2f_char_i32(c) <= 90)) or ((common.c2f_char_i32(c) >= 97) and (common.c2f_char_i32(c) <= 122))) or ((common.c2f_char_i32(c) >= 48) and (common.c2f_char_i32(c) <= 57))) or (c == 95) // 'A' 'Z' 'a' 'z' '0' '9' '_'
+}
+
+// C: driver/fmt_nucleo.c:261
+// Dois tokens da mesma linha: espaco pela tabela; par fora da tabela mantem o vao (0 fica 0, 1 ou mais vira 1); duas palavras nunca ficam coladas.
+proc vao_sem_quebra(x: ^Ctx, v: ^Vao) {
+    let a: ^FmtToken = &x.tk[v.b - 1]
+    let b: ^FmtToken = &x.tk[v.b]
+    var quer: i32 = fmt_espaco_do_par(a.papel as i32, b.papel as i32)
+    if quer < 0 {
+        var tern_1: i32 = 1
+        if v.g1 == v.g0 {
+            tern_1 = 0
+        }
+        quer = tern_1
+    }
+    if ((quer == 0) and char_de_palavra(x.txt[a.fim - 1])) and char_de_palavra(x.txt[b.ini]) {
+        quer = 1
+    }
+    var tern_2: str = ""
+    if quer != 0 {
+        tern_2 = " "
+    }
+    emitir_2(x, Troca{ini = v.g0, fim = v.g1, novo = tern_2, regra = "espaco"})
+}
+
+// C: driver/fmt_nucleo.c:272
+// Tira os espacos do fim de um comentario [p, e) (p aponta o '//').
+proc apara_comentario(x: ^Ctx, p: u64, e: u64) {
+    var q: u64 = e
+    while (q > (p + 2)) and eh_espaco(x.txt[q - 1]) {
+        q -= 1
+    }
+    emitir_2(x, Troca{ini = q, fim = e, novo = "", regra = "espaco_final"})
+}
+
+// C: driver/fmt_nucleo.c:280
+proc nivel_do_comentario(x: ^Ctx, v: ^Vao) -> u32 {
+    if not v.tem_b {
+        return 0
+    }
+    var tern_1: u32 = 0
+    if fmt_papel_fecha(x.tk[v.b].papel as i32) {
+        tern_1 = 1
+    }
+    return x.tk[v.b].nivel + tern_1
+}
+
+// C: driver/fmt_nucleo.c:286
+proc proxima_quebra(x: ^Ctx, s: u64, g1: u64) -> u64 {
+    return achar_byte_na_faixa(x.txt, s, g1, 10) // '\n'
+}
+
+// C: driver/fmt_nucleo.c:294
+// Onde termina a ultima linha de conteudo do vao (a linha do token de antes, ou uma so de comentario), no fim do arquivo: depois dela nada fica.
+proc fim_do_conteudo(x: ^Ctx, g0: u64, g1: u64, tem_a: bool) -> u64 {
+    var fim: u64 = g0
+    var s: u64 = g0
+    var primeira: bool = true
+    while true {
+        let e: u64 = proxima_quebra(x, s, g1)
+        var p: u64 = s
+        let termina: bool = e < g1
+        while (p < e) and eh_espaco(x.txt[p]) {
+            p += 1
+        }
+        if (p < e) or (primeira and tem_a) {
+            var tern_1: u64 = e
+            if termina {
+                tern_1 = e + 1
+            }
+            fim = tern_1
+        }
+        if not termina {
+            return fim
+        }
+        s = e + 1
+        primeira = false
+    }
+    return 0
+}
+
+// C: driver/fmt_nucleo.c:315
+// A ultima linha do vao (sem '\n' no fim): a indentacao do token b, ou, no fim do arquivo, o '\n' que falta.
+proc segmento_final(x: ^Ctx, v: ^Vao, g: ^Seg) {
+    let da_linha_de_a: bool = g.primeira and v.tem_a
+    if v.tem_b {
+        indentar(x, g.s, g.e, x.tk[v.b].nivel)
+        return
+    }
+    if g.p < g.e {
+        if da_linha_de_a {
+            emitir_2(x, Troca{ini = g.s, fim = g.p, novo = " ", regra = "comentario"})
+        } else {
+            indentar(x, g.s, g.p, 0)
+        }
+        apara_comentario(x, g.p, g.e)
+        emitir_2(x, Troca{ini = g.e, fim = g.e, novo = "\n", regra = "fim_de_arquivo"})
+    } else if da_linha_de_a {
+        emitir_2(x, Troca{ini = g.s, fim = g.e, novo = "\n", regra = "fim_de_arquivo"})
+    } else {
+        apagar(x, g.s, g.e, "fim_de_arquivo")
+    }
+}
+
+// C: driver/fmt_nucleo.c:336
+// Uma linha em branco terminada em '\n' ([s, e) e o que vem antes do '\n'): fica no maximo uma, e nenhuma no comeco nem no fim do arquivo.
+proc segmento_em_branco(x: ^Ctx, v: ^Vao, g: ^Seg) {
+    if (not v.tem_b) and (g.s >= v.fim_conteudo) {
+        apagar(x, g.s, g.e + 1, "fim_de_arquivo")
+    } else if not v.conteudo {
+        apagar(x, g.s, g.e + 1, "linha_em_branco")
+    } else if v.brancas == 0 {
+        emitir_2(x, Troca{ini = g.s, fim = g.e, novo = "", regra = "espaco_final"})
+        v.brancas = 1
+    } else {
+        apagar(x, g.s, g.e + 1, "linha_em_branco")
+    }
+}
+
+// C: driver/fmt_nucleo.c:351
+// O segmento e a linha do token a (terminada em '\n'): so o espaco antes do '//' final e o espaco no fim contam.
+proc segmento_da_linha_de_a(x: ^Ctx, v: ^Vao, g: ^Seg) {
+    if g.p < g.e {
+        emitir_2(x, Troca{ini = g.s, fim = g.p, novo = " ", regra = "comentario"})
+        apara_comentario(x, g.p, g.e)
+    } else {
+        emitir_2(x, Troca{ini = g.s, fim = g.e, novo = "", regra = "espaco_final"})
+    }
+    v.conteudo = true
+}
+
+// C: driver/fmt_nucleo.c:363
+// g chega com s, e, termina e primeira; aqui se acha o p.
+proc segmento(x: ^Ctx, v: ^Vao, g: Seg) {
+    var g_v: Seg = g
+    g_v.p = g_v.s
+    while (g_v.p < g_v.e) and eh_espaco(x.txt[g_v.p]) {
+        g_v.p += 1
+    }
+    if (g_v.p < g_v.e) and (not (((x.txt[g_v.p] == 47) and ((g_v.p + 1) < g_v.e)) and (x.txt[g_v.p + 1] == 47))) { // '/' '/'
+        x.falhou = true
+    } else if not g_v.termina {
+        segmento_final(x, v, &g_v)
+    } else if g_v.primeira and v.tem_a {
+        segmento_da_linha_de_a(x, v, &g_v)
+    } else if g_v.p < g_v.e {
+        indentar(x, g_v.s, g_v.p, nivel_do_comentario(x, v))
+        apara_comentario(x, g_v.p, g_v.e)
+        v.conteudo = true
+        v.brancas = 0
+    } else {
+        segmento_em_branco(x, v, &g_v)
+    }
+}
+
+// C: driver/fmt_nucleo.c:384
+// O vao antes do token i (i == n: o que sobra depois do ultimo).
+proc fmt_vao(x: ^Ctx, i: u64) {
+    var v: Vao = Vao{b = i, tem_a = i > 0, tem_b = i < x.n, fim_conteudo = SIZE_MAX_U64}
+    var primeira: bool = true
+    v.g0 = 0
+    if v.tem_a {
+        v.g0 = x.tk[i - 1].fim as u64
+    }
+    v.g1 = x.tam
+    if v.tem_b {
+        v.g1 = x.tk[i].ini as u64
+    }
+    v.conteudo = v.tem_a
+    if (proxima_quebra(x, v.g0, v.g1) == v.g1) and v.tem_b {
+        if v.tem_a {
+            vao_sem_quebra(x, &v)
+        } else {
+            indentar(x, v.g0, v.g1, x.tk[0].nivel)
+        }
+        return
+    }
+    if not v.tem_b {
+        v.fim_conteudo = fim_do_conteudo(x, v.g0, v.g1, v.tem_a)
+    }
+    var s: u64 = v.g0
+    while true {
+        let e: u64 = proxima_quebra(x, s, v.g1)
+        let termina: bool = e < v.g1
+        segmento(x, &v, Seg{s = s, e = e, termina = termina, primeira = primeira})
+        if (not termina) or x.falhou {
+            return
+        }
+        s = e + 1
+        primeira = false
+    }
+}
+
+// C: driver/fmt_nucleo.c:412
+proc marcar_primeiro_desvio(r: ^FmtResultado, crlf: PosCrlf) {
+    if r.tinha_bom {
+        r.primeiro = FmtDesvio{linha = 1, coluna = 1, regra = "bom"}
+        return
+    }
+    if len(r.edicoes) > 0 {
+        r.primeiro = FmtDesvio{linha = r.edicoes[0].linha, coluna = r.edicoes[0].coluna, regra = r.regras[0]}
+    }
+    if r.tinha_crlf and ((len(r.edicoes) == 0) or (crlf.linha < r.edicoes[0].linha) or ((crlf.linha == r.edicoes[0].linha) and (crlf.coluna <= r.edicoes[0].coluna))) {
+        r.primeiro = FmtDesvio{linha = crlf.linha, coluna = crlf.coluna, regra = "fim_de_linha"}
+    }
+}
+
+// C: driver/fmt_nucleo.c:427
+// Aplica as Edicoes ao texto normalizado e fecha o resultado.
+proc concluir_3(x: ^Ctx, crlf: PosCrlf) {
+    let r: ^FmtResultado = x.r
+    var st: i32 = EDICAO_OK
+    if x.falhou {
+        r.estado = FMT_NAO_ANALISADO
+        r.motivo = "texto inesperado entre dois tokens"
+        return
+    }
+    if not x.tudo_apagado {
+        // edicoes_aplicar recebe o texto como str: copia dos bytes do texto normalizado
+        let texto = from_bytes(x.txt, alloc = heap)
+        defer delete(texto)
+        st = edicoes_aplicar(texto, x.tam, r.edicoes[..], &r.formatado, none)
+    }
+    if st != EDICAO_OK {
+        r.estado = FMT_NAO_ANALISADO
+        let motivo: str = edicao_status_texto(st)
+        r.motivo = format(f"edicao interna invalida: {motivo}", alloc = common.arena_mem(&r.arena))
+        return
+    }
+    var bom: u32 = 0
+    if r.tinha_bom {
+        bom = 1
+    }
+    var crlf_n: u32 = 0
+    if r.tinha_crlf {
+        crlf_n = 1
+    }
+    r.desvios = (len(r.edicoes) as u32) + bom + crlf_n
+    r.estado = FMT_MUDARIA
+    if r.desvios == 0 {
+        r.estado = FMT_CANONICO
+    }
+    marcar_primeiro_desvio(r, crlf)
+}
+
+// C: driver/fmt_nucleo.c:449
+// inicios[k] = offset do 1o byte da linha k + 1.
+proc montar_inicios(x: ^Ctx) {
+    x.inicios = make([dynamic]u32, alloc = heap)
+    append(&x.inicios, item = 0 as u32)
+    var i: u64 = 0
+    while i < x.tam {
+        if x.txt[i] == 10 { // '\n'
+            append(&x.inicios, item = (i + 1) as u32)
+        }
+        i += 1
+    }
+    x.ninicios = len(x.inicios) as u64
+}
+
+// C: driver/fmt_nucleo.c:461
+// C2F-14: edicoes, regras e formatado nascem aqui (o C zera a struct e o Vec/Buf aceita push; o [dynamic] zerado da Forja nao). codigo e motivo comecam "" (char[] zerado).
+proc fmt_formatar(fonte: ?str, tam: u64, r: ^FmtResultado) {
+    var crlf: PosCrlf = PosCrlf{}
+    var x: Ctx = Ctx{r = r}
+    r.edicoes = make([dynamic]Edicao, alloc = heap)
+    r.regras = make([dynamic]str, alloc = heap)
+    r.formatado = make([dynamic]u8, alloc = heap)
+    r.codigo = ""
+    r.motivo = ""
+    normalizar_2(r, as_bytes(fonte or_else ""), tam, &crlf)
+    x.txt = r.normalizado[..]
+    x.tam = len(r.normalizado) as u64
+    var tks = make([dynamic]FmtToken, alloc = heap)
+    if ler_tokens(r, &tks) {
+        x.tk = tks[..]
+        x.n = len(tks) as u64
+        montar_inicios(&x)
+        var i: u64 = 0
+        while (i <= x.n) and (not x.falhou) {
+            fmt_vao(&x, i)
+            i += 1
+        }
+        descarregar(&x)
+        concluir_3(&x, crlf)
+    }
+    delete(tks)
+    delete(x.inicios)
+}
+
+// C: driver/fmt_nucleo.c:481
+proc fmt_resultado_liberar(r: ^FmtResultado) {
+    delete(r.normalizado)
+    delete(r.formatado)
+    delete(r.edicoes)
+    delete(r.regras)
+    common.arena_liberar(&r.arena)
+}
+
+// Os valores esperados saem do oraculo C (forja fmt --stdin --regras sobre a mesma entrada).
+test "fmt_formatar: espaco, indentacao, linha em branco e fim de arquivo" {
+    var r: FmtResultado = FmtResultado{}
+    let fonte = "proc main() {   \n        let x = 1+2  \n\n\n\n\tlet y=x\n}"
+    fmt_formatar(fonte, len(fonte) as u64, &r)
+    expect(r.estado == FMT_MUDARIA)
+    expect(r.desvios == 10)
+    expect(r.primeiro.linha == 1)
+    expect(r.primeiro.coluna == 14)
+    expect((r.primeiro.regra or_else "") == "espaco_final")
+    let formatado = from_bytes(r.formatado[..], alloc = heap)
+    expect(formatado == "proc main() {\n    let x = 1 + 2\n\n    let y = x\n}\n")
+    delete(formatado)
+    fmt_resultado_liberar(&r)
+}
+
+test "fmt_formatar: BOM e CRLF" {
+    var r: FmtResultado = FmtResultado{}
+    var b = make([dynamic]u8, alloc = heap)
+    append(&b, item = 239 as u8)
+    append(&b, item = 187 as u8)
+    append(&b, item = 191 as u8)
+    append(&b, item = "proc main() {\r\n    let x = 1\r\n}\r\n")
+    let fonte = from_bytes(b[..], alloc = heap)
+    fmt_formatar(fonte, len(fonte) as u64, &r)
+    expect(r.estado == FMT_MUDARIA)
+    expect(r.tinha_bom)
+    expect(r.tinha_crlf)
+    expect(r.desvios == 2)
+    expect((r.primeiro.regra or_else "") == "bom")
+    let formatado = from_bytes(r.formatado[..], alloc = heap)
+    expect(formatado == "proc main() {\n    let x = 1\n}\n")
+    delete(formatado)
+    delete(fonte)
+    delete(b)
+    fmt_resultado_liberar(&r)
+}
+
+test "fmt_formatar: canonico e erro de sintaxe" {
+    var r: FmtResultado = FmtResultado{}
+    let canonico = "proc main() {\n    let x = 1\n}\n"
+    fmt_formatar(canonico, len(canonico) as u64, &r)
+    expect(r.estado == FMT_CANONICO)
+    expect(r.desvios == 0)
+    expect(len(r.edicoes) == 0)
+    fmt_resultado_liberar(&r)
+    var r2: FmtResultado = FmtResultado{}
+    let ruim = "proc main( {"
+    fmt_formatar(ruim, len(ruim) as u64, &r2)
+    expect(r2.estado == FMT_NAO_ANALISADO)
+    expect((r2.codigo or_else "") == "E0101")
+    expect(r2.diag_linha == 1)
+    expect(r2.diag_coluna == 12)
+    expect((r2.motivo or_else "") == "token inesperado '{'; esperado nome do parametro")
+    fmt_resultado_liberar(&r2)
+}

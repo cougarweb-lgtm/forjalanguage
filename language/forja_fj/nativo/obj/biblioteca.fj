@@ -1,0 +1,511 @@
+// nativo/obj/biblioteca.fj - porte de compiler/nativo/obj/biblioteca.c, compiler/nativo/obj/biblioteca.h
+// sha256 de nativo/obj/biblioteca.c: ccd78389d22cc5ef5d25133c95c2a91f416959499e6b6796bcafcfc24d2317ae
+// sha256 de nativo/obj/biblioteca.h: 66bdcc07570e896071263501d13d22c4271f01f0f8f8672b4580b35dc9c6303f
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.2.0
+
+import "common"
+import "std:file"
+import "std:os"
+
+pub struct BibliotecaBusca {
+    pastas: ?[]str
+    qtd_pastas: u32
+    elf: bool
+    semente: ?str
+}
+
+struct BibliotecaAchada {
+    caminho: ?str
+    tipo: i32
+    procurei_em: [dynamic]u8
+}
+
+// prefixo e sufixo sao sempre texto (a tabela do C nao tem NULL): str, nao ?str
+struct BibCandidato {
+    prefixo: str
+    sufixo: str
+}
+
+struct BibMembros {
+    visto: bool
+    primeiro: i32
+    tem_curto: bool
+}
+
+const MEMBRO_OBJETO: i32 = 0
+const MEMBRO_IDATA: i32 = 1
+const MEMBRO_IMPORT_CURTO: i32 = 2
+const MEMBRO_OBJETO_GL: i32 = 3
+const BIB_DLL: i32 = 0
+const BIB_EXE: i32 = 1
+const BIB_IMPORT_MSVC: i32 = 2
+const BIB_IMPORT_GNU: i32 = 3
+const BIB_ESTATICA_AR: i32 = 4
+const BIB_OBJETO_GL: i32 = 5
+const BIB_DESCONHECIDO: i32 = 6
+const BIB_ELF_DINAMICO: i32 = 7
+pub const BIBLIOTECA_TAM_CAMINHO: i32 = 620
+const BIB_TAM_PREFIXO: u32 = 65536
+const BIB_ASSINATURA_AR: str = "!<arch>\n"
+const BIB_TAM_ASSINATURA_AR: u32 = 8
+const BIB_TAM_CABECALHO_MEMBRO: u32 = 60
+const BIB_OFF_MEMBRO_TAMANHO: u32 = 48
+const BIB_TAM_CAMPO_TAMANHO: u32 = 10
+const BIB_MAX_MEMBROS: u32 = 8
+const BIB_TAM_AMOSTRA_MEMBRO: u32 = 1024
+const BIB_TAM_COFF: u32 = 20
+const BIB_TAM_SECAO_COFF: u32 = 40
+const BIB_PREFIXO_IDATA: str = ".idata$"
+const BIB_OFF_PE_CARACTERISTICAS: u32 = 22
+const BIB_CARAC_DLL: u32 = 8192
+const BIB_OFF_LFANEW: u32 = 60
+const BIB_TAM_CABECALHO_IMPORT: u32 = 20
+const BIB_ASSINATURA_ANONIMA: u32 = 65535
+const BIB_VERSAO_IMPORT_CURTO: u32 = 0
+const BIB_VERSAO_OBJETO_GL: u32 = 1
+const BIB_NOME_SISTEMA: str = "ucrtbase"
+const BIB_PASTA_SISTEMA_PADRAO: str = "C:\\Windows"
+const BIB_PASTA_LINUX: str = "\\vendor\\linux"
+const BIB_TAM_MAGICA_ELF: u32 = 4
+// C: BIB_MAGICA_ELF "\x7f" "ELF": os 4 bytes sao conferidos a mao em bib_tipo_de_bytes (sem escape hex na Forja)
+const BIB_ELF_OFF_TIPO: u32 = 16
+const BIB_ELF_ET_DYN: u32 = 3
+const BIB_SEMENTE_LIBC: str = "\\libc.a"
+
+// Pre e sufixo de cada candidato, na ordem do ld.
+const BIB_CANDIDATOS: [7]BibCandidato = {
+    BibCandidato{prefixo = "lib", sufixo = ".dll.a"},
+    BibCandidato{prefixo = "", sufixo = ".dll.a"},
+    BibCandidato{prefixo = "lib", sufixo = ".a"},
+    BibCandidato{prefixo = "", sufixo = ".lib"},
+    BibCandidato{prefixo = "lib", sufixo = ".lib"},
+    BibCandidato{prefixo = "lib", sufixo = ".dll"},
+    BibCandidato{prefixo = "", sufixo = ".dll"},
+}
+
+// Alvo Linux (M5b P36): a estatica do vendor\linux vem antes; o .so e achado so para ser recusado (X0003).
+const BIB_CANDIDATOS_LINUX: [2]BibCandidato = {
+    BibCandidato{prefixo = "lib", sufixo = ".a"},
+    BibCandidato{prefixo = "lib", sufixo = ".so"},
+}
+
+// O que o primeiro membro (ou um membro seguinte) de um ar diz sobre a biblioteca.
+// C: nativo/obj/biblioteca.c:62
+// C2F-INDECIDIVEL: p
+proc bib_le16(p: []u8) -> u16 {
+    return common.c2f_trunc_u16(common.c2f_s2u_64(common.c2f_ou_i32(p[0] as i32, common.c2f_shl_i32(p[1] as i32, 8)) as i64))
+}
+
+// C: nativo/obj/biblioteca.c:67
+// C2F-INDECIDIVEL: p
+proc bib_le32(p: []u8) -> u32 {
+    return (((p[0] as u32) | ((p[1] as u32) << 8)) | ((p[2] as u32) << 16)) | ((p[3] as u32) << 24)
+}
+
+// C: nativo/obj/biblioteca.c:74
+// C2F-13: b fundido em n (len)
+proc bib_tipo_pe(b: []u8) -> i32 {
+    let n: int = len(b)
+    if n < (BIB_OFF_LFANEW as int) + 4 {
+        return BIB_DESCONHECIDO
+    }
+    let pe: int = bib_le32(b[(BIB_OFF_LFANEW as int)..<((BIB_OFF_LFANEW as int) + 4)]) as int
+    if (pe > n) or (n - pe < (BIB_OFF_PE_CARACTERISTICAS as int) + 2) {
+        return BIB_DESCONHECIDO
+    }
+    // "PE\0\0"
+    if (b[pe] != 80) or (b[pe + 1] != 69) or (b[pe + 2] != 0) or (b[pe + 3] != 0) {
+        return BIB_DESCONHECIDO
+    }
+    let car: int = pe + (BIB_OFF_PE_CARACTERISTICAS as int)
+    if ((bib_le16(b[car..<(car + 2)]) as u32) & BIB_CARAC_DLL) != 0 {
+        return BIB_DLL
+    }
+    return BIB_EXE
+}
+
+// Objeto COFF com alguma secao ".idata$..." (cabecalho e tabela de secoes inteiros em b[0..n)).
+// C: nativo/obj/biblioteca.c:85
+// C2F-13: b fundido em n (len)
+proc bib_tem_idata(b: []u8) -> bool {
+    let n: int = len(b)
+    if n < (BIB_TAM_COFF as int) {
+        return false
+    }
+    // offset 16 = SizeOfOptionalHeader; offset 2 = NumberOfSections (cabecalho COFF)
+    let secoes: int = (BIB_TAM_COFF as int) + (bib_le16(b[16..<18]) as int)
+    let qtd: int = bib_le16(b[2..<4]) as int
+    let tam_prefixo: int = len(BIB_PREFIXO_IDATA)
+    var i: int = 0
+    while (i < qtd) and (secoes + ((i + 1) * (BIB_TAM_SECAO_COFF as int)) <= n) {
+        let ini: int = secoes + (i * (BIB_TAM_SECAO_COFF as int))
+        if common.c2f_memcmp(b[ini..<(ini + tam_prefixo)], as_bytes(BIB_PREFIXO_IDATA)) == 0 {
+            return true
+        }
+        i += 1
+    }
+    return false
+}
+
+// Os bytes comecam com o cabecalho de objeto anonimo (Sig1 0, Sig2 0xFFFF): import curto ou objeto /GL.
+// C: nativo/obj/biblioteca.c:98
+// C2F-13: b fundido em n (len)
+proc bib_tem_cabecalho_anonimo(b: []u8) -> bool {
+    if len(b) < (BIB_TAM_CABECALHO_IMPORT as int) {
+        return false
+    }
+    return (bib_le16(b[0..<2]) == 0) and ((bib_le16(b[2..<4]) as u32) == BIB_ASSINATURA_ANONIMA)
+}
+
+// Classe de um membro de cabecalho anonimo pela Version: 0 import curto, 1 objeto /GL.
+// C: nativo/obj/biblioteca.c:104
+proc bib_classe_anonima(b: []u8) -> i32 {
+    let versao: u32 = bib_le16(b[4..<6]) as u32
+    if versao == BIB_VERSAO_IMPORT_CURTO {
+        return MEMBRO_IMPORT_CURTO
+    }
+    if versao == BIB_VERSAO_OBJETO_GL {
+        return MEMBRO_OBJETO_GL
+    }
+    return MEMBRO_OBJETO
+}
+
+// Classe de um membro pelos primeiros bytes: cabecalho de import curto (Sig1 0, Sig2 0xFFFF, Version 0), objeto anonimo /GL (Version 1) ou COFF.
+// C: nativo/obj/biblioteca.c:113
+// b e a amostra lida (len = n bytes de fato lidos, como o n do fread no C)
+proc bib_classe_membro(b: []u8) -> i32 {
+    if bib_tem_cabecalho_anonimo(b) {
+        return bib_classe_anonima(b)
+    }
+    if bib_tem_idata(b) {
+        return MEMBRO_IDATA
+    }
+    return MEMBRO_OBJETO
+}
+
+// Tamanho do membro (10 digitos decimais, a direita com espacos).
+// C: nativo/obj/biblioteca.c:121
+// C2F-INDECIDIVEL: cab
+proc bib_tamanho_membro(cab: []u8) -> u64 {
+    var tam: u64 = 0
+    var i: u64 = 0
+    while ((i < (BIB_TAM_CAMPO_TAMANHO as u64)) and ((cab[(BIB_OFF_MEMBRO_TAMANHO as u64) + i] as i32) >= 48)) and ((cab[(BIB_OFF_MEMBRO_TAMANHO as u64) + i] as i32) <= 57) {
+        tam = (tam * 10) + common.c2f_s2u_64(((cab[(BIB_OFF_MEMBRO_TAMANHO as u64) + i] as i32) - 48) as i64) // '0'
+        i += 1 // '0' '9'
+    }
+    return tam
+}
+
+// "/" (indice de simbolos) e "//" (nomes longos) nao sao objetos; "/123" e membro comum de nome longo.
+// C: nativo/obj/biblioteca.c:130
+// C2F-INDECIDIVEL: cab
+proc bib_membro_especial(cab: []u8) -> bool {
+    return (cab[0] == 47) and ((cab[1] == 32) or ((cab[1] == 47) and (cab[2] == 32))) // '/' ' ' '/' ' '
+}
+
+// C: nativo/obj/biblioteca.c:142
+proc bib_anotar_membro(m: ^BibMembros, classe: i32) {
+    if not m.visto {
+        m.visto = true
+        m.primeiro = classe
+    }
+    m.tem_curto = (common.c2f_b2i32(m.tem_curto) != 0) or (common.c2f_s2u_32(classe) == (MEMBRO_IMPORT_CURTO as u32))
+}
+
+// C: nativo/obj/biblioteca.c:151
+proc bib_eh_import_msvc(m: ^BibMembros) -> bool {
+    return (common.c2f_s2u_32(m.primeiro) == (MEMBRO_IMPORT_CURTO as u32)) or ((common.c2f_s2u_32(m.primeiro) == (MEMBRO_IDATA as u32)) and (common.c2f_b2i32(m.tem_curto) != 0))
+}
+
+// C: nativo/obj/biblioteca.c:156
+proc bib_tipo_do_membro(m: ^BibMembros) -> i32 {
+    if not m.visto {
+        return BIB_ESTATICA_AR
+    }
+    if common.c2f_s2u_32(m.primeiro) == (MEMBRO_OBJETO_GL as u32) {
+        return BIB_OBJETO_GL
+    }
+    if bib_eh_import_msvc(m) {
+        return BIB_IMPORT_MSVC
+    }
+    var tern_1: i32 = BIB_ESTATICA_AR
+    if common.c2f_s2u_32(m.primeiro) == (MEMBRO_IDATA as u32) {
+        tern_1 = BIB_IMPORT_GNU
+    }
+    return tern_1
+}
+
+// fread do C: le ate len(destino) bytes e para so no fim do arquivo ou no erro (devolve o total lido)
+proc bib_ler_completo(arq: ^file.File, destino: []u8) -> int {
+    var total: int = 0
+    while total < len(destino) {
+        let lidos: int = file.read(arq, destino[total..<len(destino)]) or_else -1
+        if lidos <= 0 {
+            break
+        }
+        total += lidos
+    }
+    return total
+}
+
+// Os primeiros membros do ar, lidos do arquivo com salto de corpo: o indice de simbolos do MSVC passa de 64 KiB (python313.lib: 88 KB), entao o prefixo nao basta.
+// De cada membro de objeto so os primeiros BIB_TAM_AMOSTRA_MEMBRO bytes (cabecalho COFF, tabela de secoes e o cabecalho de import curto).
+// C: nativo/obj/biblioteca.c:169
+// arq: o arquivo ja aberto pelo chamador (o C passa FILE*); o chamador fecha
+proc bib_tipo_ar_arquivo(arq: ^file.File) -> i32 {
+    var m = BibMembros{visto = false, primeiro = 0, tem_curto = false}
+    var pos: i64 = BIB_TAM_ASSINATURA_AR as i64
+    var k: u32 = 0
+    while k < BIB_MAX_MEMBROS {
+        let posicao: i64 = file.seek(arq, pos, file.SeekFrom.start) or_else -1
+        if posicao != pos {
+            break
+        }
+        var cab: [60]u8 = {}
+        if bib_ler_completo(arq, cab[..]) != (BIB_TAM_CABECALHO_MEMBRO as int) {
+            break
+        }
+        let tam: u64 = bib_tamanho_membro(cab[..])
+        if not bib_membro_especial(cab[..]) {
+            var amostra: [1024]u8 = {}
+            var tam_amostra: int = BIB_TAM_AMOSTRA_MEMBRO as int
+            if tam < (BIB_TAM_AMOSTRA_MEMBRO as u64) {
+                tam_amostra = tam as int
+            }
+            let lidos: int = bib_ler_completo(arq, amostra[0..<tam_amostra])
+            bib_anotar_membro(&m, bib_classe_membro(amostra[0..<lidos]))
+        }
+        pos += (BIB_TAM_CABECALHO_MEMBRO as i64) + (tam as i64) + ((tam & 1) as i64)
+        k += 1
+    }
+    return bib_tipo_do_membro(&m)
+}
+
+// ELF (M5b P36): ET_DYN (e_type 3 no offset 16) e .so, que o backend nao liga; o resto (objeto, executavel) nao e biblioteca aceita.
+// C: nativo/obj/biblioteca.c:186
+// C2F-13: b fundido em n (len)
+proc bib_tipo_elf(b: []u8) -> i32 {
+    if len(b) < (BIB_ELF_OFF_TIPO as int) + 2 {
+        return BIB_DESCONHECIDO
+    }
+    let tipo: u32 = bib_le16(b[(BIB_ELF_OFF_TIPO as int)..<((BIB_ELF_OFF_TIPO as int) + 2)]) as u32
+    if tipo == BIB_ELF_ET_DYN {
+        return BIB_ELF_DINAMICO
+    }
+    return BIB_DESCONHECIDO
+}
+
+// C: nativo/obj/biblioteca.c:193
+// C2F-13: b fundido em n (len)
+proc bib_tipo_de_bytes(b: []u8) -> i32 {
+    // "MZ"
+    if (len(b) >= 2) and (b[0] == 77) and (b[1] == 90) {
+        return bib_tipo_pe(b)
+    }
+    // "\x7fELF"
+    if (len(b) >= (BIB_TAM_MAGICA_ELF as int)) and (b[0] == 127) and (b[1] == 69) and (b[2] == 76) and (b[3] == 70) {
+        return bib_tipo_elf(b)
+    }
+    return BIB_DESCONHECIDO
+}
+
+// C: nativo/obj/biblioteca.c:202
+// C2F-13: b fundido em n (len)
+proc bib_eh_ar(b: []u8) -> bool {
+    if len(b) < (BIB_TAM_ASSINATURA_AR as int) {
+        return false
+    }
+    return common.c2f_memcmp(b[0..<(BIB_TAM_ASSINATURA_AR as int)], as_bytes(BIB_ASSINATURA_AR)) == 0
+}
+
+// C: snprintf(caminho, BIBLIOTECA_TAM_CAMINHO, "%s", ...) corta em 619 bytes; a copia vai para o frame (o achado guarda a visao sem dono)
+proc bib_caber(texto: str) -> str {
+    let bytes_texto = as_bytes(texto)
+    let tam: int = min(len(bytes_texto), (BIBLIOTECA_TAM_CAMINHO as int) - 1)
+    return from_bytes(bytes_texto[0..<tam], alloc = frame)
+}
+
+// ---------- busca ----------
+
+// Tenta o candidato: registra em procurei_em; se o arquivo abre, guarda caminho e tipo (lidos os primeiros 64 KiB).
+// C: nativo/obj/biblioteca.c:210
+proc bib_tentar(candidato: str, achada: ^BibliotecaAchada) -> bool {
+    append(&achada.procurei_em, items = as_bytes(candidato))
+    append(&achada.procurei_em, items = as_bytes("\n"))
+    switch r in file.open(candidato, file.OpenMode.read) {
+    case file.File:
+        var arq: file.File = r
+        defer file.close(&arq)
+        return bib_tentar_aberto(&arq, candidato, achada)
+    case file.FileError:
+        return false
+    }
+    return false
+}
+
+// o corpo de bib_tentar depois do fopen (o C faz tudo na mesma funcao; separado so para o switch do open)
+proc bib_tentar_aberto(arq: ^file.File, candidato: str, achada: ^BibliotecaAchada) -> bool {
+    var prefixo: [65536]u8 = {}
+    let n: int = bib_ler_completo(arq, prefixo[..])
+    achada.caminho = bib_caber(candidato)
+    if bib_eh_ar(prefixo[0..<n]) {
+        achada.tipo = bib_tipo_ar_arquivo(arq)
+    } else {
+        achada.tipo = bib_tipo_de_bytes(prefixo[0..<n])
+    }
+    return true
+}
+
+// pasta + separador (se a pasta ainda nao termina em um) + prefixo + link + sufixo; none se nao couber.
+// C: nativo/obj/biblioteca.c:226
+proc bib_montar(pasta: str, link: str, c: BibCandidato) -> ?str {
+    var sep: str = ""
+    let bytes_pasta = as_bytes(pasta)
+    if len(bytes_pasta) > 0 {
+        let ultimo: u8 = bytes_pasta[len(bytes_pasta) - 1]
+        // '\\' e '/'
+        if (ultimo != 92) and (ultimo != 47) {
+            sep = "\\"
+        }
+    }
+    let texto = format(f"{pasta}{sep}{c.prefixo}{link}{c.sufixo}", alloc = frame)
+    if (len(texto) == 0) or (len(texto) >= (BIBLIOTECA_TAM_CAMINHO as int)) {
+        return none
+    }
+    return texto
+}
+
+// C: nativo/obj/biblioteca.c:234
+proc bib_achar_na_pasta(pasta: str, link: str, achada: ^BibliotecaAchada) -> bool {
+    for i in 0..<len(BIB_CANDIDATOS) {
+        let candidato = bib_montar(pasta, link, BIB_CANDIDATOS[i]) or_else ""
+        if (len(candidato) > 0) and bib_tentar(candidato, achada) {
+            return true
+        }
+    }
+    return false
+}
+
+// %SystemRoot%\System32\<link>.dll (so a .dll: o sistema nao traz import library).
+// C: nativo/obj/biblioteca.c:245
+proc bib_achar_no_sistema(link: str, achada: ^BibliotecaAchada) -> bool {
+    let raiz: str = os.env("SystemRoot") or_else ""
+    var raiz_usada: str = BIB_PASTA_SISTEMA_PADRAO
+    if len(raiz) > 0 {
+        raiz_usada = raiz
+    }
+    let pasta: str = bib_caber(format(f"{raiz_usada}\\System32", alloc = frame))
+    let candidato = bib_montar(pasta, link, BibCandidato{prefixo = "", sufixo = ".dll"}) or_else ""
+    return (len(candidato) > 0) and bib_tentar(candidato, achada)
+}
+
+// "c", "m", "msvcrt" e "ucrt" sao a mesma UCRT: o gcc daqui e UCRT, entao no oraculo C "msvcrt" e a ucrtbase
+// e compartilha o FILE stdout com o print; a msvcrt.dll real do System32 e outro CRT, com outro buffer.
+// C: nativo/obj/biblioteca.c:256
+proc bib_link_eh_crt(link: str) -> bool {
+    return (((link == "m") or (link == "c")) or (link == "msvcrt")) or (link == "ucrt")
+}
+
+// C: nativo/obj/biblioteca.c:261
+proc bib_achar_linux_na_pasta(pasta: str, link: str, achada: ^BibliotecaAchada) -> bool {
+    for i in 0..<len(BIB_CANDIDATOS_LINUX) {
+        let candidato = bib_montar(pasta, link, BIB_CANDIDATOS_LINUX[i]) or_else ""
+        if (len(candidato) > 0) and bib_tentar(candidato, achada) {
+            return true
+        }
+    }
+    return false
+}
+
+// Alvo Linux: cada pasta de busca cede <pasta>\vendor\linux; nada de System32 (o link do Linux nao procura DLL).
+// C: nativo/obj/biblioteca.c:272
+proc bib_achar_linux(busca: ?^BibliotecaBusca, link: str, achada: ^BibliotecaAchada) -> bool {
+    let alvo = busca as ^BibliotecaBusca
+    let pastas: []str = alvo.pastas or_else {}
+    var i: u32 = 0
+    while i < alvo.qtd_pastas {
+        let pasta: str = bib_caber(format(f"{pastas[i]}{BIB_PASTA_LINUX}", alloc = frame))
+        if bib_achar_linux_na_pasta(pasta, link, achada) {
+            return true
+        }
+        i += 1
+    }
+    return false
+}
+
+// M5b P39-B2: a libc do alvo linux e a semente musl (libc.a ao lado de crt1.o); a libm e a msvcrt estao dentro dela.
+// C: nativo/obj/biblioteca.c:286
+proc bib_achar_semente(pasta: ?str, achada: ^BibliotecaAchada) -> bool {
+    let base: str = pasta or_else ""
+    let candidato: str = bib_caber(format(f"{base}{BIB_SEMENTE_LIBC}", alloc = frame))
+    return bib_tentar(candidato, achada)
+}
+
+// C: nativo/obj/biblioteca.c:294
+// Devolve o 1o achado da ordem de busca; procurei_em lista o que foi tentado (liberar com biblioteca_liberar).
+proc biblioteca_achar(busca: ?^BibliotecaBusca, link: str, achada: ^BibliotecaAchada) -> bool {
+    achada.caminho = none
+    achada.tipo = BIB_DESCONHECIDO
+    achada.procurei_em = make([dynamic]u8, alloc = heap)
+    let alvo = busca as ^BibliotecaBusca
+    if alvo.elf and (alvo.semente != none) and bib_link_eh_crt(link) {
+        return bib_achar_semente(alvo.semente, achada)
+    }
+    if alvo.elf {
+        return bib_achar_linux(busca, link, achada)
+    }
+    if bib_link_eh_crt(link) {
+        return bib_achar_no_sistema(BIB_NOME_SISTEMA, achada)
+    }
+    let pastas: []str = alvo.pastas or_else {}
+    var i: u32 = 0
+    while i < alvo.qtd_pastas {
+        if bib_achar_na_pasta(pastas[i], link, achada) {
+            return true
+        }
+        i += 1
+    }
+    return bib_achar_no_sistema(link, achada)
+}
+
+// C: nativo/obj/biblioteca.c:311
+proc biblioteca_liberar(achada: ^BibliotecaAchada) {
+    delete(achada.procurei_em)
+}
+
+test "biblioteca_le16_le32_little_endian" {
+    var dois: [2]u8 = {0x34, 0x12}
+    var quatro: [4]u8 = {0x78, 0x56, 0x34, 0x12}
+    expect(bib_le16(dois[..]) == 0x1234)
+    expect(bib_le32(quatro[..]) == 0x12345678)
+}
+
+test "biblioteca_tamanho_membro_decimal" {
+    var cab: [60]u8 = {}
+    cab[48] = 52 // '4'
+    cab[49] = 50 // '2'
+    expect(bib_tamanho_membro(cab[..]) == 42)
+}
+
+test "biblioteca_eh_ar_assinatura" {
+    expect(bib_eh_ar(as_bytes("!<arch>\n")))
+    expect(not bib_eh_ar(as_bytes("!<arch")))
+}
+
+test "biblioteca_tipo_de_bytes_curto_e_desconhecido" {
+    var mz: [2]u8 = {77, 90} // "MZ" sem cabecalho PE: menor que 64 bytes
+    expect(bib_tipo_de_bytes(mz[..]) == BIB_DESCONHECIDO)
+}
+
+test "biblioteca_tipo_elf_et_dyn" {
+    var elf: [18]u8 = {}
+    elf[16] = 3 // ET_DYN no offset 16
+    expect(bib_tipo_elf(elf[..]) == BIB_ELF_DINAMICO)
+}
+
+test "biblioteca_montar_separador_e_limite" {
+    let cand = BibCandidato{prefixo = "lib", sufixo = ".a"}
+    expect((bib_montar("C:\\pasta", "m", cand) or_else "") == "C:\\pasta\\libm.a")
+    expect((bib_montar("C:\\pasta\\", "m", cand) or_else "") == "C:\\pasta\\libm.a")
+}

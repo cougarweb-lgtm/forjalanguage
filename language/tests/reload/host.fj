@@ -1,0 +1,278 @@
+// Host do teste de hot reload (M8 H3). Versao: 1.0.0. Changelog: 1.0.0 - H3: primeira versao, com os modos quadros, rodizio e async.
+// Uso: host quadros <dll> <quadros> <marca> | host rodizio <alvo> <a.dll> <b.dll> <trocas> | host async <alvo> <nova.dll>
+// quadros: laco de 10 ms; a cada quadro ve a marca (o verificador a cria depois do build), chama changed() e roda update pela Api rebuscada por geracao.
+// Saida: uma linha por quadro (q, gen, passos) e as trocas (troca, recusada, marca, symbol).
+import "std:reload"
+import "std:os"
+import "std:file"
+import "std:path"
+import "std:text"
+import "std:async"
+
+struct Estado {
+    passos: i64
+    soma: f64
+    ultimo: f64
+}
+
+// Cache do simbolo update: rebuscado quando a geracao da Library muda (o ponteiro da geracao velha morre no reload).
+struct Api {
+    geracao: int
+    update: rawptr
+}
+
+// Tarefa do modo async: a DLL roda dentro dela ate fim_ns; o Estado mora na propria tarefa (heap).
+struct Tarefa {
+    update: rawptr
+    fim_ns: int
+    quadros: int
+    estado: Estado
+}
+
+proc busca_api(lib: ^reload.Library, api: ^Api) -> bool {
+    var achou = false
+    switch r in reload.symbol(lib, "update") {
+    case rawptr:
+        api.update = r
+        api.geracao = reload.generation(lib)
+        achou = true
+    case reload.ReloadError:
+        achou = false
+    }
+    return achou
+}
+
+proc roda_troca(lib: ^reload.Library) -> bool {
+    var trocou = false
+    switch r in reload.reload(lib) {
+    case none:
+        trocou = true
+    case reload.ReloadError:
+        trocou = false
+    }
+    return trocou
+}
+
+proc prova_symbol_ausente(lib: ^reload.Library) {
+    switch r in reload.symbol(lib, "nao_existe") {
+    case rawptr:
+        print("symbol nao_existe = achado (inesperado)")
+    case reload.ReloadError:
+        if r == reload.ReloadError.missing_symbol {
+            print("symbol nao_existe = missing_symbol")
+        }
+    }
+}
+
+proc marca_quadro(marca: str, q: int) {
+    if not file.exists(marca) {
+        return
+    }
+    _ = file.remove_file(marca)
+    print(f"marca q={q}")
+}
+
+proc passo_quadro(lib: ^reload.Library, api: ^Api, e: ^Estado, q: int) {
+    if reload.generation(lib) != api.geracao {
+        _ = busca_api(lib, api)
+    }
+    let up = api.update as proc(e: ^Estado, dt: f64)
+    up(e, 1.0)
+    print(f"q={q} gen={reload.generation(lib)} passos={e.passos} soma={e.soma}")
+}
+
+proc linha_existe(texto: str, linha: str) -> bool {
+    let molde = format(f"\n{texto}\n", alloc = heap)
+    defer delete(molde)
+    let agulha = format(f"\n{linha}\n", alloc = heap)
+    defer delete(agulha)
+    return text.str_contains(molde, agulha)
+}
+
+// Recusa por interface_changed: imprime as linhas da interface nova (a DLL no caminho agora) que nao existem na atual.
+proc imprime_diferencas(lib: ^reload.Library, caminho: str) {
+    // Abre uma COPIA: open da propria DLL colide com a sombra da geracao 0 ja carregada (mesmo pid e geracao).
+    let copia = path.join2(path.dir(caminho), "diferencas_interface.dll", alloc = heap)
+    defer delete(copia)
+    _ = file.copy_file(caminho, copia)
+    var outra = reload.open(copia, alloc = heap) or_else reload.Library{}
+    let atual = reload.interface_text(lib, alloc = heap)
+    defer delete(atual)
+    let nova = reload.interface_text(&outra, alloc = heap)
+    defer delete(nova)
+    reload.close(&outra)
+    _ = file.remove_file(copia)
+    var linhas = text.split_lines(nova, alloc = heap)
+    defer delete(linhas)
+    for l in linhas {
+        if not linha_existe(atual, l) {
+            print(f"  + {l}")
+        }
+    }
+}
+
+proc troca_se_mudou(lib: ^reload.Library, caminho: str, q: int) {
+    if not reload.changed(lib) {
+        return
+    }
+    let t0 = os.time_ns()
+    switch r in reload.reload(lib) {
+    case none:
+        let ms = (os.time_ns() - t0) / 1000000
+        print(f"troca gen={reload.generation(lib)} q={q} ms={ms}")
+    case reload.ReloadError:
+        print(f"recusada gen={reload.generation(lib)} q={q}")
+        if r == reload.ReloadError.interface_changed {
+            print("  motivo=interface_changed")
+            imprime_diferencas(lib, caminho)
+        } else {
+            print("  motivo=outro")
+        }
+    }
+}
+
+proc modo_quadros(dll: str, total: int, marca: str) -> int {
+    var lib = reload.open(dll, alloc = heap) or_else reload.Library{}
+    var api = Api{geracao = -1, update = none}
+    if not busca_api(&lib, &api) {
+        print("update ausente")
+        return 3
+    }
+    prova_symbol_ausente(&lib)
+    var e = Estado{passos = 0, soma = 0.0, ultimo = 0.0}
+    var q = 0
+    while q < total {
+        q += 1
+        marca_quadro(marca, q)
+        troca_se_mudou(&lib, dll, q)
+        passo_quadro(&lib, &api, &e, q)
+        os.sleep_ms(10)
+    }
+    reload.close(&lib)
+    return 0
+}
+
+// Conta os arquivos da pasta de sombras enquanto a DLL ainda esta carregada (depois do close ja nao sobra nada).
+proc conta_quente(alvo: str) -> int {
+    let pasta = path.join2(path.dir(alvo), ".forja_quente", alloc = heap)
+    defer delete(pasta)
+    var n = -1
+    switch r in file.read_dir(pasta, alloc = heap) {
+    case file.DirList:
+        n = len(r.items)
+        delete(r.items)
+        delete(r.data)
+    case file.FileError:
+        n = -1
+    }
+    return n
+}
+
+proc modo_rodizio(alvo: str, a: str, b: str, trocas: int) -> int {
+    var lib = reload.open(alvo, alloc = heap) or_else reload.Library{}
+    var pico_100: uint = 0
+    var falhas = 0
+    var k = 0
+    while k < trocas {
+        k += 1
+        var origem = a
+        if k % 2 == 0 {
+            origem = b
+        }
+        _ = file.copy_file(origem, alvo)
+        if not roda_troca(&lib) {
+            falhas += 1
+        }
+        if k == 100 {
+            pico_100 = os.peak_memory() or_else (0 as uint)
+        }
+    }
+    let pico_fim = os.peak_memory() or_else (0 as uint)
+    print(f"rodizio trocas={trocas} falhas={falhas} pico100={pico_100} picofim={pico_fim} quente={conta_quente(alvo)} gen={reload.generation(&lib)}")
+    reload.close(&lib)
+    return 0
+}
+
+proc trabalho_async(p: rawptr) -> u32 {
+    let t = p as ^Tarefa
+    let f = t.update as proc(e: ^Estado, dt: f64)
+    while os.time_ns() < t.fim_ns {
+        f(&t.estado, 0.5)
+        t.quadros += 1
+    }
+    return 0
+}
+
+proc cria_tarefa(update: rawptr, fim_ns: int) -> ^Tarefa {
+    let t = new(Tarefa, alloc = heap)
+    t.update = update
+    t.fim_ns = fim_ns
+    return t
+}
+
+// Quatro tarefas de 500 ms rodando update; o pedido de troca sai depois do spawn e o reload so entra depois do group_wait.
+proc roda_async(pl: ^async.Pool, lib: ^reload.Library, api: ^Api) -> int {
+    let fim = os.time_ns() + 500000000
+    let t0 = cria_tarefa(api.update, fim)
+    let t1 = cria_tarefa(api.update, fim)
+    let t2 = cria_tarefa(api.update, fim)
+    let t3 = cria_tarefa(api.update, fim)
+    let g = async.group_new(pl)
+    async.group_spawn(g, trabalho_async, t0 as rawptr)
+    async.group_spawn(g, trabalho_async, t1 as rawptr)
+    async.group_spawn(g, trabalho_async, t2 as rawptr)
+    async.group_spawn(g, trabalho_async, t3 as rawptr)
+    let pedido = os.time_ns()
+    async.group_wait(g)
+    let ok = roda_troca(lib)
+    let espera_ms = (os.time_ns() - pedido) / 1000000
+    let sem_queda = t0.estado.passos == t0.quadros and t1.estado.passos == t1.quadros and t2.estado.passos == t2.quadros and t3.estado.passos == t3.quadros
+    print(f"async troca_ok={ok} gen={reload.generation(lib)} espera_ms={espera_ms} quadros={t0.quadros},{t1.quadros},{t2.quadros},{t3.quadros} sem_queda={sem_queda}")
+    delete(t0)
+    delete(t1)
+    delete(t2)
+    delete(t3)
+    return 0
+}
+
+proc modo_async(alvo: str, nova: str) -> int {
+    var lib = reload.open(alvo, alloc = heap) or_else reload.Library{}
+    var api = Api{geracao = -1, update = none}
+    if not busca_api(&lib, &api) {
+        print("update ausente")
+        return 3
+    }
+    _ = file.copy_file(nova, alvo)
+    var codigo = 4
+    switch pl in async.pool_new(4) {
+    case ^async.Pool:
+        codigo = roda_async(pl, &lib, &api)
+        async.pool_close(pl)
+        delete(pl)
+    case async.AsyncError:
+        print("pool_new falhou")
+    }
+    reload.close(&lib)
+    return codigo
+}
+
+proc main() {
+    let a = os.args()
+    if len(a) < 2 {
+        print("uso: host quadros|rodizio|async ...")
+        os.exit(2)
+    }
+    var codigo = 2
+    if a[1] == "quadros" {
+        codigo = modo_quadros(a[2], text.parse_int(a[3]) or_else 0, a[4])
+    }
+    if a[1] == "rodizio" {
+        codigo = modo_rodizio(a[2], a[3], a[4], text.parse_int(a[5]) or_else 0)
+    }
+    if a[1] == "async" {
+        codigo = modo_async(a[2], a[3])
+    }
+    if codigo != 0 {
+        os.exit(codigo)
+    }
+}

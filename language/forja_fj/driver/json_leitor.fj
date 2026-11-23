@@ -1,0 +1,430 @@
+// driver/json_leitor.fj - porte de compiler/driver/json_leitor.c, compiler/driver/json_leitor.h
+// sha256 de driver/json_leitor.c: c9b5ce53e5a1794113d081956c585fdbc96374e83fbbe03eaa49ddf77a2d50cd
+// sha256 de driver/json_leitor.h: b1be94c0993d3a426324ef70aa3e88983fa33e17fa1679012a3582ce583fc588
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "common"
+
+struct JsonValor {
+    tipo: i32
+    chave: ?str
+    texto: ?str
+    numero: i64
+    filho: ?^JsonValor
+    prox: ?^JsonValor
+}
+
+// Ponteiros p e fim do C viram indices pos e fim sobre 'entrada' (str). 'texto' e a area de trabalho da decodificacao (reaproveitada).
+struct Leitor {
+    arena: ?^common.Arena
+    entrada: str
+    pos: u64
+    fim: u64
+    profundidade: i32
+    texto: [dynamic]u8
+}
+
+const JSON_PROFUNDIDADE_MAX: i32 = 32
+const JSON_NULO: i32 = 0
+const JSON_BOOL: i32 = 1
+const JSON_NUMERO: i32 = 2
+const JSON_TEXTO: i32 = 3
+const JSON_LISTA: i32 = 4
+const JSON_OBJETO: i32 = 5
+const DE: [9]u8 = {34, 92, 47, 98, 102, 110, 114, 116, 0}
+const PARA: [9]u8 = {34, 92, 47, 8, 12, 10, 13, 9, 0}
+// C2F:? tabela LITERAIS (const struct (unnamed struct at C:\ENGINE_GAME3D\language\compiler\driver\json_leitor.c:160:18)[3]): ponteiro nao nulo
+
+// C: driver/json_leitor.c:20
+proc pular_espacos(l: ^Leitor) {
+    while l.pos < l.fim {
+        let c: u8 = l.entrada[l.pos]
+        if (c == 32) or (c == 9) or (c == 10) or (c == 13) { // ' ' '\t' '\n' '\r'
+            l.pos += 1
+        } else {
+            return
+        }
+    }
+}
+
+// C: driver/json_leitor.c:25
+proc novo_valor(l: ^Leitor, tipo: i32) -> ^JsonValor {
+    let v: ^JsonValor = new(JsonValor, alloc = common.arena_mem(l.arena as ^common.Arena))
+    v.tipo = tipo
+    return v
+}
+
+// C: driver/json_leitor.c:36
+proc valor_hex(c: u8) -> i32 {
+    if (common.c2f_char_i32(c) >= 48) and (common.c2f_char_i32(c) <= 57) { // '0' '9'
+        return common.c2f_char_i32(c) - 48 // '0'
+    }
+    if (common.c2f_char_i32(c) >= 97) and (common.c2f_char_i32(c) <= 102) { // 'a' 'f'
+        return (common.c2f_char_i32(c) - 97) + 10 // 'a'
+    }
+    if (common.c2f_char_i32(c) >= 65) and (common.c2f_char_i32(c) <= 70) { // 'A' 'F'
+        return (common.c2f_char_i32(c) - 65) + 10 // 'A'
+    }
+    return -1
+}
+
+// C: driver/json_leitor.c:44
+// Le 4 digitos hexadecimais; avanca pos mesmo quando um digito e invalido (como o C), mas o chamador so segue com o retorno true.
+proc ler_hex4(l: ^Leitor, ponto: ^u32) -> bool {
+    var v: u32 = 0
+    if (l.fim - l.pos) < 4 {
+        return false
+    }
+    for k in 0..<4 {
+        let digito: i32 = valor_hex(l.entrada[l.pos])
+        l.pos += 1
+        if digito < 0 {
+            return false
+        }
+        v = (v << 4) | (digito as u32)
+    }
+    ponto^ = v
+    return true
+}
+
+// C: driver/json_leitor.c:59
+// Codifica o ponto de codigo em UTF-8 (1 a 4 bytes) no fim de *b.
+proc anexar_utf8(b: ^[dynamic]u8, ponto: u32) {
+    if ponto < 0x80 {
+        append(b, item = (ponto as u8))
+    } else if ponto < 0x800 {
+        append(b, item = ((0xC0 | (ponto >> 6)) as u8))
+        append(b, item = ((0x80 | (ponto & 0x3F)) as u8))
+    } else if ponto < 0x10000 {
+        append(b, item = ((0xE0 | (ponto >> 12)) as u8))
+        append(b, item = ((0x80 | ((ponto >> 6) & 0x3F)) as u8))
+        append(b, item = ((0x80 | (ponto & 0x3F)) as u8))
+    } else {
+        append(b, item = ((0xF0 | (ponto >> 18)) as u8))
+        append(b, item = ((0x80 | ((ponto >> 12) & 0x3F)) as u8))
+        append(b, item = ((0x80 | ((ponto >> 6) & 0x3F)) as u8))
+        append(b, item = ((0x80 | (ponto & 0x3F)) as u8))
+    }
+}
+
+// C: driver/json_leitor.c:87
+// \uXXXX (ja lido o 'u'); par substituto alto exige o baixo logo depois.
+proc ler_escape_unicode(l: ^Leitor) -> bool {
+    var ponto: u32 = 0
+    var baixo: u32 = 0
+    if not ler_hex4(l, &ponto) {
+        return false
+    }
+    if (ponto >= 0xDC00) and (ponto <= 0xDFFF) {
+        return false
+    }
+    if (ponto >= 0xD800) and (ponto <= 0xDBFF) {
+        if ((l.fim - l.pos) < 2) or (l.entrada[l.pos] != 92) or (l.entrada[l.pos + 1] != 117) { // '\\' 'u'
+            return false
+        }
+        l.pos += 2
+        if (not ler_hex4(l, &baixo)) or (baixo < 0xDC00) or (baixo > 0xDFFF) {
+            return false
+        }
+        ponto = 0x10000 + (((ponto - 0xD800) << 10) + (baixo - 0xDC00))
+    }
+    anexar_utf8(&l.texto, ponto)
+    return true
+}
+
+// C: driver/json_leitor.c:104
+// Depois da barra: um dos escapes de caractere unico ou \uXXXX. O NUL nunca casa (o strchr do C so casa c != 0).
+proc ler_escape(l: ^Leitor) -> bool {
+    if l.pos >= l.fim {
+        return false
+    }
+    let c: u8 = l.entrada[l.pos]
+    l.pos += 1
+    if c == 117 { // 'u'
+        return ler_escape_unicode(l)
+    }
+    var k: u64 = 0
+    while k < 8 { // DE tem 8 caracteres; o 9o (NUL) e so o terminador do C
+        if DE[k] == c {
+            append(&l.texto, item = PARA[k])
+            return true
+        }
+        k += 1
+    }
+    return false
+}
+
+// C: driver/json_leitor.c:121
+// Copia o texto decodificado para a arena. Como o C (strcmp, %s), o valor acaba no primeiro byte 0.
+proc copiar_texto_da_arena(l: ^Leitor) -> str {
+    let todo = l.texto[..]
+    var n: int = 0
+    while (n < len(todo)) and (todo[n] != 0) {
+        n += 1
+    }
+    if n == 0 {
+        return ""
+    }
+    return from_bytes(todo[0..<n], alloc = common.arena_mem(l.arena as ^common.Arena))
+}
+
+// C: driver/json_leitor.c:121
+// Texto entre aspas (pos esta na aspa de abertura). none = texto torto.
+proc ler_texto(l: ^Leitor) -> ?str {
+    l.pos += 1
+    clear(&l.texto)
+    while (l.pos < l.fim) and (l.entrada[l.pos] != 34) { // '"'
+        let c: u8 = l.entrada[l.pos]
+        l.pos += 1
+        if c < 32 { // 0x20
+            return none
+        }
+        if c != 92 { // '\\'
+            append(&l.texto, item = c)
+        } else if not ler_escape(l) {
+            return none
+        }
+    }
+    if l.pos >= l.fim {
+        return none
+    }
+    l.pos += 1
+    return copiar_texto_da_arena(l)
+}
+
+// C: driver/json_leitor.c:140
+// Caracteres que o C aceita no resto do numero (strchr("0123456789.eE+-", c)); o 0 tambem, porque strchr do C acha o terminador.
+proc caractere_do_numero(c: u8) -> bool {
+    if c == 0 {
+        return true
+    }
+    if (c >= 48) and (c <= 57) {
+        return true
+    }
+    return (c == 46) or (c == 101) or (c == 69) or (c == 43) or (c == 45) // '.' 'e' 'E' '+' '-'
+}
+
+// C: driver/json_leitor.c:140
+// Parte inteira em aritmetica de 64 bits com wrap (como o C na pratica); fracao e expoente sao pulados.
+proc ler_numero(l: ^Leitor) -> ?^JsonValor {
+    let v = novo_valor(l, JSON_NUMERO)
+    let negativo: bool = l.entrada[l.pos] == 45 // '-'
+    var magnitude: u64 = 0
+    var digitos: i32 = 0
+    if negativo {
+        l.pos += 1
+    }
+    while (l.pos < l.fim) and (l.entrada[l.pos] >= 48) and (l.entrada[l.pos] <= 57) {
+        magnitude = wrapping_add(wrapping_mul(magnitude, 10 as u64), (l.entrada[l.pos] - 48) as u64)
+        l.pos += 1
+        digitos += 1
+    }
+    if digitos == 0 {
+        return none
+    }
+    while (l.pos < l.fim) and caractere_do_numero(l.entrada[l.pos]) {
+        l.pos += 1
+    }
+    var bits: u64 = magnitude
+    if negativo {
+        bits = wrapping_sub(0 as u64, magnitude)
+    }
+    v.numero = transmute(bits, to = i64)
+    return v
+}
+
+// C: driver/json_leitor.c:158
+// true se o literal 'nome' esta logo em pos (cabe no restante do texto e casa byte a byte).
+proc literal_casa(l: ^Leitor, nome: str) -> bool {
+    let n: u64 = len(nome) as u64
+    if (l.fim - l.pos) < n {
+        return false
+    }
+    var k: u64 = 0
+    while k < n {
+        if l.entrada[l.pos + k] != nome[k] {
+            return false
+        }
+        k += 1
+    }
+    return true
+}
+
+// C: driver/json_leitor.c:158
+// Cria o valor do literal e avanca pos pelo tamanho do nome.
+proc literal_valor(l: ^Leitor, nome: str, tipo: i32, valor: i64) -> ?^JsonValor {
+    let v = novo_valor(l, tipo)
+    v.numero = valor
+    l.pos += len(nome) as u64
+    return v
+}
+
+// C: driver/json_leitor.c:158
+// null, true e false, nessa ordem (a tabela LITERAIS do C).
+proc ler_literal(l: ^Leitor) -> ?^JsonValor {
+    if literal_casa(l, "null") {
+        return literal_valor(l, "null", JSON_NULO, 0)
+    }
+    if literal_casa(l, "true") {
+        return literal_valor(l, "true", JSON_BOOL, 1)
+    }
+    if literal_casa(l, "false") {
+        return literal_valor(l, "false", JSON_BOOL, 0)
+    }
+    return none
+}
+
+// C: driver/json_leitor.c:181
+// Membro de objeto: "chave": valor.
+proc ler_membro(l: ^Leitor) -> ?^JsonValor {
+    pular_espacos(l)
+    if (l.pos >= l.fim) or (l.entrada[l.pos] != 34) { // '"'
+        return none
+    }
+    let chave = ler_texto(l)
+    pular_espacos(l)
+    if (chave == none) or (l.pos >= l.fim) or (l.entrada[l.pos] != 58) { // ':'
+        return none
+    }
+    l.pos += 1
+    let v = ler_valor_2(l)
+    if v != none {
+        let nodo: ^JsonValor = v as ^JsonValor
+        nodo.chave = chave
+    }
+    return v
+}
+
+// C: driver/json_leitor.c:198
+// Itens separados por virgula ate o fecha; pos esta logo depois da abertura.
+proc ler_container(l: ^Leitor, tipo: i32, fecha: u8) -> ?^JsonValor {
+    let raiz = novo_valor(l, tipo)
+    var ultimo: ?^JsonValor = none
+    pular_espacos(l)
+    if (l.pos < l.fim) and (l.entrada[l.pos] == fecha) {
+        l.pos += 1
+        return raiz
+    }
+    while true {
+        var item: ?^JsonValor = none
+        if tipo == JSON_OBJETO {
+            item = ler_membro(l)
+        } else {
+            item = ler_valor_2(l)
+        }
+        if item == none {
+            return none
+        }
+        if ultimo == none {
+            raiz.filho = item
+        } else {
+            let anterior: ^JsonValor = ultimo as ^JsonValor
+            anterior.prox = item
+        }
+        ultimo = item
+        pular_espacos(l)
+        if l.pos >= l.fim {
+            return none
+        }
+        if l.entrada[l.pos] == fecha {
+            l.pos += 1
+            return raiz
+        }
+        let sep: u8 = l.entrada[l.pos]
+        l.pos += 1
+        if sep != 44 { // ','
+            return none
+        }
+    }
+    return none
+}
+
+// C: driver/json_leitor.c:224 (LerValor; o nome _2 evita colisao no pacote)
+// Um valor: texto, objeto, lista, numero ou literal. A profundidade sobe e desce sempre, como no C.
+proc ler_valor_2(l: ^Leitor) -> ?^JsonValor {
+    var v: ?^JsonValor = none
+    pular_espacos(l)
+    if (l.pos >= l.fim) or (l.profundidade >= JSON_PROFUNDIDADE_MAX) {
+        return none
+    }
+    let c: u8 = l.entrada[l.pos]
+    l.profundidade += 1
+    if c == 34 { // '"'
+        let txt = ler_texto(l)
+        if txt != none {
+            let nodo = novo_valor(l, JSON_TEXTO)
+            nodo.texto = txt
+            v = nodo
+        }
+    } else if c == 123 { // '{'
+        l.pos += 1
+        v = ler_container(l, JSON_OBJETO, 125) // '}'
+    } else if c == 91 { // '['
+        l.pos += 1
+        v = ler_container(l, JSON_LISTA, 93) // ']'
+    } else if (c == 45) or ((c >= 48) and (c <= 57)) { // '-' ou digito
+        v = ler_numero(l)
+    } else {
+        v = ler_literal(l)
+    }
+    l.profundidade -= 1
+    return v
+}
+
+// C: driver/json_leitor.c:251
+// Le UM valor de texto[0..tam) (o C e tam bytes; aqui o fim e limitado ao comprimento real do str).
+proc json_ler(arena: ^common.Arena, texto: ?str, tam: u64) -> ?^JsonValor {
+    let entrada: str = texto or_else ""
+    var fim: u64 = tam
+    if fim > (len(entrada) as u64) {
+        fim = len(entrada) as u64
+    }
+    var l = Leitor{arena = arena, entrada = entrada, pos = 0, fim = fim, profundidade = 0, texto = make([dynamic]u8, alloc = heap)}
+    defer delete(l.texto)
+    let v = ler_valor_2(&l)
+    if v != none {
+        pular_espacos(&l)
+        if l.pos != l.fim {
+            return none
+        }
+    }
+    return v
+}
+
+// C: driver/json_leitor.c:264
+proc json_membro(objeto: ?^JsonValor, chave: ?str) -> ?^JsonValor {
+    if (objeto == none) or (common.c2f_s2u_32((objeto as ^JsonValor).tipo) != (JSON_OBJETO as u32)) {
+        return none
+    }
+    var m: ?^JsonValor = (objeto as ^JsonValor).filho
+    while m != none {
+        if ((m as ^JsonValor).chave != none) and (((m as ^JsonValor).chave or_else "") == (chave or_else "")) {
+            return m
+        }
+        m = (m as ^JsonValor).prox
+    }
+    return none
+}
+
+// C: driver/json_leitor.c:272
+proc json_texto_de(objeto: ?^JsonValor, chave: ?str) -> ?str {
+    let m = json_membro(objeto, chave)
+    if m == none {
+        return none
+    }
+    if (m as ^JsonValor).tipo != JSON_TEXTO {
+        return none
+    }
+    return (m as ^JsonValor).texto
+}
+
+// C: driver/json_leitor.c:279
+proc json_numero_de(objeto: ?^JsonValor, chave: str, padrao: i64) -> i64 {
+    let m: ?^JsonValor = json_membro(objeto, chave)
+    var tern_1: i64 = padrao
+    if (m != none) and (common.c2f_s2u_32((m as ^JsonValor).tipo) == (JSON_NUMERO as u32)) {
+        tern_1 = (m as ^JsonValor).numero
+    }
+    return tern_1
+}

@@ -1,0 +1,178 @@
+// std:compressao 0.3.0 - compressao zlib (deflate) para a Forja, por cima do zlib 1.4 (licenca zlib) em vendor\libz.a (Windows) e vendor\linux\libz.a (Linux).
+// 0.3.0 (PREPARO F5, 20/11/2026): API de FLUXO em pedacos (Stream, stream_deflate/stream_inflate/stream_push/stream_close) por cima da cola zlib_ponte; a API por buffer unico (compress/decompress) segue igual.
+// 0.2.1 (M6c P84): zlib.fj regenerado (uLong -> c_ulong, parametro len -> len_); o crc passa `previous as c_ulong` e `len_ =`, e o retorno volta `as u32`.
+// 0.2.0 (D0655 b): usa as variantes _z do zlib (z_size_t = size_t = u64 nos dois alvos); a versao sem _z recebia ?^u32 onde o C espera uLongf* (8 bytes no Linux).
+//
+// COMO USAR (o .fj raiz precisa de vendor\ ao lado: libz.a, compression\compression.fj, compression\zlib.fj; ver MEM-FORJA-GUIA-10):
+//     import "vendor:compression/compression"   (o caminho antigo vendor:compressao/compressao e o qualificador compressao. dao E0110: rode forja migrar)
+//     var original: [64]u8 = {}
+//     var pequeno: [128]u8 = {}
+//     let n = try compression.compress(original[..], dst = pequeno[..], level = 6)   // n = bytes gravados em `pequeno`
+//     var volta: [64]u8 = {}
+//     let m = try compression.decompress(pequeno[0..<n], dst = volta[..])            // m = bytes gravados em `volta`
+// Os nomes em portugues (comprimir, descomprimir, limite, ErroZlib, origem/destino/nivel = ...) dao E0110: rode forja migrar (tabela compiler\common\renomeados.c).
+//
+// Entrada e saida sao fatias []u8 de buffers SEUS (array local, make([dynamic]u8) ou slice_from): a lib nao aloca nada.
+// Dimensione o destino de compress com compression.bound(tamanho_original). Erro: ZlibError.
+// Limite por chamada: o tamanho do buffer (size_t, 64 bits nos dois alvos, pelas versoes _z). O crc tem o limite do uLong do alvo (32 bits no Windows, 64 no Linux) e a entrada do crc passa por crc32_z.
+//
+// VERIFICAR: python language\exemplos_libs\verificar_libs.py --so compressao_basico   (ou: forja run language\exemplos_libs\compressao_basico.fj)
+
+import "vendor:compression/zlib" as zl
+import "vendor:compression/zlib_ponte" as zp
+
+pub enum ZlibError {
+    dest_too_small
+    invalid_data
+    out_of_memory
+    parametro
+}
+
+// Tamanho de destino que sempre basta para comprimir `size` bytes.
+pub proc bound(size: i64) -> i64 {
+    return zl.compressBound_z(size as u64) as i64
+}
+
+// Comprime `src` em `dst` (level 0 = sem compressao, 1 = rapido, 6 = padrao, 9 = maximo).
+// Devolve quantos bytes foram gravados em `dst`. Erros: dest_too_small, out_of_memory, parametro.
+pub proc compress(src: []u8, dst: []u8, level: i32) -> i64 ! ZlibError {
+    if len(src) == 0 or len(dst) == 0 or level < 0 or level > 9 {
+        return ZlibError.parametro
+    }
+    var gravados: u64 = len(dst) as u64
+    let codigo = zl.compress2_z(&dst[0], dest_len = &gravados, source = &src[0], source_len = len(src) as u64, level = level)
+    if codigo == zl.Z_OK {
+        return gravados as i64
+    }
+    if codigo == zl.Z_BUF_ERROR {
+        return ZlibError.dest_too_small
+    }
+    if codigo == zl.Z_MEM_ERROR {
+        return ZlibError.out_of_memory
+    }
+    return ZlibError.parametro
+}
+
+// Descomprime `src` (formato zlib) em `dst`. Devolve os bytes gravados. Erros: dest_too_small, invalid_data, out_of_memory.
+pub proc decompress(src: []u8, dst: []u8) -> i64 ! ZlibError {
+    if len(src) == 0 or len(dst) == 0 {
+        return ZlibError.parametro
+    }
+    var gravados: u64 = len(dst) as u64
+    let codigo = zl.uncompress_z(&dst[0], dest_len = &gravados, source = &src[0], source_len = len(src) as u64)
+    if codigo == zl.Z_OK {
+        return gravados as i64
+    }
+    if codigo == zl.Z_BUF_ERROR {
+        return ZlibError.dest_too_small
+    }
+    if codigo == zl.Z_MEM_ERROR {
+        return ZlibError.out_of_memory
+    }
+    return ZlibError.invalid_data
+}
+
+// CRC-32 dos bytes (valor inicial 0; encadeie passando o resultado anterior em `previous`).
+pub proc crc(data: []u8, previous: u32) -> u32 {
+    if len(data) == 0 {
+        return previous
+    }
+    return zl.crc32_z(previous as c_ulong, buf = &data[0], len_ = len(data) as u64) as u32
+}
+
+// Versao do zlib embutido, por exemplo "1.4".
+pub proc versao() -> str {
+    let v = zl.zlibVersion()
+    return (v or_else "?") as str
+}
+
+// --- Fluxo em pedacos (0.3.0): entrada e saida de tamanho livre, sem buffer do tamanho do arquivo ---
+// Laco de uso (ex.: descomprimir em pedacos):
+//     var fluxo = try compression.stream_inflate(compression.StreamFormat.zlib)
+//     defer compression.stream_close(&fluxo)
+//     let passo = try compression.stream_push(&fluxo, entrada[pos..<fim], out[..], finish = false)
+//     pos += passo.consumed          // reenvie o que sobrou da entrada no proximo push
+//     saida do pedaco = out[0..<passo.written]
+//     deflate: repita com finish = true ate passo.done (a entrada acabou; o fluxo fecha)
+//     passo.written == 0 sem done = saida cheia: abra mais espaco em out
+// Depois de done os bytes que sobraram da entrada nao foram lidos. Erro: ZlibError (invalid_data = dado corrompido).
+
+pub enum StreamFormat {
+    zlib
+    raw
+}
+
+pub struct StreamStep {
+    consumed: i64
+    written: i64
+    done: bool
+}
+
+pub struct Stream {
+    handle: ?^zp.ZlibfFluxo
+    comprime: bool
+}
+
+proc formato_zlibf(format: StreamFormat) -> i32 {
+    if format == StreamFormat.raw {
+        return zp.ZLIBF_FORMATO_RAW
+    }
+    return zp.ZLIBF_FORMATO_ZLIB
+}
+
+// Novo compressor em fluxo. level 0..9 (6 = padrao). Dono do fluxo: feche com stream_close.
+pub proc stream_deflate(level: i32, format: StreamFormat) -> Stream ! ZlibError {
+    if level < 0 or level > 9 {
+        return ZlibError.parametro
+    }
+    let fluxo = zp.zlibf_deflate_novo(level, formato_zlibf(format))
+    if fluxo == none {
+        return ZlibError.out_of_memory
+    }
+    return Stream{handle = fluxo, comprime = true}
+}
+
+// Novo descompressor em fluxo. Dono do fluxo: feche com stream_close.
+pub proc stream_inflate(format: StreamFormat) -> Stream ! ZlibError {
+    let fluxo = zp.zlibf_inflate_novo(formato_zlibf(format))
+    if fluxo == none {
+        return ZlibError.out_of_memory
+    }
+    return Stream{handle = fluxo, comprime = false}
+}
+
+// Empurra um pedaco: le de input e grava em out. finish = true so vale no deflate (fecha o fluxo).
+// out vazio = parametro. Erros: invalid_data, out_of_memory, parametro.
+pub proc stream_push(s: ^Stream, input: []u8, out: []u8, finish: bool) -> StreamStep ! ZlibError {
+    if s.handle == none or len(out) == 0 {
+        return ZlibError.parametro
+    }
+    // entrada vazia passa NULL: &input[0] com len 0 nao existe
+    var entrada: ?^u8 = none
+    if len(input) > 0 {
+        entrada = &input[0]
+    }
+    var terminar: i32 = 0
+    if finish and s.comprime {
+        terminar = 1
+    }
+    var consumidos: u64 = 0
+    var gravados: u64 = 0
+    let codigo = zp.zlibf_processar(s.handle, entrada, len(input) as u64, &out[0], len(out) as u64, terminar, &consumidos, &gravados)
+    if codigo == zp.ZLIBF_ERRO_DADOS {
+        return ZlibError.invalid_data
+    }
+    if codigo == zp.ZLIBF_ERRO_MEMORIA {
+        return ZlibError.out_of_memory
+    }
+    if codigo == zp.ZLIBF_ERRO_PARAMETRO {
+        return ZlibError.parametro
+    }
+    return StreamStep{consumed = consumidos as i64, written = gravados as i64, done = codigo == zp.ZLIBF_FIM}
+}
+
+// Libera o fluxo. Depois disto stream_push devolve parametro; fechar de novo e no-op.
+pub proc stream_close(s: ^Stream) {
+    zp.zlibf_fechar(s.handle)
+    s.handle = none
+}

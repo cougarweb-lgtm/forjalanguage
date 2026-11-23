@@ -1,0 +1,142 @@
+// nativo/x64/x64_isel_conta.fj - porte de compiler/nativo/x64/x64_isel_conta.c
+// sha256 de nativo/x64/x64_isel_conta.c: c9fd2e4e6e820bd7ce15251656c88499288ea401a21c65ee386e9459345620f3
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "common"
+import "nativo/bir"
+
+const MINIMOS_CURTOS: [2][2]i32 = {{0, -128}, {0, -32768}}
+const MAXIMOS_CURTOS: [2][2]i32 = {{255, 127}, {65535, 32767}}
+const FORMAS_DIVISAO: [2][2]u16 = {{67, 68}, {69, 70}}
+const FORMAS_DESLOCA_CL: [2][2]u16 = {{71, 72}, {73, 74}}
+const FORMAS_DESLOCA_IMM: [2][2]u16 = {{77, 78}, {79, 80}}
+
+// C: nativo/x64/x64_isel_conta.c:21
+proc testar_faixa(c: ^X64Ctx, valor: i32, cond: i32, frio: u32) -> bool {
+    let arg_1: MOperando = m_imed(valor as i64)
+    let arg_2: MOperando = m_reg(X64_RAX, 32)
+    if not x64_emitir(c, mi2(FX_CMP32_RI as u16, arg_2, arg_1)) {
+        return false
+    }
+    return x64_emitir(c, mi_cc(FX_JCC_REL32 as u16, cond, m_bloco(frio)))
+}
+
+// C: nativo/x64/x64_isel_conta.c:28
+proc isel_ov_curto(c: ^X64Ctx, i: ^bir.BirInstr, base: u8) -> bool {
+    let com_sinal: bool = i.aux == (bir.BIR_SINAL as u8)
+    var largo: u8 = 0
+    if i.classe == (bir.BC_I16 as u8) {
+        largo = 1
+    }
+    let idx_sinal: u8 = common.c2f_b2i32(com_sinal) as u8
+    if not isel_operacao(c, i, base, isel_extensao_da_conta(i.classe, com_sinal)) {
+        return false
+    }
+    if com_sinal and not testar_faixa(c, MINIMOS_CURTOS[largo][1], X64_CC_L, i.alvo[0]) {
+        return false
+    }
+    var cond_faixa: i32 = X64_CC_A
+    if com_sinal {
+        cond_faixa = X64_CC_G
+    }
+    if not testar_faixa(c, MAXIMOS_CURTOS[largo][idx_sinal], cond_faixa, i.alvo[0]) {
+        return false
+    }
+    return isel_guardar(c, i.dst, X64_RAX)
+}
+
+// C: nativo/x64/x64_isel_conta.c:48
+proc preparar_dividendo(c: ^X64Ctx, sem_sinal: bool, larg: u8) -> bool {
+    if sem_sinal {
+        let arg_1: MOperando = m_reg(X64_RDX, 32)
+        let arg_2: MOperando = m_reg(X64_RDX, 32)
+        return x64_emitir(c, mi2(FX_XOR32_RR as u16, arg_2, arg_1))
+    }
+    var tern_1: i32 = FX_CDQ
+    if (larg as i32) != 0 {
+        tern_1 = FX_CQO
+    }
+    return x64_emitir(c, mi0(tern_1 as u16))
+}
+
+// C: nativo/x64/x64_isel_conta.c:56
+proc carregar_dividendo_e_divisor(c: ^X64Ctx, i: ^bir.BirInstr, ext: u8) -> bool {
+    return (common.c2f_b2i32(isel_carregar(c, X64_RAX, &i.a, ext)) != 0) and (common.c2f_b2i32(isel_carregar(c, X64_RCX, &i.b, ext)) != 0)
+}
+
+// C: nativo/x64/x64_isel_conta.c:61
+proc isel_divisao(c: ^X64Ctx, i: ^bir.BirInstr) -> bool {
+    let sem_sinal: bool = i.aux == (bir.BIR_SEM_SINAL as u8)
+    let larg: u8 = isel_indice_largura(i.classe)
+    let ext: u8 = isel_extensao_da_conta(i.classe, not sem_sinal)
+    if i.classe == (bir.BC_V128 as u8) {
+        return isel_conta_vetorial(c, i)
+    }
+    if bir.bir_classe_eh_real(i.classe as i32) {
+        return isel_conta_real(c, i)
+    }
+    if not carregar_dividendo_e_divisor(c, i, ext) {
+        return false
+    }
+    if not preparar_dividendo(c, sem_sinal, larg) {
+        return false
+    }
+    let idx_sinal: u8 = common.c2f_b2i32(sem_sinal) as u8
+    var bits: u8 = 32
+    if larg != 0 {
+        bits = 64
+    }
+    if not x64_emitir(c, mi1(FORMAS_DIVISAO[idx_sinal][larg], m_reg(X64_RCX, bits))) {
+        return false
+    }
+    var reg_resultado: i32 = X64_RAX
+    if i.op == (bir.BIR_REM as u8) {
+        reg_resultado = X64_RDX
+    }
+    return isel_guardar(c, i.dst, reg_resultado)
+}
+
+// C: nativo/x64/x64_isel_conta.c:86
+proc deslocar_rax(c: ^X64Ctx, i: ^bir.BirInstr) -> bool {
+    let sentido: u8 = common.c2f_b2i32(i.op == (bir.BIR_SHR as u8)) as u8
+    let larg: u8 = isel_indice_largura(i.classe)
+    let rax: MOperando = m_reg(X64_RAX, common.c2f_trunc_u8((32 << (common.c2f_s2u_32((larg as i32)) & 31)) as u64))
+    if i.b.tipo == (bir.BO_IMED as u8) {
+        let arg_1: MOperando = m_imed(i.b.imed)
+        let arg_2: MOperando = rax
+        let arg_3: u16 = FORMAS_DESLOCA_IMM[sentido][larg]
+        return x64_emitir(c, mi2(arg_3, arg_2, arg_1))
+    }
+    if not isel_carregar(c, X64_RCX, &i.b, bir.BE_NENHUMA as u8) {
+        return false
+    }
+    let arg_4: MOperando = m_reg(X64_RCX, 8)
+    let arg_5: MOperando = rax
+    let arg_6: u16 = FORMAS_DESLOCA_CL[sentido][larg]
+    return x64_emitir(c, mi2(arg_6, arg_5, arg_4))
+}
+
+// C: nativo/x64/x64_isel_conta.c:99
+proc isel_deslocamento(c: ^X64Ctx, i: ^bir.BirInstr) -> bool {
+    if (not isel_carregar(c, X64_RAX, &i.a, bir.BE_NENHUMA as u8)) or (not deslocar_rax(c, i)) {
+        return false
+    }
+    return isel_guardar(c, i.dst, X64_RAX)
+}
+
+// C: nativo/x64/x64_isel_conta.c:106
+proc isel_not(c: ^X64Ctx, i: ^bir.BirInstr) -> bool {
+    let larg: u8 = isel_indice_largura(i.classe)
+    if not isel_carregar(c, X64_RAX, &i.a, bir.BE_NENHUMA as u8) {
+        return false
+    }
+    var tern_1: i32 = FX_NOT32_R
+    if (larg as i32) != 0 {
+        tern_1 = FX_NOT64_R
+    }
+    if not x64_emitir(c, mi1(tern_1 as u16, m_reg(X64_RAX, common.c2f_trunc_u8((32 << (common.c2f_s2u_32((larg as i32)) & 31)) as u64)))) {
+        return false
+    }
+    return isel_guardar(c, i.dst, X64_RAX)
+}

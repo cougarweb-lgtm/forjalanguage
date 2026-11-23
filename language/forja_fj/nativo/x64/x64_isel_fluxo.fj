@@ -1,0 +1,378 @@
+// nativo/x64/x64_isel_fluxo.fj - porte de compiler/nativo/x64/x64_isel_fluxo.c
+// sha256 de nativo/x64/x64_isel_fluxo.c: c4bfc200ed1d901d81fcc7b81d5d76f5d69e9ba5c5915e896e03d49c04745735
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "common"
+import "nativo/bir"
+
+struct PlanoChamada {
+    c: ?^X64Ctx
+    i: ?^bir.BirInstr
+    oculto: u32
+    perigo: bool
+}
+
+// C: nativo/x64/x64_isel_fluxo.c:27
+proc isel_salto(c: ^X64Ctx, bloco: u32) -> bool {
+    if bloco == quadro_proximo_bloco(c) {
+        return true
+    }
+    return x64_emitir(c, mi1(FX_JMP_REL32 as u16, m_bloco(bloco)))
+}
+
+// C: nativo/x64/x64_isel_fluxo.c:37
+proc guardar_argumento_de_pilha(c: ^X64Ctx, arg: ^bir.BirOperando, desloc: i32) -> bool {
+    if bir.bir_classe_eh_real(arg.classe as i32) {
+        let arg_1: MOperando = m_mem(X64_RSP, desloc, aloc_bits(arg.classe))
+        let arg_2: u8 = arg.classe
+        let arg_3: ^X64Ctx = c
+        return isel_guardar_xmm(arg_3, arg_2, arg_1, 0)
+    }
+    let arg_4: MOperando = m_reg(X64_RAX, 64)
+    let arg_5: MOperando = m_mem(X64_RSP, desloc, 64)
+    return x64_emitir(c, mi2(FX_MOV64_MR as u16, arg_5, arg_4))
+}
+
+// C: nativo/x64/x64_isel_fluxo.c:54
+proc em_registrador(f: ?^bir.BirFuncao, o: ^bir.BirOperando) -> bool {
+    return ((o.tipo == (bir.BO_VREG as u8)) and (o.id < (f as ^bir.BirFuncao).nvregs)) and (common.c2f_b2i32(aloc_operando_de(f, o.id, 64).em_reg) != 0)
+}
+
+// C: nativo/x64/x64_isel_fluxo.c:60
+proc guardar_no_slot(c: ^X64Ctx, o: ^bir.BirOperando) -> bool {
+    let origem: AlocOperando = aloc_operando_de(c.f, o.id, 64)
+    var slot: AlocOperando = AlocOperando{}
+    if o.classe == (bir.BC_V128 as u8) {
+        return x64_sem_regra(c, "chama", "argumento V128 em registrador com perigo de registrador")
+    }
+    var tern_1: i32 = 64
+    if common.c2f_b2i32(bir.bir_classe_eh_real(o.classe as i32)) != 0 {
+        tern_1 = aloc_bits(o.classe) as i32
+    }
+    slot = aloc_operando_de(c.f, o.id, tern_1 as u8)
+    slot.em_reg = false
+    if bir.bir_classe_eh_real(o.classe as i32) {
+        var tern_2: i32 = FX_MOVSS_MX
+        if o.classe == (bir.BC_F64 as u8) {
+            tern_2 = FX_MOVSD_MX
+        }
+        let arg_1: MOperando = m_xmm(origem.reg as u8)
+        let arg_2: ^AlocOperando = &slot
+        let arg_3: u16 = tern_2 as u16
+        let arg_4: ^X64Ctx = c
+        return aloc_gravar(arg_4, arg_3, arg_2, arg_1)
+    }
+    return aloc_gravar(c, FX_MOV64_MR as u16, &slot, m_reg(origem.reg, 64))
+}
+
+// C: nativo/x64/x64_isel_fluxo.c:75
+proc carregar_do_slot(c: ^X64Ctx, reg: i32, o: ^bir.BirOperando, ext: u8) -> bool {
+    var slot: AlocOperando = aloc_operando_de(c.f, o.id, aloc_bits(o.classe))
+    slot.em_reg = false
+    let sw_1 = o.classe as i32
+    if bir.bir_classe_eh_real(sw_1) {
+        var forma_real: i32 = FX_MOVSS_XM
+        if sw_1 == bir.BC_F64 {
+            forma_real = FX_MOVSD_XM
+        }
+        return aloc_carregar(c, forma_real as u16, m_xmm(reg as u8), &slot)
+    }
+    if sw_1 == bir.BC_I64 {
+        return aloc_carregar(c, FX_MOV64_RM as u16, m_reg(reg, 64), &slot)
+    }
+    if sw_1 == bir.BC_I32 {
+        if not aloc_carregar(c, FX_MOV32_RM as u16, m_reg(reg, 32), &slot) {
+            return false
+        }
+        if ext != (bir.BE_SINAL as u8) {
+            return true
+        }
+        return x64_emitir(c, mi2(FX_MOVSXD64_RR32 as u16, m_reg(reg, 64), m_reg(reg, 32)))
+    }
+    if sw_1 == bir.BC_I8 {
+        if ext == (bir.BE_SINAL as u8) {
+            return aloc_carregar(c, FX_MOVSX64_RM8 as u16, m_reg(reg, 64), &slot)
+        }
+        return aloc_carregar(c, FX_MOVZX32_RM8 as u16, m_reg(reg, 32), &slot)
+    }
+    if sw_1 == bir.BC_I16 {
+        if ext == (bir.BE_SINAL as u8) {
+            return aloc_carregar(c, FX_MOVSX64_RM16 as u16, m_reg(reg, 64), &slot)
+        }
+        return aloc_carregar(c, FX_MOVZX32_RM16 as u16, m_reg(reg, 32), &slot)
+    }
+    return x64_sem_regra(c, "vreg", "operando de classe fora do M2 (so i8, i16, i32 e i64)")
+}
+
+// C: nativo/x64/x64_isel_fluxo.c:97
+proc ler_origem(p: ^PlanoChamada, reg: i32, o: ^bir.BirOperando, ext: u8) -> bool {
+    if (common.c2f_b2i32(p.perigo) != 0) and (common.c2f_b2i32(em_registrador((p.c as ^X64Ctx).f, o)) != 0) {
+        return carregar_do_slot(p.c as ^X64Ctx, reg, o, ext)
+    }
+    return isel_carregar(p.c as ^X64Ctx, reg, o, ext)
+}
+
+// C: nativo/x64/x64_isel_fluxo.c:105
+proc carregar_argumento(p: ^PlanoChamada, reg: i32, arg: ^bir.BirOperando, onde: ^AbiLocal) -> bool {
+    if not ler_origem(p, reg, arg, arg.extensao) {
+        return false
+    }
+    return (onde.bytes == 0) or (common.c2f_b2i32(isel_ler_bytes(p.c as ^X64Ctx, reg, reg, onde.bytes as u32)) != 0)
+}
+
+// C: nativo/x64/x64_isel_fluxo.c:113
+proc colocar_argumentos_de_pilha(p: ^PlanoChamada) -> bool {
+    var k: u32 = 0
+    while k < (p.i as ^bir.BirInstr).nargs {
+        let onde: ^AbiLocal = &((p.c as ^X64Ctx).abi or_else {})[p.oculto + k]
+        if not onde.na_pilha {
+            k += 1
+            continue
+        }
+        if not carregar_argumento(p, X64_RAX, &((p.i as ^bir.BirInstr).args or_else {})[k], onde) {
+            return false
+        }
+        if not guardar_argumento_de_pilha(p.c as ^X64Ctx, &((p.i as ^bir.BirInstr).args or_else {})[k], onde.desloc) {
+            return false
+        }
+        k += 1
+    }
+    return true
+}
+
+// C: nativo/x64/x64_isel_fluxo.c:128
+proc colocar_argumentos_de_registrador(p: ^PlanoChamada) -> bool {
+    var k: u32 = 0
+    while k < (p.i as ^bir.BirInstr).nargs {
+        let onde: ^AbiLocal = &((p.c as ^X64Ctx).abi or_else {})[p.oculto + k]
+        if onde.na_pilha {
+            k += 1
+            continue
+        }
+        if not carregar_argumento(p, onde.reg, &((p.i as ^bir.BirInstr).args or_else {})[k], onde) {
+            return false
+        }
+        k += 1
+    }
+    return true
+}
+
+// C: nativo/x64/x64_isel_fluxo.c:143
+proc escritor_antes_da_leitura(k: u32, pos: u32, oculto: u32) -> bool {
+    if (pos == 4294967295) or ((oculto != 0) and (pos == 0)) {
+        return k != pos
+    }
+    return (k >= oculto) and (k < pos)
+}
+
+// C: nativo/x64/x64_isel_fluxo.c:151
+proc origem_pisada(p: ^PlanoChamada, o: ^bir.BirOperando, pos: u32) -> bool {
+    let origem: i32 = aloc_operando_de((p.c as ^X64Ctx).f, o.id, 64).reg
+    let total: u32 = (p.i as ^bir.BirInstr).nargs + p.oculto
+    for k in (0 as u32)..<total {
+        let onde: ^AbiLocal = &((p.c as ^X64Ctx).abi or_else {})[k]
+        let mesmo_banco: bool = common.c2f_b2i32(bir.bir_classe_eh_real(((p.c as ^X64Ctx).cls or_else {})[k].classe)) == common.c2f_b2i32(bir.bir_classe_eh_real(o.classe as i32))
+        if (((common.c2f_b2i32(escritor_antes_da_leitura(k, pos, p.oculto)) != 0) and (not onde.na_pilha)) and (common.c2f_b2i32(mesmo_banco) != 0)) and (common.c2f_s2u_32(onde.reg) == common.c2f_s2u_32(origem)) {
+            return true
+        }
+    }
+    return false
+}
+
+// C: nativo/x64/x64_isel_fluxo.c:167
+proc ha_perigo_de_registrador(p: ^PlanoChamada) -> bool {
+    var k: u32 = 0
+    while k < (p.i as ^bir.BirInstr).nargs {
+        let o: ^bir.BirOperando = &((p.i as ^bir.BirInstr).args or_else {})[k]
+        if ((not ((p.c as ^X64Ctx).abi or_else {})[p.oculto + k].na_pilha) and (common.c2f_b2i32(em_registrador((p.c as ^X64Ctx).f, o)) != 0)) and (common.c2f_b2i32(origem_pisada(p, o, p.oculto + k)) != 0) {
+            return true
+        }
+        k += 1
+    }
+    if ((p.oculto != 0) and (common.c2f_b2i32(em_registrador((p.c as ^X64Ctx).f, &(p.i as ^bir.BirInstr).a)) != 0)) and (common.c2f_b2i32(origem_pisada(p, &(p.i as ^bir.BirInstr).a, 0)) != 0) {
+        return true
+    }
+    return (((p.i as ^bir.BirInstr).op == (bir.BIR_CHAMA_IND as u8)) and (common.c2f_b2i32(em_registrador((p.c as ^X64Ctx).f, &(p.i as ^bir.BirInstr).b)) != 0)) and (common.c2f_b2i32(origem_pisada(p, &(p.i as ^bir.BirInstr).b, 4294967295)) != 0)
+}
+
+// C: nativo/x64/x64_isel_fluxo.c:181
+proc guardar_origens_em_registrador(p: ^PlanoChamada) -> bool {
+    let i: ?^bir.BirInstr = p.i
+    var k: u32 = 0
+    while k < (i as ^bir.BirInstr).nargs {
+        if (common.c2f_b2i32(em_registrador((p.c as ^X64Ctx).f, &((i as ^bir.BirInstr).args or_else {})[k])) != 0) and (not guardar_no_slot(p.c as ^X64Ctx, &((i as ^bir.BirInstr).args or_else {})[k])) {
+            return false
+        }
+        k += 1
+    }
+    if ((p.oculto != 0) and (common.c2f_b2i32(em_registrador((p.c as ^X64Ctx).f, &(i as ^bir.BirInstr).a)) != 0)) and (not guardar_no_slot(p.c as ^X64Ctx, &(i as ^bir.BirInstr).a)) {
+        return false
+    }
+    return (((i as ^bir.BirInstr).op != (bir.BIR_CHAMA_IND as u8)) or (not em_registrador((p.c as ^X64Ctx).f, &(i as ^bir.BirInstr).b))) or (common.c2f_b2i32(guardar_no_slot(p.c as ^X64Ctx, &(i as ^bir.BirInstr).b)) != 0)
+}
+
+// C: nativo/x64/x64_isel_fluxo.c:195
+proc chamar_pelo_slot(c: ^X64Ctx, i: ^bir.BirInstr) -> bool {
+    var slot: MOperando = m_mem(X64_RIP, 0, 64)
+    slot.simbolo = c.obj_sim[i.simbolo]
+    if not x64_emitir(c, mi2(FX_LEA64_RM as u16, m_reg(X64_RAX, 64), slot)) {
+        return false
+    }
+    return x64_emitir(c, mi1(FX_CALL_M64 as u16, m_mem(X64_RAX, 0, 64)))
+}
+
+// C: nativo/x64/x64_isel_fluxo.c:203
+proc chamar_simbolo(c: ^X64Ctx, i: ^bir.BirInstr) -> bool {
+    let prog = c.p as ^bir.BirPrograma
+    if prog.simbolos[i.simbolo].tipo == (bir.BS_IMPORT as u8) {
+        return chamar_pelo_slot(c, i)
+    }
+    return x64_emitir(c, mi1(FX_CALL_REL32 as u16, m_simbolo(c.obj_sim[i.simbolo])))
+}
+
+// C: nativo/x64/x64_isel_fluxo.c:211 - CHAMA_IND: o endereco (b) vai para rax, depois dos argumentos; call rax
+proc chamar_pelo_endereco(p: ^PlanoChamada) -> bool {
+    let ins: ^bir.BirInstr = p.i as ^bir.BirInstr
+    let c: ^X64Ctx = p.c as ^X64Ctx
+    if not ler_origem(p, X64_RAX, &ins.b, bir.BE_NENHUMA as u8) {
+        return false
+    }
+    return x64_emitir(c, mi1(FX_CALL_R64 as u16, m_reg(X64_RAX, 64)))
+}
+
+// C: nativo/x64/x64_isel_fluxo.c:217
+proc classificar_argumentos_da_chamada(c: ^X64Ctx, i: ^bir.BirInstr, oculto: u32) -> bool {
+    if oculto != 0 {
+        let p_1 = c.cls or_else {}
+        p_1[0] = AbiArg{classe = bir.BC_I64}
+    }
+    for k in (0 as u32)..<i.nargs {
+        let p_2 = c.cls or_else {}
+        p_2[oculto + k] = AbiArg{classe = (i.args or_else {})[k].classe as i32, tam = (i.args or_else {})[k].tam}
+    }
+    if not abi_win_classificar((c.cls or_else {})[0..<i.nargs + oculto], (c.abi or_else {})) {
+        return x64_sem_regra(c, "chama", "argumento de classe fora do M1")
+    }
+    return true
+}
+
+// C: nativo/x64/x64_isel_fluxo.c:229
+proc colocar_argumentos_da_chamada(p: ^PlanoChamada) -> bool {
+    if (common.c2f_b2i32(p.perigo) != 0) and (not guardar_origens_em_registrador(p)) {
+        return false
+    }
+    if (not colocar_argumentos_de_pilha(p)) or (not colocar_argumentos_de_registrador(p)) {
+        return false
+    }
+    return (p.oculto == 0) or (common.c2f_b2i32(ler_origem(p, ((p.c as ^X64Ctx).abi or_else {})[0].reg, &(p.i as ^bir.BirInstr).a, bir.BE_NENHUMA as u8)) != 0)
+}
+
+// C: nativo/x64/x64_isel_fluxo.c:238
+proc emitir_chamada(c: ^X64Ctx, i: ^bir.BirInstr) -> bool {
+    var p: PlanoChamada = PlanoChamada{c = c, i = i, oculto = abi_win_oculto_da_chamada(i)}
+    if not classificar_argumentos_da_chamada(c, i, p.oculto) {
+        return false
+    }
+    p.perigo = ha_perigo_de_registrador(&p)
+    if not colocar_argumentos_da_chamada(&p) {
+        return false
+    }
+    var tern_1: i32 = 0
+    if i.op == (bir.BIR_CHAMA_IND as u8) {
+        tern_1 = common.c2f_b2i32(chamar_pelo_endereco(&p))
+    } else {
+        tern_1 = common.c2f_b2i32(chamar_simbolo(c, i))
+    }
+    return tern_1 != 0
+}
+
+// C: nativo/x64/x64_isel_fluxo.c:251
+proc guardar_retorno_agregado(c: ^X64Ctx, i: ^bir.BirInstr) -> bool {
+    if abi_win_oculto_da_chamada(i) != 0 {
+        return true
+    }
+    return (common.c2f_b2i32(isel_carregar(c, X64_RCX, &i.a, bir.BE_NENHUMA as u8)) != 0) and (common.c2f_b2i32(isel_gravar_bytes(c, X64_RCX, X64_RAX, i.a.tam)) != 0)
+}
+
+// C: nativo/x64/x64_isel_fluxo.c:258
+proc isel_chama(c: ^X64Ctx, i: ^bir.BirInstr) -> bool {
+    if sysv_eh_chamada_do_programa(c.p as ^bir.BirPrograma, i) {
+        return isel_chama_sysv(c, i)
+    }
+    if not emitir_chamada(c, i) {
+        return false
+    }
+    if i.a.tipo == (bir.BO_VREG as u8) {
+        return guardar_retorno_agregado(c, i)
+    }
+    return (i.dst == bir.BIR_SEM_VREG) or (common.c2f_b2i32(isel_guardar(c, i.dst, ABI_WIN_REG_RETORNO)) != 0)
+}
+
+// C: nativo/x64/x64_isel_fluxo.c:269
+proc isel_armadilha(c: ^X64Ctx, i: ^bir.BirInstr) -> bool {
+    return (common.c2f_b2i32(emitir_chamada(c, i)) != 0) and (common.c2f_b2i32(x64_emitir(c, mi0(FX_UD2 as u16))) != 0)
+}
+
+// C: nativo/x64/x64_isel_fluxo.c:276
+proc isel_salta(c: ^X64Ctx, i: ^bir.BirInstr) -> bool {
+    return isel_salto(c, i.alvo[0])
+}
+
+// C: nativo/x64/x64_isel_fluxo.c:282
+proc isel_desvia(c: ^X64Ctx, i: ^bir.BirInstr) -> bool {
+    let proximo: u32 = quadro_proximo_bloco(c)
+    var cond: AlocOperando = aloc_operando_de(c.f, i.a.id, 8)
+    if not aloc_carregar(c, FX_MOVZX32_RM8 as u16, m_reg(X64_RAX, 32), &cond) {
+        return false
+    }
+    let arg_1: MOperando = m_reg(X64_RAX, 32)
+    let arg_2: MOperando = m_reg(X64_RAX, 32)
+    if not x64_emitir(c, mi2(FX_TEST32_RR as u16, arg_2, arg_1)) {
+        return false
+    }
+    if (i.alvo[0] == proximo) and (i.alvo[1] != proximo) {
+        return x64_emitir(c, mi_cc(FX_JCC_REL32 as u16, X64_CC_E, m_bloco(i.alvo[1])))
+    }
+    if not x64_emitir(c, mi_cc(FX_JCC_REL32 as u16, X64_CC_NE, m_bloco(i.alvo[0]))) {
+        return false
+    }
+    return isel_salto(c, i.alvo[1])
+}
+
+// C: nativo/x64/x64_isel_fluxo.c:300
+proc retornar_agregado(c: ^X64Ctx, i: ^bir.BirInstr) -> bool {
+    let home: MOperando = m_mem(X64_RBP, abi_win_param_rbp(0), 64)
+    if common.c2f_s2u_32(abi_win_retorno(bir.BC_I64, i.a.tam)) == (ABI_RET_RAX as u32) {
+        return (common.c2f_b2i32(isel_carregar(c, X64_RAX, &i.a, bir.BE_NENHUMA as u8)) != 0) and (common.c2f_b2i32(isel_ler_bytes(c, X64_RAX, X64_RAX, i.a.tam)) != 0)
+    }
+    if (not isel_carregar(c, X64_RDX, &i.a, bir.BE_NENHUMA as u8)) or (not x64_emitir(c, mi2(FX_MOV64_RM as u16, m_reg(X64_RCX, 64), home))) {
+        return false
+    }
+    return (common.c2f_b2i32(isel_bloco_mem(c, i.a.tam)) != 0) and (common.c2f_b2i32(x64_emitir(c, mi2(FX_MOV64_RM as u16, m_reg(X64_RAX, 64), home))) != 0)
+}
+
+// C: nativo/x64/x64_isel_fluxo.c:311
+proc carregar_retorno(c: ^X64Ctx, i: ^bir.BirInstr) -> bool {
+    if i.a.tipo == (bir.BO_NADA as u8) {
+        return true
+    }
+    if i.a.tam != 0 {
+        return retornar_agregado(c, i)
+    }
+    return isel_carregar(c, ABI_WIN_REG_RETORNO, &i.a, bir.BE_NENHUMA as u8)
+}
+
+// C: nativo/x64/x64_isel_fluxo.c:321
+// C: nativo/x64/x64_isel_fluxo.c:321 - o epilogo e o salto ao bloco de indice nblocos; plantio 3 (so teste) soma 1 ao codigo de saida
+proc isel_retorna(c: ^X64Ctx, i: ^bir.BirInstr) -> bool {
+    if not carregar_retorno(c, i) {
+        return false
+    }
+    if isel_plantio(c, i) == 3 {
+        if not x64_emitir(c, mi2(FX_ADD32_RI as u16, m_reg(X64_RAX, 32), m_imed(1))) {
+            return false
+        }
+    }
+    return isel_salto(c, (c.f as ^bir.BirFuncao).nblocos)
+}

@@ -1,0 +1,166 @@
+// Marco rede R7: envio SMTP de vendor:net/mail contra tests\rede\servidor_mail.py (127.0.0.1, porta efemera, sem internet). Certificados de teste em tests\rede\certs\.
+// Argumentos (o verificar_libs.py passa): 1 = smtp:// plain, sem auth, recusa RCPT recusado@exemplo.com; 2 = smtp:// com STARTTLS + AUTH PLAIN; 3 = smtps:// com AUTH LOGIN; 4 = smtp:// mudo (nunca responde);
+// 5, 6, 7 = arquivos onde os servidores 1, 2, 3 gravam envelope + DATA; 8 = caminho do ca.pem. Usuario "usuario", senha "segredo".
+// Prova: envelope (MAIL, RCPT de to+cc+bcc), bcc fora do DATA, DATA igual ao build_message (a linha que comeca com '.' prova o dot-stuffing do curl), STARTTLS exigido, AUTH PLAIN e LOGIN, senha errada = auth,
+// RCPT 550 = rejected, servidor mudo = timeout. O boundary e gerado a cada envio: o teste o le do DATA recebido e remonta a mensagem com ele.
+// COMPILAR/RODAR: python language\exemplos_libs\verificar_libs.py --so smtp_local --backend x64   (SAIDA ESPERADA: smtp_local.esperado)
+
+import "std:file"
+import "std:mem"
+import "std:os"
+import "std:text"
+import "std:time" as tm
+import "vendor:net/mail" as mail
+
+// 2026-11-18 21:05 UTC; no fuso -03:00 o Date sai "Wed, 18 Nov 2026 18:05:00 -0300".
+proc data_fixa() -> tm.DateTime {
+    return tm.DateTime{year = 2026, month = 11, day = 18, hour = 21, minute = 5}
+}
+
+// Nome do erro para a saida.
+proc rotular(e: mail.MailError) -> str {
+    switch e {
+    case mail.MailError.invalid_address:
+        return "invalid_address"
+    case mail.MailError.cannot_resolve:
+        return "cannot_resolve"
+    case mail.MailError.cannot_connect:
+        return "cannot_connect"
+    case mail.MailError.timeout:
+        return "timeout"
+    case mail.MailError.tls:
+        return "tls"
+    case mail.MailError.auth:
+        return "auth"
+    case mail.MailError.rejected:
+        return "rejected"
+    case mail.MailError.protocol:
+        return "protocol"
+    case mail.MailError.not_found:
+        return "not_found"
+    case mail.MailError.out_of_memory:
+        return "out_of_memory"
+    case mail.MailError.other:
+        return "other"
+    }
+    return "?"
+}
+
+// Envia e imprime "<rotulo> enviado" ou "<rotulo> erro <nome>". Devolve true se enviou.
+proc enviar(rotulo: str, cfg: ^mail.SmtpConfig, msg: ^mail.Message) -> bool {
+    let a = mem.arena_create()
+    defer mem.arena_destroy(a)
+    switch e in mail.send(cfg, msg, alloc = a) {
+    case mail.MailError:
+        print(f"{rotulo} erro {rotular(e)}")
+        return false
+    default:
+        print(f"{rotulo} enviado")
+        return true
+    }
+    return false
+}
+
+// O boundary que o send gerou: o primeiro boundary="..." do DATA recebido ("x" se a mensagem nao e multipart).
+proc extrair_boundary(dados: str) -> str {
+    let _, depois, achou = text.cut(dados, "boundary=\"")
+    if not achou {
+        return "x"
+    }
+    let nome, _, _ = text.cut(depois, "\"")
+    return nome
+}
+
+// Le o arquivo que o servidor gravou, imprime o envelope e confere o DATA com build_message. oculto = endereco bcc que nao pode aparecer no DATA ("" = nao confere).
+proc conferir_recebido(rotulo: str, caminho: str, msg: ^mail.Message, oculto: str) {
+    let a = mem.arena_create()
+    defer mem.arena_destroy(a)
+    switch bruto in file.read_all(caminho, alloc = a) {
+    case [dynamic]u8:
+        let recebido = from_bytes(bruto[..], alloc = a)
+        let envelope, dados, achou = text.cut(recebido, "--DATA--\n")
+        print(text.trim(envelope))
+        switch esperado in mail.build_message(msg, boundary = extrair_boundary(dados), alloc = a) {
+        case str:
+            print(f"{rotulo} dados igual={dados == esperado} marca={achou}")
+        case mail.MailError:
+            print(f"{rotulo} build erro")
+        }
+        if len(oculto) > 0 {
+            let vazou = text.str_contains(dados, oculto)
+            print(f"{rotulo} bcc no texto={vazou}")
+        }
+    case file.FileError:
+        print(f"{rotulo} arquivo ausente")
+    }
+}
+
+// Servidor 1 (plain): to + cc + bcc no envelope, bcc fora do DATA, linha que comeca com '.' (dot-stuffing). Depois: starttls exigido (padrao) sem o servidor oferecer = tls; RCPT 550 = rejected.
+proc caso_plain(base: str, saida: str) {
+    var para: [1]str = {"destino@exemplo.com"}
+    var copia: [1]str = {"copia@exemplo.com"}
+    var oculta: [1]str = {"oculto@exemplo.com"}
+    var sem_anexo: [1]mail.Attachment = {}
+    var msg = mail.Message{from = "Remetente <remetente@exemplo.com>", to = para[..], cc = copia[..], bcc = oculta[..], subject = "Teste plain", text = ".linha com ponto\nsegunda linha\n", attachments = sem_anexo[0..<0], date_utc = data_fixa(), offset_s = -10800, message_id = "<smtp-1@exemplo.com>"}
+    var cfg = mail.SmtpConfig{url = base, user = "", password = "", starttls = false}
+    if enviar("plain", &cfg, &msg) {
+        conferir_recebido("plain", saida, &msg, "oculto@exemplo.com")
+    }
+    var exige = mail.SmtpConfig{url = base, user = "", password = ""}
+    _ = enviar("starttls_exigido", &exige, &msg)
+    var recusado: [1]str = {"recusado@exemplo.com"}
+    var msg_recusada = mail.Message{from = "remetente@exemplo.com", to = recusado[..], cc = copia[0..<0], bcc = copia[0..<0], subject = "Recusada", text = "x\n", attachments = sem_anexo[0..<0], date_utc = data_fixa(), offset_s = -10800, message_id = "<smtp-2@exemplo.com>"}
+    _ = enviar("rcpt_recusado", &cfg, &msg_recusada)
+}
+
+// Servidor 2 (STARTTLS + AUTH PLAIN): envia com a CA de teste; senha errada = auth.
+proc caso_starttls(base: str, saida: str, ca: str) {
+    var para: [1]str = {"destino@exemplo.com"}
+    var nada: [1]str = {}
+    var sem_anexo: [1]mail.Attachment = {}
+    var msg = mail.Message{from = "remetente@exemplo.com", to = para[..], cc = nada[0..<0], bcc = nada[0..<0], subject = "Teste STARTTLS", text = "Por STARTTLS\n", attachments = sem_anexo[0..<0], date_utc = data_fixa(), offset_s = -10800, message_id = "<smtp-3@exemplo.com>"}
+    var cfg = mail.SmtpConfig{url = base, user = "usuario", password = "segredo", ca_file = ca}
+    if enviar("starttls_plain", &cfg, &msg) {
+        conferir_recebido("starttls_plain", saida, &msg, "")
+    }
+    var errada = mail.SmtpConfig{url = base, user = "usuario", password = "errada", ca_file = ca}
+    _ = enviar("senha_errada", &errada, &msg)
+    var sem_ca = mail.SmtpConfig{url = base, user = "usuario", password = "segredo"}
+    _ = enviar("sem_ca", &sem_ca, &msg)
+}
+
+// Servidor 3 (smtps + AUTH LOGIN): mensagem com acento, html e um anexo (multipart), boundary gerado pelo send.
+proc caso_smtps(base: str, saida: str, ca: str) {
+    var para: [1]str = {"destino@exemplo.com"}
+    var nada: [1]str = {}
+    var dados: [4]u8 = {0, 1, 255, 10}
+    var anexos: [1]mail.Attachment = {mail.Attachment{name = "dados.bin", content_type = "application/octet-stream", data = dados[..]}}
+    var msg = mail.Message{from = "remetente@exemplo.com", to = para[..], cc = nada[0..<0], bcc = nada[0..<0], subject = "Olá, smtps", text = "Açúcar e ação\n", html = "<p>Açúcar</p>\n", attachments = anexos[..], date_utc = data_fixa(), offset_s = -10800, message_id = "<smtp-4@exemplo.com>"}
+    var cfg = mail.SmtpConfig{url = base, user = "usuario", password = "segredo", starttls = false, ca_file = ca}
+    if enviar("smtps_login", &cfg, &msg) {
+        conferir_recebido("smtps_login", saida, &msg, "")
+    }
+}
+
+// Servidor 4 (mudo): aceita a conexao e nunca responde; o prazo de 500 ms estoura.
+proc caso_mudo(base: str) {
+    var para: [1]str = {"destino@exemplo.com"}
+    var nada: [1]str = {}
+    var sem_anexo: [1]mail.Attachment = {}
+    var msg = mail.Message{from = "remetente@exemplo.com", to = para[..], cc = nada[0..<0], bcc = nada[0..<0], subject = "Mudo", text = "x\n", attachments = sem_anexo[0..<0], date_utc = data_fixa(), offset_s = -10800, message_id = "<smtp-5@exemplo.com>"}
+    var cfg = mail.SmtpConfig{url = base, user = "", password = "", starttls = false, timeout_ms = 500}
+    _ = enviar("mudo", &cfg, &msg)
+}
+
+proc main() {
+    defer mail.shutdown()
+    let args = os.args()
+    if len(args) < 9 {
+        print("uso: smtp_local <smtp plain> <smtp starttls> <smtps> <smtp mudo> <saida1> <saida2> <saida3> <ca.pem>")
+        os.exit(2)
+    }
+    caso_plain(args[1], saida = args[5])
+    caso_starttls(args[2], saida = args[6], ca = args[8])
+    caso_smtps(args[3], saida = args[7], ca = args[8])
+    caso_mudo(args[4])
+}

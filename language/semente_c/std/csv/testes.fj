@@ -1,0 +1,176 @@
+// std:csv - testes do modulo (V01). Anexados ao texto de std:csv SO em forja test std:csv (o build normal nao os ve).
+// Versao: 0.1.0. Changelog: 0.1.0 - V01: casos de std_wip\csv\teste.fj convertidos para test/expect (RFC 4180, aspas, quebra dentro de aspas, campos vazios, separador ponto e virgula, erros explicitos e escritor com ida e volta).
+// Sem import e sem proc main: o pedaco fica dentro do modulo, entao chama as procs dele SEM prefixo (reader_new, next_record, writer_new...).
+
+// Nome do erro com o prefixo que o teste antigo imprimia.
+proc descrever_erro(e: CsvError) -> str {
+    switch e {
+    case CsvError.aspas_nao_fechadas:
+        return "erro: aspas_nao_fechadas"
+    case CsvError.aspas_mal_posicionadas:
+        return "erro: aspas_mal_posicionadas"
+    case CsvError.separador_invalido:
+        return "erro: separador_invalido"
+    }
+    return "erro: desconhecido"
+}
+
+// Estado final do leitor: "ok" ou o nome do erro.
+proc fim_csv(erro: ?CsvError) -> str {
+    switch e in erro {
+    case CsvError:
+        return descrever_erro(e)
+    case none:
+        return "ok"
+    }
+    return "desconhecido"
+}
+
+test "CSV RFC 4180: CRLF e campos simples" {
+    var r = reader_new("aaa,bbb,ccc\r\nzzz,yyy,xxx\r\n", sep = VIRGULA)
+    defer reader_delete(&r)
+    var campos = make([dynamic]str, alloc = heap)
+    defer delete(campos)
+    expect(next_record(&r, fields = &campos))
+    let l1 = text.join(campos[..], "|", alloc = heap)
+    expect(l1 == "aaa|bbb|ccc")
+    delete(l1)
+    expect(next_record(&r, fields = &campos))
+    let l2 = text.join(campos[..], "|", alloc = heap)
+    expect(l2 == "zzz|yyy|xxx")
+    delete(l2)
+    expect(not next_record(&r, fields = &campos))
+    expect(fim_csv(r.erro) == "ok")
+}
+
+test "CSV aspas, aspa dobrada e virgula dentro do campo" {
+    var r = reader_new("\"campo, com virgula\",\"aspas \"\"dentro\"\"\",fim\n", sep = VIRGULA)
+    defer reader_delete(&r)
+    var campos = make([dynamic]str, alloc = heap)
+    defer delete(campos)
+    expect(next_record(&r, fields = &campos))
+    let l1 = text.join(campos[..], "|", alloc = heap)
+    expect(l1 == "campo, com virgula|aspas \"dentro\"|fim")
+    delete(l1)
+    expect(not next_record(&r, fields = &campos))
+    expect(fim_csv(r.erro) == "ok")
+}
+
+test "CSV quebra de linha dentro de aspas, CRLF e ultima linha sem quebra" {
+    var r = reader_new("\"linha1\nlinha2\",x\r\n\"y\",z", sep = VIRGULA)
+    defer reader_delete(&r)
+    var campos = make([dynamic]str, alloc = heap)
+    defer delete(campos)
+    expect(next_record(&r, fields = &campos))
+    let l1 = text.join(campos[..], "|", alloc = heap)
+    var pedacos = text.split(l1, "\n", alloc = heap)
+    expect(pedacos[0] == "linha1")
+    expect(pedacos[1] == "linha2|x")
+    delete(pedacos)
+    delete(l1)
+    expect(next_record(&r, fields = &campos))
+    let l2 = text.join(campos[..], "|", alloc = heap)
+    expect(l2 == "y|z")
+    delete(l2)
+    expect(not next_record(&r, fields = &campos))
+    expect(fim_csv(r.erro) == "ok")
+}
+
+test "CSV campos vazios e linha vazia" {
+    var r = reader_new(",,\n\nx,", sep = VIRGULA)
+    defer reader_delete(&r)
+    var campos = make([dynamic]str, alloc = heap)
+    defer delete(campos)
+    expect(next_record(&r, fields = &campos))
+    let l1 = text.join(campos[..], "|", alloc = heap)
+    expect(l1 == "||")
+    delete(l1)
+    expect(next_record(&r, fields = &campos))
+    let l2 = text.join(campos[..], "|", alloc = heap)
+    expect(l2 == "")
+    delete(l2)
+    expect(next_record(&r, fields = &campos))
+    let l3 = text.join(campos[..], "|", alloc = heap)
+    expect(l3 == "x|")
+    delete(l3)
+    expect(not next_record(&r, fields = &campos))
+    expect(fim_csv(r.erro) == "ok")
+}
+
+test "CSV separador ponto e virgula e campo citado vazio" {
+    var r = reader_new("a;\"b;c\";d\n\"\";\"\"", sep = PONTO_VIRGULA)
+    defer reader_delete(&r)
+    var campos = make([dynamic]str, alloc = heap)
+    defer delete(campos)
+    expect(next_record(&r, fields = &campos))
+    let l1 = text.join(campos[..], "|", alloc = heap)
+    expect(l1 == "a|b;c|d")
+    delete(l1)
+    expect(next_record(&r, fields = &campos))
+    let l2 = text.join(campos[..], "|", alloc = heap)
+    expect(l2 == "|")
+    delete(l2)
+    expect(not next_record(&r, fields = &campos))
+    expect(fim_csv(r.erro) == "ok")
+}
+
+test "CSV erro: aspas nao fechadas" {
+    var r = reader_new("\"abc,def\n", sep = VIRGULA)
+    defer reader_delete(&r)
+    var campos = make([dynamic]str, alloc = heap)
+    defer delete(campos)
+    expect(not next_record(&r, fields = &campos))
+    expect(fim_csv(r.erro) == "erro: aspas_nao_fechadas")
+}
+
+test "CSV erro: texto depois da aspa de fechamento" {
+    var r = reader_new("\"a\"b,c\n", sep = VIRGULA)
+    defer reader_delete(&r)
+    var campos = make([dynamic]str, alloc = heap)
+    defer delete(campos)
+    expect(not next_record(&r, fields = &campos))
+    expect(fim_csv(r.erro) == "erro: aspas_mal_posicionadas")
+}
+
+test "CSV erro: separador invalido" {
+    var r = reader_new("a,b\n", sep = "ab")
+    defer reader_delete(&r)
+    var campos = make([dynamic]str, alloc = heap)
+    defer delete(campos)
+    expect(not next_record(&r, fields = &campos))
+    expect(fim_csv(r.erro) == "erro: separador_invalido")
+}
+
+test "CSV escritor: citacao dos campos e ida e volta" {
+    var w = writer_new(VIRGULA)
+    defer writer_delete(&w)
+    var primeiro: [5]str = {"a", "b,c", "d\"e", "f\ng", ""}
+    write_record(&w, primeiro[..])
+    var segundo: [3]str = {"x", "y z", ""}
+    write_record(&w, segundo[..])
+    let texto = writer_texto(&w, alloc = heap)
+    defer delete(texto)
+    var linhas = text.split(texto, "\n", alloc = heap)
+    defer delete(linhas)
+    expect(linhas[0] == "a,\"b,c\",\"d\"\"e\",\"f")
+    expect(linhas[1] == "g\",")
+    expect(linhas[2] == "x,y z,")
+    expect(linhas[3] == "")
+    var r = reader_new(texto, sep = VIRGULA)
+    defer reader_delete(&r)
+    var campos = make([dynamic]str, alloc = heap)
+    defer delete(campos)
+    expect(next_record(&r, fields = &campos))
+    let l1 = text.join(campos[..], "|", alloc = heap)
+    var pedacos = text.split(l1, "\n", alloc = heap)
+    expect(pedacos[0] == "a|b,c|d\"e|f")
+    expect(pedacos[1] == "g|")
+    delete(pedacos)
+    delete(l1)
+    expect(next_record(&r, fields = &campos))
+    let l2 = text.join(campos[..], "|", alloc = heap)
+    expect(l2 == "x|y z|")
+    delete(l2)
+    expect(not next_record(&r, fields = &campos))
+    expect(fim_csv(r.erro) == "ok")
+}

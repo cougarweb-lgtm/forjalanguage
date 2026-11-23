@@ -1,0 +1,83 @@
+// erro_thread.fj (Linux) - M5c-b P57: o errno/estado de erro de uma thread nao vaza para outra e o runtime nao o zera. 4 threads (foreign pthread_create) fazem 2000 voltas de std:file:
+// as de id par leem um arquivo que existe (tem de ler 5 bytes), as de id impar leem um que nao existe (tem de dar FileError.not_found). Cada thread imprime
+// "T <id> ok <voltas>" ao fim (so se todas as voltas deram o resultado esperado) ou "T <id> ERRO <volta>". O harness roda no cwd com erro_thread_existe.tmp ja criado pela fixture.
+// Verificacao: python -I verificar_threads_linux.py --forja <forja.exe>
+import "std:os"
+import "std:file"
+
+foreign {
+    link "c"
+    proc pthread_create(tid: rawptr, atributos: u64, rotina: proc(p: rawptr) -> rawptr, parametro: rawptr) -> i32
+    proc pthread_join(tid: u64, retorno: u64) -> i32
+}
+
+const FIOS: int = 4
+const VOLTAS: int = 2000
+
+struct Carga {
+    id: int
+}
+
+proc leu_cinco_bytes() -> bool {
+    var ok = false
+    switch d in file.read_all("erro_thread_existe.tmp", alloc = heap) {
+    case [dynamic]u8:
+        ok = len(d) == 5
+        delete(d)
+    case file.FileError:
+        ok = false
+    }
+    return ok
+}
+
+proc deu_nao_achou() -> bool {
+    var ok = false
+    switch d in file.read_all("erro_thread_nao_existe.tmp", alloc = heap) {
+    case [dynamic]u8:
+        delete(d)
+    case file.FileError:
+        ok = d == file.FileError.not_found
+    }
+    return ok
+}
+
+proc deu_certo(par: bool) -> bool {
+    if par {
+        return leu_cinco_bytes()
+    }
+    return deu_nao_achou()
+}
+
+proc rotina(p: rawptr) -> rawptr {
+    let c = p as ^Carga
+    let par = c.id % 2 == 0
+    for i in 0..<VOLTAS {
+        if not deu_certo(par) {
+            print(f"T {c.id} ERRO {i}")
+            return p
+        }
+    }
+    print(f"T {c.id} ok {VOLTAS}")
+    return p
+}
+
+proc main() {
+    var dados: [5]u8 = {1, 2, 3, 4, 5}
+    _ = file.write_all("erro_thread_existe.tmp", data = dados[..])
+    var cargas = make([dynamic]^Carga, alloc = heap)
+    var fios = make([dynamic]u64, alloc = heap)
+    os.multithread_on()
+    for k in 0..<FIOS {
+        let c = new(Carga, alloc = heap)
+        c.id = k
+        append(&cargas, item = c)
+        append(&fios, item = 0)
+        _ = pthread_create(&fios[k] as rawptr, atributos = 0, rotina = rotina, parametro = c as rawptr)
+    }
+    for k in 0..<FIOS {
+        _ = pthread_join(fios[k], retorno = 0)
+        delete(cargas[k])
+    }
+    delete(cargas)
+    delete(fios)
+}

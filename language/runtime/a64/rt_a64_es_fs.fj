@@ -1,0 +1,775 @@
+// runtime/a64/rt_a64_es_fs.fj - std:file (handles fs_*, pastas e trava) do alvo aarch64-linux em Forja (A3.3h): modulo std:a64_es_fs
+// Versao: 0.4.1
+// Changelog: 0.4.1 - K1: R0009 de handle com os campos do x64 (kind forja_fs_abrir/forja_fs_pasta_abrir e destruidor); o exit segue 101 como o do x64 (medido pelo lote do WSL).
+//            0.4.0 - J1d: falhas de std:file (fs_erro_base, fs_falha_arquivo, fs_falha_pasta) gravam o errno para std:os.last_error (rt_os_erro_gravar).
+//                    0.3.0 - J1c: handles_relatar_vivos (dev): R0009 de handle aberto no fim do programa, uma linha por posicao viva (kind File ou DirList, sem pilha), como o rt_handles.c do x64; chamado pelo fim de rt_a64.fj.
+//                    0.2.0 - J1a: fs_copiar, fs_renomear e o laco de copia foram para std:a64_es_fs2 (rt_a64_es_fs2.fj), teto de 800 linhas; os helpers que eles usam viram pub.
+//                    0.1.0 - A3.3h: fs_abrir/ler/gravar/posicionar/descarregar/fechar, fs_info, fs_remover/renomear/copiar, fs_criar_pasta/remover_pasta,
+//                    fs_pasta_abrir/proximo/fechar sobre openat/read/write/lseek/fsync/newfstatat/unlinkat/renameat/mkdirat/getdents64/flock.
+//                    Tabela de 32 handles no heap (handle = geracao << 32 | indice+1, como o x64); buffer de 36 KiB por posicao (pasta e file.lock) fica
+//                    guardado na posicao, sem free. libmem_encerrou = no-op (a64 nao rastreia lib). handle_nasce/handle_solta = no-op: o R0009 de
+//                    handle vivo no fim do programa (dev) ainda NAO e relatado no a64 (pendencia: precisa do hook de fim em rt_a64.fj).
+// Os helpers de std:a64_es (openat, stat, erro de arquivo) sao reusados; a tabela e as syscalls de handle ficam aqui.
+
+import "std:wasm_rt" as wasm_rt
+import "std:a64_rt" as host
+import "std:a64_es" as es
+
+foreign {
+    proc sys_chamar = "forja_rt_syscall"(num: int, a0: int, a1: int, a2: int, a3: int, a4: int, a5: int) -> int
+    proc rt_modo_dev = "forja_rt_modo_dev"() -> bool
+}
+
+// syscalls do aarch64 (asm-generic/unistd.h)
+const FS_SYS_UNLINKAT: int = 35
+const FS_SYS_MKDIRAT: int = 34
+const FS_SYS_FLOCK: int = 32
+const FS_SYS_CLOSE: int = 57
+const FS_SYS_GETDENTS64: int = 61
+const FS_SYS_LSEEK: int = 62
+const FS_SYS_READ: int = 63
+const FS_SYS_WRITE: int = 64
+const FS_SYS_FSTAT: int = 80
+const FS_SYS_NEWFSTATAT: int = 79
+const FS_SYS_FSYNC: int = 82
+const FS_AT_FDCWD: int = -100
+const FS_AT_SEM_SEGUIR_LINK: int = 256
+const FS_AT_REMOVEDIR: int = 512
+const FS_LOCK_EX_NB: int = 6
+const FS_MODO_NOVO: int = 438
+const FS_MODO_PASTA_NOVA: int = 511
+// flags de open do aarch64 (asm-generic/fcntl.h): O_RDONLY|O_CLOEXEC, O_WRONLY|O_CREAT|O_TRUNC|O_CLOEXEC, ...; O_DIRECTORY = 040000 (0x4000) aqui, 0200000 no x86_64 (o qemu strace mostrou O_DIRECT no 0x10000)
+const FS_O_LER: int = 524288
+const FS_O_GRAVAR: int = 524865
+const FS_O_ANEXAR: int = 525377
+const FS_O_CRIAR: int = 524481
+const FS_O_PASTA: int = 540672
+const FS_O_TRAVA: int = 524353
+// errno positivos
+const FS_EPERM: int = 1
+const FS_ENOENT: int = 2
+const FS_EBADF: int = 9
+const FS_EAGAIN: int = 11
+const FS_EACCES: int = 13
+const FS_EEXIST: int = 17
+const FS_ENOTDIR: int = 20
+const FS_EISDIR: int = 21
+const FS_EROFS: int = 30
+const FS_ENAMETOOLONG: int = 36
+const FS_ENOTEMPTY: int = 39
+const FS_RET_EINTR: int = -4
+const FS_TENTATIVAS_TRAVA: int = 3
+// codigos neutros (FileError do std:file): FORJA_FS_ERR_* do x64
+const FS_ERR_NAO_EXISTE: int = 1
+const FS_ERR_SEM_PERMISSAO: int = 2
+const FS_ERR_OUTRO: int = 3
+const FS_ERR_JA_EXISTE: int = 4
+const FS_ERR_DIRETORIO: int = 5
+const FS_ERR_NAO_DIRETORIO: int = 6
+const FS_ERR_NAO_VAZIO: int = 7
+const FS_ERR_FECHADO: int = 9
+const FS_ERR_OCUPADO: int = 10
+// modos e origens, na ordem do runtime (FORJA_FS_MODO_* e FORJA_FS_ORIGEM_*)
+const FS_MODO_LER: int = 0
+const FS_MODO_GRAVAR: int = 1
+const FS_MODO_ANEXAR: int = 2
+const FS_MODO_CRIAR: int = 3
+const FS_MODO_TRAVA: int = 4
+const FS_ORIGEM_MAXIMA: int = 2
+// tipo do item (FORJA_FS_TIPO_*): arquivo, pasta, link, outro e busca (interno de pasta)
+const FS_TIPO_ARQUIVO: uint = 0
+const FS_TIPO_PASTA: uint = 1
+const FS_TIPO_LINK: uint = 2
+const FS_TIPO_OUTRO: uint = 3
+const FS_TIPO_BUSCA: uint = 4
+const FS_HANDLES_MAX: uint = 32
+const FS_ENTRADA_BYTES: uint = 64
+// campos de cada posicao da tabela (fd + 1 = 0 quando livre)
+const FS_OFF_FD: uint = 0
+const FS_OFF_GERACAO: uint = 8
+const FS_OFF_TIPO: uint = 16
+const FS_OFF_SO_LEITURA: uint = 24
+const FS_OFF_POS: uint = 32
+const FS_OFF_FIM: uint = 40
+const FS_OFF_BUFFER: uint = 48
+const FS_OFF_TRAVA: uint = 56
+// buffer de cada posicao: getdents64 nos primeiros 32 KiB; caminho do file.lock a partir de 32 KiB (ate PATH_MAX)
+const FS_BLOCO_PASTA: int = 32768
+const FS_BUF_BYTES: uint = 36864
+const FS_OFF_CAMINHO: uint = 32768
+const FS_BLOCO_COPIA: int = 65536
+const FS_LOTE_MAX: int = 1073741824
+const FS_SLOT_TABELA: uint = 1128
+const FS_SLOT_COPIA: uint = 1144
+// stat do aarch64 (128 B): st_mode u32 em 16 (nlink u32 em 20), st_size em 48, st_mtime em 88 (ns em 96)
+const FS_STAT_MODO: uint = 16
+const FS_STAT_TAMANHO: uint = 48
+const FS_STAT_MTIME: uint = 88
+const FS_STAT_MTIME_NS: uint = 96
+const FS_S_IFMT: uint = 61440
+const FS_S_IFREG: uint = 32768
+const FS_S_IFDIR: uint = 16384
+const FS_S_IFLNK: uint = 40960
+const FS_MASCARA_32: uint = 4294967295
+const FS_NS_POR_S: uint = 1000000000
+const FS_SEM_SEGUIR: int = 256
+// dirent64: reclen u16 em 16, tipo u8 em 18, nome a partir de 19
+const FS_DIRENT_RECLEN: uint = 16
+const FS_DIRENT_TIPO: uint = 18
+const FS_DIRENT_NOME: uint = 19
+const FS_DT_DESCONHECIDO: uint = 0
+const FS_DT_PASTA: uint = 4
+const FS_DT_ARQUIVO: uint = 8
+const FS_DT_LINK: uint = 10
+const FS_PONTO: uint = 46
+const FS_NUL: uint = 0
+const FS_BITS_BYTE: uint = 8
+const FS_MASCARA_BYTE: uint = 255
+const FS_FECHADO_NEG: int = -9
+const FS_OUTRO_NEG: int = -3
+
+// texto do fonte das falhas internas deste modulo
+proc texto_std() -> cstr {
+    return "std:file"
+}
+
+proc fs_zerar(inicio: uint, palavras: uint) {
+    var k: uint = 0
+    while k < palavras {
+        wasm_rt.memoria_escrever_u64(inicio + (k * 8), 0)
+        k += 1
+    }
+}
+
+// Tabela de 32 posicoes no heap, criada na 1a vez e guardada no estado (sem free)
+proc fs_tabela() -> uint {
+    var t: uint = wasm_rt.memoria_ler_u64(FS_SLOT_TABELA)
+    if t == 0 {
+        t = wasm_rt.heap_alocar(FS_HANDLES_MAX * FS_ENTRADA_BYTES)
+        if t == 0 {
+            host.falha_r0007_texto("sem memoria para a tabela de handles de std:file", (FS_HANDLES_MAX * FS_ENTRADA_BYTES) as int, transmute(texto_std() as rawptr, to = int), 0)
+        }
+        fs_zerar(t, FS_HANDLES_MAX * (FS_ENTRADA_BYTES / 8))
+        wasm_rt.memoria_escrever_u64(FS_SLOT_TABELA, t)
+    }
+    return t
+}
+
+proc fs_entrada(i: uint) -> uint {
+    return fs_tabela() + (i * FS_ENTRADA_BYTES)
+}
+
+proc fs_campo(e: uint, off: uint) -> uint {
+    return wasm_rt.memoria_ler_u64(e + off)
+}
+
+proc fs_ajustar(e: uint, off: uint, valor: uint) {
+    wasm_rt.memoria_escrever_u64(e + off, valor)
+}
+
+// Buffer da posicao (pasta ou caminho do file.lock): alocado 1x e reusado pela mesma posicao
+proc fs_buffer(e: uint) -> uint {
+    var b: uint = fs_campo(e, FS_OFF_BUFFER)
+    if b == 0 {
+        b = wasm_rt.heap_alocar(FS_BUF_BYTES)
+        if b == 0 {
+            host.falha_r0007_texto("sem memoria para o buffer de std:file", FS_BUF_BYTES as int, transmute(texto_std() as rawptr, to = int), 0)
+        }
+        fs_ajustar(e, FS_OFF_BUFFER, b)
+    }
+    return b
+}
+
+// Bloco de copia de fs_copiar: 64 KiB, alocado 1x
+pub proc fs_bloco_copia() -> uint {
+    var b: uint = wasm_rt.memoria_ler_u64(FS_SLOT_COPIA)
+    if b == 0 {
+        b = wasm_rt.heap_alocar(FS_BLOCO_COPIA as uint)
+        if b == 0 {
+            host.falha_r0007_texto("sem memoria para copiar arquivo em std:file", FS_BLOCO_COPIA as int, transmute(texto_std() as rawptr, to = int), 0)
+        }
+        wasm_rt.memoria_escrever_u64(FS_SLOT_COPIA, b)
+    }
+    return b
+}
+
+pub proc fs_fechar_fd(fd: int) {
+    _ = sys_chamar(FS_SYS_CLOSE, fd, 0, 0, 0, 0, 0)
+}
+
+// Handle -> posicao, ou 0 se fechado, de outro tipo ou de outra geracao
+proc fs_achar(h: uint, tipo: uint) -> uint {
+    let posicao: uint = h & FS_MASCARA_32
+    if (posicao == 0) or (posicao > FS_HANDLES_MAX) {
+        return 0
+    }
+    let e: uint = fs_entrada(posicao - 1)
+    if (fs_campo(e, FS_OFF_FD) == 0) or (fs_campo(e, FS_OFF_TIPO) != tipo) or (fs_campo(e, FS_OFF_GERACAO) != (h >> 32)) {
+        return 0
+    }
+    return e
+}
+
+// Posicao de arquivo aberto, ou 0 com erro = fechado
+proc fs_aberto(h: uint, erro: uint) -> uint {
+    let e: uint = fs_achar(h, FS_TIPO_ARQUIVO)
+    if e == 0 {
+        es.es_grava_i32(erro, FS_ERR_FECHADO)
+    }
+    return e
+}
+
+// Guarda o fd numa posicao livre: handle, ou 0 com erro = OUTRO (fecha o fd)
+proc fs_ocupar(fd: int, tipo: uint, so_leitura: int, erro: uint) -> uint {
+    var i: uint = 0
+    while i < FS_HANDLES_MAX {
+        let e: uint = fs_entrada(i)
+        if fs_campo(e, FS_OFF_FD) == 0 {
+            fs_ajustar(e, FS_OFF_FD, (fd + 1) as uint)
+            fs_ajustar(e, FS_OFF_TIPO, tipo)
+            fs_ajustar(e, FS_OFF_SO_LEITURA, so_leitura as uint)
+            fs_ajustar(e, FS_OFF_POS, 0)
+            fs_ajustar(e, FS_OFF_FIM, 0)
+            fs_ajustar(e, FS_OFF_TRAVA, 0)
+            return (fs_campo(e, FS_OFF_GERACAO) << 32) | (i + 1)
+        }
+        i += 1
+    }
+    fs_fechar_fd(fd)
+    es.es_grava_i32(erro, FS_ERR_OUTRO)
+    return 0
+}
+
+// Fecha a posicao: file.lock apaga o arquivo antes do close (como o DELETE_ON_CLOSE); a geracao sobe e o handle antigo deixa de valer
+proc fs_liberar(e: uint) {
+    if fs_campo(e, FS_OFF_TRAVA) == 1 {
+        let caminho: uint = fs_buffer(e) + FS_OFF_CAMINHO
+        _ = sys_chamar(FS_SYS_UNLINKAT, FS_AT_FDCWD, caminho as int, 0, 0, 0, 0)
+    }
+    fs_fechar_fd((fs_campo(e, FS_OFF_FD) as int) - 1)
+    fs_ajustar(e, FS_OFF_FD, 0)
+    fs_ajustar(e, FS_OFF_TRAVA, 0)
+    fs_ajustar(e, FS_OFF_GERACAO, fs_campo(e, FS_OFF_GERACAO) + 1)
+}
+
+// J1d: falha do kernel (retorno negativo = -errno) grava o errno positivo para std:os.last_error; sucesso nao grava
+proc fs_guardar_erro(retorno: int) {
+    if retorno < 0 {
+        host.rt_os_erro_gravar(0 - retorno)
+    }
+}
+
+// -errno do kernel -> codigo neutro (a tabela de es_erro_base do x64)
+pub proc fs_erro_base(retorno: int) -> int {
+    fs_guardar_erro(retorno)
+    let e: int = 0 - retorno
+    if (e == FS_ENOENT) or (e == FS_ENOTDIR) or (e == FS_ENAMETOOLONG) {
+        return FS_ERR_NAO_EXISTE
+    }
+    if (e == FS_EACCES) or (e == FS_EPERM) or (e == FS_EROFS) or (e == FS_EISDIR) {
+        return FS_ERR_SEM_PERMISSAO
+    }
+    if e == FS_EEXIST {
+        return FS_ERR_JA_EXISTE
+    }
+    if e == FS_ENOTEMPTY {
+        return FS_ERR_NAO_VAZIO
+    }
+    return FS_ERR_OUTRO
+}
+
+// read/write num fd aberto sem esse acesso (EBADF) = sem permissao
+proc fs_erro_acesso(retorno: int) -> int {
+    if retorno == (0 - FS_EBADF) {
+        return FS_ERR_SEM_PERMISSAO
+    }
+    return fs_erro_base(retorno)
+}
+
+// Falha em arquivo: acesso negado sobre uma pasta vira DIRETORIO
+pub proc fs_falha_arquivo(caminho: uint, retorno: int) -> int {
+    fs_guardar_erro(retorno)
+    let e: int = 0 - retorno
+    if ((e == FS_EISDIR) or (e == FS_EACCES) or (e == FS_EPERM) or (e == FS_EEXIST)) and (fs_tipo_caminho(caminho) == (FS_TIPO_PASTA as int)) {
+        return FS_ERR_DIRETORIO
+    }
+    return fs_erro_base(retorno)
+}
+
+// Falha em pasta: arquivo no lugar vira NAO_DIRETORIO; EEXIST do rmdir = NAO_VAZIO
+proc fs_falha_pasta(caminho: uint, retorno: int) -> int {
+    fs_guardar_erro(retorno)
+    if fs_tipo_caminho(caminho) == (FS_TIPO_ARQUIVO as int) {
+        return FS_ERR_NAO_DIRETORIO
+    }
+    if retorno == (0 - FS_EEXIST) {
+        return FS_ERR_NAO_VAZIO
+    }
+    return fs_erro_base(retorno)
+}
+
+// S_IFMT -> FileKind (arquivo, pasta, link, outro)
+pub proc fs_tipo_do_modo(modo: uint) -> uint {
+    let formato: uint = modo & FS_S_IFMT
+    if formato == FS_S_IFREG {
+        return FS_TIPO_ARQUIVO
+    }
+    if formato == FS_S_IFDIR {
+        return FS_TIPO_PASTA
+    }
+    if formato == FS_S_IFLNK {
+        return FS_TIPO_LINK
+    }
+    return FS_TIPO_OUTRO
+}
+
+// Tipo do que esta no caminho, sem seguir link; -1 se nao existe ou nao da para ver
+pub proc fs_tipo_caminho(caminho: uint) -> int {
+    let base: uint = es.es_scratch()
+    let r: int = sys_chamar(FS_SYS_NEWFSTATAT, FS_AT_FDCWD, caminho as int, base as int, FS_SEM_SEGUIR, 0, 0)
+    if r != 0 {
+        return -1
+    }
+    return fs_tipo_do_modo(wasm_rt.memoria_ler_u64(base + FS_STAT_MODO) & FS_MASCARA_32) as int
+}
+
+// Caminho vazio = nao existe (o runtime decide)
+pub proc fs_vazio(caminho: uint) -> bool {
+    return wasm_rt.memoria_ler_u8(caminho) == FS_NUL
+}
+
+// Quantos links em fd (0 = apagado): st_nlink de fstat; falha = 1 (segue vivo)
+proc fs_nlink(fd: int) -> uint {
+    let base: uint = es.es_scratch()
+    if sys_chamar(FS_SYS_FSTAT, fd, base as int, 0, 0, 0, 0) != 0 {
+        return 1
+    }
+    return wasm_rt.memoria_ler_u64(base + FS_STAT_MODO) >> 32
+}
+
+// file.lock: flock LOCK_EX|LOCK_NB; fd com a trava ou -errno (-EAGAIN = outro handle tem o arquivo)
+proc fs_abrir_trava(caminho: uint) -> int {
+    var tentativa: int = 0
+    while tentativa < FS_TENTATIVAS_TRAVA {
+        let fd: int = es.es_abrir(caminho, FS_O_TRAVA, FS_MODO_NOVO)
+        if fd < 0 {
+            return fd
+        }
+        let r: int = sys_chamar(FS_SYS_FLOCK, fd, FS_LOCK_EX_NB, 0, 0, 0, 0)
+        if r != 0 {
+            fs_fechar_fd(fd)
+            return r
+        }
+        if fs_nlink(fd) > 0 {
+            return fd
+        }
+        fs_fechar_fd(fd)
+        tentativa += 1
+    }
+    return 0 - FS_EAGAIN
+}
+
+// Guarda a trava com uma copia do caminho no buffer da posicao (o close apaga o arquivo)
+proc fs_guardar_trava(fd: int, caminho: uint, erro: uint) -> uint {
+    let h: uint = fs_ocupar(fd, FS_TIPO_ARQUIVO, 0, erro)
+    if h == 0 {
+        return 0
+    }
+    let e: uint = fs_achar(h, FS_TIPO_ARQUIVO)
+    let b: uint = fs_buffer(e)
+    var k: uint = 0
+    while true {
+        let c: uint = wasm_rt.memoria_ler_u8(caminho + k)
+        wasm_rt.memoria_escrever_u8(b + FS_OFF_CAMINHO + k, c)
+        if c == FS_NUL {
+            break
+        }
+        k += 1
+    }
+    fs_ajustar(e, FS_OFF_TRAVA, 1)
+    return h
+}
+
+proc fs_flags_do_modo(modo: int) -> int {
+    if modo == FS_MODO_LER {
+        return FS_O_LER
+    }
+    if modo == FS_MODO_GRAVAR {
+        return FS_O_GRAVAR
+    }
+    if modo == FS_MODO_ANEXAR {
+        return FS_O_ANEXAR
+    }
+    if modo == FS_MODO_CRIAR {
+        return FS_O_CRIAR
+    }
+    if modo == FS_MODO_TRAVA {
+        return FS_O_TRAVA
+    }
+    return -1
+}
+
+// Abre o arquivo no modo: handle, ou 0 com erro. Pasta aberta para leitura = DIRETORIO.
+pub proc fs_abrir(caminho: uint, modo: int, erro: uint) -> uint {
+    let flags: int = fs_flags_do_modo(modo)
+    if flags < 0 {
+        es.es_grava_i32(erro, FS_ERR_OUTRO)
+        return 0
+    }
+    if fs_vazio(caminho) {
+        es.es_grava_i32(erro, FS_ERR_NAO_EXISTE)
+        return 0
+    }
+    var fd: int = 0
+    if modo == FS_MODO_TRAVA {
+        fd = fs_abrir_trava(caminho)
+    } else {
+        fd = es.es_abrir(caminho, flags, FS_MODO_NOVO)
+    }
+    if fd < 0 {
+        var codigo: int = fs_falha_arquivo(caminho, fd)
+        if (modo == FS_MODO_TRAVA) and (fd == (0 - FS_EAGAIN)) {
+            codigo = FS_ERR_OCUPADO
+        }
+        es.es_grava_i32(erro, codigo)
+        return 0
+    }
+    if modo == FS_MODO_TRAVA {
+        return fs_guardar_trava(fd, caminho, erro)
+    }
+    if (modo == FS_MODO_LER) and (es.es_formato_fd(fd) == FS_S_IFDIR) {
+        fs_fechar_fd(fd)
+        es.es_grava_i32(erro, FS_ERR_DIRETORIO)
+        return 0
+    }
+    var so_leitura: int = 0
+    if modo == FS_MODO_LER {
+        so_leitura = 1
+    }
+    return fs_ocupar(fd, FS_TIPO_ARQUIVO, so_leitura, erro)
+}
+
+// Le ate n bytes (no maximo 1 GiB por chamada): quantos leu, 0 = fim, -1 com erro
+pub proc fs_ler(h: uint, destino: uint, n: int, erro: uint) -> int {
+    let e: uint = fs_aberto(h, erro)
+    if e == 0 {
+        return -1
+    }
+    if n <= 0 {
+        return 0
+    }
+    var lote: int = n
+    if lote > FS_LOTE_MAX {
+        lote = FS_LOTE_MAX
+    }
+    let fd: int = (fs_campo(e, FS_OFF_FD) as int) - 1
+    var r: int = sys_chamar(FS_SYS_READ, fd, destino as int, lote, 0, 0, 0)
+    while r == FS_RET_EINTR {
+        r = sys_chamar(FS_SYS_READ, fd, destino as int, lote, 0, 0, 0)
+    }
+    if r < 0 {
+        es.es_grava_i32(erro, fs_erro_acesso(r))
+        return -1
+    }
+    return r
+}
+
+// Grava os n bytes inteiros em lotes de 1 GiB: quantos gravou (= n) ou -1 com erro
+pub proc fs_gravar(h: uint, origem: uint, n: int, erro: uint) -> int {
+    let e: uint = fs_aberto(h, erro)
+    if e == 0 {
+        return -1
+    }
+    let fd: int = (fs_campo(e, FS_OFF_FD) as int) - 1
+    var feito: int = 0
+    while feito < n {
+        var lote: int = n - feito
+        if lote > FS_LOTE_MAX {
+            lote = FS_LOTE_MAX
+        }
+        let r: int = sys_chamar(FS_SYS_WRITE, fd, (origem as int) + feito, lote, 0, 0, 0)
+        if r == FS_RET_EINTR {
+            continue
+        }
+        if r < 0 {
+            es.es_grava_i32(erro, fs_erro_acesso(r))
+            return -1
+        }
+        if r == 0 {
+            es.es_grava_i32(erro, FS_ERR_OUTRO)
+            return -1
+        }
+        feito += r
+    }
+    return feito
+}
+
+// lseek: posicao nova, ou -1 com erro (origem fora de 0..2 = OUTRO)
+pub proc fs_posicionar(h: uint, desloc: int, origem: int, erro: uint) -> int {
+    let e: uint = fs_aberto(h, erro)
+    if e == 0 {
+        return -1
+    }
+    if (origem < 0) or (origem > FS_ORIGEM_MAXIMA) {
+        es.es_grava_i32(erro, FS_ERR_OUTRO)
+        return -1
+    }
+    let fd: int = (fs_campo(e, FS_OFF_FD) as int) - 1
+    let r: int = sys_chamar(FS_SYS_LSEEK, fd, desloc, origem, 0, 0, 0)
+    if r < 0 {
+        es.es_grava_i32(erro, fs_erro_base(r))
+        return -1
+    }
+    return r
+}
+
+// fsync: 0, ou -1 com erro (arquivo so de leitura = sem permissao)
+pub proc fs_descarregar(h: uint, erro: uint) -> i32 {
+    let e: uint = fs_aberto(h, erro)
+    if e == 0 {
+        return -1
+    }
+    if fs_campo(e, FS_OFF_SO_LEITURA) == 1 {
+        es.es_grava_i32(erro, FS_ERR_SEM_PERMISSAO)
+        return -1
+    }
+    let r: int = sys_chamar(FS_SYS_FSYNC, (fs_campo(e, FS_OFF_FD) as int) - 1, 0, 0, 0, 0, 0)
+    if r < 0 {
+        es.es_grava_i32(erro, fs_erro_base(r))
+        return -1
+    }
+    return 0
+}
+
+// Fecha o handle; handle ja fechado ou invalido nao faz nada
+pub proc fs_fechar(h: uint) {
+    let e: uint = fs_achar(h, FS_TIPO_ARQUIVO)
+    if e != 0 {
+        fs_liberar(e)
+    }
+}
+
+// Consulta sem seguir link: tamanho (so arquivo; pasta e link = 0), mtime_ns (UTC desde 1970) e tipo. 0 ou o codigo neutro
+pub proc fs_info(caminho: uint, tamanho: uint, mtime_ns: uint, tipo: uint) -> i32 {
+    if fs_vazio(caminho) {
+        return FS_ERR_NAO_EXISTE as i32
+    }
+    let base: uint = es.es_scratch()
+    let r: int = sys_chamar(FS_SYS_NEWFSTATAT, FS_AT_FDCWD, caminho as int, base as int, FS_SEM_SEGUIR, 0, 0)
+    if r != 0 {
+        return fs_erro_base(r) as i32
+    }
+    let tip: uint = fs_tipo_do_modo(wasm_rt.memoria_ler_u64(base + FS_STAT_MODO) & FS_MASCARA_32)
+    var tam: uint = 0
+    if tip == FS_TIPO_ARQUIVO {
+        tam = wasm_rt.memoria_ler_u64(base + FS_STAT_TAMANHO)
+    }
+    let segundos: uint = wasm_rt.memoria_ler_u64(base + FS_STAT_MTIME)
+    let nanos: uint = wasm_rt.memoria_ler_u64(base + FS_STAT_MTIME_NS)
+    wasm_rt.memoria_escrever_u64(tamanho, tam)
+    wasm_rt.memoria_escrever_u64(mtime_ns, (segundos * FS_NS_POR_S) + nanos)
+    es.es_grava_i32(tipo, tip as int)
+    return 0
+}
+
+// Apaga um arquivo (nunca pasta): 0 ou o codigo neutro
+pub proc fs_remover(caminho: uint) -> i32 {
+    if fs_vazio(caminho) {
+        return FS_ERR_NAO_EXISTE as i32
+    }
+    let r: int = sys_chamar(FS_SYS_UNLINKAT, FS_AT_FDCWD, caminho as int, 0, 0, 0, 0)
+    if r == 0 {
+        return 0
+    }
+    return fs_falha_arquivo(caminho, r) as i32
+}
+
+// Cria uma pasta (so o ultimo nivel): 0 ou o codigo neutro
+pub proc fs_criar_pasta(caminho: uint) -> i32 {
+    if fs_vazio(caminho) {
+        return FS_ERR_NAO_EXISTE as i32
+    }
+    let r: int = sys_chamar(FS_SYS_MKDIRAT, FS_AT_FDCWD, caminho as int, FS_MODO_PASTA_NOVA, 0, 0, 0)
+    if r == 0 {
+        return 0
+    }
+    return fs_erro_base(r) as i32
+}
+
+// Remove a pasta vazia: cheia = NAO_VAZIO, arquivo = NAO_DIRETORIO
+pub proc fs_remover_pasta(caminho: uint) -> i32 {
+    if fs_vazio(caminho) {
+        return FS_ERR_NAO_EXISTE as i32
+    }
+    let r: int = sys_chamar(FS_SYS_UNLINKAT, FS_AT_FDCWD, caminho as int, FS_AT_REMOVEDIR, 0, 0, 0)
+    if r == 0 {
+        return 0
+    }
+    return fs_falha_pasta(caminho, r) as i32
+}
+
+// Abre a pasta para listar (sem "." nem ".."): handle da busca, ou 0 com erro
+pub proc fs_pasta_abrir(caminho: uint, erro: uint) -> uint {
+    if fs_vazio(caminho) {
+        es.es_grava_i32(erro, FS_ERR_NAO_EXISTE)
+        return 0
+    }
+    let fd: int = es.es_abrir(caminho, FS_O_PASTA, 0)
+    if fd < 0 {
+        es.es_grava_i32(erro, fs_falha_pasta(caminho, fd))
+        return 0
+    }
+    return fs_ocupar(fd, FS_TIPO_BUSCA, 0, erro)
+}
+
+// Enche o buffer da busca com getdents64 quando acabou: 1 = ha registro, 0 = fim, negativo = -codigo
+proc fs_recarregar(e: uint) -> int {
+    let pos: uint = fs_campo(e, FS_OFF_POS)
+    if pos < fs_campo(e, FS_OFF_FIM) {
+        return 1
+    }
+    let fd: int = (fs_campo(e, FS_OFF_FD) as int) - 1
+    let b: uint = fs_buffer(e)
+    var r: int = sys_chamar(FS_SYS_GETDENTS64, fd, b as int, FS_BLOCO_PASTA, 0, 0, 0)
+    while r == FS_RET_EINTR {
+        r = sys_chamar(FS_SYS_GETDENTS64, fd, b as int, FS_BLOCO_PASTA, 0, 0, 0)
+    }
+    if r < 0 {
+        return 0 - fs_erro_base(r)
+    }
+    if r == 0 {
+        return 0
+    }
+    fs_ajustar(e, FS_OFF_POS, 0)
+    fs_ajustar(e, FS_OFF_FIM, r as uint)
+    return 1
+}
+
+proc fs_nome_oculto(nome: uint) -> bool {
+    if wasm_rt.memoria_ler_u8(nome) != FS_PONTO {
+        return false
+    }
+    let segundo: uint = wasm_rt.memoria_ler_u8(nome + 1)
+    if segundo == FS_NUL {
+        return true
+    }
+    return (segundo == FS_PONTO) and (wasm_rt.memoria_ler_u8(nome + 2) == FS_NUL)
+}
+
+proc fs_tamanho_texto(nome: uint) -> int {
+    var k: uint = 0
+    while wasm_rt.memoria_ler_u8(nome + k) != FS_NUL {
+        k += 1
+    }
+    return k as int
+}
+
+// Tipo do item pelo d_type; DT_UNKNOWN consulta o nome relativo ao fd da pasta (sem seguir link)
+proc fs_tipo_do_item(e: uint, dtipo: uint, nome: uint) -> uint {
+    if dtipo == FS_DT_ARQUIVO {
+        return FS_TIPO_ARQUIVO
+    }
+    if dtipo == FS_DT_PASTA {
+        return FS_TIPO_PASTA
+    }
+    if dtipo == FS_DT_LINK {
+        return FS_TIPO_LINK
+    }
+    if dtipo == FS_DT_DESCONHECIDO {
+        let base: uint = es.es_scratch()
+        let fd: int = (fs_campo(e, FS_OFF_FD) as int) - 1
+        if sys_chamar(FS_SYS_NEWFSTATAT, fd, nome as int, base as int, FS_SEM_SEGUIR, 0, 0) == 0 {
+            return fs_tipo_do_modo(wasm_rt.memoria_ler_u64(base + FS_STAT_MODO) & FS_MASCARA_32)
+        }
+    }
+    return FS_TIPO_OUTRO
+}
+
+// Proximo item: tamanho do nome (com NUL logo depois em destino), 0 = fim, negativo = -codigo; tipo recebe o FileKind
+pub proc fs_pasta_proximo(h: uint, destino: uint, n: int, tipo: uint) -> int {
+    let e: uint = fs_achar(h, FS_TIPO_BUSCA)
+    if e == 0 {
+        return FS_FECHADO_NEG
+    }
+    while true {
+        let estado: int = fs_recarregar(e)
+        if estado <= 0 {
+            return estado
+        }
+        let pos: uint = fs_campo(e, FS_OFF_POS)
+        let reg: uint = fs_buffer(e) + pos
+        let reclen: uint = wasm_rt.memoria_ler_u8(reg + FS_DIRENT_RECLEN) | (wasm_rt.memoria_ler_u8(reg + FS_DIRENT_RECLEN + 1) << FS_BITS_BYTE)
+        fs_ajustar(e, FS_OFF_POS, pos + reclen)
+        let dtipo: uint = wasm_rt.memoria_ler_u8(reg + FS_DIRENT_TIPO)
+        let nome: uint = reg + FS_DIRENT_NOME
+        if fs_nome_oculto(nome) {
+            continue
+        }
+        let tam: int = fs_tamanho_texto(nome)
+        if (tam + 1) > n {
+            return FS_OUTRO_NEG
+        }
+        var k: uint = 0
+        while k <= (tam as uint) {
+            wasm_rt.memoria_escrever_u8(destino + k, wasm_rt.memoria_ler_u8(nome + k))
+            k += 1
+        }
+        es.es_grava_i32(tipo, fs_tipo_do_item(e, dtipo, nome) as int)
+        return tam
+    }
+    return FS_OUTRO_NEG
+}
+
+// Fecha a busca de pasta; handle ja fechado nao faz nada
+pub proc fs_pasta_fechar(h: uint) {
+    let e: uint = fs_achar(h, FS_TIPO_BUSCA)
+    if e != 0 {
+        fs_liberar(e)
+    }
+}
+
+// forja_libmem_encerrou: no a64 nao ha rastreio de lib (rt_libmem), nada a fazer
+pub proc libmem_encerrou(simbolo: uint) {
+}
+
+// forja_handle_nasce / forja_handle_solta (dev, foreign com creates/destroys): nao ha lista extra; a tabela de fs_* e o rastreio (handles_relatar_vivos)
+pub proc handle_nasce(kind: uint, h: uint, indireto: i32, destruidor: uint) {
+}
+
+pub proc handle_solta(h: uint) {
+}
+
+// R0009 de handle vivo no fim do programa (dev, J1c): uma linha por posicao da tabela ainda aberta, como o rt_handles.c do x64 (sem pilha).
+// Devolve quantas eram; release nao checa e devolve 0. Sem tabela criada (slot 0) nao aloca nada.
+pub proc handles_relatar_vivos() -> i32 {
+    if (not rt_modo_dev()) or (wasm_rt.memoria_ler_u64(FS_SLOT_TABELA) == 0) {
+        return 0
+    }
+    var vivos: i32 = 0
+    for i in (0 as uint)..<FS_HANDLES_MAX {
+        let e: uint = fs_entrada(i)
+        if fs_campo(e, FS_OFF_FD) != 0 {
+            fs_relatar_linha(fs_campo(e, FS_OFF_TIPO))
+            vivos += 1
+        }
+    }
+    return vivos
+}
+
+// Uma linha R0009 de handle com os campos do x64 (kind = simbolo `creates`, destruidor = simbolo `destroys`; sem a pilha):
+// busca de pasta (FS_TIPO_BUSCA) = forja_fs_pasta_abrir/forja_fs_pasta_fechar, os demais = forja_fs_abrir/forja_arquivo_fechar
+proc fs_relatar_linha(tipo: uint) {
+    var kind: str = "forja_fs_abrir"
+    var destruidor: str = "forja_arquivo_fechar"
+    if tipo == FS_TIPO_BUSCA {
+        kind = "forja_fs_pasta_abrir"
+        destruidor = "forja_fs_pasta_fechar"
+    }
+    host.rt_erro_str("{\"codigo\": \"R0009\", \"tipo\": \"handle\", \"kind\": \"")
+    host.rt_erro_str(kind)
+    host.rt_erro_str("\", \"destruidor\": \"")
+    host.rt_erro_str(destruidor)
+    host.rt_erro_str("\", \"arquivo\": \"std:file\", \"linha\": 0, \"causa\": \"vazamento: handle ")
+    host.rt_erro_str(kind)
+    host.rt_erro_str(" vivo no fim do programa: falta fechar (destroys)\"}\n")
+}

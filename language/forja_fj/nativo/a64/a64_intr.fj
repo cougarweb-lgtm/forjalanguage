@@ -1,0 +1,393 @@
+// nativo/a64/a64_intr.fj - intrinsecos do alvo aarch64-linux: o minimo para forja_rt_syscall (contrato_a64 §3.4)
+// Versao: 0.9.0
+// Changelog: 0.9.0 - I3: no alvo iOS (c.macho) forja_rt_syscall nao vira `svc`: vai pela ponte para o proc rt_syscall de std:a64_ios.
+//            0.8.0 - A3.3k: forja_memcpy/forja_memset inline (laco ldp/stp de 16 B, cauda byte a byte; LENTO = BL da ponte para memmove, enderecos nulos ou baixos).
+//            0.7.0 - A3.3h: forja_math_roundf (f32 = frinta, como forja_math_round) e forja_math_truncf (f32 = frintz, como forja_math_trunc).
+//            0.6.0 - A3.3h: forja_math_ceilf (f32 teto = frintp, como forja_math_ceil).
+//            0.5.0 - A3.3g: forja_math_floorf (f32 floor = frintm no tipo f32 da BIR, mesmo arredonda do f64).
+//                    0.4.0 - A2.2(d): forja_rt_estado_base (adrp+add no .data forja_rt_estado, 4 KiB), forja_rt_modo_dev (const pelo modo do programa),
+//                    forja_rt_trunc_i32/i64 (fcvtzs, satura), forja_rt_floor e forja_math_floor/ceil/trunc/round (frintm/p/z/a); o resto do runtime vai pela ponte.
+//            0.3.0 - A2.2(b): BS_RUNTIME forja_X sem intrinseco e com proc da ponte (a64_alcance.fj) vira BL.
+//            0.2.0 - A1.3(iv): forja_fio_da_ponte (prologo da ponte, BS_RUNTIME sem argumentos) = nada a emitir no A1 (sem thread de fora).
+//            0.1.0 - A1.3(i): forja_rt_syscall(num, a0..a5) -> int = `mov x8,num ; mov x0..x5 ; svc #0` (resultado em x0; erro = -errno, como o kernel).
+//                    Reconhece o BS_RUNTIME `forja_rt_syscall` (runtime em Forja, A2.2) e, so enquanto nao ha runtime, o import `syscall` da libc
+//                    (BS_IMPORT `__imp_syscall`): o usuario nao pode declarar `foreign forja_*` (E0905), entao as fixtures sem runtime declaram
+//                    `link "c"` + `proc syscall(num, a0..a5) -> int`, que o x86_64-linux resolve na libc (oraculo) e aqui vira o mesmo svc.
+//                    Qualquer outro runtime = X0001 (A2.2); qualquer outro import = X0003 (foreign com link so a partir do A4).
+
+import "common"
+import "nativo/bir"
+import "nativo/obj"
+
+const A64_NOME_SYSCALL_RT: str = "forja_rt_syscall"
+const A64_NOME_SYSCALL_LIBC: str = "__imp_syscall"
+const A64_NOME_FIO_PONTE: str = "forja_fio_da_ponte"
+const A64_ARGS_SYSCALL: u32 = 7
+const R_NUMERO_SYSCALL: u32 = 8
+
+proc a64_eh_syscall(sim: ^bir.BirSimbolo) -> bool {
+    let nome = sim.nome or_else ""
+    if (sim.tipo as i32) == bir.BS_RUNTIME {
+        return nome == A64_NOME_SYSCALL_RT
+    }
+    return ((sim.tipo as i32) == bir.BS_IMPORT) and (nome == A64_NOME_SYSCALL_LIBC)
+}
+
+// svc #0 com x8 = args[0] e x0..x5 = args[1..6]
+proc a64_intr_syscall(c: ^A64Ctx, ins: ^bir.BirInstr) -> bool {
+    if ins.nargs != A64_ARGS_SYSCALL {
+        return a64_recusa(c, "forja_rt_syscall com numero de argumentos diferente de 7")
+    }
+    let args: []bir.BirOperando = ins.args or_else {}
+    for k in (0 as u32)..<ins.nargs {
+        if (args[k].tam != 0) or (not a64_classe_inteira(args[k].classe)) {
+            return a64_recusa(c, "forja_rt_syscall com argumento que nao e inteiro")
+        }
+        var reg: u32 = R_NUMERO_SYSCALL
+        if k > 0 {
+            reg = k - 1
+        }
+        if not a64_operando(c, reg, &args[k]) {
+            return false
+        }
+    }
+    a64_op(c, A64F_SVC, false, A64Ops{imm = 0})
+    a64_resultado(c, ins, 0)
+    return true
+}
+
+const A64_NOME_ESTADO_BASE: str = "forja_rt_estado_base"
+const A64_NOME_MODO_DEV: str = "forja_rt_modo_dev"
+const A64_NOME_TRUNC_I32: str = "forja_rt_trunc_i32"
+const A64_NOME_TRUNC_I64: str = "forja_rt_trunc_i64"
+const A64_NOME_FLOOR_RT: str = "forja_rt_floor"
+const A64_NOME_MATH_FLOOR: str = "forja_math_floor"
+const A64_NOME_MATH_FLOORF: str = "forja_math_floorf"
+const A64_NOME_MATH_CEIL: str = "forja_math_ceil"
+const A64_NOME_MATH_CEILF: str = "forja_math_ceilf"
+const A64_NOME_MATH_ROUNDF: str = "forja_math_roundf"
+const A64_NOME_MATH_TRUNCF: str = "forja_math_truncf"
+const A64_NOME_MATH_TRUNC: str = "forja_math_trunc"
+const A64_NOME_MATH_ROUND: str = "forja_math_round"
+const A64_NOME_ESTADO: str = "forja_rt_estado"
+const A64_TAM_ESTADO: u32 = 4096
+const A64_RET_ESTADO_MAX: u32 = 4095 // enderecos de retorno ate aqui sao do estado (rt_ponteiro_de)
+const A64_COND_RET_LS: u32 = 9 // cond LS (x <= y sem sinal) do cmp acima
+
+// .data forja_rt_estado (4 KiB zerados, alinhado a 16): criado na 1a referencia; o rt_a64 usa os slots de 1 a 4095 (rt_ponteiro_de)
+proc a64_garantir_estado(c: ^A64Ctx) {
+    if obj.obj_achar_simbolo(c.o, A64_NOME_ESTADO) >= 0 {
+        return
+    }
+    let secao: u32 = obj.obj_secao_abrir(c.o, ".data", obj.OS_DATA, 16)
+    let dados: ^obj.ObjSecao = &c.o.secoes[secao as u64]
+    var k: u32 = 0
+    while k < A64_TAM_ESTADO {
+        append(&dados.bytes, item = (0 as u8))
+        k += 1
+    }
+    _ = obj.obj_simbolo_definir(c.o, A64_NOME_ESTADO, secao as i32, 0)
+}
+
+// adrp + add do .data forja_rt_estado em rd (relocs ADR_PAGE e ADD_LO12, como END_SIMBOLO): usado pelo intrinseco e pelo retorno da ponte
+proc a64_estado_em(c: ^A64Ctx, rd: u32) {
+    a64_garantir_estado(c)
+    let sim: u32 = obj.obj_simbolo_referir(c.o, A64_NOME_ESTADO)
+    let off_adrp = a64_offset(c)
+    a64_palavra(c, a64_cod_adr(A64F_ADRP, 0 as i64, rd))
+    obj.obj_relocar(c.o, obj.ObjAlvoReloc{secao = c.texto, off = off_adrp}, obj.ObjCorrecao{tipo = obj.OR_A64_ADR_PAGE, simbolo = sim, adendo = 0})
+    let off_add = a64_offset(c)
+    a64_op(c, A64F_ADD_IMM, true, A64Ops{rd = rd, rn = rd, imm = 0})
+    obj.obj_relocar(c.o, obj.ObjAlvoReloc{secao = c.texto, off = off_add}, obj.ObjCorrecao{tipo = obj.OR_A64_ADD_LO12, simbolo = sim, adendo = 0})
+}
+
+// forja_rt_estado_base() -> uint
+proc a64_intr_estado_base(c: ^A64Ctx, ins: ^bir.BirInstr) -> bool {
+    if ins.nargs != 0 {
+        return a64_recusa(c, "forja_rt_estado_base com argumentos")
+    }
+    a64_estado_em(c, R_T0)
+    a64_resultado(c, ins, R_T0)
+    return true
+}
+
+// x0 = endereco do retorno do rt_wasm: ate 4095 e do estado (como rt_ponteiro_de do rt_a64), o resto e endereco real.
+// cmp x0,#4095 ; csel x0, estado+x0, x0, ls
+proc a64_mapear_retorno(c: ^A64Ctx) {
+    a64_estado_em(c, R_T2)
+    a64_op(c, A64F_ADD_REG, true, A64Ops{rd = R_T2, rn = R_T2, rm = 0})
+    a64_op(c, A64F_SUBS_IMM, true, A64Ops{rd = R_XZR, rn = 0, imm = A64_RET_ESTADO_MAX})
+    a64_op(c, A64F_CSEL, true, A64Ops{rd = 0, rn = R_T2, rm = 0, imm = A64_COND_RET_LS})
+}
+
+// forja_rt_modo_dev() -> bool: 1 no build dev, 0 no release (a mesma regra do wasm_intr)
+proc a64_intr_modo_dev(c: ^A64Ctx, ins: ^bir.BirInstr) -> bool {
+    if ins.nargs != 0 {
+        return a64_recusa(c, "forja_rt_modo_dev com argumentos")
+    }
+    var dev: u64 = 1
+    if (c.p.modo as i32) == (bir.BM_RELEASE as i32) {
+        dev = 0
+    }
+    a64_const(c, R_T0, dev, false)
+    a64_resultado(c, ins, R_T0)
+    return true
+}
+
+// forja_rt_trunc_i32/i64(v: f64): fcvtzs (satura; NaN = 0, o trunc_sat do wasm); x = destino de 64 bits
+proc a64_intr_trunc(c: ^A64Ctx, ins: ^bir.BirInstr, x: bool) -> bool {
+    if ins.nargs != 1 {
+        return a64_recusa(c, "forja_rt_trunc com numero de argumentos diferente de 1")
+    }
+    let args: []bir.BirOperando = ins.args or_else {}
+    if not a64_carregar_real(c, A64_VREG_REAL_A, &args[0]) {
+        return false
+    }
+    a64_op(c, A64F_FCVTZS, x, A64Ops{rd = R_T0, rn = A64_VREG_REAL_A, imm2 = a64_tipo_real(args[0].classe)})
+    a64_resultado(c, ins, R_T0)
+    return true
+}
+
+// real -> real com arredondamento (f64 e f32): forma FRINTM (piso), FRINTP (teto), FRINTZ (trunc), FRINTA (round = longe de zero)
+proc a64_intr_arredonda(c: ^A64Ctx, ins: ^bir.BirInstr, forma: u32) -> bool {
+    if ins.nargs != 1 {
+        return a64_recusa(c, "arredondamento real com numero de argumentos diferente de 1")
+    }
+    let args: []bir.BirOperando = ins.args or_else {}
+    if not a64_carregar_real(c, A64_VREG_REAL_A, &args[0]) {
+        return false
+    }
+    a64_op(c, forma, false, A64Ops{rd = A64_VREG_REAL_A, rn = A64_VREG_REAL_A, imm2 = a64_tipo_real(ins.classe)})
+    a64_resultado_real(c, ins, A64_VREG_REAL_A)
+    return true
+}
+
+// ---- forja_memcpy / forja_memset inline (A3.3k): caminho rapido de 16 B por volta + BL da ponte (rt_a64.memcpy/memset) como caminho LENTO.
+// Todo desvio tem distancia CONSTANTE em instrucoes (layout fixo abaixo, sem remendo); a64_conferir_trecho prova o total emitido.
+// LENTO: destino/origem nulos, ou em [1,4095] (estado mapeado por rt_ponteiro_de), ou sobreposicao com destino acima da origem (memmove).
+const A64_NOME_MEMCPY: str = "forja_memcpy"
+const A64_NOME_MEMSET: str = "forja_memset"
+const A64_MASCARA_IMM19: u64 = 524287
+const A64_MASCARA_IMM26: u64 = 67108863
+const A64_COND_BAIXO: u32 = 3 // LO
+const A64_COND_ALTO_IGUAL: u32 = 2 // HS
+const A64_COND_DIFERENTE: u32 = 1 // NE
+const A64_LIMITE_ESTADO_MENOS1: u32 = 4095 // (x - 1) < 4095 <=> x em [1, 4095]
+const A64_ESCALA_PAR: u32 = 2 // imm7 do ldp/stp em unidades de 8 B: 16 B
+const A64_BITS_PALAVRA: u32 = 63
+const A64_REG_CONTADOR: u32 = 16 // x16
+const A64_REG_DEST: u32 = 0
+const A64_REG_ORIG_OU_VALOR: u32 = 1
+const A64_REG_TAM: u32 = 2
+const A64_PALAVRAS_MEMCPY: u32 = 29
+const A64_PALAVRAS_MEMSET: u32 = 21
+
+// desvio de distancia fixa (em instrucoes, com sinal): CBZ/CBNZ/B.cond usam imm19, B usa imm26; o sinal vem do complemento de dois do i64
+proc a64_desvio_fixo(c: ^A64Ctx, forma: u32, reg: u32, cond: u32, delta: i64) {
+    var mascara: u64 = A64_MASCARA_IMM19
+    if forma == A64F_B {
+        mascara = A64_MASCARA_IMM26
+    }
+    let imm: u32 = (transmute(delta, to = u64) & mascara) as u32
+    a64_op(c, forma, true, A64Ops{rd = reg, imm = imm, imm2 = cond})
+}
+
+// x16 = reg - 1 ; cmp x16,#4095 ; b.lo (delta instrucoes ate o LENTO, contado a partir do b.lo)
+proc a64_guarda_baixo(c: ^A64Ctx, reg: u32, delta: i64) {
+    a64_op(c, A64F_SUB_IMM, true, A64Ops{rd = A64_REG_CONTADOR, rn = reg, imm = 1})
+    a64_op(c, A64F_SUBS_IMM, true, A64Ops{rd = R_XZR, rn = A64_REG_CONTADOR, imm = A64_LIMITE_ESTADO_MENOS1})
+    a64_desvio_fixo(c, A64F_B_COND, 0, A64_COND_BAIXO, delta)
+}
+
+// laco de 16 B (ldp/stp pos-indexado; contador em x16 = n / 16 ja calculado), copia ou preenche; 4 palavras de copia ou 3 de preenchimento
+proc a64_laco16(c: ^A64Ctx, copia: bool) {
+    if copia {
+        a64_op(c, A64F_LDP_X_POS, true, A64Ops{rd = R_T0, rn = A64_REG_ORIG_OU_VALOR, rm = R_T1, imm = A64_ESCALA_PAR})
+        a64_op(c, A64F_STP_X_POS, true, A64Ops{rd = R_T0, rn = A64_REG_DEST, rm = R_T1, imm = A64_ESCALA_PAR})
+    } else {
+        a64_op(c, A64F_STP_X_POS, true, A64Ops{rd = A64_REG_ORIG_OU_VALOR, rn = A64_REG_DEST, rm = A64_REG_ORIG_OU_VALOR, imm = A64_ESCALA_PAR})
+    }
+    a64_op(c, A64F_SUBS_IMM, true, A64Ops{rd = A64_REG_CONTADOR, rn = A64_REG_CONTADOR, imm = 1})
+    var volta: i64 = -3
+    if not copia {
+        volta = -2
+    }
+    a64_desvio_fixo(c, A64F_B_COND, 0, A64_COND_DIFERENTE, volta)
+}
+
+// cauda de 0..15 B byte a byte (x2 = n mod 16): [cbz x2 FIM ;] ldrb/strb [; add x1] ; add x0 ; subs x2 ; b.ne
+proc a64_cauda_bytes(c: ^A64Ctx, copia: bool) {
+    if copia {
+        a64_acesso(c, A64F_LDRB, R_T0, A64_REG_ORIG_OU_VALOR, 0)
+        a64_acesso(c, A64F_STRB, R_T0, A64_REG_DEST, 0)
+        a64_op(c, A64F_ADD_IMM, true, A64Ops{rd = A64_REG_ORIG_OU_VALOR, rn = A64_REG_ORIG_OU_VALOR, imm = 1})
+    } else {
+        a64_acesso(c, A64F_STRB, A64_REG_ORIG_OU_VALOR, A64_REG_DEST, 0)
+    }
+    a64_op(c, A64F_ADD_IMM, true, A64Ops{rd = A64_REG_DEST, rn = A64_REG_DEST, imm = 1})
+    a64_op(c, A64F_SUBS_IMM, true, A64Ops{rd = A64_REG_TAM, rn = A64_REG_TAM, imm = 1})
+    var volta: i64 = -5
+    if not copia {
+        volta = -3
+    }
+    a64_desvio_fixo(c, A64F_B_COND, 0, A64_COND_DIFERENTE, volta)
+}
+
+// x16 = x2 >> 4 ; cbz x16, +delta (cauda) ; laco16 ; x2 = x2 & 15 ; cbz x2, +fim
+proc a64_corpo_rapido(c: ^A64Ctx, copia: bool, delta_cauda: i64, delta_fim: i64) {
+    a64_op(c, A64F_UBFM, true, A64Ops{rd = A64_REG_CONTADOR, rn = A64_REG_TAM, imm = 4, imm2 = A64_BITS_PALAVRA})
+    a64_desvio_fixo(c, A64F_CBZ, A64_REG_CONTADOR, 0, delta_cauda)
+    a64_laco16(c, copia)
+    a64_op(c, A64F_UBFM, true, A64Ops{rd = A64_REG_TAM, rn = A64_REG_TAM, imm = 0, imm2 = 3})
+    a64_desvio_fixo(c, A64F_CBZ, A64_REG_TAM, 0, delta_fim)
+    a64_cauda_bytes(c, copia)
+}
+
+proc a64_conferir_trecho(c: ^A64Ctx, inicio: u32, palavras: u32) {
+    if (a64_offset(c) - inicio) != (palavras * 4) {
+        common.falha_interna("a64_intr: trecho de memcpy/memset com tamanho diferente do layout fixo")
+    }
+}
+
+// x0=destino x1=origem x2=n. Layout (indice): 0 cbz x0 ; 1 cbz x1 ; 2-4 guarda x0 ; 5-7 guarda x1 ; 8 cmp x0,x1 ; 9 b.ls RAPIDO(15) ;
+// 10 add x16,x1,x2 ; 11 cmp x0,x16 ; 12 b.hs RAPIDO(15) ; 13 LENTO bl ; 14 b FIM(29) ; 15-28 corpo rapido
+proc a64_emitir_memcpy(c: ^A64Ctx, ponte: u32) {
+    let inicio: u32 = a64_offset(c)
+    a64_desvio_fixo(c, A64F_CBZ, A64_REG_DEST, 0, 13)
+    a64_desvio_fixo(c, A64F_CBZ, A64_REG_ORIG_OU_VALOR, 0, 12)
+    a64_guarda_baixo(c, A64_REG_DEST, 9)
+    a64_guarda_baixo(c, A64_REG_ORIG_OU_VALOR, 6)
+    a64_op(c, A64F_SUBS_REG, true, A64Ops{rd = R_XZR, rn = A64_REG_DEST, rm = A64_REG_ORIG_OU_VALOR})
+    a64_desvio_fixo(c, A64F_B_COND, 0, A64_COND_RET_LS, 6)
+    a64_op(c, A64F_ADD_REG, true, A64Ops{rd = A64_REG_CONTADOR, rn = A64_REG_ORIG_OU_VALOR, rm = A64_REG_TAM})
+    a64_op(c, A64F_SUBS_REG, true, A64Ops{rd = R_XZR, rn = A64_REG_DEST, rm = A64_REG_CONTADOR})
+    a64_desvio_fixo(c, A64F_B_COND, 0, A64_COND_ALTO_IGUAL, 3)
+    a64_bl_simbolo(c, ponte)
+    a64_desvio_fixo(c, A64F_B, 0, 0, 15)
+    a64_corpo_rapido(c, true, 5, 7)
+    a64_conferir_trecho(c, inicio, A64_PALAVRAS_MEMCPY)
+}
+
+// x0=destino x1=valor x2=n. Layout: 0 cbz x0 ; 1-3 guarda ; 4 uxtb x1 ; 5-7 espalha o byte (orr lsl 8/16/32) ; 8-18 corpo rapido ;
+// 19 b FIM(21) ; 20 LENTO bl (x1 ainda original, so chega por desvio antes do uxtb) ; 21 FIM
+proc a64_emitir_memset(c: ^A64Ctx, ponte: u32) {
+    let inicio: u32 = a64_offset(c)
+    a64_desvio_fixo(c, A64F_CBZ, A64_REG_DEST, 0, 20)
+    a64_guarda_baixo(c, A64_REG_DEST, 17)
+    a64_op(c, A64F_UBFM, true, A64Ops{rd = A64_REG_ORIG_OU_VALOR, rn = A64_REG_ORIG_OU_VALOR, imm = 0, imm2 = 7})
+    var deslocamento: u32 = 8
+    while deslocamento <= 32 {
+        a64_op(c, A64F_ORR_REG, true, A64Ops{rd = A64_REG_ORIG_OU_VALOR, rn = A64_REG_ORIG_OU_VALOR, rm = A64_REG_ORIG_OU_VALOR, imm = deslocamento})
+        deslocamento = deslocamento * 2
+    }
+    a64_corpo_rapido(c, false, 4, 7)
+    a64_desvio_fixo(c, A64F_B, 0, 0, 2)
+    a64_bl_simbolo(c, ponte)
+    a64_conferir_trecho(c, inicio, A64_PALAVRAS_MEMSET)
+}
+
+// forja_memcpy/forja_memset sem resultado e com a ponte viva: inline; qualquer outra forma volta a ponte normal (achou^ = false)
+proc a64_intr_mem(c: ^A64Ctx, ins: ^bir.BirInstr, nome: str, achou: ^bool) -> bool {
+    let funcoes: []bir.BirFuncao = c.p.funcoes or_else {}
+    let k: u32 = a64_alcance_do_runtime(c.p, funcoes, nome)
+    if (k == A64_ALC_SEM) or (ins.nargs != 3) or (ins.dst != bir.BIR_SEM_VREG) or (ins.a.tam != 0) {
+        achou^ = false
+        return false
+    }
+    if not a64_passar_argumentos(c, ins) {
+        return false
+    }
+    if nome == A64_NOME_MEMCPY {
+        a64_emitir_memcpy(c, funcoes[k].simbolo)
+    } else {
+        a64_emitir_memset(c, funcoes[k].simbolo)
+    }
+    return true
+}
+
+// intrinsecos do runtime (contrato_a64 §3.4) e os forja_math_floor/ceil/trunc/round; o resto de forja_rt_* e da ponte.
+// Devolve false em achou^ quando o nome nao e intrinseco
+proc a64_intr_do_runtime(c: ^A64Ctx, ins: ^bir.BirInstr, nome: str, achou: ^bool) -> bool {
+    achou^ = true
+    if (nome == A64_NOME_MEMCPY) or (nome == A64_NOME_MEMSET) {
+        return a64_intr_mem(c, ins, nome, achou)
+    }
+    if nome == A64_NOME_ESTADO_BASE {
+        return a64_intr_estado_base(c, ins)
+    }
+    if nome == A64_NOME_MODO_DEV {
+        return a64_intr_modo_dev(c, ins)
+    }
+    if nome == A64_NOME_TRUNC_I32 {
+        return a64_intr_trunc(c, ins, false)
+    }
+    if nome == A64_NOME_TRUNC_I64 {
+        return a64_intr_trunc(c, ins, true)
+    }
+    if (nome == A64_NOME_FLOOR_RT) or (nome == A64_NOME_MATH_FLOOR) or (nome == A64_NOME_MATH_FLOORF) {
+        return a64_intr_arredonda(c, ins, A64F_FRINTM)
+    }
+    if (nome == A64_NOME_MATH_CEIL) or (nome == A64_NOME_MATH_CEILF) {
+        return a64_intr_arredonda(c, ins, A64F_FRINTP)
+    }
+    if (nome == A64_NOME_MATH_ROUND) or (nome == A64_NOME_MATH_ROUNDF) {
+        return a64_intr_arredonda(c, ins, A64F_FRINTA)
+    }
+    if (nome == A64_NOME_MATH_TRUNC) or (nome == A64_NOME_MATH_TRUNCF) {
+        return a64_intr_arredonda(c, ins, A64F_FRINTZ)
+    }
+    achou^ = false
+    return false
+}
+
+// CHAMA de proc da ponte (runtime em Forja, convencao do wasm): sem x8. Escalar e agregado de registrador vem em x0; agregado maior
+// vem como ENDERECO dos bytes em x0 (o rt_wasm devolve uint), copiado para o destino da BIR
+proc a64_chamar_ponte(c: ^A64Ctx, ins: ^bir.BirInstr, alvo: u32) -> bool {
+    if not a64_passar_argumentos(c, ins) {
+        return false
+    }
+    a64_bl_simbolo(c, alvo)
+    if (ins.a.tam == 0) or a64_tam_registrador(ins.a.tam) {
+        return a64_recebe_retorno(c, ins)
+    }
+    a64_mapear_retorno(c)
+    if not a64_operando(c, R_T0, &ins.a) {
+        return false
+    }
+    a64_mov(c, R_T1, 0)
+    a64_mover_bloco(c, ins.a.tam, false)
+    return true
+}
+
+// CHAMA de simbolo que nao e funcao Forja: intrinseco conhecido, proc da ponte (a64_alcance.fj) ou recusa com a causa (X0001 runtime, X0003 import)
+proc a64_isel_intrinseco(c: ^A64Ctx, ins: ^bir.BirInstr, sim: ^bir.BirSimbolo) -> bool {
+    // I3: no iOS nao ha `svc` (Darwin sem syscall estavel): forja_rt_syscall vai pela ponte para rt_syscall (std:a64_ios, libSystem)
+    if a64_eh_syscall(sim) and (not (c.macho and ((sim.tipo as i32) == bir.BS_RUNTIME))) {
+        return a64_intr_syscall(c, ins)
+    }
+    let nome = sim.nome or_else ""
+    if (sim.tipo as i32) == bir.BS_RUNTIME {
+        var achou: bool = false
+        let feito: bool = a64_intr_do_runtime(c, ins, nome, &achou)
+        if achou {
+            return feito
+        }
+        if nome == A64_NOME_FIO_PONTE {
+            // A1: sem thread de fora nem ponte exportada, o fio e o principal; o prologo da ponte nao tem efeito a emitir (A4 traz o runtime)
+            return true
+        }
+        let funcoes: []bir.BirFuncao = c.p.funcoes or_else {}
+        let k: u32 = a64_alcance_do_runtime(c.p, funcoes, nome)
+        if k != A64_ALC_SEM {
+            return a64_chamar_ponte(c, ins, funcoes[k].simbolo)
+        }
+    }
+    if (sim.tipo as i32) == bir.BS_IMPORT {
+        let causa = format(f"foreign '{nome}' nao existe no alvo aarch64-linux (foreign com link so a partir do A4)", alloc = heap)
+        defer delete(causa)
+        return common.diag_relatar(c.erro, common.X0003, c.pos, causa)
+    }
+    let o_que = format(f"runtime '{nome}'", alloc = heap)
+    defer delete(o_que)
+    return a64_recusa(c, o_que)
+}

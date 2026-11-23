@@ -1,0 +1,439 @@
+// driver/cmd_fmt.fj - porte de compiler/driver/cmd_fmt.c, compiler/driver/cmd_fmt.h
+// sha256 de driver/cmd_fmt.c: 748c41c1ccc0625de4b570af3f965c8749e02e4575a9b7ea75d3a75a19cdbca1
+// sha256 de driver/cmd_fmt.h: 03f5bd1c9520fce6f95f3c6cd0d8c771e478e5c8d4efd5d64682233c6bb643c7
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "std:os"
+import "common"
+
+const SAIDA_OK_3: i32 = 0
+const SAIDA_PENDENTE: i32 = 1
+const SAIDA_USO_3: i32 = 2
+// C2F-A0: static const char *const NOMES[8]
+const NOMES_REGRAS_FMT: [8]str = {"bom", "fim_de_linha", "fim_de_arquivo", "linha_em_branco", "espaco_final", "indentacao", "espaco", "comentario"}
+
+// fclose de um stdout/stderr criado por c2f_saida_stdout()/c2f_saida_stderr(): so solta o objeto (o descritor do processo fica).
+proc saida_soltar(s: ^common.Saida) {
+    _ = common.c2f_saida_fechar(s)
+}
+
+// C: driver/cmd_fmt.c:30
+proc uso_errado_5(motivo: ?str) -> i32 {
+    let txt_1 = motivo or_else "(null)"
+    let msg_1 = format(f"forja: fmt: {txt_1}\n", alloc = heap)
+    defer delete(msg_1)
+    let err = common.c2f_saida_stderr()
+    defer saida_soltar(err)
+    common.c2f_saida_formatar(err, msg_1)
+    common.c2f_saida_escrever_texto(err, "uso: forja fmt <arq.fj | pasta> ... [--aplicar] [--json] [--stdin]\n")
+    return SAIDA_USO_3
+}
+
+// C: driver/cmd_fmt.c:38
+// Confere a combinacao das opcoes; none = valida.
+proc validar_argumentos(p: ^FmtPedido) -> ?str {
+    if p.stdin_padrao {
+        if p.aplicar or p.json or (p.nentradas > 0) {
+            return "--stdin nao vale com --aplicar, --json nem com caminho"
+        }
+        return none
+    }
+    if p.regras {
+        return "--regras so vale com --stdin"
+    }
+    if p.nentradas == 0 {
+        return "falta o arquivo .fj ou a pasta"
+    }
+    return none
+}
+
+// C: driver/cmd_fmt.c:49
+// Le as opcoes e as entradas; devolve o motivo do uso errado (none = argumentos validos).
+// C2F-13: argc fica (o C le argv[0..argc)); as entradas sao as proprias fatias do argv numa lista sem dono (frame: o C a liberava com free(pedido.entradas) no fim do RodarFmt).
+proc ler_argumentos_4(argc: i32, argv: []str, p: ^FmtPedido) -> ?str {
+    p^ = FmtPedido{}
+    var lista = make([dynamic]str, alloc = frame, cap = (argc as int) + 1)
+    var k: i32 = 0
+    while k < argc {
+        let a: str = argv[k as int]
+        if a == "--aplicar" {
+            p.aplicar = true
+        } else if a == "--json" {
+            p.json = true
+        } else if a == "--stdin" {
+            p.stdin_padrao = true
+        } else if a == "--regras" {
+            p.regras = true
+        } else if (len(a) > 0) and (a[0] == 45) { // '-'
+            p.entradas = lista[..]
+            return "opcao desconhecida (valem --aplicar, --json e --stdin)"
+        } else {
+            append(&lista, item = a)
+            p.nentradas += 1
+        }
+        k += 1
+    }
+    p.entradas = lista[..]
+    return validar_argumentos(p)
+}
+
+// C: driver/cmd_fmt.c:66
+proc listar_arquivos(p: ^FmtPedido, arena: ^common.Arena, arquivos: ^[dynamic]str) -> bool {
+    var k: i32 = 0
+    while k < p.nentradas {
+        if migrar_coletar((p.entradas or_else {})[k], arena, arquivos) {
+            k += 1
+            continue
+        }
+        let fmt_1: str = (p.entradas or_else {})[k]
+        let msg_1 = format(f"forja: fmt: nao achei '{fmt_1}'\n", alloc = heap)
+        defer delete(msg_1)
+        let err_nao_achei = common.c2f_saida_stderr()
+        defer saida_soltar(err_nao_achei)
+        common.c2f_saida_formatar(err_nao_achei, msg_1)
+        return false
+    }
+    return true
+}
+
+// C: driver/cmd_fmt.c:76
+proc imprimir_rodape(x: ^FmtExecucao) {
+    let t: FmtTotais = x.totais
+    let out = common.c2f_saida_stdout()
+    defer saida_soltar(out)
+    if (x.pedido as ^FmtPedido).aplicar {
+        let msg = format(f"{t.gravados} gravados, {t.nao_analisados} nao analisados, {t.canonicos} canonicos\n", alloc = heap)
+        defer delete(msg)
+        common.c2f_saida_escrever_texto(out, msg)
+    } else {
+        let msg = format(f"{t.mudariam} mudariam, {t.nao_analisados} nao analisados, {t.canonicos} canonicos\n", alloc = heap)
+        defer delete(msg)
+        common.c2f_saida_escrever_texto(out, msg)
+    }
+}
+
+// C: driver/cmd_fmt.c:84
+proc imprimir_documento(x: ^FmtExecucao) {
+    var doc = make([dynamic]u8, alloc = heap)
+    defer delete(doc)
+    fmt_json_documento(&doc, x)
+    let out = common.c2f_saida_stdout()
+    defer saida_soltar(out)
+    common.c2f_saida_escrever(out, doc[..])
+}
+
+// C: driver/cmd_fmt.c:94
+// 1 = algum arquivo nao analisado, ou (dry-run) algum arquivo mudaria; 0 = tudo canonico ou gravado.
+proc codigo_da_execucao(x: ^FmtExecucao) -> i32 {
+    if x.totais.nao_analisados > 0 {
+        return SAIDA_PENDENTE
+    }
+    if (not (x.pedido as ^FmtPedido).aplicar) and (x.totais.mudariam > 0) {
+        return SAIDA_PENDENTE
+    }
+    return SAIDA_OK_3
+}
+
+// C: driver/cmd_fmt.c:102
+// Arquivo ou pasta: processa cada .fj na ordem, com o relatorio (rodape ou documento JSON) no fim. Um erro de E/S para na hora (exit 2), como o migrar.
+// C2F-14: x.json nasce aqui (o C zera a struct e o Buf aceita push).
+proc executar_2(p: ^FmtPedido) -> i32 {
+    var arena: common.Arena = common.Arena{}
+    var arquivos = make([dynamic]str, alloc = heap)
+    var x: FmtExecucao = FmtExecucao{pedido = p}
+    var codigo: i32 = SAIDA_OK_3
+    x.json = make([dynamic]u8, alloc = heap)
+    if not listar_arquivos(p, &arena, &arquivos) {
+        codigo = SAIDA_USO_3
+    }
+    var k: int = 0
+    while (codigo == SAIDA_OK_3) and (k < len(arquivos)) {
+        if not fmt_processar_arquivo(arquivos[k], &x) {
+            codigo = SAIDA_USO_3
+        }
+        k += 1
+    }
+    if codigo == SAIDA_OK_3 {
+        if p.json {
+            imprimir_documento(&x)
+        } else {
+            imprimir_rodape(&x)
+        }
+        codigo = codigo_da_execucao(&x)
+    }
+    delete(x.json)
+    delete(arquivos)
+    common.arena_liberar(&arena)
+    return codigo
+}
+
+// C: driver/cmd_fmt.c:125
+// A entrada padrao inteira (binario: os.read_all_stdin le bytes crus; o _setmode da saida e do rodar_stdin). false = erro de leitura.
+proc ler_entrada_padrao(entrada: ^[dynamic]u8) -> bool {
+    switch r in os.read_all_stdin(alloc = heap) {
+    case [dynamic]u8:
+        append(entrada, items = r[..])
+        delete(r)
+        return true
+    case os.InputError:
+        return false
+    }
+    return false
+}
+
+// C: driver/cmd_fmt.c:138
+proc imprimir_erro_de_fmt(r: ^FmtResultado) {
+    var b = make([dynamic]u8, alloc = heap)
+    defer delete(b)
+    append(&b, item = "{\"estado\": \"nao_analisado\", \"diagnostico\": ")
+    edicoes_json_texto_ou_nulo(&b, r.codigo)
+    format(f", \"linha\": {r.diag_linha}, \"coluna\": {r.diag_coluna}, \"causa\": ", into = &b)
+    let motivo: str = r.motivo or_else ""
+    edicoes_json_texto(&b, motivo, len(motivo) as u64)
+    append(&b, item = "}\n")
+    let err = common.c2f_saida_stderr()
+    defer saida_soltar(err)
+    common.c2f_saida_escrever(err, b[..])
+}
+
+// C: driver/cmd_fmt.c:152
+// Auxilio de medicao do verificar_fmt.py (--stdin --regras): uma linha no stderr, "desvios=N primeiro=L:C:regra regras=nome:qtd,...".
+proc imprimir_regras_de_fmt(r: ^FmtResultado) {
+    var separador: str = ""
+    let regra: str = r.primeiro.regra or_else "-"
+    var b = make([dynamic]u8, alloc = heap)
+    defer delete(b)
+    format(f"desvios={r.desvios} primeiro={r.primeiro.linha}:{r.primeiro.coluna}:{regra} regras=", into = &b)
+    for k in 0..<len(NOMES_REGRAS_FMT) {
+        var qtd: u32 = 0
+        if ((k == 0) and r.tinha_bom) or ((k == 1) and r.tinha_crlf) {
+            qtd = 1
+        }
+        for j in 0..<len(r.regras) {
+            if r.regras[j] == NOMES_REGRAS_FMT[k] {
+                qtd += 1
+            }
+        }
+        if qtd > 0 {
+            let nome: str = NOMES_REGRAS_FMT[k]
+            format(f"{separador}{nome}:{qtd}", into = &b)
+            separador = ","
+        }
+    }
+    append(&b, item = 10 as u8) // '\n'
+    let err = common.c2f_saida_stderr()
+    defer saida_soltar(err)
+    common.c2f_saida_escrever(err, b[..])
+}
+
+// C: driver/cmd_fmt.c:170
+// 'forja fmt --stdin [--regras]': o fonte da entrada padrao sai formatado na saida padrao. Erro de sintaxe = JSON no stderr, exit 1, stdout vazio.
+proc rodar_stdin(regras: bool) -> i32 {
+    var entrada = make([dynamic]u8, alloc = heap)
+    defer delete(entrada)
+    var r: FmtResultado = FmtResultado{}
+    var codigo: i32 = SAIDA_OK_3
+    if not ler_entrada_padrao(&entrada) {
+        let err_entrada = common.c2f_saida_stderr()
+        defer saida_soltar(err_entrada)
+        common.c2f_saida_escrever_texto(err_entrada, "forja fmt: nao consegui ler a entrada padrao\n")
+        return SAIDA_USO_3
+    }
+    let texto = from_bytes(entrada[..], alloc = heap)
+    defer delete(texto)
+    fmt_formatar(texto, len(texto) as u64, &r)
+    if r.estado == FMT_NAO_ANALISADO {
+        imprimir_erro_de_fmt(&r)
+        codigo = SAIDA_PENDENTE
+    } else {
+        let out = common.c2f_saida_stdout()
+        defer saida_soltar(out)
+        common.c2f_saida_binaria(out) // _setmode(_fileno(stdout), _O_BINARY) do LerEntradaPadrao
+        common.c2f_saida_escrever(out, r.formatado[..])
+        if regras {
+            imprimir_regras_de_fmt(&r)
+        }
+    }
+    fmt_resultado_liberar(&r)
+    return codigo
+}
+
+// C: driver/cmd_fmt.c:194
+// ASSINATURA: argv era `^?^u8` (char **); passa a []str (C2F-13/83), como o rodar_stdin e o LerArgumentos ja esperavam. O chamador (main_despacho, chamar_subcomando_rodar) tem de passar []str.
+proc rodar_fmt(argc: i32, argv: []str) -> i32 {
+    var pedido: FmtPedido = FmtPedido{}
+    let erro: ?str = ler_argumentos_4(argc, argv, &pedido)
+    if erro != none {
+        return uso_errado_5(erro)
+    }
+    if pedido.stdin_padrao {
+        return rodar_stdin(pedido.regras)
+    }
+    return executar_2(&pedido)
+}
+
+// C: driver/cmd_fmt.c:212
+// Offset no texto do fonte da posicao (linha e coluna em bytes a partir de 1, sem CR). Fora do texto vale o fim.
+proc offset_da_posicao(f: ^common.Fonte, linha: u32, coluna: u32) -> u32 {
+    var off: u32 = 0
+    var l: u32 = 1
+    while (l < linha) and ((off as u64) < f.tam) {
+        if f.texto[off] == 10 { // '\n'
+            l += 1
+        }
+        off += 1
+    }
+    var tern_1: u32 = 0
+    if coluna > 0 {
+        tern_1 = coluna - 1
+    }
+    off += tern_1
+    var tern_2: u32 = 0
+    if (off as u64) < f.tam {
+        tern_2 = off
+    } else {
+        tern_2 = common.c2f_trunc_u32(f.tam)
+    }
+    return tern_2
+}
+
+// C: driver/cmd_fmt.c:225
+// Coluna_fim do 1o desvio: a faixa da Edicao que comeca nele (uma linha so); sem Edicao (BOM ou CRLF, que nao sao Edicoes) vale a propria coluna.
+proc coluna_fim_do_primeiro(r: ^FmtResultado) -> u32 {
+    for k in 0..<len(r.edicoes) {
+        let e: Edicao = r.edicoes[k]
+        if (e.linha != r.primeiro.linha) or (e.coluna != r.primeiro.coluna) {
+            continue
+        }
+        if e.linha_fim <= e.linha {
+            return e.coluna_fim
+        }
+        return e.coluna
+    }
+    return r.primeiro.coluna
+}
+
+// C: driver/cmd_fmt.c:237
+// A 1a edicao vira a correcao 'certa' quando cabe no pacote (uma linha so, 'novo' e trecho antigo dentro dos limites do diagnostico); senao so dica.
+proc abrir_sugestao_do_fmt(d: ^common.Diag, f: ^common.Fonte, r: ^FmtResultado, forma: str) {
+    var e: Edicao = Edicao{}
+    var cabe: bool = false
+    if len(r.edicoes) > 0 {
+        e = r.edicoes[0]
+        let novo: str = e.novo or_else ""
+        let sem_quebra: bool = achar_byte_na_faixa(as_bytes(novo), 0, len(novo) as u64, 10) == (len(novo) as u64) // strchr(novo, '\n') == NULL
+        cabe = (e.linha_fim <= e.linha) and sem_quebra and (len(novo) < (common.DIAG_NOVO_MAX as int)) and (wrapping_sub(e.coluna_fim, e.coluna) <= (common.DIAG_ANTIGO_MAX as u32))
+    }
+    var confianca: i32 = common.DIAG_SO_DICA
+    if cabe {
+        confianca = common.DIAG_CERTA
+    }
+    _ = common.diag_sugerir(&d.sug, confianca, forma)
+    if cabe {
+        _ = common.diag_editar(&d.sug, offset_da_posicao(f, e.linha, e.coluna), offset_da_posicao(f, e.linha, e.coluna_fim), e.novo)
+    }
+}
+
+// C: driver/cmd_fmt.c:248
+// Monta e imprime o F0001 do 1o desvio (UM por arquivo): causa com a regra e o total, forma_certa com o caminho, coluna_fim e a correcao.
+proc imprimir_f0001(f: ^common.Fonte, r: ^FmtResultado, sd: ^common.SaidaDiag) {
+    var d: common.Diag = common.Diag{}
+    let regra: str = r.primeiro.regra or_else "(null)"
+    let causa = format(f"fora da forma canonica: {regra} ({r.desvios} desvios)", alloc = heap)
+    defer delete(causa)
+    _ = common.diag_relatar(&d, common.F0001, offset_da_posicao(f, r.primeiro.linha, r.primeiro.coluna), causa)
+    let caminho: str = f.caminho or_else ""
+    let comando = format(f"rode forja fmt --aplicar {caminho}", alloc = heap)
+    defer delete(comando)
+    let forma = common.c2f_cortar(comando, 319) // char forma[320]
+    defer delete(forma)
+    // sem caminho: a sugestao e cortada em DIAG_DESCRICAO_MAX; o comando inteiro fica em forma_certa
+    abrir_sugestao_do_fmt(&d, f, r, "rode forja fmt --aplicar neste arquivo")
+    common.diag_forma(&d, none, forma)
+    let coluna_fim = format(f"{coluna_fim_do_primeiro(r)}", alloc = heap)
+    defer delete(coluna_fim)
+    common.diag_acrescentar_extra(&d, "coluna_fim", coluna_fim)
+    let out = common.c2f_saida_stdout()
+    defer saida_soltar(out)
+    common.diag_imprimir_json(&d, f, out, sd)
+}
+
+// C: driver/cmd_fmt.c:262
+// sd = o SaidaDiag unico do principal (resumo/ja_visto valem tambem para o F0001 do --canonico).
+proc conferir_canonico_se_ha(canonico: bool, f: ^common.Fonte, sd: ^common.SaidaDiag) -> bool {
+    var r: FmtResultado = FmtResultado{}
+    var ok: bool = true
+    if not canonico {
+        return true
+    }
+    // fmt_formatar recebe o texto como str: copia dos f.tam bytes do texto da fonte
+    let texto = from_bytes(f.texto[0..<(f.tam as int)], alloc = heap)
+    defer delete(texto)
+    fmt_formatar(texto, f.tam, &r)
+    if r.estado == FMT_MUDARIA {
+        imprimir_f0001(f, &r, sd)
+        ok = false
+    }
+    fmt_resultado_liberar(&r)
+    return ok
+}
+
+// Os esperados saem do oraculo C (LerArgumentos, ValidarArgumentos, CodigoDaExecucao, OffsetDaPosicao).
+test "ler_argumentos_4: opcoes, entradas e combinacoes invalidas" {
+    var p: FmtPedido = FmtPedido{}
+    var a1: [4]str = {"a", "--aplicar", "--json", "b"}
+    expect(ler_argumentos_4(4, a1[..], &p) == none)
+    expect(p.nentradas == 2)
+    expect(p.aplicar and p.json and (not p.stdin_padrao) and (not p.regras))
+    expect((p.entradas or_else {})[0] == "a")
+    expect((p.entradas or_else {})[1] == "b")
+    var a2: [2]str = {"--stdin", "--regras"}
+    expect(ler_argumentos_4(2, a2[..], &p) == none)
+    expect(p.stdin_padrao and p.regras and (p.nentradas == 0))
+    var a3: [2]str = {"--stdin", "x.fj"}
+    expect((ler_argumentos_4(2, a3[..], &p) or_else "") == "--stdin nao vale com --aplicar, --json nem com caminho")
+    var a4: [2]str = {"--regras", "x.fj"}
+    expect((ler_argumentos_4(2, a4[..], &p) or_else "") == "--regras so vale com --stdin")
+    var a5: [1]str = {"-x"}
+    expect((ler_argumentos_4(1, a5[..], &p) or_else "") == "opcao desconhecida (valem --aplicar, --json e --stdin)")
+    expect(p.nentradas == 0)
+    let vazio: []str = {}
+    expect((ler_argumentos_4(0, vazio, &p) or_else "") == "falta o arquivo .fj ou a pasta")
+    var a6: [1]str = {""}
+    expect(ler_argumentos_4(1, a6[..], &p) == none)
+    expect(p.nentradas == 1)
+}
+
+test "codigo_da_execucao e uso_errado_5" {
+    var p: FmtPedido = FmtPedido{}
+    var x: FmtExecucao = FmtExecucao{}
+    x.pedido = &p
+    expect(codigo_da_execucao(&x) == 0)
+    x.totais.mudariam = 3
+    expect(codigo_da_execucao(&x) == 1)
+    p.aplicar = true
+    expect(codigo_da_execucao(&x) == 0)
+    x.totais.nao_analisados = 2
+    expect(codigo_da_execucao(&x) == 1)
+    expect(uso_errado_5("motivo") == 2)
+    expect(uso_errado_5(none) == 2)
+}
+
+test "offset_da_posicao e coluna_fim_do_primeiro" {
+    var f: common.Fonte = common.Fonte{}
+    let texto = "ab\ncde\nf"
+    _ = common.fonte_adotar_texto(&f, "x.fj", texto, len(texto) as u64)
+    expect(offset_da_posicao(&f, 1, 1) == 0)
+    expect(offset_da_posicao(&f, 2, 2) == 4)
+    expect(offset_da_posicao(&f, 3, 1) == 7)
+    expect(offset_da_posicao(&f, 9, 9) == 8)
+    expect(offset_da_posicao(&f, 0, 0) == 0)
+    common.fonte_liberar(&f)
+    var r: FmtResultado = FmtResultado{}
+    let sujo = "proc main() {   \n}\n"
+    fmt_formatar(sujo, len(sujo) as u64, &r)
+    expect(r.estado == FMT_MUDARIA)
+    expect(coluna_fim_do_primeiro(&r) == 17)
+    fmt_resultado_liberar(&r)
+}

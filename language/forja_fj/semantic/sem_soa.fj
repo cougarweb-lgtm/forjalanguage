@@ -1,0 +1,218 @@
+// semantic/sem_soa.fj - porte de compiler/semantic/sem_soa.c
+// sha256 de semantic/sem_soa.c: c94cf141b5e46d5447f2e0db0c9c6be831a109ad7fa76e91a2fbc904fa7a4f2c
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "common"
+import "frontend"
+
+// C: semantic/sem_soa.c:11
+proc elemento_da_soa(s: ^Semantica, soa: u32) -> u32 {
+    let arg_1: u32 = tipo_de(&s.tipos, soa).a
+    let arg_2: ^Tipos = &s.tipos
+    return tipo_de(arg_2, arg_1).a
+}
+
+// C: semantic/sem_soa.c:17
+proc conferir_struct_da_soa(s: ^Semantica, ref: ?^frontend.TipoRef, elemento: u32) -> bool {
+    let r: ^frontend.TipoRef = ref as ^frontend.TipoRef
+    if tipo_classe_de(&s.tipos, elemento) != TC_STRUCT {
+        let tipo = sem_descrever_str(s, elemento)
+        defer delete(tipo)
+        let msg_1 = format(f"soa guarda struct da Forja (recebeu {tipo})", alloc = heap)
+        defer delete(msg_1)
+        return sem_erro(s, common.E0320, r.pos, msg_1)
+    }
+    let d: ^frontend.Decl = (s.globais or_else {})[tipo_de(&s.tipos, elemento).a].decl as ^frontend.Decl
+    if (d.ncampos == 0) or sem_tipo_eh_opaco(s, elemento) {
+        let msg_2 = format(f"soa de '{sem_nome_texto(s, d.nome)}' nao existe: a struct precisa de ao menos 1 campo visivel", alloc = heap)
+        defer delete(msg_2)
+        return sem_erro(s, common.E0320, r.pos, msg_2)
+    }
+    if d.contem_dono {
+        let msg_3 = format(f"soa de '{sem_nome_texto(s, d.nome)}' nao existe: a struct tem campo dono de memoria (lista, map ou soa dinamica)", alloc = heap)
+        defer delete(msg_3)
+        return sem_erro(s, common.E0320, r.pos, msg_3)
+    }
+    return true
+}
+
+// C: semantic/sem_soa.c:36
+proc resolver_soa(s: ^Semantica, t: ?^frontend.TipoRef, base: ^u32) -> bool {
+    // TipoRef.alvo (TipoRef * no C) chega como fatia de 1 elemento: o objeto e o [0]
+    let alvo_ref: ^frontend.TipoRef = &((t as ^frontend.TipoRef).alvo or_else {})[0]
+    if alvo_ref.forma == (frontend.TR_FATIA as u8) {
+        let msg_1 = format(f"soa[]S nao existe: use soa[N]S ou soa[dynamic]S", alloc = heap)
+        defer delete(msg_1)
+        return sem_erro(s, common.E0320, alvo_ref.pos, msg_1)
+    }
+    if not sem_resolver_tipo_ref(s, alvo_ref) {
+        return false
+    }
+    let colunas: u32 = alvo_ref.tipo
+    let ref_elemento: ^frontend.TipoRef = &(alvo_ref.alvo or_else {})[0]
+    if not conferir_struct_da_soa(s, ref_elemento, tipo_de(&s.tipos, colunas).a) {
+        return false
+    }
+    base^ = tipo_soa(&s.tipos, colunas)
+    return true
+}
+
+// C: semantic/sem_soa.c:49
+proc sem_literal_soa(s: ^Semantica, e: ^frontend.Expr, ctx: u32) -> bool {
+    if tipo_soa_dinamica(&s.tipos, ctx) {
+        let msg_1 = format(f"soa[dynamic]S nasce de make: make(soa[dynamic]S, alloc = heap)", alloc = heap)
+        defer delete(msg_1)
+        return sem_erro(s, common.E0320, e.pos, msg_1)
+    }
+    if e.nargs > 0 {
+        let msg_2 = format(f"soa nao tem literal com elementos: comece com {{}} e grave a[i] = S{{...}}", alloc = heap)
+        defer delete(msg_2)
+        return sem_erro(s, common.E0320, e.pos, msg_2)
+    }
+    e.tipo = ctx
+    return true
+}
+
+// C: semantic/sem_soa.c:62
+proc sem_indice_soa(s: ^Semantica, e: ^frontend.Expr) -> bool {
+    if common.c2f_s2u_32(tipo_classe_de(&s.tipos, (e.a as ^frontend.Expr).tipo)) == (TC_PONTEIRO as u32) {
+        let msg_1 = format(f"indexe a soa apontada com p^[i]", alloc = heap)
+        defer delete(msg_1)
+        return sem_erro(s, common.E0320, e.pos_op, msg_1)
+    }
+    if not sem_checar(s, e.b, TIPO_INT as u32) {
+        return false
+    }
+    if not tipo_eh_inteiro((e.b as ^frontend.Expr).tipo) {
+        return sem_erro_do_inteiro(s, e.b, "o indice")
+    }
+    e.tipo = elemento_da_soa(s, (e.a as ^frontend.Expr).tipo)
+    return true
+}
+
+// C: semantic/sem_soa.c:74
+proc sem_coluna_da_soa(s: ^Semantica, e: ^frontend.Expr) -> bool {
+    let arg_1: u32 = elemento_da_soa(s, (e.a as ^frontend.Expr).tipo)
+    let arg_2: ^Tipos = &s.tipos
+    let d: ?^frontend.Decl = (s.globais or_else {})[tipo_de(arg_2, arg_1).a].decl
+    let idx: i32 = sem_achar_campo(d, e.nome)
+    if idx < 0 {
+        var sp: SemParecido = SemParecido{}
+        sem_parecido_iniciar(s, common.E0201, e.pos_op, e.nome, &sp)
+        sem_parecidos_de_campos(s, d, &sp)
+        let msg_1 = format(f"campo '{sem_nome_texto(s, e.nome)}' nao existe na struct '{sem_nome_texto(s, (d as ^frontend.Decl).nome)}' da soa", alloc = heap)
+        defer delete(msg_1)
+        return sem_erro_parecido(s, &sp, msg_1)
+    }
+    if not sem_lvalor_mutavel_de(s, e.a, "a coluna da soa empresta os campos para alterar: declare com var") {
+        return false
+    }
+    e.ref = frontend.REF_CAMPO as u8
+    e.ref_id = idx
+    e.tipo = tipo_fatia(&s.tipos, ((d as ^frontend.Decl).campos or_else {})[idx].tipo.tipo)
+    return true
+}
+
+// C: semantic/sem_soa.c:92
+proc sem_for_soa(s: ^Semantica, st: ^frontend.Stmt) -> bool {
+    let pos: u32 = sem_pos_depois_da_palavra(s, st.pos)
+    if st.item_ref {
+        let msg_1 = format(f"for &item nao existe em soa: use for i, item in a e grave a[i].campo", alloc = heap)
+        defer delete(msg_1)
+        return sem_erro(s, common.E0320, pos, msg_1)
+    }
+    if common.c2f_s2u_32(tipo_classe_de(&s.tipos, (st.expr as ^frontend.Expr).tipo)) == (TC_PONTEIRO as u32) {
+        let msg_2 = format(f"percorra a soa apontada com p^", alloc = heap)
+        defer delete(msg_2)
+        return sem_erro(s, common.E0320, (st.expr as ^frontend.Expr).pos, msg_2)
+    }
+    let altura: u32 = escopo_altura(&s.escopo)
+    var indice: NovoLocal = NovoLocal{nome = st.nome_indice, pos = pos, tipo = TIPO_INT as u32, natureza = LOC_FOR as u8, origem = 0}
+    st.tipo_local = elemento_da_soa(s, (st.expr as ^frontend.Expr).tipo)
+    var item: NovoLocal = NovoLocal{nome = st.nome, pos = pos, tipo = st.tipo_local, natureza = LOC_FOR as u8, origem = 0}
+    let ok: bool = (((st.nome_indice < 0) or (common.c2f_b2i32(sem_declarar_local(s, &indice, &st.local_indice)) != 0)) and (common.c2f_b2i32(sem_declarar_local(s, &item, &st.local_id)) != 0)) and (common.c2f_b2i32(corpo_de_laco(s, st.corpo)) != 0)
+    escopo_recuar(&s.escopo, altura)
+    return ok
+}
+
+// G3 S5: testes dirigidos (so existem em `forja test`)
+// A struct "P" do teste: simbolo SIM_STRUCT com Decl de `ncampos` campos (dono = campo de memoria; externo = opaca).
+proc s5_struct_p(c: ^S5Cena, d: ^frontend.Decl, ncampos: u32) -> u32 {
+    let id: i32 = s5_nome(c, "P")
+    d.tipo_no = frontend.D_STRUCT as u8
+    d.nome = id
+    d.ncampos = ncampos
+    let tipo: u32 = tipo_struct(&c.sv.tipos, id)
+    let y: ^Simbolo = &(c.sv.globais or_else {})[id]
+    y.categoria = SIM_STRUCT as u8
+    y.tipo = tipo
+    y.decl = d
+    return tipo
+}
+
+test "sem_soa: conferir_struct_da_soa (E0320 de tipo, campos, opaca e dono)" {
+    var pre: [1]str = {"P"}
+    var c = S5Cena{}
+    s5_cena_montar(&c, pre[..])
+    let d: ^frontend.Decl = s4_novo_decl(&c.sv)
+    let p: u32 = s5_struct_p(&c, d, 2)
+    var ref = frontend.TipoRef{erro = -1, pos = 15}
+    expect(conferir_struct_da_soa(&c.sv, &ref, p))
+    expect(not conferir_struct_da_soa(&c.sv, &ref, TIPO_I32 as u32))
+    expect(c.diag.codigo == common.E0320 and c.diag.off == 15 and (c.diag.causa or_else "") == "soa guarda struct da Forja (recebeu i32)")
+    d.ncampos = 0
+    expect(not conferir_struct_da_soa(&c.sv, &ref, p))
+    expect(c.diag.codigo == common.E0320 and (c.diag.causa or_else "") == "soa de 'P' nao existe: a struct precisa de ao menos 1 campo visivel")
+    d.ncampos = 2
+    d.externo = true
+    expect(not conferir_struct_da_soa(&c.sv, &ref, p))
+    expect((c.diag.causa or_else "") == "soa de 'P' nao existe: a struct precisa de ao menos 1 campo visivel")
+    d.externo = false
+    d.contem_dono = true
+    expect(not conferir_struct_da_soa(&c.sv, &ref, p))
+    expect(c.diag.off == 15 and (c.diag.causa or_else "") == "soa de 'P' nao existe: a struct tem campo dono de memoria (lista, map ou soa dinamica)")
+    s5_cena_liberar(&c)
+}
+
+test "sem_soa: resolver_soa, literal, indice e elemento_da_soa" {
+    var pre: [1]str = {"P"}
+    var c = S5Cena{}
+    s5_cena_montar(&c, pre[..])
+    let d: ^frontend.Decl = s4_novo_decl(&c.sv)
+    let p: u32 = s5_struct_p(&c, d, 2)
+    // soa[dynamic]P resolve; soa[]P e soa[dynamic]i32 erram
+    var interno: [1]frontend.TipoRef = {frontend.TipoRef{nome = s5_nome(&c, "P"), erro = -1, pos = 31}}
+    let colunas = frontend.TipoRef{forma = frontend.TR_DINAMICO as u8, alvo = interno[..], erro = -1, pos = 30}
+    var alvo: [1]frontend.TipoRef = {colunas}
+    var t = frontend.TipoRef{forma = frontend.TR_SOA as u8, alvo = alvo[..], erro = -1}
+    var base: u32 = 0
+    expect(resolver_soa(&c.sv, &t, &base) and base == tipo_soa(&c.sv.tipos, tipo_dinamico(&c.sv.tipos, p)))
+    expect(elemento_da_soa(&c.sv, base) == p)
+    alvo[0].forma = frontend.TR_FATIA as u8
+    expect(not resolver_soa(&c.sv, &t, &base))
+    expect(c.diag.codigo == common.E0320 and c.diag.off == 30 and (c.diag.causa or_else "") == "soa[]S nao existe: use soa[N]S ou soa[dynamic]S")
+    alvo[0].forma = frontend.TR_DINAMICO as u8
+    interno[0].nome = s5_nome(&c, "i32")
+    expect(not resolver_soa(&c.sv, &t, &base))
+    expect(c.diag.codigo == common.E0320 and c.diag.off == 31 and (c.diag.causa or_else "") == "soa guarda struct da Forja (recebeu i32)")
+    // literal: dinamica nasce de make; fixa so aceita {}; elementos erram
+    let soa_din: u32 = tipo_soa(&c.sv.tipos, tipo_dinamico(&c.sv.tipos, p))
+    let soa_fix: u32 = tipo_soa(&c.sv.tipos, tipo_array(&c.sv.tipos, p, 3))
+    var e = frontend.Expr{tipo_no = frontend.EX_LITERAL_ARRAY as u8, pos = 9}
+    expect(not sem_literal_soa(&c.sv, &e, soa_din))
+    expect(c.diag.codigo == common.E0320 and c.diag.off == 9 and (c.diag.causa or_else "") == "soa[dynamic]S nasce de make: make(soa[dynamic]S, alloc = heap)")
+    expect(sem_literal_soa(&c.sv, &e, soa_fix) and e.tipo == soa_fix)
+    e.nargs = 2
+    expect(not sem_literal_soa(&c.sv, &e, soa_fix))
+    expect((c.diag.causa or_else "") == "soa nao tem literal com elementos: comece com {} e grave a[i] = S{...}")
+    // indice: a soa por valor da o elemento; por ponteiro erra
+    var fa = s5_folha(soa_fix, false)
+    var fb = s5_folha(TIPO_INT as u32, false)
+    var ei = frontend.Expr{tipo_no = frontend.EX_INDICE as u8, a = &fa, b = &fb, pos = 4, pos_op = 6}
+    expect(sem_indice_soa(&c.sv, &ei) and ei.tipo == p)
+    fa = s5_folha(tipo_ponteiro(&c.sv.tipos, soa_fix), false)
+    expect(not sem_indice_soa(&c.sv, &ei))
+    expect(c.diag.codigo == common.E0320 and c.diag.off == 6 and (c.diag.causa or_else "") == "indexe a soa apontada com p^[i]")
+    s5_cena_liberar(&c)
+}

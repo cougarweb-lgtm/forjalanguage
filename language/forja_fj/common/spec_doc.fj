@@ -1,0 +1,397 @@
+// common/spec_doc.fj - porte de compiler/common/spec_doc.c, compiler/common/spec_doc.h
+// sha256 de common/spec_doc.c: 6e19e9d3b133f72eb0a89230fa126d556a844db1d32096663c098ad79e952c16
+// sha256 de common/spec_doc.h: db93266ca04cad81111a9ff4d6ed992bd355f9b93de913f361cdb0e366c8f1ab
+// gerado por c2forja esqueleto 0.3.2; corpo real do P-common C3
+// Versao: 0.2.0
+//
+// Vistas: DocTexto.texto e uma fatia que vai ate o fim do buffer; `p + k` do C = texto[k..<len(texto)] e a diferenca de dois ponteiros do mesmo buffer = diferenca dos len.
+// Nomes de secao (char[32] do C) = str que e fatia do str do arquivo embutido (doc_embutida_texto): sem copia e sem heap.
+
+pub struct SpecSecao {
+    nome: ?str
+    bloco: DocTexto
+    corpo: DocTexto
+}
+
+const MAPA_CODIGO_TAM: i32 = 5
+pub const SPEC_NOME_MAX: i32 = 32
+pub const SPEC_SECOES_MAX: i32 = 16
+const SPEC_TRECHO_MAX: i32 = 320
+
+// C: common/spec_doc.c:15
+pub proc spec_proxima_linha(resto: ^DocTexto, linha: ^DocTexto) -> bool {
+    var n: u64 = 0
+    if resto.tam == 0 {
+        return false
+    }
+    while n < resto.tam and resto.texto[n] != 10 { // '\n'
+        n += 1
+    }
+    linha.texto = resto.texto
+    if n > 0 and resto.texto[n - 1] == 13 { // '\r'
+        linha.tam = n - 1
+    } else {
+        linha.tam = n
+    }
+    var avancar: u64 = n
+    if n < resto.tam {
+        avancar = n + 1
+    }
+    resto.texto = resto.texto[(avancar as int)..<len(resto.texto)]
+    resto.tam -= avancar
+    return true
+}
+
+// C: common/spec_doc.c:31
+// C: LerTitulo devolvia o nome em char[32]; aqui devolve o tamanho do nome (que comeca no byte 3 da linha, ja cortado em SPEC_NOME_MAX - 1) e quem chama fatia o str do arquivo.
+proc ler_titulo(linha: DocTexto) -> (eh: bool, n: u64) {
+    // "== " no comeco (61 61 32) e " ==" no fim (32 61 61)
+    if linha.tam < 7 or linha.texto[0] != 61 or linha.texto[1] != 61 or linha.texto[2] != 32 {
+        return false, 0
+    }
+    if linha.texto[linha.tam - 3] != 32 or linha.texto[linha.tam - 2] != 61 or linha.texto[linha.tam - 1] != 61 {
+        return false, 0
+    }
+    var n: u64 = linha.tam - 6
+    if n >= (SPEC_NOME_MAX as u64) {
+        n = (SPEC_NOME_MAX as u64) - 1
+    }
+    return true, n
+}
+
+// C: common/spec_doc.c:43
+// fim: o resto do buffer a partir do fim da secao (suffix do mesmo buffer de s.bloco.texto e s.corpo.texto).
+proc fechar_secao(s: ^SpecSecao, fim: []u8) {
+    s.bloco.tam = (len(s.bloco.texto) - len(fim)) as u64
+    s.corpo.tam = (len(s.corpo.texto) - len(fim)) as u64
+}
+
+// C: common/spec_doc.c:49
+pub proc spec_secoes(fonte: i32, saida: []SpecSecao, cap: u64) -> u64 {
+    let total = doc_embutida(fonte)
+    let texto = doc_embutida_texto(fonte)
+    var resto = total
+    var linha = DocTexto{}
+    var n: u64 = 0
+    while true {
+        let inicio = resto.texto
+        if not spec_proxima_linha(&resto, &linha) {
+            break
+        }
+        let eh, nome_n = ler_titulo(linha)
+        if not eh {
+            continue
+        }
+        if n > 0 {
+            fechar_secao(&saida[n - 1], inicio)
+        }
+        if n == cap {
+            return n
+        }
+        let desde = (len(total.texto) - len(linha.texto)) + 3 // a linha comeca em len(total) - len(linha.texto); o nome vem depois de "== "
+        saida[n].nome = texto[desde..<desde + (nome_n as int)]
+        saida[n].bloco.texto = inicio
+        saida[n].corpo.texto = resto.texto
+        n += 1
+    }
+    if n > 0 {
+        fechar_secao(&saida[n - 1], total.texto[(total.tam as int)..<len(total.texto)])
+    }
+    return n
+}
+
+// C: common/spec_doc.c:72
+// C2F-13: lista fundido em n (len)
+pub proc spec_achar_secao(lista: []SpecSecao, nome: ?str) -> ?^SpecSecao {
+    for k in (0 as u64)..<(len(lista) as u64) {
+        if (lista[k].nome or_else "") == (nome or_else "") {
+            return &lista[k]
+        }
+    }
+    return none
+}
+
+// C: common/spec_doc.c:79
+// C: secao era char[SPEC_NOME_MAX] de saida; aqui ^str (fatia do mapa_spec.tsv embutido). Em false o destino fica como estava.
+pub proc spec_secao_do_codigo(codigo: ?str, secao: ^str) -> bool {
+    let total = doc_embutida(DOC_MAPA)
+    let texto = doc_embutida_texto(DOC_MAPA)
+    let cod = codigo or_else ""
+    var resto = total
+    var linha = DocTexto{}
+    _ = spec_proxima_linha(&resto, &linha) // cabecalho "codigo<TAB>secao"
+    while spec_proxima_linha(&resto, &linha) {
+        var n: u64 = 0
+        if linha.tam > ((MAPA_CODIGO_TAM as u64) + 1) {
+            n = linha.tam - (MAPA_CODIGO_TAM as u64) - 1
+        }
+        // codigo do C: memcmp de 5 bytes e codigo[5] == NUL = o texto tem exatamente 5 bytes e eles batem
+        if n == 0 or linha.texto[MAPA_CODIGO_TAM] != 9 or len(cod) != (MAPA_CODIGO_TAM as int) or c2f_memcmp(linha.texto[0..<MAPA_CODIGO_TAM], as_bytes(cod)) != 0 { // TAB
+            continue
+        }
+        if n >= (SPEC_NOME_MAX as u64) {
+            n = (SPEC_NOME_MAX as u64) - 1
+        }
+        let desde = (len(total.texto) - len(linha.texto)) + (MAPA_CODIGO_TAM as int) + 1
+        secao^ = texto[desde..<desde + (n as int)]
+        return true
+    }
+    return false
+}
+
+// C: common/spec_doc.c:99
+proc fim_da_clausula(linha: DocTexto, inicio: u64) -> u64 {
+    var fundo: i32 = 0
+    var crase: bool = false
+    for i in inicio..<linha.tam {
+        let c: u8 = linha.texto[i]
+        let ponto_final: bool = ((c == 59) or (c == 46)) and (((i + 1) == linha.tam) or (linha.texto[i + 1] == 32)) // ';' '.' ' '
+        if c == 96 { // '`'
+            crase = not crase
+        } else if crase {
+            continue
+        } else if c == 40 { // '('
+            fundo += 1
+        } else if (c == 41) and (fundo > 0) { // ')'
+            fundo -= 1
+        } else if (c2f_b2i32(ponto_final) != 0) and (fundo == 0) {
+            return i
+        }
+    }
+    return linha.tam
+}
+
+// C: common/spec_doc.c:118
+proc proxima_clausula(resto: ^DocTexto, clausula: ^DocTexto) -> bool {
+    var inicio: u64 = 0
+    while inicio < resto.tam and resto.texto[inicio] == 32 { // ' '
+        inicio += 1
+    }
+    if inicio >= resto.tam {
+        return false
+    }
+    let fim = fim_da_clausula(resto^, inicio)
+    clausula.texto = resto.texto[(inicio as int)..<len(resto.texto)]
+    clausula.tam = fim - inicio
+    var consumido: u64 = fim
+    if fim < resto.tam {
+        consumido = fim + 1
+    }
+    resto.texto = resto.texto[(consumido as int)..<len(resto.texto)]
+    resto.tam -= consumido
+    return true
+}
+
+// C: common/spec_doc.c:135
+proc eh_alfanumerico(c: u8) -> bool {
+    return ((((c2f_char_i32(c) >= 48) and (c2f_char_i32(c) <= 57)) or ((c2f_char_i32(c) >= 65) and (c2f_char_i32(c) <= 90))) or ((c2f_char_i32(c) >= 97) and (c2f_char_i32(c) <= 122))) or (c == 95) // '0' '9' 'A' 'Z' 'a' 'z' '_'
+}
+
+// C: common/spec_doc.c:140
+proc cita_codigo(clausula: DocTexto, codigo: ?str) -> bool {
+    let cod = codigo or_else ""
+    let n = len(cod) as u64
+    var i: u64 = 0
+    while i + n <= clausula.tam {
+        let antes = i > 0 and eh_alfanumerico(clausula.texto[i - 1])
+        let depois = i + n < clausula.tam and eh_alfanumerico(clausula.texto[i + n])
+        if not antes and not depois and c2f_memcmp(clausula.texto[(i as int)..<((i + n) as int)], as_bytes(cod)) == 0 {
+            return true
+        }
+        i += 1
+    }
+    return false
+}
+
+// C: common/spec_doc.c:154
+proc proxima_linha_de_texto(resto: ^DocTexto, linha: ^DocTexto, em_bloco: ^bool) -> bool {
+    while spec_proxima_linha(resto, linha) {
+        // "```" = 96 96 96
+        if linha.tam >= 3 and linha.texto[0] == 96 and linha.texto[1] == 96 and linha.texto[2] == 96 {
+            em_bloco^ = not em_bloco^
+            continue
+        }
+        if not em_bloco^ and linha.tam > 0 {
+            return true
+        }
+    }
+    return false
+}
+
+// C: common/spec_doc.c:167
+proc achar_clausula_do_codigo(corpo: DocTexto, codigo: ?str, achada: ^DocTexto) -> bool {
+    var corpo_v: DocTexto = corpo
+    var linha: DocTexto = DocTexto{}
+    var em_bloco: bool = false
+    while proxima_linha_de_texto(&corpo_v, &linha, &em_bloco) {
+        var clausula: DocTexto = DocTexto{}
+        while proxima_clausula(&linha, &clausula) {
+            if not cita_codigo(clausula, codigo) {
+                continue
+            }
+            achada^ = clausula
+            return true
+        }
+    }
+    return false
+}
+
+// C: common/spec_doc.c:185
+proc comeco_da_secao(corpo: DocTexto, achado: ^DocTexto) -> bool {
+    var corpo_v: DocTexto = corpo
+    var linha: DocTexto = DocTexto{}
+    var clausula: DocTexto = DocTexto{}
+    var em_bloco: bool = false
+    var fim: u64 = 0
+    if not proxima_linha_de_texto(&corpo_v, &linha, &em_bloco) {
+        return false
+    }
+    var resto: DocTexto = linha
+    while proxima_clausula(&resto, &clausula) {
+        let ate: u64 = ((len(linha.texto) - len(clausula.texto)) as u64) + clausula.tam
+        if fim > 0 and ate > (SPEC_TRECHO_MAX as u64) {
+            break
+        }
+        fim = ate
+    }
+    achado.texto = linha.texto
+    achado.tam = fim
+    return true
+}
+
+// C: common/spec_doc.c:205
+proc copiar_cortado(texto: DocTexto, saida: []u8, cap: u64) -> u64 {
+    var n: u64 = texto.tam
+    if n > (SPEC_TRECHO_MAX as u64) {
+        n = SPEC_TRECHO_MAX as u64
+    }
+    if n > wrapping_sub(cap, 4) { // cap - 4 em size_t (da a volta se cap < 4, como no C)
+        n = wrapping_sub(cap, 4)
+    }
+    if n < texto.tam {
+        while n > 1 and texto.texto[n] != 32 { // ' '
+            n -= 1
+        }
+        while n > 1 and (texto.texto[n] & 0xC0) == 0x80 {
+            n -= 1
+        }
+    }
+    copy(saida[0..<(n as int)], texto.texto[0..<(n as int)])
+    if n < texto.tam {
+        saida[n] = 46 // '.' '.' '.'
+        saida[n + 1] = 46
+        saida[n + 2] = 46
+        n += 3
+    }
+    saida[n] = 0
+    return n
+}
+
+// C: common/spec_doc.c:224
+proc spec_trecho_do_codigo(codigo: ?str, secao: str, saida: []u8, cap: u64) -> u64 {
+    var lista: [16]SpecSecao = {} // SPEC_SECOES_MAX
+    let qtd = spec_secoes(DOC_SPEC, lista[..], SPEC_SECOES_MAX as u64)
+    let s = spec_achar_secao(lista[0..<(qtd as int)], secao)
+    var achado: DocTexto = DocTexto{}
+    if s == none {
+        return 0
+    }
+    let sec = s as ^SpecSecao
+    if not achar_clausula_do_codigo(sec.corpo, codigo, &achado) and not comeco_da_secao(sec.corpo, &achado) {
+        return 0
+    }
+    return copiar_cortado(achado, saida, cap)
+}
+
+// C: common/spec_doc.c:235
+// C: a copia sem os CR ia num malloc (com o ramo de falha `""`, que nao existe aqui) e ImprimirTextoJson recebia a string C; aqui vai um str feito dos mesmos bytes.
+pub proc spec_imprimir_texto_json(saida: ^Saida, texto: DocTexto) {
+    var copia = make([dynamic]u8, alloc = heap)
+    defer delete(copia)
+    for i in (0 as u64)..<texto.tam {
+        if texto.texto[i] != 13 { // '\r'
+            append(&copia, item = texto.texto[i])
+        }
+    }
+    let s = to_str(&copia)
+    defer delete(s)
+    imprimir_texto_json(saida, s)
+}
+
+// ---- Testes: porte do teste_common_spec.c (TestaDocEmbutida e a parte de TestaMapaCompleto que nao depende do catalogo do diag; o resto fica para o P-common C2: DiagCodigoTexto/DIAG_QTD,
+// diag_spec_texto, DiagImprimirJson).
+
+// Os 13 temas, na mesma ordem, no cartao e na spec; os 6 arquivos embutidos existem; o cartao abre com "CARTAO FORJA".
+test "spec_doc_embutida" {
+    // 0.47.0: o cartao ganhou o tema "alvos" (antes de "cli"); a spec segue com 13.
+    let temas_spec: [13]str = {"formato", "declarar", "proc", "fluxo", "erro", "memoria", "colecoes", "texto", "foreign", "modulos", "testes", "saida", "cli"}
+    let temas_cartao: [14]str = {"formato", "declarar", "proc", "fluxo", "erro", "memoria", "colecoes", "texto", "foreign", "modulos", "testes", "saida", "alvos", "cli"}
+    var spec: [16]SpecSecao = {}
+    var cartao: [16]SpecSecao = {}
+    let nspec = spec_secoes(DOC_SPEC, spec[..], SPEC_SECOES_MAX as u64)
+    let ncartao = spec_secoes(DOC_CARTAO, cartao[..], SPEC_SECOES_MAX as u64)
+    var mesmos = nspec == 13 and ncartao == 14
+    for k in 0..<13 {
+        if mesmos and (spec[k].nome or_else "") != temas_spec[k] {
+            mesmos = false
+        }
+    }
+    for k in 0..<14 {
+        if mesmos and (cartao[k].nome or_else "") != temas_cartao[k] {
+            mesmos = false
+        }
+    }
+    expect(mesmos)
+    for k in 0..<6 {
+        let t = doc_embutida(k as i32)
+        expect(t.tam > 0 and (t.tam as int) == len(t.texto))
+    }
+    expect(doc_embutida_texto(DOC_CARTAO)[0..<12] == "CARTAO FORJA")
+    expect(doc_embutida_texto(99) == "")
+}
+
+// Todo codigo do mapa_spec.tsv: secao no mapa, secao existente na spec e no cartao, trecho nao vazio, curto e terminado em NUL sem NUL no meio.
+test "spec_mapa_completo" {
+    var spec: [16]SpecSecao = {}
+    var cartao: [16]SpecSecao = {}
+    let nspec = spec_secoes(DOC_SPEC, spec[..], SPEC_SECOES_MAX as u64)
+    let ncartao = spec_secoes(DOC_CARTAO, cartao[..], SPEC_SECOES_MAX as u64)
+    let mapa = doc_embutida_texto(DOC_MAPA)
+    var resto = doc_embutida(DOC_MAPA)
+    var linha = DocTexto{}
+    var trecho: [328]u8 = {}
+    var codigos = 0
+    var sem_mapa = 0
+    var sem_secao = 0
+    var sem_trecho = 0
+    _ = spec_proxima_linha(&resto, &linha) // cabecalho
+    while spec_proxima_linha(&resto, &linha) {
+        let desde = len(mapa) - len(linha.texto)
+        let codigo = mapa[desde..<desde + 5]
+        var secao = ""
+        codigos += 1
+        if not spec_secao_do_codigo(codigo, &secao) {
+            sem_mapa += 1
+            continue
+        }
+        if spec_achar_secao(spec[0..<(nspec as int)], secao) == none or spec_achar_secao(cartao[0..<(ncartao as int)], secao) == none {
+            sem_secao += 1
+        }
+        let n = spec_trecho_do_codigo(codigo, secao, trecho[..], 328)
+        var sem_nul = true
+        for i in 0..<(n as int) {
+            if trecho[i] == 0 {
+                sem_nul = false
+            }
+        }
+        if n == 0 or n > ((SPEC_TRECHO_MAX as u64) + 3) or not sem_nul or trecho[n] != 0 {
+            sem_trecho += 1
+        }
+    }
+    expect(codigos == 161)
+    expect(sem_mapa == 0 and sem_secao == 0 and sem_trecho == 0)
+    var secao_fora = "intacta"
+    expect(not spec_secao_do_codigo("E9999", &secao_fora) and not spec_secao_do_codigo("E050", &secao_fora) and secao_fora == "intacta")
+    var secao_e0707 = ""
+    expect(spec_secao_do_codigo("E0707", &secao_e0707) and secao_e0707 == "declarar")
+}

@@ -1,0 +1,129 @@
+// nativo/bir/analises_lacos.fj - porte de compiler/nativo/bir/analises_lacos.c
+// sha256 de nativo/bir/analises_lacos.c: 34aa2f4d9d21ae4d7124ecfbc3313c5665691e24620d2a3c6a5f588bc2d0b17a
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "common"
+
+struct ColetaCorpo {
+    marca: []u8 // C2F-INDECIDIVEL
+    pilha: ?[]u32
+    lista: ?[]u32
+    npilha: u32
+    nlista: u32
+}
+
+// C: nativo/bir/analises_lacos.c:15
+// C2F-VOID: x, y (qsort): ids sao u32 direto, sem ponteiro void; a ordem e a do C (menor primeiro)
+proc comparar_id(x: u32, y: u32) -> i32 {
+    if x < y {
+        return -1
+    }
+    if x > y {
+        return 1
+    }
+    return 0
+}
+
+// Ordenacao crescente por insercao: o corpo do laco e pequeno e os ids sao unicos (a marca barra repeticao), entao o resultado e o do qsort.
+proc ordenar_ids_crescente(ids: []u32) {
+    for i in (1 as u32)..<(len(ids) as u32) {
+        var j: u32 = i
+        while (j > 0) and (comparar_id(ids[j - 1], ids[j]) > 0) {
+            let troca: u32 = ids[j - 1]
+            ids[j - 1] = ids[j]
+            ids[j] = troca
+            j -= 1
+        }
+    }
+}
+
+// C: nativo/bir/analises_lacos.c:22
+proc entrar_no_corpo(c: ^ColetaCorpo, b: u32) {
+    if c.marca[b] != 0 {
+        return
+    }
+    c.marca[b] = 1
+    var lista: []u32 = c.lista or_else {}
+    lista[c.nlista] = b
+    c.nlista += 1
+    var pilha: []u32 = c.pilha or_else {}
+    pilha[c.npilha] = b
+    c.npilha += 1
+}
+
+// C: nativo/bir/analises_lacos.c:32
+proc semear_origens(a: ^AnalisesBir, h: u32, c: ^ColetaCorpo) -> u32 {
+    var n: u32 = 0
+    var k: u32 = (a.pred_ini or_else {})[h]
+    while k < (a.pred_ini or_else {})[h + 1] {
+        if analises_domina(a, h, (a.pred or_else {})[k]) {
+            entrar_no_corpo(c, (a.pred or_else {})[k])
+            n += 1
+        }
+        k += 1
+    }
+    return n
+}
+
+// C: nativo/bir/analises_lacos.c:46
+proc expandir_corpo(a: ^AnalisesBir, h: u32, c: ^ColetaCorpo) {
+    while c.npilha > 0 {
+        c.npilha -= 1
+        let b: u32 = (c.pilha or_else {})[c.npilha]
+        if b == h {
+            continue
+        }
+        var k: u32 = (a.pred_ini or_else {})[b]
+        while k < (a.pred_ini or_else {})[b + 1] {
+            if (a.pos_rpo or_else {})[(a.pred or_else {})[k]] != BIR_SEM_BLOCO {
+                entrar_no_corpo(c, (a.pred or_else {})[k])
+            }
+            k += 1
+        }
+    }
+}
+
+// C: nativo/bir/analises_lacos.c:61
+proc guardar_laco(a: ^AnalisesBir, h: u32, c: ^ColetaCorpo) {
+    let laco_id: u32 = a.nlacos
+    a.nlacos += 1
+    let lista: []u32 = c.lista or_else {}
+    ordenar_ids_crescente(lista[0..<(c.nlista as int)])
+    var lacos: []LacoBir = a.lacos or_else {}
+    lacos[laco_id].cabecalho = h
+    lacos[laco_id].ncorpo = c.nlista
+    let corpo: []u32 = analises_vetor32(a, c.nlista as u64)
+    for k in (0 as u32)..<c.nlista {
+        corpo[k] = lista[k]
+    }
+    lacos[laco_id].corpo = corpo
+    var prof: []u32 = a.prof_laco or_else {}
+    for k in (0 as u32)..<c.nlista {
+        prof[lista[k]] += 1
+        c.marca[lista[k]] = 0
+    }
+    c.nlista = 0
+}
+
+// C: nativo/bir/analises_lacos.c:77
+proc analises_calcular_lacos(a: ^AnalisesBir) {
+    let n: u32 = a.nblocos
+    var c: ColetaCorpo = ColetaCorpo{marca = common.arena_fatia_u8(&a.arena, n as int), pilha = analises_vetor32(a, n as u64), lista = analises_vetor32(a, n as u64), npilha = 0, nlista = 0}
+    a.lacos = arena_fatia_laco_bir(&a.arena, (n + 1) as int)
+    a.prof_laco = analises_vetor32(a, n as u64)
+    for h in (0 as u32)..<n {
+        if (a.pos_rpo or_else {})[h] == BIR_SEM_BLOCO {
+            continue
+        }
+        entrar_no_corpo(&c, h)
+        c.npilha = 0
+        if semear_origens(a, h, &c) == 0 {
+            c.marca[h] = 0
+            c.nlista = 0
+            continue
+        }
+        expandir_corpo(a, h, &c)
+        guardar_laco(a, h, &c)
+    }
+}

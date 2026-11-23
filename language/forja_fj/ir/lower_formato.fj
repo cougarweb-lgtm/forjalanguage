@@ -1,0 +1,138 @@
+// ir/lower_formato.fj - porte de compiler/ir/lower_formato.c
+// sha256 de ir/lower_formato.c: a42dc573fcb8b8786ea360b9025e99827509dcf7089544e99da960bb35185c61
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "common"
+import "frontend"
+import "semantic"
+
+// C: ir/lower_formato.c:13
+proc parte_eh_texto(parte: ^frontend.Arg) -> bool {
+    return parte.indice < 0
+}
+
+// C: ir/lower_formato.c:19
+proc valores_das_partes(c: ^LowerCtx, ftexto: ?^frontend.Expr) -> ?[]Valor {
+    let f: ^frontend.Expr = ftexto as ^frontend.Expr
+    let valores: ?[]Valor = lw_args(c, f.nargs)
+    let vals: []Valor = valores or_else {}
+    var k: u32 = 0
+    while k < f.nargs {
+        let parte: ^frontend.Arg = &((f.args or_else {})[k])
+        if parte_eh_texto(parte) {
+            vals[k] = lw_valor_texto(lw_texto_decodificado(c, parte.valor), semantic.TIPO_STR as u32)
+        } else {
+            vals[k] = lw_expr(c, parte.valor)
+        }
+        k += 1
+    }
+    return valores
+}
+
+// C: ir/lower_formato.c:31
+proc parte_eh_depurar(parte: ^frontend.Arg) -> bool {
+    return (parte.indice >= 0) and (common.c2f_e_i32(parte.indice, frontend.FMT_DEPURAR) != 0)
+}
+
+// C: ir/lower_formato.c:37
+// C2F: valores = fatia dos valores das partes (vazia quando nargs == 0); npares recebe o total de pares
+proc pares_da_instrucao(c: ^LowerCtx, ftexto: ?^frontend.Expr, valores: []Valor, npares: ^u32) -> ?[]Valor {
+    let f: ^frontend.Expr = ftexto as ^frontend.Expr
+    var pares: [dynamic]Valor = make([dynamic]Valor, alloc = heap)
+    defer delete(pares)
+    var k: u32 = 0
+    while k < f.nargs {
+        let parte: ^frontend.Arg = &((f.args or_else {})[k])
+        if parte_eh_depurar(parte) {
+            lw_depurar(c, &pares, valores[k], f.pos_op)
+            k += 1
+            continue
+        }
+        var indice_par: i32 = 0
+        if not parte_eh_texto(parte) {
+            indice_par = parte.indice
+        }
+        append(&pares, item = lw_valor_int(indice_par as i64, semantic.TIPO_U32 as u32))
+        append(&pares, item = valores[k])
+        k += 1
+    }
+    let saida: ?[]Valor = lw_args(c, len(pares) as u32)
+    let dest: []Valor = saida or_else {}
+    for j in 0..<len(pares) {
+        dest[j] = pares[j]
+    }
+    npares^ = len(pares) as u32
+    return saida
+}
+
+// C: ir/lower_formato.c:57
+proc tipo_do_modo(modo: u8) -> u32 {
+    if modo == 1 {
+        return semantic.TIPO_STR as u32
+    }
+    var tern_1: i32 = semantic.TIPO_VAZIO
+    if modo == 2 {
+        tern_1 = semantic.TIPO_CSTR
+    }
+    return common.c2f_s2u_32(tern_1)
+}
+
+// C: ir/lower_formato.c:63
+proc lw_formata(c: ^LowerCtx, ftexto: ?^frontend.Expr, modo: u8, alocador: Valor, saida: ^?^IrInstr) {
+    var npares: u32 = 0
+    let valores: ?[]Valor = valores_das_partes(c, ftexto)
+    let pares: ?[]Valor = pares_da_instrucao(c, ftexto, valores or_else {}, &npares)
+    let f: ^frontend.Expr = ftexto as ^frontend.Expr
+    let i: ^IrInstr = lw_nova_instr(c, IR_FORMATA, f.pos_op)
+    var k: u32 = 0
+    while k < f.nargs {
+        let parte: ^frontend.Arg = &((f.args or_else {})[k])
+        if (not parte_eh_texto(parte)) and (common.c2f_e_i32(parte.indice, frontend.FMT_CURTO) != 0) {
+            let prog_fmt: ^IrPrograma = c.prog as ^IrPrograma
+            prog_fmt.usa_real_curto = true
+        }
+        k += 1
+    }
+    i.op_aux = modo
+    i.tipo = tipo_do_modo(modo)
+    if (modo == 1) or (modo == 2) {
+        i.destino = lw_novo_temp(c)
+    } else {
+        i.destino = -1
+    }
+    i.a = alocador
+    i.args = pares
+    i.nargs = npares
+    saida^ = i
+}
+
+// Valores do C: modo -> tipo (TipoDoModo); parte de texto tem indice < 0; {x:?} tem FMT_DEPURAR.
+test "lower_formato: tipo do modo e classificacao das partes" {
+    expect(tipo_do_modo(1) == semantic.TIPO_STR as u32 and tipo_do_modo(2) == semantic.TIPO_CSTR as u32)
+    expect(tipo_do_modo(0) == semantic.TIPO_VAZIO as u32 and tipo_do_modo(3) == semantic.TIPO_VAZIO as u32)
+    var parte_txt: frontend.Arg = frontend.Arg{indice = -1}
+    var parte_fmt: frontend.Arg = frontend.Arg{indice = 0}
+    var parte_dep: frontend.Arg = frontend.Arg{indice = frontend.FMT_DEPURAR}
+    expect(parte_eh_texto(&parte_txt) and not parte_eh_texto(&parte_fmt))
+    expect(parte_eh_depurar(&parte_dep) and not parte_eh_depurar(&parte_fmt) and not parte_eh_depurar(&parte_txt))
+}
+
+// f"" sem partes: uma IR_FORMATA com nargs 0 (args = none) e destino temporario so para str/cstr.
+test "lower_formato: f sem partes vira IR_FORMATA sem pares" {
+    var a: common.Arena = common.Arena{}
+    defer common.arena_liberar(&a)
+    var bloco: IrBloco = IrBloco{}
+    var prog: IrPrograma = IrPrograma{}
+    var c: LowerCtx = LowerCtx{}
+    c.arena = &a
+    c.atual = &bloco
+    c.prog = &prog
+    var ftexto: frontend.Expr = frontend.Expr{pos_op = 5}
+    var saida: ?^IrInstr = none
+    lw_formata(&c, &ftexto, 1, Valor{}, &saida)
+    let i: ^IrInstr = saida as ^IrInstr
+    expect(i.op == IR_FORMATA as u8 and i.op_aux == 1 and i.nargs == 0 and i.args == none)
+    expect(i.tipo == semantic.TIPO_STR as u32 and i.destino == 0 and c.ntemps == 1)
+    expect(prog.usa_real_curto == false)
+}

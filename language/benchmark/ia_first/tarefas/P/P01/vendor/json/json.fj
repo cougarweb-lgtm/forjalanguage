@@ -1,0 +1,429 @@
+// std:json 0.1.0 - JSON para a Forja, feito por cima do cJSON 1.7.19 (MIT) em vendor\libcjson.a.
+//
+// COMO USAR (o .fj raiz do programa precisa de uma pasta vendor\ ao lado; ver MEM-FORJA-GUIA-10):
+//     import "vendor:json/json"
+//     ...
+//     let doc = try json.parse("{\"a\": 1}")
+//     defer json.close(doc)
+//     let a = try json.field_int(doc, name = "a")
+// Os nomes antigos em portugues (abrir, fechar, campo_inteiro, nome = ..., ErroJson, TipoJson...) dao E0110: rode forja migrar (tabela compiler\common\renomeados.c).
+//
+// DONOS E EMPRESTADOS (a regra que evita vazamento e ponteiro solto):
+//   - parse, parse_file, new_object e new_list devolvem um Json DONO: chame json.close(doc) uma vez.
+//   - field, item, set_object, set_list, push_object e lista_lista devolvem uma VISTA (dono = false) de dentro do dono:
+//     vale ate o close do dono; json.close numa vista nao faz nada.
+//   - text, field_text e key devolvem um str EMPRESTADO do documento: vale ate o close. Para guardar, copie
+//     com format(f"{s}", alloc = heap).
+//   - dump devolve um str NOVO em heap: o chamador faz delete.
+// Um objeto/lista anexado a outro (set_*, push_*) pertence ao pai; so o pai e fechado.
+// Erro: JsonError. Nada aqui devolve ponteiro cru; o campo no do Json e interno, nao mexa.
+// Limite: o cJSON guarda o ultimo erro de parse numa variavel global (nao e seguro para abrir JSON em 2 threads).
+//
+// VERIFICAR: python language\vendor\json\verificar_json.py   (ou: forja test language\exemplos_libs\teste_json.fj)
+
+import "vendor:json/cjson" as cj
+
+pub enum JsonError {
+    invalid
+    missing
+    wrong_type
+    out_of_memory
+    file
+}
+
+pub enum JsonKind {
+    null
+    boolean
+    number
+    text
+    list
+    object
+    outro
+}
+
+pub struct Json {
+    no: ?^cj.CJson
+    dono: bool
+}
+
+const JSON_ARQUIVO_MAXIMO: i32 = 268435456
+
+foreign {
+    link "msvcrt"
+    opaque JsonArquivoC
+    proc json_c_fopen = "fopen"(caminho: cstr, modo: cstr) -> ?^JsonArquivoC
+    proc json_c_fclose = "fclose"(arquivo: ?^JsonArquivoC) -> i32
+    proc json_c_fseek = "fseek"(arquivo: ?^JsonArquivoC, deslocamento: i32, origem: i32) -> i32
+    proc json_c_ftell = "ftell"(arquivo: ?^JsonArquivoC) -> i32
+    proc json_c_fread = "fread"(destino: rawptr, tamanho: u64, quantidade: u64, arquivo: ?^JsonArquivoC) -> u64
+    proc json_c_malloc = "malloc"(bytes: u64) -> rawptr
+    proc json_c_free = "free"(bloco: rawptr)
+}
+
+// ---------------------------------------------------------------- parse e close
+
+// Texto JSON (cstr, termina em NUL) -> documento dono. Erro: invalid.
+pub proc parse(texto: cstr) -> Json ! JsonError {
+    let lido = cj.cJSON_Parse(texto)
+    switch r in lido {
+    case ^cj.CJson:
+        return Json{no = r, dono = true}
+    case none:
+        return JsonError.invalid
+    }
+    return JsonError.invalid
+}
+
+// str -> documento dono (copia o texto para ganhar o NUL final). Erro: invalid.
+pub proc parse_str(texto: str) -> Json ! JsonError {
+    let copia = format_c(f"{texto}", alloc = heap)
+    defer delete(copia)
+    return parse(copia)
+}
+
+// Le o arquivo inteiro e abre. Erros: file (nao abriu, vazio, maior que 256 MiB, leitura curta), out_of_memory, invalid.
+pub proc parse_file(caminho: cstr) -> Json ! JsonError {
+    let aberto = json_c_fopen(caminho, modo = "rb")
+    switch a in aberto {
+    case ^JsonArquivoC:
+        _ = json_c_fseek(a, deslocamento = 0, origem = 2)
+        let tamanho = json_c_ftell(a)
+        _ = json_c_fseek(a, deslocamento = 0, origem = 0)
+        if tamanho <= 0 or tamanho > JSON_ARQUIVO_MAXIMO {
+            _ = json_c_fclose(a)
+            return JsonError.file
+        }
+        let bloco = json_c_malloc((tamanho as u64) + 1)
+        let bytes = bloco as ^u8
+        let janela = slice_from(bytes, len = tamanho + 1)
+        let lidos = json_c_fread(bloco, tamanho = 1, quantidade = tamanho as u64, arquivo = a)
+        _ = json_c_fclose(a)
+        if lidos != (tamanho as u64) {
+            json_c_free(bloco)
+            return JsonError.file
+        }
+        janela[tamanho] = 0
+        let doc = parse(bloco as cstr)
+        json_c_free(bloco)
+        return try doc
+    case none:
+        return JsonError.file
+    }
+    return JsonError.file
+}
+
+// Fecha um documento DONO. Em vista (dono = false) nao faz nada.
+pub proc close(doc: Json) {
+    if doc.dono {
+        cj.cJSON_Delete(doc.no)
+    }
+}
+
+// ---------------------------------------------------------------- ler
+
+// Tipo do valor: null, boolean, number, text, list, object (outro = vazio/invalido).
+pub proc kind(j: Json) -> JsonKind {
+    if cj.cJSON_IsNull(j.no) != 0 {
+        return JsonKind.null
+    }
+    if cj.cJSON_IsBool(j.no) != 0 {
+        return JsonKind.boolean
+    }
+    if cj.cJSON_IsNumber(j.no) != 0 {
+        return JsonKind.number
+    }
+    if cj.cJSON_IsString(j.no) != 0 {
+        return JsonKind.text
+    }
+    if cj.cJSON_IsArray(j.no) != 0 {
+        return JsonKind.list
+    }
+    if cj.cJSON_IsObject(j.no) != 0 {
+        return JsonKind.object
+    }
+    return JsonKind.outro
+}
+
+// Vista do campo `name` de um objeto. Erros: wrong_type (j nao e objeto), missing (nao tem o campo).
+pub proc field(j: Json, name: cstr) -> Json ! JsonError {
+    if cj.cJSON_IsObject(j.no) == 0 {
+        return JsonError.wrong_type
+    }
+    let achado = cj.cJSON_GetObjectItemCaseSensitive(j.no, string = name)
+    switch c in achado {
+    case ^cj.CJson:
+        return Json{no = c, dono = false}
+    case none:
+        return JsonError.missing
+    }
+    return JsonError.missing
+}
+
+// true se o objeto tem o campo `name`.
+pub proc has_field(j: Json, name: cstr) -> bool {
+    if cj.cJSON_IsObject(j.no) == 0 {
+        return false
+    }
+    return cj.cJSON_HasObjectItem(j.no, string = name) != 0
+}
+
+// Quantidade de elementos de uma lista (ou de campos de um objeto); 0 para outros tipos.
+pub proc size(j: Json) -> i32 {
+    if cj.cJSON_IsArray(j.no) == 0 and cj.cJSON_IsObject(j.no) == 0 {
+        return 0
+    }
+    return cj.cJSON_GetArraySize(j.no)
+}
+
+// Vista do elemento `indice` (0..size-1) de uma lista. Erros: wrong_type (nao e lista), missing (indice fora).
+pub proc item(j: Json, indice: i32) -> Json ! JsonError {
+    if cj.cJSON_IsArray(j.no) == 0 {
+        return JsonError.wrong_type
+    }
+    if indice < 0 or indice >= cj.cJSON_GetArraySize(j.no) {
+        return JsonError.missing
+    }
+    let achado = cj.cJSON_GetArrayItem(j.no, index = indice)
+    switch c in achado {
+    case ^cj.CJson:
+        return Json{no = c, dono = false}
+    case none:
+        return JsonError.missing
+    }
+    return JsonError.missing
+}
+
+// Nome (chave) do campo `indice` de um objeto: str emprestado. Erros: wrong_type, missing.
+pub proc key(j: Json, indice: i32) -> str ! JsonError {
+    if cj.cJSON_IsObject(j.no) == 0 {
+        return JsonError.wrong_type
+    }
+    if indice < 0 or indice >= cj.cJSON_GetArraySize(j.no) {
+        return JsonError.missing
+    }
+    let achado = cj.cJSON_GetArrayItem(j.no, index = indice)
+    switch c in achado {
+    case ^cj.CJson:
+        let nome = c.string as cstr
+        return nome as str
+    case none:
+        return JsonError.missing
+    }
+    return JsonError.missing
+}
+
+// Valor numerico (todo numero JSON e f64). Erro: wrong_type.
+pub proc number(j: Json) -> f64 ! JsonError {
+    if cj.cJSON_IsNumber(j.no) == 0 {
+        return JsonError.wrong_type
+    }
+    return cj.cJSON_GetNumberValue(j.no)
+}
+
+// Valor inteiro (trunca a parte fracionaria). Erro: wrong_type.
+pub proc integer(j: Json) -> i64 ! JsonError {
+    let n = try number(j)
+    return n as i64
+}
+
+// Texto emprestado do documento. Erro: wrong_type.
+pub proc text(j: Json) -> str ! JsonError {
+    if cj.cJSON_IsString(j.no) == 0 {
+        return JsonError.wrong_type
+    }
+    let lido = cj.cJSON_GetStringValue(j.no)
+    switch s in lido {
+    case cstr:
+        return s as str
+    case none:
+        return JsonError.wrong_type
+    }
+    return JsonError.wrong_type
+}
+
+// true/false. Erro: wrong_type.
+pub proc boolean(j: Json) -> bool ! JsonError {
+    if cj.cJSON_IsBool(j.no) == 0 {
+        return JsonError.wrong_type
+    }
+    return cj.cJSON_IsTrue(j.no) != 0
+}
+
+// Atalhos field + leitura (a combinacao mais comum). Erros: os de field e os da leitura.
+pub proc field_number(j: Json, name: cstr) -> f64 ! JsonError {
+    let c = try field(j, name = name)
+    return try number(c)
+}
+
+pub proc field_int(j: Json, name: cstr) -> i64 ! JsonError {
+    let c = try field(j, name = name)
+    return try integer(c)
+}
+
+pub proc field_text(j: Json, name: cstr) -> str ! JsonError {
+    let c = try field(j, name = name)
+    return try text(c)
+}
+
+pub proc field_bool(j: Json, name: cstr) -> bool ! JsonError {
+    let c = try field(j, name = name)
+    return try boolean(c)
+}
+
+// ---------------------------------------------------------------- criar e escrever
+
+// Objeto novo e vazio, DONO.
+pub proc new_object() -> Json ! JsonError {
+    let novo = cj.cJSON_CreateObject()
+    switch c in novo {
+    case ^cj.CJson:
+        return Json{no = c, dono = true}
+    case none:
+        return JsonError.out_of_memory
+    }
+    return JsonError.out_of_memory
+}
+
+// Lista nova e vazia, DONA.
+pub proc new_list() -> Json ! JsonError {
+    let novo = cj.cJSON_CreateArray()
+    switch c in novo {
+    case ^cj.CJson:
+        return Json{no = c, dono = true}
+    case none:
+        return JsonError.out_of_memory
+    }
+    return JsonError.out_of_memory
+}
+
+// Poe `name: valor` no objeto (se o nome ja existe, o cJSON acrescenta outro; use nomes distintos).
+pub proc set_number(object: Json, name: cstr, valor: f64) -> ! JsonError {
+    if cj.cJSON_IsObject(object.no) == 0 {
+        return JsonError.wrong_type
+    }
+    let criado = cj.cJSON_AddNumberToObject(object.no, name = name, number = valor)
+    if criado == none {
+        return JsonError.out_of_memory
+    }
+}
+
+pub proc set_text(object: Json, name: cstr, valor: cstr) -> ! JsonError {
+    if cj.cJSON_IsObject(object.no) == 0 {
+        return JsonError.wrong_type
+    }
+    let criado = cj.cJSON_AddStringToObject(object.no, name = name, string = valor)
+    if criado == none {
+        return JsonError.out_of_memory
+    }
+}
+
+pub proc set_bool(object: Json, name: cstr, valor: bool) -> ! JsonError {
+    if cj.cJSON_IsObject(object.no) == 0 {
+        return JsonError.wrong_type
+    }
+    var flag: i32 = 0
+    if valor {
+        flag = 1
+    }
+    let criado = cj.cJSON_AddBoolToObject(object.no, name = name, boolean = flag)
+    if criado == none {
+        return JsonError.out_of_memory
+    }
+}
+
+pub proc set_null(object: Json, name: cstr) -> ! JsonError {
+    if cj.cJSON_IsObject(object.no) == 0 {
+        return JsonError.wrong_type
+    }
+    let criado = cj.cJSON_AddNullToObject(object.no, name = name)
+    if criado == none {
+        return JsonError.out_of_memory
+    }
+}
+
+// Cria um objeto/lista filho dentro do objeto e devolve a VISTA dele para preencher. Pertence ao pai.
+pub proc set_object(object: Json, name: cstr) -> Json ! JsonError {
+    if cj.cJSON_IsObject(object.no) == 0 {
+        return JsonError.wrong_type
+    }
+    let criado = cj.cJSON_AddObjectToObject(object.no, name = name)
+    switch c in criado {
+    case ^cj.CJson:
+        return Json{no = c, dono = false}
+    case none:
+        return JsonError.out_of_memory
+    }
+    return JsonError.out_of_memory
+}
+
+pub proc set_list(object: Json, name: cstr) -> Json ! JsonError {
+    if cj.cJSON_IsObject(object.no) == 0 {
+        return JsonError.wrong_type
+    }
+    let criado = cj.cJSON_AddArrayToObject(object.no, name = name)
+    switch c in criado {
+    case ^cj.CJson:
+        return Json{no = c, dono = false}
+    case none:
+        return JsonError.out_of_memory
+    }
+    return JsonError.out_of_memory
+}
+
+// Acrescenta um valor ao fim da lista. Se o cJSON recusar, libera o item criado (sem vazar).
+proc json_anexar(list: Json, criado: ?^cj.CJson) -> Json ! JsonError {
+    switch c in criado {
+    case ^cj.CJson:
+        if cj.cJSON_AddItemToArray(list.no, item = c) == 0 {
+            cj.cJSON_Delete(c)
+            return JsonError.out_of_memory
+        }
+        return Json{no = c, dono = false}
+    case none:
+        return JsonError.out_of_memory
+    }
+    return JsonError.out_of_memory
+}
+
+pub proc push_number(list: Json, valor: f64) -> ! JsonError {
+    if cj.cJSON_IsArray(list.no) == 0 {
+        return JsonError.wrong_type
+    }
+    let _anexado = try json_anexar(list, criado = cj.cJSON_CreateNumber(valor))
+}
+
+pub proc push_text(list: Json, valor: cstr) -> ! JsonError {
+    if cj.cJSON_IsArray(list.no) == 0 {
+        return JsonError.wrong_type
+    }
+    let _anexado = try json_anexar(list, criado = cj.cJSON_CreateString(valor))
+}
+
+pub proc push_object(list: Json) -> Json ! JsonError {
+    if cj.cJSON_IsArray(list.no) == 0 {
+        return JsonError.wrong_type
+    }
+    return try json_anexar(list, criado = cj.cJSON_CreateObject())
+}
+
+// ---------------------------------------------------------------- gerar texto
+
+// Texto JSON do valor: str NOVO em heap (o chamador faz delete). pretty = true indenta. Erro: out_of_memory.
+pub proc dump(j: Json, pretty: bool) -> str ! JsonError {
+    var bruto: ?cstr = none
+    if pretty {
+        bruto = cj.cJSON_Print(j.no)
+    } else {
+        bruto = cj.cJSON_PrintUnformatted(j.no)
+    }
+    switch c in bruto {
+    case cstr:
+        let visto = c as str
+        let copia = format(f"{visto}", alloc = heap)
+        cj.cJSON_free(c as rawptr)
+        return copia
+    case none:
+        return JsonError.out_of_memory
+    }
+    return JsonError.out_of_memory
+}

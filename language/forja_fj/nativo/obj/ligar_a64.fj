@@ -1,0 +1,198 @@
+// nativo/obj/ligar_a64.fj - relocacoes AArch64 do ligador ELF (contrato_a64 1.3)
+// Versao: 0.2.0
+// Changelog: 0.2.0 - A4.3: relocacoes GOT_PAGE e LD64_GOT_LO12 sobre a celula da .got.
+
+import "common"
+import "nativo/fmt" as pefmt
+
+// Cada relocacao A64 mexe num campo de 4 bytes (uma palavra de instrucao) que ja traz o
+// opcode: o valor entra por OR nos bits do imediato, sem apagar o resto da palavra.
+// PREL32 e dado (nao instrucao): grava os 4 bytes inteiros.
+// Formulas: S simbolo, A adendo, P endereco do campo (todas em i64 com sinal).
+// Falha (false) = o valor nao cabe no campo ou esta desalinhado; o chamador relata.
+
+const LIG_A64_LIM_BRANCH26: i64 = 33554432 // 2^25 palavras = +-128 MiB
+const LIG_A64_LIM_BRANCH19: i64 = 262144 // 2^18 palavras = +-1 MiB
+const LIG_A64_LIM_PAGINA: i64 = 1048576 // 2^20 paginas = +-4 GiB
+const LIG_A64_MASCARA_12: u64 = 4095
+const LIG_A64_DESLOC_IMM12: u64 = 10
+
+// le/grava a palavra de 4 bytes little-endian do campo (a instrucao ja traz o opcode)
+pub proc ligar_a64_ler_palavra(sec: []u8, campo: u32) -> u32 {
+    let b0: u32 = sec[campo] as u32
+    let b1: u32 = sec[campo + 1] as u32
+    let b2: u32 = sec[campo + 2] as u32
+    let b3: u32 = sec[campo + 3] as u32
+    return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+}
+
+proc ligar_a64_gravar_palavra(sec: []u8, campo: u32, valor: u32) {
+    sec[campo] = (valor & 255) as u8
+    sec[campo + 1] = ((valor >> 8) & 255) as u8
+    sec[campo + 2] = ((valor >> 16) & 255) as u8
+    sec[campo + 3] = ((valor >> 24) & 255) as u8
+}
+
+// B / BL: imm26 = delta >> 2 em 26 bits (ou imm19 em B.cond/CBZ, deslocado de 5 bits)
+proc ligar_a64_ramo26(sec: []u8, campo: u32, delta: i64) -> bool {
+    if (transmute(delta, to = u64) & 3) != 0 {
+        return false
+    }
+    let imm: i64 = delta / 4
+    if (imm < -LIG_A64_LIM_BRANCH26) or (imm >= LIG_A64_LIM_BRANCH26) {
+        return false
+    }
+    let campo_imm: u32 = (transmute(imm, to = u64) & 67108863) as u32
+    ligar_a64_gravar_palavra(sec, campo, ligar_a64_ler_palavra(sec, campo) | campo_imm)
+    return true
+}
+
+proc ligar_a64_ramo19(sec: []u8, campo: u32, delta: i64) -> bool {
+    if (transmute(delta, to = u64) & 3) != 0 {
+        return false
+    }
+    let imm: i64 = delta / 4
+    if (imm < -LIG_A64_LIM_BRANCH19) or (imm >= LIG_A64_LIM_BRANCH19) {
+        return false
+    }
+    let campo_imm: u32 = ((transmute(imm, to = u64) & 524287) << 5) as u32
+    ligar_a64_gravar_palavra(sec, campo, ligar_a64_ler_palavra(sec, campo) | campo_imm)
+    return true
+}
+
+// ADRP: diferenca de paginas (4 KiB) em 21 bits; immlo nos bits 29-30, immhi nos bits 5-23
+proc ligar_a64_pagina(sec: []u8, campo: u32, sa: i64, pc: i64) -> bool {
+    let paginas: i64 = (sa / 4096) - (pc / 4096)
+    if (paginas < -LIG_A64_LIM_PAGINA) or (paginas >= LIG_A64_LIM_PAGINA) {
+        return false
+    }
+    let bits: u64 = transmute(paginas, to = u64)
+    let immlo: u32 = (bits & 3) as u32
+    let immhi: u32 = ((bits >> 2) & 524287) as u32
+    let campo_imm: u32 = (immlo << 29) | (immhi << 5)
+    ligar_a64_gravar_palavra(sec, campo, ligar_a64_ler_palavra(sec, campo) | campo_imm)
+    return true
+}
+
+// escala (log2 do tamanho do acesso) de cada LDST; ADD_LO12 e LDST8 usam 0
+proc ligar_a64_escala(tipo: i32) -> u64 {
+    if tipo == OR_A64_LDST128 {
+        return 4
+    }
+    if tipo == OR_A64_LDST64 {
+        return 3
+    }
+    if tipo == OR_A64_LDST32 {
+        return 2
+    }
+    if tipo == OR_A64_LDST16 {
+        return 1
+    }
+    return 0
+}
+
+// ADD imm12 / LDR-STR imm12 escalado: (S+A) & 0xFFF, deslocado pela escala; erro se nao alinhado
+proc ligar_a64_lo12(sec: []u8, campo: u32, tipo: i32, sa: i64) -> bool {
+    let baixo: u64 = transmute(sa, to = u64) & LIG_A64_MASCARA_12
+    let escala: u64 = ligar_a64_escala(tipo)
+    if (baixo & (((1 as u64) << escala) - 1)) != 0 {
+        return false
+    }
+    let campo_imm: u32 = ((baixo >> escala) << LIG_A64_DESLOC_IMM12) as u32
+    ligar_a64_gravar_palavra(sec, campo, ligar_a64_ler_palavra(sec, campo) | campo_imm)
+    return true
+}
+
+// A4.3: GOT_PAGE = ADRP e LD64_GOT_LO12 = LDR x,[x,#lo12] (escala 8), ambos sobre a CELULA da .got do simbolo, nao sobre o simbolo
+proc ligar_a64_relocar_got(l: ^LigacaoEstado, ap: ^LigarElfAplicacao, sec: []u8) -> bool {
+    let r: ^ObjReloc = ap.reloc as ^ObjReloc
+    let k: i64 = ligar_elf_indice_celula(l, ap.objeto, r.correcao.simbolo)
+    if k < 0 {
+        common.falha_interna("ligar: celula .got de um simbolo A64 nao foi planejada")
+    }
+    let celula: u64 = wrapping_add(wrapping_add(pefmt.pe_base_da_imagem(l.im), l.rva[LIGAR_SAIDA_GOT] as u64), common.c2f_s2u_64(k) * (ELF_TAM_CELULA as u64))
+    var tipo: i32 = OR_A64_ADR_PAGE
+    if r.correcao.tipo == OR_A64_LD64_GOT_LO12 {
+        tipo = OR_A64_LDST64
+    }
+    if ligar_a64_aplicar(sec, ap.campo as u32, tipo, celula, 0, ap.p) {
+        return true
+    }
+    return common.diag_relatar(l.erro as ^common.Diag, common.X0903, 0, "ELF AArch64: a celula da .got nao cabe no campo da relocacao GOT (faixa ou alinhamento)")
+}
+
+// Resolve o simbolo da relocacao A64 e aplica no campo da secao de saida; faixa estourada = X0903
+pub proc ligar_a64_relocar(l: ^LigacaoEstado, ap: ^LigarElfAplicacao, sec: []u8) -> bool {
+    let r: ^ObjReloc = ap.reloc as ^ObjReloc
+    if (r.correcao.tipo == OR_A64_GOT_PAGE) or (r.correcao.tipo == OR_A64_LD64_GOT_LO12) {
+        return ligar_a64_relocar_got(l, ap, sec)
+    }
+    var s: u64 = 0
+    if not ligar_elf_alvo_abs(l, ap.objeto, r.correcao.simbolo, &s) {
+        return false
+    }
+    if ligar_a64_aplicar(sec, ap.campo as u32, r.correcao.tipo, s, r.correcao.adendo, ap.p) {
+        return true
+    }
+    let txt = ligar_elf_simbolo(l, ap.objeto, r.correcao.simbolo).nome or_else "(null)"
+    let msg = format(f"ELF AArch64: relocacao tipo {r.correcao.tipo} do simbolo '{txt}' nao cabe no campo (faixa ou alinhamento)", alloc = heap)
+    defer delete(msg)
+    return common.diag_relatar(l.erro as ^common.Diag, common.X0903, 0, msg)
+}
+
+// Ponto de entrada: aplica a relocacao `tipo` (OR_A64_*) no campo de 4 bytes sec[campo..]
+pub proc ligar_a64_aplicar(sec: []u8, campo: u32, tipo: i32, s: u64, a: i64, p: u64) -> bool {
+    let sa: i64 = transmute(s, to = i64) + a
+    let pc: i64 = transmute(p, to = i64)
+    if tipo == OR_A64_PREL32 {
+        ligar_a64_gravar_palavra(sec, campo, transmute(sa - pc, to = u64) as u32)
+        return true
+    }
+    if (tipo == OR_A64_CALL26) or (tipo == OR_A64_JUMP26) {
+        return ligar_a64_ramo26(sec, campo, sa - pc)
+    }
+    if tipo == OR_A64_CONDBR19 {
+        return ligar_a64_ramo19(sec, campo, sa - pc)
+    }
+    if tipo == OR_A64_ADR_PAGE {
+        return ligar_a64_pagina(sec, campo, sa, pc)
+    }
+    return ligar_a64_lo12(sec, campo, tipo, sa)
+}
+
+test "ligar_a64_bl_para_frente" {
+    var sec: [4]u8 = {0, 0, 0, 148} // BL com imm 0 = 0x94000000
+    expect(ligar_a64_aplicar(sec[..], 0, OR_A64_CALL26, 0x400008, 0, 0x400000))
+    // delta 8 -> imm26 = 2 -> 0x94000002
+    expect(ligar_a64_ler_palavra(sec[..], 0) == 0x94000002)
+}
+
+test "ligar_a64_fora_de_faixa_e_desalinhado" {
+    var sec: [4]u8 = {0, 0, 0, 148}
+    expect(not ligar_a64_aplicar(sec[..], 0, OR_A64_JUMP26, 0x400002, 0, 0x400000))
+    expect(not ligar_a64_aplicar(sec[..], 0, OR_A64_CALL26, 0x800000000, 0, 0x400000))
+}
+
+test "ligar_a64_adrp_e_ldr_w_escalado" {
+    // ADRP x0 de 0x400000 para 0x412345: paginas 0x412 - 0x400 = 18 -> immlo 2, immhi 4
+    var adrp: [4]u8 = {0, 0, 0, 144}
+    expect(ligar_a64_aplicar(adrp[..], 0, OR_A64_ADR_PAGE, 0x412345, 0, 0x400000))
+    expect(ligar_a64_ler_palavra(adrp[..], 0) == 0xD0000080)
+    // LDR w0, [x0] com 0x412344: lo12 0x344, escala 4 -> imm12 0xD1; 0x412345 desalinhado recusa
+    var ldr: [4]u8 = {0, 0, 64, 185}
+    expect(ligar_a64_aplicar(ldr[..], 0, OR_A64_LDST32, 0x412344, 0, 0x400000))
+    expect(ligar_a64_ler_palavra(ldr[..], 0) == 0xB9434400)
+    var ruim: [4]u8 = {0, 0, 64, 185}
+    expect(not ligar_a64_aplicar(ruim[..], 0, OR_A64_LDST32, 0x412345, 0, 0x400000))
+    expect(ligar_a64_ler_palavra(ruim[..], 0) == 0xB9400000)
+}
+
+test "ligar_a64_add_lo12_e_ldst64" {
+    var sec: [4]u8 = {0, 0, 0, 145} // ADD x0, x0, #0 = 0x91000000
+    expect(ligar_a64_aplicar(sec[..], 0, OR_A64_ADD_LO12, 0x400a18, 0, 0x400000))
+    // (S+A) & 0xFFF = 0xa18 vai para imm12 (bits 10-21)
+    expect(ligar_a64_ler_palavra(sec[..], 0) == (0x91000000 | (0xa18 << 10)))
+    var sec2: [4]u8 = {0, 0, 0, 249} // LDR x0, [x0] = 0xf9400000 (base); imm12 zero
+    expect(ligar_a64_aplicar(sec2[..], 0, OR_A64_LDST64, 0x400a18, 0, 0x400000))
+    expect(ligar_a64_ler_palavra(sec2[..], 0) == (0xf9000000 | ((0xa18 >> 3) << 10)))
+}

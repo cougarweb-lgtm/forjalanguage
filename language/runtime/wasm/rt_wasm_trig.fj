@@ -1,0 +1,899 @@
+// runtime/wasm/rt_wasm_trig.fj - std:math do alvo wasm32-wasip1, grupo 2 (sin, cos, tan em f64 e f32), porte para Forja pura da libm do musl 1.2.6
+// LIMITE: arquivo > 800 linhas (porte fiel de 12 .c do musl; dividir duplicaria a ligacao do modulo)
+// Versao: 0.2.0 (sin/cos/tan com __rem_pio2, __rem_pio2_large e __rem_pio2f; mesmos bits que o musl no x64)
+// Contrato: o simbolo forja_math_X do std:math e atendido pelo proc pub math_X deste modulo (f32: math_Xf); o driver injeta o modulo so no alvo wasm.
+// Funcoes publicas: math_sin, math_cos, math_tan (f64) e math_sinf, math_cosf, math_tanf (f32).
+// Fonte C: third/musl_math/{sin,cos,tan,sinf,cosf,tanf,__sin,__cos,__tan,__rem_pio2,__rem_pio2_large,__sindf,__cosdf,__tandf,__rem_pio2f}.c
+// Constantes e tabelas: python language/tests/nativo/wasm/math_bits/tabelas/gerar_tabelas_trig.py (--selftest confere contra o hex do C).
+// Verificacao: python -X utf8 -I language/tests/nativo/wasm/math_bits/comparar_x64.py trig (e --release).
+// Regra do modulo: sem alocacao, sem estado; sem floor/trunc embutido (piso por soma de 2^52); hex-float do C vira decimal fixo ou u64 + transmute.
+
+// ---- constantes escalares (decimal de notacao fixa; mesmo double que o musl) ----
+const TRIG_2_24: f64 = 16777216.0
+const TRIG_2_M24: f64 = 0.000000059604644775390625
+const SIN_S1: f64 = -0.16666666666666632
+const SIN_S2: f64 = 0.00833333333332249
+const SIN_S3: f64 = -0.0001984126982985795
+const SIN_S4: f64 = 0.0000027557313707070068
+const SIN_S5: f64 = -0.000000025050760253406863
+const SIN_S6: f64 = 0.000000000158969099521155
+const COS_C1: f64 = 0.0416666666666666
+const COS_C2: f64 = -0.001388888888887411
+const COS_C3: f64 = 0.00002480158728947673
+const COS_C4: f64 = -0.00000027557314351390663
+const COS_C5: f64 = 0.000000002087572321298175
+const COS_C6: f64 = -0.000000000011359647557788195
+const TAN_PIO4: f64 = 0.7853981633974483
+const TAN_PIO4LO: f64 = 0.00000000000000003061616997868383
+const TRIG_TOINT: f64 = 6755399441055744.0
+const TRIG_INVPIO2: f64 = 0.6366197723675814
+const TRIG_PIO4: f64 = 0.7853981633974483
+const TRIG_PIO2_1: f64 = 1.5707963267341256
+const TRIG_PIO2_1T: f64 = 0.00000000006077100506506192
+const TRIG_PIO2_2: f64 = 0.00000000006077100506303966
+const TRIG_PIO2_2T: f64 = 0.0000000000000000000020222662487959506
+const TRIG_PIO2_3: f64 = 0.0000000000000000000020222662487111665
+const TRIG_PIO2_3T: f64 = 0.000000000000000000000000000000084784276603689
+const TRIG_PIO2F_1: f64 = 1.5707963109016418
+const TRIG_PIO2F_1T: f64 = 0.000000015893254773528196
+const TRIG_PIO4F: f64 = 0.7853981852531433
+const TRIG_MPIO2_1: f64 = 1.5707963267948966
+const TRIG_MPIO2_2: f64 = 3.141592653589793
+const TRIG_MPIO2_3: f64 = 4.71238898038469
+const TRIG_MPIO2_4: f64 = 6.283185307179586
+const SINDF_S1: f64 = -0.16666666641626524
+const SINDF_S2: f64 = 0.008333329385889463
+const SINDF_S3: f64 = -0.00019839334836096632
+const SINDF_S4: f64 = 0.000002718311493989822
+const COSDF_C0: f64 = -0.499999997251031
+const COSDF_C1: f64 = 0.04166662332373906
+const COSDF_C2: f64 = -0.001388676377460993
+const COSDF_C3: f64 = 0.00002439044879627741
+
+// ---- tabelas (bits: o f64 e lido com transmute) ----
+const TRIG_IPIO2: [690]i32 = {
+    0xA2F983, 0x6E4E44, 0x1529FC, 0x2757D1, 0xF534DD, 0xC0DB62,
+    0x95993C, 0x439041, 0xFE5163, 0xABDEBB, 0xC561B7, 0x246E3A,
+    0x424DD2, 0xE00649, 0x2EEA09, 0xD1921C, 0xFE1DEB, 0x1CB129,
+    0xA73EE8, 0x8235F5, 0x2EBB44, 0x84E99C, 0x7026B4, 0x5F7E41,
+    0x3991D6, 0x398353, 0x39F49C, 0x845F8B, 0xBDF928, 0x3B1FF8,
+    0x97FFDE, 0x5980F, 0xEF2F11, 0x8B5A0A, 0x6D1F6D, 0x367ECF,
+    0x27CB09, 0xB74F46, 0x3F669E, 0x5FEA2D, 0x7527BA, 0xC7EBE5,
+    0xF17B3D, 0x739F7, 0x8A5292, 0xEA6BFB, 0x5FB11F, 0x8D5D08,
+    0x560330, 0x46FC7B, 0x6BABF0, 0xCFBC20, 0x9AF436, 0x1DA9E3,
+    0x91615E, 0xE61B08, 0x659985, 0x5F14A0, 0x68408D, 0xFFD880,
+    0x4D7327, 0x310606, 0x1556CA, 0x73A8C9, 0x60E27B, 0xC08C6B,
+    0x47C419, 0xC367CD, 0xDCE809, 0x2A8359, 0xC4768B, 0x961CA6,
+    0xDDAF44, 0xD15719, 0x53EA5, 0xFF0705, 0x3F7E33, 0xE832C2,
+    0xDE4F98, 0x327DBB, 0xC33D26, 0xEF6B1E, 0x5EF89F, 0x3A1F35,
+    0xCAF27F, 0x1D87F1, 0x21907C, 0x7C246A, 0xFA6ED5, 0x772D30,
+    0x433B15, 0xC614B5, 0x9D19C3, 0xC2C4AD, 0x414D2C, 0x5D000C,
+    0x467D86, 0x2D71E3, 0x9AC69B, 0x6233, 0x7CD2B4, 0x97A7B4,
+    0xD55537, 0xF63ED7, 0x1810A3, 0xFC764D, 0x2A9D64, 0xABD770,
+    0xF87C63, 0x57B07A, 0xE71517, 0x5649C0, 0xD9D63B, 0x3884A7,
+    0xCB2324, 0x778AD6, 0x23545A, 0xB91F00, 0x1B0AF1, 0xDFCE19,
+    0xFF319F, 0x6A1E66, 0x615799, 0x47FBAC, 0xD87F7E, 0xB76522,
+    0x89E832, 0x60BFE6, 0xCDC4EF, 0x9366C, 0xD43F5D, 0xD7DE16,
+    0xDE3B58, 0x929BDE, 0x2822D2, 0xE88628, 0x4D58E2, 0x32CAC6,
+    0x16E308, 0xCB7DE0, 0x50C017, 0xA71DF3, 0x5BE018, 0x34132E,
+    0x621283, 0x14883, 0x5B8EF5, 0x7FB0AD, 0xF2E91E, 0x434A48,
+    0xD36710, 0xD8DDAA, 0x425FAE, 0xCE616A, 0xA4280A, 0xB499D3,
+    0xF2A606, 0x7F775C, 0x83C2A3, 0x883C61, 0x78738A, 0x5A8CAF,
+    0xBDD76F, 0x63A62D, 0xCBBFF4, 0xEF818D, 0x67C126, 0x45CA55,
+    0x36D9CA, 0xD2A828, 0x8D61C2, 0x77C912, 0x142604, 0x9B4612,
+    0xC459C4, 0x44C5C8, 0x91B24D, 0xF31700, 0xAD43D4, 0xE54929,
+    0x10D5FD, 0xFCBE00, 0xCC941E, 0xEECE70, 0xF53E13, 0x80F1EC,
+    0xC3E7B3, 0x28F8C7, 0x940593, 0x3E71C1, 0xB3092E, 0xF3450B,
+    0x9C1288, 0x7B20AB, 0x9FB52E, 0xC29247, 0x2F327B, 0x6D550C,
+    0x90A772, 0x1FE76B, 0x96CB31, 0x4A1679, 0xE27941, 0x89DFF4,
+    0x9794E8, 0x84E6E2, 0x973199, 0x6BED88, 0x365F5F, 0xEFDBB,
+    0xB49A48, 0x6CA467, 0x427271, 0x325D8D, 0xB8159F, 0x9E5BC,
+    0x25318D, 0x3974F7, 0x1C0530, 0x10C0D, 0x68084B, 0x58EE2C,
+    0x90AA47, 0x2E774, 0x24D6BD, 0xA67DF7, 0x72486E, 0xEF169F,
+    0xA6948E, 0xF691B4, 0x5153D1, 0xF20ACF, 0x339820, 0x7E4BF5,
+    0x6863B2, 0x5F3EDD, 0x35D40, 0x7F8985, 0x295255, 0xC06437,
+    0x10D86D, 0x324832, 0x754C5B, 0xD4714E, 0x6E5445, 0xC1090B,
+    0x69F52A, 0xD56614, 0x9D0727, 0x50045D, 0xDB3BB4, 0xC576EA,
+    0x17F987, 0x7D6B49, 0xBA271D, 0x296996, 0xACCCC6, 0x5414AD,
+    0x6AE290, 0x89D988, 0x50722C, 0xBEA404, 0x940777, 0x7030F3,
+    0x27FC00, 0xA871EA, 0x49C266, 0x3DE064, 0x83DD97, 0x973FA3,
+    0xFD9443, 0x8C860D, 0xDE4131, 0x9D3992, 0x8C70DD, 0xE7B717,
+    0x3BDF08, 0x2B3715, 0xA0805C, 0x93805A, 0x921110, 0xD8E80F,
+    0xAF806C, 0x4BFFDB, 0xF9038, 0x761859, 0x15A562, 0xBBCB61,
+    0xB989C7, 0xBD4010, 0x4F2D2, 0x277549, 0xF6B6EB, 0xBB22DB,
+    0xAA140A, 0x2F2689, 0x768364, 0x333B09, 0x1A940E, 0xAA3A51,
+    0xC2A31D, 0xAEEDAF, 0x12265C, 0x4DC26D, 0x9C7A2D, 0x9756C0,
+    0x833F03, 0xF6F009, 0x8C402B, 0x99316D, 0x7B439, 0x15200C,
+    0x5BC3D8, 0xC492F5, 0x4BADC6, 0xA5CA4E, 0xCD37A7, 0x36A9E6,
+    0x9492AB, 0x6842DD, 0xDE6319, 0xEF8C76, 0x528B68, 0x37DBFC,
+    0xABA1AE, 0x3115DF, 0xA1AE00, 0xDAFB0C, 0x664D64, 0xB705ED,
+    0x306529, 0xBF5657, 0x3AFF47, 0xB9F96A, 0xF3BE75, 0xDF9328,
+    0x3080AB, 0xF68C66, 0x15CB04, 0x622FA, 0x1DE4D9, 0xA4B33D,
+    0x8F1B57, 0x9CD36, 0xE9424E, 0xA4BE13, 0xB52333, 0x1AAAF0,
+    0xA8654F, 0xA5C1D2, 0xF3F0B, 0xCD785B, 0x76F923, 0x48B7B,
+    0x721789, 0x53A6C6, 0xE26E6F, 0xEBEF, 0x584A9B, 0xB7DAC4,
+    0xBA66AA, 0xCFCF76, 0x1D02D1, 0x2DF1B1, 0xC1998C, 0x77ADC3,
+    0xDA4886, 0xA05DF7, 0xF480C6, 0x2FF0AC, 0x9AECDD, 0xBC5C3F,
+    0x6DDED0, 0x1FC790, 0xB6DB2A, 0x3A25A3, 0x9AAF00, 0x9353AD,
+    0x457B6, 0xB42D29, 0x7E804B, 0xA707DA, 0xEAA76, 0xA1597B,
+    0x2A1216, 0x2DB7DC, 0xFDE5FA, 0xFEDB89, 0xFDBE89, 0x6C76E4,
+    0xFCA906, 0x70803E, 0x156E85, 0xFF87FD, 0x73E28, 0x336761,
+    0x86182A, 0xEABD4D, 0xAFE7B3, 0x6E6D8F, 0x396795, 0x5BBF31,
+    0x48D784, 0x16DF30, 0x432DC7, 0x356125, 0xCE70C9, 0xB8CB30,
+    0xFD6CBF, 0xA200A4, 0xE46C05, 0xA0DD5A, 0x476F21, 0xD21262,
+    0x845CB9, 0x496170, 0xE0566B, 0x15299, 0x375550, 0xB7D51E,
+    0xC4F133, 0x5F6E13, 0xE4305D, 0xA92E85, 0xC3B21D, 0x3632A1,
+    0xA4B708, 0xD4B1EA, 0x21F716, 0xE4698F, 0x77FF27, 0x80030C,
+    0x2D408D, 0xA0CD4F, 0x99A520, 0xD3A2B3, 0xA5D2F, 0x42F9B4,
+    0xCBDA11, 0xD0BE7D, 0xC1DB9B, 0xBD17AB, 0x81A2CA, 0x5C6A08,
+    0x17552E, 0x550027, 0xF0147F, 0x8607E1, 0x640B14, 0x8D4196,
+    0xDEBE87, 0x2AFDDA, 0xB6256B, 0x34897B, 0xFEF305, 0x9EBFB9,
+    0x4F6A68, 0xA82A4A, 0x5AC44F, 0xBCF82D, 0x985AD7, 0x95C7F4,
+    0x8D4D0D, 0xA63A20, 0x5F57A4, 0xB13F14, 0x953880, 0x120CC,
+    0x86DD71, 0xB6DEC9, 0xF560BF, 0x11654D, 0x6B0701, 0xACB08C,
+    0xD0C0B2, 0x485551, 0xEFB1E, 0xC37295, 0x3B06A3, 0x3540C0,
+    0x7BDC06, 0xCC45E0, 0xFA294E, 0xC8CAD6, 0x41F3E8, 0xDE647C,
+    0xD8649B, 0x31BED9, 0xC397A4, 0xD45877, 0xC5E369, 0x13DAF0,
+    0x3C3ABA, 0x461846, 0x5F7555, 0xF5BDD2, 0xC6926E, 0x5D2EAC,
+    0xED440E, 0x423E1C, 0x87C461, 0xE9FD29, 0xF3D6E7, 0xCA7C22,
+    0x35916F, 0xC5E008, 0x8DD7FF, 0xE26A6E, 0xC6FDB0, 0xC10893,
+    0x745D7C, 0xB2AD6B, 0x9D6ECD, 0x7B723E, 0x6A11C6, 0xA9CFF7,
+    0xDF7329, 0xBAC9B5, 0x5100B7, 0xDB2E2, 0x24BA74, 0x607DE5,
+    0x8AD874, 0x2C150D, 0xC1881, 0x94667E, 0x162901, 0x767A9F,
+    0xBEFDFD, 0xEF4556, 0x367ED9, 0x13D9EC, 0xB9BA8B, 0xFC97C4,
+    0x27A831, 0xC36EF1, 0x36C594, 0x56A8D8, 0xB5A8B4, 0xECCCF,
+    0x2D8912, 0x34576F, 0x89562C, 0xE3CE99, 0xB920D6, 0xAA5E6B,
+    0x9C2A3E, 0xCC5F11, 0x4A0BFD, 0xFBF4E1, 0x6D3B8E, 0x2C86E2,
+    0x84D4E9, 0xA9B4FC, 0xD1EEEF, 0xC9352E, 0x61392F, 0x442138,
+    0xC8D91B, 0xAFC81, 0x6A4AFB, 0xD81C2F, 0x84B453, 0x8C994E,
+    0xCC2254, 0xDC552A, 0xD6C6C0, 0x96190B, 0xB8701A, 0x649569,
+    0x605A26, 0xEE523F, 0xF117F, 0x11B5F4, 0xF5CBFC, 0x2DBC34,
+    0xEEBC34, 0xCC5DE8, 0x605EDD, 0x9B8E67, 0xEF3392, 0xB817C9,
+    0x9B5861, 0xBC57E1, 0xC68351, 0x103ED8, 0x4871DD, 0xDD1C2D,
+    0xA118AF, 0x462C21, 0xD7F359, 0x987AD9, 0xC0549E, 0xFA864F,
+    0xFC0656, 0xAE79E5, 0x362289, 0x22AD38, 0xDC9367, 0xAAE855,
+    0x382682, 0x9BE7CA, 0xA40D51, 0xB13399, 0xED7A9, 0x480569,
+    0xF0B265, 0xA7887F, 0x974C88, 0x36D1F9, 0xB39221, 0x4A827B,
+    0x21CF98, 0xDC9F40, 0x5547DC, 0x3A74E1, 0x42EB67, 0xDF9DFE,
+    0x5FD45E, 0xA4677B, 0x7AACBA, 0xA2F655, 0x23882B, 0x55BA41,
+    0x86E59, 0x862A21, 0x834739, 0xE6E389, 0xD49EE5, 0x40FB49,
+    0xE956FF, 0xCA0F1C, 0x8A59C5, 0x2BFA94, 0xC5C1D3, 0xCFC50F,
+    0xAE5ADB, 0x86C547, 0x624385, 0x3B8621, 0x94792C, 0x876110,
+    0x7B4C2A, 0x1A2C80, 0x12BF43, 0x902688, 0x893C78, 0xE4C4A8,
+    0x7BDBE5, 0xC23AC4, 0xEAF426, 0x8A67F7, 0xBF920D, 0x2BA365,
+    0xB1933D, 0xB7CBD, 0xDC51A4, 0x63DD27, 0xDDE169, 0x19949A,
+    0x9529A8, 0x28CE68, 0xB4ED09, 0x209F44, 0xCA984E, 0x638270,
+    0x237C7E, 0x32B90F, 0x8EF5A7, 0xE75614, 0x8F121, 0x2A9DB5,
+    0x4D7E6F, 0x5119A5, 0xABF9B5, 0xD6DF82, 0x61DD96, 0x23616,
+    0x9F3AC4, 0xA1A283, 0x6DED72, 0x7A8D39, 0xA9B882, 0x5C326B,
+    0x5B2746, 0xED3400, 0x7700D2, 0x55F4FC, 0x4D5901, 0x8071E0,
+}
+const TRIG_PIO2_BITS: [8]u64 = {
+    0x3FF921FB40000000, 0x3E74442D00000000, 0x3CF8469880000000, 0x3B78CC5160000000, 0x39F01B8380000000, 0x387A252040000000,
+    0x36E3822280000000, 0x3569F31D00000000,
+}
+const TRIG_TAN_T_BITS: [13]u64 = {
+    0x3FD5555555555563, 0x3FC111111110FE7A, 0x3FABA1BA1BB341FE, 0x3F9664F48406D637, 0x3F8226E3E96E8493, 0x3F6D6D22C9560328,
+    0x3F57DBC8FEE08315, 0x3F4344D8F2F26501, 0x3F3026F71A8D1068, 0x3F147E88A03792A6, 0x3F12B80F32F0A7E9, 0xBEF375CBDB605373,
+    0x3EFB2A7074BF7AD4,
+}
+const TRIG_TANDF_T_BITS: [6]u64 = {
+    0x3FD5554D3418C99F, 0x3FC112FD38999F72, 0x3FAB54C91D865AFE, 0x3F991DF3908C33CE, 0x3F685DADFCECF44E, 0x3F8362B9BF971BCD,
+}
+
+// ---- utilitarios de bits e de piso (sem embutido de floor/trunc) ----
+
+// Palavra alta do double (GET_HIGH_WORD do musl): o sinal, o expoente e o topo da mantissa
+proc trig_palavra_alta(d: f64) -> u32 {
+    return (transmute(d, to = u64) >> 32) as u32
+}
+
+// Expoente biased do double (u.i >> 52 & 0x7ff do __rem_pio2)
+proc trig_expoente(d: f64) -> int {
+    return ((transmute(d, to = u64) >> 52) & 0x7ff) as int
+}
+
+// Zera a palavra baixa do double (SET_LOW_WORD(d, 0) do __tan)
+proc trig_zera_baixa(d: f64) -> f64 {
+    return transmute(transmute(d, to = u64) & 0xffffffff00000000, to = f64)
+}
+
+// 2^k exato por bits (scalbn(1.0, k) do musl); k entre -1022 e 1023
+proc trig_pot2(k: int) -> f64 {
+    return transmute(((1023 + k) as u64) << 52, to = f64)
+}
+
+// Piso de t >= 0 (< 2^51): somar e subtrair 2^52 arredonda para o inteiro mais perto; se subiu, desce 1
+proc trig_piso_pos(t: f64) -> f64 {
+    let arredondado: f64 = (t + TRIG_TOINT) - TRIG_TOINT
+    if arredondado > t {
+        return arredondado - 1.0
+    }
+    return arredondado
+}
+
+// ---- nucleos de sin, cos e tan (kernels do musl sobre [-pi/4, pi/4]) ----
+
+// __sin do musl (k_sin.c); com_y diz se a cauda y de x entra na conta
+proc sin_nucleo(x: f64, y: f64, com_y: bool) -> f64 {
+    let z: f64 = x * x
+    let w: f64 = z * z
+    let r: f64 = SIN_S2 + z * (SIN_S3 + z * SIN_S4) + z * w * (SIN_S5 + z * SIN_S6)
+    let v: f64 = z * x
+    if not com_y {
+        return x + v * (SIN_S1 + z * r)
+    }
+    return x - ((z * (0.5 * y - v * r) - y) - v * SIN_S1)
+}
+
+// __cos do musl (k_cos.c); y e a cauda de x
+proc cos_nucleo(x: f64, y: f64) -> f64 {
+    let z: f64 = x * x
+    let w: f64 = z * z
+    let r: f64 = z * (COS_C1 + z * (COS_C2 + z * COS_C3)) + w * w * (COS_C4 + z * (COS_C5 + z * COS_C6))
+    let hz: f64 = 0.5 * z
+    let wc: f64 = 1.0 - hz
+    return wc + (((1.0 - wc) - hz) + (z * r - x * y))
+}
+
+// Coeficiente T[i] do __tan do musl, lido da tabela de bits
+proc tan_t(i: int) -> f64 {
+    return transmute(TRIG_TAN_T_BITS[i], to = f64)
+}
+
+// __tan do musl (k_tan.c): tan, ou -1/tan se impar; |x| >= 0.6744 reduz por pi/4 - x
+proc tan_nucleo(x0: f64, y0: f64, impar: bool) -> f64 {
+    var x: f64 = x0
+    var y: f64 = y0
+    let hx: u32 = trig_palavra_alta(x)
+    let grande: bool = (hx & 0x7fffffff) >= 0x3FE59428
+    var negativo: bool = false
+    if grande {
+        negativo = (hx >> 31) == 1
+        if negativo {
+            x = -x
+            y = -y
+        }
+        x = (TAN_PIO4 - x) + (TAN_PIO4LO - y)
+        y = 0.0
+    }
+    let z: f64 = x * x
+    let w: f64 = z * z
+    let r1: f64 = tan_t(1) + w * (tan_t(3) + w * (tan_t(5) + w * (tan_t(7) + w * (tan_t(9) + w * tan_t(11)))))
+    let v: f64 = z * (tan_t(2) + w * (tan_t(4) + w * (tan_t(6) + w * (tan_t(8) + w * (tan_t(10) + w * tan_t(12))))))
+    let s: f64 = z * x
+    let r: f64 = y + z * (s * (r1 + v) + y) + s * tan_t(0)
+    let soma: f64 = x + r
+    if grande {
+        var sg: f64 = 1.0
+        if impar {
+            sg = -1.0
+        }
+        let v2: f64 = sg - 2.0 * (x + (r - soma * soma / (soma + sg)))
+        if negativo {
+            return -v2
+        }
+        return v2
+    }
+    if not impar {
+        return soma
+    }
+    let w0: f64 = trig_zera_baixa(soma)
+    let v3: f64 = r - (w0 - x)
+    let a: f64 = -1.0 / soma
+    let a0: f64 = trig_zera_baixa(a)
+    return a0 + a * (1.0 + a0 * w0 + a0 * v3)
+}
+
+// ---- reducao de x por pi/2 em f64 (__rem_pio2 e __rem_pio2_large do musl) ----
+
+// Reducao para |x| em (pi/4, 9pi/4] que nao cai no caso medio: quadrante = +-1..+-4
+proc rem_pio2_pequeno(x: f64, ix: u32, negativo: bool) -> (quad: int, cabeca: f64, cauda: f64) {
+    var m: int = 4
+    if ix <= 0x4002d97c {
+        m = 1
+    } else if ix <= 0x400f6a7a {
+        m = 2
+    } else if ix <= 0x4015fdbc {
+        m = 3
+    }
+    let mf: f64 = m as f64
+    if negativo {
+        let zn: f64 = x + mf * TRIG_PIO2_1
+        let cn: f64 = zn + mf * TRIG_PIO2_1T
+        return -m, cn, (zn - cn) + mf * TRIG_PIO2_1T
+    }
+    let z: f64 = x - mf * TRIG_PIO2_1
+    let c0: f64 = z - mf * TRIG_PIO2_1T
+    return m, c0, (z - c0) - mf * TRIG_PIO2_1T
+}
+
+// Ramo medio (|x| < 2^20 pi/2): n = rint(x * 2/pi) e ate tres rodadas de pi/2 para nao perder bits
+proc rem_pio2_medio(x: f64, ix: u32) -> (quad: int, cabeca: f64, cauda: f64) {
+    var cociente: f64 = x * TRIG_INVPIO2 + TRIG_TOINT - TRIG_TOINT
+    var n: int = cociente as int
+    var r: f64 = x - cociente * TRIG_PIO2_1
+    var w: f64 = cociente * TRIG_PIO2_1T
+    if r - w < -TRIG_PIO4 {
+        n -= 1
+        cociente -= 1.0
+        r = x - cociente * TRIG_PIO2_1
+        w = cociente * TRIG_PIO2_1T
+    } else if r - w > TRIG_PIO4 {
+        n += 1
+        cociente += 1.0
+        r = x - cociente * TRIG_PIO2_1
+        w = cociente * TRIG_PIO2_1T
+    }
+    var cab: f64 = r - w
+    let ex: int = (ix >> 20) as int
+    var ey: int = trig_expoente(cab)
+    if ex - ey > 16 {
+        let t: f64 = r
+        w = cociente * TRIG_PIO2_2
+        r = t - w
+        w = cociente * TRIG_PIO2_2T - ((t - r) - w)
+        cab = r - w
+        ey = trig_expoente(cab)
+        if ex - ey > 49 {
+            let t2: f64 = r
+            w = cociente * TRIG_PIO2_3
+            r = t2 - w
+            w = cociente * TRIG_PIO2_3T - ((t2 - r) - w)
+            cab = r - w
+        }
+    }
+    return n, cab, (r - cab) - w
+}
+
+// Verdadeiro se x cai num ponto do ramo medio mesmo estando na faixa pequena (mantissa de pi/2 e 3pi/2, 2pi, 4pi/2 do musl)
+proc rem_pio2_meio_exato(ix: u32) -> bool {
+    if ix <= 0x400f6a7a and (ix & 0xfffff) == 0x921fb {
+        return true
+    }
+    return ix == 0x4012d97c or ix == 0x401921fb
+}
+
+// q[i] de __rem_pio2_large: soma x[j] * ipio2[jv + i - j] (zero fora da tabela), na mesma ordem do musl
+proc rem_pio2_produto(x: []f64, jv: int, i: int) -> f64 {
+    var soma: f64 = 0.0
+    for j in 0..<len(x) {
+        let k: int = jv + i - j
+        if k >= 0 {
+            soma += x[j] * (TRIG_IPIO2[k] as f64)
+        }
+    }
+    return soma
+}
+
+// Parte inteira do 2/pi em 24 bits por digito (distill do musl): iq[i] = digito, z = resto
+proc rem_pio2_distila(q: [20]f64, jz: int) -> (digitos: [20]u32, fim: f64) {
+    var iq: [20]u32 = {}
+    var z: f64 = q[jz]
+    var i: int = 0
+    var j: int = jz
+    while j > 0 {
+        let fw: f64 = trig_piso_pos(z * TRIG_2_M24)
+        iq[i] = trig_piso_pos(z - TRIG_2_24 * fw) as u32
+        z = q[j - 1] + fw
+        i += 1
+        j -= 1
+    }
+    return iq, z
+}
+
+// Passo de n e de ih (quadrante) do musl: z vira fracao em [0, 1), e 1-q se o quadrante passa de 0.5
+proc rem_pio2_inteiro(iq0: [20]u32, jz: int, q0: int, z0: f64) -> (digitos: [20]u32, inteiro_n: int, quadrante_ih: int, zfrac: f64) {
+    var iq: [20]u32 = iq0
+    var z: f64 = z0 * trig_pot2(q0)
+    z -= 8.0 * trig_piso_pos(z * 0.125)
+    var n: int = trig_piso_pos(z) as int
+    z = z - (n as f64)
+    var ih: int = 0
+    if q0 > 0 {
+        let deslocamento: u32 = (24 - q0) as u32
+        let pedaco: u32 = iq[jz - 1] >> deslocamento
+        n += (pedaco as int)
+        iq[jz - 1] = iq[jz - 1] - (pedaco << deslocamento)
+        ih = (iq[jz - 1] >> ((23 - q0) as u32)) as int
+    } else if q0 == 0 {
+        ih = (iq[jz - 1] >> 23) as int
+    } else if z >= 0.5 {
+        ih = 2
+    }
+    if ih > 0 {
+        n += 1
+        var carry: bool = false
+        for i in 0..<jz {
+            let digito: u32 = iq[i]
+            if carry {
+                iq[i] = 0xffffff - digito
+            } else if digito != 0 {
+                carry = true
+                iq[i] = 0x1000000 - digito
+            }
+        }
+        if q0 == 1 {
+            iq[jz - 1] = iq[jz - 1] & 0x7fffff
+        } else if q0 == 2 {
+            iq[jz - 1] = iq[jz - 1] & 0x3fffff
+        }
+        if ih == 2 {
+            z = 1.0 - z
+            if carry {
+                z = z - trig_pot2(q0)
+            }
+        }
+    }
+    return iq, n, ih, z
+}
+
+// Verdadeiro se iq[jk..jz-1] e todo zero: falta precisao e o musl recalcula com mais termos de ipio2
+proc rem_pio2_zerado(iq: [20]u32, jk: int, jz: int) -> bool {
+    for i in jk..<jz {
+        if iq[i] != 0 {
+            return false
+        }
+    }
+    return true
+}
+
+// Corta os zeros do fim e reescreve z como os ultimos digitos de 24 bits (fim de __rem_pio2_large)
+proc rem_pio2_corta(iq0: [20]u32, jz0: int, q00: int, z: f64) -> (digitos: [20]u32, jz_out: int, q0_out: int) {
+    var iq: [20]u32 = iq0
+    var jz: int = jz0
+    var q0: int = q00
+    if z == 0.0 {
+        jz -= 1
+        q0 -= 24
+        while iq[jz] == 0 {
+            jz -= 1
+            q0 -= 24
+        }
+        return iq, jz, q0
+    }
+    let zr: f64 = z * trig_pot2(-q0)
+    if zr >= TRIG_2_24 {
+        let fw: f64 = trig_piso_pos(zr * TRIG_2_M24)
+        iq[jz] = trig_piso_pos(zr - TRIG_2_24 * fw) as u32
+        jz += 1
+        q0 += 24
+        iq[jz] = fw as u32
+    } else {
+        iq[jz] = trig_piso_pos(zr) as u32
+    }
+    return iq, jz, q0
+}
+
+// q em f64 (os digitos escalados por 2^q0) e fq = PIo2 x q, somas parciais do musl
+proc rem_pio2_produtos(iq: [20]u32, jz: int, q0: int, jk: int) -> [20]f64 {
+    var q: [20]f64 = {}
+    var fw: f64 = trig_pot2(q0)
+    var i: int = jz
+    while i >= 0 {
+        q[i] = fw * (iq[i] as f64)
+        fw = fw * TRIG_2_M24
+        i -= 1
+    }
+    var fq: [20]f64 = {}
+    i = jz
+    while i >= 0 {
+        var soma: f64 = 0.0
+        var k: int = 0
+        while k <= jk and k <= jz - i {
+            soma += trig_pio2(k) * q[i + k]
+            k += 1
+        }
+        fq[jz - i] = soma
+        i -= 1
+    }
+    return fq
+}
+
+// PIo2[k] de __rem_pio2_large, lido da tabela de bits
+proc trig_pio2(k: int) -> f64 {
+    return transmute(TRIG_PIO2_BITS[k], to = f64)
+}
+
+// Soma os fq em duas partes (cabeca e cauda) com o sinal do quadrante; prec 0 (f32) so usa a cabeca
+proc rem_pio2_compoe(fq: [20]f64, jz: int, ih: int, prec: int) -> (cabeca: f64, cauda: f64) {
+    var fw: f64 = 0.0
+    var i: int = jz
+    while i >= 0 {
+        fw += fq[i]
+        i -= 1
+    }
+    var a: f64 = fw
+    if ih != 0 {
+        a = -fw
+    }
+    if prec == 0 {
+        return a, 0.0
+    }
+    fw = fq[0] - fw
+    i = 1
+    while i <= jz {
+        fw += fq[i]
+        i += 1
+    }
+    var b: f64 = fw
+    if ih != 0 {
+        b = -fw
+    }
+    return a, b
+}
+
+// __rem_pio2_large do musl: x - N*pi/2 com x em parcelas de 24 bits; prec 0 = f32 (jk 3), prec 1 = f64 (jk 4)
+proc rem_pio2_largo(x: []f64, e0: int, prec: int) -> (quad: int, cabeca: f64, cauda: f64) {
+    var jk: int = 4
+    if prec == 0 {
+        jk = 3
+    }
+    var jv: int = 0
+    if e0 >= 3 {
+        jv = (e0 - 3) / 24
+    }
+    let q0: int = e0 - 24 * (jv + 1)
+    var q: [20]f64 = {}
+    for i in 0..<jk + 1 {
+        q[i] = rem_pio2_produto(x, jv, i)
+    }
+    var jz: int = jk
+    while true {
+        let iqd, zd = rem_pio2_distila(q, jz)
+        let iqi, parte, ih, fracao = rem_pio2_inteiro(iqd, jz, q0, zd)
+        if fracao == 0.0 and rem_pio2_zerado(iqi, jk, jz) {
+            var k: int = 1
+            while iqi[jk - k] == 0 {
+                k += 1
+            }
+            let alvo: int = jz + k
+            for i in jz + 1..=alvo {
+                q[i] = rem_pio2_produto(x, jv, i)
+            }
+            jz = alvo
+            continue
+        }
+        let iqc, jzc, q0c = rem_pio2_corta(iqi, jz, q0, fracao)
+        let fq = rem_pio2_produtos(iqc, jzc, q0c, jk)
+        let ca, cb = rem_pio2_compoe(fq, jzc, ih, prec)
+        return parte % 8, ca, cb
+    }
+    return 0, 0.0, 0.0
+}
+
+// Parte grande (|x| >= 2^20 pi/2): mantissa de |x| em tres parcelas de 24 bits e o musl grande
+proc rem_pio2_grande_f64(x: f64, ix: u32, negativo: bool) -> (quad: int, cabeca: f64, cauda: f64) {
+    let u: u64 = transmute(x, to = u64)
+    let z0: f64 = transmute((u & 0x000fffffffffffff) | 0x4160000000000000, to = f64)
+    var tx: [3]f64 = {}
+    var z: f64 = z0
+    for i in 0..<2 {
+        tx[i] = trig_piso_pos(z)
+        z = (z - tx[i]) * TRIG_2_24
+    }
+    tx[2] = z
+    var nx: int = 3
+    while tx[nx - 1] == 0.0 {
+        nx -= 1
+    }
+    let e0: int = ((ix >> 20) as int) - 1046
+    let qa, ca, cb = rem_pio2_largo(tx[0..<nx], e0, 1)
+    if negativo {
+        return -qa, -ca, -cb
+    }
+    return qa, ca, cb
+}
+
+// Reducao de x por pi/2 (__rem_pio2 do musl): quadrante, cabeca e cauda; |x| <= pi/4 nao chega aqui
+proc rem_pio2(x: f64) -> (quad: int, cabeca: f64, cauda: f64) {
+    let u: u64 = transmute(x, to = u64)
+    let ix: u32 = ((u >> 32) as u32) & 0x7fffffff
+    let negativo: bool = ((u >> 63) == 1)
+    if ix <= 0x401c463b and not rem_pio2_meio_exato(ix) {
+        return rem_pio2_pequeno(x, ix, negativo)
+    }
+    if ix < 0x413921fb {
+        return rem_pio2_medio(x, ix)
+    }
+    if ix >= 0x7ff00000 {
+        return 0, x - x, x - x
+    }
+    return rem_pio2_grande_f64(x, ix, negativo)
+}
+
+// ---- reducao de x por pi/2 em f32 (__rem_pio2f do musl, em double por dentro) ----
+
+// Reducao de x float por pi/2: quadrante e resto em double
+proc rem_pio2f(x: f32) -> (quad: int, cabeca: f64) {
+    let ix: u32 = transmute(x, to = u32) & 0x7fffffff
+    let sinal: bool = (transmute(x, to = u32) >> 31) == 1
+    let xd: f64 = x as f64
+    if ix >= 0x7f800000 {
+        return 0, (x - x) as f64
+    }
+    if ix < 0x4dc90fdb {
+        var cociente: f64 = xd * TRIG_INVPIO2 + TRIG_TOINT - TRIG_TOINT
+        var n: int = cociente as int
+        var y: f64 = xd - cociente * TRIG_PIO2F_1 - cociente * TRIG_PIO2F_1T
+        if y < -TRIG_PIO4F {
+            n -= 1
+            cociente -= 1.0
+            y = xd - cociente * TRIG_PIO2F_1 - cociente * TRIG_PIO2F_1T
+        } else if y > TRIG_PIO4F {
+            n += 1
+            cociente += 1.0
+            y = xd - cociente * TRIG_PIO2F_1 - cociente * TRIG_PIO2F_1T
+        }
+        return n, y
+    }
+    let e0: int = ((ix >> 23) as int) - 150
+    let escala: f32 = transmute(ix - ((e0 as u32) << 23), to = f32)
+    var tx: [1]f64 = {}
+    tx[0] = escala as f64
+    let qa, ca, _ = rem_pio2_largo(tx[0..<1], e0, 0)
+    if sinal {
+        return -qa, -ca
+    }
+    return qa, ca
+}
+
+// ---- nucleos f32: __sindf, __cosdf e __tandf do musl (entrada e calculo em double) ----
+
+// __sindf do musl (k_sinf.c): sin em [-pi/4, pi/4], devolvido em float
+proc sin_df(x: f64) -> f32 {
+    let z: f64 = x * x
+    let w: f64 = z * z
+    let r: f64 = SINDF_S3 + z * SINDF_S4
+    let s: f64 = z * x
+    return ((x + s * (SINDF_S1 + z * SINDF_S2)) + s * w * r) as f32
+}
+
+// __cosdf do musl (k_cosf.c): cos em [-pi/4, pi/4], devolvido em float
+proc cos_df(x: f64) -> f32 {
+    let z: f64 = x * x
+    let w: f64 = z * z
+    let r: f64 = COSDF_C2 + z * COSDF_C3
+    return (((1.0 + z * COSDF_C0) + w * COSDF_C1) + (w * z) * r) as f32
+}
+
+// Coeficiente T[i] do __tandf do musl, lido da tabela de bits
+proc tandf_t(i: int) -> f64 {
+    return transmute(TRIG_TANDF_T_BITS[i], to = f64)
+}
+
+// __tandf do musl (k_tanf.c): tan, ou -1/tan se impar, devolvido em float
+proc tan_df(x: f64, impar: bool) -> f32 {
+    let z: f64 = x * x
+    let r: f64 = tandf_t(4) + z * tandf_t(5)
+    let t: f64 = tandf_t(2) + z * tandf_t(3)
+    let w: f64 = z * z
+    let s: f64 = z * x
+    let u: f64 = tandf_t(0) + z * tandf_t(1)
+    let soma: f64 = (x + s * u) + (s * w) * (t + w * r)
+    if impar {
+        return (-1.0 / soma) as f32
+    }
+    return soma as f32
+}
+
+// ---- funcoes publicas: sin, cos e tan em f64 (s_sin.c, s_cos.c, s_tan.c do musl) ----
+
+// sin do musl: |x| <= pi/4 vai direto ao nucleo, o resto passa pela reducao por pi/2
+pub proc math_sin(x: f64) -> f64 {
+    let ix: u32 = trig_palavra_alta(x) & 0x7fffffff
+    if ix <= 0x3fe921fb {
+        if ix < 0x3e500000 {
+            return x
+        }
+        return sin_nucleo(x, 0.0, false)
+    }
+    if ix >= 0x7ff00000 {
+        return x - x
+    }
+    let quad, cabeca, cauda = rem_pio2(x)
+    let setor: u64 = transmute(quad, to = u64) & 3
+    if setor == 0 {
+        return sin_nucleo(cabeca, cauda, true)
+    }
+    if setor == 1 {
+        return cos_nucleo(cabeca, cauda)
+    }
+    if setor == 2 {
+        return -sin_nucleo(cabeca, cauda, true)
+    }
+    return -cos_nucleo(cabeca, cauda)
+}
+
+// cos do musl: |x| <= pi/4 vai direto ao nucleo (1.0 para x minusculo), o resto passa pela reducao
+pub proc math_cos(x: f64) -> f64 {
+    let ix: u32 = trig_palavra_alta(x) & 0x7fffffff
+    if ix <= 0x3fe921fb {
+        if ix < 0x3e46a09e {
+            return 1.0
+        }
+        return cos_nucleo(x, 0.0)
+    }
+    if ix >= 0x7ff00000 {
+        return x - x
+    }
+    let quad, cabeca, cauda = rem_pio2(x)
+    let setor: u64 = transmute(quad, to = u64) & 3
+    if setor == 0 {
+        return cos_nucleo(cabeca, cauda)
+    }
+    if setor == 1 {
+        return -sin_nucleo(cabeca, cauda, true)
+    }
+    if setor == 2 {
+        return -cos_nucleo(cabeca, cauda)
+    }
+    return sin_nucleo(cabeca, cauda, true)
+}
+
+// tan do musl: |x| <= pi/4 vai direto ao nucleo, o resto passa pela reducao (impar = quadrante impar)
+pub proc math_tan(x: f64) -> f64 {
+    let ix: u32 = trig_palavra_alta(x) & 0x7fffffff
+    if ix <= 0x3fe921fb {
+        if ix < 0x3e400000 {
+            return x
+        }
+        return tan_nucleo(x, 0.0, false)
+    }
+    if ix >= 0x7ff00000 {
+        return x - x
+    }
+    let quad, cabeca, cauda = rem_pio2(x)
+    return tan_nucleo(cabeca, cauda, (transmute(quad, to = u64) & 1) == 1)
+}
+
+// ---- funcoes publicas f32: sinf, cosf e tanf do musl (s_sinf.c, s_cosf.c, s_tanf.c) ----
+
+// sinf do musl: faixas de pi/4 com constantes de 1..4 pi/2 e, fora delas, a reducao rem_pio2f
+pub proc math_sinf(x: f32) -> f32 {
+    let ix: u32 = transmute(x, to = u32)
+    let negativo: bool = (ix >> 31) == 1
+    let absix: u32 = ix & 0x7fffffff
+    let xd: f64 = x as f64
+    if absix <= 0x3f490fda {
+        if absix < 0x39800000 {
+            return x
+        }
+        return sin_df(xd)
+    }
+    if absix <= 0x407b53d1 {
+        if absix <= 0x4016cbe3 {
+            if negativo {
+                return -cos_df(xd + TRIG_MPIO2_1)
+            }
+            return cos_df(xd - TRIG_MPIO2_1)
+        }
+        if negativo {
+            return sin_df(-(xd + TRIG_MPIO2_2))
+        }
+        return sin_df(-(xd - TRIG_MPIO2_2))
+    }
+    if absix <= 0x40e231d5 {
+        if absix <= 0x40afeddf {
+            if negativo {
+                return cos_df(xd + TRIG_MPIO2_3)
+            }
+            return -cos_df(xd - TRIG_MPIO2_3)
+        }
+        if negativo {
+            return sin_df(xd + TRIG_MPIO2_4)
+        }
+        return sin_df(xd - TRIG_MPIO2_4)
+    }
+    if absix >= 0x7f800000 {
+        return x - x
+    }
+    let quad, cabeca = rem_pio2f(x)
+    let setor: u64 = transmute(quad, to = u64) & 3
+    if setor == 0 {
+        return sin_df(cabeca)
+    }
+    if setor == 1 {
+        return cos_df(cabeca)
+    }
+    if setor == 2 {
+        return sin_df(-cabeca)
+    }
+    return -cos_df(cabeca)
+}
+
+// cosf do musl: faixas de pi/4 com constantes de 1..4 pi/2 e, fora delas, a reducao rem_pio2f
+pub proc math_cosf(x: f32) -> f32 {
+    let ix: u32 = transmute(x, to = u32)
+    let negativo: bool = (ix >> 31) == 1
+    let absix: u32 = ix & 0x7fffffff
+    let xd: f64 = x as f64
+    if absix <= 0x3f490fda {
+        if absix < 0x39800000 {
+            return 1.0
+        }
+        return cos_df(xd)
+    }
+    if absix <= 0x407b53d1 {
+        if absix > 0x4016cbe3 {
+            if negativo {
+                return -cos_df(xd + TRIG_MPIO2_2)
+            }
+            return -cos_df(xd - TRIG_MPIO2_2)
+        }
+        if negativo {
+            return sin_df(xd + TRIG_MPIO2_1)
+        }
+        return sin_df(TRIG_MPIO2_1 - xd)
+    }
+    if absix <= 0x40e231d5 {
+        if absix > 0x40afeddf {
+            if negativo {
+                return cos_df(xd + TRIG_MPIO2_4)
+            }
+            return cos_df(xd - TRIG_MPIO2_4)
+        }
+        if negativo {
+            return sin_df(-(xd) - TRIG_MPIO2_3)
+        }
+        return sin_df(xd - TRIG_MPIO2_3)
+    }
+    if absix >= 0x7f800000 {
+        return x - x
+    }
+    let quad, cabeca = rem_pio2f(x)
+    let setor: u64 = transmute(quad, to = u64) & 3
+    if setor == 0 {
+        return cos_df(cabeca)
+    }
+    if setor == 1 {
+        return sin_df(-cabeca)
+    }
+    if setor == 2 {
+        return -cos_df(cabeca)
+    }
+    return sin_df(cabeca)
+}
+
+// tanf do musl: faixas de pi/4 com constantes de 1..4 pi/2 e, fora delas, a reducao rem_pio2f
+pub proc math_tanf(x: f32) -> f32 {
+    let ix: u32 = transmute(x, to = u32)
+    let negativo: bool = (ix >> 31) == 1
+    let absix: u32 = ix & 0x7fffffff
+    let xd: f64 = x as f64
+    if absix <= 0x3f490fda {
+        if absix < 0x39800000 {
+            return x
+        }
+        return tan_df(xd, false)
+    }
+    if absix <= 0x407b53d1 {
+        if absix <= 0x4016cbe3 {
+            if negativo {
+                return tan_df(xd + TRIG_MPIO2_1, true)
+            }
+            return tan_df(xd - TRIG_MPIO2_1, true)
+        }
+        if negativo {
+            return tan_df(xd + TRIG_MPIO2_2, false)
+        }
+        return tan_df(xd - TRIG_MPIO2_2, false)
+    }
+    if absix <= 0x40e231d5 {
+        if absix <= 0x40afeddf {
+            if negativo {
+                return tan_df(xd + TRIG_MPIO2_3, true)
+            }
+            return tan_df(xd - TRIG_MPIO2_3, true)
+        }
+        if negativo {
+            return tan_df(xd + TRIG_MPIO2_4, false)
+        }
+        return tan_df(xd - TRIG_MPIO2_4, false)
+    }
+    if absix >= 0x7f800000 {
+        return x - x
+    }
+    let quad, cabeca = rem_pio2f(x)
+    return tan_df(cabeca, (transmute(quad, to = u64) & 1) == 1)
+}

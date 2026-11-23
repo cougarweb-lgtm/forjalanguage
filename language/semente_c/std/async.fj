@@ -1,0 +1,164 @@
+// std:async - pool de threads e grupo de tarefas (M5 P51). API em ingles (ADR-39); Forja pura sobre std:thread e std:sync (nenhum runtime novo, nenhum objeto novo no ligador).
+// Versao: 0.1.0. Changelog: 0.1.0 - M5 P51: pool_new, pool_close, group_new, group_spawn e group_wait; fila unica com Mutex e Cond (sem roubo, sem Future, sem export ao C).
+// Posse: pool_new devolve ^Pool no heap: pool_close junta os workers e libera as listas; quem chamou libera o ^Pool com delete.
+// Group e um valor com o id do grupo (group_new): o contador de pendentes mora no Pool, sob o mesmo Mutex da fila; por isso o grupo nao guarda ponteiro para a tarefa.
+// Cada group_new ocupa 8 bytes no pool ate pool_close. group_wait pode ser chamada de novo depois de mais group_spawn.
+// Nome: "new" e palavra do compilador, por isso pool_new. A fila cresce sem teto fixo (append).
+
+import "std:thread"
+import "std:sync"
+
+// Erro do pool: sem_recursos = o sistema nao criou um worker; invalido = n_workers < 1.
+pub enum AsyncError { sem_recursos, invalido }
+
+// Tarefa enfileirada: proc e arg vao ao worker; grupo e o id do grupo que desconta ao terminar.
+struct Tarefa {
+    p: proc(q: rawptr) -> u32
+    arg: rawptr
+    grupo: int
+}
+
+// Pool: fila unica protegida por m; fila_viva acorda workers, terminou acorda group_wait.
+// contagens[id] = tarefas pendentes do grupo id (lido e escrito sob m).
+pub struct Pool {
+    m: sync.Mutex
+    fila_viva: sync.Cond
+    terminou: sync.Cond
+    fila: [dynamic]Tarefa
+    cabeca: int = 0
+    trabalhadores: [dynamic]thread.Thread
+    contagens: [dynamic]int
+    encerrando: bool = false
+}
+
+// Grupo de tarefas sobre um Pool: pool e o pool, id e o indice do contador em contagens.
+pub struct Group {
+    pool: ^Pool
+    id: int = 0
+}
+
+// Pede o fim: marca encerrando e junta todos os workers (eles esvaziam a fila antes de sair).
+proc encerrar_workers(p: ^Pool) {
+    sync.lock(&p.m)
+    p.encerrando = true
+    sync.broadcast(&p.fila_viva)
+    sync.unlock(&p.m)
+    for t in p.trabalhadores {
+        _ = thread.join(t)
+    }
+}
+
+// Corpo de cada worker: tira tarefa, roda e avisa o grupo; ao receber none (fila vazia e encerrando) sai.
+proc trabalhador(q: rawptr) -> u32 {
+    let p = q as ^Pool
+    var seguir = true
+    while seguir {
+        switch t in proxima_tarefa(p) {
+        case Tarefa:
+            executar(p, t)
+        case none:
+            seguir = false
+        }
+    }
+    return 0
+}
+
+// Espera a fila ter tarefa ou o pool encerrar; devolve a proxima tarefa ou none.
+proc proxima_tarefa(p: ^Pool) -> ?Tarefa {
+    sync.lock(&p.m)
+    while p.cabeca == len(p.fila) and not p.encerrando {
+        sync.wait(&p.fila_viva, &p.m)
+    }
+    if p.cabeca == len(p.fila) {
+        sync.unlock(&p.m)
+        return none
+    }
+    let t = p.fila[p.cabeca]
+    p.cabeca += 1
+    if p.cabeca == len(p.fila) {
+        clear(&p.fila)
+        p.cabeca = 0
+    }
+    sync.unlock(&p.m)
+    return t
+}
+
+// Roda a tarefa fora do Mutex e, ao fim, desconta do grupo; acorda group_wait quando o grupo zera.
+proc executar(p: ^Pool, t: Tarefa) {
+    let _resultado = t.p(t.arg)
+    sync.lock(&p.m)
+    p.contagens[t.grupo] -= 1
+    if p.contagens[t.grupo] == 0 {
+        sync.broadcast(&p.terminou)
+    }
+    sync.unlock(&p.m)
+}
+
+// Sobe um worker no pool; false = o sistema nao criou a thread.
+proc subir_worker(p: ^Pool) -> bool {
+    switch t in thread.spawn(trabalhador, arg = p as rawptr) {
+    case thread.Thread:
+        append(&p.trabalhadores, item = t)
+        return true
+    case thread.ThreadError:
+        return false
+    }
+    return false
+}
+
+// Cria o pool com n_workers threads (n_workers >= 1). Devolve ^Pool no heap: pool_close e depois delete.
+pub proc pool_new(n_workers: int) -> ^Pool ! AsyncError {
+    if n_workers < 1 {
+        return AsyncError.invalido
+    }
+    let p = new(Pool, alloc = heap)
+    p.fila = make([dynamic]Tarefa, alloc = heap, cap = 64)
+    p.trabalhadores = make([dynamic]thread.Thread, alloc = heap, cap = n_workers)
+    p.contagens = make([dynamic]int, alloc = heap, cap = 8)
+    for _i in 0..<n_workers {
+        if not subir_worker(p) {
+            encerrar_workers(p)
+            delete(p.trabalhadores)
+            delete(p.contagens)
+            delete(p.fila)
+            delete(p)
+            return AsyncError.sem_recursos
+        }
+    }
+    return p
+}
+
+// Espera a fila esvaziar e junta todos os workers: depois disso 0 threads vivas. Nao libera o ^Pool (faca delete(p) depois).
+pub proc pool_close(p: ^Pool) {
+    encerrar_workers(p)
+    delete(p.trabalhadores)
+    delete(p.contagens)
+    delete(p.fila)
+}
+
+// Cria um grupo sobre o pool p: var g = group_new(p) e depois group_spawn(g, ...).
+pub proc group_new(p: ^Pool) -> Group {
+    sync.lock(&p.m)
+    let id = len(p.contagens)
+    append(&p.contagens, item = 0)
+    sync.unlock(&p.m)
+    return Group{pool = p, id = id}
+}
+
+// Enfileira p(arg) no pool do grupo. O worker que rodar a tarefa desconta do grupo ao terminar.
+pub proc group_spawn(g: Group, p: proc(q: rawptr) -> u32, arg: rawptr) {
+    sync.lock(&g.pool.m)
+    g.pool.contagens[g.id] += 1
+    append(&g.pool.fila, item = Tarefa{p = p, arg = arg, grupo = g.id})
+    sync.signal(&g.pool.fila_viva)
+    sync.unlock(&g.pool.m)
+}
+
+// Bloqueia ate todas as tarefas do grupo terminarem (pendentes = 0). Pode ser chamada de novo depois de mais group_spawn.
+pub proc group_wait(g: Group) {
+    sync.lock(&g.pool.m)
+    while g.pool.contagens[g.id] > 0 {
+        sync.wait(&g.pool.terminou, &g.pool.m)
+    }
+    sync.unlock(&g.pool.m)
+}

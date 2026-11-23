@@ -1,0 +1,129 @@
+// semantic/sem_texto_builder.fj - porte de compiler/semantic/sem_texto_builder.c
+// sha256 de semantic/sem_texto_builder.c: 282693b247fff1eb9c70a9a1d0c8fe07857ff845c0be4845d37bf9564a330369
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "common"
+import "frontend"
+
+// C: semantic/sem_texto_builder.c:22
+proc builder_por_endereco(s: ^Semantica, lista: ?^frontend.Expr, quem: str, exemplo: str) -> bool {
+    let l: ^frontend.Expr = lista as ^frontend.Expr
+    let k: ^TipoInfo = tipo_de(&s.tipos, l.tipo)
+    if tipo_classe_de(&s.tipos, l.tipo) == TC_DINAMICO {
+        let msg_1 = format(f"{quem} recebe o endereco do builder: {exemplo}", alloc = heap)
+        defer delete(msg_1)
+        return sem_erro(s, common.E0310, l.pos, msg_1)
+    }
+    if (k.classe != (TC_PONTEIRO as u8)) or (tipo_classe_de(&s.tipos, k.a) != TC_DINAMICO) {
+        let texto = s4_descrever(s, l.tipo)
+        defer delete(texto)
+        let msg_2 = format(f"{quem} pede ^[dynamic]u8, o endereco do builder (tipo {texto})", alloc = heap)
+        defer delete(msg_2)
+        return sem_erro(s, common.E0310, l.pos, msg_2)
+    }
+    let elemento: u32 = tipo_de(&s.tipos, k.a).a
+    if elemento != (TIPO_U8 as u32) {
+        let texto_2 = s4_descrever(s, elemento)
+        defer delete(texto_2)
+        let msg_3 = format(f"{quem} pede lista de u8, o builder de texto (elemento {texto_2})", alloc = heap)
+        defer delete(msg_3)
+        return sem_erro(s, common.E0301, l.pos, msg_3)
+    }
+    // C2F-32: snprintf(motivo, 96, ...) corta em 95 bytes
+    let motivo_inteiro = format(f"{quem} altera o builder: declare com var", alloc = heap)
+    defer delete(motivo_inteiro)
+    let motivo = motivo_inteiro[0..<min(len(motivo_inteiro), 95)]
+    return (l.tipo_no != (frontend.EX_UNARIO as u8)) or (l.op != (frontend.OP_ENDERECO as u8)) or sem_lvalor_mutavel_de(s, l.a, motivo)
+}
+
+// C: semantic/sem_texto_builder.c:45
+proc origem_do_builder_local(s: ^Semantica, buf: ?^frontend.Expr) -> u8 {
+    if ((((buf as ^frontend.Expr).tipo_no != (frontend.EX_UNARIO as u8)) or ((buf as ^frontend.Expr).op != (frontend.OP_ENDERECO as u8))) or (((buf as ^frontend.Expr).a as ^frontend.Expr).tipo_no != (frontend.EX_NOME as u8))) or (((buf as ^frontend.Expr).a as ^frontend.Expr).modulo != 0) {
+        return frontend.ALOC_NENHUM as u8
+    }
+    let local: ?^LocalInfo = escopo_buscar(&s.escopo, ((buf as ^frontend.Expr).a as ^frontend.Expr).nome)
+    if local == none {
+        return frontend.ALOC_NENHUM as u8
+    }
+    if ((((local as ^LocalInfo).origem == (frontend.ALOC_PARAM as u8)) or ((local as ^LocalInfo).origem == (frontend.ALOC_ARENA as u8))) or ((local as ^LocalInfo).origem == (frontend.ALOC_FRAME as u8))) or ((local as ^LocalInfo).origem == (frontend.ALOC_ESCOPO as u8)) {
+        return (local as ^LocalInfo).origem
+    }
+    return frontend.ALOC_NENHUM as u8
+}
+
+// C: semantic/sem_texto_builder.c:55
+proc sem_chamar_to_str(s: ^Semantica, e: ^frontend.Expr) -> bool {
+    if not sem_ligar_embutido(s, e, s.params_lista[(ASS_LISTA as int)..<((ASS_LISTA as int) + 1)]) {
+        return false
+    }
+    let buf: ?^frontend.Expr = (argumento_do_parametro(e, 0) as ^frontend.Arg).valor
+    if (not sem_checar(s, buf, TIPO_VAZIO as u32)) or (not builder_por_endereco(s, buf, "to_str", "to_str(&buf)")) {
+        return false
+    }
+    let origem: u8 = origem_do_builder_local(s, buf)
+    if origem == (frontend.ALOC_ESCOPO as u8) {
+        let msg_1 = format(f"to_str move o bloco do builder para a str e o alloc = scope o libera no fim do bloco: faca o builder com alloc = heap (e delete(s)), frame ou uma Arena", alloc = heap)
+        defer delete(msg_1)
+        return sem_erro(s, common.E0316, (buf as ^frontend.Expr).pos, msg_1)
+    }
+    e.tipo = TIPO_STR as u32
+    e.alocacao = origem
+    return true
+}
+
+// C: semantic/sem_texto_builder.c:70
+proc sem_formato_tem_into(s: ^Semantica, e: ^frontend.Expr) -> bool {
+    var k: u32 = 0
+    while k < e.nargs {
+        if ((e.args or_else {})[k].nome >= 0) and (sem_nome_texto(s, (e.args or_else {})[k].nome) == "into") {
+            return true
+        }
+        k += 1
+    }
+    return false
+}
+
+// C: semantic/sem_texto_builder.c:79
+proc sem_chamar_formato_into(s: ^Semantica, e: ^frontend.Expr) -> bool {
+    if e.ref_id != frontend.EMB_FORMAT {
+        let msg_1 = format(f"into so existe no format: format_c devolve um cstr novo", alloc = heap)
+        defer delete(msg_1)
+        return sem_erro(s, common.E0315, e.pos_op, msg_1)
+    }
+    if (((e.nargs != 2) or ((e.args or_else {})[0].nome >= 0)) or ((e.args or_else {})[1].nome < 0)) or (sem_nome_texto(s, (e.args or_else {})[1].nome) != "into") {
+        let msg_2 = format(f"format(f\"...\", into = &buf) leva so o texto e o into, nessa ordem: into e alloc nao andam juntos", alloc = heap)
+        defer delete(msg_2)
+        return sem_erro(s, common.E0501, e.pos_op, msg_2)
+    }
+    let texto: ?^frontend.Expr = (e.args or_else {})[0].valor
+    let buf: ?^frontend.Expr = (e.args or_else {})[1].valor
+    if (texto as ^frontend.Expr).tipo_no != (frontend.EX_FTEXTO as u8) {
+        let msg_3 = format(f"format pede f\"...\" como 1o argumento", alloc = heap)
+        defer delete(msg_3)
+        return sem_erro(s, common.E0315, (texto as ^frontend.Expr).pos, msg_3)
+    }
+    let p_1 = e.args or_else {}
+    p_1[0].indice = 0
+    let p_2 = e.args or_else {}
+    p_2[1].indice = 1
+    if ((not sem_f_texto(s, texto as ^frontend.Expr)) or (not sem_checar(s, buf, TIPO_VAZIO as u32))) or (not builder_por_endereco(s, buf, "format(into =)", "format(f\"...\", into = &buf)")) {
+        return false
+    }
+    e.tipo = TIPO_VAZIO as u32
+    return true
+}
+
+// C: semantic/sem_texto_builder.c:95
+proc sem_texto_no_builder(s: ^Semantica, lista: ?^frontend.Expr, item: ?^frontend.Arg) -> bool {
+    let arg_1: u32 = tipo_de(&s.tipos, (lista as ^frontend.Expr).tipo).a
+    let arg_2: ^Tipos = &s.tipos
+    if common.c2f_s2u_32(tipo_classe_de(arg_2, arg_1)) != (TC_DINAMICO as u32) {
+        let msg_1 = format(f"item de texto so vale em lista dinamica ([dynamic]u8): em lista fixa, um append por byte", alloc = heap)
+        defer delete(msg_1)
+        return sem_erro(s, common.E0310, ((item as ^frontend.Arg).valor as ^frontend.Expr).pos, msg_1)
+    }
+    let ptr_1: ^frontend.Arg = item as ^frontend.Arg
+    ptr_1.indice = frontend.APPEND_PARAM_ITEMS
+    return true
+}

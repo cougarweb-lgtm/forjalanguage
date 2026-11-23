@@ -1,0 +1,231 @@
+// Exemplo da std:shaping (vendor\shaping 0.1.0, HarfBuzz 15.1.0 em vendor\libharfbuzz.a; fonte de teste Amiri-Regular.ttf, SIL OFL 1.1).
+// Sem argumentos: roda so os casos que nao precisam de fonte (bytes aleatorios, vazio, versao) e sai.
+// Com `-- <pasta>`: abre <pasta>\Amiri-Regular.ttf e imprime shaping (latim com e sem ligadura, arabe RTL, glifo ausente), metricas, avanco, subset e os negativos com fonte.
+//   Com `-- <pasta> <arquivo>` o subset tambem grava em <arquivo> para o oraculo abrir com fontTools (sem o 2o argumento nada e gravado).
+// Saida deterministica: shaping_basico.esperado (rodar com `-- oraculos\dados`).
+// VERIFICAR: python -I language\exemplos_libs\oraculos\shaping.py --verificar --forja <forja.exe absoluto>
+
+import "vendor:shaping/shaping"
+import "std:file"
+import "std:os"
+import "std:path"
+
+// Nome curto do erro, para a saida do exemplo.
+proc nome_erro(erro: shaping.ShapingError) -> str {
+    switch erro {
+    case shaping.ShapingError.invalid_font:
+        return "invalid_font"
+    case shaping.ShapingError.invalid_input:
+        return "invalid_input"
+    case shaping.ShapingError.invalid_glyph:
+        return "invalid_glyph"
+    case shaping.ShapingError.out_of_memory:
+        return "out_of_memory"
+    }
+    return "desconhecido"
+}
+
+// Uma linha por glifo: gid, cluster, avanco x e y, deslocamento x e y (unidades da fonte).
+proc imprimir_glifos(rotulo: str, glifos: []shaping.Glyph) {
+    let quantos = len(glifos)
+    print(f"{rotulo} n={quantos}")
+    for g in glifos {
+        print(f"  g {g.gid} {g.cluster} {g.x_advance} {g.y_advance} {g.x_offset} {g.y_offset}")
+    }
+}
+
+// Faz o shape e imprime os glifos, ou o nome do erro.
+proc mostrar_shape(fonte: shaping.Font, rotulo: str, texto: str, opcoes: shaping.ShapeOptions) {
+    switch glifos in shaping.shape(fonte, texto, opcoes) {
+    case [dynamic]shaping.Glyph:
+        defer delete(glifos)
+        imprimir_glifos(rotulo, glifos[..])
+    case shaping.ShapingError:
+        print(f"{rotulo} {nome_erro(glifos)}")
+    }
+}
+
+// Metricas e cmap: upem, ascender, descender, line_gap, quantidade de glifos e gids de 'A' e de um emoji (0 = ausente).
+proc mostrar_metricas(fonte: shaping.Font) {
+    switch upem in shaping.units_per_em(fonte) {
+    case i32:
+        print(f"upem {upem}")
+    case shaping.ShapingError:
+        print(f"upem {nome_erro(upem)}")
+    }
+    switch metricas in shaping.metrics(fonte) {
+    case shaping.FontMetrics:
+        print(f"metricas {metricas.ascender} {metricas.descender} {metricas.line_gap}")
+    case shaping.ShapingError:
+        print(f"metricas {nome_erro(metricas)}")
+    }
+    switch total in shaping.glyph_count(fonte) {
+    case i32:
+        print(f"glifos {total}")
+    case shaping.ShapingError:
+        print(f"glifos {nome_erro(total)}")
+    }
+    switch gid_a in shaping.glyph_for_char(fonte, 65) {
+    case u32:
+        print(f"gid_A {gid_a}")
+    case shaping.ShapingError:
+        print(f"gid_A {nome_erro(gid_a)}")
+    }
+    switch gid_emoji in shaping.glyph_for_char(fonte, 128512) {
+    case u32:
+        print(f"gid_emoji {gid_emoji}")
+    case shaping.ShapingError:
+        print(f"gid_emoji {nome_erro(gid_emoji)}")
+    }
+}
+
+// Avanco de um gid valido e de um gid fora da faixa (tem de dar invalid_glyph).
+proc mostrar_avanco(fonte: shaping.Font) {
+    switch avanco in shaping.glyph_advance(fonte, 36) {
+    case i32:
+        print(f"avanco_A {avanco}")
+    case shaping.ShapingError:
+        print(f"avanco_A {nome_erro(avanco)}")
+    }
+    switch avanco in shaping.glyph_advance(fonte, 99999999) {
+    case i32:
+        print(f"avanco_fora {avanco}")
+    case shaping.ShapingError:
+        print(f"avanco_fora {nome_erro(avanco)}")
+    }
+}
+
+// Shapings: latim sem ligadura (kern, -liga), latim com ligadura (pt-BR), arabe RTL automatico, glifo ausente e casos de erro.
+proc mostrar_shapings(fonte: shaping.Font) {
+    mostrar_shape(fonte, "latim_sem_liga", "office fi", shaping.ShapeOptions{script = "Latn", language = "pt-BR", features = "kern,-liga"})
+    mostrar_shape(fonte, "latim_com_liga", "office fi", shaping.ShapeOptions{script = "Latn", language = "pt-BR"})
+    mostrar_shape(fonte, "arabe_auto", "العربية", shaping.ShapeOptions{})
+    mostrar_shape(fonte, "ausente", "a😀", shaping.ShapeOptions{direction = shaping.Direction.ltr})
+    mostrar_shape(fonte, "script_curto", "abc", shaping.ShapeOptions{script = "Lat"})
+    mostrar_shape(fonte, "vazio", "", shaping.ShapeOptions{})
+}
+
+// Subset dos gids de 'o' e 'f' (mais o .notdef). Com destino (2o argumento), grava o resultado para o oraculo; sem ele so imprime o tamanho.
+proc mostrar_subset(fonte: shaping.Font, destino: str) {
+    switch gid_o in shaping.glyph_for_char(fonte, 111) {
+    case u32:
+        var gids: [3]u32 = {0, gid_o, 0}
+        switch gid_f in shaping.glyph_for_char(fonte, 102) {
+        case u32:
+            gids[2] = gid_f
+        case shaping.ShapingError:
+            print("subset f falhou")
+            return
+        }
+        switch bytes in shaping.subset(fonte, gids[..], shaping.SUBSET_SEM_HINTS) {
+        case [dynamic]u8:
+            defer delete(bytes)
+            print(f"subset bytes {len(bytes)}")
+            gravar_subset(bytes[..], destino)
+        case shaping.ShapingError:
+            print(f"subset {nome_erro(bytes)}")
+        }
+    case shaping.ShapingError:
+        print(f"subset gid_o {nome_erro(gid_o)}")
+    }
+}
+
+// Grava o subset no arquivo dado (2o argumento) quando ele foi dado.
+proc gravar_subset(bytes: []u8, destino: str) {
+    if len(destino) == 0 {
+        return
+    }
+    let erro = file.write_all(destino, data = bytes)
+    if erro != none {
+        print("subset gravacao falhou")
+    }
+}
+
+// Negativos com fonte: subset com gid fora da faixa (invalid_glyph) e lista vazia (invalid_input).
+proc mostrar_negativos_subset(fonte: shaping.Font) {
+    var fora: [1]u32 = {99999999}
+    switch bytes in shaping.subset(fonte, fora[..], 0) {
+    case [dynamic]u8:
+        delete(bytes)
+        print("subset_fora aceito")
+    case shaping.ShapingError:
+        print(f"subset_fora {nome_erro(bytes)}")
+    }
+    var fora_nenhum: [1]u32 = {0}
+    switch bytes in shaping.subset(fonte, fora_nenhum[0..<0], 0) {
+    case [dynamic]u8:
+        delete(bytes)
+        print("subset_vazio aceito")
+    case shaping.ShapingError:
+        print(f"subset_vazio {nome_erro(bytes)}")
+    }
+}
+
+// Fonte aberta: roda todos os casos com ela e fecha no fim.
+proc rodar_com_fonte(fonte: shaping.Font, destino: str) {
+    defer shaping.close(fonte)
+    print(f"versao {shaping.version()}")
+    mostrar_metricas(fonte)
+    mostrar_avanco(fonte)
+    mostrar_shapings(fonte)
+    mostrar_subset(fonte, destino)
+    mostrar_negativos_subset(fonte)
+}
+
+// Abre os bytes da fonte e roda. Erro de abertura vira linha de saida.
+proc abrir_e_rodar(dados: []u8, destino: str) {
+    switch fonte in shaping.open(dados) {
+    case shaping.Font:
+        rodar_com_fonte(fonte, destino)
+    case shaping.ShapingError:
+        print(f"open {nome_erro(fonte)}")
+    }
+}
+
+// Casos sem fonte: bytes aleatorios e vazio tem de ser recusados como invalid_font.
+proc mostrar_negativos_sem_fonte() {
+    var lixo: [256]u8 = {}
+    var semente: int = 12345
+    for i in 0..<256 {
+        semente = (semente * 1103515245 + 12345) % 2147483648
+        lixo[i] = ((semente / 65536) % 256) as u8
+    }
+    switch aleatoria in shaping.open(lixo[..]) {
+    case shaping.Font:
+        shaping.close(aleatoria)
+        print("aleatoria aceita")
+    case shaping.ShapingError:
+        print(f"aleatoria {nome_erro(aleatoria)}")
+    }
+    var nenhum: [1]u8 = {0}
+    switch vazia in shaping.open(nenhum[0..<0]) {
+    case shaping.Font:
+        shaping.close(vazia)
+        print("vazia aceita")
+    case shaping.ShapingError:
+        print(f"vazia {nome_erro(vazia)}")
+    }
+}
+
+proc main() {
+    defer shaping.shutdown()
+    mostrar_negativos_sem_fonte()
+    let argumentos = os.args()
+    if len(argumentos) < 2 {
+        print("sem fonte: so os casos acima")
+        return
+    }
+    let caminho = path.join2(argumentos[1], "Amiri-Regular.ttf", alloc = heap)
+    defer delete(caminho)
+    var destino = ""
+    if len(argumentos) >= 3 {
+        destino = argumentos[2]
+    }
+    switch lida in file.read_all(caminho, alloc = heap) {
+    case [dynamic]u8:
+        defer delete(lida)
+        abrir_e_rodar(lida[..], destino)
+    case file.FileError:
+        print("fonte nao lida")
+    }
+}

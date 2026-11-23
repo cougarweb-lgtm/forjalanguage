@@ -1,0 +1,593 @@
+// driver/mapa_resumo.fj - porte de compiler/driver/mapa_resumo.c
+// sha256 de driver/mapa_resumo.c: 44546f8668acc2930a11a37c05e758ba78203e5c164963094bb63b0ea0b7172d
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "common"
+import "frontend"
+import "semantic"
+
+struct Corte {
+    restante: u32
+    omitidos: u32
+}
+
+struct CategoriaDeTipos {
+    modulo: u8
+    categoria: u8
+}
+
+struct LadoDoImport {
+    modulo: u8
+    importadores: bool
+}
+
+const LIMITE_GERAL: i32 = 6
+const LIMITE_MODULO: i32 = 40
+const ASSINATURA_MAX: i32 = 160
+const COMENTARIO_MAX: i32 = 80
+const TITULO_MAX_2: i32 = 60
+const TIPO_DETALHE_MAX: i32 = 200
+
+// C: driver/mapa_resumo.c:19
+proc cabe(c: ^Corte) -> bool {
+    if c.restante == 0 {
+        c.omitidos += 1
+        return false
+    }
+    c.restante -= 1
+    return true
+}
+
+// C: driver/mapa_resumo.c:29
+proc anexar_omitidos(b: ^[dynamic]u8, c: ^Corte) {
+    if c.omitidos > 0 {
+        format(f" +{c.omitidos}", into = b)
+    }
+}
+
+// C: driver/mapa_resumo.c:34
+proc anexar_nome(q: ^Consulta, b: ^[dynamic]u8, nome: i32) {
+    append(b, item = common.interner_texto(&(q.c as ^Compilacao).nomes, nome)[0..<common.interner_tam(&(q.c as ^Compilacao).nomes, nome) as u64])
+}
+
+// C: driver/mapa_resumo.c:39
+proc anexar_caminho(q: ^Consulta, b: ^[dynamic]u8, modulo: u8) {
+    anexar_nome(q, b, (q.c as ^Compilacao).modulos.itens[modulo].caminho)
+}
+
+// C: driver/mapa_resumo.c:45
+// Anexa no maximo 'max' bytes de t[0..n), sem partir um caractere UTF-8, com "..." quando cortou.
+proc anexar_truncado(b: ^[dynamic]u8, t: ?str, n: u64, max: u64) {
+    let txt: str = t or_else ""
+    if n <= max {
+        append(b, item = txt[0..<n])
+        return
+    }
+    var corte: u64 = max - 3
+    while (corte > 0) and ((txt[corte] & 192) == 128) {
+        corte -= 1
+    }
+    append(b, item = txt[0..<corte])
+    append(b, item = "...")
+}
+
+// C: driver/mapa_resumo.c:57
+// Anexa a lista (com o titulo antes e um '\n' no fim, se faltar) a saida e libera a lista.
+proc anexar_lista(q: ^Consulta, titulo: str, lista: ^[dynamic]u8) {
+    if len(lista^) > 0 {
+        append(&q.saida, item = titulo)
+        append(&q.saida, items = lista^[..])
+        if lista^[len(lista^) - 1] != 10 {
+            append(&q.saida, item = "\n")
+        }
+    }
+    delete(lista^)
+}
+
+// C: driver/mapa_resumo.c:63
+proc limite_de(p: ^PedidoConsulta, padrao: u32) -> u32 {
+    var tern_1: u32 = padrao
+    if p.limite != 0 {
+        tern_1 = p.limite
+    }
+    return tern_1
+}
+
+// C: driver/mapa_resumo.c:68
+proc rotulo_do_tipo(d: ?^frontend.Decl) -> str {
+    if (d as ^frontend.Decl).tipo_no == (frontend.D_STRUCT as u8) {
+        return "struct"
+    }
+    if (d as ^frontend.Decl).tipo_no == (frontend.D_ENUM as u8) {
+        return "enum"
+    }
+    return "union"
+}
+
+// C: driver/mapa_resumo.c:75
+proc cabecalho(q: ^Consulta) {
+    var t: MapaTamanho = MapaTamanho{}
+    mapa_medir(q, &t)
+    append(&q.saida, item = "mapa ")
+    anexar_caminho(q, &q.saida, 0)
+    format(f": {t.modulos} modulos, {t.linhas} linhas, {t.publicos} pub, {t.tipos} tipos, {t.testes} testes", into = &q.saida)
+    if t.externos > 0 {
+        format(f", {t.externos} std", into = &q.saida)
+    }
+    append(&q.saida, item = " (Nl = linhas; * = pub)\n")
+}
+
+// C: driver/mapa_resumo.c:87
+proc linha_de_entrada(q: ^Consulta, limite: u32) {
+    var b: [dynamic]u8 = make([dynamic]u8, alloc = heap)
+    var corte: Corte = Corte{restante = limite, omitidos = 0}
+    var d: ?^frontend.Decl = ((q.c as ^Compilacao).sem.programa as ^frontend.Programa).primeira
+    while d != none {
+        let entrada: ?str = consulta_entrada_de(q, d)
+        if ((entrada == none) or (not mapa_no_escopo(q, (d as ^frontend.Decl).modulo as i32, -1))) or (not cabe(&corte)) {
+            d = (d as ^frontend.Decl).prox
+            continue
+        }
+        var tern_1: str = " "
+        if (len(b) as u64) > 0 {
+            tern_1 = ", "
+        }
+        append(&b, item = tern_1)
+        if (entrada or_else "") == "export" {
+            append(&b, item = "export ")
+        }
+        semantic.ast_id_base_da_decl(&b, &(q.c as ^Compilacao).modulos, &(q.c as ^Compilacao).nomes, d)
+        d = (d as ^frontend.Decl).prox
+    }
+    anexar_omitidos(&b, &corte)
+    anexar_lista(q, "entrada:", &b)
+}
+
+// C: driver/mapa_resumo.c:108
+proc tipos_da_categoria(q: ^Consulta, quais: CategoriaDeTipos, corte: ^Corte, b: ^[dynamic]u8) {
+    var aberto: bool = false
+    var d: ?^frontend.Decl = ((q.c as ^Compilacao).sem.programa as ^frontend.Programa).primeira
+    while d != none {
+        if ((((d as ^frontend.Decl).modulo as i32) != (quais.modulo as i32)) or (((d as ^frontend.Decl).tipo_no as i32) != (quais.categoria as i32))) or (not cabe(corte)) {
+            d = (d as ^frontend.Decl).prox
+            continue
+        }
+        if not aberto {
+            var tern_1: str = ""
+            if (len(b^) as u64) > 0 {
+                tern_1 = ";"
+            }
+            format(f"{tern_1} {rotulo_do_tipo(d)}", into = b)
+        }
+        aberto = true
+        append(b, item = " ")
+        anexar_nome(q, b, (d as ^frontend.Decl).nome)
+        if (d as ^frontend.Decl).publico {
+            append(b, item = "*")
+        }
+        d = (d as ^frontend.Decl).prox
+    }
+}
+
+// C: driver/mapa_resumo.c:122
+proc tipos_do_modulo(q: ^Consulta, modulo: u8, limite: u32, b: ^[dynamic]u8) {
+    var corte: Corte = Corte{restante = limite, omitidos = 0}
+    tipos_da_categoria(q, CategoriaDeTipos{modulo = modulo, categoria = frontend.D_STRUCT as u8}, &corte, b)
+    tipos_da_categoria(q, CategoriaDeTipos{modulo = modulo, categoria = frontend.D_ENUM as u8}, &corte, b)
+    tipos_da_categoria(q, CategoriaDeTipos{modulo = modulo, categoria = frontend.D_UNIAO as u8}, &corte, b)
+    anexar_omitidos(b, &corte)
+}
+
+// C: driver/mapa_resumo.c:133
+proc pubs_do_modulo(q: ^Consulta, modulo: u8, limite: u32, b: ^[dynamic]u8) {
+    var corte: Corte = Corte{restante = limite, omitidos = 0}
+    var d: ?^frontend.Decl = ((q.c as ^Compilacao).sem.programa as ^frontend.Programa).primeira
+    while d != none {
+        if (((((d as ^frontend.Decl).modulo as i32) != (modulo as i32)) or (not consulta_eh_api(d))) or (common.c2f_b2i32(mapa_eh_tipo(d)) != 0)) or (not cabe(&corte)) {
+            d = (d as ^frontend.Decl).prox
+            continue
+        }
+        append(b, item = " ")
+        anexar_nome(q, b, (d as ^frontend.Decl).nome)
+        if (d as ^frontend.Decl).tipo_no == (frontend.D_PROC as u8) {
+            append(b, item = "()")
+        }
+        d = (d as ^frontend.Decl).prox
+    }
+    anexar_omitidos(b, &corte)
+}
+
+// C: driver/mapa_resumo.c:146
+proc linha_do_modulo(q: ^Consulta, modulo: u8) {
+    append(&q.saida, item = "\n")
+    anexar_caminho(q, &q.saida, modulo)
+    format(f" {consulta_linhas_do_modulo(q, modulo)}l", into = &q.saida)
+    if modulo == 0 {
+        append(&q.saida, item = " raiz")
+    }
+    var primeiro: bool = true
+    var d: ?^frontend.Decl = ((q.c as ^Compilacao).sem.programa as ^frontend.Programa).primeira
+    while d != none {
+        if ((d as ^frontend.Decl).tipo_no != (frontend.D_IMPORT as u8)) or (((d as ^frontend.Decl).modulo as i32) != (modulo as i32)) {
+            d = (d as ^frontend.Decl).prox
+            continue
+        }
+        var tern_1: str = " "
+        if common.c2f_b2i32(primeiro) != 0 {
+            tern_1 = " -> "
+        }
+        append(&q.saida, item = tern_1)
+        primeiro = false
+        anexar_caminho(q, &q.saida, (d as ^frontend.Decl).indice as u8)
+        d = (d as ^frontend.Decl).prox
+    }
+    append(&q.saida, item = "\n")
+}
+
+// C: driver/mapa_resumo.c:162
+proc bloco_do_modulo(q: ^Consulta, modulo: u8, limite: u32) {
+    var tipos: [dynamic]u8 = make([dynamic]u8, alloc = heap)
+    var pubs: [dynamic]u8 = make([dynamic]u8, alloc = heap)
+    linha_do_modulo(q, modulo)
+    tipos_do_modulo(q, modulo, limite, &tipos)
+    pubs_do_modulo(q, modulo, limite, &pubs)
+    anexar_lista(q, "  tipos:", &tipos)
+    anexar_lista(q, "  pub:", &pubs)
+}
+
+// C: driver/mapa_resumo.c:174
+// "std: mem os" - o std embutido que o projeto importa (o prefixo "std:" sai do nome).
+proc linha_do_std(q: ^Consulta) {
+    var b: [dynamic]u8 = make([dynamic]u8, alloc = heap)
+    var k: u32 = 1
+    while k < (q.c as ^Compilacao).modulos.n {
+        if (q.c as ^Compilacao).modulos.itens[k].origem == (frontend.MOD_STD as u8) {
+            let nome: i32 = (q.c as ^Compilacao).modulos.itens[k].caminho
+            let tam: u64 = common.interner_tam(&(q.c as ^Compilacao).nomes, nome) as u64
+            let texto: str = common.interner_texto(&(q.c as ^Compilacao).nomes, nome)
+            append(&b, item = " ")
+            append(&b, item = texto[4..<tam])
+        }
+        k += 1
+    }
+    anexar_lista(q, "\nstd:", &b)
+}
+
+// C: driver/mapa_resumo.c:187
+// C2F-13: ordem fundido em n (len)
+proc linha_de_testes(q: ^Consulta, ordem: []u8) {
+    var b: [dynamic]u8 = make([dynamic]u8, alloc = heap)
+    for i in (0 as i32)..<(len(ordem) as i32) {
+        var total: u32 = 0
+        var d: ?^frontend.Decl = ((q.c as ^Compilacao).sem.programa as ^frontend.Programa).primeira
+        while d != none {
+            total += common.c2f_b2u32((((d as ^frontend.Decl).modulo as i32) == (ordem[i] as i32)) and (common.c2f_b2i32(consulta_eh_teste_do_projeto(q, d)) != 0))
+            d = (d as ^frontend.Decl).prox
+        }
+        if total == 0 {
+            continue
+        }
+        var tern_1: str = " "
+        if (len(b) as u64) > 0 {
+            tern_1 = ", "
+        }
+        append(&b, item = tern_1)
+        anexar_caminho(q, &b, ordem[i])
+        format(f" {total}", into = &b)
+    }
+    anexar_lista(q, "testes:", &b)
+}
+
+// C: driver/mapa_resumo.c:205
+// Cada biblioteca de 'link' uma vez: so o primeiro link com aquele nome entra.
+proc linha_de_links(q: ^Consulta) {
+    var b: [dynamic]u8 = make([dynamic]u8, alloc = heap)
+    var d: ?^frontend.Decl = ((q.c as ^Compilacao).sem.programa as ^frontend.Programa).primeira
+    while d != none {
+        if (d as ^frontend.Decl).tipo_no == (frontend.D_LINK as u8) {
+            var repetido: bool = false
+            var a: ?^frontend.Decl = ((q.c as ^Compilacao).sem.programa as ^frontend.Programa).primeira
+            while (a != d) and (not repetido) {
+                repetido = ((a as ^frontend.Decl).tipo_no == (frontend.D_LINK as u8)) and ((a as ^frontend.Decl).nome == (d as ^frontend.Decl).nome)
+                a = (a as ^frontend.Decl).prox
+            }
+            if not repetido {
+                append(&b, item = " ")
+                anexar_nome(q, &b, (d as ^frontend.Decl).nome)
+            }
+        }
+        d = (d as ^frontend.Decl).prox
+    }
+    anexar_lista(q, "links:", &b)
+}
+
+// C: driver/mapa_resumo.c:220
+// Visao geral do projeto: cabecalho, entrada, modulos, std, testes e links, nesta ordem.
+proc resumo_geral(q: ^Consulta, p: ^PedidoConsulta) -> i32 {
+    var ordem: [255]u8 = {} // 255 = frontend.MODULOS_MAX
+    let n: i32 = consulta_ordem_dos_modulos(q, ordem[..])
+    let limite: u32 = limite_de(p, LIMITE_GERAL as u32)
+    cabecalho(q)
+    linha_de_entrada(q, limite)
+    append(&q.saida, item = "modulos:")
+    var i: i32 = 0
+    while i < n {
+        if mapa_no_escopo(q, ordem[i] as i32, -1) {
+            bloco_do_modulo(q, ordem[i], limite)
+        }
+        i += 1
+    }
+    linha_do_std(q)
+    linha_de_testes(q, ordem[0..<(n as int)])
+    linha_de_links(q)
+    return CONSULTAR_OK
+}
+
+// C: driver/mapa_resumo.c:246
+proc imports_do_modulo(q: ^Consulta, lado: LadoDoImport, limite: u32, b: ^[dynamic]u8) {
+    var corte: Corte = Corte{restante = limite, omitidos = 0}
+    var d: ?^frontend.Decl = ((q.c as ^Compilacao).sem.programa as ^frontend.Programa).primeira
+    while d != none {
+        var tern_1: i32 = (d as ^frontend.Decl).modulo as i32
+        if common.c2f_b2i32(lado.importadores) != 0 {
+            tern_1 = ((d as ^frontend.Decl).indice as u8) as i32
+        }
+        let dono: u8 = tern_1 as u8
+        if (((d as ^frontend.Decl).tipo_no != (frontend.D_IMPORT as u8)) or ((dono as i32) != (lado.modulo as i32))) or (not cabe(&corte)) {
+            d = (d as ^frontend.Decl).prox
+            continue
+        }
+        append(b, item = " ")
+        var tern_2: i32 = 0
+        if common.c2f_b2i32(lado.importadores) != 0 {
+            tern_2 = (d as ^frontend.Decl).modulo as i32
+        } else {
+            tern_2 = common.c2f_trunc_u8(common.c2f_s2u_64((d as ^frontend.Decl).indice as i64)) as i32
+        }
+        anexar_caminho(q, b, tern_2 as u8)
+        d = (d as ^frontend.Decl).prox
+    }
+    anexar_omitidos(b, &corte)
+}
+
+// C: driver/mapa_resumo.c:260
+// "  struct Corpo* {massa: f32, cor: Cor}" / "  enum Cor* {vermelho, azul}" / "  union Forma* {Corpo, i32}".
+proc detalhe_do_tipo(q: ^Consulta, d: ?^frontend.Decl, limite: u32, b: ^[dynamic]u8) {
+    var corte: Corte = Corte{restante = limite, omitidos = 0}
+    let membros: bool = (d as ^frontend.Decl).tipo_no == (frontend.D_ENUM as u8)
+    var n: u32 = (d as ^frontend.Decl).ncampos
+    if membros {
+        n = (d as ^frontend.Decl).nmembros
+    }
+    format(f"  {rotulo_do_tipo(d)} ", into = b)
+    anexar_nome(q, b, (d as ^frontend.Decl).nome)
+    if (d as ^frontend.Decl).publico {
+        append(b, item = "* {")
+    } else {
+        append(b, item = " {")
+    }
+    var i: u32 = 0
+    while i < n {
+        if cabe(&corte) {
+            if i > 0 {
+                append(b, item = ", ")
+            }
+            if membros {
+                anexar_nome(q, b, ((d as ^frontend.Decl).membros or_else {})[i].nome)
+            } else if (d as ^frontend.Decl).tipo_no == (frontend.D_STRUCT as u8) {
+                anexar_nome(q, b, ((d as ^frontend.Decl).campos or_else {})[i].nome)
+                append(b, item = ": ")
+            }
+            if not membros {
+                semantic.tipo_anexar_texto(&(q.c as ^Compilacao).sem.tipos, ((d as ^frontend.Decl).campos or_else {})[i].tipo.tipo, b)
+            }
+        }
+        i += 1
+    }
+    anexar_omitidos(b, &corte)
+    append(b, item = "}\n")
+}
+
+// C: driver/mapa_resumo.c:280
+// Os tipos do modulo com o detalhe de cada um (cortado em TIPO_DETALHE_MAX bytes); os que nao cabem viram "+K tipos".
+proc tipos_detalhados(q: ^Consulta, modulo: u8, limite: u32) {
+    var b: [dynamic]u8 = make([dynamic]u8, alloc = heap)
+    var corte: Corte = Corte{restante = limite, omitidos = 0}
+    var d: ?^frontend.Decl = ((q.c as ^Compilacao).sem.programa as ^frontend.Programa).primeira
+    while d != none {
+        if ((d as ^frontend.Decl).modulo != modulo) or (not mapa_eh_tipo(d)) or (not cabe(&corte)) {
+            d = (d as ^frontend.Decl).prox
+            continue
+        }
+        var um: [dynamic]u8 = make([dynamic]u8, alloc = heap)
+        detalhe_do_tipo(q, d, limite, &um)
+        let texto: str = from_bytes(um[..], alloc = heap)
+        anexar_truncado(&b, texto, (len(um) - 1) as u64, TIPO_DETALHE_MAX as u64)
+        delete(texto)
+        append(&b, item = "\n")
+        delete(um)
+        d = (d as ^frontend.Decl).prox
+    }
+    if corte.omitidos > 0 {
+        format(f"  +{corte.omitidos} tipos\n", into = &b)
+    }
+    anexar_lista(q, "tipos:\n", &b)
+}
+
+// C: driver/mapa_resumo.c:298
+// "  proc f(a: i32) -> i32  // 1a linha do comentario"
+proc linha_de_api(q: ^Consulta, d: ?^frontend.Decl, b: ^[dynamic]u8) {
+    var assinatura: [dynamic]u8 = make([dynamic]u8, alloc = heap)
+    var comentario: [dynamic]u8 = make([dynamic]u8, alloc = heap)
+    consulta_assinatura_da_api(q, d, &assinatura)
+    consulta_comentario_acima(q, d, &comentario)
+    append(b, item = "  ")
+    let texto_assinatura: str = from_bytes(assinatura[..], alloc = heap)
+    anexar_truncado(b, texto_assinatura, len(assinatura) as u64, ASSINATURA_MAX as u64)
+    delete(texto_assinatura)
+    var fim: u64 = 0
+    while (fim < (len(comentario) as u64)) and (comentario[fim] != 10) {
+        fim += 1
+    }
+    if fim > 0 {
+        let texto_comentario: str = from_bytes(comentario[..], alloc = heap)
+        append(b, item = "  // ")
+        anexar_truncado(b, texto_comentario, fim, COMENTARIO_MAX as u64)
+        delete(texto_comentario)
+    }
+    append(b, item = "\n")
+    delete(assinatura)
+    delete(comentario)
+}
+
+// C: driver/mapa_resumo.c:317
+proc api_detalhada(q: ^Consulta, modulo: u8, limite: u32) {
+    var b: [dynamic]u8 = make([dynamic]u8, alloc = heap)
+    var corte: Corte = Corte{restante = limite, omitidos = 0}
+    var d: ?^frontend.Decl = ((q.c as ^Compilacao).sem.programa as ^frontend.Programa).primeira
+    while d != none {
+        if (((((d as ^frontend.Decl).modulo as i32) != (modulo as i32)) or (not consulta_eh_api(d))) or (common.c2f_b2i32(mapa_eh_tipo(d)) != 0)) or (not cabe(&corte)) {
+            d = (d as ^frontend.Decl).prox
+            continue
+        }
+        linha_de_api(q, d, &b)
+        d = (d as ^frontend.Decl).prox
+    }
+    if corte.omitidos > 0 {
+        format(f"  +{corte.omitidos} nomes\n", into = &b)
+    }
+    anexar_lista(q, "api:\n", &b)
+}
+
+// C: driver/mapa_resumo.c:331
+// O nome do arquivo (sem a pasta) onde 'd' esta, com ':' no fim; nada num modulo de um arquivo so.
+proc anexar_arquivo_do_pacote(q: ^Consulta, b: ^[dynamic]u8, d: ?^frontend.Decl) {
+    if consulta_qtd_arquivos(q, (d as ^frontend.Decl).modulo) < 2 {
+        return
+    }
+    let posicao: common.FontePosicao = common.fonte_localizar_no_arquivo(&(q.c as ^Compilacao).fonte, (d as ^frontend.Decl).pos)
+    let caminho: str = posicao.caminho or_else ""
+    var inicio_nome: u64 = 0
+    var k: u64 = 0
+    while k < (len(caminho) as u64) {
+        if (caminho[k] == 47) or (caminho[k] == 92) {
+            inicio_nome = k + 1
+        }
+        k += 1
+    }
+    let nome: str = caminho[inicio_nome..<(len(caminho) as u64)]
+    format(f"{nome}:", into = b)
+}
+
+// C: driver/mapa_resumo.c:342
+proc testes_detalhados(q: ^Consulta, modulo: u8, limite: u32) {
+    var b: [dynamic]u8 = make([dynamic]u8, alloc = heap)
+    var corte: Corte = Corte{restante = limite, omitidos = 0}
+    var d: ?^frontend.Decl = ((q.c as ^Compilacao).sem.programa as ^frontend.Programa).primeira
+    while d != none {
+        if ((((d as ^frontend.Decl).modulo as i32) != (modulo as i32)) or (not consulta_eh_teste_do_projeto(q, d))) or (not cabe(&corte)) {
+            d = (d as ^frontend.Decl).prox
+            continue
+        }
+        append(&b, item = "  ")
+        anexar_arquivo_do_pacote(q, &b, d)
+        format(f"L{common.fonte_localizar_no_arquivo(&(q.c as ^Compilacao).fonte, (d as ^frontend.Decl).pos).linha} ", into = &b)
+        let arg_1: u64 = common.interner_tam(&(q.c as ^Compilacao).nomes, (d as ^frontend.Decl).nome) as u64
+        let arg_2: str = common.interner_texto(&(q.c as ^Compilacao).nomes, (d as ^frontend.Decl).nome)
+        let arg_3: ^[dynamic]u8 = &b
+        anexar_truncado(arg_3, arg_2, arg_1, TITULO_MAX_2 as u64)
+        append(&b, item = "\n")
+        d = (d as ^frontend.Decl).prox
+    }
+    if corte.omitidos > 0 {
+        format(f"  +{corte.omitidos} testes\n", into = &b)
+    }
+    anexar_lista(q, "testes:\n", &b)
+}
+
+// C: driver/mapa_resumo.c:359
+proc resumo_do_modulo(q: ^Consulta, p: ^PedidoConsulta, modulo: u8) -> i32 {
+    let limite: u32 = limite_de(p, LIMITE_MODULO as u32)
+    var importa: [dynamic]u8 = make([dynamic]u8, alloc = heap)
+    var importado: [dynamic]u8 = make([dynamic]u8, alloc = heap)
+    append(&q.saida, item = "modulo ")
+    anexar_caminho(q, &q.saida, modulo)
+    format(f" ({consulta_origem_do_modulo(q, modulo)}, {consulta_linhas_do_modulo(q, modulo)}l)\n", into = &q.saida)
+    imports_do_modulo(q, LadoDoImport{modulo = modulo, importadores = false}, limite, &importa)
+    imports_do_modulo(q, LadoDoImport{modulo = modulo, importadores = true}, limite, &importado)
+    anexar_lista(q, "importa:", &importa)
+    anexar_lista(q, "importado por:", &importado)
+    tipos_detalhados(q, modulo, limite)
+    api_detalhada(q, modulo, limite)
+    testes_detalhados(q, modulo, limite)
+    return CONSULTAR_OK
+}
+
+// C: driver/mapa_resumo.c:377
+proc mapa_resumo(q: ^Consulta, p: ^PedidoConsulta, so: i32) -> i32 {
+    var tern_1: i32 = 0
+    if so >= 0 {
+        tern_1 = resumo_do_modulo(q, p, so as u8)
+    } else {
+        tern_1 = resumo_geral(q, p)
+    }
+    return tern_1
+}
+
+test "cabe e anexar_omitidos: o corte conta o que nao coube" {
+    var c: Corte = Corte{restante = 1, omitidos = 0}
+    expect(cabe(&c) == true)
+    expect(cabe(&c) == false)
+    expect((c.restante == 0) and (c.omitidos == 1))
+    var b = make([dynamic]u8, alloc = heap)
+    anexar_omitidos(&b, &c)
+    let t = to_str(&b)
+    expect(t == " +1")
+    delete(t)
+}
+
+test "anexar_truncado: corta com '...' sem partir caractere UTF-8" {
+    var b = make([dynamic]u8, alloc = heap)
+    anexar_truncado(&b, "abcdef", 6, 10)
+    let t1 = to_str(&b)
+    expect(t1 == "abcdef")
+    delete(t1)
+    var c = make([dynamic]u8, alloc = heap)
+    anexar_truncado(&c, "abcdefgh", 8, 5)
+    let t2 = to_str(&c)
+    expect(t2 == "ab...")
+    delete(t2)
+    var d = make([dynamic]u8, alloc = heap)
+    anexar_truncado(&d, "aéxyz", 6, 5)
+    let t3 = to_str(&d)
+    expect(t3 == "a...")
+    delete(t3)
+}
+
+test "anexar_lista: titulo, '\\n' no fim se faltar, nada quando vazia" {
+    var q: Consulta = Consulta{}
+    q.saida = make([dynamic]u8, alloc = heap)
+    var l = make([dynamic]u8, alloc = heap)
+    append(&l, items = as_bytes("ab"))
+    anexar_lista(&q, "T:", &l)
+    var vazia = make([dynamic]u8, alloc = heap)
+    anexar_lista(&q, "X:", &vazia)
+    let t = to_str(&q.saida)
+    expect(t == "T:ab\n")
+    delete(t)
+}
+
+test "rotulo_do_tipo e limite_de do mapa" {
+    var d: frontend.Decl = frontend.Decl{}
+    d.tipo_no = frontend.D_ENUM as u8
+    expect(rotulo_do_tipo(&d) == "enum")
+    d.tipo_no = frontend.D_STRUCT as u8
+    expect(rotulo_do_tipo(&d) == "struct")
+    d.tipo_no = frontend.D_UNIAO as u8
+    expect(rotulo_do_tipo(&d) == "union")
+    var p: PedidoConsulta = PedidoConsulta{}
+    expect(limite_de(&p, 6) == 6)
+    p.limite = 3
+    expect(limite_de(&p, 6) == 3)
+}

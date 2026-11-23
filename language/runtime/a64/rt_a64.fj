@@ -1,0 +1,712 @@
+// runtime/a64/rt_a64.fj - runtime do alvo aarch64-linux em Forja (A2.2(b), decisao D2'): modulo std:a64_rt
+// Versao: 0.14.1
+// Changelog: 0.14.1 - I4f: slot 1192 RASTRO_ALTO (rt_a64_mem.fj). 0.14.0 - I3: entrada_main (iOS) no FIM do arquivo, sem deslocar linhas (as falhas de runtime embutem a linha). 0.13.1 - K1: mapa unico dos slots do estado (comentario acima de A64_EST_JANELA_BASE); STDIN_PEND passou de 1088 para 1152 (rt_a64_proc.fj).
+//                    0.13.0 - J1d: rt_os_erro_gravar (errno da falha de std:file em A64_EST_ULTIMO_ERRO, lido por std:os.last_error).
+//                    0.12.0 - J1c: fim chama forja_handles_relatar_vivos (R0009 de handle aberto, dev) e sai 101 se houver handle vivo.
+//                    0.11.0 - J1a: conversao real -> inteiro, relogio/dormir, faixa/faixa_u64, str_de_cstr, proc_ambiente, stdin, os_pid, proc_escrever_erro, proc_pico_memoria e main_erro foram para std:a64_proc (rt_a64_proc.fj), teto de 800 linhas; mesmos procs e semantica.
+//                    0.10.0 - A3.3g: faixa/faixa_u64 (R0001), str_de_cstr (str pela memoria de estado), proc_ambiente (envp do sp), stdin_ler/stdin_ler_linha (read(0)), main_erro (R0004, sai 1), proc_escrever_erro, os_pid, proc_pico_memoria (getrusage).
+//                    0.9.0 - A-E2: falha_r0007_texto e falha_r0008_texto (causa de texto + valor) para o std:a64_mem; sem outra mudanca.
+//                    0.8.0 - A3.3b: fim sai com o codigo de forja_fim_programa (R0009 em dev sai 101); memcpy/memset por u64 com o endereco traduzido 1x (memmove: copia para tras
+//                    quando o destino esta acima da origem); as_*_de_f64 locais: R0002 com o f64 original (como o x64); i64 minimo sem estouro.
+//                    0.7.0 - A3.3a: rt_conta_bits (popcount), proc_tempo_ns/proc_hora_ns (clock_gettime 113, MONOTONIC e REALTIME) e proc_dormir_ms (nanosleep 101): nome = simbolo sem o `forja_`.
+//                    0.6.0 - A4.4(a..c): auto-init preguicosa no .so (sem entrada: args vazios, guarda de pilha off, heap sob demanda); fallback alto da janela
+//                    (mmap sem dica); FORJA_A64_JANELA_ALTA=1 no envp forca o fallback (exe); fmt_imprimir_erro (era err_escrever u32) e proc_argumentos com ponteiro de 64 bits
+//                    (args = ponteiros para o argv da pilha, bloco em mmap proprio; sem o heap do rt_wasm, que estreita para u32).
+//                    0.5.0 - A2.2(e): R0016 em dev (guarda no prologo, contrato §3.7): entrada grava o limite da pilha no slot 1048 (sp0 - 8 MiB + 64 KiB);
+//                    falha_pilha imprime o JSON do wasm/x64 e sai 101. Release sem guarda. falha_alocacao (R0007, forja_falha_alocacao da BIR).
+//                    0.4.1 - A2.2(d): fim chama o fim_programa do rt_wasm (R0009 de vazamento em dev, no stderr; o codigo dele nao vale).
+//                    0.4.0 - A2.2(d): heap sobre a janela mmap de 1 GiB (dicas 0x8000_0000, 0x4000_0000, 0x2000_0000; MAP_FIXED_NOREPLACE; fim <= 0xFFFF_FFFF).
+//                    O emulador Android ocupa 0x4000_0000 e ignora dicas abaixo de 0x8000_0000 (sondagem de 22/11/2026). Ponteiro de 1..4095 = estado do runtime
+//                    (forja_rt_estado_base); args por sp salvo em entrada; host do rt_wasm (heap_base, memoria_*, args_*, err_escrever, os_write_stdout, falha_fatia).
+//                    0.3.0 - A2.2(c): falhas de runtime (falha_estouro/_u, falha_conversao_i/_u, falha_nulo, falha_indice) no JSON do x64 em stderr e exit 101.
+//                    0.2.0 - A2.2(b): entrada/fim (_start), rt_sair (exit_group) e print_texto/i32/i64/u64/bool sobre o write do kernel.
+//                    0.1.0 - A2.2(a): so o encanamento (modulo vazio).
+// Contrato: cada proc pub X atende o simbolo de runtime forja_X (ponte em nativo/a64/a64_alcance.fj); o syscall vem do intrinseco forja_rt_syscall
+// (nativo/a64/a64_intr.fj). Intrinsecos: forja_rt_estado_base (adrp no .bss forja_rt_estado), forja_rt_modo_dev, forja_rt_trunc_i32/i64 (a fazer no a64_intr).
+
+foreign {
+    proc forja_rt_syscall(num: int, a0: int, a1: int, a2: int, a3: int, a4: int, a5: int) -> int
+    proc forja_rt_estado_base() -> uint
+    proc forja_fim_programa(codigo: i32) -> i32
+    proc forja_handles_relatar_vivos() -> i32
+}
+
+const A64_SYS_WRITE: int = 64
+const A64_SYS_EXIT_GROUP: int = 94
+const A64_FD_STDOUT: int = 1
+const A64_FD_STDERR: int = 2
+const A64_SAIDA_FALHA: int = 101
+
+// Chamado pelo _start antes de forja_programa: guarda o sp (argc em [sp], argv[i] em [sp+8+8i]) para os.args (rt_args_*)
+pub proc entrada(sp: uint) {
+    rt_escrever_u64(A64_EST_ARGS_SP, sp)
+    rt_escrever_u64(A64_EST_LIMITE_PILHA, sp - (A64_PILHA_BYTES - A64_FOLGA_PILHA))
+    if rt_env_pede_janela_alta(sp) {
+        rt_escrever_u64(A64_EST_JANELA_ALTA, 1)
+    }
+}
+
+// No .so nao ha entrada: o estado nasce zerado (args vazios, LIMITE_PILHA 0 = guarda desligada, heap e janela sob demanda)
+// FORJA_A64_JANELA_ALTA=1 no envp (so o exe tem envp): forca o fallback alto da janela, para testar. envp = sp + 16 + 8*argc, lista terminada em NULL
+proc rt_env_pede_janela_alta(sp: uint) -> bool {
+    let argc: uint = rt_ler_u64(sp)
+    var k: uint = sp + 16 + argc * 8
+    var p: uint = rt_ler_u64(k)
+    while p != 0 {
+        if rt_texto_igual(p, "FORJA_A64_JANELA_ALTA=1") {
+            return true
+        }
+        k += 8
+        p = rt_ler_u64(k)
+    }
+    return false
+}
+
+// R0007 (A2.2(e)): a BIR chama forja_falha_alocacao quando o heap nao atende (exaustao da janela, append sem alocador, cap estourado); causa "<oque> (<valor>)" como o wasm
+pub proc falha_alocacao(oque: int, valor: int, arquivo: int, linha: i32) {
+    rt_falha_cabeca("R0007", arquivo, linha)
+    rt_erro_json(oque)
+    rt_erro_str(" (")
+    rt_erro_int(valor)
+    rt_erro_str(")")
+    rt_falha_fim()
+}
+
+// R0007 e R0008 com causa de texto (A-E2, para o std:a64_mem): saida "causa (valor)"; `arquivo` e o nome NUL-terminado do fonte
+pub proc falha_r0007_texto(causa: str, valor: int, arquivo: int, linha: i32) {
+    rt_falha_cabeca("R0007", arquivo, linha)
+    rt_erro_str(causa)
+    rt_erro_str(" (")
+    rt_erro_int(valor)
+    rt_erro_str(")")
+    rt_falha_fim()
+}
+
+// R0008 com a causa inteira (sem "(valor)"), como o forja_falha do x64
+pub proc falha_r0008_texto(causa: str, arquivo: int, linha: i32) {
+    rt_falha_cabeca("R0008", arquivo, linha)
+    rt_erro_str(causa)
+    rt_falha_fim()
+}
+
+// R0016 (A2.2(e)): a guarda do prologo (dev) compara sp com o limite do slot 1048; abaixo dele zera o slot e chama aqui (sai 101, como o wasm)
+pub proc falha_pilha() {
+    rt_erro_str("{\"codigo\": \"R0016\", \"tipo\": \"runtime\", \"causa\": \"estouro de pilha: recursao funda demais\"}\n")
+    rt_sair(A64_SAIDA_FALHA)
+}
+
+// Chamado pelo _start com o codigo de saida de forja_programa; nao volta. O fim_programa do rt_wasm relata o vazamento (R0009) no stderr em dev
+// e devolve 101; esse codigo e a saida (como no wasm e no x64)
+pub proc fim(codigo: i32) {
+    var saida: i32 = forja_fim_programa(codigo)
+    if forja_handles_relatar_vivos() > 0 {
+        saida = A64_SAIDA_FALHA as i32
+    }
+    rt_sair(saida as int)
+}
+
+// J1d: grava o errno positivo da falha (o x64 grava rt_os_ultimo_erro em cada falha de std:file); so falha grava, sucesso nao zera
+pub proc rt_os_erro_gravar(erro: int) {
+    rt_escrever_u64(A64_EST_ULTIMO_ERRO, erro as uint)
+}
+
+pub proc rt_sair(codigo: int) {
+    _ = forja_rt_syscall(A64_SYS_EXIT_GROUP, codigo, 0, 0, 0, 0, 0)
+}
+
+// write(fd, buf + inicio, n) pelo kernel; o endereco do buffer sai por transmute (nao por foreign: forja_rt_endereco_de ja e do rt_wasm)
+proc rt_escrever_fd(fd: int, buf: ^[24]u8, inicio: int, n: int) {
+    let base: int = transmute(buf as rawptr, to = int)
+    _ = forja_rt_syscall(A64_SYS_WRITE, fd, base + inicio, n, 0, 0, 0)
+}
+
+proc rt_escrever_buf(buf: ^[24]u8, inicio: int, n: int) {
+    rt_escrever_fd(A64_FD_STDOUT, buf, inicio, n)
+}
+
+proc rt_escrever_lf() {
+    var buf: [24]u8 = {}
+    buf[0] = 10
+    rt_escrever_buf(&buf, 0, 1)
+}
+
+// byte de p (o endereco de um texto NUL-terminado da BIR)
+proc rt_byte_em(p: int) -> u8 {
+    let q = transmute(p, to = rawptr) as ^u8
+    return q^
+}
+
+// print_texto(p): o texto NUL-terminado em p e um LF, como no wasm
+pub proc print_texto(p: int) {
+    var n: int = 0
+    while rt_byte_em(p + n) != 0 {
+        n += 1
+    }
+    _ = forja_rt_syscall(A64_SYS_WRITE, A64_FD_STDOUT, p, n, 0, 0, 0)
+    rt_escrever_lf()
+}
+
+// decimal de v (sem sinal), com '-' opcional, e LF num unico write; buf de 24 B basta para u64 com sinal
+proc rt_imprimir_magnitude(v: u64, menos: bool) {
+    var buf: [24]u8 = {}
+    buf[23] = 10
+    var pos: int = 22
+    var resto: u64 = v
+    if resto == 0 {
+        buf[pos] = 48
+        pos -= 1
+    }
+    while resto > 0 {
+        buf[pos] = (48 + (resto % 10)) as u8
+        resto = resto / 10
+        pos -= 1
+    }
+    if menos {
+        buf[pos] = 45
+        pos -= 1
+    }
+    rt_escrever_buf(&buf, pos + 1, 23 - pos)
+}
+
+pub proc print_i64(v: int) {
+    if v < 0 {
+        rt_imprimir_magnitude(((-(v + 1)) as u64) + 1, true)
+        return
+    }
+    rt_imprimir_magnitude(v as u64, false)
+}
+
+pub proc print_i32(v: i32) {
+    print_i64(v as int)
+}
+
+pub proc print_u64(v: u64) {
+    rt_imprimir_magnitude(v, false)
+}
+
+// bool chega como i32: so o byte baixo vale (como print_bool do wasm)
+pub proc print_bool(v: i32) {
+    let b: u32 = v as u32
+    if (b & 255) != 0 {
+        print("true")
+    } else {
+        print("false")
+    }
+}
+
+// ---- falhas (A2.2(c)): mesmo JSON do forja_falha do x64 (sem pilha, que o harness tira), em stderr, e exit 101 ----
+
+// um byte para stderr; a falha e o ultimo que sai, entao um write por byte basta
+proc rt_erro_byte(b: u8) {
+    var buf: [24]u8 = {}
+    buf[0] = b
+    rt_escrever_fd(A64_FD_STDERR, &buf, 0, 1)
+}
+
+pub proc rt_erro_str(s: str) {
+    let bytes: []u8 = as_bytes(s)
+    for k in 0..<len(bytes) {
+        rt_erro_byte(bytes[k])
+    }
+}
+
+// texto NUL-terminado em p, com '"' e '\' escapados
+pub proc rt_erro_json(p: int) {
+    var k: int = 0
+    while rt_byte_em(p + k) != 0 {
+        let b: u8 = rt_byte_em(p + k)
+        if (b == 34) or (b == 92) {
+            rt_erro_byte(92)
+        }
+        rt_erro_byte(b)
+        k += 1
+    }
+}
+
+pub proc rt_erro_uint(v: u64) {
+    var buf: [24]u8 = {}
+    var pos: int = 24
+    var resto: u64 = v
+    pos -= 1
+    buf[pos] = (48 + (resto % 10)) as u8
+    resto = resto / 10
+    while resto > 0 {
+        pos -= 1
+        buf[pos] = (48 + (resto % 10)) as u8
+        resto = resto / 10
+    }
+    rt_escrever_fd(A64_FD_STDERR, &buf, pos, 24 - pos)
+}
+
+pub proc rt_erro_int(v: int) {
+    if v < 0 {
+        rt_erro_byte(45)
+        rt_erro_uint(((-(v + 1)) as u64) + 1)
+        return
+    }
+    rt_erro_uint(v as u64)
+}
+
+// {"codigo": "Rxxxx", "tipo": "runtime", "arquivo": "...", "linha": N, "causa": "
+pub proc rt_falha_cabeca(codigo: str, arquivo: int, linha: i32) {
+    rt_erro_str("{\"codigo\": \"")
+    rt_erro_str(codigo)
+    rt_erro_str("\", \"tipo\": \"runtime\", \"arquivo\": \"")
+    rt_erro_json(arquivo)
+    rt_erro_str("\", \"linha\": ")
+    rt_erro_int(linha as int)
+    rt_erro_str(", \"causa\": \"")
+}
+
+// fecha o JSON com LF e sai com 101 (o exit das falhas do x64)
+pub proc rt_falha_fim() {
+    rt_erro_str("\"}\n")
+    rt_sair(A64_SAIDA_FALHA)
+}
+
+pub proc falha_estouro(operacao: int, a: int, b: int, arquivo: int, linha: i32) {
+    rt_falha_cabeca("R0002", arquivo, linha)
+    rt_erro_str("estouro de inteiro em ")
+    rt_erro_json(operacao)
+    rt_erro_str(": ")
+    rt_erro_int(a)
+    rt_erro_str(" e ")
+    rt_erro_int(b)
+    rt_falha_fim()
+}
+
+pub proc falha_estouro_u(operacao: int, a: uint, b: uint, arquivo: int, linha: i32) {
+    rt_falha_cabeca("R0002", arquivo, linha)
+    rt_erro_str("estouro de inteiro em ")
+    rt_erro_json(operacao)
+    rt_erro_str(": ")
+    rt_erro_uint(a as u64)
+    rt_erro_str(" e ")
+    rt_erro_uint(b as u64)
+    rt_falha_fim()
+}
+
+pub proc falha_conversao_i(valor: int, alvo: int, arquivo: int, linha: i32) {
+    rt_falha_cabeca("R0002", arquivo, linha)
+    rt_erro_str("conversao 'as' de ")
+    rt_erro_int(valor)
+    rt_erro_str(" para ")
+    rt_erro_json(alvo)
+    rt_erro_str(" fora da faixa")
+    rt_falha_fim()
+}
+
+pub proc falha_conversao_u(valor: uint, alvo: int, arquivo: int, linha: i32) {
+    rt_falha_cabeca("R0002", arquivo, linha)
+    rt_erro_str("conversao 'as' de ")
+    rt_erro_uint(valor as u64)
+    rt_erro_str(" para ")
+    rt_erro_json(alvo)
+    rt_erro_str(" fora da faixa")
+    rt_falha_fim()
+}
+
+pub proc falha_nulo(oque: int, arquivo: int, linha: i32) {
+    rt_falha_cabeca("R0005", arquivo, linha)
+    rt_erro_json(oque)
+    rt_erro_str(": ponteiro nulo")
+    rt_falha_fim()
+}
+
+pub proc falha_indice(i: int, n: int, arquivo: int, linha: i32) {
+    rt_falha_cabeca("R0006", arquivo, linha)
+    rt_erro_str("indice ")
+    rt_erro_int(i)
+    rt_erro_str(" fora de 0..<")
+    rt_erro_int(n)
+    rt_falha_fim()
+}
+
+pub proc falha_fatia(lo: int, hi: int, excl: int, n: int, arquivo: int, linha: i32) {
+    rt_falha_cabeca("R0006", arquivo, linha)
+    rt_erro_str("fatia ")
+    rt_erro_int(lo)
+    if excl != 0 {
+        rt_erro_str("..<")
+    } else {
+        rt_erro_str("..=")
+    }
+    rt_erro_int(hi)
+    rt_erro_str(" fora de 0..=")
+    rt_erro_int(n)
+    rt_falha_fim()
+}
+
+// ---- A2.2(d): estado do runtime, janela do heap, args e os hosts do rt_wasm (a ponte liga forja_X ao proc X) ----
+
+// Slots do estado (.bss forja_rt_estado, 4 KiB): o rt_wasm usa ate 1024; a partir daqui o a64 guarda base e limite da janela e o sp do _start.
+// MAPA UNICO DOS SLOTS (cada um de 8 B; nenhum endereco pode repetir; K1 achou 1088 em dois donos). Os nomes vivem nos arquivos indicados:
+//   496 ARGS_BLOCO | 800/808 FMT_PTR/FMT_LEN (rt_wasm usa 784..816) | 832..1023 filtro de teste do rt_wasm
+//   1024 JANELA_BASE | 1032 JANELA_LIM | 1040 ARGS_SP | 1048 LIMITE_PILHA (lido pelo isel: a64_quadro.fj) | 1056 JANELA_ALTA
+//   1064 livre | 1072 STR_PTR | 1080 STR_LEN (rt_a64_proc.fj) | 1088 ALOC_SLOT_TABELA | 1096 FRAME_SLOT_BASE | 1104 FRAME_SLOT_TOPO
+//   1112 FRAME_SLOT_GERACAO | 1120 ALOC_SLOT_QTD (os 5 em rt_a64_mem.fj) | 1128 FS_SLOT_TABELA | 1144 FS_SLOT_COPIA (rt_a64_es_fs.fj)
+//   1136 ES_SLOT_SCRATCH (rt_a64_es.fj) | 1152 STDIN_PEND | 1160 AMB_PTR | 1168 AMB_QTD | 1176 AMB_CAP (rt_a64_proc.fj) | 1184 ULTIMO_ERRO
+//   1192 RASTRO_ALTO (rt_a64_mem.fj) | 1200..4095 livres. Slot novo: some aqui primeiro. A janela alta e o limite de pilha (1048, 1056) nao mudam: o isel os referencia.
+const A64_EST_JANELA_BASE: uint = 1024
+const A64_EST_JANELA_LIM: uint = 1032
+const A64_EST_ARGS_SP: uint = 1040
+// limite da pilha para a guarda de R0016 (dev): sp0 - 8 MiB + 64 KiB de folga para falha_pilha e o fmt; zero = sem guarda
+const A64_EST_LIMITE_PILHA: uint = 1048
+// 1 = janela alta forcada pelo envp (FORJA_A64_JANELA_ALTA=1); 0 = dicas baixas primeiro
+const A64_EST_JANELA_ALTA: uint = 1056
+// J1d: errno positivo da ultima falha de std:file (std:os.last_error); 0 = nenhuma ainda
+const A64_EST_ULTIMO_ERRO: uint = 1184
+// bloco de os.args (ponteiro, como o ARGS_BLOCO do rt_wasm) e o buffer de formatacao do fmt (FMT_PTR/FMT_LEN do rt_wasm)
+const A64_EST_ARGS_BLOCO: uint = 496
+const A64_EST_FMT_PTR: uint = 800
+const A64_EST_FMT_LEN: uint = 808
+// A3.3g: ponteiro e tamanho do str de cstr (16 B, lidos de volta como ^str) e 1 byte devolvido do stdin (byte + 1; 0 = nada)
+const A64_ARGS_CABECALHO: uint = 16
+const A64_ARGS_STR_BYTES: uint = 16
+const A64_PILHA_BYTES: uint = 8388608
+const A64_FOLGA_PILHA: uint = 65536
+const A64_ESTADO_TAMANHO: uint = 4096
+const A64_JANELA_BYTES: uint = 1073741824
+const A64_PAGINA_BYTES: uint = 65536
+const A64_SYS_MMAP: int = 222
+const A64_PROT_RW: int = 3
+// MAP_FIXED_NOREPLACE (0x100000) | MAP_PRIVATE (0x02) | MAP_ANONYMOUS (0x20) | MAP_NORESERVE (0x4000)
+const A64_MMAP_FLAGS: int = 1064994
+// mmap sem dica (fallback alto e blocos de args): MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE; o kernel escolhe o endereco
+const A64_MMAP_SEM_DICA: int = 16418
+// Dicas baixas em ordem; so vale a que o kernel devolver intacta. Sem nenhuma (ex.: a ART ocupa os 4 GiB baixos), rt_janela_alta.
+const A64_DICA_1: uint = 2147483648
+const A64_DICA_2: uint = 1073741824
+const A64_DICA_3: uint = 536870912
+
+// Enderecos de 1 a 4095 sao o estado do runtime (o rt_wasm mapeia a memoria baixa assim); o resto e endereco real
+pub proc rt_ponteiro_de(a: uint) -> rawptr {
+    if (a >= 1) and (a < A64_ESTADO_TAMANHO) {
+        return transmute(forja_rt_estado_base() + a, to = rawptr)
+    }
+    return transmute(a, to = rawptr)
+}
+
+pub proc rt_endereco_de(p: rawptr) -> uint {
+    return transmute(p, to = uint)
+}
+
+pub proc rt_ler_u64(endereco: uint) -> uint {
+    let p = rt_ponteiro_de(endereco) as ^u64
+    let valor: u64 = p^
+    return valor as uint
+}
+
+pub proc rt_escrever_u64(endereco: uint, valor: uint) {
+    let p = rt_ponteiro_de(endereco) as ^u64
+    p^ = valor as u64
+}
+
+proc rt_escrever_u32(endereco: uint, valor: uint) {
+    let p = rt_ponteiro_de(endereco) as ^u32
+    p^ = valor as u32
+}
+
+pub proc rt_ler_u8(endereco: uint) -> u8 {
+    let p = rt_ponteiro_de(endereco) as ^u8
+    let valor: u8 = p^
+    return valor
+}
+
+pub proc rt_escrever_u8(endereco: uint, valor: u8) {
+    let p = rt_ponteiro_de(endereco) as ^u8
+    p^ = valor
+}
+
+// Mapeia 1 GiB na dica e so vale se o kernel devolveu a propria dica (ocupada = -EEXIST com MAP_FIXED_NOREPLACE)
+proc rt_janela_tentar(dica: uint) -> bool {
+    let r: int = forja_rt_syscall(A64_SYS_MMAP, dica as int, A64_JANELA_BYTES as int, A64_PROT_RW, A64_MMAP_FLAGS, -1, 0)
+    if r != (dica as int) {
+        return false
+    }
+    rt_escrever_u64(A64_EST_JANELA_BASE, dica)
+    rt_escrever_u64(A64_EST_JANELA_LIM, dica)
+    return true
+}
+
+// Fallback alto (A4.4(b)): o kernel escolhe o endereco (pode passar de 4 GiB). Mapeia 64 KiB a mais para alinhar a base a pagina de 64 KiB
+proc rt_janela_alta() -> bool {
+    let r: int = forja_rt_syscall(A64_SYS_MMAP, 0, (A64_JANELA_BYTES + A64_PAGINA_BYTES) as int, A64_PROT_RW, A64_MMAP_SEM_DICA, -1, 0)
+    if r <= 0 {
+        return false
+    }
+    let base: uint = (((r as uint) + A64_PAGINA_BYTES - 1) / A64_PAGINA_BYTES) * A64_PAGINA_BYTES
+    rt_escrever_u64(A64_EST_JANELA_BASE, base)
+    rt_escrever_u64(A64_EST_JANELA_LIM, base)
+    return true
+}
+
+// Abre a janela no 1o uso: dicas baixas (salvo FORJA_A64_JANELA_ALTA=1), depois o fallback alto; so falha se o kernel recusar tudo (heap: falha_alocacao)
+proc rt_janela_garantir() {
+    if rt_ler_u64(A64_EST_JANELA_BASE) != 0 {
+        return
+    }
+    if rt_ler_u64(A64_EST_JANELA_ALTA) == 0 {
+        if rt_janela_tentar(A64_DICA_1) {
+            return
+        }
+        if rt_janela_tentar(A64_DICA_2) {
+            return
+        }
+        if rt_janela_tentar(A64_DICA_3) {
+            return
+        }
+    }
+    _ = rt_janela_alta()
+}
+
+pub proc rt_heap_base() -> uint {
+    rt_janela_garantir()
+    return rt_ler_u64(A64_EST_JANELA_BASE)
+}
+
+// paginas (64 KiB) ate o limite logico; o heap so usa o que esta abaixo dele
+pub proc rt_memoria_paginas() -> int {
+    rt_janela_garantir()
+    return (rt_ler_u64(A64_EST_JANELA_LIM) / A64_PAGINA_BYTES) as int
+}
+
+// memory.grow do wasm: sobe o limite logico; devolve as paginas antigas ou -1 (sem janela, ou passou de 1 GiB)
+pub proc rt_memoria_crescer(paginas: int) -> int {
+    rt_janela_garantir()
+    let base: uint = rt_ler_u64(A64_EST_JANELA_BASE)
+    let lim: uint = rt_ler_u64(A64_EST_JANELA_LIM)
+    let novo: uint = lim + (paginas as uint) * A64_PAGINA_BYTES
+    if (base == 0) or (novo > (base + A64_JANELA_BYTES)) {
+        return -1
+    }
+    rt_escrever_u64(A64_EST_JANELA_LIM, novo)
+    return (lim / A64_PAGINA_BYTES) as int
+}
+
+// tamanho do texto NUL-terminado em endereco (sem o NUL)
+pub proc rt_texto_tamanho(endereco: uint) -> uint {
+    var n: uint = 0
+    while rt_ler_u8(endereco + n) != 0 {
+        n += 1
+    }
+    return n
+}
+
+// o texto NUL-terminado em endereco e exatamente s
+proc rt_texto_igual(endereco: uint, s: str) -> bool {
+    let bytes: []u8 = as_bytes(s)
+    for k in 0..<len(bytes) {
+        if rt_ler_u8(endereco + (k as uint)) != bytes[k] {
+            return false
+        }
+    }
+    return rt_ler_u8(endereco + (len(bytes) as uint)) == 0
+}
+
+// Monta o bloco de os.args num mmap proprio: [argc u64][pad][argc * (ponteiro u64, tamanho u64)] apontando para o argv da pilha (sem copia). 0 = sem pilha (.so) ou sem memoria
+proc rt_args_montar() -> uint {
+    let sp: uint = rt_ler_u64(A64_EST_ARGS_SP)
+    if sp == 0 {
+        return 0
+    }
+    let argc: uint = rt_ler_u64(sp)
+    let tamanho: uint = A64_ARGS_CABECALHO + argc * A64_ARGS_STR_BYTES
+    let r: int = forja_rt_syscall(A64_SYS_MMAP, 0, tamanho as int, A64_PROT_RW, A64_MMAP_SEM_DICA, -1, 0)
+    if r <= 0 {
+        return 0
+    }
+    let bloco: uint = r as uint
+    rt_escrever_u64(bloco, argc)
+    for k in (0 as uint)..<argc {
+        let origem: uint = rt_ler_u64(sp + 8 + k * 8)
+        let entrada_k: uint = bloco + A64_ARGS_CABECALHO + k * A64_ARGS_STR_BYTES
+        rt_escrever_u64(entrada_k, origem)
+        rt_escrever_u64(entrada_k + 8, rt_texto_tamanho(origem))
+    }
+    return bloco
+}
+
+// std:os args() (simbolo forja_proc_argumentos): *quantos = argc; devolve o vetor de str de 16 B (ponteiro + tamanho, 64 bits), vivo ate o fim
+pub proc proc_argumentos(quantos: ^int) -> rawptr {
+    var bloco: uint = rt_ler_u64(A64_EST_ARGS_BLOCO)
+    if bloco == 0 {
+        bloco = rt_args_montar()
+    }
+    if bloco == 0 {
+        quantos^ = 0
+        return rt_ponteiro_de(A64_EST_ARGS_BLOCO)
+    }
+    rt_escrever_u64(A64_EST_ARGS_BLOCO, bloco)
+    quantos^ = rt_ler_u64(bloco) as int
+    return rt_ponteiro_de(bloco + A64_ARGS_CABECALHO)
+}
+
+// WASI args_sizes_get: argc (u32) em argc_ptr e bytes de todos os argumentos com o NUL em buf_tam_ptr
+pub proc rt_args_tamanhos(argc_ptr: uint, buf_tam_ptr: uint) -> int {
+    let sp: uint = rt_ler_u64(A64_EST_ARGS_SP)
+    let argc: uint = rt_ler_u64(sp)
+    var total: uint = 0
+    for k in (0 as uint)..<argc {
+        total += rt_texto_tamanho(rt_ler_u64(sp + 8 + k * 8)) + 1
+    }
+    rt_escrever_u32(argc_ptr, argc)
+    rt_escrever_u32(buf_tam_ptr, total)
+    return 0
+}
+
+// WASI args_get: o i32 de cada argumento em argv_ptr e os bytes NUL-terminados a partir de buf_ptr
+pub proc rt_args_obter(argv_ptr: uint, buf_ptr: uint) -> int {
+    let sp: uint = rt_ler_u64(A64_EST_ARGS_SP)
+    let argc: uint = rt_ler_u64(sp)
+    var cursor: uint = buf_ptr
+    for k in (0 as uint)..<argc {
+        let origem: uint = rt_ler_u64(sp + 8 + k * 8)
+        let n: uint = rt_texto_tamanho(origem)
+        rt_escrever_u32(argv_ptr + k * 4, cursor)
+        for j in (0 as uint)..<(n + 1) {
+            rt_escrever_u8(cursor + j, rt_ler_u8(origem + j))
+        }
+        cursor += n + 1
+    }
+    return 0
+}
+
+// eprint/LF do fmt (substitui fmt_imprimir_erro do rt_wasm): o texto vai do estado em 64 bits; o rt_wasm fazia `as u32` do ponteiro, que em dev
+// falha com R0002 quando a janela passa de 4 GiB. O LF sai num write a parte (mesmos bytes do buffer + LF)
+pub proc fmt_imprimir_erro() {
+    let base: uint = rt_ler_u64(A64_EST_FMT_PTR)
+    let tamanho: uint = rt_ler_u64(A64_EST_FMT_LEN)
+    _ = forja_rt_syscall(A64_SYS_WRITE, A64_FD_STDERR, base as int, tamanho as int, 0, 0, 0)
+    rt_erro_byte(10)
+}
+
+// stderr do fmt do rt_wasm (foreign forja_err_escrever, chamado pelos procs de falha do rt_wasm que o alcance ainda puxa, ex.: os.exit fora da faixa):
+// o texto vem do estado em 64 bits. Os u32 da assinatura ja foram truncados (com R0002 em dev) pelo `as u32` do chamador, que e do rt_wasm
+pub proc err_escrever(ptr: u32, n: u32) {
+    let base: uint = rt_ler_u64(A64_EST_FMT_PTR)
+    let tamanho: uint = rt_ler_u64(A64_EST_FMT_LEN)
+    _ = forja_rt_syscall(A64_SYS_WRITE, A64_FD_STDERR, base as int, tamanho as int, 0, 0, 0)
+}
+
+// stdout do rt_wasm (forja_os_write_stdout): dados e um endereco real
+pub proc os_write_stdout(dados: ^u8, n: i64) {
+    let base: int = transmute(dados as rawptr, to = int)
+    _ = forja_rt_syscall(A64_SYS_WRITE, A64_FD_STDOUT, base, n as int, 0, 0, 0)
+}
+
+// COPIA_MEM e ZERA_MEM acima de 64 B viram forja_memcpy/forja_memset na BIR do a64: o endereco e traduzido UMA vez por chamada;
+// a copia anda de 8 em 8 B (u64) e a cauda vai byte a byte. Destino acima da origem com sobreposicao copia de tras para frente (memmove)
+pub proc memcpy(destino: uint, origem: uint, n: uint) {
+    let d: uint = rt_endereco_de(rt_ponteiro_de(destino))
+    let o: uint = rt_endereco_de(rt_ponteiro_de(origem))
+    if (d > o) and (d < o + n) {
+        rt_copiar_para_tras(d, o, n)
+        return
+    }
+    rt_copiar_para_frente(d, o, n)
+}
+
+proc rt_copiar_para_frente(d: uint, o: uint, n: uint) {
+    var k: uint = 0
+    while k + 8 <= n {
+        rt_gravar_bruto_u64(d + k, rt_ler_bruto_u64(o + k))
+        k += 8
+    }
+    while k < n {
+        rt_gravar_bruto_u8(d + k, rt_ler_bruto_u8(o + k))
+        k += 1
+    }
+}
+
+// pedacos de 8 B do topo para a base: cada leitura cai abaixo dos bytes ja gravados quando d > o
+proc rt_copiar_para_tras(d: uint, o: uint, n: uint) {
+    var k: uint = n
+    while k >= 8 {
+        k -= 8
+        rt_gravar_bruto_u64(d + k, rt_ler_bruto_u64(o + k))
+    }
+    while k > 0 {
+        k -= 1
+        rt_gravar_bruto_u8(d + k, rt_ler_bruto_u8(o + k))
+    }
+}
+
+pub proc memset(destino: uint, valor: uint, n: uint) {
+    let d: uint = rt_endereco_de(rt_ponteiro_de(destino))
+    let byte: u8 = valor as u8
+    let mascara: u64 = 0x0101010101010101
+    let padrao: u64 = (byte as u64) * mascara
+    var k: uint = 0
+    while k + 8 <= n {
+        rt_gravar_bruto_u64(d + k, padrao)
+        k += 8
+    }
+    while k < n {
+        rt_gravar_bruto_u8(d + k, byte)
+        k += 1
+    }
+}
+
+// acesso a um endereco ja traduzido (sem rt_ponteiro_de por byte): so memcpy/memset usam
+proc rt_ler_bruto_u64(a: uint) -> u64 {
+    let p = transmute(a, to = rawptr) as ^u64
+    return p^
+}
+
+proc rt_gravar_bruto_u64(a: uint, v: u64) {
+    let p = transmute(a, to = rawptr) as ^u64
+    p^ = v
+}
+
+proc rt_ler_bruto_u8(a: uint) -> u8 {
+    let p = transmute(a, to = rawptr) as ^u8
+    return p^
+}
+
+proc rt_gravar_bruto_u8(a: uint, v: u8) {
+    let p = transmute(a, to = rawptr) as ^u8
+    p^ = v
+}
+
+// forja_rt_conta_bits(v): bits 1 de v (cada volta apaga o bit mais baixo; o rt nativo faz o mesmo em C). Fica aqui: std:a64_es usa host.rt_conta_bits
+pub proc rt_conta_bits(v: u64) -> int {
+    var x: u64 = v
+    var n: int = 0
+    while x != 0 {
+        x = x & (x - 1)
+        n += 1
+    }
+    return n
+}
+
+// I3 (iOS): o dyld chama o main(argc, argv, envp) e o `_start` do iOS repassa x0..x2 para ca. Monta num mmap o mesmo bloco que o kernel Linux poe na pilha
+// ([argc][argv..][0][envp..][0]) e o guarda como sp de args; o limite da pilha parte do argv (topo da pilha da thread principal).
+// Fica no FIM do arquivo de proposito: as falhas de runtime embutem a linha de quem chama, e acrescentar antes deslocaria os bytes dos outros alvos.
+pub proc entrada_main(argc: uint, argv: uint, envp: uint) {
+    rt_escrever_u64(A64_EST_LIMITE_PILHA, argv - (A64_PILHA_BYTES - A64_FOLGA_PILHA))
+    var nenv: uint = 0
+    while rt_ler_u64(envp + nenv * 8) != 0 {
+        nenv += 1
+    }
+    let tamanho: uint = (argc + nenv + 3) * 8
+    let r: int = forja_rt_syscall(A64_SYS_MMAP, 0, tamanho as int, A64_PROT_RW, A64_MMAP_SEM_DICA, -1, 0)
+    if r <= 0 {
+        return
+    }
+    let bloco: uint = r as uint
+    rt_escrever_u64(bloco, argc)
+    for k in (0 as uint)..<argc {
+        rt_escrever_u64(bloco + 8 + k * 8, rt_ler_u64(argv + k * 8))
+    }
+    rt_escrever_u64(bloco + 8 + argc * 8, 0)
+    for k in (0 as uint)..<nenv {
+        rt_escrever_u64(bloco + 16 + argc * 8 + k * 8, rt_ler_u64(envp + k * 8))
+    }
+    rt_escrever_u64(bloco + 16 + (argc + nenv) * 8, 0)
+    rt_escrever_u64(A64_EST_ARGS_SP, bloco)
+    if rt_env_pede_janela_alta(bloco) {
+        rt_escrever_u64(A64_EST_JANELA_ALTA, 1)
+    }
+}
+

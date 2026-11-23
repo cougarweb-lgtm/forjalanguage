@@ -1,0 +1,975 @@
+// semantic/sem_memoria.fj - porte de compiler/semantic/sem_memoria.c
+// sha256 de semantic/sem_memoria.c: 0873888e225919e81c6e5434a24b46455cf4a8f8edc77972640a21cdaabc5521
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "common"
+import "frontend"
+
+// C2F-71: static const char *const SO_POOL de ConferirEmDoDelete (sem_memoria.c:599)
+const SO_POOL: str = "o alloc do delete so recebe um Pool: delete(p, alloc = pool); delete nao aceita 'alloc = ...' de Allocator (heap, frame, o alloc do proc)"
+
+// C: semantic/sem_memoria.c:36
+proc sem_tipo_eh_dono(s: ^Semantica, t: u32) -> bool {
+    let k: ^TipoInfo = tipo_de(&s.tipos, t)
+    if k.classe == (TC_DINAMICO as u8) {
+        return true
+    }
+    if k.classe == (TC_ARRAY as u8) {
+        return sem_tipo_eh_dono(s, k.a)
+    }
+    if k.classe == (TC_STRUCT as u8) {
+        return ((s.globais or_else {})[k.a].decl as ^frontend.Decl).contem_dono
+    }
+    if k.classe == (TC_RESULTADO as u8) {
+        return sem_tipo_eh_dono(s, k.a)
+    }
+    if common.c2f_b2i32((k.classe as i32) >= TC_MAPA) != 0 {
+        return (k.classe == (TC_MAPA as u8)) or ((k.classe == (TC_SOA as u8)) and (common.c2f_b2i32(tipo_soa_dinamica(&s.tipos, t)) != 0))
+    }
+    return false
+}
+
+// C: semantic/sem_memoria.c:48
+proc sem_colecao_dona(s: ^Semantica, t: u32) -> bool {
+    let c: i32 = tipo_classe_de(&s.tipos, t)
+    return ((common.c2f_s2u_32(c) == (TC_DINAMICO as u32)) or (common.c2f_s2u_32(c) == (TC_MAPA as u32))) or ((common.c2f_s2u_32(c) == (TC_SOA as u32)) and (common.c2f_b2i32(tipo_soa_dinamica(&s.tipos, t)) != 0))
+}
+
+// C: semantic/sem_memoria.c:55
+proc sem_conferir_movimento_dono(s: ^Semantica, e: ?^frontend.Expr) -> bool {
+    let ex: ^frontend.Expr = e as ^frontend.Expr
+    if ex.tipo_no == (frontend.EX_EMBRULHA as u8) {
+        return true
+    }
+    if not sem_tipo_eh_dono(s, ex.tipo) {
+        return true
+    }
+    if ex.tipo_no == (frontend.EX_OR_ELSE as u8) {
+        return sem_conferir_movimento_dono(s, ex.b)
+    }
+    if (((ex.tipo_no == (frontend.EX_NOME as u8)) or (ex.tipo_no == (frontend.EX_CAMPO as u8))) or (ex.tipo_no == (frontend.EX_INDICE as u8))) or ((ex.tipo_no == (frontend.EX_UNARIO as u8)) and (ex.op == (frontend.OP_DEREF as u8))) {
+        let tipo = s4_descrever(s, ex.tipo)
+        defer delete(tipo)
+        if tipo_classe_de(&s.tipos, ex.tipo) == TC_MAPA {
+            let msg_1 = format(f"copiar {tipo} criaria dois donos da mesma tabela: use &m (^map[K]V) para alterar ou ler", alloc = heap)
+            defer delete(msg_1)
+            _ = sem_erro(s, common.E0311, ex.pos, msg_1)
+        } else if tipo_classe_de(&s.tipos, ex.tipo) == TC_SOA {
+            let msg_2 = format(f"copiar {tipo} criaria dois donos das mesmas colunas: use &a (^soa[dynamic]S)", alloc = heap)
+            defer delete(msg_2)
+            _ = sem_erro(s, common.E0311, ex.pos, msg_2)
+        } else {
+            let msg_3 = format(f"copiar {tipo} criaria duas donas da mesma memoria: use &x (^[dynamic]T) para alterar ou x[..] para emprestar", alloc = heap)
+            defer delete(msg_3)
+            _ = sem_erro(s, common.E0311, ex.pos, msg_3)
+        }
+        sem_forma_do_dono(s, DONO_COPIA, ex.pos, ex.tipo)
+        return false
+    }
+    return true
+}
+
+// C: semantic/sem_memoria.c:83
+proc sem_alocacao_do_nome(s: ^Semantica, v: ?^frontend.Expr) -> u8 {
+    if (v as ^frontend.Expr).tipo_no != (frontend.EX_NOME as u8) {
+        return frontend.ALOC_NENHUM as u8
+    }
+    if (v as ^frontend.Expr).nome == s.nome_heap {
+        return frontend.ALOC_HEAP as u8
+    }
+    if (v as ^frontend.Expr).nome == s.nome_frame {
+        return frontend.ALOC_FRAME as u8
+    }
+    if (v as ^frontend.Expr).nome == s.nome_escopo {
+        return frontend.ALOC_ESCOPO as u8
+    }
+    var tern_1: i32 = frontend.ALOC_NENHUM
+    if ((v as ^frontend.Expr).nome == s.nome_scope) and (common.c2f_b2i32(em_nao_declarado(s, v)) != 0) {
+        tern_1 = frontend.ALOC_ESCOPO
+    }
+    return tern_1 as u8
+}
+
+// C: semantic/sem_memoria.c:93
+proc conferir_valor_antigo(s: ^Semantica, v: ?^frontend.Expr) -> bool {
+    let vv: ^frontend.Expr = v as ^frontend.Expr
+    var r: ?^common.Renomeado = none
+    if vv.nome == s.nome_escopo {
+        r = common.renomeado_buscar(common.REN_VALOR_ALOCADOR, "escopo")
+    }
+    if r == none {
+        return true
+    }
+    common.renomeado_notar_tabela(s.diag as ^common.Diag, vv.pos, common.interner_tam(nomes_da_sem(s), vv.nome), r)
+    if not common.renomeado_recusa_em(s.diag as ^common.Diag, r) {
+        return true
+    }
+    return common.renomeado_recusar(s.diag as ^common.Diag, vv.pos, common.interner_tam(nomes_da_sem(s), vv.nome), r)
+}
+
+// C: semantic/sem_memoria.c:103
+proc base_do_alocador(s: ^Semantica, t: u32) -> u32 {
+    let k: ^TipoInfo = tipo_de(&s.tipos, t)
+    var tern_1: u32 = t
+    if k.classe == (TC_PONTEIRO as u8) {
+        tern_1 = k.a
+    }
+    return tern_1
+}
+
+// C: semantic/sem_memoria.c:110
+proc trocar_por_id_criar(s: ^Semantica, em: ?^frontend.Arg) -> ^frontend.Expr {
+    let a: ^frontend.Arg = em as ^frontend.Arg
+    let base: ?^frontend.Expr = a.valor
+    let campo: ^frontend.Expr = s4_novo_expr(s)
+    campo.tipo_no = frontend.EX_CAMPO as u8
+    campo.a = base
+    campo.nome = s.nome_id
+    campo.pos = (base as ^frontend.Expr).pos
+    campo.pos_op = campo.pos
+    a.valor = campo
+    return campo
+}
+
+// C: semantic/sem_memoria.c:122
+proc trocar_por_id(s: ^Semantica, em: ?^frontend.Arg) -> bool {
+    return sem_checar(s, trocar_por_id_criar(s, em), TIPO_VAZIO as u32)
+}
+
+// C: semantic/sem_memoria.c:129
+proc trocar_por_id_do_parametro(s: ^Semantica, em: ?^frontend.Arg) -> bool {
+    let campo: ^frontend.Expr = trocar_por_id_criar(s, em)
+    campo.ref = frontend.REF_CAMPO as u8
+    campo.ref_id = 0
+    campo.tipo = TIPO_U32 as u32
+    return true
+}
+
+// C: semantic/sem_memoria.c:139
+proc em_nao_declarado(s: ^Semantica, v: ?^frontend.Expr) -> bool {
+    return ((((v as ^frontend.Expr).tipo_no == (frontend.EX_NOME as u8)) and ((v as ^frontend.Expr).modulo == 0)) and (escopo_buscar(&s.escopo, (v as ^frontend.Expr).nome) == none)) and (sem_achar_simbolo(s, (v as ^frontend.Expr).nome, 0).categoria == (SIM_NENHUM as u8))
+}
+
+// C: semantic/sem_memoria.c:145
+proc erro_em_desconhecido(s: ^Semantica, v: ?^frontend.Expr) -> bool {
+    let vv: ^frontend.Expr = v as ^frontend.Expr
+    if em_nao_declarado(s, v) {
+        // C2F-32: snprintf(texto, 96, ...) corta em 95 bytes
+        let texto_inteiro = format(f"'{sem_nome_texto(s, vv.nome)}' (nao declarado)", alloc = heap)
+        defer delete(texto_inteiro)
+        let texto = texto_inteiro[0..<min(len(texto_inteiro), 95)]
+        let msg_1 = format(f"alloc recebe heap, frame, scope, Arena ou Pool (import \"std:mem\"); recebeu {texto}", alloc = heap)
+        defer delete(msg_1)
+        return sem_erro(s, common.E0310, vv.pos, msg_1)
+    }
+    let texto_2 = s4_descrever(s, vv.tipo)
+    defer delete(texto_2)
+    let msg_2 = format(f"alloc recebe heap, frame, scope, Arena ou Pool (import \"std:mem\"); recebeu {texto_2}", alloc = heap)
+    defer delete(msg_2)
+    return sem_erro(s, common.E0310, vv.pos, msg_2)
+}
+
+// C: semantic/sem_memoria.c:154
+proc em_de_alocador(s: ^Semantica, chamada: ^frontend.Expr, em: ?^frontend.Arg) -> bool {
+    let v: ?^frontend.Expr = (em as ^frontend.Arg).valor
+    var base: u32 = 0
+    s.alocador_lendo = (v as ^frontend.Expr).tipo_no == (frontend.EX_NOME as u8)
+    let lido: bool = sem_checar(s, v, TIPO_VAZIO as u32)
+    s.alocador_lendo = false
+    if not lido {
+        return false
+    }
+    base = base_do_alocador(s, (v as ^frontend.Expr).tipo)
+    if sem_eh_allocator(s, (v as ^frontend.Expr).tipo) {
+        chamada.alocacao = frontend.ALOC_PARAM as u8
+        return trocar_por_id_do_parametro(s, em)
+    }
+    if (s.tipo_arena != 0) and (base == s.tipo_arena) {
+        chamada.alocacao = frontend.ALOC_ARENA as u8
+    } else if (s.tipo_pool != 0) and (base == s.tipo_pool) {
+        chamada.alocacao = frontend.ALOC_POOL as u8
+    } else {
+        return erro_em_desconhecido(s, v)
+    }
+    if (chamada.alocacao == (frontend.ALOC_POOL as u8)) and (chamada.ref_id != frontend.EMB_NEW) {
+        let msg_1 = format(f"Pool so serve new: make, format e format_c pedem heap, frame, scope ou Arena", alloc = heap)
+        defer delete(msg_1)
+        return sem_erro(s, common.E0310, (v as ^frontend.Expr).pos, msg_1)
+    }
+    return trocar_por_id(s, em)
+}
+
+// C: semantic/sem_memoria.c:177
+proc sem_conferir_alocador(s: ^Semantica, chamada: ^frontend.Expr, em: ?^frontend.Arg) -> bool {
+    let a: ^frontend.Arg = em as ^frontend.Arg
+    let v: ?^frontend.Expr = a.valor
+    let aloc: u8 = sem_alocacao_do_nome(s, v)
+    if (aloc == (frontend.ALOC_ESCOPO as u8)) and (not conferir_valor_antigo(s, v)) {
+        return false
+    }
+    if (aloc == (frontend.ALOC_ESCOPO as u8)) and (s.let_em_analise != chamada) {
+        let vv: ^frontend.Expr = v as ^frontend.Expr
+        vv.tipo = TIPO_VAZIO as u32
+        let msg_1 = format(f"alloc = scope so vale direto no let/var: let g = new(T, alloc = scope)", alloc = heap)
+        defer delete(msg_1)
+        return sem_erro(s, common.E0316, vv.pos, msg_1)
+    }
+    if aloc != (frontend.ALOC_NENHUM as u8) {
+        let vv: ^frontend.Expr = v as ^frontend.Expr
+        vv.tipo = TIPO_VAZIO as u32
+        chamada.alocacao = aloc
+        return true
+    }
+    if em_nao_declarado(s, v) {
+        return erro_em_desconhecido(s, v)
+    }
+    return em_de_alocador(s, chamada, em)
+}
+
+// C: semantic/sem_memoria.c:196
+proc resolver_tipo_do_argumento(s: ^Semantica, e: ^frontend.Expr, ref: ^?^frontend.TipoRef, tipo: ^u32) -> bool {
+    let no: ?^frontend.Expr = (e.args or_else {})[0].valor
+    ref^ = (no as ^frontend.Expr).alvo
+    if not sem_resolver_tipo_ref(s, (no as ^frontend.Expr).alvo) {
+        return false
+    }
+    tipo^ = ((no as ^frontend.Expr).alvo as ^frontend.TipoRef).tipo
+    let ptr_1: ^frontend.Expr = no as ^frontend.Expr
+    ptr_1.tipo = tipo^
+    return true
+}
+
+// C: semantic/sem_memoria.c:207
+proc new_de_struct(s: ^Semantica, e: ^frontend.Expr, ref: ^frontend.TipoRef, tipo: u32) -> bool {
+    let lit: ^frontend.Expr = s4_novo_expr(s)
+    lit.tipo_no = frontend.EX_LITERAL_STRUCT as u8
+    lit.nome = transmute(tipo_de(&s.tipos, tipo).a, to = i32)
+    lit.pos = ref.pos
+    lit.pos_op = ref.pos
+    if not sem_literal_struct(s, lit) {
+        return false
+    }
+    e.b = lit
+    return true
+}
+
+// C: semantic/sem_memoria.c:219
+proc conferir_tipo_do_new(s: ^Semantica, e: ^frontend.Expr, ref: ^frontend.TipoRef, tipo: u32) -> bool {
+    let classe: i32 = tipo_classe_de(&s.tipos, tipo)
+    e.b = none
+    if classe == TC_RESULTADO {
+        let msg_1 = format(f"new de 'T ! E' nao existe", alloc = heap)
+        defer delete(msg_1)
+        return sem_erro(s, common.E0310, ref.pos, msg_1)
+    }
+    if classe == TC_DINAMICO {
+        let msg_2 = format(f"new([dynamic]T) nao existe: a lista ja guarda os elementos fora; crie com make([dynamic]T, alloc = heap)", alloc = heap)
+        defer delete(msg_2)
+        return sem_erro(s, common.E0310, ref.pos, msg_2)
+    }
+    if classe == TC_STRUCT {
+        return new_de_struct(s, e, ref, tipo)
+    }
+    if not sem_tipo_sem_zero(s, tipo) {
+        return true
+    }
+    let texto = s4_descrever(s, tipo)
+    defer delete(texto)
+    let msg_3 = format(f"new({texto}): o tipo nao tem valor zero e new cria o valor zero; use ?^T ou guarde o ponteiro num struct com padrao", alloc = heap)
+    defer delete(msg_3)
+    return sem_erro(s, common.E0310, ref.pos, msg_3)
+}
+
+// C: semantic/sem_memoria.c:235
+proc chamar_new(s: ^Semantica, e: ^frontend.Expr) -> bool {
+    var ref: ?^frontend.TipoRef = none
+    var tipo: u32 = 0
+    if not sem_ligar_embutido(s, e, s.params_new[..]) {
+        return false
+    }
+    if not resolver_tipo_do_argumento(s, e, &ref, &tipo) {
+        return false
+    }
+    if not sem_conferir_alocador(s, e, &(e.args or_else {})[1]) {
+        return false
+    }
+    if not conferir_tipo_do_new(s, e, ref as ^frontend.TipoRef, tipo) {
+        return false
+    }
+    e.tipo = tipo_ponteiro(&s.tipos, tipo)
+    return true
+}
+
+// C: semantic/sem_memoria.c:248
+proc conferir_tipo_do_make(s: ^Semantica, ref: ^frontend.TipoRef, tipo: u32) -> bool {
+    let classe: i32 = tipo_classe_de(&s.tipos, tipo)
+    if common.c2f_s2u_32(classe) == (TC_DINAMICO as u32) {
+        return true
+    }
+    if common.c2f_b2i32(tipo_eh_lista_fixa(&s.tipos, tipo)) != 0 {
+        return sem_erro_de_lista_fixa(s, ref.pos, "make nao cria [dynamic, N]T: a lista fixa nasce de {} e nao tem alocador (var l: [dynamic, N]T = {})")
+    }
+    if common.c2f_b2i32(common.c2f_s2u_32(classe) == (TC_MAPA as u32)) != 0 {
+        return true
+    }
+    if common.c2f_b2i32(common.c2f_s2u_32(classe) == (TC_SOA as u32)) != 0 {
+        if tipo_soa_dinamica(&s.tipos, tipo) {
+            return true
+        }
+        let msg_1 = format(f"soa[N]S nao nasce de make: declare var a: soa[N]S = {{}}", alloc = heap)
+        defer delete(msg_1)
+        return sem_erro(s, common.E0320, ref.pos, msg_1)
+    }
+    if common.c2f_s2u_32(classe) == (TC_FATIA as u32) {
+        let msg_2 = format(f"make de fatia nao existe: crie a lista com make([dynamic]T, alloc = heap) e empreste com l[..]", alloc = heap)
+        defer delete(msg_2)
+        return sem_erro(s, common.E0310, ref.pos, msg_2)
+    }
+    let msg_3 = format(f"make cria lista, map ou soa dinamica: make([dynamic]T, alloc = heap, cap = 0)", alloc = heap)
+    defer delete(msg_3)
+    return sem_erro(s, common.E0310, ref.pos, msg_3)
+}
+
+// C: semantic/sem_memoria.c:267
+proc conferir_cap(s: ^Semantica, v: ?^frontend.Expr, rotulo: str) -> bool {
+    var negativo: bool = false
+    var magnitude: u64 = 0
+    if (not sem_expr(s, v, TIPO_INT as u32)) or (not sem_compativel(s, TIPO_INT as u32, (v as ^frontend.Expr).tipo, (v as ^frontend.Expr).pos)) {
+        return false
+    }
+    if ((common.c2f_b2i32(sem_inteiro_constante(s, v, &negativo, &magnitude)) != 0) and (common.c2f_b2i32(negativo) != 0)) and (magnitude != 0) {
+        let msg_1 = format(f"{rotulo} negativo (-{magnitude})", alloc = heap)
+        defer delete(msg_1)
+        return sem_erro(s, common.E0421, (v as ^frontend.Expr).pos, msg_1)
+    }
+    return true
+}
+
+// C: semantic/sem_memoria.c:279
+proc conferir_elemento_zeravel(s: ^Semantica, pos: u32, elemento: u32, quem: str) -> bool {
+    if (tipo_eh_inteiro(elemento) or tipo_eh_real(&s.tipos, elemento)) or (elemento == (TIPO_BOOL as u32)) {
+        return true
+    }
+    let texto = s4_descrever(s, elemento)
+    defer delete(texto)
+    let msg_1 = format(f"{quem} so vale em lista de inteiro, real ou bool (elemento {texto}): os demais entram um a um com append", alloc = heap)
+    defer delete(msg_1)
+    return sem_erro(s, common.E0310, pos, msg_1)
+}
+
+// C: semantic/sem_memoria.c:288
+proc conferir_tamanhos_do_make(s: ^Semantica, e: ^frontend.Expr, tipo: u32) -> bool {
+    var k: u32 = 2
+    while k < e.nargs {
+        let g: ^frontend.Arg = &(e.args or_else {})[k]
+        let eh_len: bool = g.indice == frontend.MAKE_PARAM_LEN
+        var tern_1: str = "cap"
+        if common.c2f_b2i32(eh_len) != 0 {
+            tern_1 = "len"
+        }
+        if not conferir_cap(s, g.valor, tern_1) {
+            return false
+        }
+        if not eh_len {
+            k += 1
+            continue
+        }
+        if common.c2f_s2u_32(tipo_classe_de(&s.tipos, tipo)) != (TC_DINAMICO as u32) {
+            let msg_1 = format(f"len so vale em make([dynamic]T, alloc = heap, len = n)", alloc = heap)
+            defer delete(msg_1)
+            return sem_erro(s, common.E0310, (g.valor as ^frontend.Expr).pos, msg_1)
+        }
+        let arg_1: str = "make com len"
+        let arg_2: u32 = tipo_de(&s.tipos, tipo).a
+        let arg_3: u32 = (g.valor as ^frontend.Expr).pos
+        let arg_4: ^Semantica = s
+        if not conferir_elemento_zeravel(arg_4, arg_3, arg_2, arg_1) {
+            return false
+        }
+        k += 1
+    }
+    return true
+}
+
+// C: semantic/sem_memoria.c:302
+proc chamar_make(s: ^Semantica, e: ^frontend.Expr) -> bool {
+    var ref: ?^frontend.TipoRef = none
+    var tipo: u32 = 0
+    if not sem_ligar_embutido(s, e, s.params_make[..]) {
+        return false
+    }
+    if not resolver_tipo_do_argumento(s, e, &ref, &tipo) {
+        return false
+    }
+    if not sem_conferir_alocador(s, e, &(e.args or_else {})[1]) {
+        return false
+    }
+    if not conferir_tipo_do_make(s, ref as ^frontend.TipoRef, tipo) {
+        return false
+    }
+    if not conferir_tamanhos_do_make(s, e, tipo) {
+        return false
+    }
+    e.tipo = tipo
+    return true
+}
+
+// C: semantic/sem_memoria.c:318
+proc eh_ponteiro_de_lista(s: ^Semantica, t: u32, anulavel_vale: bool) -> bool {
+    let k: ^TipoInfo = tipo_de(&s.tipos, t)
+    if (k.classe != (TC_PONTEIRO as u8)) and (not ((common.c2f_b2i32(anulavel_vale) != 0) and (k.classe == (TC_ANULAVEL as u8)))) {
+        return false
+    }
+    return common.c2f_s2u_32(tipo_classe_de(&s.tipos, k.a)) == (TC_DINAMICO as u32)
+}
+
+// C: semantic/sem_memoria.c:326
+proc eh_ponteiro_de_lista_fixa(s: ^Semantica, t: u32) -> bool {
+    let k: ^TipoInfo = tipo_de(&s.tipos, t)
+    return (k.classe == (TC_PONTEIRO as u8)) and (common.c2f_b2i32(tipo_eh_lista_fixa(&s.tipos, k.a)) != 0)
+}
+
+// C: semantic/sem_memoria.c:333
+proc eh_ponteiro_de_soa_dinamica(s: ^Semantica, t: u32, anulavel_vale: bool) -> bool {
+    let k: ^TipoInfo = tipo_de(&s.tipos, t)
+    if (k.classe != (TC_PONTEIRO as u8)) and (not ((common.c2f_b2i32(anulavel_vale) != 0) and (k.classe == (TC_ANULAVEL as u8)))) {
+        return false
+    }
+    return (common.c2f_s2u_32(tipo_classe_de(&s.tipos, k.a)) == (TC_SOA as u32)) and (common.c2f_b2i32(tipo_soa_dinamica(&s.tipos, k.a)) != 0)
+}
+
+// C: semantic/sem_memoria.c:341
+proc eh_ponteiro_de_mapa(s: ^Semantica, t: u32, anulavel_vale: bool) -> bool {
+    let k: ^TipoInfo = tipo_de(&s.tipos, t)
+    if (k.classe != (TC_PONTEIRO as u8)) and (not ((common.c2f_b2i32(anulavel_vale) != 0) and (k.classe == (TC_ANULAVEL as u8)))) {
+        return false
+    }
+    return common.c2f_s2u_32(tipo_classe_de(&s.tipos, k.a)) == (TC_MAPA as u32)
+}
+
+// C: semantic/sem_memoria.c:349
+proc erro_da_colecao_do_append(s: ^Semantica, lista: ?^frontend.Expr) -> bool {
+    let l: ^frontend.Expr = lista as ^frontend.Expr
+    if (tipo_classe_de(&s.tipos, l.tipo) == TC_DINAMICO) or tipo_eh_lista_fixa(&s.tipos, l.tipo) {
+        let msg_1 = format(f"append recebe o endereco da lista: append(&lista, item = x)", alloc = heap)
+        defer delete(msg_1)
+        _ = sem_erro(s, common.E0310, l.pos, msg_1)
+        sem_sugerir_endereco_do_append(s, lista)
+        return false
+    }
+    if (s.tipos.tem_soa and (tipo_classe_de(&s.tipos, l.tipo) == TC_SOA)) and tipo_soa_dinamica(&s.tipos, l.tipo) {
+        let msg_2 = format(f"append recebe o endereco da soa: append(&a, item = s)", alloc = heap)
+        defer delete(msg_2)
+        _ = sem_erro(s, common.E0310, l.pos, msg_2)
+        sem_sugerir_endereco_do_append(s, lista)
+        return false
+    }
+    let texto = s4_descrever(s, l.tipo)
+    defer delete(texto)
+    let msg_3 = format(f"append pede ^[dynamic]T ou ^soa[dynamic]S (tipo {texto})", alloc = heap)
+    defer delete(msg_3)
+    return sem_erro(s, common.E0310, l.pos, msg_3)
+}
+
+// C: semantic/sem_memoria.c:367
+proc conferir_lista_do_append(s: ^Semantica, lista: ?^frontend.Expr) -> bool {
+    var soa: bool = false
+    if not sem_checar(s, lista, TIPO_VAZIO as u32) {
+        return false
+    }
+    if (not eh_ponteiro_de_lista(s, (lista as ^frontend.Expr).tipo, false)) and (not eh_ponteiro_de_lista_fixa(s, (lista as ^frontend.Expr).tipo)) {
+        soa = (common.c2f_b2i32(s.tipos.tem_soa) != 0) and (common.c2f_b2i32(eh_ponteiro_de_soa_dinamica(s, (lista as ^frontend.Expr).tipo, false)) != 0)
+        if not soa {
+            return erro_da_colecao_do_append(s, lista)
+        }
+    }
+    if ((lista as ^frontend.Expr).tipo_no != (frontend.EX_UNARIO as u8)) or ((lista as ^frontend.Expr).op != (frontend.OP_ENDERECO as u8)) {
+        return true
+    }
+    var tern_1: str = "append altera a lista: declare com var"
+    if common.c2f_b2i32(soa) != 0 {
+        tern_1 = "append altera a soa: declare com var"
+    }
+    return sem_lvalor_mutavel_de(s, (lista as ^frontend.Expr).a, tern_1)
+}
+
+// C: semantic/sem_memoria.c:380
+proc elemento_do_append(s: ^Semantica, lista: ?^frontend.Expr) -> u32 {
+    let apontado: u32 = tipo_de(&s.tipos, (lista as ^frontend.Expr).tipo).a
+    var elemento: u32 = tipo_de(&s.tipos, apontado).a
+    if common.c2f_b2i32(common.c2f_s2u_32(tipo_classe_de(&s.tipos, apontado)) == (TC_SOA as u32)) != 0 {
+        elemento = tipo_de(&s.tipos, elemento).a
+    }
+    if common.c2f_b2i32(tipo_eh_lista_fixa(&s.tipos, apontado)) != 0 {
+        elemento = tipo_lista_fixa_elemento(&s.tipos, apontado)
+    }
+    return elemento
+}
+
+// C: semantic/sem_memoria.c:390
+proc conferir_items_do_append(s: ^Semantica, lista: ?^frontend.Expr, items: ?^frontend.Expr, elemento: u32) -> bool {
+    let l: ^frontend.Expr = lista as ^frontend.Expr
+    let it: ^frontend.Expr = items as ^frontend.Expr
+    let apontado: u32 = tipo_de(&s.tipos, l.tipo).a
+    if tipo_classe_de(&s.tipos, apontado) != TC_DINAMICO {
+        let msg_1 = format(f"items so vale em lista dinamica ([dynamic]T): em lista fixa e soa, um append por elemento", alloc = heap)
+        defer delete(msg_1)
+        return sem_erro(s, common.E0310, it.pos, msg_1)
+    }
+    if not sem_checar(s, items, TIPO_VAZIO as u32) {
+        return false
+    }
+    let fatia_do_elemento: bool = (tipo_classe_de(&s.tipos, it.tipo) == TC_FATIA) and (tipo_de(&s.tipos, it.tipo).a == elemento)
+    if (not fatia_do_elemento) and (not ((it.tipo == (TIPO_TEXTO as u32)) and (elemento == (TIPO_U8 as u32)))) {
+        let texto = s4_descrever(s, it.tipo)
+        defer delete(texto)
+        let msg_2 = format(f"items pede a fatia dos elementos da lista (a[..]; str numa lista de u8), nao {texto}", alloc = heap)
+        defer delete(msg_2)
+        return sem_erro(s, common.E0301, it.pos, msg_2)
+    }
+    if sem_tipo_eh_dono(s, elemento) {
+        let msg_3 = format(f"items copiaria elementos que sao donos de memoria: acrescente um a um com append(&l, item = ...) movendo cada dono", alloc = heap)
+        defer delete(msg_3)
+        return sem_erro(s, common.E0311, it.pos, msg_3)
+    }
+    return true
+}
+
+// C: semantic/sem_memoria.c:410
+proc chamar_append(s: ^Semantica, e: ^frontend.Expr) -> bool {
+    if not sem_ligar_embutido(s, e, s.params_append[..]) {
+        return false
+    }
+    let lista: ?^frontend.Expr = (e.args or_else {})[0].valor
+    if not conferir_lista_do_append(s, lista) {
+        return false
+    }
+    let item: ?^frontend.Arg = argumento_do_parametro(e, frontend.APPEND_PARAM_ITEM)
+    let items: ?^frontend.Arg = argumento_do_parametro(e, frontend.APPEND_PARAM_ITEMS)
+    if (item == none) and (items == none) {
+        let msg_1 = format(f"falta o argumento 'item' (um elemento) ou 'items' (uma fatia)", alloc = heap)
+        defer delete(msg_1)
+        return sem_erro(s, common.E0503, e.pos_op, msg_1)
+    }
+    if (item != none) and (items != none) {
+        let msg_2 = format(f"item e items juntos: um append acrescenta um elemento (item) ou uma fatia (items)", alloc = heap)
+        defer delete(msg_2)
+        return sem_erro(s, common.E0501, (items as ^frontend.Arg).pos_nome, msg_2)
+    }
+    let elemento: u32 = elemento_do_append(s, lista)
+    e.tipo = TIPO_VAZIO as u32
+    if items != none {
+        return conferir_items_do_append(s, lista, (items as ^frontend.Arg).valor, elemento)
+    }
+    let it: ^frontend.Arg = item as ^frontend.Arg
+    if not sem_checar(s, it.valor, elemento) {
+        return false
+    }
+    if (elemento == (TIPO_U8 as u32)) and ((it.valor as ^frontend.Expr).tipo == (TIPO_TEXTO as u32)) {
+        return sem_texto_no_builder(s, lista, item)
+    }
+    if not sem_coagir(s, it.valor, elemento, (it.valor as ^frontend.Expr).pos) {
+        return false
+    }
+    return sem_conferir_movimento(s, it.valor) and sem_conferir_posse(s, it.valor, PONTO_GUARDA)
+}
+
+// C: semantic/sem_memoria.c:428
+proc sem_chamar_resize(s: ^Semantica, e: ^frontend.Expr) -> bool {
+    if not sem_ligar_embutido(s, e, s.params_resize[..]) {
+        return false
+    }
+    let lista: ?^frontend.Expr = (e.args or_else {})[0].valor
+    if not sem_checar(s, lista, TIPO_VAZIO as u32) {
+        return false
+    }
+    let l: ^frontend.Expr = lista as ^frontend.Expr
+    if not eh_ponteiro_de_lista(s, l.tipo, false) {
+        let texto = s4_descrever(s, l.tipo)
+        defer delete(texto)
+        if tipo_classe_de(&s.tipos, l.tipo) == TC_DINAMICO {
+            let msg_1 = format(f"resize recebe o endereco da lista: resize(&lista, len = n)", alloc = heap)
+            defer delete(msg_1)
+            return sem_erro(s, common.E0310, l.pos, msg_1)
+        }
+        let msg_2 = format(f"resize pede ^[dynamic]T (tipo {texto})", alloc = heap)
+        defer delete(msg_2)
+        return sem_erro(s, common.E0310, l.pos, msg_2)
+    }
+    if ((l.tipo_no == (frontend.EX_UNARIO as u8)) and (l.op == (frontend.OP_ENDERECO as u8))) and (not sem_lvalor_mutavel_de(s, l.a, "resize altera a lista: declare com var")) {
+        return false
+    }
+    if not conferir_cap(s, (e.args or_else {})[1].valor, "len") {
+        return false
+    }
+    if not conferir_elemento_zeravel(s, l.pos, tipo_de(&s.tipos, tipo_de(&s.tipos, l.tipo).a).a, "resize") {
+        return false
+    }
+    e.tipo = TIPO_VAZIO as u32
+    return true
+}
+
+// C: semantic/sem_memoria.c:447
+proc sem_chamar_sort(s: ^Semantica, e: ^frontend.Expr) -> bool {
+    if not sem_ligar_embutido(s, e, s.params_um[..]) {
+        return false
+    }
+    let v: ?^frontend.Expr = (e.args or_else {})[0].valor
+    if not sem_checar(s, v, TIPO_VAZIO as u32) {
+        return false
+    }
+    let args_e = e.args or_else {}
+    args_e[0].indice = 0
+    let vv: ^frontend.Expr = v as ^frontend.Expr
+    var elemento: u32 = 0
+    if tipo_classe_de(&s.tipos, vv.tipo) == TC_FATIA {
+        elemento = tipo_de(&s.tipos, vv.tipo).a
+    }
+    if (elemento == 0) or (not ((tipo_eh_inteiro(elemento) or (elemento == (TIPO_F32 as u32))) or (elemento == (TIPO_F64 as u32)) or (elemento == (TIPO_TEXTO as u32)))) {
+        let texto = s4_descrever(s, vv.tipo)
+        defer delete(texto)
+        let msg_1 = format(f"sort pede uma fatia de inteiro, real (f32, f64) ou str: sort(l[..]); recebeu {texto}", alloc = heap)
+        defer delete(msg_1)
+        return sem_erro(s, common.E0310, vv.pos, msg_1)
+    }
+    e.tipo = TIPO_VAZIO as u32
+    return true
+}
+
+// C: semantic/sem_memoria.c:465
+proc sem_chamar_sort_by(s: ^Semantica, e: ^frontend.Expr) -> bool {
+    var params: [2]u32 = {0, 0}
+    var assinatura: ProcAssinatura = ProcAssinatura{params = params[..], nomes = none, n = 2, retorno = TIPO_BOOL as u32}
+    if not sem_ligar_embutido(s, e, s.params_sort_by[..]) {
+        return false
+    }
+    let v: ?^frontend.Expr = (argumento_do_parametro(e, 0) as ^frontend.Arg).valor
+    let p: ?^frontend.Expr = (argumento_do_parametro(e, 1) as ^frontend.Arg).valor
+    if not sem_checar(s, v, TIPO_VAZIO as u32) {
+        return false
+    }
+    let vv: ^frontend.Expr = v as ^frontend.Expr
+    var elemento: u32 = 0
+    if tipo_classe_de(&s.tipos, vv.tipo) == TC_FATIA {
+        elemento = tipo_de(&s.tipos, vv.tipo).a
+    }
+    if elemento == 0 {
+        let texto = s4_descrever(s, vv.tipo)
+        defer delete(texto)
+        let msg_1 = format(f"sort_by pede uma fatia: sort_by(l[..], less = p); recebeu {texto}", alloc = heap)
+        defer delete(msg_1)
+        return sem_erro(s, common.E0310, vv.pos, msg_1)
+    }
+    params[0] = tipo_ponteiro(&s.tipos, elemento)
+    params[1] = params[0]
+    let comparador: u32 = tipo_proc(&s.tipos, &assinatura)
+    s.comparador_sort_by = true
+    let ok_comparador: bool = sem_checar(s, p, comparador)
+    s.comparador_sort_by = false
+    if (not ok_comparador) or (not sem_coagir(s, p, comparador, (p as ^frontend.Expr).pos)) {
+        return false
+    }
+    e.tipo = TIPO_VAZIO as u32
+    return true
+}
+
+// C: semantic/sem_memoria.c:490
+proc sem_eh_ordenavel_do_runtime(t: u32) -> bool {
+    return (((common.c2f_b2i32(tipo_eh_inteiro(t)) != 0) or (t == (TIPO_F32 as u32))) or (t == (TIPO_F64 as u32))) or (t == (TIPO_TEXTO as u32))
+}
+
+// C: semantic/sem_memoria.c:497
+proc ligar_chave_do_sort(s: ^Semantica, chave: ?^frontend.Expr, elemento: u32, campo: ^u32) -> bool {
+    var y: ?^Simbolo = none
+    var est: ?^frontend.Decl = none
+    var idx: i32 = -1
+    if ((chave as ^frontend.Expr).tipo_no == (frontend.EX_CAMPO as u8)) and (((chave as ^frontend.Expr).a as ^frontend.Expr).tipo_no == (frontend.EX_NOME as u8)) {
+        y = sem_achar_simbolo(s, ((chave as ^frontend.Expr).a as ^frontend.Expr).nome, ((chave as ^frontend.Expr).a as ^frontend.Expr).modulo)
+    }
+    if ((y != none) and ((y as ^Simbolo).categoria == (SIM_STRUCT as u8))) and ((y as ^Simbolo).tipo == elemento) {
+        est = sem_decl_da_struct(s, elemento)
+    }
+    if est != none {
+        idx = sem_achar_campo(est, (chave as ^frontend.Expr).nome)
+    }
+    if idx < 0 {
+        let msg_1 = format(f"sort_by_key: a chave nao e um campo da struct do elemento (use key = Struct.campo)", alloc = heap)
+        defer delete(msg_1)
+        return sem_erro(s, common.E0337, (chave as ^frontend.Expr).pos, msg_1)
+    }
+    var tern_1: u32 = ((chave as ^frontend.Expr).a as ^frontend.Expr).pos
+    if ((chave as ^frontend.Expr).a as ^frontend.Expr).modulo != 0 {
+        tern_1 = ((chave as ^frontend.Expr).a as ^frontend.Expr).pos_op
+    }
+    var uso: NomeUsado = NomeUsado{nome = ((chave as ^frontend.Expr).a as ^frontend.Expr).nome, pos = tern_1, modulo = ((chave as ^frontend.Expr).a as ^frontend.Expr).modulo}
+    if not sem_visivel(s, y, &uso) {
+        return false
+    }
+    let ptr_1: ^frontend.Expr = chave as ^frontend.Expr
+    let ptr_2: ^frontend.Expr = ptr_1.a as ^frontend.Expr
+    ptr_2.ref = frontend.REF_STRUCT as u8
+    let ptr_3: ^frontend.Expr = chave as ^frontend.Expr
+    let ptr_4: ^frontend.Expr = ptr_3.a as ^frontend.Expr
+    ptr_4.ref_id = (y as ^Simbolo).indice
+    let ptr_5: ^frontend.Expr = chave as ^frontend.Expr
+    let ptr_6: ^frontend.Expr = ptr_5.a as ^frontend.Expr
+    ptr_6.tipo = elemento
+    let ptr_7: ^frontend.Expr = chave as ^frontend.Expr
+    ptr_7.ref = frontend.REF_CAMPO as u8
+    let ptr_8: ^frontend.Expr = chave as ^frontend.Expr
+    ptr_8.ref_id = idx
+    campo^ = ((est as ^frontend.Decl).campos or_else {})[idx].tipo.tipo
+    let ptr_9: ^frontend.Expr = chave as ^frontend.Expr
+    ptr_9.tipo = campo^
+    s.usa_layout = true
+    return true
+}
+
+// C: semantic/sem_memoria.c:520
+proc sem_chamar_sort_by_key(s: ^Semantica, e: ^frontend.Expr) -> bool {
+    var campo: u32 = TIPO_VAZIO as u32
+    if not sem_ligar_embutido(s, e, s.params_sort_by_key[..]) {
+        return false
+    }
+    let v: ?^frontend.Expr = (argumento_do_parametro(e, 0) as ^frontend.Arg).valor
+    let chave: ?^frontend.Expr = (argumento_do_parametro(e, 1) as ^frontend.Arg).valor
+    if not sem_checar(s, v, TIPO_VAZIO as u32) {
+        return false
+    }
+    let vv: ^frontend.Expr = v as ^frontend.Expr
+    var elemento: u32 = 0
+    if tipo_classe_de(&s.tipos, vv.tipo) == TC_FATIA {
+        elemento = tipo_de(&s.tipos, vv.tipo).a
+    }
+    if (elemento == 0) or (tipo_classe_de(&s.tipos, elemento) != TC_STRUCT) {
+        let texto = s4_descrever(s, vv.tipo)
+        defer delete(texto)
+        let msg_1 = format(f"sort_by_key pede uma fatia de struct: sort_by_key(l[..], key = Struct.campo); recebeu {texto}", alloc = heap)
+        defer delete(msg_1)
+        return sem_erro(s, common.E0310, vv.pos, msg_1)
+    }
+    if not ligar_chave_do_sort(s, chave, elemento, &campo) {
+        return false
+    }
+    if not sem_eh_ordenavel_do_runtime(campo) {
+        let texto_2 = s4_descrever(s, campo)
+        defer delete(texto_2)
+        let msg_2 = format(f"sort_by_key: o campo da chave nao e ordenavel (tipo {texto_2}): so inteiro, f32, f64 e str", alloc = heap)
+        defer delete(msg_2)
+        return sem_erro(s, common.E0337, (chave as ^frontend.Expr).pos, msg_2)
+    }
+    e.tipo = TIPO_VAZIO as u32
+    return true
+}
+
+// C: semantic/sem_memoria.c:542
+proc sem_chamar_binary_search(s: ^Semantica, e: ^frontend.Expr) -> bool {
+    if not sem_ligar_embutido(s, e, s.params_binary_search[..]) {
+        return false
+    }
+    let v: ?^frontend.Expr = (argumento_do_parametro(e, 0) as ^frontend.Arg).valor
+    let valor: ?^frontend.Expr = (argumento_do_parametro(e, 1) as ^frontend.Arg).valor
+    if not sem_checar(s, v, TIPO_VAZIO as u32) {
+        return false
+    }
+    let vv: ^frontend.Expr = v as ^frontend.Expr
+    var elemento: u32 = 0
+    if tipo_classe_de(&s.tipos, vv.tipo) == TC_FATIA {
+        elemento = tipo_de(&s.tipos, vv.tipo).a
+    }
+    if elemento == 0 {
+        let texto = s4_descrever(s, vv.tipo)
+        defer delete(texto)
+        let msg_1 = format(f"binary_search pede uma fatia: binary_search(l[..], value = v); recebeu {texto}", alloc = heap)
+        defer delete(msg_1)
+        return sem_erro(s, common.E0310, vv.pos, msg_1)
+    }
+    if not sem_eh_ordenavel_do_runtime(elemento) {
+        let texto_2 = s4_descrever(s, elemento)
+        defer delete(texto_2)
+        let msg_2 = format(f"binary_search: o elemento nao e ordenavel (tipo {texto_2}): so inteiro, f32, f64 e str", alloc = heap)
+        defer delete(msg_2)
+        return sem_erro(s, common.E0337, vv.pos, msg_2)
+    }
+    if (not sem_checar(s, valor, elemento)) or (not sem_coagir(s, valor, elemento, (valor as ^frontend.Expr).pos)) {
+        return false
+    }
+    var elementos: [2]u32 = {TIPO_INT as u32, TIPO_BOOL as u32}
+    e.tipo = tipo_tupla(&s.tipos, elementos[..])
+    return true
+}
+
+// C: semantic/sem_memoria.c:566
+proc conferir_texto_do_delete(s: ^Semantica, v: ?^frontend.Expr) -> bool {
+    if (v as ^frontend.Expr).tipo_no != (frontend.EX_TEXTO as u8) {
+        return true
+    }
+    let msg_1 = format(f"delete de texto literal nao existe: so libera o que veio de format/format_c (alloc = heap)", alloc = heap)
+    defer delete(msg_1)
+    return sem_erro(s, common.E0310, (v as ^frontend.Expr).pos, msg_1)
+}
+
+// C: semantic/sem_memoria.c:573
+proc conferir_alvo_do_delete(s: ^Semantica, v: ?^frontend.Expr) -> bool {
+    let vv: ^frontend.Expr = v as ^frontend.Expr
+    let classe: i32 = tipo_classe_de(&s.tipos, vv.tipo)
+    if classe == TC_DINAMICO {
+        return sem_lvalor_mutavel_de(s, v, "delete(lista) zera a lista: declare com var")
+    }
+    if tipo_eh_lista_fixa(&s.tipos, vv.tipo) {
+        return sem_erro_de_lista_fixa(s, vv.pos, "delete nao existe para [dynamic, N]T: a lista vive no proprio valor; esvazie com l = {}")
+    }
+    if (classe >= TC_MAPA) and sem_colecao_dona(s, vv.tipo) {
+        return sem_lvalor_mutavel_de(s, v, "delete zera a colecao: declare com var")
+    }
+    if eh_ponteiro_de_lista(s, vv.tipo, true) {
+        let msg_1 = format(f"delete(p^) apaga a lista apontada; o ponteiro nao veio de new", alloc = heap)
+        defer delete(msg_1)
+        return sem_erro(s, common.E0310, vv.pos, msg_1)
+    }
+    if (s.tipos.tem_soa and eh_ponteiro_de_soa_dinamica(s, vv.tipo, true)) or (s.tipos.tem_mapa and eh_ponteiro_de_mapa(s, vv.tipo, true)) {
+        let msg_2 = format(f"delete(p^) apaga a colecao apontada; o ponteiro nao veio de new", alloc = heap)
+        defer delete(msg_2)
+        return sem_erro(s, common.E0310, vv.pos, msg_2)
+    }
+    if (classe == TC_PONTEIRO) or (classe == TC_ANULAVEL) {
+        return true
+    }
+    if ((vv.tipo == (TIPO_STR as u32)) or (vv.tipo == (TIPO_CSTR as u32))) or tipo_opcional_nicho(&s.tipos, vv.tipo) {
+        return conferir_texto_do_delete(s, v)
+    }
+    let texto = s4_descrever(s, vv.tipo)
+    defer delete(texto)
+    let msg_3 = format(f"delete pede ^T vindo de new ou [dynamic]T (tipo {texto})", alloc = heap)
+    defer delete(msg_3)
+    return sem_erro(s, common.E0310, vv.pos, msg_3)
+}
+
+// C: semantic/sem_memoria.c:598
+proc conferir_em_do_delete(s: ^Semantica, e: ^frontend.Expr) -> bool {
+    let em: ^frontend.Arg = &(e.args or_else {})[1]
+    if sem_alocacao_do_nome(s, em.valor) != (frontend.ALOC_NENHUM as u8) {
+        return sem_erro(s, common.E0310, (em.valor as ^frontend.Expr).pos, SO_POOL)
+    }
+    s.alocador_lendo = (em.valor as ^frontend.Expr).tipo_no == (frontend.EX_NOME as u8)
+    let lido: bool = sem_checar(s, em.valor, TIPO_VAZIO as u32)
+    s.alocador_lendo = false
+    if not lido {
+        return false
+    }
+    if (s.tipo_pool == 0) or (base_do_alocador(s, (em.valor as ^frontend.Expr).tipo) != s.tipo_pool) {
+        return sem_erro(s, common.E0310, (em.valor as ^frontend.Expr).pos, SO_POOL)
+    }
+    let alvo: ^frontend.Expr = (e.args or_else {})[0].valor as ^frontend.Expr
+    let classe: i32 = tipo_classe_de(&s.tipos, alvo.tipo)
+    if (classe != TC_PONTEIRO) and (classe != TC_ANULAVEL) {
+        let msg_1 = format(f"delete(p, alloc = pool) pede ^T vindo de new(T, alloc = pool)", alloc = heap)
+        defer delete(msg_1)
+        return sem_erro(s, common.E0310, alvo.pos, msg_1)
+    }
+    e.alocacao = frontend.ALOC_POOL as u8
+    return trocar_por_id(s, em)
+}
+
+// C: semantic/sem_memoria.c:621
+proc sem_chamar_slice_from(s: ^Semantica, e: ^frontend.Expr) -> bool {
+    if not sem_ligar_embutido(s, e, s.params_slice_from[..]) {
+        return false
+    }
+    let p: ?^frontend.Expr = (argumento_do_parametro(e, 0) as ^frontend.Arg).valor
+    let n: ?^frontend.Expr = (argumento_do_parametro(e, 1) as ^frontend.Arg).valor
+    if (not sem_checar(s, p, TIPO_VAZIO as u32)) or (not sem_checar(s, n, TIPO_INT as u32)) {
+        return false
+    }
+    let pp: ^frontend.Expr = p as ^frontend.Expr
+    let classe: i32 = tipo_classe_de(&s.tipos, pp.tipo)
+    let texto = s4_descrever(s, pp.tipo)
+    defer delete(texto)
+    if (classe != TC_PONTEIRO) and (classe != TC_ANULAVEL) {
+        let msg_1 = format(f"slice_from pede ^T ou ?^T vindo de foreign (tipo {texto}); rawptr e cstr nao tem tamanho de elemento", alloc = heap)
+        defer delete(msg_1)
+        return sem_erro(s, common.E0301, pp.pos, msg_1)
+    }
+    let elemento: u32 = tipo_de(&s.tipos, pp.tipo).a
+    if sem_tipo_eh_opaco(s, elemento) {
+        let msg_2 = format(f"slice_from de ponteiro para tipo opaco ({texto}): o tamanho do elemento e desconhecido", alloc = heap)
+        defer delete(msg_2)
+        return sem_erro(s, common.E0301, pp.pos, msg_2)
+    }
+    if not tipo_eh_inteiro((n as ^frontend.Expr).tipo) {
+        let msg_3 = format(f"len de slice_from pede um inteiro (a contagem de elementos do vetor C)", alloc = heap)
+        defer delete(msg_3)
+        return sem_erro(s, common.E0301, (n as ^frontend.Expr).pos, msg_3)
+    }
+    e.tipo = tipo_fatia(&s.tipos, elemento)
+    return true
+}
+
+// C: semantic/sem_memoria.c:643
+proc chamar_delete(s: ^Semantica, e: ^frontend.Expr) -> bool {
+    if not sem_ligar_embutido(s, e, s.params_delete[..]) {
+        return false
+    }
+    if not sem_checar(s, (e.args or_else {})[0].valor, TIPO_VAZIO as u32) {
+        return false
+    }
+    if not conferir_alvo_do_delete(s, (e.args or_else {})[0].valor) {
+        return false
+    }
+    if len(s.mapas_em_for) != 0 {
+        let alvo: ?^frontend.Expr = (e.args or_else {})[0].valor
+        var nome: i32 = -1
+        if (alvo as ^frontend.Expr).tipo_no == (frontend.EX_NOME as u8) {
+            nome = (alvo as ^frontend.Expr).nome
+        }
+        if not sem_conferir_mapa_no_for(s, alvo, nome) {
+            return false
+        }
+    }
+    e.tipo = TIPO_VAZIO as u32
+    e.alocacao = frontend.ALOC_HEAP as u8
+    if (e.nargs > 1) and (not conferir_em_do_delete(s, e)) {
+        return false
+    }
+    return sem_conferir_delete(s, e)
+}
+
+// C: semantic/sem_memoria.c:658
+proc chamar_frame_reset(s: ^Semantica, e: ^frontend.Expr) -> bool {
+    if not sem_ligar_embutido(s, e, none) {
+        return false
+    }
+    e.tipo = TIPO_VAZIO as u32
+    return true
+}
+
+// C: semantic/sem_memoria.c:666
+proc sem_chamar_memoria(s: ^Semantica, e: ^frontend.Expr, embutido: i32) -> bool {
+    if embutido == frontend.EMB_NEW {
+        return chamar_new(s, e)
+    }
+    if embutido == frontend.EMB_MAKE {
+        return chamar_make(s, e)
+    }
+    if embutido == frontend.EMB_APPEND {
+        return chamar_append(s, e)
+    }
+    if embutido == frontend.EMB_DELETE {
+        return chamar_delete(s, e)
+    }
+    if embutido == frontend.EMB_FRAME_RESET {
+        return chamar_frame_reset(s, e)
+    }
+    let msg_1 = format(f"SemChamarMemoria: embutido {embutido} desconhecido", alloc = heap)
+    defer delete(msg_1)
+    common.falha_interna(msg_1)
+    return false
+}
+
+// C: semantic/sem_memoria.c:677
+proc sem_tipo_solto(s: ^Semantica, e: ^frontend.Expr) -> bool {
+    let msg_1 = format(f"um tipo so vale como 1o argumento de new e make", alloc = heap)
+    defer delete(msg_1)
+    return sem_erro(s, common.E0310, e.pos, msg_1)
+}

@@ -1,0 +1,1244 @@
+// nativo/obj/ligar.fj - porte de compiler/nativo/obj/ligar.c, compiler/nativo/obj/ligar.h
+// sha256 de nativo/obj/ligar.c: a2823ef7a309eeb39654e8880370f02e82baaa7bf1128ffc262243daea7e5ad9
+// sha256 de nativo/obj/ligar.h: e262dac757414d196d7f4a3b60a6c930c735d7d8bdc299ba95a43bef79fe98ab
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.3.0
+// Changelog: 0.3.0 - A4.2/A4.3: pedido dinamico (DT_NEEDED, runpath, exports do .so na Imagem, sem _start no .so, indefinidos viram GOT).
+//            0.2.0 - A4.1: comentario A4.2 no ponto do ELF (sem mudanca de codigo)
+
+import "common"
+import "nativo/fmt" as pefmt
+
+struct ImportTabela {
+    dll: ?str
+    simbolos: ?[]str
+    qtd: u32
+}
+
+pub struct LigarPedido {
+    programa: ?^Objeto
+    runtime: ?^Objeto
+    ryu: ?^Objeto
+    terceiros: ?^Objeto
+    legado: ?^Objeto
+    math: ?^Objeto
+    es: ?^Objeto
+    thread: ?^Objeto
+    sync: ?^Objeto
+    atomic: ?^Objeto
+    varena: ?^Objeto
+    net: ?^Objeto
+    curto: ?^Objeto
+    entrada: ?^Objeto
+    semente: ?^Objeto
+    perfil: ?^Objeto
+    tabelas: ?[]ImportTabela
+    qtd_tabelas: u32
+    dll: bool
+    nome_dll: ?str
+    exports: ?[]str
+    qtd_exports: u32
+    formato: i32
+    pie: bool
+    maquina: u32 // A64: 0 = x86-64 (padrao); 183 = AArch64 (so o ELF entende)
+    pagina: u32 // A64: 0 = 4096; 16384 para AArch64
+    entrada_no_programa: bool // A64: o _start esta no objeto do programa, nao no runtime
+    dinamico: bool // A4.2: ELF dinamico (alvo android): GOT/GLOB_DAT, DT_NEEDED, exports no .dynsym
+    necessarias: ?[]str // A4.2: nomes do `link "x"` (x = "c" -> DT_NEEDED libc.so)
+    qtd_necessarias: u32
+    runpath: ?str // A4.2: DT_RUNPATH opcional (so o exe)
+}
+
+struct LigarSaida {
+    nome: ?str
+    carac: u32
+}
+
+struct LigarUsados {
+    usados: [320]str // C2F-B3: era ?[320]str; sem o opcional para fatiar e gravar
+    n: u32
+    k: u32
+}
+
+struct LigarPonto {
+    alvo: u32
+    campo: u32
+}
+
+const LIGAR_SEPARADOR_GRUPO: str = "$."
+const LIGAR_ENTRADA_ELF: str = "_start"
+// C2F-82 macro LIGAR_PREFIXO_IMP = ALCANCE_PREFIXO_IMP  (expandida no uso)
+const LIGAR_TAM_PREFIXO_IMP: i32 = 6
+const LIGAR_TAM_CAMPO_DIR64: u32 = 8
+const LIGAR_TAM_CAMPO_32: u32 = 4
+const LIGAR_TAM_CAMPO_16: u32 = 2
+const LIGAR_TERCEIROS: i32 = 3
+const LIGAR_LEGADO: i32 = 4
+const LIGAR_CURTO: i32 = 5
+const LIGAR_MATH: i32 = 6
+const LIGAR_ES: i32 = 7
+const LIGAR_THREAD: i32 = 8
+const LIGAR_SYNC: i32 = 9
+const LIGAR_ATOMIC: i32 = 10
+const LIGAR_VARENA: i32 = 11
+const LIGAR_NET: i32 = 12
+const LIGAR_ENTRADA: i32 = 13
+const LIGAR_SEMENTE: i32 = 14
+const LIGAR_PERFIL: i32 = 15
+const LIGAR_TAM_ZEROS: i32 = 256
+const LIGAR_BITS_BYTE: u32 = 8
+const LIGAR_NOMES_ENTRADA: [2][2]str = {{"forja_entrada", "forja_entrada_ctor"}, {"forja_entrada_dll", "forja_entrada_dll_ctor"}}
+// C2F-B3: LIGAR_SAIDAS (const LigarSaida[9]) vira 2 arrays paralelos: LIGAR_NOMES_SAIDA e LIGAR_CARAC_SAIDA (PE_SECAO_*, mesma ordem LIGAR_SAIDA_*)
+const LIGAR_CARAC_SAIDA: [9]u32 = {pefmt.PE_SECAO_TEXTO, pefmt.PE_SECAO_LEITURA, pefmt.PE_SECAO_DADOS, pefmt.PE_SECAO_LEITURA, pefmt.PE_SECAO_LEITURA, pefmt.PE_SECAO_BSS, pefmt.PE_SECAO_DADOS, pefmt.PE_SECAO_DADOS, pefmt.PE_SECAO_DADOS}
+// LIGAR_ORDEM_SAIDAS[IMAGEM_PE] e [IMAGEM_ELF] (a ordem em que as saidas viram secoes)
+const LIGAR_ORDEM_SAIDAS: [2][9]i32 = {{0, 1, 2, 3, 4, 5, 6, 7, 8}, {1, 0, 2, 6, 7, 8, 5, 3, 4}}
+// nomes das saidas (LIGAR_SAIDAS[k].nome do C), na ordem LIGAR_SAIDA_*; so o nome entra em ligar_indice_saida
+const LIGAR_NOMES_SAIDA: [9]str = {".text", ".rdata", ".data", ".pdata", ".xdata", ".bss", ".init_array", ".got", ".tdata"}
+const ZEROS: [256]u8 = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
+
+// C: nativo/obj/ligar.c:124
+proc ligar_alinhar(v: u32, alinhamento: u32) -> u32 {
+    return (((v + alinhamento) - 1) / alinhamento) * alinhamento
+}
+
+// C: nativo/obj/ligar.c:129
+proc ligar_contrib_de(l: ^LigacaoEstado, o: i32, sec: u32) -> ^LigarContrib {
+    return &l.contrib[o][sec as u64]
+}
+
+// C: nativo/obj/ligar.c:135
+proc ligar_tabelas_fixas(pedido: ^LigarPedido) -> u32 {
+    if common.c2f_s2u_32(pedido.formato) != (pefmt.IMAGEM_PE as u32) {
+        return 0
+    }
+    var tern_1: i32 = LIGAR_QTD_TABELAS_BASE
+    if pedido.net != none {
+        tern_1 = LIGAR_QTD_TABELAS
+    }
+    return common.c2f_s2u_32(tern_1)
+}
+
+// C: nativo/obj/ligar.c:143
+proc ligar_juntar_tabelas(l: ^LigacaoEstado, pedido: ^LigarPedido) {
+    let fixas: u32 = ligar_tabelas_fixas(pedido)
+    if (fixas + pedido.qtd_tabelas) > (pefmt.IMAGEM_MAX_DLLS as u32) {
+        let total: u32 = fixas + pedido.qtd_tabelas
+        let msg_1 = format(f"ligar: {total} tabelas de imports; a Imagem aceita {pefmt.IMAGEM_MAX_DLLS} DLLs", alloc = heap)
+        defer delete(msg_1)
+        common.falha_interna(msg_1)
+    }
+    ligar_copiar_fixas(l, fixas)
+    l.qtd_tabelas = fixas
+    var t: u32 = 0
+    while t < pedido.qtd_tabelas {
+        let tabela: ^ImportTabela = &(pedido.tabelas or_else {})[t as u64]
+        if (fixas == (LIGAR_QTD_TABELAS as u32)) and ligar_mesma_dll((tabela.dll or_else ""), LIGAR_NOME_DLL_WS2_32) {
+            ligar_fundir_ws2(&l.tabelas[LIGAR_QTD_TABELAS_BASE as u32], tabela, l.fundidos[..])
+        } else {
+            l.tabelas[l.qtd_tabelas] = tabela^
+            l.qtd_tabelas += 1
+        }
+        t += 1
+    }
+}
+
+// C: nativo/obj/ligar.c:162
+proc ligar_planejar_imports(l: ^LigacaoEstado) {
+    var t: u32 = 0
+    while t < l.qtd_tabelas {
+        var s: u32 = 0
+        while s < l.tabelas[t].qtd {
+            if l.qtd_plano == (ALCANCE_MAX_IMPORTS as u32) {
+                let msg_1 = format(f"ligar: mais de {ALCANCE_MAX_IMPORTS} imports nas tabelas", alloc = heap)
+                defer delete(msg_1)
+                common.falha_interna(msg_1)
+            }
+            l.plano[l.qtd_plano] = (l.tabelas[t].simbolos or_else {})[s as u64]
+            l.qtd_plano += 1
+            s += 1
+        }
+        t += 1
+    }
+}
+
+// C: nativo/obj/ligar.c:174
+proc ligar_escolher_entrada(l: ^LigacaoEstado) {
+    let terceiros: ?^Objeto = (l.obj or_else {})[LIGAR_TERCEIROS]
+    let ctor: bool = obj_achar_simbolo(terceiros as ^Objeto, TERCEIROS_SIMBOLO_CTORS_INI) >= 0
+    var tern_1: i32 = LIGAR_RUNTIME
+    if common.c2f_b2i32(ctor) != 0 {
+        tern_1 = LIGAR_LEGADO
+    }
+    l.objeto_entrada = tern_1
+    var tern_2: i32 = 0
+    if common.c2f_b2i32((l.pedido as ^LigarPedido).dll) != 0 {
+        tern_2 = 1
+    }
+    var tern_3: i32 = 0
+    if common.c2f_b2i32(ctor) != 0 {
+        tern_3 = 1
+    }
+    l.nome_entrada = LIGAR_NOMES_ENTRADA[tern_2][tern_3]
+    if common.c2f_s2u_32((l.pedido as ^LigarPedido).formato) == (pefmt.IMAGEM_ELF as u32) {
+        l.nome_entrada = LIGAR_ENTRADA_ELF
+        if (l.pedido as ^LigarPedido).entrada != none {
+            l.objeto_entrada = LIGAR_ENTRADA
+        }
+        if (l.pedido as ^LigarPedido).semente != none {
+            l.objeto_entrada = LIGAR_SEMENTE
+        }
+        // A1.2: o aarch64-linux nao tem runtime em C; o _start vem do proprio programa
+        if (l.pedido as ^LigarPedido).entrada_no_programa {
+            l.objeto_entrada = LIGAR_PROGRAMA
+        }
+    }
+    l.raizes[0] = AlcanceRaiz{objeto = LIGAR_PROGRAMA, simbolo = none}
+    l.raizes[1] = AlcanceRaiz{objeto = l.objeto_entrada, simbolo = l.nome_entrada}
+}
+
+// C: nativo/obj/ligar.c:193
+proc ligar_preparar(l: ^LigacaoEstado) {
+    ligar_planejar_imports(l)
+    ligar_escolher_entrada(l)
+    l.celulas = make([dynamic]LigarCelula, alloc = heap)
+    for o in (0 as i32)..<LIGAR_QTD_OBJETOS {
+        l.rva_sim[o] = make([dynamic]u32, alloc = heap)
+        l.contrib[o] = make([dynamic]LigarContrib, alloc = heap)
+        let qtd_secoes: u64 = len(((l.obj or_else {})[o] as ^Objeto).secoes) as u64
+        var s: u64 = 0
+        while s < qtd_secoes {
+            append(&l.contrib[o], item = LigarContrib{saida = LIGAR_SEM_SAIDA, off = 0})
+            s += 1
+        }
+    }
+    l.entrada.raizes = l.raizes[..]
+    l.entrada.qtd_raizes = LIGAR_QTD_RAIZES as u32
+    l.entrada.imports = l.plano[(0 as u64)..<(l.qtd_plano as u64)]
+    l.entrada.qtd_imports = l.qtd_plano
+    l.entrada.dinamico = (l.pedido as ^LigarPedido).dinamico
+    l.entrada.obj = l.obj
+    l.texto_runtime_off = LIGAR_SEM_RVA
+    alcance_calcular(&l.entrada, &l.alcance)
+}
+
+// C: nativo/obj/ligar.c:213
+proc ligar_liberar(l: ^LigacaoEstado) {
+    for o in (0 as i32)..<LIGAR_QTD_OBJETOS {
+        delete(l.rva_sim[o])
+        delete(l.contrib[o])
+    }
+    delete(l.celulas)
+    alcance_liberar(&l.alcance)
+}
+
+// C: nativo/obj/ligar.c:224
+proc ligar_conferir_alcance(l: ^LigacaoEstado) -> bool {
+    if l.alcance.indefinido != none {
+        let txt_1 = l.alcance.indefinido or_else "(null)"
+        let msg_1 = format(f"COFF: simbolo '{txt_1}' indefinido (nao esta no programa nem no runtime)", alloc = heap)
+        defer delete(msg_1)
+        return common.diag_relatar(l.erro as ^common.Diag, common.X0903, 0, msg_1)
+    }
+    if l.alcance.import_fora != none {
+        let txt_2 = l.alcance.import_fora or_else "(null)"
+        let msg_2 = format(f"COFF: simbolo '{txt_2}' importado fora das tabelas de imports (KERNEL32 do runtime e DLLs dos 'link')", alloc = heap)
+        defer delete(msg_2)
+        return common.diag_relatar(l.erro as ^common.Diag, common.X0903, 0, msg_2)
+    }
+    return true
+}
+
+// C: nativo/obj/ligar.c:236
+proc ligar_indice_saida(nome: str) -> i32 {
+    let n: u64 = len(nome) as u64
+    var k: i32 = 0
+    while k < LIGAR_SAIDA_TLS {
+        let nome_saida: str = LIGAR_NOMES_SAIDA[k]
+        let base: u64 = len(nome_saida) as u64
+        // o nome da saida tem de ser o prefixo inteiro, e o que vem depois e fim ou separador de grupo ('$' ou '.')
+        if (n >= base) and (nome[0..<base] == nome_saida) {
+            if (n == base) or (nome[base] == LIGAR_SEPARADOR_GRUPO[0]) or (nome[base] == LIGAR_SEPARADOR_GRUPO[1]) {
+                return k
+            }
+        }
+        k += 1
+    }
+    return -1
+}
+
+// C: nativo/obj/ligar.c:246
+proc ligar_tamanho_secao(s: ^ObjSecao) -> u32 {
+    var tern_1: u32 = (len(s.bytes) as u64) as u32
+    if (common.c2f_s2u_32(s.tipo) == (OS_BSS as u32)) or (common.c2f_s2u_32(s.tipo) == (OS_TBSS as u32)) {
+        tern_1 = s.tam_bss
+    }
+    return tern_1
+}
+
+// C: nativo/obj/ligar.c:252
+proc ligar_anotar_texto_runtime(l: ^LigacaoEstado, o: i32, k: i32, off: u32) {
+    if ((o == LIGAR_RUNTIME) and (k == LIGAR_SAIDA_TEXTO)) and (l.texto_runtime_off == LIGAR_SEM_RVA) {
+        l.texto_runtime_off = off
+    }
+}
+
+// C: nativo/obj/ligar.c:259
+proc ligar_saida_so_do_pe(l: ^LigacaoEstado, k: i32) -> bool {
+    return (common.c2f_s2u_32((l.pedido as ^LigarPedido).formato) == (pefmt.IMAGEM_ELF as u32)) and ((k == LIGAR_SAIDA_PDATA) or (k == LIGAR_SAIDA_XDATA))
+}
+
+// C: nativo/obj/ligar.c:265
+proc ligar_mapear_secao(l: ^LigacaoEstado, o: i32, sec: u32) -> bool {
+    if not alcance_vivo(&l.alcance, o, sec) {
+        return true
+    }
+    let s: ^ObjSecao = &((l.obj or_else {})[o] as ^Objeto).secoes[sec as u64]
+    if s.tipo >= OS_DEBUG_ABBREV {
+        return true // M6 P66 (D-M6-4): secao de debug nao tem saida; ligar_elf_debug a copia para Imagem.dbg
+    }
+    let elf: bool = (l.pedido as ^LigarPedido).formato == pefmt.IMAGEM_ELF
+    var k: i32 = 0
+    if elf {
+        k = ligar_saida_elf(s)
+    } else {
+        k = ligar_indice_saida((s.nome or_else ""))
+    }
+    if k < 0 {
+        if elf {
+            return ligar_elf_sem_saida(l, s)
+        }
+        let txt_1 = s.nome or_else "(null)"
+        let msg_1 = format(f"COFF: secao '{txt_1}' sem lugar no PE (use .text, .rdata, .data, .pdata, .xdata ou .bss)", alloc = heap)
+        defer delete(msg_1)
+        return common.diag_relatar(l.erro as ^common.Diag, common.X0903, 0, msg_1)
+    }
+    if (k == LIGAR_SAIDA_BSS) and (s.tipo != OS_BSS) {
+        let txt_2 = s.nome or_else "(null)"
+        let msg_2 = format(f"COFF: secao '{txt_2}' com conteudo dentro de .bss", alloc = heap)
+        defer delete(msg_2)
+        return common.diag_relatar(l.erro as ^common.Diag, common.X0903, 0, msg_2)
+    }
+    if (k == LIGAR_SAIDA_TLS) and (not ligar_elf_tls_permitido(l, s)) {
+        return false
+    }
+    if ligar_saida_so_do_pe(l, k) {
+        return true // ELF: o unwind do Win64 nao tem lugar (D-M5-7); a secao fica sem saida e as relocacoes dela (ADDR32NB) nao se aplicam
+    }
+    let c: ^LigarContrib = ligar_contrib_de(l, o, sec)
+    c.saida = k
+    c.off = ligar_alinhar(l.tam[k], s.alinhamento)
+    l.tam[k] = c.off + ligar_tamanho_secao(s)
+    ligar_anotar_texto_runtime(l, o, k, c.off)
+    return true
+}
+
+// C: nativo/obj/ligar.c:289
+proc ligar_mapear_objeto(l: ^LigacaoEstado, o: i32) -> bool {
+    let secs: ^[dynamic]ObjSecao = &((l.obj or_else {})[o] as ^Objeto).secoes
+    var s: u32 = 0
+    while (s as u64) < (len(secs^) as u64) {
+        if not ligar_mapear_secao(l, o, s) {
+            return false
+        }
+        s += 1
+    }
+    return true
+}
+
+// C: nativo/obj/ligar.c:299
+proc ligar_zeros(b: ^[dynamic]u8, n: u64) {
+    var k: u64 = 0
+    while k < n {
+        append(b, item = 0)
+        k += 1
+    }
+}
+
+// C: nativo/obj/ligar.c:310
+proc ligar_pegar(l: ^LigacaoEstado, o: i32, sec: u32, b: ^[dynamic]u8) {
+    let s: ^ObjSecao = &((l.obj or_else {})[o] as ^Objeto).secoes[sec as u64]
+    if s.tipo == OS_TBSS {
+        return // M5c-b P61: o .tbss so ocupa memoria (cauda do bloco TLS), nao tem bytes
+    }
+    ligar_zeros(b, (ligar_contrib_de(l, o, sec).off as u64) - (len(b^) as u64))
+    if s.tipo == OS_BSS {
+        ligar_zeros(b, s.tam_bss as u64)
+    } else {
+        var i: u64 = 0
+        while i < (len(s.bytes) as u64) {
+            append(b, item = s.bytes[i])
+            i += 1
+        }
+    }
+}
+
+// C: nativo/obj/ligar.c:322
+proc ligar_juntar(l: ^LigacaoEstado, k: i32, b: ^[dynamic]u8) {
+    for o in (0 as i32)..<LIGAR_QTD_OBJETOS {
+        var sec: u32 = 0
+        while (sec as u64) < (len(((l.obj or_else {})[o] as ^Objeto).secoes) as u64) {
+            if ligar_contrib_de(l, o, sec).saida == k {
+                ligar_pegar(l, o, sec, b)
+            }
+            sec += 1
+        }
+    }
+}
+
+// C: nativo/obj/ligar.c:332
+proc ligar_criar_secao(l: ^LigacaoEstado, k: i32) -> bool {
+    var b: [dynamic]u8 = make([dynamic]u8, alloc = heap)
+    let bss: bool = k == LIGAR_SAIDA_BSS
+    if not bss {
+        ligar_juntar(l, k, &b)
+    }
+    if k == LIGAR_SAIDA_GOT {
+        ligar_zeros(&b, l.tam[k] as u64) // celulas .got: zeros aqui, o endereco entra depois de resolver (ligar_elf_preencher_got)
+    }
+    var pedido: pefmt.PeSecaoPedido = pefmt.PeSecaoPedido{nome = LIGAR_NOMES_SAIDA[k], caracteristicas = LIGAR_CARAC_SAIDA[k], bytes = none, tam_virtual = l.tam[k]}
+    if not bss {
+        pedido.bytes = &b
+    }
+    let rva: u32 = pefmt.imagem_secao(l.im as ^pefmt.Imagem, &pedido, l.erro as ^common.Diag)
+    delete(b)
+    if rva == 0 {
+        return false
+    }
+    l.rva[k] = rva
+    l.idx_im[k] = (l.im as ^pefmt.Imagem).qtd_secoes - 1
+    return true
+}
+
+// C: nativo/obj/ligar.c:356
+proc ligar_selecionar_tabela(l: ^LigacaoEstado, tabela: ^ImportTabela, u: ^LigarUsados) {
+    var s: u32 = 0
+    while s < tabela.qtd {
+        l.slot_import[u.k] = -1
+        if alcance_import_usado(&l.alcance, u.k) {
+            l.slot_import[u.k] = u.n as i32
+            u.usados[u.n] = l.plano[u.k]
+            u.n += 1
+        }
+        s += 1
+        u.k += 1
+    }
+}
+
+// C: nativo/obj/ligar.c:368
+proc ligar_importar(l: ^LigacaoEstado) {
+    var u: LigarUsados = LigarUsados{n = 0, k = 0}
+    var dlls: [17]pefmt.PeImportDll = {}
+    var n_dlls: u32 = 0
+    for t in (0 as u32)..<l.qtd_tabelas {
+        let ini: u32 = u.n
+        ligar_selecionar_tabela(l, &l.tabelas[t], &u)
+        if u.n > ini {
+            dlls[n_dlls] = pefmt.PeImportDll{dll = l.tabelas[t].dll, nomes = u.usados[(ini as u64)..<(u.n as u64)], n = u.n - ini}
+            n_dlls += 1
+        }
+    }
+    if (n_dlls > 0) and (not pefmt.pe_reservar_importacoes_dlls(l.im as ^pefmt.Imagem, dlls[(0 as u64)..<(n_dlls as u64)])) {
+        let msg_1 = format(f"ligar: os {u.n} imports alcancaveis nao couberam no .idata", alloc = heap)
+        defer delete(msg_1)
+        common.falha_interna(msg_1)
+    }
+}
+
+// C: nativo/obj/ligar.c:383
+proc ligar_mapear_objetos(l: ^LigacaoEstado) -> bool {
+    for o in (0 as i32)..<LIGAR_QTD_OBJETOS {
+        if not ligar_mapear_objeto(l, o) {
+            return false
+        }
+    }
+    return true
+}
+
+// C: nativo/obj/ligar.c:392
+proc ligar_montar_secoes(l: ^LigacaoEstado) -> bool {
+    if not ligar_mapear_objetos(l) {
+        return false
+    }
+    ligar_elf_planejar_got(l) // ELF: o tamanho da .got sai das relocacoes vivas, antes de criar as secoes
+    ligar_elf_planejar_tls(l) // ELF: .tdata e .tbss no bloco TLS (offsets e tamanho), antes de criar a secao
+    for i in (0 as i32)..<LIGAR_QTD_SAIDA {
+        let k: i32 = LIGAR_ORDEM_SAIDAS[(l.pedido as ^LigarPedido).formato][i]
+        if (l.tam[k] > 0) and (not ligar_criar_secao(l, k)) {
+            return false
+        }
+    }
+    ligar_elf_marcar_tls(l) // ELF: a Imagem guarda a secao TLS e o p_align do PT_TLS
+    if l.texto_runtime_off != LIGAR_SEM_RVA {
+        let ptr_1: ^pefmt.Imagem = l.im as ^pefmt.Imagem
+        ptr_1.runtime_texto_rva = l.rva[LIGAR_SAIDA_TEXTO] + l.texto_runtime_off
+    }
+    ligar_importar(l)
+    return true
+}
+
+// C: nativo/obj/ligar.c:413
+proc ligar_rva_definido(l: ^LigacaoEstado, o: i32, s: ?^ObjSimbolo) -> u32 {
+    let c: ^LigarContrib = ligar_contrib_de(l, o, common.c2f_s2u_32((s as ^ObjSimbolo).secao))
+    if (c.saida == LIGAR_SEM_SAIDA) or (l.tam[c.saida] == 0) {
+        return LIGAR_SEM_RVA
+    }
+    return (l.rva[c.saida] + c.off) + (s as ^ObjSimbolo).off
+}
+
+// C: nativo/obj/ligar.c:422
+proc ligar_achar_definido(l: ^LigacaoEstado, o: i32, nome: str) -> ?^ObjSimbolo {
+    let i: i64 = obj_achar_simbolo((l.obj or_else {})[o] as ^Objeto, nome)
+    if i < 0 {
+        return none
+    }
+    let s: ^ObjSimbolo = &((l.obj or_else {})[o] as ^Objeto).simbolos[common.c2f_s2u_64(i)]
+    var tern_1: ?^ObjSimbolo = none
+    if (common.c2f_b2i32(s.global) != 0) and (s.secao != OBJ_SECAO_INDEFINIDA) {
+        tern_1 = s
+    }
+    return tern_1
+}
+
+// C: nativo/obj/ligar.c:432
+proc ligar_rva_import(l: ^LigacaoEstado, s: ^ObjSimbolo) -> u32 {
+    let nome: str = (s.nome or_else "")
+    let base: str = nome[(LIGAR_TAM_PREFIXO_IMP as u64)..<(len(nome) as u64)]
+    var k: u32 = 0
+    while k < l.qtd_plano {
+        if (l.plano[k] == base) and (l.slot_import[k] >= 0) {
+            return (l.im as ^pefmt.Imagem).importacao.iat_rva[l.slot_import[k] as u32]
+        }
+        k += 1
+    }
+    return LIGAR_SEM_RVA
+}
+
+// C: nativo/obj/ligar.c:443
+proc ligar_rva_externo(l: ^LigacaoEstado, o: i32, s: ^ObjSimbolo) -> u32 {
+    for outro in (0 as i32)..<LIGAR_QTD_OBJETOS {
+        var tern_1: ?^ObjSimbolo = none
+        if outro == o {
+            tern_1 = none
+        } else {
+            tern_1 = ligar_achar_definido(l, outro, (s.nome or_else ""))
+        }
+        let achado: ?^ObjSimbolo = tern_1
+        if achado != none {
+            return ligar_rva_definido(l, outro, achado)
+        }
+    }
+    return LIGAR_SEM_RVA
+}
+
+// C: nativo/obj/ligar.c:453
+proc ligar_duplicado(l: ^LigacaoEstado, o: i32, s: ^ObjSimbolo) -> bool {
+    for outro in (0 as i32)..<LIGAR_QTD_OBJETOS {
+        if ((outro != o) and (common.c2f_b2i32(s.global) != 0)) and (ligar_achar_definido(l, outro, (s.nome or_else "")) != none) {
+            return true
+        }
+    }
+    return false
+}
+
+// C: nativo/obj/ligar.c:462
+proc ligar_resolver_simbolo(l: ^LigacaoEstado, o: i32, s: ^ObjSimbolo, rva: ^u32) -> bool {
+    let nome: str = (s.nome or_else "")
+    if s.secao >= 0 {
+        if ligar_duplicado(l, o, s) {
+            let msg_1 = format(f"COFF: simbolo '{nome}' definido nos dois objetos", alloc = heap)
+            defer delete(msg_1)
+            return common.diag_relatar(l.erro as ^common.Diag, common.X0903, 0, msg_1)
+        }
+        rva^ = ligar_rva_definido(l, o, s)
+        return true
+    }
+    rva^ = ligar_rva_externo(l, o, s)
+    if (rva^ == LIGAR_SEM_RVA) and alcance_eh_import(nome) {
+        rva^ = ligar_rva_import(l, s)
+    }
+    if rva^ == LIGAR_SEM_RVA {
+        // ELF: __init_array_start e similares, dados pelo proprio ligador (o bool de retorno o C ignora)
+        _ = ligar_elf_simbolo_do_ligador(l, nome, rva)
+    }
+    return true
+}
+
+// C: nativo/obj/ligar.c:478
+proc ligar_resolver_objeto(l: ^LigacaoEstado, o: i32) -> bool {
+    let sims: ^[dynamic]ObjSimbolo = &((l.obj or_else {})[o] as ^Objeto).simbolos
+    var j: u64 = 0
+    while j < (len(sims^) as u64) {
+        var rva: u32 = 0
+        if not ligar_resolver_simbolo(l, o, &sims[j], &rva) {
+            return false
+        }
+        append(&l.rva_sim[o], item = rva)
+        j += 1
+    }
+    return true
+}
+
+// C: nativo/obj/ligar.c:490
+proc ligar_resolver_simbolos(l: ^LigacaoEstado) -> bool {
+    for o in (0 as i32)..<LIGAR_QTD_OBJETOS {
+        if not ligar_resolver_objeto(l, o) {
+            return false
+        }
+    }
+    return true
+}
+
+// C: nativo/obj/ligar.c:503
+proc ligar_valor_reloc(c: ^ObjCorrecao, alvo: u32, p: u32, base: u64) -> u64 {
+    let s: i64 = alvo as i64
+    let a: i64 = c.adendo
+    let sw_1 = common.c2f_s2u_32(c.tipo)
+    if sw_1 == (OR_REL32 as u32) {
+        return common.c2f_s2u_64(((s + a) - ((p as i64) + 4)))
+    } else if sw_1 == (OR_ADDR32NB as u32) {
+        return common.c2f_s2u_64((s + a))
+    } else if sw_1 == (OR_ADDR64 as u32) {
+        return common.c2f_s2u_64(((transmute(base, to = i64) + s) + a))
+    } else {
+    }
+    let msg_1 = format(f"ligar: tipo de relocacao {c.tipo} desconhecido", alloc = heap)
+    defer delete(msg_1)
+    common.falha_interna(msg_1)
+    return 0
+}
+
+// C: nativo/obj/ligar.c:523
+proc ligar_tamanho_campo(tipo: i32) -> u32 {
+    let sw_1 = common.c2f_s2u_32(tipo)
+    if sw_1 == (OR_ADDR64 as u32) {
+        return LIGAR_TAM_CAMPO_DIR64
+    } else if sw_1 == (OR_SECTION as u32) {
+        return LIGAR_TAM_CAMPO_16
+    } else {
+        return LIGAR_TAM_CAMPO_32
+    }
+    return 0
+}
+
+// C: nativo/obj/ligar.c:536
+proc ligar_valor_secao(l: ^LigacaoEstado, c: ^ObjCorrecao, alvo: u32, valor: ^u64) -> bool {
+    for k in (0 as i32)..<LIGAR_QTD_SAIDA {
+        if ((l.tam[k] == 0) or (alvo < l.rva[k])) or ((alvo - l.rva[k]) >= l.tam[k]) {
+            continue
+        }
+        var tern_1: u64 = common.c2f_s2u_64((((alvo - l.rva[k]) as i64) + c.adendo))
+        if common.c2f_s2u_32(c.tipo) == (OR_SECTION as u32) {
+            tern_1 = (l.idx_im[k] as u64) + 1
+        }
+        valor^ = tern_1
+        return true
+    }
+    let msg_1 = format(f"COFF: relocacao SECTION/SECREL para um simbolo fora das secoes de saida (RVA 0x{alvo:x})", alloc = heap)
+    defer delete(msg_1)
+    return common.diag_relatar(l.erro as ^common.Diag, common.X0903, 0, msg_1)
+}
+
+// C: nativo/obj/ligar.c:553
+proc ligar_valor_de(l: ^LigacaoEstado, r: ^ObjReloc, ponto: LigarPonto, valor: ^u64) -> bool {
+    if (common.c2f_s2u_32(r.correcao.tipo) == (OR_SECTION as u32)) or (common.c2f_s2u_32(r.correcao.tipo) == (OR_SECREL as u32)) {
+        return ligar_valor_secao(l, &r.correcao, ponto.alvo, valor)
+    }
+    let arg_1: u64 = pefmt.pe_base_da_imagem(l.im)
+    let arg_2: u32 = ponto.campo
+    let arg_3: u32 = ponto.alvo
+    let arg_4: ^ObjCorrecao = &r.correcao
+    valor^ = ligar_valor_reloc(arg_4, arg_3, arg_2, arg_1)
+    return true
+}
+
+// C: nativo/obj/ligar.c:561
+// C2F-13: p fundido em n (len)
+proc ligar_escrever_campo(p: []u8, v: u64) {
+    for k in (0 as u32)..<(len(p) as u32) {
+        p[k] = common.c2f_trunc_u8(v >> (((k * LIGAR_BITS_BYTE) as u64) & 63))
+    }
+}
+
+// C: nativo/obj/ligar.c:568
+proc ligar_conferir_campo_na_secao(l: ^LigacaoEstado, k: i32, sec_off: u32, tam: u32) {
+    let ps: ^pefmt.PeSecao = &(l.im as ^pefmt.Imagem).secoes[l.idx_im[k]]
+    if (l.tam[k] == 0) or (((sec_off + tam) as u64) > (len(ps.bytes) as u64)) {
+        let msg_1 = format(f"ligar: relocacao em 0x{sec_off:x} fora da secao de saida {k}", alloc = heap)
+        defer delete(msg_1)
+        common.falha_interna(msg_1)
+    }
+}
+
+// C: nativo/obj/ligar.c:577
+proc ligar_aplicar_reloc(l: ^LigacaoEstado, o: i32, r: ^ObjReloc) -> bool {
+    let c: ^LigarContrib = ligar_contrib_de(l, o, r.alvo.secao)
+    if c.saida == LIGAR_SEM_SAIDA {
+        return true // relocacao de secao descartada nao se aplica (a secao nao esta no exe)
+    }
+    if (l.pedido as ^LigarPedido).formato == pefmt.IMAGEM_ELF {
+        return ligar_elf_relocar(l, o, r) // o ELF tem as proprias relocacoes (ABS32, GOTPCRELX, celulas .got...): ligar_elf.c
+    }
+    let k: i32 = c.saida
+    let sec_off: u32 = c.off + r.alvo.off
+    let alvo: u32 = l.rva_sim[o][r.correcao.simbolo as u64]
+    if alvo == LIGAR_SEM_RVA {
+        let txt_1 = ((l.obj or_else {})[o] as ^Objeto).simbolos[r.correcao.simbolo as u64].nome or_else "(null)"
+        let msg_1 = format(f"COFF: relocacao aponta para o simbolo '{txt_1}', que cai numa secao vazia", alloc = heap)
+        defer delete(msg_1)
+        return common.diag_relatar(l.erro as ^common.Diag, common.X0903, 0, msg_1)
+    }
+    let im: ^pefmt.Imagem = l.im as ^pefmt.Imagem
+    let ps: ^pefmt.PeSecao = &im.secoes[l.idx_im[k]]
+    let dir64: bool = r.correcao.tipo == OR_ADDR64
+    let tam: u32 = ligar_tamanho_campo(r.correcao.tipo)
+    ligar_conferir_campo_na_secao(l, k, sec_off, tam)
+    let p: u32 = l.rva[k] + sec_off
+    var valor: u64 = 0
+    if not ligar_valor_de(l, r, LigarPonto{alvo = alvo, campo = p}, &valor) {
+        return false
+    }
+    ligar_escrever_campo(ps.bytes[(sec_off as u64)..<((sec_off as u64) + (tam as u64))], valor)
+    if dir64 and ((l.pedido as ^LigarPedido).formato == pefmt.IMAGEM_PE) {
+        append(&im.dir64, item = p) // o ELF ET_EXEC tem endereco fixo: nada a relocar na carga
+    }
+    return true
+}
+
+// C: nativo/obj/ligar.c:604
+proc ligar_aplicar_relocs(l: ^LigacaoEstado) -> bool {
+    ligar_elf_preencher_got(l)
+    ligar_elf_debug(l)
+    for o in (0 as i32)..<LIGAR_QTD_OBJETOS {
+        let rels: ^[dynamic]ObjReloc = &((l.obj or_else {})[o] as ^Objeto).relocs
+        var i: u64 = 0
+        while i < (len(rels^) as u64) {
+            if not ligar_aplicar_reloc(l, o, &rels[i]) {
+                return false
+            }
+            i += 1
+        }
+    }
+    return true
+}
+
+// C: nativo/obj/ligar.c:620
+proc ligar_entrada(l: ^LigacaoEstado) -> bool {
+    if (l.pedido as ^LigarPedido).dinamico and (l.pedido as ^LigarPedido).dll {
+        return true // .so: sem _start, o carregador entra pelos exports
+    }
+    let nome: ?str = l.nome_entrada
+    let e: ?^ObjSimbolo = ligar_achar_definido(l, l.objeto_entrada, (nome or_else ""))
+    if e == none {
+        let txt_1 = nome or_else "(null)"
+        let msg_1 = format(f"COFF: simbolo '{txt_1}' indefinido no runtime (sem entrada)", alloc = heap)
+        defer delete(msg_1)
+        return common.diag_relatar(l.erro as ^common.Diag, common.X0903, 0, msg_1)
+    }
+    let rva: u32 = ligar_rva_definido(l, l.objeto_entrada, e)
+    if rva == LIGAR_SEM_RVA {
+        let txt_2 = nome or_else "(null)"
+        let msg_2 = format(f"COFF: simbolo '{txt_2}' cai numa secao vazia", alloc = heap)
+        defer delete(msg_2)
+        return common.diag_relatar(l.erro as ^common.Diag, common.X0903, 0, msg_2)
+    }
+    let ptr_1: ^pefmt.Imagem = l.im as ^pefmt.Imagem
+    ptr_1.entrada_rva = rva
+    return true
+}
+
+// C: nativo/obj/ligar.c:636
+proc ligar_coletar_exports(l: ^LigacaoEstado, simbolos: ^[dynamic]pefmt.PeExporta) -> bool {
+    let p: ?^LigarPedido = l.pedido
+    var ok: bool = true
+    var k: u32 = 0
+    while (k < (p as ^LigarPedido).qtd_exports) and (common.c2f_b2i32(ok) != 0) {
+        let s: ?^ObjSimbolo = ligar_achar_definido(l, LIGAR_PROGRAMA, ((p as ^LigarPedido).exports or_else {})[k])
+        var tern_1: u32 = LIGAR_SEM_RVA
+        if s != none {
+            tern_1 = ligar_rva_definido(l, LIGAR_PROGRAMA, s)
+        }
+        let rva: u32 = tern_1
+        if rva == LIGAR_SEM_RVA {
+            let fmt_1: str = ((p as ^LigarPedido).exports or_else {})[k]
+            let msg_1 = format(f"COFF: export '{fmt_1}' nao esta definido no programa", alloc = heap)
+            defer delete(msg_1)
+            ok = common.diag_relatar(l.erro as ^common.Diag, common.X0903, 0, msg_1)
+        } else {
+            append(simbolos, item = pefmt.PeExporta{})
+            simbolos[len(simbolos^) - 1] = pefmt.PeExporta{nome = ((p as ^LigarPedido).exports or_else {})[k], rva = rva}
+        }
+        k += 1
+    }
+    return ok
+}
+
+// C: nativo/obj/ligar.c:654
+proc ligar_exportar(l: ^LigacaoEstado) -> bool {
+    let p: ^LigarPedido = l.pedido as ^LigarPedido
+    var simbolos: [dynamic]pefmt.PeExporta = make([dynamic]pefmt.PeExporta, alloc = heap)
+    var ok: bool = ligar_coletar_exports(l, &simbolos)
+    if ok and (p.formato == pefmt.IMAGEM_ELF) {
+        // A4.2: no ELF os exports vao para o .dynsym (escritor dinamico), sem secao de exportacao do PE
+        for k in (0 as u64)..<(len(simbolos) as u64) {
+            append(&(l.im as ^pefmt.Imagem).exportacoes, item = simbolos[k])
+        }
+    } else if ok {
+        if not pefmt.pe_reservar_exportacoes(l.im as ^pefmt.Imagem, (p.nome_dll or_else ""), simbolos[..]) {
+            ok = common.diag_relatar(l.erro as ^common.Diag, common.X0903, 0, "COFF: a DLL nao tem export ou repete um nome de export")
+        }
+    }
+    delete(simbolos)
+    return ok
+}
+
+// C: nativo/obj/ligar.c:669
+proc ligar_ryu_ou_vazio(pedido: ^LigarPedido, vazio: ^Objeto) -> ?^Objeto {
+    var tern_1: ?^Objeto = vazio
+    if pedido.ryu != none {
+        tern_1 = pedido.ryu
+    }
+    return tern_1
+}
+
+// C: nativo/obj/ligar.c:675
+proc ligar_etapas_da_imagem(l: ^LigacaoEstado) -> bool {
+    return ((((common.c2f_b2i32(ligar_conferir_alcance(l)) != 0) and (common.c2f_b2i32(ligar_montar_secoes(l)) != 0)) and (common.c2f_b2i32(ligar_resolver_simbolos(l)) != 0)) and (common.c2f_b2i32(ligar_entrada(l)) != 0)) and (common.c2f_b2i32(ligar_aplicar_relocs(l)) != 0)
+}
+
+// C: nativo/obj/ligar.c:680
+proc ligar_nomes_importados(pedido: ^LigarPedido) -> u32 {
+    var n: u32 = 0
+    var t: u32 = 0
+    while t < ligar_tabelas_fixas(pedido) {
+        n += ligar_qtd_fixa(t)
+        t += 1
+    }
+    t = 0
+    while t < pedido.qtd_tabelas {
+        n += (pedido.tabelas or_else {})[t as u64].qtd
+        t += 1
+    }
+    return n
+}
+
+// C: nativo/obj/ligar.c:692
+proc ligar_conferir_limites(pedido: ^LigarPedido, erro: ^common.Diag) -> bool {
+    let dlls: u32 = ligar_tabelas_fixas(pedido) + pedido.qtd_tabelas
+    let nomes: u32 = ligar_nomes_importados(pedido)
+    if dlls > (pefmt.IMAGEM_MAX_DLLS as u32) {
+        let msg_1 = format(f"o programa pede {dlls} DLLs com import, contando a KERNEL32 e a ADVAPI32 do runtime; o ligador nativo aceita no maximo {pefmt.IMAGEM_MAX_DLLS}", alloc = heap)
+        defer delete(msg_1)
+        return common.diag_relatar(erro, common.X0109, 0, msg_1)
+    }
+    if nomes > (ALCANCE_MAX_IMPORTS as u32) {
+        let msg_2 = format(f"o programa pede {nomes} nomes importados de DLL, contando os {LIGAR_QTD_IMPORTS + LIGAR_QTD_IMPORTS_ADVAPI32} da KERNEL32 e da ADVAPI32 do runtime; o ligador nativo aceita no maximo {ALCANCE_MAX_IMPORTS}", alloc = heap)
+        defer delete(msg_2)
+        return common.diag_relatar(erro, common.X0109, 0, msg_2)
+    }
+    return true
+}
+
+// C: nativo/obj/ligar.c:706
+proc ligar_fechar_pe(l: ^LigacaoEstado) -> bool {
+    var tern_1: i32 = transmute(l.idx_im[LIGAR_SAIDA_PDATA], to = i32)
+    if l.tam[LIGAR_SAIDA_PDATA] == 0 {
+        tern_1 = -1
+    }
+    let pdata: i32 = tern_1
+    return ligar_pe_finalizar(l.im as ^pefmt.Imagem, pdata, l.erro as ^common.Diag)
+}
+
+// C: nativo/obj/ligar.c:714
+proc ligar_fechar(l: ^LigacaoEstado) -> bool {
+    if (common.c2f_b2i32((l.pedido as ^LigarPedido).dll) != 0) and (not ligar_exportar(l)) {
+        return false
+    }
+    if common.c2f_s2u_32((l.pedido as ^LigarPedido).formato) == (pefmt.IMAGEM_ELF as u32) {
+        // A4.2: ELF dinamico (PIE + DT_NEEDED, o .so do android) entra aqui; hoje o aarch64-linux-android sai como o ELF estatico do aarch64-linux
+        ligar_elf_coletar_simbolos(l)
+        return true
+    }
+    return ligar_fechar_pe(l)
+}
+
+// A4.2: passa para a Imagem o que o escritor ELF dinamico precisa (DT_NEEDED, DT_SONAME do .so, DT_RUNPATH do exe)
+proc ligar_dinamico_na_imagem(pedido: ^LigarPedido, im: ^pefmt.Imagem) {
+    im.dinamico = pedido.dinamico
+    if not pedido.dinamico {
+        return
+    }
+    let nomes: []str = pedido.necessarias or_else {}
+    for k in (0 as u32)..<pedido.qtd_necessarias {
+        append(&im.necessarias, item = nomes[k])
+    }
+    im.runpath = pedido.runpath
+    if pedido.dll {
+        im.soname = pedido.nome_dll
+    }
+}
+
+// C: nativo/obj/ligar.c:725
+proc ligar_imagem(pedido: ^LigarPedido, im: ^pefmt.Imagem, erro: ^common.Diag) -> bool {
+    var sem_ryu: Objeto = Objeto{}
+    obj_iniciar(&sem_ryu)
+    var objs: [16]?^Objeto = {}
+    objs[LIGAR_PROGRAMA] = pedido.programa
+    objs[LIGAR_RUNTIME] = pedido.runtime
+    objs[LIGAR_RYU] = ligar_ryu_ou_vazio(pedido, &sem_ryu)
+    objs[LIGAR_TERCEIROS] = pedido.terceiros or_else &sem_ryu
+    objs[LIGAR_LEGADO] = pedido.legado or_else &sem_ryu
+    objs[LIGAR_CURTO] = pedido.curto or_else &sem_ryu
+    objs[LIGAR_MATH] = pedido.math or_else &sem_ryu
+    objs[LIGAR_ES] = pedido.es or_else &sem_ryu
+    objs[LIGAR_THREAD] = pedido.thread or_else &sem_ryu
+    objs[LIGAR_SYNC] = pedido.sync or_else &sem_ryu
+    objs[LIGAR_ATOMIC] = pedido.atomic or_else &sem_ryu
+    objs[LIGAR_VARENA] = pedido.varena or_else &sem_ryu
+    objs[LIGAR_NET] = pedido.net or_else &sem_ryu
+    objs[LIGAR_ENTRADA] = pedido.entrada or_else &sem_ryu
+    objs[LIGAR_SEMENTE] = pedido.semente or_else &sem_ryu
+    objs[LIGAR_PERFIL] = pedido.perfil or_else &sem_ryu
+    var l: LigacaoEstado = LigacaoEstado{}
+    l.obj = objs
+    l.im = im
+    l.erro = erro
+    l.pedido = pedido
+    im.dll = pedido.dll
+    im.formato = pedido.formato
+    im.pie = pedido.pie
+    im.maquina = pedido.maquina
+    im.pagina = pedido.pagina
+    ligar_dinamico_na_imagem(pedido, im)
+    ligar_juntar_tabelas(&l, pedido)
+    ligar_preparar(&l)
+    let ok: bool = ligar_etapas_da_imagem(&l) and ligar_fechar(&l)
+    ligar_liberar(&l)
+    obj_liberar(&sem_ryu)
+    return ok
+}
+
+// C: nativo/obj/ligar.c:756
+pub proc ligar_com_tabelas(pedido: ^LigarPedido, im: ^pefmt.Imagem, erro: ^common.Diag) -> bool {
+    return ((common.c2f_b2i32(ligar_elf_conferir_formato(pedido, erro)) != 0) and (common.c2f_b2i32(ligar_conferir_limites(pedido, erro)) != 0)) and (common.c2f_b2i32(ligar_imagem(pedido, im, erro)) != 0)
+}
+
+// C: nativo/obj/ligar.c:761
+proc ligar(programa: ^Objeto, runtime: ^Objeto, im: ^pefmt.Imagem, erro: ^common.Diag) -> bool {
+    var lit_1 = LigarPedido{programa = programa, runtime = runtime}
+    return ligar_com_tabelas(&lit_1, im, erro)
+}
+
+// ---------- testes dirigidos (V4 W4b): o estado do ligador montado em memoria, sem I/O ----------
+
+proc ligar_teste_abrir(objs: ^[16]Objeto, ptrs: ^[16]?^Objeto) {
+    for i in (0 as u32)..<16 {
+        obj_iniciar(&objs[i])
+        ptrs[i] = &objs[i]
+    }
+}
+
+proc ligar_teste_fechar(objs: ^[16]Objeto) {
+    for i in (0 as u32)..<16 {
+        obj_liberar(&objs[i])
+    }
+}
+
+// uma secao com os bytes dados (e a lista de bytes na ordem)
+proc ligar_teste_secao(o: ^Objeto, nome: str, tipo: i32, alinhamento: u32, bytes: []u8) -> u32 {
+    let sec: u32 = obj_secao_abrir(o, nome, tipo, alinhamento)
+    for k in (0 as u64)..<(len(bytes) as u64) {
+        append(&o.secoes[sec as u64].bytes, item = bytes[k])
+    }
+    return sec
+}
+
+test "ligar_alinhar e indice_saida" {
+    expect(ligar_alinhar(0, 16) == 0)
+    expect(ligar_alinhar(1, 16) == 16)
+    expect(ligar_alinhar(16, 16) == 16)
+    expect(ligar_alinhar(17, 4) == 20)
+    expect(ligar_indice_saida(".text") == 0)
+    expect(ligar_indice_saida(".text$f") == 0)
+    expect(ligar_indice_saida(".text.unlikely") == 0)
+    expect(ligar_indice_saida(".textx") == -1)
+    expect(ligar_indice_saida(".rdata$zzz") == 1)
+    expect(ligar_indice_saida(".data") == 2)
+    expect(ligar_indice_saida(".pdata") == 3)
+    expect(ligar_indice_saida(".xdata") == 4)
+    expect(ligar_indice_saida(".bss") == 5)
+    expect(ligar_indice_saida(".init_array") == 6)
+    expect(ligar_indice_saida(".got") == 7)
+    expect(ligar_indice_saida(".tdata") == -1)
+    expect(ligar_indice_saida(".idata") == -1)
+    expect(ligar_indice_saida(".te") == -1)
+    expect(LIGAR_NOMES_SAIDA[LIGAR_SAIDA_TLS] == ".tdata")
+    expect(LIGAR_CARAC_SAIDA[LIGAR_SAIDA_TEXTO] == pefmt.PE_SECAO_TEXTO)
+    expect(LIGAR_CARAC_SAIDA[LIGAR_SAIDA_PDATA] == pefmt.PE_SECAO_LEITURA)
+    expect(LIGAR_CARAC_SAIDA[LIGAR_SAIDA_BSS] == pefmt.PE_SECAO_BSS)
+    expect(LIGAR_CARAC_SAIDA[LIGAR_SAIDA_GOT] == pefmt.PE_SECAO_DADOS)
+    expect(LIGAR_ORDEM_SAIDAS[pefmt.IMAGEM_PE][8] == 8)
+    expect(LIGAR_ORDEM_SAIDAS[pefmt.IMAGEM_ELF][0] == 1)
+    expect(LIGAR_ORDEM_SAIDAS[pefmt.IMAGEM_ELF][8] == 4)
+}
+
+test "ligar_zeros anexa n bytes zero" {
+    var b: [dynamic]u8 = make([dynamic]u8, alloc = heap)
+    defer delete(b)
+    ligar_zeros(&b, 0)
+    expect(len(b) == 0)
+    ligar_zeros(&b, 3)
+    expect(len(b) == 3)
+    append(&b, item = 7)
+    ligar_zeros(&b, 300)
+    expect(len(b) == 304)
+    expect(b[2] == 0)
+    expect(b[3] == 7)
+    expect(b[303] == 0)
+}
+
+test "ligar_juntar_tabelas copia as fixas, funde a WS2_32 e junta as dos link" {
+    var objs: [16]Objeto = {}
+    var ptrs: [16]?^Objeto = {}
+    ligar_teste_abrir(&objs, &ptrs)
+    defer ligar_teste_fechar(&objs)
+    var extra_nomes: [3]str = {"socket", "ws_novo_1", "ws_novo_2"}
+    var outra_nomes: [1]str = {"CoisaDeOutraDll"}
+    var extras: [2]ImportTabela = {}
+    extras[0] = ImportTabela{dll = "ws2_32.dll", simbolos = extra_nomes[..], qtd = 3}
+    extras[1] = ImportTabela{dll = "outra.dll", simbolos = outra_nomes[..], qtd = 1}
+    var pedido: LigarPedido = LigarPedido{programa = &objs[0], runtime = &objs[1], net = &objs[2], tabelas = extras[..], qtd_tabelas = 2}
+    var l: LigacaoEstado = LigacaoEstado{}
+    l.obj = ptrs
+    l.pedido = &pedido
+    expect(ligar_tabelas_fixas(&pedido) == 3)
+    ligar_juntar_tabelas(&l, &pedido)
+    expect(l.qtd_tabelas == 4)
+    expect(l.tabelas[0].qtd == 85)
+    expect((l.tabelas[0].dll or_else "") == "KERNEL32.dll")
+    expect((l.tabelas[0].simbolos or_else {})[0] == "GetStdHandle")
+    expect((l.tabelas[0].simbolos or_else {})[84] == "SetLastError")
+    expect((l.tabelas[1].dll or_else "") == "ADVAPI32.dll")
+    expect(l.tabelas[1].qtd == 1)
+    expect((l.tabelas[1].simbolos or_else {})[0] == "SystemFunction036")
+    // a WS2_32 fixa (18) fundida com a do link: socket ja existe, entram 2
+    expect((l.tabelas[2].dll or_else "") == "WS2_32.dll")
+    expect(l.tabelas[2].qtd == 20)
+    expect((l.tabelas[2].simbolos or_else {})[0] == "WSAStartup")
+    expect((l.tabelas[2].simbolos or_else {})[17] == "getsockopt")
+    expect((l.tabelas[2].simbolos or_else {})[18] == "ws_novo_1")
+    expect((l.tabelas[2].simbolos or_else {})[19] == "ws_novo_2")
+    expect((l.tabelas[3].dll or_else "") == "outra.dll")
+    expect(l.tabelas[3].qtd == 1)
+    ligar_planejar_imports(&l)
+    expect(l.qtd_plano == 85 + 1 + 20 + 1)
+    expect(l.plano[0] == "GetStdHandle")
+    expect(l.plano[85] == "SystemFunction036")
+    expect(l.plano[86] == "WSAStartup")
+    expect(l.plano[105] == "ws_novo_2")
+    expect(l.plano[106] == "CoisaDeOutraDll")
+    expect(ligar_nomes_importados(&pedido) == 85 + 1 + 18 + 3 + 1)
+    // sem net so as 2 fixas; ELF nao tem nenhuma
+    var sem_net: LigarPedido = LigarPedido{programa = &objs[0], runtime = &objs[1]}
+    expect(ligar_tabelas_fixas(&sem_net) == 2)
+    expect(ligar_nomes_importados(&sem_net) == 86)
+    var elf: LigarPedido = LigarPedido{programa = &objs[0], runtime = &objs[1], formato = pefmt.IMAGEM_ELF}
+    expect(ligar_tabelas_fixas(&elf) == 0)
+    expect(ligar_nomes_importados(&elf) == 0)
+}
+
+test "ligar_selecionar_tabela marca os slots dos imports alcancaveis" {
+    var l: LigacaoEstado = LigacaoEstado{}
+    l.plano[0] = "a"
+    l.plano[1] = "b"
+    l.plano[2] = "c"
+    l.plano[3] = "d"
+    l.alcance.imports_usados[0] = 5 // bits 0 e 2
+    var u: LigarUsados = LigarUsados{n = 0, k = 0}
+    var tabela: ImportTabela = ImportTabela{qtd = 3}
+    ligar_selecionar_tabela(&l, &tabela, &u)
+    expect(u.k == 3)
+    expect(u.n == 2)
+    expect(u.usados[0] == "a")
+    expect(u.usados[1] == "c")
+    expect(l.slot_import[0] == 0)
+    expect(l.slot_import[1] == -1)
+    expect(l.slot_import[2] == 1)
+    // a 2a tabela continua de onde a 1a parou (k=3): d nao esta usado
+    var t2: ImportTabela = ImportTabela{qtd = 1}
+    ligar_selecionar_tabela(&l, &t2, &u)
+    expect(u.k == 4)
+    expect(u.n == 2)
+    expect(l.slot_import[3] == -1)
+}
+
+test "ligar integrado PE: alcance, secoes, simbolos, entrada e relocacoes" {
+    var objs: [16]Objeto = {}
+    var ptrs: [16]?^Objeto = {}
+    ligar_teste_abrir(&objs, &ptrs)
+    defer ligar_teste_fechar(&objs)
+    // programa: .text (REL32 em 0), .data (ADDR64 em 4), .bss
+    var texto_prog: [8]u8 = {0, 0, 0, 0, 144, 144, 144, 144}
+    var dados_prog: [12]u8 = {9, 9, 9, 9, 0, 0, 0, 0, 0, 0, 0, 0}
+    let sec_t: u32 = ligar_teste_secao(&objs[0], ".text", OS_TEXTO, 16, texto_prog[..])
+    let sec_d: u32 = ligar_teste_secao(&objs[0], ".data", OS_DATA, 4, dados_prog[..])
+    let sec_b: u32 = obj_secao_abrir(&objs[0], ".bss", OS_BSS, 8)
+    objs[0].secoes[sec_b as u64].tam_bss = 24
+    let s_ent: u32 = obj_simbolo_referir(&objs[0], "forja_entrada")
+    let s_dado: u32 = obj_simbolo_definir(&objs[0], "meu_dado", sec_d as i32, 0)
+    let s_imp: u32 = obj_simbolo_referir(&objs[0], "__imp_GetStdHandle")
+    obj_relocar(&objs[0], ObjAlvoReloc{secao = sec_t, off = 0}, ObjCorrecao{tipo = OR_REL32, simbolo = s_ent, adendo = -4})
+    obj_relocar(&objs[0], ObjAlvoReloc{secao = sec_d, off = 4}, ObjCorrecao{tipo = OR_ADDR64, simbolo = s_dado, adendo = 0})
+    obj_relocar(&objs[0], ObjAlvoReloc{secao = sec_t, off = 4}, ObjCorrecao{tipo = OR_REL32, simbolo = s_imp, adendo = -4})
+    // runtime: .text$f define forja_entrada; .text$dead nao e alcancada
+    var texto_rt: [2]u8 = {195, 195}
+    var morta_rt: [1]u8 = {204}
+    let sec_rt: u32 = ligar_teste_secao(&objs[1], ".text$f", OS_TEXTO, 16, texto_rt[..])
+    let sec_morta: u32 = ligar_teste_secao(&objs[1], ".text$dead", OS_TEXTO, 1, morta_rt[..])
+    let s_rt: u32 = obj_simbolo_definir(&objs[1], "forja_entrada", sec_rt as i32, 0)
+    var pedido: LigarPedido = LigarPedido{programa = &objs[0], runtime = &objs[1]}
+    var erro: common.Diag = common.Diag{tem = false}
+    var im: pefmt.Imagem = pefmt.Imagem{}
+    im.dir64 = make([dynamic]u32, alloc = heap)
+    defer delete(im.dir64)
+    var l: LigacaoEstado = LigacaoEstado{}
+    l.obj = ptrs
+    l.im = &im
+    l.erro = &erro
+    l.pedido = &pedido
+    ligar_juntar_tabelas(&l, &pedido)
+    ligar_preparar(&l)
+    defer ligar_liberar(&l)
+    expect(l.qtd_tabelas == 2)
+    expect(l.qtd_plano == 86)
+    expect(l.objeto_entrada == LIGAR_RUNTIME)
+    expect((l.nome_entrada or_else "") == "forja_entrada")
+    expect(l.texto_runtime_off == LIGAR_SEM_RVA)
+    expect(len(l.contrib[0]) == 3)
+    expect(len(l.contrib[1]) == 2)
+    expect(l.contrib[1][1].saida == LIGAR_SEM_SAIDA)
+    // alcance: tudo do programa vivo, a entrada do runtime viva, a secao morta fora; so o import GetStdHandle usado
+    expect(l.alcance.indefinido == none)
+    expect(l.alcance.import_fora == none)
+    expect(alcance_vivo(&l.alcance, 0, sec_t))
+    expect(alcance_vivo(&l.alcance, 0, sec_d))
+    expect(alcance_vivo(&l.alcance, 0, sec_b))
+    expect(alcance_vivo(&l.alcance, 1, sec_rt))
+    expect(not alcance_vivo(&l.alcance, 1, sec_morta))
+    expect(alcance_import_usado(&l.alcance, 0))
+    expect(not alcance_import_usado(&l.alcance, 1))
+    expect(ligar_conferir_alcance(&l))
+    // secoes: ordem e alinhamento das contribuicoes
+    expect(ligar_mapear_objetos(&l))
+    expect(l.contrib[0][0].saida == LIGAR_SAIDA_TEXTO)
+    expect(l.contrib[0][0].off == 0)
+    expect(l.contrib[0][1].saida == LIGAR_SAIDA_DATA)
+    expect(l.contrib[0][2].saida == LIGAR_SAIDA_BSS)
+    expect(l.contrib[1][0].saida == LIGAR_SAIDA_TEXTO)
+    expect(l.contrib[1][0].off == 16)
+    expect(l.contrib[1][1].saida == LIGAR_SEM_SAIDA)
+    expect(l.tam[LIGAR_SAIDA_TEXTO] == 18)
+    expect(l.tam[LIGAR_SAIDA_DATA] == 12)
+    expect(l.tam[LIGAR_SAIDA_BSS] == 24)
+    expect(l.texto_runtime_off == 16)
+    expect(ligar_contrib_de(&l, 1, sec_rt).off == 16)
+    // os bytes das secoes de saida moram na Imagem (o que imagem_secao faria): .text em secoes[0], .data em secoes[1]
+    im.secoes[0].bytes = make([dynamic]u8, alloc = heap)
+    im.secoes[1].bytes = make([dynamic]u8, alloc = heap)
+    defer delete(im.secoes[0].bytes)
+    defer delete(im.secoes[1].bytes)
+    let juntado: ^[dynamic]u8 = &im.secoes[0].bytes
+    let dados: ^[dynamic]u8 = &im.secoes[1].bytes
+    ligar_juntar(&l, LIGAR_SAIDA_TEXTO, juntado)
+    expect(len(juntado^) == 18)
+    expect(juntado[4] == 144)
+    expect(juntado[8] == 0)
+    expect(juntado[15] == 0)
+    expect(juntado[16] == 195)
+    expect(juntado[17] == 195)
+    ligar_juntar(&l, LIGAR_SAIDA_DATA, dados)
+    expect(len(dados^) == 12)
+    // RVAs das saidas (quem as da no real e imagem_secao) e os slots da IAT
+    l.rva[LIGAR_SAIDA_TEXTO] = 4096
+    l.rva[LIGAR_SAIDA_DATA] = 8192
+    l.rva[LIGAR_SAIDA_BSS] = 12288
+    l.idx_im[LIGAR_SAIDA_TEXTO] = 0
+    l.idx_im[LIGAR_SAIDA_DATA] = 1
+    im.qtd_secoes = 2
+    var k: u32 = 0
+    while k < 320 {
+        l.slot_import[k] = -1
+        k += 1
+    }
+    l.slot_import[0] = 0
+    im.importacao.iat_rva[0] = 13568
+    expect(ligar_resolver_simbolos(&l))
+    expect(l.rva_sim[0][s_ent as u64] == 4096 + 16)
+    expect(l.rva_sim[0][s_dado as u64] == 8192)
+    expect(l.rva_sim[0][s_imp as u64] == 13568)
+    expect(l.rva_sim[1][s_rt as u64] == 4096 + 16)
+    expect(ligar_rva_import(&l, &objs[0].simbolos[s_imp as u64]) == 13568)
+    expect(ligar_entrada(&l))
+    expect(im.entrada_rva == 4096 + 16)
+    // relocacoes: REL32 em .text+0 (S + A - (P + 4)), ADDR64 em .data+4 (base + S) e o __imp_ em .text+4
+    expect(ligar_aplicar_reloc(&l, 0, &objs[0].relocs[0]))
+    expect(juntado[0] == 8)
+    expect(juntado[1] == 0)
+    expect(juntado[3] == 0)
+    expect(ligar_aplicar_reloc(&l, 0, &objs[0].relocs[1]))
+    expect(dados[4] == 0)
+    expect(dados[5] == 32)
+    expect(dados[6] == 0)
+    expect(dados[7] == 64)
+    expect(dados[8] == 1)
+    expect(dados[9] == 0)
+    expect(len(im.dir64) == 1)
+    expect(im.dir64[0] == 8196)
+    expect(ligar_aplicar_reloc(&l, 0, &objs[0].relocs[2]))
+    // S + A - (P + 4) = 13568 - 4 - (4096 + 4 + 4) = 9460 = 0x24F4
+    expect(juntado[4] == 244)
+    expect(juntado[5] == 36)
+    expect(len(im.dir64) == 1)
+    expect(ligar_fechar_pe(&l))
+    // simbolo definido nos dois objetos: o programa passa a definir tambem forja_entrada no objeto 2
+    expect(not ligar_duplicado(&l, 1, &objs[1].simbolos[s_rt as u64]))
+    let s_dup: u32 = obj_simbolo_definir(&objs[2], "forja_entrada", 0, 0)
+    expect(ligar_duplicado(&l, 1, &objs[1].simbolos[s_rt as u64]))
+    var rva: u32 = 0
+    expect(not ligar_resolver_simbolo(&l, 1, &objs[1].simbolos[s_rt as u64], &rva))
+    expect(erro.tem)
+    expect(erro.codigo == common.X0903)
+    expect((erro.causa or_else "") == "COFF: simbolo 'forja_entrada' definido nos dois objetos")
+    expect(s_dup == 0)
+}
+
+test "ligar_mapear_secao: secao sem lugar no PE e conteudo dentro de .bss" {
+    var objs: [16]Objeto = {}
+    var ptrs: [16]?^Objeto = {}
+    ligar_teste_abrir(&objs, &ptrs)
+    defer ligar_teste_fechar(&objs)
+    var um: [1]u8 = {1}
+    let sec_x: u32 = ligar_teste_secao(&objs[0], ".xyz", OS_DATA, 4, um[..])
+    let sec_b: u32 = ligar_teste_secao(&objs[0], ".bss", OS_DATA, 4, um[..])
+    let sec_dbg: u32 = ligar_teste_secao(&objs[0], ".debug_info", OS_DEBUG_INFO, 1, um[..])
+    let sec_e: u32 = ligar_teste_secao(&objs[1], ".text", OS_TEXTO, 16, um[..])
+    let s_rt: u32 = obj_simbolo_definir(&objs[1], "forja_entrada", sec_e as i32, 0)
+    var pedido: LigarPedido = LigarPedido{programa = &objs[0], runtime = &objs[1]}
+    var erro: common.Diag = common.Diag{tem = false}
+    var im: pefmt.Imagem = pefmt.Imagem{}
+    var l: LigacaoEstado = LigacaoEstado{}
+    l.obj = ptrs
+    l.im = &im
+    l.erro = &erro
+    l.pedido = &pedido
+    ligar_juntar_tabelas(&l, &pedido)
+    ligar_preparar(&l)
+    defer ligar_liberar(&l)
+    expect(ligar_mapear_secao(&l, 0, sec_dbg)) // debug: sem saida, sem erro
+    expect(l.contrib[0][sec_dbg as u64].saida == LIGAR_SEM_SAIDA)
+    expect(not ligar_mapear_secao(&l, 0, sec_x))
+    expect(erro.codigo == common.X0903)
+    expect((erro.causa or_else "") == "COFF: secao '.xyz' sem lugar no PE (use .text, .rdata, .data, .pdata, .xdata ou .bss)")
+    expect(not ligar_mapear_secao(&l, 0, sec_b))
+    expect((erro.causa or_else "") == "COFF: secao '.bss' com conteudo dentro de .bss")
+    expect(s_rt == 0)
+}

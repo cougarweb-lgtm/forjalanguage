@@ -1,0 +1,144 @@
+// std:linebreak 0.1.0 - quebra de linha (UAX #14) e quebra de grafema (UAX #29) para a Forja, por cima do libunibreak 8.0.1 (licenca zlib) em vendor\libunibreak.a (Windows) e vendor\linux\libunibreak.a (Linux). Tabelas Unicode 17.0.0.
+// Versao: 0.1.0
+// Changelog: 0.1.0 - primeira versao: line_breaks_utf8, grapheme_breaks_utf8, break_at, grapheme_at, unicode_version, init.
+//
+// COMO USAR (o .fj raiz precisa de uma pasta vendor\ ao lado: libunibreak.a, linebreak\linebreak.fj, linebreak\linebreak_c.fj e linebreak\graphemebreak_c.fj; ver MEM-FORJA-GUIA-10):
+//     import "vendor:linebreak/linebreak"
+//     var quebras = linebreak.line_breaks_utf8("Ola mundo, tudo bem?", lang = "", alloc = heap)
+//     defer delete(quebras)
+//     switch k in linebreak.break_at(quebras[..], 3) {
+//     case linebreak.BreakKind:
+//         print(k == linebreak.BreakKind.allow_break)
+//     case linebreak.LinebreakError:
+//         print("indice fora")
+//     }
+//
+// SAIDA: line_breaks_utf8 devolve UM valor por BYTE do texto (nao por caractere). No ULTIMO byte de cada caractere UTF-8 fica a quebra DEPOIS dele
+// (BreakKind); os bytes anteriores do mesmo caractere ficam inside_char (no ASCII o caractere tem 1 byte, entao o valor e o proprio byte).
+// Assim, a quebra depois do caractere que termina no byte i e break_at(saida, i). break_at le o byte i ja convertido para o enum.
+// grapheme_breaks_utf8 segue o mesmo formato, com GraphemeKind (boundary, inside_grapheme, inside_char).
+// FIM DO TEXTO: a lib devolve um valor "indeterminado" no ultimo caractere; pela LB3 do UAX #14 o fim do texto e quebra obrigatoria, entao esse valor e trocado por must_break.
+//   Nenhum outro valor e alterado. O grafema nao tem essa troca: o que a lib devolve no fim do texto e o que sai aqui.
+//
+// TEXTO: todo parametro de texto publico e `str` (UTF-8). `lang` e o codigo ISO 639-1 ("en", "de", "es", "fr", "ja", "ko", "ru", "zh"), "" = regra padrao;
+//   o sufixo "-strict" (ex.: "-strict", "ja-strict") liga o modo estrito do Conditional Japanese Starter (CJ, kana pequena): na regra padrao a lib
+//   resolve CJ como ID; com "-strict", como NS. O LineBreakTest oficial (17.0.0) e gerado no modo "-strict": use-o para conferir.
+//   Codigo desconhecido cai na regra padrao. O texto e a lingua sao copiados para cstr em heap dentro da proc, usados e liberados la dentro.
+//
+// DONOS E EMPRESTADOS:
+//   - line_breaks_utf8 e grapheme_breaks_utf8 devolvem lista DONA do alocador passado em `alloc`: chame delete(lista) uma vez (ou use alloc = heap com defer delete).
+//   - break_at e grapheme_at nao alocam e nao guardam nada: leem a lista emprestada.
+//
+// Erro: LinebreakError (out_of_range: indice fora da lista; invalid_value: byte que nao e um valor da lib).
+//
+// LIMITE: a lib guarda tabelas em memoria estatica e nao exige init; init() existe para o contrato e pode ser chamada quantas vezes quiser (as duas funcoes da lib sao no-op).
+//
+// VERIFICAR: python language\exemplos_libs\verificar_libs.py --so linebreak_basico   (ou: forja run language\exemplos_libs\linebreak_basico.fj)
+
+import "vendor:linebreak/linebreak_c" as lbc
+import "vendor:linebreak/graphemebreak_c" as gbc
+
+pub enum BreakKind {
+    must_break
+    allow_break
+    no_break
+    inside_char
+}
+
+pub enum GraphemeKind {
+    boundary
+    inside_grapheme
+    inside_char
+}
+
+pub enum LinebreakError {
+    out_of_range
+    invalid_value
+}
+
+const UNICODE_VERSAO: str = "17.0.0"
+
+// Versao das tabelas Unicode usadas pela lib (as tabelas vem do LineBreak-17.0.0.txt e do GraphemeBreakProperty da 17.0.0).
+pub proc unicode_version() -> str {
+    return UNICODE_VERSAO
+}
+
+// A lib nao exige init (as funcoes init_* sao vazias na 8.0.1). Mantida no contrato; chamar de novo nao faz nada.
+pub proc init() {
+    lbc.init_linebreak()
+    gbc.init_graphemebreak()
+}
+
+// Quebra de linha por byte: uma entrada por byte do texto, com a quebra depois do caractere que ele inicia (ver SAIDA acima).
+pub proc line_breaks_utf8(text: str, lang: str, alloc: Allocator) -> [dynamic]u8 {
+    var saida = make([dynamic]u8, alloc = alloc, cap = len(text))
+    if len(text) == 0 {
+        return saida
+    }
+    let lang_c = format_c(f"{lang}", alloc = heap)
+    defer delete(lang_c)
+    let bytes = as_bytes(text)
+    resize(&saida, len(text))
+    let brks = &saida[0] as rawptr
+    lbc.set_linebreaks_utf8(&bytes[0], len_ = len(bytes) as u64, lang = lang_c, brks = brks as ?^i8)
+    for i in 0..<len(saida) {
+        if (saida[i] as i32) == lbc.LINEBREAK_INDETERMINATE {
+            saida[i] = (lbc.LINEBREAK_MUSTBREAK as u8)
+        }
+    }
+    return saida
+}
+
+// Quebra de grafema por byte (mesmo formato de line_breaks_utf8, com GraphemeKind).
+pub proc grapheme_breaks_utf8(text: str, lang: str, alloc: Allocator) -> [dynamic]u8 {
+    var saida = make([dynamic]u8, alloc = alloc, cap = len(text))
+    if len(text) == 0 {
+        return saida
+    }
+    let lang_c = format_c(f"{lang}", alloc = heap)
+    defer delete(lang_c)
+    let bytes = as_bytes(text)
+    resize(&saida, len(text))
+    let brks = &saida[0] as rawptr
+    gbc.set_graphemebreaks_utf8(&bytes[0], len_ = len(bytes) as u64, lang = lang_c, brks = brks as ?^i8)
+    return saida
+}
+
+// Le a quebra do byte `index` de uma lista de line_breaks_utf8.
+pub proc break_at(breaks: []u8, index: int) -> BreakKind ! LinebreakError {
+    if index < 0 or index >= len(breaks) {
+        return LinebreakError.out_of_range
+    }
+    let valor = breaks[index] as i32
+    if valor == lbc.LINEBREAK_MUSTBREAK {
+        return BreakKind.must_break
+    }
+    if valor == lbc.LINEBREAK_ALLOWBREAK {
+        return BreakKind.allow_break
+    }
+    if valor == lbc.LINEBREAK_NOBREAK {
+        return BreakKind.no_break
+    }
+    if valor == lbc.LINEBREAK_INSIDEACHAR {
+        return BreakKind.inside_char
+    }
+    return LinebreakError.invalid_value
+}
+
+// Le o tipo de grafema do byte `index` de uma lista de grapheme_breaks_utf8.
+pub proc grapheme_at(breaks: []u8, index: int) -> GraphemeKind ! LinebreakError {
+    if index < 0 or index >= len(breaks) {
+        return LinebreakError.out_of_range
+    }
+    let valor = breaks[index] as i32
+    if valor == gbc.GRAPHEMEBREAK_BREAK {
+        return GraphemeKind.boundary
+    }
+    if valor == gbc.GRAPHEMEBREAK_NOBREAK {
+        return GraphemeKind.inside_grapheme
+    }
+    if valor == gbc.GRAPHEMEBREAK_INSIDEACHAR {
+        return GraphemeKind.inside_char
+    }
+    return LinebreakError.invalid_value
+}

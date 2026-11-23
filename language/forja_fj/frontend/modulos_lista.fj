@@ -1,0 +1,329 @@
+// frontend/modulos_lista.fj - porte de compiler/frontend/modulos_lista.c
+// sha256 de frontend/modulos_lista.c: 2c7f193354d62d106ee169d7c998ee386e877c2ae115646f910bc334ae49bf13
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.2.0
+// Changelog: 0.2.0 - G3 P-front A: corpo real. Lista.nomes (char[192][96]) vira lista de str de heap cortadas em 95 bytes (quem cria a Lista chama lista_liberar); FindFirstFileA/
+//            FindNextFileA -> file.read_dir (C2F-C1; pasta e arquivo "link" sem seguir o link, como no pasta_fj); qsort -> sort_by com comparador ^str (C2F-B0);
+//            destino dos textos fica []u8 (o chamador le ate o tamanho devolvido); SINONIMOS vira const [7]Sinonimo.
+
+import "std:text"
+import "std:file"
+import "common"
+
+struct Lista {
+    nomes: [dynamic]str
+    n: u64
+    fora: u64
+}
+
+struct Sinonimo {
+    pt: str
+    en: str
+}
+
+const NOMES_MAX: i32 = 192
+const NOME_TAM: i32 = 96
+const VENDOR_PROFUNDIDADE: i32 = 4
+const DISTANCIA_MAX: i32 = 2
+const RESERVA_FALTA: i32 = 16
+
+// Sinonimos do que a IA escreve em PT para o modulo da std (confirmados contra a tabela STD)
+const SINONIMOS: [7]Sinonimo = {
+    Sinonimo{pt = "texto", en = "text"},
+    Sinonimo{pt = "ficheiro", en = "file"},
+    Sinonimo{pt = "arquivo", en = "file"},
+    Sinonimo{pt = "memoria", en = "mem"},
+    Sinonimo{pt = "rede", en = "net"},
+    Sinonimo{pt = "tempo", en = "time"},
+    Sinonimo{pt = "caminho", en = "path"},
+}
+
+// C2F: o C tinha Lista na pilha (char[192][96]); aqui cada nome e uma str de heap e a lista de dono unico precisa ser liberada
+proc lista_liberar(l: ^Lista) {
+    for k in 0..<len(l.nomes) {
+        delete(l.nomes[k])
+    }
+    delete(l.nomes)
+}
+
+// C: frontend/modulos_lista.c:31
+// snprintf(l->nomes[n], NOME_TAM, "%s", nome): corta em NOME_TAM - 1 bytes
+proc acrescentar(l: ^Lista, nome: str) {
+    if l.n >= (NOMES_MAX as u64) {
+        l.fora += 1
+        return
+    }
+    append(&l.nomes, item = common.c2f_cortar(nome, (NOME_TAM - 1) as int))
+    l.n += 1
+}
+
+// C: frontend/modulos_lista.c:40
+proc coletar_std(l: ^Lista) {
+    var nomes: [192]str = {}
+    let n: u64 = modulos_std_nomes(nomes[..], NOMES_MAX as u64)
+    for k in (0 as u64)..<n {
+        let nome = format(f"std:{nomes[k]}", alloc = heap)
+        acrescentar(l, nome)
+        delete(nome)
+    }
+}
+
+// C: frontend/modulos_lista.c:53
+proc eh_fj(nome: str) -> bool {
+    let n: u64 = len(nome) as u64
+    return (n > 3) and (nome[(n - 3)..<n] == ".fj")
+}
+
+// C: frontend/modulos_lista.c:60
+// Desce a pasta 'dir' (rel = o caminho do import ate aqui, com '/' no fim) e acrescenta cada .fj como vendor:<rel><nome sem .fj>.
+// C2F-C1: FindFirstFileA -> file.read_dir (ja sem "." e ".."); padrao[400] = dir + "\*": dir que nao cabe da busca falha e a pasta e pulada
+proc coletar_pasta(dir: str, rel: str, profundidade: i32, l: ^Lista) {
+    if profundidade > VENDOR_PROFUNDIDADE {
+        return
+    }
+    if (len(dir) + 2) >= 400 {
+        return
+    }
+    switch lista in file.read_dir(dir, alloc = heap) {
+    case file.DirList:
+        for i in 0..<len(lista.items) {
+            let achado: file.DirEntry = lista.items[i]
+            if (len(achado.name) == 0) or (achado.name[0] == 46) { // '.'
+                continue
+            }
+            if achado.kind == file.FileKind.dir {
+                let sub_dir_inteiro = format(f"{dir}\\{achado.name}", alloc = heap)
+                let sub_dir = common.c2f_cortar(sub_dir_inteiro, 399) // char sub_dir[400]
+                let sub_rel_inteiro = format(f"{rel}{achado.name}/", alloc = heap)
+                let sub_rel = common.c2f_cortar(sub_rel_inteiro, (NOME_TAM - 1) as int) // char sub_rel[NOME_TAM]
+                coletar_pasta(sub_dir, sub_rel, profundidade + 1, l)
+                delete(sub_dir_inteiro)
+                delete(sub_dir)
+                delete(sub_rel_inteiro)
+                delete(sub_rel)
+            } else if eh_fj(achado.name) {
+                let nome = format(f"vendor:{rel}{achado.name[0..<(len(achado.name) - 3)]}", alloc = heap)
+                acrescentar(l, nome) // o corte em NOME_TAM - 1 acontece em acrescentar
+                delete(nome)
+            }
+        }
+        delete(lista.items)
+        delete(lista.data)
+    case file.FileError:
+        return
+    }
+}
+
+// C: frontend/modulos_lista.c:86
+// vendor\ ao lado do arquivo raiz (pasta = Modulos.pasta)
+proc coletar_vendor(pasta: str, l: ^Lista) {
+    let dir_inteiro = format(f"{pasta}\\vendor", alloc = heap)
+    let dir = common.c2f_cortar(dir_inteiro, 399) // char dir[400]
+    coletar_pasta(dir, "", 0, l)
+    delete(dir_inteiro)
+    delete(dir)
+}
+
+// C: frontend/modulos_lista.c:99
+proc coletar_nomes(pasta: str, l: ^Lista) {
+    l.n = 0
+    l.fora = 0
+    coletar_std(l)
+    coletar_vendor(pasta, l)
+}
+
+// C: frontend/modulos_lista.c:107
+// C2F-B0: comparador de qsort (const void * -> ^str, os casts somem)
+proc comparar_nomes(a: ^str, b: ^str) -> i32 {
+    return common.c2f_strcmp(a^, b^)
+}
+
+// C2F-B0: o par `_menor` do sort_by
+proc comparar_nomes_menor(a: ^str, b: ^str) -> bool {
+    return comparar_nomes(a, b) < 0
+}
+
+// C: frontend/modulos_lista.c:113
+// Anexa 'tam' bytes em destino se cabem com a folga da marca " (+N)"; false = nao coube.
+proc anexar(destino: []u8, cap: u64, n: ^u64, texto: str, tam: u64) -> bool {
+    if ((n^ + tam) + (RESERVA_FALTA as u64)) >= cap {
+        return false
+    }
+    let origem: []u8 = as_bytes(texto)
+    for k in (0 as u64)..<tam {
+        destino[n^ + k] = origem[k]
+    }
+    n^ += tam
+    destino[n^] = 0
+    return true
+}
+
+// C: frontend/modulos_lista.c:123
+// Um grupo ("std: " ou "vendor: ") por prefixo; itens separados por ", " e grupos por "; ".
+proc juntar(l: ^Lista, destino: []u8, cap: u64) -> u64 {
+    var n: u64 = 0
+    var k: u64 = 0
+    var cab: u64 = 0
+    var grupo: str = ""
+    var tem_grupo: bool = false
+    destino[0] = 0
+    while k < l.n {
+        let nome: str = l.nomes[k]
+        let dois: int = text.index_byte(nome, 58) or_else 0 // strchr(nome, ':'): todo nome tem o ':' do grupo
+        let cab_nome: u64 = (dois as u64) + 1
+        let grupo_novo: bool = (not tem_grupo) or (cab_nome != cab) or (not common.c2f_prefixo_igual(grupo, nome, cab_nome as int))
+        if grupo_novo {
+            var separador: str = ""
+            if tem_grupo {
+                separador = "; "
+            }
+            if not anexar(destino, cap, &n, separador, len(separador) as u64) {
+                break
+            }
+            if (not anexar(destino, cap, &n, nome, cab_nome)) or (not anexar(destino, cap, &n, " ", 1)) {
+                break
+            }
+            grupo = nome
+            tem_grupo = true
+            cab = cab_nome
+        } else if not anexar(destino, cap, &n, ", ", 2) {
+            break
+        }
+        let resto: str = nome[cab_nome..<(len(nome) as u64)]
+        if not anexar(destino, cap, &n, resto, len(resto) as u64) {
+            break
+        }
+        k += 1
+    }
+    if (k < l.n) or (l.fora > 0) {
+        let marca_inteira = format(f" (+{(l.n - k) + l.fora})", alloc = heap)
+        let marca = common.c2f_cortar(marca_inteira, (RESERVA_FALTA - 1) as int) // char marca[RESERVA_FALTA]
+        // A marca usa a folga RESERVA_FALTA que o anexar deixou livre: passar por anexar() a recusava quando o corte caia perto do fim (lista de 31+ modulos perdia o " (+N)")
+        let origem_marca: []u8 = as_bytes(marca)
+        for j in (0 as u64)..<(len(marca) as u64) {
+            destino[n + j] = origem_marca[j]
+        }
+        n += len(marca) as u64
+        destino[n] = 0
+        delete(marca_inteira)
+        delete(marca)
+    }
+    return n
+}
+
+// C: frontend/modulos_lista.c:152
+pub proc modulos_listar_disponiveis(pasta: str, destino: []u8, cap: u64) -> u64 {
+    var l: Lista = Lista{nomes = make([dynamic]str, alloc = heap)}
+    defer lista_liberar(&l)
+    coletar_nomes(pasta, &l)
+    sort_by(l.nomes[0..<(l.n as int)], less = comparar_nomes_menor)
+    return juntar(&l, destino, cap)
+}
+
+// C: frontend/modulos_lista.c:162
+// Distancia de Levenshtein entre a e b; acima de DISTANCIA_MAX devolve DISTANCIA_MAX + 1 (com corte pelo tamanho).
+proc distancia(a: str, b: str) -> u64 {
+    let na: u64 = len(a) as u64
+    let nb: u64 = len(b) as u64
+    let fora: u64 = (DISTANCIA_MAX as u64) + 1
+    var ant: [96]u64 = {}
+    var atu: [96]u64 = {}
+    if (na >= (NOME_TAM as u64)) or (nb >= (NOME_TAM as u64)) {
+        return fora
+    }
+    if (na > (nb + (DISTANCIA_MAX as u64))) or (nb > (na + (DISTANCIA_MAX as u64))) {
+        return fora
+    }
+    for j in (0 as u64)..=nb {
+        ant[j] = j
+    }
+    for i in (1 as u64)..=na {
+        atu[0] = i
+        for j in (1 as u64)..=nb {
+            var custo: u64 = 1
+            if a[i - 1] == b[j - 1] {
+                custo = 0
+            }
+            var m: u64 = ant[j] + 1
+            if (atu[j - 1] + 1) < m {
+                m = atu[j - 1] + 1
+            }
+            if (ant[j - 1] + custo) < m {
+                m = ant[j - 1] + custo
+            }
+            atu[j] = m
+        }
+        for j in (0 as u64)..=nb { // memcpy(ant, atu, (nb + 1) * sizeof ant[0])
+            ant[j] = atu[j]
+        }
+    }
+    if ant[nb] > (DISTANCIA_MAX as u64) {
+        return fora
+    }
+    return ant[nb]
+}
+
+// C: frontend/modulos_lista.c:183
+proc existe(l: ^Lista, nome: str) -> bool {
+    for k in (0 as u64)..<l.n {
+        if l.nomes[k] == nome {
+            return true
+        }
+    }
+    return false
+}
+
+// C: frontend/modulos_lista.c:192
+// Sinonimo PT -> EN do sufixo 'sufixo' no grupo 'cab' ("std:"); true se o EN existe na lista.
+proc sinonimo_existente(l: ^Lista, import_c: str, cab: u64, destino: []u8, cap: u64) -> bool {
+    for k in 0..<7 {
+        if import_c[cab..<(len(import_c) as u64)] != SINONIMOS[k].pt {
+            continue
+        }
+        let candidato = format(f"{import_c[0..<cab]}{SINONIMOS[k].en}", alloc = heap)
+        defer delete(candidato)
+        _ = common.c2f_snprintf(destino, candidato) // snprintf(destino, cap, ...): grava cortado em cap - 1 e Existe le o texto gravado
+        let gravado: u64 = min(len(candidato) as u64, cap - 1)
+        return existe(l, candidato[0..<gravado])
+    }
+    return false
+}
+
+// C: frontend/modulos_lista.c:203
+// Modulo com nome proximo de 'import' (mesmo grupo std:/vendor:): sinonimo primeiro, depois o de menor distancia (empate = o 1o).
+proc melhor_parecido(l: ^Lista, import_c: str, cab: u64, destino: []u8, cap: u64) -> bool {
+    var melhor: u64 = (DISTANCIA_MAX as u64) + 1
+    var idx: u64 = 0
+    for k in (0 as u64)..<l.n {
+        if not common.c2f_prefixo_igual(l.nomes[k], import_c, cab as int) {
+            continue
+        }
+        let d: u64 = distancia(l.nomes[k][cab..<(len(l.nomes[k]) as u64)], import_c[cab..<(len(import_c) as u64)])
+        if d < melhor {
+            melhor = d
+            idx = k
+        }
+    }
+    if melhor > (DISTANCIA_MAX as u64) {
+        return false
+    }
+    _ = common.c2f_snprintf(destino, l.nomes[idx])
+    return true
+}
+
+// C: frontend/modulos_lista.c:222
+// O modulo parecido com 'import' (ex.: "std:texto" -> "std:text") em destino: sinonimo PT/EN ou Levenshtein <= 2. false = nenhum.
+pub proc modulos_parecido(pasta: str, import_c: str, destino: []u8, cap: u64) -> bool {
+    let dois: ?int = text.index_byte(import_c, 58)
+    if dois == none {
+        return false
+    }
+    let cab: u64 = ((dois or_else 0) as u64) + 1
+    var l: Lista = Lista{nomes = make([dynamic]str, alloc = heap)}
+    defer lista_liberar(&l)
+    coletar_nomes(pasta, &l)
+    if sinonimo_existente(&l, import_c, cab, destino, cap) {
+        return true
+    }
+    return melhor_parecido(&l, import_c, cab, destino, cap)
+}

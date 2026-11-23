@@ -1,0 +1,561 @@
+// runtime/wasm/rt_wasm_atan.fj - std:math do alvo wasm32-wasip1, grupo 3 (atan, asin, acos, atan2), porte para Forja pura da libm do musl 1.2.6
+// Versao: 0.2.0 (atan, asin, acos, atan2 em f64 e f32; bits iguais ao musl do x64)
+// Contrato: o simbolo forja_math_X do std:math e atendido pelo proc pub math_X deste modulo (f32: math_Xf); o driver injeta o modulo so no alvo wasm.
+// Fonte C (mesma fonte do x64 = bits iguais): third/musl_math/{atan,atanf,asin,asinf,acos,acosf,atan2,atan2f}.c
+// Tabelas ATAN_*, PIO2_*, PI*: tests/nativo/wasm/math_bits/tabelas/gerar_tabelas_atan.py (os bits estao colados abaixo).
+// Verificacao: python -X utf8 -I language/tests/nativo/wasm/math_bits/comparar_x64.py atan  (e com --release)
+// Regra do modulo: sem alocacao, sem estado; hex-float do C vira u64/u32 + transmute; unsigned do C que volta a dar a volta usa wrapping_*.
+
+// ---- tabelas e constantes (geradas; bits do musl) ----
+// Valores fixos do musl: 2^-120 (o `0x1p-120` do C que forca o arredondamento), 1.0 (x == 1 por bits)
+const ATAN_TINY64: u64 = 0x3870000000000000
+const ATAN_TINY32: u32 = 0x03800000
+const ATAN_UM64: u64 = 0x3FF0000000000000
+
+const ATAN_HI64: [4]u64 = {
+    0x3FDDAC670561BB4F, 0x3FE921FB54442D18, 0x3FEF730BD281F69B, 0x3FF921FB54442D18,
+}
+
+const ATAN_LO64: [4]u64 = {
+    0x3C7A2B7F222F65E2, 0x3C81A62633145C07, 0x3C7007887AF0CBBD, 0x3C91A62633145C07,
+}
+
+const ATAN_T64: [11]u64 = {
+    0x3FD555555555550D, 0xBFC999999998EBC4, 0x3FC24924920083FF, 0xBFBC71C6FE231671,
+    0x3FB745CDC54C206E, 0xBFB3B0F2AF749A6D, 0x3FB10D66A0D03D51, 0xBFADDE2D52DEFD9A,
+    0x3FA97B4B24760DEB, 0xBFA2B4442C6A6C2F, 0x3F90AD3AE322DA11,
+}
+
+const ATAN_R_P64: [6]u64 = {
+    0x3FC5555555555555, 0xBFD4D61203EB6F7D, 0x3FC9C1550E884455, 0xBFA48228B5688F3B,
+    0x3F49EFE07501B288, 0x3F023DE10DFDF709,
+}
+
+const ATAN_R_Q64: [4]u64 = {
+    0xC0033A271C8A2D4B, 0x40002AE59C598AC8, 0xBFE6066C1B8D0159, 0x3FB3B8C5B12E9282,
+}
+
+const ATAN_HI32: [4]u32 = {
+    0x3EED6338, 0x3F490FDA, 0x3F7B985E, 0x3FC90FDA,
+}
+
+const ATAN_LO32: [4]u32 = {
+    0x31AC3769, 0x33222168, 0x33140FB4, 0x33A22168,
+}
+
+const ATAN_T32: [5]u32 = {
+    0x3EAAAAA9, 0xBE4CCA98, 0x3E11F50D, 0xBDDA1247,
+    0x3D7CAC25,
+}
+
+const ATAN_R_P32: [3]u32 = {
+    0x3E2AAA75, 0xBD2F13BA, 0xBC0DD36B,
+}
+
+const ATAN_R_Q32: [1]u32 = {
+    0xBF34E5AE,
+}
+
+const ATAN_PIO2_HI64: u64 = 0x3FF921FB54442D18
+
+const ATAN_PIO2_LO64: u64 = 0x3C91A62633145C07
+
+const ATAN_PI64: u64 = 0x400921FB54442D18
+
+const ATAN_PI_LO64: u64 = 0x3CA1A62633145C07
+
+const ATAN_PIO2_HI32: u32 = 0x3FC90FDA
+
+const ATAN_PIO2_LO32: u32 = 0x33A22168
+
+const ATAN_PI32: u32 = 0x40490FDB
+
+const ATAN_PI_LO32: u32 = 0xB3BBBD2E
+
+// ---- auxiliares privados (bits; sem sinal de zero perdido: fabs do C so zera o bit de sinal) ----
+
+// Valor absoluto de f64 pelo bit de sinal (musl fabs; -0.0 vira +0.0)
+proc atan_abs64(x: f64) -> f64 {
+    return transmute(transmute(x, to = u64) & 0x7fffffffffffffff, to = f64)
+}
+
+// Valor absoluto de f32 pelo bit de sinal (musl fabsf)
+proc atan_abs32(x: f32) -> f32 {
+    return transmute(transmute(x, to = u32) & 0x7fffffff, to = f32)
+}
+
+// Zera os 32 bits baixos de um f64 (SET_LOW_WORD(f, 0) do asin.c e do acos.c)
+proc atan_zera_baixa64(x: f64) -> f64 {
+    return transmute(transmute(x, to = u64) & 0xffffffff00000000, to = f64)
+}
+
+// R(z) = P(z)/Q(z) do asin.c em f64; o acos.c usa a mesma R
+proc atan_r64(z: f64) -> f64 {
+    let p0: f64 = transmute(ATAN_R_P64[0], to = f64)
+    let p1: f64 = transmute(ATAN_R_P64[1], to = f64)
+    let p2: f64 = transmute(ATAN_R_P64[2], to = f64)
+    let p3: f64 = transmute(ATAN_R_P64[3], to = f64)
+    let p4: f64 = transmute(ATAN_R_P64[4], to = f64)
+    let p5: f64 = transmute(ATAN_R_P64[5], to = f64)
+    let q1: f64 = transmute(ATAN_R_Q64[0], to = f64)
+    let q2: f64 = transmute(ATAN_R_Q64[1], to = f64)
+    let q3: f64 = transmute(ATAN_R_Q64[2], to = f64)
+    let q4: f64 = transmute(ATAN_R_Q64[3], to = f64)
+    // a ordem das somas e dos produtos segue o C: o arredondamento depende dela
+    let p: f64 = z * (p0 + z * (p1 + z * (p2 + z * (p3 + z * (p4 + z * p5)))))
+    let q: f64 = 1.0 + z * (q1 + z * (q2 + z * (q3 + z * q4)))
+    return p / q
+}
+
+// R(z) do asinf.c e do acosf.c em f32 (mesmos coeficientes nos dois)
+proc atan_r32(z: f32) -> f32 {
+    let p0: f32 = transmute(ATAN_R_P32[0], to = f32)
+    let p1: f32 = transmute(ATAN_R_P32[1], to = f32)
+    let p2: f32 = transmute(ATAN_R_P32[2], to = f32)
+    let q1: f32 = transmute(ATAN_R_Q32[0], to = f32)
+    let p: f32 = z * (p0 + z * (p1 + z * p2))
+    let q: f32 = 1.0 + z * q1
+    return p / q
+}
+
+// Reducao do atan.c em f64: id = -1 deixa x com sinal (|x| < 7/16); id 0..3 usa o |x| reduzido
+proc atan_reduz64(ax: u32, x: f64) -> (id: int, t: f64) {
+    if ax < 0x3fdc0000 {
+        return -1, x
+    }
+    let ab: f64 = atan_abs64(x)
+    if ax < 0x3ff30000 {
+        if ax < 0x3fe60000 {
+            return 0, (2.0 * ab - 1.0) / (2.0 + ab)
+        }
+        return 1, (ab - 1.0) / (ab + 1.0)
+    }
+    if ax < 0x40038000 {
+        return 2, (ab - 1.5) / (1.0 + 1.5 * ab)
+    }
+    return 3, -1.0 / ab
+}
+
+// Reducao do atanf.c em f32 (mesmos limites do C, em bits de f32)
+proc atan_reduz32(ix: u32, x: f32) -> (id: int, t: f32) {
+    if ix < 0x3ee00000 {
+        return -1, x
+    }
+    let ab: f32 = atan_abs32(x)
+    if ix < 0x3f980000 {
+        if ix < 0x3f300000 {
+            return 0, (2.0 * ab - 1.0) / (2.0 + ab)
+        }
+        return 1, (ab - 1.0) / (ab + 1.0)
+    }
+    if ix < 0x401c0000 {
+        return 2, (ab - 1.5) / (1.0 + 1.5 * ab)
+    }
+    return 3, -1.0 / ab
+}
+
+// Polinomio do atan.c: s1 = z*(a0+w*(a2+...)) e s2 = w*(a1+...), com z = t*t e w = z*z (separados como no C)
+proc atan_polinomio64(t: f64) -> (s1: f64, s2: f64) {
+    let z: f64 = t * t
+    let w: f64 = z * z
+    let a0: f64 = transmute(ATAN_T64[0], to = f64)
+    let a1: f64 = transmute(ATAN_T64[1], to = f64)
+    let a2: f64 = transmute(ATAN_T64[2], to = f64)
+    let a3: f64 = transmute(ATAN_T64[3], to = f64)
+    let a4: f64 = transmute(ATAN_T64[4], to = f64)
+    let a5: f64 = transmute(ATAN_T64[5], to = f64)
+    let a6: f64 = transmute(ATAN_T64[6], to = f64)
+    let a7: f64 = transmute(ATAN_T64[7], to = f64)
+    let a8: f64 = transmute(ATAN_T64[8], to = f64)
+    let a9: f64 = transmute(ATAN_T64[9], to = f64)
+    let a10: f64 = transmute(ATAN_T64[10], to = f64)
+    let impar: f64 = z * (a0 + w * (a2 + w * (a4 + w * (a6 + w * (a8 + w * a10)))))
+    let par: f64 = w * (a1 + w * (a3 + w * (a5 + w * (a7 + w * a9))))
+    return impar, par
+}
+
+// ---- f64 ----
+
+// atan(x) (atan.c): |x| >= 2^66 devolve +-pi/2; |x| < 2^-27 devolve x (sem arredondar)
+pub proc math_atan(x: f64) -> f64 {
+    let hx: u32 = (transmute(x, to = u64) >> 32) as u32
+    let sinal: bool = (hx >> 31) != 0
+    let ax: u32 = hx & 0x7fffffff
+    if ax >= 0x44100000 {
+        if x != x {
+            return x
+        }
+        let topo: f64 = transmute(ATAN_HI64[3], to = f64) + transmute(ATAN_TINY64, to = f64)
+        if sinal {
+            return -topo
+        }
+        return topo
+    }
+    if ax < 0x3e400000 {
+        return x
+    }
+    let id, t = atan_reduz64(ax, x)
+    let s1, s2 = atan_polinomio64(t)
+    let soma: f64 = s1 + s2
+    if id < 0 {
+        return t - t * soma
+    }
+    // atanhi - ((x*(s1+s2) - atanlo) - x), na mesma ordem do C
+    let z: f64 = transmute(ATAN_HI64[id], to = f64) - (t * soma - transmute(ATAN_LO64[id], to = f64) - t)
+    if sinal {
+        return -z
+    }
+    return z
+}
+
+// asin(x) (asin.c): |x| > 1 ou NaN devolve NaN; |x| == 1 devolve +-pi/2
+pub proc math_asin(x: f64) -> f64 {
+    let bits: u64 = transmute(x, to = u64)
+    let hx: u32 = (bits >> 32) as u32
+    let sinal: bool = (hx >> 31) != 0
+    let ix: u32 = hx & 0x7fffffff
+    let pio2_hi: f64 = transmute(ATAN_PIO2_HI64, to = f64)
+    let pio2_lo: f64 = transmute(ATAN_PIO2_LO64, to = f64)
+    if ix >= 0x3ff00000 {
+        if (bits & 0x7fffffffffffffff) == ATAN_UM64 {
+            return x * pio2_hi + transmute(ATAN_TINY64, to = f64)
+        }
+        let zero: f64 = x - x
+        return zero / zero
+    }
+    if ix < 0x3fe00000 {
+        // 2^-1022 <= |x| < 2^-26: o C evita o underflow aqui, e x ja e o resultado
+        if ix < 0x3e500000 and ix >= 0x00100000 {
+            return x
+        }
+        return x + x * atan_r64(x * x)
+    }
+    let z: f64 = (1.0 - atan_abs64(x)) * 0.5
+    let s: f64 = sqrt(z)
+    let r: f64 = atan_r64(z)
+    var y: f64 = 0.0
+    if ix >= 0x3fef3333 {
+        y = pio2_hi - (2.0 * (s + s * r) - pio2_lo)
+    } else {
+        // f = parte alta de s (f + c = sqrt(z)): a correcao c evita perder bits na subtracao
+        let f: f64 = atan_zera_baixa64(s)
+        let c: f64 = (z - f * f) / (s + f)
+        y = 0.5 * pio2_hi - (2.0 * s * r - (pio2_lo - 2.0 * c) - (0.5 * pio2_hi - 2.0 * f))
+    }
+    if sinal {
+        return -y
+    }
+    return y
+}
+
+// acos(x) (acos.c): |x| > 1 ou NaN devolve NaN; acos(-1) = pi; acos(1) = 0
+pub proc math_acos(x: f64) -> f64 {
+    let bits: u64 = transmute(x, to = u64)
+    let hx: u32 = (bits >> 32) as u32
+    let ix: u32 = hx & 0x7fffffff
+    let pio2_hi: f64 = transmute(ATAN_PIO2_HI64, to = f64)
+    let pio2_lo: f64 = transmute(ATAN_PIO2_LO64, to = f64)
+    if ix >= 0x3ff00000 {
+        if (bits & 0x7fffffffffffffff) == ATAN_UM64 {
+            if (hx >> 31) != 0 {
+                return 2.0 * pio2_hi + transmute(ATAN_TINY64, to = f64)
+            }
+            return 0.0
+        }
+        let zero: f64 = x - x
+        return zero / zero
+    }
+    if ix < 0x3fe00000 {
+        if ix <= 0x3c600000 {
+            return pio2_hi + transmute(ATAN_TINY64, to = f64)
+        }
+        return pio2_hi - (x - (pio2_lo - x * atan_r64(x * x)))
+    }
+    if (hx >> 31) != 0 {
+        let zn: f64 = (1.0 + x) * 0.5
+        let sn: f64 = sqrt(zn)
+        let wn: f64 = atan_r64(zn) * sn - pio2_lo
+        return 2.0 * (pio2_hi - (sn + wn))
+    }
+    let z: f64 = (1.0 - x) * 0.5
+    let s: f64 = sqrt(z)
+    let df: f64 = atan_zera_baixa64(s)
+    let c: f64 = (z - df * df) / (s + df)
+    let w: f64 = atan_r64(z) * s + c
+    return 2.0 * (df + w)
+}
+
+// atan2(y, x) (atan2.c): casos especiais por bits; no caso geral, atan(|y/x|) de math_atan e o quadrante pelo sinal
+// LIMITE: 82 linhas (alvo 60) - os casos especiais do C (zeros, infinitos, |y/x| extremo) ficam no mesmo corpo para conferir o switch(m) linha a linha com o C
+pub proc math_atan2(y: f64, x: f64) -> f64 {
+    if x != x or y != y {
+        return x + y
+    }
+    let ux: u64 = transmute(x, to = u64)
+    let uy: u64 = transmute(y, to = u64)
+    if ux == ATAN_UM64 {
+        return math_atan(y)
+    }
+    // m = 2*sinal(x) + sinal(y), como no C
+    let m: u32 = ((uy >> 63) as u32) | (((ux >> 63) as u32) << 1)
+    let ax: u64 = ux & 0x7fffffffffffffff
+    let ay: u64 = uy & 0x7fffffffffffffff
+    let ix: u32 = (ax >> 32) as u32
+    let iy: u32 = (ay >> 32) as u32
+    let pi: f64 = transmute(ATAN_PI64, to = f64)
+    let pi_lo: f64 = transmute(ATAN_PI_LO64, to = f64)
+    let pio2: f64 = pi / 2.0
+    let pio4: f64 = pi / 4.0
+    if ay == 0 {
+        if m < 2 {
+            return y
+        }
+        if m == 2 {
+            return pi
+        }
+        return -pi
+    }
+    if ax == 0 {
+        if (m & 1) != 0 {
+            return -pio2
+        }
+        return pio2
+    }
+    if ix == 0x7ff00000 {
+        if iy == 0x7ff00000 {
+            if m == 0 {
+                return pio4
+            }
+            if m == 1 {
+                return -pio4
+            }
+            if m == 2 {
+                return 3.0 * pi / 4.0
+            }
+            return -(3.0 * pi / 4.0)
+        }
+        if m == 0 {
+            return 0.0
+        }
+        if m == 1 {
+            let zero: f64 = 0.0
+            return -zero
+        }
+        if m == 2 {
+            return pi
+        }
+        return -pi
+    }
+    // |y/x| > 2^64: o quociente nao muda o quadrante
+    if ((ix + 0x4000000) < iy) or iy == 0x7ff00000 {
+        if (m & 1) != 0 {
+            return -pio2
+        }
+        return pio2
+    }
+    var z: f64 = 0.0
+    // |y/x| < 2^-64 com x < 0: z = 0 evita underflow espurio, como no C
+    if not ((m & 2) != 0 and (iy + 0x4000000) < ix) {
+        z = math_atan(atan_abs64(y / x))
+    }
+    if m == 0 {
+        return z
+    }
+    if m == 1 {
+        return -z
+    }
+    if m == 2 {
+        return pi - (z - pi_lo)
+    }
+    return (z - pi_lo) - pi
+}
+
+// ---- f32 ----
+
+// atanf(x) (atanf.c): algoritmo do atan em f32; |x| >= 2^26 devolve +-pi/2; |x| < 2^-12 devolve x
+pub proc math_atanf(x: f32) -> f32 {
+    let hx: u32 = transmute(x, to = u32)
+    let sinal: bool = (hx >> 31) != 0
+    let ix: u32 = hx & 0x7fffffff
+    if ix >= 0x4c800000 {
+        if x != x {
+            return x
+        }
+        let topo: f32 = transmute(ATAN_HI32[3], to = f32) + transmute(ATAN_TINY32, to = f32)
+        if sinal {
+            return -topo
+        }
+        return topo
+    }
+    if ix < 0x39800000 {
+        return x
+    }
+    let id, t = atan_reduz32(ix, x)
+    let z2: f32 = t * t
+    let w: f32 = z2 * z2
+    let a0: f32 = transmute(ATAN_T32[0], to = f32)
+    let a1: f32 = transmute(ATAN_T32[1], to = f32)
+    let a2: f32 = transmute(ATAN_T32[2], to = f32)
+    let a3: f32 = transmute(ATAN_T32[3], to = f32)
+    let a4: f32 = transmute(ATAN_T32[4], to = f32)
+    let s1: f32 = z2 * (a0 + w * (a2 + w * a4))
+    let s2: f32 = w * (a1 + w * a3)
+    if id < 0 {
+        return t - t * (s1 + s2)
+    }
+    let z: f32 = transmute(ATAN_HI32[id], to = f32) - ((t * (s1 + s2) - transmute(ATAN_LO32[id], to = f32)) - t)
+    if sinal {
+        return -z
+    }
+    return z
+}
+
+// asinf(x) (asinf.c): a conta vai em double como no C e so volta a f32 no fim
+pub proc math_asinf(x: f32) -> f32 {
+    let hx: u32 = transmute(x, to = u32)
+    let sinal: bool = (hx >> 31) != 0
+    let ix: u32 = hx & 0x7fffffff
+    let pio2: f64 = transmute(ATAN_PIO2_HI64, to = f64)
+    if ix >= 0x3f800000 {
+        if ix == 0x3f800000 {
+            return ((x as f64) * pio2 + transmute(ATAN_TINY64, to = f64)) as f32
+        }
+        let zero: f32 = x - x
+        return zero / zero
+    }
+    if ix < 0x3f000000 {
+        if ix < 0x39800000 and ix >= 0x00800000 {
+            return x
+        }
+        return x + x * atan_r32(x * x)
+    }
+    let z: f32 = (1.0 - atan_abs32(x)) * 0.5
+    let s: f64 = sqrt(z as f64)
+    let y: f32 = (pio2 - 2.0 * (s + s * (atan_r32(z) as f64))) as f32
+    if sinal {
+        return -y
+    }
+    return y
+}
+
+// acosf(x) (acosf.c): |x| > 1 ou NaN devolve NaN; acosf(-1) = pi; acosf(1) = 0
+pub proc math_acosf(x: f32) -> f32 {
+    let hx: u32 = transmute(x, to = u32)
+    let sinal: bool = (hx >> 31) != 0
+    let ix: u32 = hx & 0x7fffffff
+    let pio2_hi: f32 = transmute(ATAN_PIO2_HI32, to = f32)
+    let pio2_lo: f32 = transmute(ATAN_PIO2_LO32, to = f32)
+    let tiny: f32 = transmute(ATAN_TINY32, to = f32)
+    if ix >= 0x3f800000 {
+        if ix == 0x3f800000 {
+            if sinal {
+                return 2.0 * pio2_hi + tiny
+            }
+            return 0.0
+        }
+        let zero: f32 = x - x
+        return zero / zero
+    }
+    if ix < 0x3f000000 {
+        if ix <= 0x32800000 {
+            return pio2_hi + tiny
+        }
+        return pio2_hi - (x - (pio2_lo - x * atan_r32(x * x)))
+    }
+    if sinal {
+        let zn: f32 = (1.0 + x) * 0.5
+        let sn: f32 = sqrt(zn)
+        let wn: f32 = atan_r32(zn) * sn - pio2_lo
+        return 2.0 * (pio2_hi - (sn + wn))
+    }
+    let z: f32 = (1.0 - x) * 0.5
+    let s: f32 = sqrt(z)
+    // df = s com os 12 bits baixos zerados (hx & 0xfffff000 do C)
+    let df: f32 = transmute(transmute(s, to = u32) & 0xfffff000, to = f32)
+    let c: f32 = (z - df * df) / (s + df)
+    let w: f32 = atan_r32(z) * s + c
+    return 2.0 * (df + w)
+}
+
+// atan2f(y, x) (atan2f.c): mesmo desenho do atan2 em f32, com atanf no caso geral
+// LIMITE: 80 linhas (alvo 60) - mesmo motivo do math_atan2: casos especiais do C no mesmo corpo, para conferir o switch(m) com o C
+pub proc math_atan2f(y: f32, x: f32) -> f32 {
+    if x != x or y != y {
+        return x + y
+    }
+    let ux: u32 = transmute(x, to = u32)
+    let uy: u32 = transmute(y, to = u32)
+    if ux == 0x3f800000 {
+        return math_atanf(y)
+    }
+    // m = 2*sinal(x) + sinal(y), como no C
+    let m: u32 = ((uy >> 31) & 1) | ((ux >> 30) & 2)
+    let ix: u32 = ux & 0x7fffffff
+    let iy: u32 = uy & 0x7fffffff
+    let pi: f32 = transmute(ATAN_PI32, to = f32)
+    let pi_lo: f32 = transmute(ATAN_PI_LO32, to = f32)
+    let pio2: f32 = pi / 2.0
+    let pio4: f32 = pi / 4.0
+    if iy == 0 {
+        if m < 2 {
+            return y
+        }
+        if m == 2 {
+            return pi
+        }
+        return -pi
+    }
+    if ix == 0 {
+        if (m & 1) != 0 {
+            return -pio2
+        }
+        return pio2
+    }
+    if ix == 0x7f800000 {
+        if iy == 0x7f800000 {
+            if m == 0 {
+                return pio4
+            }
+            if m == 1 {
+                return -pio4
+            }
+            if m == 2 {
+                return 3.0 * pi / 4.0
+            }
+            return -(3.0 * pi / 4.0)
+        }
+        if m == 0 {
+            return 0.0
+        }
+        if m == 1 {
+            let zero: f32 = 0.0
+            return -zero
+        }
+        if m == 2 {
+            return pi
+        }
+        return -pi
+    }
+    // |y/x| > 2^26: o quociente nao muda o quadrante
+    if ((ix + 0xd000000) < iy) or iy == 0x7f800000 {
+        if (m & 1) != 0 {
+            return -pio2
+        }
+        return pio2
+    }
+    var z: f32 = 0.0
+    // |y/x| < 2^-26 com x < 0: z = 0 evita underflow espurio, como no C
+    if not ((m & 2) != 0 and (iy + 0xd000000) < ix) {
+        z = math_atanf(atan_abs32(y / x))
+    }
+    if m == 0 {
+        return z
+    }
+    if m == 1 {
+        return -z
+    }
+    if m == 2 {
+        return pi - (z - pi_lo)
+    }
+    return (z - pi_lo) - pi
+}

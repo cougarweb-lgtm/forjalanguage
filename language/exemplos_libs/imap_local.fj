@@ -1,0 +1,212 @@
+// Marco rede R8: leitura IMAP de vendor:net/mail contra tests\rede\servidor_mail.py --imap (127.0.0.1, porta efemera, sem internet; caixa fixa em tests\rede\caixa.json).
+// Argumentos (o verificar_libs.py passa): 1 = imap:// (texto claro); 2 = imaps:// (TLS implicito); 3 = caminho do ca.pem. Usuario "usuario", senha "segredo".
+// Prova: listar pastas; search UNSEEN = 2 UIDs; fetch confere Subject (inclusive dobrado e RFC 2047 sem decodificar); mark_read -> UNSEEN = 1; delete -> ALL = 2; a segunda sessao ve o mesmo estado;
+// erros: uid inexistente, pasta inexistente, criterio com CR/LF = other; senha errada = auth; starttls exigido (padrao) num servidor sem ele = tls; imaps com ca_file e sem ele = tls.
+// COMPILAR/RODAR: python language\exemplos_libs\verificar_libs.py --so imap_local --backend x64   (SAIDA ESPERADA: imap_local.esperado)
+
+import "std:mem"
+import "std:os"
+import "vendor:net/mail" as mail
+
+// Nome do erro para a saida.
+proc rotular(e: mail.MailError) -> str {
+    switch e {
+    case mail.MailError.invalid_address:
+        return "invalid_address"
+    case mail.MailError.cannot_resolve:
+        return "cannot_resolve"
+    case mail.MailError.cannot_connect:
+        return "cannot_connect"
+    case mail.MailError.timeout:
+        return "timeout"
+    case mail.MailError.tls:
+        return "tls"
+    case mail.MailError.auth:
+        return "auth"
+    case mail.MailError.rejected:
+        return "rejected"
+    case mail.MailError.protocol:
+        return "protocol"
+    case mail.MailError.not_found:
+        return "not_found"
+    case mail.MailError.out_of_memory:
+        return "out_of_memory"
+    case mail.MailError.other:
+        return "other"
+    }
+    return "?"
+}
+
+// Imprime as pastas do servidor.
+proc listar_pastas(s: ^mail.MailSession, rotulo: str) {
+    let a = mem.arena_create()
+    defer mem.arena_destroy(a)
+    switch r in mail.imap_folders(s, alloc = a) {
+    case [dynamic]str:
+        print(f"{rotulo} pastas={len(r)}")
+        for nome in r {
+            print(f"{rotulo} pasta {nome}")
+        }
+    case mail.MailError:
+        print(f"{rotulo} pastas erro {rotular(r)}")
+    }
+}
+
+// Imprime os UIDs que a busca devolveu (ou o erro).
+proc buscar(s: ^mail.MailSession, rotulo: str, pasta: str, criterio: str) {
+    let a = mem.arena_create()
+    defer mem.arena_destroy(a)
+    switch r in mail.imap_search(s, folder = pasta, criteria = criterio, alloc = a) {
+    case [dynamic]int:
+        print(f"{rotulo} total={len(r)}")
+        for uid in r {
+            print(f"{rotulo} uid={uid}")
+        }
+    case mail.MailError:
+        print(f"{rotulo} erro {rotular(r)}")
+    }
+}
+
+// Imprime o valor do cabecalho (ou "ausente").
+proc mostrar_cabecalho(rotulo: str, bruto: str, nome: str, alloc: Allocator) {
+    switch v in mail.message_header(bruto, name = nome, alloc = alloc) {
+    case str:
+        print(f"{rotulo} {nome}=[{v}]")
+    case none:
+        print(f"{rotulo} {nome} ausente")
+    }
+}
+
+// Busca a mensagem e imprime o tamanho e os cabecalhos Subject, message-id (caixa trocada de proposito) e X-Nada (nao existe).
+proc ler_mensagem(s: ^mail.MailSession, rotulo: str, pasta: str, uid: int) {
+    let a = mem.arena_create()
+    defer mem.arena_destroy(a)
+    switch r in mail.imap_fetch(s, folder = pasta, uid = uid, alloc = a) {
+    case str:
+        print(f"{rotulo} tamanho={len(r)}")
+        mostrar_cabecalho(rotulo, r, "Subject", a)
+        mostrar_cabecalho(rotulo, r, "message-id", a)
+        mostrar_cabecalho(rotulo, r, "X-Nada", a)
+    case mail.MailError:
+        print(f"{rotulo} erro {rotular(r)}")
+    }
+}
+
+// Marca como lida e imprime "<rotulo> ok" ou "<rotulo> erro <nome>".
+proc marcar_como_lida(s: ^mail.MailSession, rotulo: str, pasta: str, uid: int) {
+    switch e in mail.imap_mark_read(s, folder = pasta, uid = uid) {
+    case mail.MailError:
+        print(f"{rotulo} erro {rotular(e)}")
+    default:
+        print(f"{rotulo} ok")
+    }
+}
+
+// Apaga e imprime "<rotulo> ok" ou "<rotulo> erro <nome>".
+proc apagar(s: ^mail.MailSession, rotulo: str, pasta: str, uid: int) {
+    switch e in mail.imap_delete(s, folder = pasta, uid = uid) {
+    case mail.MailError:
+        print(f"{rotulo} erro {rotular(e)}")
+    default:
+        print(f"{rotulo} ok")
+    }
+}
+
+// Sessao 1 (texto claro, starttls = false): pastas, busca, leitura, marcar como lida, apagar e os erros de comando.
+proc percorrer_caixa(s: ^mail.MailSession) {
+    listar_pastas(s, "plain")
+    buscar(s, "naolidas", pasta = "INBOX", criterio = "UNSEEN")
+    ler_mensagem(s, "uid12", pasta = "INBOX", uid = 12)
+    ler_mensagem(s, "uid13", pasta = "INBOX", uid = 13)
+    marcar_como_lida(s, "marcar12", pasta = "INBOX", uid = 12)
+    buscar(s, "naolidas2", pasta = "INBOX", criterio = "UNSEEN")
+    apagar(s, "apagar13", pasta = "INBOX", uid = 13)
+    buscar(s, "todas", pasta = "INBOX", criterio = "ALL")
+    ler_mensagem(s, "uid99", pasta = "INBOX", uid = 99)
+    buscar(s, "pasta_ruim", pasta = "Naoexiste", criterio = "ALL")
+    buscar(s, "injecao", pasta = "INBOX", criterio = "ALL\r\nA9 LOGOUT")
+}
+
+// Abre a sessao com a configuracao e roda o que o chamador pede; erro de abertura sai impresso.
+proc caso_plain(base: str) {
+    var cfg = mail.MailConfig{url = base, user = "usuario", password = "segredo", starttls = false}
+    switch aberta in mail.imap_open(&cfg) {
+    case mail.MailSession:
+        var s = aberta
+        percorrer_caixa(&s)
+        mail.mail_close(&s)
+    case mail.MailError:
+        print(f"plain abrir erro {rotular(aberta)}")
+        return
+    }
+    // Segunda sessao: o servidor guardou o estado (lida e apagada), entao a busca ve 2 mensagens.
+    switch outra in mail.imap_open(&cfg) {
+    case mail.MailSession:
+        var s2 = outra
+        buscar(&s2, "reaberta", pasta = "INBOX", criterio = "ALL")
+        mail.mail_close(&s2)
+        mail.mail_close(&s2)
+    case mail.MailError:
+        print(f"reaberta abrir erro {rotular(outra)}")
+    }
+}
+
+// Erros de abertura no servidor de texto claro: senha errada = auth; starttls exigido (padrao) sem o servidor oferecer = tls; url de outro protocolo = other.
+proc caso_erros_de_abertura(base: str) {
+    var errada = mail.MailConfig{url = base, user = "usuario", password = "errada", starttls = false}
+    switch s in mail.imap_open(&errada) {
+    case mail.MailSession:
+        print("senha_errada abriu")
+    case mail.MailError:
+        print(f"senha_errada erro {rotular(s)}")
+    }
+    var exige = mail.MailConfig{url = base, user = "usuario", password = "segredo"}
+    switch s in mail.imap_open(&exige) {
+    case mail.MailSession:
+        print("starttls_exigido abriu")
+    case mail.MailError:
+        print(f"starttls_exigido erro {rotular(s)}")
+    }
+    var outro = mail.MailConfig{url = "pop3://127.0.0.1:1", user = "usuario", password = "segredo"}
+    switch s in mail.imap_open(&outro) {
+    case mail.MailSession:
+        print("protocolo_trocado abriu")
+    case mail.MailError:
+        print(f"protocolo_trocado erro {rotular(s)}")
+    }
+}
+
+// Servidor imaps: com a CA de teste le a caixa; sem ela o certificado nao e confiavel = tls.
+proc caso_imaps(base: str, ca: str) {
+    var cfg = mail.MailConfig{url = base, user = "usuario", password = "segredo", ca_file = ca}
+    switch aberta in mail.imap_open(&cfg) {
+    case mail.MailSession:
+        var s = aberta
+        listar_pastas(&s, "imaps")
+        ler_mensagem(&s, "imaps11", pasta = "INBOX", uid = 11)
+        mail.mail_close(&s)
+    case mail.MailError:
+        print(f"imaps abrir erro {rotular(aberta)}")
+    }
+    var sem_ca = mail.MailConfig{url = base, user = "usuario", password = "segredo"}
+    switch aberta in mail.imap_open(&sem_ca) {
+    case mail.MailSession:
+        print("sem_ca abriu")
+        var s = aberta
+        mail.mail_close(&s)
+    case mail.MailError:
+        print(f"sem_ca erro {rotular(aberta)}")
+    }
+}
+
+proc main() {
+    defer mail.shutdown()
+    let args = os.args()
+    if len(args) < 4 {
+        print("uso: imap_local <imap://> <imaps://> <ca.pem>")
+        os.exit(2)
+    }
+    caso_plain(args[1])
+    caso_erros_de_abertura(args[1])
+    caso_imaps(args[2], ca = args[3])
+}

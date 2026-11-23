@@ -1,0 +1,789 @@
+// semantic/sem_tipo.fj - porte de compiler/semantic/sem_tipo.c
+// sha256 de semantic/sem_tipo.c: b986d04f931644efc595094c81a4b1d8832ff75c7a49bf07718a6b54dd58c3da
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "common"
+import "frontend"
+
+const TAMANHO_MAX_ARRAY: i32 = 2147483647
+const CAPACIDADE_MAX_LISTA_FIXA: i32 = 65536
+// C2F-A0: a tabela TIPO_DO_NOME (TipoId[SYM_QTD], i64 = int e u64 = uint; 0 nos demais) virou cadeia de if na mesma ordem de significado
+
+// C: semantic/sem_tipo.c:55
+proc tipo_embutido(nome: i32) -> u32 {
+    if nome == frontend.SYM_I32 {
+        return TIPO_I32 as u32
+    } else if (nome == frontend.SYM_INT) or (nome == frontend.SYM_I64) {
+        return TIPO_INT as u32
+    } else if nome == frontend.SYM_F32 {
+        return TIPO_F32 as u32
+    } else if nome == frontend.SYM_BOOL {
+        return TIPO_BOOL as u32
+    } else if nome == frontend.SYM_I8 {
+        return TIPO_I8 as u32
+    } else if nome == frontend.SYM_I16 {
+        return TIPO_I16 as u32
+    } else if nome == frontend.SYM_U8 {
+        return TIPO_U8 as u32
+    } else if nome == frontend.SYM_U16 {
+        return TIPO_U16 as u32
+    } else if nome == frontend.SYM_U32 {
+        return TIPO_U32 as u32
+    } else if (nome == frontend.SYM_U64) or (nome == frontend.SYM_UINT) {
+        return TIPO_UINT as u32
+    } else if nome == frontend.SYM_F64 {
+        return TIPO_F64 as u32
+    } else if nome == frontend.SYM_STR {
+        return TIPO_TEXTO as u32
+    } else if nome == frontend.SYM_CSTR {
+        return TIPO_CSTR as u32
+    } else if nome == frontend.SYM_RAWPTR {
+        return TIPO_RAWPTR as u32
+    }
+    return frontend.TIPO_NAO_RESOLVIDO as u32
+}
+
+// R-S3/C2F: TipoRef.alvo (TipoRef * no C) chega como fatia de 1 elemento: o objeto e o [0].
+proc sem_tipo_alvo_de(t: ^frontend.TipoRef) -> ^frontend.TipoRef {
+    return &(t.alvo or_else {})[0]
+}
+
+// SemDescrever em str de heap (o chamador faz delete): o texto cortado em 95 bytes, como o char texto[96] do C.
+proc sem_descrever_str(s: ^Semantica, tipo: u32) -> str {
+    var texto: [96]u8 = {}
+    sem_descrever(s, tipo, texto[..], 96)
+    return from_bytes(texto[0..<common.c2f_strlen_b(texto[..])], alloc = heap)
+}
+
+// C: semantic/sem_tipo.c:61
+proc tipo_c_long(s: ^Semantica, nome: i32, tipo: ^u32) -> bool {
+    let texto: str = sem_nome_texto(s, nome)
+    if texto == "c_long" {
+        var tern_1: i32 = TIPO_I32
+        if common.c2f_b2i32(s.alvo_lp64) != 0 {
+            tern_1 = TIPO_INT
+        }
+        tipo^ = common.c2f_s2u_32(tern_1)
+    } else if texto == "c_ulong" {
+        var tern_2: i32 = TIPO_U32
+        if common.c2f_b2i32(s.alvo_lp64) != 0 {
+            tern_2 = TIPO_UINT
+        }
+        tipo^ = common.c2f_s2u_32(tern_2)
+    } else {
+        return false
+    }
+    return true
+}
+
+// C: semantic/sem_tipo.c:70
+proc sem_resolver_nome_tipo(s: ^Semantica, nome: i32, pos: u32, modulo: u8, tipo: ^u32) -> bool {
+    if common.c2f_b2i32(nome == frontend.SYM_QUAT) != 0 {
+        sem_quat_garantir(s)
+    }
+    if common.c2f_b2i32(nome == frontend.SYM_ALLOCATOR) != 0 {
+        sem_allocator_garantir(s)
+    }
+    let y: ^Simbolo = sem_achar_simbolo(s, nome, modulo)
+    let eh_tipo: bool = (((y.categoria == (SIM_UNIDADE as u8)) or (y.categoria == (SIM_STRUCT as u8))) or (y.categoria == (SIM_ENUM as u8))) or (y.categoria == (SIM_UNIAO as u8))
+    var uso: NomeUsado = NomeUsado{nome = nome, pos = pos, modulo = modulo}
+    if not sem_visivel(s, y, &uso) {
+        return false
+    }
+    tipo^ = tipo_embutido(nome)
+    if tipo^ != (frontend.TIPO_NAO_RESOLVIDO as u32) {
+        return true
+    }
+    if eh_tipo {
+        if (y.envenenado as i32) != 0 {
+            tipo^ = sem_uso_de_veneno(s)
+            return true
+        }
+        if (((common.c2f_b2i32(s.tem_opaco) != 0) and (y.categoria == (SIM_STRUCT as u8))) and (common.c2f_b2i32((y.decl as ^frontend.Decl).externo) != 0)) and (not s.sob_ponteiro) {
+            let msg_1 = format(f"o tipo opaco '{sem_nome_texto(s, nome)}' (de foreign) nao tem tamanho conhecido na Forja: use ^{sem_nome_texto(s, nome)} ou ?^{sem_nome_texto(s, nome)}", alloc = heap)
+            defer delete(msg_1)
+            return sem_erro(s, common.E0908, pos, msg_1)
+        }
+        tipo^ = y.tipo
+        return true
+    }
+    if y.categoria == (SIM_NENHUM as u8) {
+        if (modulo == 0) and (common.c2f_b2i32(tipo_c_long(s, nome, tipo)) != 0) {
+            return true
+        }
+        if sem_nome_ja_relatado(s, nome) {
+            return sem_erro_calado(s, pos)
+        }
+        if (modulo == 0) and (common.c2f_b2i32(sem_idioma_de_tipo(s, nome, pos)) != 0) {
+            return false
+        }
+        let msg_2 = format(f"tipo '{sem_nome_texto(s, nome)}' nao declarado", alloc = heap)
+        defer delete(msg_2)
+        return sem_erro(s, common.E0201, pos, msg_2)
+    }
+    let msg_3 = format(f"'{sem_nome_texto(s, nome)}' nao e um tipo", alloc = heap)
+    defer delete(msg_3)
+    return sem_erro(s, common.E0201, pos, msg_3)
+}
+
+// C: semantic/sem_tipo.c:102
+proc resolver_erro(s: ^Semantica, t: ?^frontend.TipoRef, base: u32) -> bool {
+    let y: ^Simbolo = sem_achar_simbolo(s, (t as ^frontend.TipoRef).erro, (t as ^frontend.TipoRef).modulo_erro)
+    var pos: u32 = sem_pos_do_erro(s, (t as ^frontend.TipoRef).pos)
+    if (t as ^frontend.TipoRef).modulo_erro != 0 {
+        pos = sem_pos_do_nome_qualificado(s, pos)
+    }
+    var uso: NomeUsado = NomeUsado{nome = (t as ^frontend.TipoRef).erro, pos = pos, modulo = (t as ^frontend.TipoRef).modulo_erro}
+    if not sem_visivel(s, y, &uso) {
+        return false
+    }
+    if sem_simbolo_veneno(y) {
+        let ptr_1: ^frontend.TipoRef = t as ^frontend.TipoRef
+        ptr_1.tipo = sem_uso_de_veneno(s)
+        return true
+    }
+    if y.categoria == (SIM_NENHUM as u8) {
+        let msg_1 = format(f"tipo de erro '{sem_nome_texto(s, (t as ^frontend.TipoRef).erro)}' nao declarado", alloc = heap)
+        defer delete(msg_1)
+        return sem_erro(s, common.E0201, pos, msg_1)
+    }
+    if y.categoria != (SIM_ENUM as u8) {
+        let msg_2 = format(f"'{sem_nome_texto(s, (t as ^frontend.TipoRef).erro)}' nao e um enum; o tipo depois de '!' precisa ser um enum de erro", alloc = heap)
+        defer delete(msg_2)
+        return sem_erro(s, common.E0605, pos, msg_2)
+    }
+    if base == y.tipo {
+        let msg_3 = format(f"o valor e o erro de '{sem_nome_texto(s, (t as ^frontend.TipoRef).erro)} ! {sem_nome_texto(s, (t as ^frontend.TipoRef).erro)}' sao o mesmo tipo '{sem_nome_texto(s, (t as ^frontend.TipoRef).erro)}': um return desse enum fica ambiguo", alloc = heap)
+        defer delete(msg_3)
+        return sem_erro(s, common.E0609, pos, msg_3)
+    }
+    let ptr_2: ^frontend.TipoRef = t as ^frontend.TipoRef
+    ptr_2.tipo = tipo_resultado(&s.tipos, base, y.tipo)
+    return true
+}
+
+// C: semantic/sem_tipo.c:129
+// '^T' e '?^T' valem sobre qualquer tipo.
+proc resolver_forma_composta(s: ^Semantica, t: ?^frontend.TipoRef, base: ^u32) -> bool {
+    let tr: ^frontend.TipoRef = t as ^frontend.TipoRef
+    let alvo: ^frontend.TipoRef = sem_tipo_alvo_de(tr)
+    if s.tem_opaco {
+        s.sob_ponteiro = alvo.forma == (frontend.TR_NOME as u8) // v1.8b: opaco so atras de ponteiro
+    }
+    let alvo_ok: bool = sem_resolver_tipo_ref(s, alvo)
+    s.sob_ponteiro = false
+    if not alvo_ok {
+        return false
+    }
+    if tr.forma == (frontend.TR_ANULAVEL as u8) {
+        base^ = tipo_anulavel(&s.tipos, alvo.tipo)
+    } else {
+        base^ = tipo_ponteiro(&s.tipos, alvo.tipo)
+    }
+    return true
+}
+
+// C: semantic/sem_tipo.c:142
+// C2F-N1: `const char *digitos` = o texto do fonte dali ate o NUL do fim -> fatia []u8 (o lexer le ate o fim como NUL)
+proc ler_tamanho(s: ^Semantica, digitos: []u8, pos: u32, n: ^u32) -> bool {
+    var v: u64 = 0
+    if (not tipo_ler_literal_u64(digitos, &v)) or (v > (TAMANHO_MAX_ARRAY as u64)) {
+        let msg_1 = format(f"tamanho maximo {TAMANHO_MAX_ARRAY}", alloc = heap)
+        defer delete(msg_1)
+        return sem_erro(s, common.E0308, pos, msg_1)
+    }
+    if v == 0 {
+        let msg_2 = format(f"array de tamanho 0 nao existe", alloc = heap)
+        defer delete(msg_2)
+        return sem_erro(s, common.E0308, pos, msg_2)
+    }
+    n^ = v as u32
+    return true
+}
+
+// C: semantic/sem_tipo.c:154
+// N escrito como nome: so const inteira cujo init e um literal (sem conta); os outros usos de colchete tem erro proprio.
+proc tamanho_por_nome(s: ^Semantica, t: ?^frontend.TipoRef, n: ^u32) -> bool {
+    let tr: ^frontend.TipoRef = t as ^frontend.TipoRef
+    let y: ^Simbolo = sem_achar_simbolo(s, tr.nome, 0)
+    var uso: NomeUsado = NomeUsado{nome = tr.nome, pos = tr.pos_tamanho, modulo = 0} // D31: so nome sem apelido
+    if not sem_visivel(s, y, &uso) {
+        return false
+    }
+    if sem_simbolo_veneno(y) {
+        return sem_erro_calado(s, tr.pos_tamanho) // L8: const (ou enum) com erro nao da N
+    }
+    if y.categoria == (SIM_CONST as u8) {
+        let init: ?^frontend.Expr = (y.decl as ^frontend.Decl).init
+        if sem_usa_layout_no_texto(init) {
+            let msg_1 = format(f"a const '{sem_nome_texto(s, tr.nome)}' usa size_of, align_of ou offset_of e esses valores nao valem no tamanho de [N]T: escreva o numero", alloc = heap)
+            defer delete(msg_1)
+            return sem_erro(s, common.E0328, tr.pos_tamanho, msg_1)
+        }
+        if ((init as ^frontend.Expr).tipo_no != (frontend.EX_INT as u8)) or (not tipo_eh_inteiro(y.tipo)) {
+            let msg_2 = format(f"a const '{sem_nome_texto(s, tr.nome)}' precisa ser um literal inteiro (sem conta) para ser tamanho de array", alloc = heap)
+            defer delete(msg_2)
+            return sem_erro(s, common.E0308, tr.pos_tamanho, msg_2)
+        }
+        let texto: []u8 = (s.fonte as ^common.Fonte).texto
+        return ler_tamanho(s, texto[((init as ^frontend.Expr).pos_op as int)..<len(texto)], tr.pos_tamanho, n)
+    }
+    if y.categoria == (SIM_ENUM as u8) {
+        let msg_3 = format(f"[Enum]T fica para depois da v1.9: use [N]T com uma const N ou map[Enum]T", alloc = heap)
+        defer delete(msg_3)
+        return sem_erro(s, common.E0308, tr.pos_tamanho, msg_3)
+    }
+    let msg_4 = format(f"o tamanho do array e literal inteiro ou const inteira", alloc = heap)
+    defer delete(msg_4)
+    return sem_erro(s, common.E0308, tr.pos_tamanho, msg_4)
+}
+
+// C: semantic/sem_tipo.c:176
+proc resolver_tamanho(s: ^Semantica, t: ?^frontend.TipoRef, n: ^u32) -> bool {
+    let tr: ^frontend.TipoRef = t as ^frontend.TipoRef
+    if tr.nome < 0 {
+        let texto: []u8 = (s.fonte as ^common.Fonte).texto
+        return ler_tamanho(s, texto[(tr.pos_tamanho as int)..<len(texto)], tr.pos_tamanho, n)
+    }
+    return tamanho_por_nome(s, t, n)
+}
+
+// C: semantic/sem_tipo.c:185
+// v1.11 L15a: a capacidade N de '[dynamic, N]T' (literal ou const como no array), de 1 a 65536; fora disso E0335 (const igual a 0 cai no E0308 do array).
+proc sem_resolver_capacidade(s: ^Semantica, t: ?^frontend.TipoRef, n: ^u32) -> bool {
+    let tr: ^frontend.TipoRef = t as ^frontend.TipoRef
+    let causa: str = "a capacidade de [dynamic, N]T vai de 1 a 65536"
+    if tr.nome < 0 {
+        var v: u64 = 0
+        let texto: []u8 = (s.fonte as ^common.Fonte).texto
+        if (not tipo_ler_literal_u64(texto[(tr.pos_tamanho as int)..<len(texto)], &v)) or (v == 0) or (v > (CAPACIDADE_MAX_LISTA_FIXA as u64)) {
+            return sem_erro(s, common.E0335, tr.pos_tamanho, causa)
+        }
+        n^ = v as u32
+        return true
+    }
+    if not resolver_tamanho(s, t, n) {
+        return false
+    }
+    if n^ <= (CAPACIDADE_MAX_LISTA_FIXA as u32) {
+        return true
+    }
+    return sem_erro(s, common.E0335, tr.pos_tamanho, causa)
+}
+
+// C: semantic/sem_tipo.c:201
+// '[N]T' e '[]T': o elemento nao pode ser resultado; N vem de resolver_tamanho.
+proc resolver_colecao(s: ^Semantica, t: ?^frontend.TipoRef, base: ^u32) -> bool {
+    var n: u32 = 0
+    let tr: ^frontend.TipoRef = t as ^frontend.TipoRef
+    let alvo: ^frontend.TipoRef = sem_tipo_alvo_de(tr)
+    if not sem_resolver_tipo_ref(s, alvo) {
+        return false
+    }
+    if tipo_classe_de(&s.tipos, alvo.tipo) == TC_RESULTADO {
+        let msg_1 = format(f"array de 'T ! E' nao existe: guarde o valor ou o erro", alloc = heap)
+        defer delete(msg_1)
+        return sem_erro(s, common.E0308, alvo.pos, msg_1)
+    }
+    if tr.forma == (frontend.TR_FATIA as u8) {
+        base^ = tipo_fatia(&s.tipos, alvo.tipo)
+        return true
+    }
+    if not resolver_tamanho(s, t, &n) {
+        return false
+    }
+    base^ = tipo_array(&s.tipos, alvo.tipo, n)
+    return true
+}
+
+// C: semantic/sem_tipo.c:218
+// '[dynamic]T': o elemento nao pode ser resultado.
+proc resolver_dinamico(s: ^Semantica, t: ?^frontend.TipoRef, base: ^u32) -> bool {
+    let alvo: ^frontend.TipoRef = sem_tipo_alvo_de(t as ^frontend.TipoRef)
+    if not sem_resolver_tipo_ref(s, alvo) {
+        return false
+    }
+    if tipo_classe_de(&s.tipos, alvo.tipo) == TC_RESULTADO {
+        let msg_1 = format(f"lista de 'T ! E' nao existe: guarde o valor ou o erro", alloc = heap)
+        defer delete(msg_1)
+        return sem_erro(s, common.E0308, alvo.pos, msg_1)
+    }
+    if not sem_exige_copiavel(s, alvo.tipo, alvo.pos, "elemento de [dynamic] por valor: a lista guarda o valor") {
+        return false
+    }
+    base^ = tipo_dinamico(&s.tipos, alvo.tipo)
+    return true
+}
+
+// C: semantic/sem_tipo.c:230
+// '?T' (v1.7): o alvo nao pode ja guardar "ausente" (??T, ?^T, rawptr) nem ser dono (a lista vazia ja e a ausencia). Erros em t.pos (o '?' de fora).
+proc resolver_opcional(s: ^Semantica, t: ?^frontend.TipoRef, base: ^u32) -> bool {
+    let tr: ^frontend.TipoRef = t as ^frontend.TipoRef
+    if not sem_resolver_tipo_ref(s, sem_tipo_alvo_de(tr)) {
+        return false
+    }
+    let alvo: u32 = sem_tipo_alvo_de(tr).tipo
+    let classe: i32 = tipo_classe_de(&s.tipos, alvo)
+    if classe == TC_OPCIONAL {
+        let msg_1 = format(f"??T nao existe: ?T ja guarda um valor ou none", alloc = heap)
+        defer delete(msg_1)
+        return sem_erro(s, common.E0312, tr.pos, msg_1)
+    }
+    if classe == TC_ANULAVEL {
+        let msg_2 = format(f"?^T ja aceita none: escreva ?^T, sem o 2o '?'", alloc = heap)
+        defer delete(msg_2)
+        return sem_erro(s, common.E0312, tr.pos, msg_2)
+    }
+    if classe == TC_RAWPTR {
+        let msg_3 = format(f"rawptr ja aceita none: use rawptr", alloc = heap)
+        defer delete(msg_3)
+        return sem_erro(s, common.E0312, tr.pos, msg_3)
+    }
+    if sem_tipo_eh_dono(s, alvo) {
+        let texto = sem_descrever_str(s, alvo)
+        defer delete(texto)
+        let msg_4 = format(f"?{texto} nao existe: a lista vazia (len 0) ja e a ausencia", alloc = heap)
+        defer delete(msg_4)
+        return sem_erro(s, common.E0312, tr.pos, msg_4)
+    }
+    base^ = tipo_opcional(&s.tipos, alvo)
+    return true
+}
+
+// C: semantic/sem_tipo.c:247
+// LIMITE: cognitiva - despacho por forma do tipo escrito, na ordem do C
+proc resolver_tipo_ref_interno(s: ^Semantica, t: ?^frontend.TipoRef) -> bool {
+    var base: u32 = TIPO_VAZIO as u32
+    let tr: ^frontend.TipoRef = t as ^frontend.TipoRef
+    let forma: i32 = tr.forma as i32
+    if forma == frontend.TR_DINAMICO {
+        if not resolver_dinamico(s, t, &base) {
+            return false
+        }
+    } else if (forma == frontend.TR_ARRAY) or (forma == frontend.TR_FATIA) {
+        if not resolver_colecao(s, t, &base) {
+            return false
+        }
+    } else if forma == frontend.TR_OPCIONAL {
+        if not resolver_opcional(s, t, &base) {
+            return false
+        }
+    } else if forma == frontend.TR_LISTA_FIXA {
+        if not sem_resolver_lista_fixa(s, t, &base) {
+            return false
+        }
+    } else if forma == frontend.TR_TUPLA { // so existe em Decl.retorno e quem a resolve e DeclProc (sem_decl.c)
+        common.falha_interna("semantica: TR_TUPLA fora de Decl.retorno")
+    } else if forma != frontend.TR_NOME {
+        if forma >= frontend.TR_MAPA {
+            if not sem_resolver_tipo_v19(s, t, &base) {
+                return false
+            }
+        } else if not resolver_forma_composta(s, t, &base) {
+            return false
+        }
+    } else if tr.nome >= 0 {
+        var pos_nome: u32 = tr.pos
+        if tr.modulo != 0 {
+            pos_nome = tr.pos_tamanho
+        }
+        if not sem_resolver_nome_tipo(s, tr.nome, pos_nome, tr.modulo, &base) {
+            return false
+        }
+    }
+    if ((s.tipo_allocator != 0) and (base == s.tipo_allocator)) and (not sem_allocator_fora_de_parametro(s, t)) {
+        return false // B01a: Allocator so no parametro alloc
+    }
+    if tr.erro >= 0 {
+        return resolver_erro(s, t, base)
+    }
+    tr.tipo = base
+    return true
+}
+
+// C: semantic/sem_tipo.c:276
+proc sem_resolver_tipo_ref(s: ^Semantica, t: ?^frontend.TipoRef) -> bool {
+    if (t as ^frontend.TipoRef).forma == (frontend.TR_PROC as u8) {
+        return sem_resolver_tipo_proc(s, t)
+    }
+    s.prof_tipo += 1
+    let ok: bool = resolver_tipo_ref_interno(s, t)
+    s.prof_tipo -= 1
+    return ok
+}
+
+// C: semantic/sem_tipo.c:285
+// C2F-N7: snprintf(saida, cap, "%s", texto) = c2f_snprintf (corta em cap - 1 e grava o NUL); saida tem len >= cap
+pub proc sem_descrever(s: ^Semantica, tipo: u32, saida: []u8, cap: u64) {
+    var b = make([dynamic]u8, alloc = heap)
+    tipo_anexar_texto(&s.tipos, tipo, &b)
+    let texto = to_str(&b)
+    defer delete(texto)
+    _ = common.c2f_snprintf(saida[0..<(cap as int)], texto)
+}
+
+// C: semantic/sem_tipo.c:294
+// v1.7 (D12): a tupla nao e valor de primeira classe; so o erro de tipo muda de texto (caminho de erro de sem_compativel).
+proc erro_de_tupla(s: ^Semantica, esperado: u32, recebido: u32, pos: u32) -> bool {
+    if tipo_classe_de(&s.tipos, recebido) == TC_TUPLA {
+        let texto = sem_descrever_str(s, recebido)
+        defer delete(texto)
+        let msg_1 = format(f"a chamada devolve {texto} (varios valores): desestruture com let a, b = f()", alloc = heap)
+        defer delete(msg_1)
+        return sem_erro(s, common.E0314, pos, msg_1)
+    }
+    let msg_2 = format(f"retorno multiplo pede 'return a, b' com {tipo_tupla_qtd(&s.tipos, esperado)} valores", alloc = heap)
+    defer delete(msg_2)
+    return sem_erro(s, common.E0314, pos, msg_2)
+}
+
+// C: semantic/sem_tipo.c:304
+proc sem_compativel(s: ^Semantica, esperado: u32, recebido: u32, pos: u32) -> bool {
+    if ((esperado == recebido) or (recebido == (TIPO_VENENO as u32))) or (esperado == (TIPO_VENENO as u32)) {
+        return true
+    }
+    if tipo_proc_compativel(&s.tipos, esperado, recebido) {
+        return true // v1.12: mesma assinatura, nomes de parametro a parte
+    }
+    // D8: a unica coercao implicita da linguagem, ^T -> ?^T (mesmo apontado)
+    if ((tipo_classe_de(&s.tipos, esperado) == TC_ANULAVEL) and (tipo_classe_de(&s.tipos, recebido) == TC_PONTEIRO)) and (tipo_de(&s.tipos, esperado).a == tipo_de(&s.tipos, recebido).a) {
+        return true
+    }
+    if (tipo_classe_de(&s.tipos, recebido) == TC_TUPLA) or (tipo_classe_de(&s.tipos, esperado) == TC_TUPLA) {
+        return erro_de_tupla(s, esperado, recebido, pos)
+    }
+    let texto_esperado = sem_descrever_str(s, esperado)
+    defer delete(texto_esperado)
+    let texto_recebido = sem_descrever_str(s, recebido)
+    defer delete(texto_recebido)
+    if (tipo_classe_de(&s.tipos, esperado) == TC_REAL) and (tipo_classe_de(&s.tipos, recebido) == TC_REAL) {
+        let msg_1 = format(f"dimensoes diferentes: esperado {texto_esperado}, recebido {texto_recebido}", alloc = heap)
+        defer delete(msg_1)
+        return sem_erro(s, common.E0412, pos, msg_1)
+    }
+    let msg_2 = format(f"tipo diferente: esperado {texto_esperado}, recebido {texto_recebido}", alloc = heap)
+    defer delete(msg_2)
+    return sem_erro(s, common.E0301, pos, msg_2)
+}
+
+// C: semantic/sem_tipo.c:326
+proc compativel_sem_erro(esperado: u32, recebido: u32) -> bool {
+    return esperado == recebido
+}
+
+// C: semantic/sem_tipo.c:329
+// D3: embrulha 'e' no lugar. O no original vai para a arena e 'e' vira EX_EMBRULHA (a = original, op = tag da variante).
+// C2F-20: `new(frontend.Expr)` fora do pacote e E1003; o no vem de uma lista de 1 elemento na arena (como os arena_fatia_<tipo>), devolvida como fatia.
+proc arena_fatia_expr_embrulho(a: ^common.Arena) -> []frontend.Expr {
+    var l = make([dynamic]frontend.Expr, alloc = common.arena_mem(a), cap = 1)
+    append(&l, item = frontend.Expr{})
+    return l[..]
+}
+
+proc embrulhar(s: ^Semantica, e: ?^frontend.Expr, tipo: u32, tag: u8) {
+    var celula: []frontend.Expr = arena_fatia_expr_embrulho(s.arena as ^common.Arena)
+    let dentro: ^frontend.Expr = &celula[0]
+    let ex: ^frontend.Expr = e as ^frontend.Expr
+    dentro^ = ex^
+    ex.tipo_no = frontend.EX_EMBRULHA as u8
+    ex.a = dentro
+    ex.b = none
+    ex.args = none
+    ex.nargs = 0
+    ex.flexivel = false
+    ex.ref = frontend.REF_NENHUM as u8
+    ex.ref_id = 0
+    ex.op = tag
+    ex.tipo = tipo
+}
+
+// C: semantic/sem_tipo.c:346
+proc sem_variante_de(s: ^Semantica, uniao: u32, tipo: u32) -> i32 {
+    let d: ?^frontend.Decl = (s.globais or_else {})[tipo_de(&s.tipos, uniao).a].decl
+    for i in (0 as u32)..<(d as ^frontend.Decl).ncampos {
+        if ((d as ^frontend.Decl).campos or_else {})[i].tipo.tipo == tipo {
+            return transmute(i, to = i32)
+        }
+    }
+    return -1
+}
+
+// C: semantic/sem_tipo.c:356
+// Lista "A, B, C" das variantes da union (corta em cap - 1 bytes; o C passa 160).
+proc listar_variantes(s: ^Semantica, uniao: u32, saida: []u8, cap: u64) {
+    let d: ?^frontend.Decl = (s.globais or_else {})[tipo_de(&s.tipos, uniao).a].decl
+    var usado: u64 = 0
+    saida[0] = 0
+    var i: u32 = 0
+    while (i < (d as ^frontend.Decl).ncampos) and (usado < cap) {
+        let um = sem_descrever_str(s, ((d as ^frontend.Decl).campos or_else {})[i].tipo.tipo)
+        var separador: str = ", "
+        if i == 0 {
+            separador = ""
+        }
+        let item = format(f"{separador}{um}", alloc = heap)
+        let n: i32 = common.c2f_snprintf(saida[(usado as int)..<(cap as int)], item)
+        usado = usado + (n as u64)
+        delete(item)
+        delete(um)
+        i += 1
+    }
+}
+
+// C: semantic/sem_tipo.c:371
+// D3: Variante -> Union; recebido que nao e variante = E0313 em pos.
+proc coagir_para_uniao(s: ^Semantica, e: ?^frontend.Expr, esperado: u32, pos: u32) -> bool {
+    let ex: ^frontend.Expr = e as ^frontend.Expr
+    if ex.tipo == (TIPO_VENENO as u32) {
+        return true
+    }
+    let k: i32 = sem_variante_de(s, esperado, ex.tipo)
+    if k >= 0 {
+        embrulhar(s, e, esperado, k as u8)
+        return true
+    }
+    let recebido = sem_descrever_str(s, ex.tipo)
+    defer delete(recebido)
+    let nome = sem_descrever_str(s, esperado)
+    defer delete(nome)
+    var lista_b: [160]u8 = {}
+    listar_variantes(s, esperado, lista_b[..], 160)
+    let lista = from_bytes(lista_b[0..<common.c2f_strlen_b(lista_b[..])], alloc = heap)
+    defer delete(lista)
+    let msg_1 = format(f"o valor de tipo {recebido} nao e variante da union '{nome}' (variantes: {lista})", alloc = heap)
+    defer delete(msg_1)
+    return sem_erro(s, common.E0313, pos, msg_1)
+}
+
+// C: semantic/sem_tipo.c:386
+proc sem_coagir_lento(s: ^Semantica, e: ?^frontend.Expr, esperado: u32, pos: u32) -> bool {
+    let k: ^TipoInfo = tipo_de(&s.tipos, esperado)
+    if (k.classe == (TC_OPCIONAL as u8)) and (common.c2f_b2i32(compativel_sem_erro(k.a, (e as ^frontend.Expr).tipo)) != 0) {
+        embrulhar(s, e, esperado, 0)
+        return true
+    }
+    if k.classe == (TC_UNIAO as u8) {
+        return coagir_para_uniao(s, e, esperado, pos)
+    }
+    if sem_compativel(s, esperado, (e as ^frontend.Expr).tipo, pos) {
+        return true
+    }
+    if (common.c2f_s2u_32((s.diag as ^common.Diag).codigo) == (common.E0301 as u32)) and ((s.diag as ^common.Diag).off == pos) {
+        sem_sugerir_conversao(s, e, esperado)
+        sem_forma_tipo_diferente(s, e, esperado)
+    }
+    return false
+}
+
+// C: semantic/sem_tipo.c:403
+proc sem_tipo_tem_struct_por_valor(s: ^Semantica, t: u32) -> bool {
+    let k: ^TipoInfo = tipo_de(&s.tipos, t)
+    if k.classe == (TC_STRUCT as u8) {
+        return true
+    }
+    if (k.classe == (TC_ARRAY as u8)) or (k.classe == (TC_OPCIONAL as u8)) {
+        return sem_tipo_tem_struct_por_valor(s, k.a)
+    }
+    if k.classe != (TC_UNIAO as u8) {
+        return false
+    }
+    let d: ?^frontend.Decl = (s.globais or_else {})[k.a].decl
+    var i: u32 = 0
+    while i < (d as ^frontend.Decl).ncampos {
+        if sem_tipo_tem_struct_por_valor(s, ((d as ^frontend.Decl).campos or_else {})[i].tipo.tipo) {
+            return true
+        }
+        i += 1
+    }
+    return false
+}
+
+// C: semantic/sem_tipo.c:416
+proc sem_decl_da_struct(s: ^Semantica, tipo: u32) -> ?^frontend.Decl {
+    let k: ^TipoInfo = tipo_de(&s.tipos, tipo)
+    if k.classe == (TC_PONTEIRO as u8) {
+        let alvo: ^TipoInfo = tipo_de(&s.tipos, k.a)
+        var tern_1: ?^frontend.Decl = none
+        if alvo.classe == (TC_STRUCT as u8) {
+            tern_1 = (s.globais or_else {})[alvo.a].decl
+        }
+        return tern_1
+    }
+    var tern_2: ?^frontend.Decl = none
+    if k.classe == (TC_STRUCT as u8) {
+        tern_2 = (s.globais or_else {})[k.a].decl
+    }
+    return tern_2
+}
+
+// C: semantic/sem_tipo.c:426
+proc sem_achar_campo(estrutura: ?^frontend.Decl, nome: i32) -> i32 {
+    for i in (0 as u32)..<(estrutura as ^frontend.Decl).ncampos {
+        if ((estrutura as ^frontend.Decl).campos or_else {})[i].nome == nome {
+            return transmute(i, to = i32)
+        }
+    }
+    return -1
+}
+
+// C: semantic/sem_tipo.c:434
+proc achar_membro_exato(enumeracao: ?^frontend.Decl, nome: i32) -> i32 {
+    for i in (0 as u32)..<(enumeracao as ^frontend.Decl).nmembros {
+        if ((enumeracao as ^frontend.Decl).membros or_else {})[i].nome == nome {
+            return transmute(i, to = i32)
+        }
+    }
+    return -1
+}
+
+// C: semantic/sem_tipo.c:443
+// L3c2: a entrada de REN_MEMBRO cujo escopo tem o caminho do modulo do enum e o nome (novo) do enum, e que tem 'nome' (so a forma antiga interessa); none = nao ha.
+// C2F-N2: renomeado_achar_em devolve copia no heap; o chamador faz delete (a que nao serve e liberada aqui).
+proc membro_renomeado(s: ^Semantica, enumeracao: ?^frontend.Decl, nome: i32) -> ?^common.Renomeado {
+    let en: ^frontend.Decl = enumeracao as ^frontend.Decl
+    var era_antigo: bool = false
+    if (s.modulos == none) or ((en.modulo as u32) >= modulos_da_sem(s).n) {
+        return none
+    }
+    // C2F-N1: palavras era `const char *[3]` terminado em NULL; vira []str sem o NULL
+    var palavras: [2]str = {common.interner_texto(nomes_da_sem(s), modulos_da_sem(s).itens[en.modulo].caminho), sem_nome_texto(s, en.nome)}
+    let r: ?^common.Renomeado = common.renomeado_achar_em(common.REN_MEMBRO, palavras[..], sem_nome_texto(s, nome), &era_antigo)
+    if (r != none) and era_antigo {
+        return r
+    }
+    delete(r)
+    return none
+}
+
+// C: semantic/sem_tipo.c:456
+proc sem_achar_membro(s: ^Semantica, enumeracao: ?^frontend.Decl, nome: i32, pos: u32) -> i32 {
+    var idx: i32 = achar_membro_exato(enumeracao, nome)
+    if idx >= 0 {
+        return idx
+    }
+    let r: ?^common.Renomeado = membro_renomeado(s, enumeracao, nome)
+    defer delete(r)
+    if r == none {
+        return -1
+    }
+    let nomes: ^common.Interner = nomes_da_sem(s)
+    let novo: str = (r as ^common.Renomeado).novo or_else ""
+    idx = achar_membro_exato(enumeracao, common.interner_achar(nomes, novo, len(novo) as u32))
+    if idx >= 0 {
+        common.renomeado_notar_tabela(s.diag as ^common.Diag, pos, common.interner_tam(nomes, nome), r)
+    }
+    if (idx >= 0) and common.renomeado_recusa_em(s.diag as ^common.Diag, r) {
+        _ = common.renomeado_recusar(s.diag as ^common.Diag, pos, common.interner_tam(nomes, nome), r)
+        return SEM_MEMBRO_RECUSADO
+    }
+    return idx
+}
+
+// C: semantic/sem_tipo.c:473
+proc sem_membro_ausente(s: ^Semantica, e: ^frontend.Expr, enumeracao: ?^frontend.Decl, idx: i32) -> bool {
+    var sp: SemParecido = SemParecido{}
+    if idx == SEM_MEMBRO_RECUSADO {
+        return false
+    }
+    sem_parecido_iniciar(s, common.E0201, e.pos_op, e.nome, &sp)
+    sem_parecidos_de_membros(s, enumeracao, &sp)
+    let msg_1 = format(f"o enum '{sem_nome_texto(s, (e.a as ^frontend.Expr).nome)}' nao tem o membro '{sem_nome_texto(s, e.nome)}'", alloc = heap)
+    defer delete(msg_1)
+    return sem_erro_parecido(s, &sp, msg_1)
+}
+
+// sem_descrever (corte em cap - 1), sem_descrever_str (corte em 95) e listar_variantes (lista com ", ", corte no cap); sem_erro nao entra (so pela paridade)
+test "sem_tipo: sem_descrever e listar_variantes" {
+    var arena: common.Arena = common.Arena{}
+    var nomes: common.Interner = common.Interner{}
+    var dims: DimTabela = DimTabela{}
+    var s: Semantica = Semantica{}
+    common.interner_iniciar(&nomes, &arena)
+    dim_iniciar(&dims)
+    s.nomes = slice_from(&nomes, len = 1)
+    s.arena = &arena
+    tipos_iniciar(&s.tipos, &nomes, &dims)
+    let grifo: i32 = common.internar(&nomes, "Grifo", 5)
+    let uniao_nome: i32 = common.internar(&nomes, "Resp", 4)
+    let g: u32 = tipo_struct(&s.tipos, grifo)
+    let uniao: u32 = tipo_uniao(&s.tipos, uniao_nome)
+    let t_ptr: u32 = tipo_ponteiro(&s.tipos, g)
+    var curto: [4]u8 = {}
+    sem_descrever(&s, t_ptr, curto[..], 4)
+    expect(curto[0] == 94 and curto[1] == 71 and curto[2] == 114 and curto[3] == 0) // "^Gr" cortado em cap - 1 = 3 bytes
+    var inteiro: [32]u8 = {}
+    sem_descrever(&s, t_ptr, inteiro[..], 32)
+    expect(common.c2f_strlen_b(inteiro[..]) == 6)
+    let d1 = sem_descrever_str(&s, t_ptr)
+    expect(d1 == "^Grifo")
+    delete(d1)
+    let nome_enorme: str = "N123456789N123456789N123456789N123456789N123456789N123456789N123456789N123456789N123456789N123456789N123456789N123456789"
+    let enorme: i32 = common.internar(&nomes, nome_enorme, len(nome_enorme) as u32)
+    let t_enorme: u32 = tipo_struct(&s.tipos, enorme)
+    let d2 = sem_descrever_str(&s, t_enorme)
+    expect(len(d2) == 95 and d2 == nome_enorme[0..<95])
+    delete(d2)
+    s.globais = arena_fatia_simbolo(&arena, len(nomes.nomes) + 4)
+    var campos = make([dynamic]frontend.Campo, alloc = common.arena_mem(&arena), cap = 3)
+    for i in 0..<3 {
+        append(&campos, item = frontend.Campo{})
+    }
+    campos[0].tipo.tipo = TIPO_INT as u32
+    campos[1].tipo.tipo = TIPO_TEXTO as u32
+    campos[2].tipo.tipo = g
+    var decls = make([dynamic]frontend.Decl, alloc = common.arena_mem(&arena), cap = 1)
+    append(&decls, item = frontend.Decl{})
+    decls[0].tipo_no = frontend.D_UNIAO as u8
+    decls[0].campos = campos[..]
+    decls[0].ncampos = 3
+    let globais = s.globais or_else {}
+    globais[uniao_nome].decl = &decls[0]
+    var lista: [160]u8 = {}
+    listar_variantes(&s, uniao, lista[..], 160)
+    expect(common.c2f_strlen_b(lista[..]) == 15)
+    let lista_t = from_bytes(lista[0..<15], alloc = heap)
+    expect(lista_t == "int, str, Grifo")
+    delete(lista_t)
+    var corte: [7]u8 = {}
+    listar_variantes(&s, uniao, corte[..], 7)
+    let corte_t = from_bytes(corte[0..<common.c2f_strlen_b(corte[..])], alloc = heap)
+    expect(corte_t == "int, s") // snprintf devolve o tamanho que caberia: usado passa do cap e o laco para
+    delete(corte_t)
+    tipos_liberar(&s.tipos)
+    dim_liberar(&dims)
+    common.interner_liberar(&nomes)
+    common.arena_liberar(&arena)
+}
+
+// sem_compativel nos caminhos que nao chamam sem_erro: igual, veneno, proc de mesma assinatura (nomes a parte) e a coercao ^T -> ?^T
+test "sem_tipo: sem_compativel sem erro" {
+    var arena: common.Arena = common.Arena{}
+    var nomes: common.Interner = common.Interner{}
+    var dims: DimTabela = DimTabela{}
+    var s: Semantica = Semantica{}
+    common.interner_iniciar(&nomes, &arena)
+    dim_iniciar(&dims)
+    s.nomes = slice_from(&nomes, len = 1)
+    s.arena = &arena
+    tipos_iniciar(&s.tipos, &nomes, &dims)
+    let grifo: i32 = common.internar(&nomes, "Grifo", 5)
+    let outro: i32 = common.internar(&nomes, "Outro", 5)
+    let g: u32 = tipo_struct(&s.tipos, grifo)
+    let o: u32 = tipo_struct(&s.tipos, outro)
+    expect(sem_compativel(&s, TIPO_INT as u32, TIPO_INT as u32, 0))
+    expect(sem_compativel(&s, TIPO_INT as u32, TIPO_VENENO as u32, 0) and sem_compativel(&s, TIPO_VENENO as u32, TIPO_TEXTO as u32, 0))
+    expect(sem_compativel(&s, tipo_anulavel(&s.tipos, g), tipo_ponteiro(&s.tipos, g), 0))
+    var params: [1]u32 = {TIPO_INT as u32}
+    var nomes_p: [1]i32 = {grifo}
+    var sem_nomes: ProcAssinatura = ProcAssinatura{params = params[..], nomes = none, n = 1, retorno = TIPO_BOOL as u32}
+    var com_nomes: ProcAssinatura = ProcAssinatura{params = params[..], nomes = nomes_p[..], n = 1, retorno = TIPO_BOOL as u32}
+    let p1: u32 = tipo_proc(&s.tipos, &sem_nomes)
+    let p2: u32 = tipo_proc(&s.tipos, &com_nomes)
+    expect(p1 != p2 and sem_compativel(&s, p1, p2, 0))
+    expect(tipo_anulavel(&s.tipos, g) != tipo_anulavel(&s.tipos, o) and tipo_de(&s.tipos, tipo_anulavel(&s.tipos, g)).a != tipo_de(&s.tipos, tipo_ponteiro(&s.tipos, o)).a)
+    tipos_liberar(&s.tipos)
+    dim_liberar(&dims)
+    common.interner_liberar(&nomes)
+    common.arena_liberar(&arena)
+}

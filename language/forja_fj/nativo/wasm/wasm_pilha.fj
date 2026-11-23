@@ -1,0 +1,576 @@
+// nativo/wasm/wasm_pilha.fj - fluxo de controle do alvo wasm32-wasip1: CFG da BIR -> block/loop/if/br
+// Versao: 0.1.0 (W1.e1: algoritmo de Ramsey, "Beyond Relooper", sobre RPO + dominadores)
+// Contrato: wasm_emitir_fluxo(prog, f, tabela, corpo, erro) emite o corpo da funcao (sem os locais) e o final `unreachable`.
+// CFG irredutivel (aresta de retorno cujo destino nao domina a origem) = X0001 "CFG irredutivel". As arestas laterais dos
+// *_OV (alvo frio) nao entram no CFG: o emissor trata o frio dentro da instrucao (W1.f).
+
+import "common"
+import "nativo/bir"
+import "nativo/fmt" as pefmt
+
+const SEM_BLOCO: u32 = 4294967295
+const CTX_BLOCO: u32 = 1
+const CTX_LACO: u32 = 2
+const CTX_SE: u32 = 3
+const OP_UNREACHABLE: u8 = 0x00
+const OP_LOCAL_TEE: u8 = 0x22
+const OP_GLOBAL_GET: u8 = 0x23
+const OP_GLOBAL_SET: u8 = 0x24
+const OP_I64_LT_S: u8 = 0x53
+const OP_I64_ADD: u8 = 0x7C
+const OP_BLOCK: u8 = 0x02
+const OP_LOOP: u8 = 0x03
+const OP_IF: u8 = 0x04
+const OP_ELSE: u8 = 0x05
+const OP_BR: u8 = 0x0C
+const OP_I32_AND: u8 = 0x71
+const OP_I64_NE: u8 = 0x52
+const BLOCO_VAZIO: u8 = 0x40
+
+struct WasmFluxo {
+    prog: ^bir.BirPrograma
+    f: ^bir.BirFuncao
+    tabela: []u32
+    corpo: ^[dynamic]u8
+    erro: ^common.Diag
+    m: ^pefmt.WasmModulo // 0.32.0: o call_indirect precisa do indice do tipo da assinatura, que o modulo guarda
+    suc0: []u32 // por bloco: 1o destino do terminador (SEM_BLOCO = nenhum)
+    suc1: []u32 // por bloco: 2o destino (so DESVIA)
+    pos: []u32 // por bloco: posicao no RPO (SEM_BLOCO = inalcancavel)
+    idom: []u32 // por bloco: dominador imediato (a entrada domina a si)
+    fwd: []u32 // por bloco: arestas diretas que chegam nele
+    laco: []u32 // por bloco: 1 se recebe aresta de retorno
+    filho_ini: []u32 // arvore de dominadores: indice inicial dos filhos de cada bloco
+    filho: []u32 // filhos, do maior para o menor RPO
+    ctx_tipo: []u32 // pilha de contexto: o que cada rotulo wasm aberto significa
+    ctx_alvo: []u32
+    topo: u32
+    tam_quadro: u32 // bytes do quadro na pilha sombra (0 = funcao sem slots, sem prologo nem epilogo)
+    quadro: u32 // indice do local i64 com o endereco-base do quadro (= f.nvregs)
+    slot_off: []u32 // deslocamento de cada slot dentro do quadro
+}
+
+proc wasm_vetor(n: u64, valor: u32) -> [dynamic]u32 {
+    var v = make([dynamic]u32, alloc = heap, cap = n as int)
+    for _k in (0 as u64)..<n {
+        append(&v, item = valor)
+    }
+    return v
+}
+
+// Destinos do terminador de cada bloco (so SALTA e DESVIA tem destino)
+proc wasm_destinos(f: ^bir.BirFuncao, suc0: []u32, suc1: []u32) {
+    for b in (0 as u32)..<f.nblocos {
+        let bloco: ^bir.BirBloco = &f.blocos[b]
+        let ultimo: ^bir.BirInstr = &bloco.instrs[bloco.n - 1] // bloco.n = instrucoes validas (len(instrs) pode sobrar)
+        if (ultimo.op as i32) == bir.BIR_SALTA {
+            suc0[b] = ultimo.alvo[0]
+        }
+        if (ultimo.op as i32) == bir.BIR_DESVIA {
+            suc0[b] = ultimo.alvo[0]
+            suc1[b] = ultimo.alvo[1]
+        }
+    }
+}
+
+// DFS iterativa a partir da entrada (bloco 0); rpo = blocos alcancaveis em ordem reversa de pos-ordem
+proc wasm_calcular_rpo(n: u64, suc0: []u32, suc1: []u32, rpo: ^[dynamic]u32) {
+    var visitado = wasm_vetor(n, 0)
+    defer delete(visitado)
+    var estagio = wasm_vetor(n, 0)
+    defer delete(estagio)
+    var pilha = make([dynamic]u32, alloc = heap)
+    defer delete(pilha)
+    var pos_ordem = make([dynamic]u32, alloc = heap)
+    defer delete(pos_ordem)
+    append(&pilha, item = 0)
+    visitado[0] = 1
+    while len(pilha) > 0 {
+        let b: u32 = pilha[len(pilha) - 1]
+        let e: u32 = estagio[b]
+        if e < 2 {
+            estagio[b] = e + 1
+            var s: u32 = suc0[b]
+            if e == 1 {
+                s = suc1[b]
+            }
+            if (s != SEM_BLOCO) and (visitado[s] == 0) {
+                visitado[s] = 1
+                append(&pilha, item = s)
+            }
+        } else {
+            append(&pos_ordem, item = b)
+            _ = pop(&pilha)
+        }
+    }
+    var k: int = len(pos_ordem)
+    while k > 0 {
+        k -= 1
+        append(rpo, item = pos_ordem[k])
+    }
+}
+
+// Ponto de encontro de x e y na arvore de dominadores (Cooper-Harvey-Kennedy)
+proc wasm_intersectar(pos: []u32, idom: []u32, x: u32, y: u32) -> u32 {
+    var a: u32 = x
+    var b: u32 = y
+    while a != b {
+        while pos[a] > pos[b] {
+            a = idom[a]
+        }
+        while pos[b] > pos[a] {
+            b = idom[b]
+        }
+    }
+    return a
+}
+
+// Dominadores imediatos; precisa dos predecessores, montados aqui so entre blocos alcancaveis
+proc wasm_calcular_idom(n: u64, rpo: []u32, pos: []u32, suc0: []u32, suc1: []u32, idom: []u32) {
+    var cont = wasm_vetor(n + 1, 0)
+    defer delete(cont)
+    for i in 0..<len(rpo) {
+        let b: u32 = rpo[i]
+        if suc0[b] != SEM_BLOCO {
+            cont[suc0[b] + 1] += 1
+        }
+        if suc1[b] != SEM_BLOCO {
+            cont[suc1[b] + 1] += 1
+        }
+    }
+    for b in (0 as u64)..<n {
+        cont[b + 1] += cont[b]
+    }
+    var preenchido = wasm_vetor(n, 0)
+    defer delete(preenchido)
+    var pred = wasm_vetor(cont[n] as u64, 0)
+    defer delete(pred)
+    for i in 0..<len(rpo) {
+        let b: u32 = rpo[i]
+        for j in 0..<2 {
+            var s: u32 = suc0[b]
+            if j == 1 {
+                s = suc1[b]
+            }
+            if s != SEM_BLOCO {
+                pred[cont[s] + preenchido[s]] = b
+                preenchido[s] += 1
+            }
+        }
+    }
+    idom[0] = 0
+    var mudou: bool = true
+    while mudou {
+        mudou = false
+        for i in 1..<len(rpo) {
+            let b: u32 = rpo[i]
+            var nova: u32 = SEM_BLOCO
+            for k in cont[b]..<cont[b + 1] {
+                let p: u32 = pred[k]
+                if idom[p] != SEM_BLOCO {
+                    if nova == SEM_BLOCO {
+                        nova = p
+                    } else {
+                        nova = wasm_intersectar(pos, idom, nova, p)
+                    }
+                }
+            }
+            if idom[b] != nova {
+                idom[b] = nova
+                mudou = true
+            }
+        }
+    }
+}
+
+// x domina y? (sobe pela arvore de dominadores a partir de y)
+proc wasm_domina(fx: ^WasmFluxo, x: u32, y: u32) -> bool {
+    var a: u32 = y
+    while true {
+        if a == x {
+            return true
+        }
+        if a == 0 {
+            return false
+        }
+        a = fx.idom[a]
+    }
+    return false
+}
+
+proc wasm_fluxo_falha(fx: ^WasmFluxo, causa: str) -> bool {
+    return common.diag_relatar(fx.erro, common.X0001, fx.f.pos, causa)
+}
+
+// fwd/laco por bloco; devolve falso (erro relatado) se houver aresta de retorno cujo destino nao domina a origem
+proc wasm_classificar_arestas(fx: ^WasmFluxo, rpo: []u32) -> bool {
+    for i in 0..<len(rpo) {
+        let b: u32 = rpo[i]
+        for j in 0..<2 {
+            var s: u32 = fx.suc0[b]
+            if j == 1 {
+                s = fx.suc1[b]
+            }
+            if s != SEM_BLOCO {
+                if fx.pos[s] > fx.pos[b] {
+                    fx.fwd[s] += 1
+                } else {
+                    if not wasm_domina(fx, s, b) {
+                        return wasm_fluxo_falha(fx, "CFG irredutivel no alvo wasm32-wasip1")
+                    }
+                    fx.laco[s] = 1
+                }
+            }
+        }
+    }
+    return true
+}
+
+// Filhos na arvore de dominadores, do maior para o menor RPO
+proc wasm_montar_filhos(fx: ^WasmFluxo, rpo: []u32) {
+    for i in 1..<len(rpo) {
+        fx.filho_ini[fx.idom[rpo[i]] + 1] += 1
+    }
+    for b in (0 as u32)..<fx.f.nblocos {
+        fx.filho_ini[b + 1] += fx.filho_ini[b]
+    }
+    var preenchido = wasm_vetor(fx.f.nblocos as u64, 0)
+    defer delete(preenchido)
+    var i: int = len(rpo)
+    while i > 1 {
+        i -= 1
+        let b: u32 = rpo[i]
+        let pai: u32 = fx.idom[b]
+        fx.filho[fx.filho_ini[pai] + preenchido[pai]] = b
+        preenchido[pai] += 1
+    }
+}
+
+proc wasm_ctx_empilhar(fx: ^WasmFluxo, tipo: u32, alvo: u32) {
+    fx.ctx_tipo[fx.topo] = tipo
+    fx.ctx_alvo[fx.topo] = alvo
+    fx.topo += 1
+}
+
+// Profundidade de rotulo (0 = o mais interno) do contexto tipo/alvo; SEM_BLOCO se nao existe
+proc wasm_ctx_indice(fx: ^WasmFluxo, tipo: u32, alvo: u32) -> u32 {
+    var k: u32 = 0
+    while k < fx.topo {
+        let i: u32 = fx.topo - 1 - k
+        if (fx.ctx_tipo[i] == tipo) and (fx.ctx_alvo[i] == alvo) {
+            return k
+        }
+        k += 1
+    }
+    return SEM_BLOCO
+}
+
+proc wasm_emitir_br(fx: ^WasmFluxo, tipo: u32, destino: u32) -> bool {
+    let k: u32 = wasm_ctx_indice(fx, tipo, destino)
+    if k == SEM_BLOCO {
+        return wasm_fluxo_falha(fx, "falha interna do stackifier wasm: rotulo de salto nao encontrado")
+    }
+    append(fx.corpo, item = OP_BR)
+    pefmt.wasm_leb_u32(fx.corpo, k)
+    return true
+}
+
+// Salto de `origem` para `destino`: retorno = br ao laco; juncao = br ao bloco; senao o destino e inlinado aqui
+proc wasm_ramificar(fx: ^WasmFluxo, origem: u32, destino: u32) -> bool {
+    if fx.pos[destino] <= fx.pos[origem] {
+        return wasm_emitir_br(fx, CTX_LACO, destino)
+    }
+    if fx.fwd[destino] >= 2 {
+        return wasm_emitir_br(fx, CTX_BLOCO, destino)
+    }
+    return wasm_arvore(fx, destino)
+}
+
+// Condicao de DESVIA como i32 na pilha: i8/i16 mascaram os bits altos indefinidos; i64 compara com zero
+proc wasm_empilhar_condicao(fx: ^WasmFluxo, ins: ^bir.BirInstr) -> bool {
+    if not wasm_empilhar(ins.a, fx.corpo) {
+        return wasm_nao_suportado(fx.erro, ins.pos, "condicao de desvio que nao e inteiro")
+    }
+    let classe: i32 = ins.a.classe as i32
+    if (classe == bir.BC_I8) or (classe == bir.BC_I16) {
+        var mascara: i32 = 255
+        if classe == bir.BC_I16 {
+            mascara = 65535
+        }
+        append(fx.corpo, item = OP_I32_CONST)
+        pefmt.wasm_leb_s32(fx.corpo, mascara)
+        append(fx.corpo, item = OP_I32_AND)
+    }
+    if classe == bir.BC_I64 {
+        append(fx.corpo, item = OP_I64_CONST)
+        pefmt.wasm_leb_s64(fx.corpo, 0)
+        append(fx.corpo, item = OP_I64_NE)
+    }
+    return true
+}
+
+// Layout do quadro na pilha sombra: slots em ordem, cada um alinhado a seu alinhamento; devolve o total arredondado a 16
+// (o $sp fica sempre multiplo de 16: PILHA_TOPO e os quadros o sao)
+proc wasm_quadro_layout(f: ^bir.BirFuncao, slot_off: ^[dynamic]u32) -> u32 {
+    var fim: u32 = 0
+    for k in (0 as u32)..<f.nslots {
+        let ali: u32 = max(f.slots[k].alinhamento, 1)
+        fim = ((fim + ali - 1) / ali) * ali
+        append(slot_off, item = fim)
+        fim += f.slots[k].tam
+    }
+    return ((fim + 15) / 16) * 16
+}
+
+// R0016: chama falha_pilha do runtime (sai pelo proc_exit com JSON no stderr) e fecha com unreachable; sem indice, so o unreachable
+proc wasm_emitir_falha_pilha(fx: ^WasmFluxo) {
+    let indice: u32 = wasm_alcance_indice_falha_pilha(fx.prog, fx.tabela)
+    if indice != SEM_FUNCAO {
+        append(fx.corpo, item = OP_CALL)
+        pefmt.wasm_leb_u32(fx.corpo, indice)
+    }
+    append(fx.corpo, item = OP_UNREACHABLE)
+}
+
+// Prologo: quadro = $sp - tam; abaixo do fim da pilha = falha_pilha (R0016) + unreachable (trap); $sp = quadro
+proc wasm_prologo(fx: ^WasmFluxo) {
+    append(fx.corpo, item = OP_GLOBAL_GET)
+    pefmt.wasm_leb_u32(fx.corpo, 0)
+    append(fx.corpo, item = OP_I64_CONST)
+    pefmt.wasm_leb_s64(fx.corpo, fx.tam_quadro as i64)
+    append(fx.corpo, item = OP_I64_SUB)
+    append(fx.corpo, item = OP_LOCAL_TEE)
+    pefmt.wasm_leb_u32(fx.corpo, fx.quadro)
+    append(fx.corpo, item = OP_I64_CONST)
+    pefmt.wasm_leb_s64(fx.corpo, PILHA_BASE as i64)
+    append(fx.corpo, item = OP_I64_LT_S)
+    append(fx.corpo, item = OP_IF)
+    append(fx.corpo, item = BLOCO_VAZIO)
+    wasm_emitir_falha_pilha(fx)
+    append(fx.corpo, item = OP_END)
+    append(fx.corpo, item = OP_LOCAL_GET)
+    pefmt.wasm_leb_u32(fx.corpo, fx.quadro)
+    append(fx.corpo, item = OP_GLOBAL_SET)
+    pefmt.wasm_leb_u32(fx.corpo, 0)
+}
+
+// Epilogo antes de todo RETORNA: $sp = quadro + tam (ARMADILHA nao restaura: o proc_exit encerra)
+proc wasm_epilogo(fx: ^WasmFluxo) {
+    if fx.tam_quadro == 0 {
+        return
+    }
+    append(fx.corpo, item = OP_LOCAL_GET)
+    pefmt.wasm_leb_u32(fx.corpo, fx.quadro)
+    append(fx.corpo, item = OP_I64_CONST)
+    pefmt.wasm_leb_s64(fx.corpo, fx.tam_quadro as i64)
+    append(fx.corpo, item = OP_I64_ADD)
+    append(fx.corpo, item = OP_GLOBAL_SET)
+    pefmt.wasm_leb_u32(fx.corpo, 0)
+}
+
+// END_SLOT: dst = quadro + deslocamento do slot a.imed
+proc wasm_emitir_end_slot(fx: ^WasmFluxo, ins: ^bir.BirInstr) -> bool {
+    let k: i64 = ins.a.imed
+    if (k < 0) or (k >= (fx.f.nslots as i64)) {
+        return wasm_nao_suportado(fx.erro, ins.pos, "end_slot com slot fora do quadro")
+    }
+    append(fx.corpo, item = OP_LOCAL_GET)
+    pefmt.wasm_leb_u32(fx.corpo, fx.quadro)
+    let off: u32 = fx.slot_off[k as u32]
+    if off != 0 {
+        append(fx.corpo, item = OP_I64_CONST)
+        pefmt.wasm_leb_s64(fx.corpo, off as i64)
+        append(fx.corpo, item = OP_I64_ADD)
+    }
+    append(fx.corpo, item = OP_LOCAL_SET)
+    pefmt.wasm_leb_u32(fx.corpo, ins.dst)
+    return true
+}
+
+// Terminador do bloco x
+proc wasm_terminador(fx: ^WasmFluxo, x: u32, ultimo: ^bir.BirInstr) -> bool {
+    let op: i32 = ultimo.op as i32
+    if op == bir.BIR_SALTA {
+        return wasm_ramificar(fx, x, ultimo.alvo[0])
+    }
+    if op == bir.BIR_DESVIA {
+        if not wasm_empilhar_condicao(fx, ultimo) {
+            return false
+        }
+        append(fx.corpo, item = OP_IF)
+        append(fx.corpo, item = BLOCO_VAZIO)
+        wasm_ctx_empilhar(fx, CTX_SE, SEM_BLOCO)
+        var ok: bool = wasm_ramificar(fx, x, ultimo.alvo[0])
+        append(fx.corpo, item = OP_ELSE)
+        ok = ok and wasm_ramificar(fx, x, ultimo.alvo[1])
+        fx.topo -= 1
+        append(fx.corpo, item = OP_END)
+        return ok
+    }
+    if op == bir.BIR_RETORNA {
+        wasm_epilogo(fx)
+        return wasm_emitir_retorno(ultimo, fx.corpo, fx.erro)
+    }
+    if op == bir.BIR_ARMADILHA {
+        return wasm_emitir_armadilha(fx, ultimo)
+    }
+    return wasm_nao_suportado(fx.erro, ultimo.pos, wasm_nome_do_op(ultimo.op))
+}
+
+// ARMADILHA = chamada ao runtime de falha (que sai pelo proc_exit) + unreachable
+proc wasm_emitir_armadilha(fx: ^WasmFluxo, ins: ^bir.BirInstr) -> bool {
+    if not wasm_emitir_chamada(fx.prog, ins, fx.tabela, fx.corpo, fx.erro) {
+        return false
+    }
+    append(fx.corpo, item = OP_UNREACHABLE)
+    return true
+}
+
+// Corpo do bloco frio de um *_OV (instrucoes + ARMADILHA final), emitido no lugar, dentro do `if` do estouro
+proc wasm_emitir_frio(fx: ^WasmFluxo, ins: ^bir.BirInstr) -> bool {
+    let frio: ^bir.BirBloco = &fx.f.blocos[ins.alvo[0]]
+    if (frio.n == 0) or ((frio.instrs[frio.n - 1].op as i32) != bir.BIR_ARMADILHA) {
+        return wasm_nao_suportado(fx.erro, ins.pos, "conta checada com bloco frio que nao termina em armadilha")
+    }
+    for k in (0 as u64)..<((frio.n as u64) - 1) {
+        if not wasm_emitir_instr(fx, &frio.instrs[k]) {
+            return false
+        }
+    }
+    return wasm_emitir_armadilha(fx, &frio.instrs[frio.n - 1])
+}
+
+// *_OV: if (estourou) { bloco frio; unreachable }, depois o resultado com volta (alvo[0] = 0 = sem frio: nao estoura)
+proc wasm_emitir_conta_ov(fx: ^WasmFluxo, ins: ^bir.BirInstr) -> bool {
+    if not wasm_classe_inteira(ins.classe) {
+        return wasm_nao_suportado(fx.erro, ins.pos, "conta checada de real")
+    }
+    if ins.alvo[0] != 0 {
+        var ov = wasm_ov_novo(ins, fx.corpo)
+        if not wasm_ov_flag(&ov) {
+            return wasm_nao_suportado(fx.erro, ins.pos, "conta checada com operando invalido")
+        }
+        append(fx.corpo, item = OP_IF)
+        append(fx.corpo, item = BLOCO_VAZIO)
+        if not wasm_emitir_frio(fx, ins) {
+            return false
+        }
+        append(fx.corpo, item = OP_END)
+    }
+    if not wasm_ov_resultado(ins, fx.corpo) {
+        return wasm_nao_suportado(fx.erro, ins.pos, "conta checada com operando invalido")
+    }
+    return true
+}
+
+// Instrucao de dentro do bloco: *_OV leva o frio junto; o resto vai ao emissor geral
+proc wasm_emitir_no_bloco(fx: ^WasmFluxo, ins: ^bir.BirInstr) -> bool {
+    let op: i32 = ins.op as i32
+    if (op >= bir.BIR_ADD_OV) and (op <= bir.BIR_NEG_OV) {
+        return wasm_emitir_conta_ov(fx, ins)
+    }
+    return wasm_emitir_instr(fx, ins)
+}
+
+// Instrucoes do bloco x (sem o terminador) + terminador
+proc wasm_codigo_do_bloco(fx: ^WasmFluxo, x: u32) -> bool {
+    let bloco: ^bir.BirBloco = &fx.f.blocos[x]
+    let total: u64 = bloco.n as u64
+    for k in (0 as u64)..<(total - 1) {
+        if not wasm_emitir_no_bloco(fx, &bloco.instrs[k]) {
+            return false
+        }
+    }
+    return wasm_terminador(fx, x, &bloco.instrs[total - 1])
+}
+
+// Aninha um `block` por filho-juncao (do maior para o menor RPO); o codigo de x vai no mais interno
+proc wasm_dentro(fx: ^WasmFluxo, x: u32, ys: []u32, i: int) -> bool {
+    if i == len(ys) {
+        return wasm_codigo_do_bloco(fx, x)
+    }
+    append(fx.corpo, item = OP_BLOCK)
+    append(fx.corpo, item = BLOCO_VAZIO)
+    wasm_ctx_empilhar(fx, CTX_BLOCO, ys[i])
+    let ok: bool = wasm_dentro(fx, x, ys, i + 1)
+    fx.topo -= 1
+    append(fx.corpo, item = OP_END)
+    if not ok {
+        return false
+    }
+    return wasm_arvore(fx, ys[i])
+}
+
+// Sub-arvore de dominadores de x: laco (se for cabecalho) + blocos das juncoes que x domina
+proc wasm_arvore(fx: ^WasmFluxo, x: u32) -> bool {
+    var ys = make([dynamic]u32, alloc = heap)
+    defer delete(ys)
+    for k in fx.filho_ini[x]..<fx.filho_ini[x + 1] {
+        if fx.fwd[fx.filho[k]] >= 2 {
+            append(&ys, item = fx.filho[k])
+        }
+    }
+    let eh_laco: bool = fx.laco[x] != 0
+    if eh_laco {
+        append(fx.corpo, item = OP_LOOP)
+        append(fx.corpo, item = BLOCO_VAZIO)
+        wasm_ctx_empilhar(fx, CTX_LACO, x)
+    }
+    let ok: bool = wasm_dentro(fx, x, ys[..], 0)
+    if eh_laco {
+        fx.topo -= 1
+        append(fx.corpo, item = OP_END)
+    }
+    return ok
+}
+
+// Corpo da funcao (instrucoes, sem a declaracao de locais) + `unreachable` final; falso = erro ja relatado
+// LIMITE: parametros 6 (o modulo entrou na 0.32.0 para o call_indirect; os 6 sao o contexto de emissao, funcao de uso unico)
+proc wasm_emitir_fluxo(prog: ^bir.BirPrograma, f: ^bir.BirFuncao, tabela: []u32, corpo: ^[dynamic]u8, erro: ^common.Diag, m: ^pefmt.WasmModulo) -> bool {
+    let n: u64 = f.nblocos as u64
+    var suc0 = wasm_vetor(n, SEM_BLOCO)
+    defer delete(suc0)
+    var suc1 = wasm_vetor(n, SEM_BLOCO)
+    defer delete(suc1)
+    wasm_destinos(f, suc0[..], suc1[..])
+    var rpo = make([dynamic]u32, alloc = heap)
+    defer delete(rpo)
+    wasm_calcular_rpo(n, suc0[..], suc1[..], &rpo)
+    var pos = wasm_vetor(n, SEM_BLOCO)
+    defer delete(pos)
+    for i in 0..<len(rpo) {
+        pos[rpo[i]] = i as u32
+    }
+    var idom = wasm_vetor(n, SEM_BLOCO)
+    defer delete(idom)
+    wasm_calcular_idom(n, rpo[..], pos[..], suc0[..], suc1[..], idom[..])
+    var fwd = wasm_vetor(n, 0)
+    defer delete(fwd)
+    var laco = wasm_vetor(n, 0)
+    defer delete(laco)
+    var filho_ini = wasm_vetor(n + 1, 0)
+    defer delete(filho_ini)
+    var filho = wasm_vetor(n, SEM_BLOCO)
+    defer delete(filho)
+    var ctx_alvo = wasm_vetor(3 * n + 8, 0)
+    defer delete(ctx_alvo)
+    var ctx_tipo = wasm_vetor(3 * n + 8, 0)
+    defer delete(ctx_tipo)
+    var slot_off = make([dynamic]u32, alloc = heap)
+    defer delete(slot_off)
+    let tam_quadro: u32 = wasm_quadro_layout(f, &slot_off)
+    var fx = WasmFluxo{prog = prog, f = f, tabela = tabela, corpo = corpo, erro = erro, m = m, suc0 = suc0[..], suc1 = suc1[..], pos = pos[..], idom = idom[..], fwd = fwd[..], laco = laco[..], filho_ini = filho_ini[..], filho = filho[..], ctx_tipo = ctx_tipo[..], ctx_alvo = ctx_alvo[..], topo = 0, tam_quadro = 0, quadro = f.nvregs, slot_off = slot_off[..]}
+    if not wasm_classificar_arestas(&fx, rpo[..]) {
+        return false
+    }
+    wasm_montar_filhos(&fx, rpo[..])
+    if f.nslots > 0 {
+        fx.tam_quadro = tam_quadro
+        wasm_prologo(&fx)
+    }
+    if not wasm_arvore(&fx, 0) {
+        return false
+    }
+    append(corpo, item = OP_UNREACHABLE)
+    return true
+}

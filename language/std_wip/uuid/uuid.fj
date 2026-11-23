@@ -1,0 +1,149 @@
+// std:uuid (WIP, A22) - UUID v4 e v7 montados a partir de bytes que o chamador traz, formato 8-4-4-4-12 minusculo e parse. Forja pura (sem foreign), igual nos 2 backends.
+// Versao: 0.1.0. Changelog: 0.1.0 - L3 (A22): v4, v7, format_uuid, parse_uuid, versao, variante_rfc e UuidError.
+// Aleatoriedade NAO e daqui: v4 e v7 recebem os bytes aleatorios do chamador (a fonte segura e o item A21, outro lote). Este modulo so ajusta os bits de versao e de variante.
+// v4 pede 16 bytes aleatorios; v7 pede 10 bytes aleatorios e o carimbo unix_ms (48 bits, em milissegundos). Tamanho errado ou carimbo fora de 48 bits = UuidError.
+// format_uuid devolve texto DONO do alocador do chamador (delete so se for heap); parse_uuid aceita maiusculas e minusculas.
+
+pub enum UuidError { tamanho_invalido, formato_invalido, tempo_invalido }
+
+const BYTES_V4: int = 16
+const BYTES_V7: int = 10
+const BYTES_UUID: int = 16
+const TAMANHO_TEXTO: int = 36
+const HIFEN: u8 = 45
+const HIFEN_POS_1: int = 8
+const HIFEN_POS_2: int = 13
+const HIFEN_POS_3: int = 18
+const HIFEN_POS_4: int = 23
+const DIGITOS_HEX: str = "0123456789abcdef"
+const HEX_INVALIDO: u32 = 16
+const HEX_MAXIMO: u32 = 15
+const ASCII_ZERO: u8 = 48
+const ASCII_NOVE: u8 = 57
+const ASCII_A_MAIUSCULA: u8 = 65
+const ASCII_F_MAIUSCULA: u8 = 70
+const ASCII_A_MINUSCULA: u8 = 97
+const ASCII_F_MINUSCULA: u8 = 102
+const OFFSET_DIGITO: u32 = 48
+const OFFSET_MAIUSCULA: u32 = 55
+const OFFSET_MINUSCULA: u32 = 87
+const VERSAO_4: u8 = 0x40
+const VERSAO_7: u8 = 0x70
+const VARIANTE_RFC: u8 = 0x80
+const MASCARA_NIBBLE: u8 = 0x0F
+const MASCARA_VARIANTE: u8 = 0x3F
+const DESLOCA_NIBBLE: u8 = 4
+const DESLOCA_VARIANTE: u8 = 6
+const VARIANTE_BITS: u8 = 2
+const TEMPO_BITS: u64 = 48
+const TEMPO_BYTES: int = 6
+const BITS_POR_BYTE: u64 = 8
+const MASCARA_BYTE: u64 = 0xFF
+const POSICAO_VERSAO: int = 6
+const POSICAO_VARIANTE: int = 8
+const POSICAO_RAND_V7_INICIO: int = 9
+const RAND_V7_DESLOCO: int = 6
+
+// Valor 0..15 do digito hex c (maiuscula ou minuscula), ou HEX_INVALIDO.
+proc valor_hex(c: u8) -> u32 {
+    if c >= ASCII_ZERO and c <= ASCII_NOVE {
+        return (c as u32) - OFFSET_DIGITO
+    }
+    if c >= ASCII_A_MINUSCULA and c <= ASCII_F_MINUSCULA {
+        return (c as u32) - OFFSET_MINUSCULA
+    }
+    if c >= ASCII_A_MAIUSCULA and c <= ASCII_F_MAIUSCULA {
+        return (c as u32) - OFFSET_MAIUSCULA
+    }
+    return HEX_INVALIDO
+}
+
+// UUID v4 (RFC 9562): os 16 bytes do chamador com versao 4 no nibble alto do byte 6 e variante 10 no byte 8. Os bytes aleatorios vem de fora (A21).
+pub proc v4(random: []u8) -> [16]u8 ! UuidError {
+    if len(random) != BYTES_V4 {
+        return UuidError.tamanho_invalido
+    }
+    var out: [16]u8 = {}
+    for i in 0..<BYTES_UUID {
+        out[i] = random[i]
+    }
+    out[POSICAO_VERSAO] = (out[POSICAO_VERSAO] & MASCARA_NIBBLE) | VERSAO_4
+    out[POSICAO_VARIANTE] = (out[POSICAO_VARIANTE] & MASCARA_VARIANTE) | VARIANTE_RFC
+    return out
+}
+
+// UUID v7 (RFC 9562): carimbo unix_ms em 48 bits big endian (bytes 0..5), versao 7, 12 bits aleatorios (byte 6 baixo e byte 7), variante 10 e 62 bits aleatorios. random tem 10 bytes; unix_ms acima de 48 bits = UuidError.tempo_invalido.
+pub proc v7(random: []u8, unix_ms: u64) -> [16]u8 ! UuidError {
+    if len(random) != BYTES_V7 {
+        return UuidError.tamanho_invalido
+    }
+    if (unix_ms >> TEMPO_BITS) != 0 {
+        return UuidError.tempo_invalido
+    }
+    var out: [16]u8 = {}
+    for i in 0..<TEMPO_BYTES {
+        let deslocamento = ((TEMPO_BYTES - 1 - i) as u64) * BITS_POR_BYTE
+        out[i] = ((unix_ms >> deslocamento) & MASCARA_BYTE) as u8
+    }
+    out[POSICAO_VERSAO] = VERSAO_7 | (random[0] & MASCARA_NIBBLE)
+    out[7] = random[1]
+    out[POSICAO_VARIANTE] = VARIANTE_RFC | (random[2] & MASCARA_VARIANTE)
+    for i in POSICAO_RAND_V7_INICIO..<BYTES_UUID {
+        out[i] = random[i - RAND_V7_DESLOCO]
+    }
+    return out
+}
+
+// Texto 8-4-4-4-12 minusculo, ex.: 00112233-4455-4677-8899-aabbccddeeff. Devolve texto dono do alocador do chamador.
+pub proc format_uuid(u: [16]u8, alloc: Allocator) -> str {
+    var out = make([dynamic]u8, alloc = heap)
+    defer delete(out)
+    for i in 0..<BYTES_UUID {
+        if i == 4 or i == 6 or i == 8 or i == 10 {
+            append(&out, item = HIFEN)
+        }
+        append(&out, item = DIGITOS_HEX[(u[i] >> DESLOCA_NIBBLE) as int])
+        append(&out, item = DIGITOS_HEX[(u[i] & MASCARA_NIBBLE) as int])
+    }
+    return from_bytes(out[..], alloc = alloc)
+}
+
+// Le o texto 8-4-4-4-12 (maiusculas ou minusculas) de volta para 16 bytes. Comprimento errado = UuidError.tamanho_invalido; hifen fora do lugar ou digito que nao e hex = UuidError.formato_invalido.
+pub proc parse_uuid(s: str) -> [16]u8 ! UuidError {
+    if len(s) != TAMANHO_TEXTO {
+        return UuidError.tamanho_invalido
+    }
+    var out: [16]u8 = {}
+    var digitos = 0
+    var alto: u32 = 0
+    for p in 0..<TAMANHO_TEXTO {
+        let c = s[p]
+        if p == HIFEN_POS_1 or p == HIFEN_POS_2 or p == HIFEN_POS_3 or p == HIFEN_POS_4 {
+            if c != HIFEN {
+                return UuidError.formato_invalido
+            }
+        } else {
+            let v = valor_hex(c)
+            if v == HEX_INVALIDO {
+                return UuidError.formato_invalido
+            }
+            if digitos % 2 == 0 {
+                alto = v
+            } else {
+                out[digitos / 2] = ((alto << 4) | v) as u8
+            }
+            digitos += 1
+        }
+    }
+    return out
+}
+
+// Versao do UUID (nibble alto do byte 6): 4 para v4, 7 para v7.
+pub proc versao(u: [16]u8) -> u8 {
+    return u[POSICAO_VERSAO] >> DESLOCA_NIBBLE
+}
+
+// true se a variante e a RFC (bits 10 no inicio do byte 8).
+pub proc variante_rfc(u: [16]u8) -> bool {
+    return (u[POSICAO_VARIANTE] >> DESLOCA_VARIANTE) == VARIANTE_BITS
+}

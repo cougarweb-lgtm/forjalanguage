@@ -1,0 +1,77 @@
+// ir/lower_sorteio.fj - porte de compiler/ir/lower_sorteio.c
+// sha256 de ir/lower_sorteio.c: 616ae92c72fe3f81931a2118bed204540032df4e3c73c2708d683e9963a66e8c
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "common"
+import "frontend"
+import "semantic"
+
+// C2F-82 macro de funcao INT_VALOR ( n ) LwValorInt ( ( n ) , TIPO_INT )
+
+// C: ir/lower_sorteio.c:17
+proc below_do_rng(k: ^LoCtx, rng: Valor) -> ?^frontend.Decl {
+    let below: ?^frontend.Decl = semantic.sem_below_do_rng((k.c as ^LowerCtx).sem as ^semantic.Semantica, rng.tipo)
+    if below == none {
+        let msg_1 = format(f"lowering: rng de shuffle/choice sem o below de std:rand (offset {k.pos})", alloc = heap)
+        defer delete(msg_1)
+        common.falha_interna(msg_1)
+    }
+    return below
+}
+
+// C: ir/lower_sorteio.c:25
+proc sorteio_below(k: ^LoCtx, rng: Valor, below: ?^frontend.Decl, n: Valor) -> Valor {
+    let c: ^LowerCtx = k.c as ^LowerCtx
+    var args: []Valor = vetor_args_zerados(c, 2)
+    let i: ^IrInstr = lw_nova_instr(c, IR_CHAMADA, k.pos)
+    args[0] = rng
+    args[1] = n
+    i.nome = (below as ^frontend.Decl).chave
+    i.tipo = semantic.TIPO_UINT as u32
+    i.args = args
+    i.nargs = 2
+    i.destino = lw_novo_temp(c)
+    return lw_valor_temp(i.destino, semantic.TIPO_UINT as u32)
+}
+
+// C: ir/lower_sorteio.c:41
+proc troca_com_sorteado(k: ^LoCtx, b: ^LlBase, rng: Valor, below: ?^frontend.Decl, i: Valor) {
+    let n: Valor = lo_converte(k, semantic.TIPO_UINT as u32, ll_mais(k, i, lw_valor_int(1, semantic.TIPO_INT as u32)))
+    let j: Valor = lo_converte(k, semantic.TIPO_INT as u32, sorteio_below(k, rng, below, n))
+    let em_i: Valor = ll_le(k, b, i, true)
+    let em_j: Valor = ll_le(k, b, j, false)
+    ll_grava(k, ll_end(k, b, i, true), b.elemento, em_j)
+    ll_grava(k, ll_end(k, b, j, false), b.elemento, em_i)
+}
+
+// C: ir/lower_sorteio.c:52
+proc lw_shuffle(c: ^LowerCtx, e: ^frontend.Expr) -> Valor {
+    var k: LoCtx = LoCtx{c = c, pos = e.pos_op}
+    let colecao: Valor = lw_expr(c, ll_argumento(e, 0))
+    var b: LlBase = ll_base_de(c, colecao)
+    let rng: Valor = lw_expr(c, ll_argumento(e, 1))
+    let below: ?^frontend.Decl = below_do_rng(&k, rng)
+    let n: Valor = ll_tamanho(&k, colecao)
+    var externo: ?^IrBloco = none
+    let i: Valor = ll_entra_laco(&k, lw_valor_int(0, semantic.TIPO_INT as u32), n, &externo)
+    troca_com_sorteado(&k, &b, rng, below, i)
+    ll_sai_do_laco(&k, externo as ^IrBloco)
+    return lw_valor_nenhum()
+}
+
+// C: ir/lower_sorteio.c:68
+proc lw_choice(c: ^LowerCtx, e: ^frontend.Expr) -> Valor {
+    var k: LoCtx = LoCtx{c = c, pos = e.pos_op}
+    let colecao: Valor = lw_expr(c, ll_argumento(e, 0))
+    var b: LlBase = ll_base_de(c, colecao)
+    let rng: Valor = lw_expr(c, ll_argumento(e, 1))
+    let below: ?^frontend.Decl = below_do_rng(&k, rng)
+    let n: Valor = ll_tamanho(&k, colecao)
+    let resultado: i32 = lo_local(&k, e.tipo, lw_valor_nenhum())
+    let fora: ^IrBloco = lo_entra_se(&k, lo_nao(&k, ll_igual(&k, n, lw_valor_int(0, semantic.TIPO_INT as u32))))
+    let j: Valor = lo_converte(&k, semantic.TIPO_INT as u32, sorteio_below(&k, rng, below, lo_converte(&k, semantic.TIPO_UINT as u32, n)))
+    lo_atribui(&k, resultado, e.tipo, ll_embrulha(&k, e.tipo, ll_le(&k, &b, j, false)))
+    lo_sai_do_se(&k, fora)
+    return lw_valor_local(resultado, e.tipo)
+}

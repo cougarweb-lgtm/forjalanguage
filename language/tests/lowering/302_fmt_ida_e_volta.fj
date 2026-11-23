@@ -1,0 +1,174 @@
+// IA1-S2f (D-FMT): ida e volta nas 9 regioes: o texto de money/fixed/integer volta ao MESMO int por parse_money/parse_fixed/parse_integer (scale 0, 2 e 3; money padrao, accounting, com o codigo da regiao e sem simbolo), e o de number/percent volta ao mesmo f64.
+// 5003 valores deterministas (gerador congruente linear, 1 a 19 algarismos, sinais, menor e maior int, 0). Cada bloco imprime o total de conferencias, as falhas (0) e um hash de todos os textos formatados: o oraculo Python independente (scratchpad, sem o forja) formata e le por conta propria e tem de dar o mesmo hash.
+import "std:fmt" as fmt
+
+const MODULO_HASH: int = 1000003
+const LCG_A: int = 1103515245
+const LCG_C: int = 12345
+const LCG_M: int = 2147483648
+const VALORES: int = 5000
+const DOIS_32: int = 4294967296
+const SCALES: [3]int = {0, 2, 3}
+
+struct Placar {
+    total: int = 0
+    falhas: int = 0
+    hash: int = 0
+}
+
+proc proximo(x: int) -> int {
+    return (x * LCG_A + LCG_C) % LCG_M
+}
+
+// Mistura os bytes de texto no hash.
+proc mistura(p: ^Placar, texto: str) {
+    for i in 0..<len(texto) {
+        p.hash = (p.hash * 31 + (texto[i] as int)) % MODULO_HASH
+    }
+}
+
+proc confere_money(p: ^Placar, texto: str, loc: fmt.Locale, valor: int, scale: int) {
+    p.total += 1
+    mistura(p, texto)
+    switch r in fmt.parse_money(texto, loc = loc, scale = scale) {
+    case int:
+        if r != valor {
+            p.falhas += 1
+        }
+    case fmt.ParseError:
+        p.falhas += 1
+    }
+}
+
+proc confere_fixed(p: ^Placar, texto: str, loc: fmt.Locale, valor: int, scale: int) {
+    p.total += 1
+    mistura(p, texto)
+    switch r in fmt.parse_fixed(texto, loc = loc, scale = scale) {
+    case int:
+        if r != valor {
+            p.falhas += 1
+        }
+    case fmt.ParseError:
+        p.falhas += 1
+    }
+}
+
+proc confere_integer(p: ^Placar, texto: str, loc: fmt.Locale, valor: int) {
+    p.total += 1
+    mistura(p, texto)
+    switch r in fmt.parse_integer(texto, loc = loc) {
+    case int:
+        if r != valor {
+            p.falhas += 1
+        }
+    case fmt.ParseError:
+        p.falhas += 1
+    }
+}
+
+// As 5 formas de dinheiro de v numa regiao e numa escala, formatadas e lidas de volta.
+proc ida_e_volta_escala(p: ^Placar, v: int, loc: fmt.Locale, scale: int) {
+    let m1 = fmt.money(v, loc = loc, scale = scale, alloc = heap)
+    confere_money(p, m1, loc, v, scale)
+    delete(m1)
+    let m2 = fmt.money(v, loc = loc, scale = scale, accounting = true, alloc = heap)
+    confere_money(p, m2, loc, v, scale)
+    delete(m2)
+    let m3 = fmt.money(v, loc = loc, scale = scale, code = loc.currency_code, alloc = heap)
+    confere_money(p, m3, loc, v, scale)
+    delete(m3)
+    let m4 = fmt.money(v, loc = loc, scale = scale, symbol = false, alloc = heap)
+    confere_money(p, m4, loc, v, scale)
+    delete(m4)
+    let f1 = fmt.fixed(v, loc = loc, scale = scale, alloc = heap)
+    confere_fixed(p, f1, loc, v, scale)
+    delete(f1)
+}
+
+proc ida_e_volta_valor(p: ^Placar, v: int) {
+    for li in 0..<9 {
+        let loc = fmt.LOCALES[li]
+        for si in 0..<3 {
+            ida_e_volta_escala(p, v, loc, SCALES[si])
+        }
+        let i1 = fmt.integer(v, loc = loc, alloc = heap)
+        confere_integer(p, i1, loc, v)
+        delete(i1)
+    }
+}
+
+// Valores deterministas: 1 a 19 algarismos, 1 em 3 negativo; depois o menor int, o maior e 0.
+proc dinheiro() {
+    var p = Placar{}
+    var a = 1
+    var b = 2
+    for i in 0..<VALORES {
+        a = proximo(a)
+        b = proximo(b)
+        let bruto = a * DOIS_32 + b
+        let digitos = 1 + i % 19
+        var v = bruto
+        if digitos < 19 {
+            var limite = 1
+            for _k in 0..<digitos {
+                limite = limite * 10
+            }
+            v = bruto % limite
+        }
+        if b % 3 == 0 {
+            v = -v
+        }
+        ida_e_volta_valor(&p, v)
+    }
+    ida_e_volta_valor(&p, -9223372036854775807 - 1)
+    ida_e_volta_valor(&p, 9223372036854775807)
+    ida_e_volta_valor(&p, 0)
+    print(f"valores={VALORES + 3} total={p.total} falhas={p.falhas} hash={p.hash}")
+}
+
+// number com 2 casas de k * 0.25 (exato em f64), com sinal alternado, lido de volta por parse_number.
+proc numeros() {
+    var p = Placar{}
+    for k in 0..<2000 {
+        var v = (k as f64) * 0.25
+        if k % 2 == 1 {
+            v = -v
+        }
+        for li in 0..<9 {
+            let loc = fmt.LOCALES[li]
+            let t = fmt.number(v, loc = loc, decimals = 2, alloc = heap)
+            p.total += 1
+            mistura(&p, t)
+            if (fmt.parse_number(t, loc = loc) or_else 12345.0) != v {
+                p.falhas += 1
+            }
+            delete(t)
+        }
+    }
+    print(f"number total={p.total} falhas={p.falhas} hash={p.hash}")
+}
+
+// percent com 1 casa de k / 200 (passos de 0,5%), lido de volta por parse_percent.
+proc percentuais() {
+    var p = Placar{}
+    for k in 0..<400 {
+        let v = (k as f64) / 200.0
+        for li in 0..<9 {
+            let loc = fmt.LOCALES[li]
+            let t = fmt.percent(v, loc = loc, decimals = 1, alloc = heap)
+            p.total += 1
+            mistura(&p, t)
+            if (fmt.parse_percent(t, loc = loc) or_else 12345.0) != v {
+                p.falhas += 1
+            }
+            delete(t)
+        }
+    }
+    print(f"percent total={p.total} falhas={p.falhas} hash={p.hash}")
+}
+
+proc main() {
+    dinheiro()
+    numeros()
+    percentuais()
+}

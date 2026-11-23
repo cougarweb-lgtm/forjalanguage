@@ -1,0 +1,90 @@
+// driver/fmt_indent.fj - porte de compiler/driver/fmt_indent.c
+// sha256 de driver/fmt_indent.c: cabe28333fd42db0e1fe7ff892f2038936396612bafa69d62428a8687b98105e
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "frontend"
+
+// As aberturas ainda sem fechar (abertas[0..topo)) e se um 'switch' espera a sua '{'.
+// C2F-11: abertas era `uint8_t *` (calloc n + 1); aqui e a lista dona, do tamanho n + 1 zerada.
+struct Pilha {
+    abertas: [dynamic]u8
+    topo: u64
+    switch_pendente: bool
+}
+
+const ABERTA_COMUM: i32 = 0
+const ABERTA_SWITCH: i32 = 1
+
+// C: driver/fmt_indent.c:20
+proc eh_abertura(tipo: u8) -> bool {
+    return ((tipo == (frontend.TK_LPAREN as u8)) or (tipo == (frontend.TK_LCOLCHETE as u8))) or (tipo == (frontend.TK_LBRACE as u8))
+}
+
+// C: driver/fmt_indent.c:26
+// O nivel do token se ele abrir a linha: aberturas pendentes, menos 1 se ele fecha, ou se e 'case'/'default' direto no switch.
+proc nivel_do_token(t: ^FmtToken, p: ^Pilha) -> u32 {
+    var nivel: u32 = p.topo as u32
+    let eh_rotulo: bool = (t.tipo == (frontend.KW_CASE as u8)) or (t.tipo == (frontend.KW_DEFAULT as u8))
+    let rotulo: bool = eh_rotulo and (p.topo > 0) and (p.abertas[p.topo - 1] == (ABERTA_SWITCH as u8))
+    if (nivel > 0) and (fmt_papel_fecha(t.papel as i32) or rotulo) {
+        nivel -= 1
+    }
+    return nivel
+}
+
+// C: driver/fmt_indent.c:36
+// Depois do token: abre (a '{' de bloco logo depois de um 'switch' e a do switch) ou fecha.
+proc atualizar_pilha(t: ^FmtToken, p: ^Pilha) {
+    if t.tipo == (frontend.KW_SWITCH as u8) {
+        p.switch_pendente = true
+    }
+    if eh_abertura(t.tipo) {
+        var aberta: i32 = ABERTA_COMUM
+        if (t.papel == (PAPEL_LK as u8)) and p.switch_pendente {
+            aberta = ABERTA_SWITCH
+        }
+        p.abertas[p.topo] = aberta as u8
+        p.topo += 1
+        if t.papel == (PAPEL_LK as u8) {
+            p.switch_pendente = false
+        }
+    } else if fmt_papel_fecha(t.papel as i32) and (p.topo > 0) {
+        p.topo -= 1
+    }
+}
+
+// C: driver/fmt_indent.c:47
+// C2F-13: t fundido em n (len)
+proc fmt_calcular_niveis(t: []FmtToken) {
+    var p: Pilha = Pilha{}
+    p.abertas = make([dynamic]u8, alloc = heap)
+    resize(&p.abertas, len(t) + 1)
+    for i in 0..<len(t) {
+        t[i].nivel = nivel_do_token(&t[i], &p)
+        atualizar_pilha(&t[i], &p)
+    }
+    delete(p.abertas)
+}
+
+// '{' abre o nivel 1; o token dentro dele fica no nivel 1; '}' volta ao nivel 0; a '}' seguinte (pilha vazia) nao desce abaixo de 0.
+test "fmt_calcular_niveis: abertura, conteudo e fechamento" {
+    var t: [5]FmtToken = {FmtToken{}, FmtToken{}, FmtToken{}, FmtToken{}, FmtToken{}}
+    t[0].tipo = frontend.TK_LBRACE as u8
+    t[1].tipo = frontend.TK_IDENT as u8
+    t[2].tipo = frontend.TK_LBRACE as u8
+    t[3].tipo = frontend.TK_RBRACE as u8
+    t[4].tipo = frontend.TK_RBRACE as u8
+    for k in 0..<5 {
+        t[k].ini = (k as u32) * 2
+        t[k].fim = ((k as u32) * 2) + 1
+        t[k].primeiro = true
+    }
+    fmt_atribuir_papeis(t[..], none)
+    fmt_calcular_niveis(t[..])
+    expect(t[0].nivel == 0)
+    expect(t[1].nivel == 1)
+    expect(t[2].nivel == 1)
+    expect(t[3].nivel == 1)
+    expect(t[4].nivel == 0)
+}

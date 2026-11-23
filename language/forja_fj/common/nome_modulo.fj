@@ -1,0 +1,168 @@
+// common/nome_modulo.fj - porte de compiler/common/nome_modulo.c, compiler/common/nome_modulo.h
+// sha256 de common/nome_modulo.c: dc91da4835adb7617e99df51b91a2f9dcfe5c7b619182f7f29dffcc54f3092eb
+// sha256 de common/nome_modulo.h: 1627d79ec40a88000d357690922c17c2bf0ad83050400fb6e875d6a516ebfd69
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+pub const NOME_MODULO_TAG_MAX: i32 = 96
+
+// C: common/nome_modulo.c:10
+proc caractere_de_identificador(c: u8) -> bool {
+    return ((((c2f_char_i32(c) >= 65) and (c2f_char_i32(c) <= 90)) or ((c2f_char_i32(c) >= 97) and (c2f_char_i32(c) <= 122))) or ((c2f_char_i32(c) >= 48) and (c2f_char_i32(c) <= 57))) or (c == 95) // 'A' 'Z' 'a' 'z' '0' '9' '_'
+}
+
+// C: common/nome_modulo.c:16
+// C2F-07: o `char *tag` de saida vira o retorno `str` (heap; o chamador faz delete)
+proc tag_natural(caminho: str) -> str {
+    var segmento: u64 = 0
+    for p in (0 as u64)..<(len(caminho) as u64) {
+        if (caminho[p] == 47) or (caminho[p] == 58) { // '/' ':'
+            segmento = p + 1
+        }
+    }
+    var tag = make([dynamic]u8, alloc = heap)
+    defer delete(tag)
+    let fim: u64 = len(caminho) as u64
+    if (segmento >= fim) or ((caminho[segmento] >= 48) and (caminho[segmento] <= 57)) { // '0' '9'
+        append(&tag, item = 109 as u8) // 'm'
+    }
+    var p: u64 = segmento
+    while (p < fim) and ((len(tag) as u64) + 1 < ((NOME_MODULO_TAG_MAX - 12) as u64)) {
+        if caractere_de_identificador(caminho[p]) {
+            append(&tag, item = caminho[p])
+        } else {
+            append(&tag, item = 95 as u8) // '_'
+        }
+        p += 1
+    }
+    let r: str = to_str(&tag)
+    return r
+}
+
+// C: common/nome_modulo.c:28
+// C2F-07: tags (char[96] por modulo) vira []str
+proc tag_ja_usada(tags: []str, ate: u64, tag: str) -> bool {
+    for j in (0 as u64)..<ate {
+        if tags[j] == tag {
+            return true
+        }
+    }
+    return false
+}
+
+// C: common/nome_modulo.c:37
+// C2F-13: caminhos fundido em n (len)
+// ASSINATURA (esqueleto dizia tags: [96]str, que nao e gravavel nem o tipo do C): tags passa a []str com len(tags) >= len(caminhos); cada tags[i] e str de heap
+// escrita aqui (o chamador faz delete de cada uma)
+pub proc nome_modulo_tags(caminhos: []str, tags: []str) {
+    for i in (0 as u64)..<(len(caminhos) as u64) {
+        tags[i] = tag_natural(caminhos[i])
+        while tag_ja_usada(tags, i, tags[i]) {
+            let velho: str = tags[i]
+            var base: str = velho
+            if (len(velho) as u64) + 12 >= (NOME_MODULO_TAG_MAX as u64) {
+                base = velho[0..<(NOME_MODULO_TAG_MAX - 13)]
+            }
+            tags[i] = format(f"{base}_{i as u32}", alloc = heap)
+            delete(velho)
+        }
+    }
+}
+
+// C: common/nome_modulo.c:50
+// C2F-32: snprintf(saida, cap, ...) monta inteiro e corta em cap - 1 bytes (c2f_snprintf grava o NUL); saida e []u8 com len >= cap
+pub proc nome_modulo_chave(tag: str, nome: str, tam_nome: u64, saida: []u8, cap: u64) -> u64 {
+    let t: str = format(f"{len(tag) as u32}{tag}_{nome[0..<tam_nome]}", alloc = heap)
+    defer delete(t)
+    let n: i32 = c2f_snprintf(saida[0..<cap], t)
+    if (n > 0) and (c2f_s2u_64(n as i64) < cap) {
+        return c2f_s2u_64(n as i64)
+    }
+    return 0
+}
+
+// C: common/nome_modulo.c:56
+// N1: chave + k -> chave[k..<len(chave)]; strlen(chave + digitos) -> len(chave) - digitos (sem NUL embutido em chave)
+pub proc nome_modulo_exibicao(chave: str) -> str {
+    var tam_tag: u64 = 0
+    var digitos: u64 = 0
+    let fim: u64 = len(chave) as u64
+    if (c2f_nul_em(chave, 0) < 49) or (c2f_nul_em(chave, 0) > 57) { // '1' '9'
+        return chave
+    }
+    while (digitos < fim) and (chave[digitos] >= 48) and (chave[digitos] <= 57) { // '0' '9'
+        tam_tag = wrapping_add(wrapping_mul(tam_tag, 10), (chave[digitos] - 48) as u64)
+        digitos += 1
+    }
+    if (tam_tag == 0) or ((fim - digitos) < (tam_tag + 1)) or (chave[digitos + tam_tag] != 95) { // '_'
+        return chave
+    }
+    return chave[(digitos + tam_tag + 1)..<fim]
+}
+
+// os 3 grupos de teste_common_nome_modulo.c que nao dependem da semantica (TestaChaveInjetiva, TestaExibicao, TestaTags); TestaDeclChave fica com o lote de sem_chave
+proc teste_chave_igual(tag: str, nome: str, esperada: str) -> bool {
+    var saida: [128]u8 = {}
+    let n: u64 = nome_modulo_chave(tag, nome, len(nome) as u64, saida[..], 128)
+    return (n == (len(esperada) as u64)) and (c2f_memcmp(saida[0..<n], as_bytes(esperada)) == 0)
+}
+
+test "nome_modulo_chave" {
+    var a: [128]u8 = {}
+    var b: [128]u8 = {}
+    let na: u64 = nome_modulo_chave("db", "x_y", 3, a[..], 128)
+    let nb: u64 = nome_modulo_chave("db_x", "y", 1, b[..], 128)
+    expect(na > 0 and nb > 0 and c2f_memcmp(a[0..<na], b[0..<nb]) != 0)
+    expect(teste_chave_igual("db", "x_y", "2db_x_y"))
+    expect(teste_chave_igual("db_x", "y", "4db_x_y"))
+    expect(teste_chave_igual("json", "close", "4json_close"))
+    let ca: str = from_bytes(a[0..<na], alloc = heap)
+    let cb: str = from_bytes(b[0..<nb], alloc = heap)
+    expect(nome_modulo_exibicao(ca) == "x_y")
+    expect(nome_modulo_exibicao(cb) == "y")
+    delete(ca)
+    delete(cb)
+    expect(nome_modulo_chave("db", "x_y", 3, a[..], 5) == 0) // nao cabe: 0
+    expect(a[4] == 0) // o corte do snprintf deixa o NUL em cap - 1
+}
+
+test "nome_modulo_exibicao" {
+    expect(nome_modulo_exibicao("4json_close") == "close")
+    expect(nome_modulo_exibicao("close") == "close")
+    expect(nome_modulo_exibicao("0teste_3") == "0teste_3")
+    expect(nome_modulo_exibicao("0lista_fixa_1") == "0lista_fixa_1")
+    expect(nome_modulo_exibicao("12abcdefghijkl_f") == "f")
+    expect(nome_modulo_exibicao("9ab") == "9ab") // prefixo que nao fecha: volta inteiro
+    expect(nome_modulo_exibicao("2dbx") == "2dbx") // falta o '_' depois da tag
+    expect(nome_modulo_exibicao("4json_") == "")
+    expect(nome_modulo_exibicao("") == "")
+}
+
+test "nome_modulo_tags" {
+    var caminhos: [6]str = {"vendor:db", "pasta/db", "std:file", "sub/outro/db", "a/db_1", "x-y.z"}
+    var tags: [6]str = {"", "", "", "", "", ""}
+    nome_modulo_tags(caminhos[..], tags[..])
+    expect(tags[0] == "db")
+    expect(tags[1] == "db_1") // tag repetida: sufixo _<indice>
+    expect(tags[2] == "file")
+    expect(tags[3] == "db_3")
+    expect(tags[4] == "db_1_4") // "db_1" natural ja foi tomada pelo sufixo do indice 1
+    expect(tags[5] == "x_y_z") // fora de [A-Za-z0-9_] vira '_'
+    for i in 0..<6 {
+        for j in (i + 1)..<6 {
+            expect(tags[i] != tags[j])
+        }
+    }
+    for i in 0..<6 {
+        delete(tags[i])
+    }
+    var um: [1]str = {""}
+    var vazio: [1]str = {"vendor:"}
+    nome_modulo_tags(vazio[..], um[..])
+    expect(um[0] == "m") // segmento vazio vira "m"
+    delete(um[0])
+    var digito: [1]str = {"std:9x"}
+    nome_modulo_tags(digito[..], um[..])
+    expect(um[0] == "m9x") // nunca comeca por digito
+    delete(um[0])
+}

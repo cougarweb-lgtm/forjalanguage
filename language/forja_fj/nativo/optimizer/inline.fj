@@ -1,0 +1,767 @@
+// nativo/optimizer/inline.fj - porte de compiler/nativo/optimizer/inline.c, compiler/nativo/optimizer/inline.h
+// sha256 de nativo/optimizer/inline.c: ff4e545765002189b476423e1726e4f3e740dc6b354cb1f4b107f57e012cce7f
+// sha256 de nativo/optimizer/inline.h: b62a98a85f4d001f499419b40fce12f933bbdeaddfbb747d6b1d6a5628e6728f
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "common"
+import "nativo/bir"
+
+struct SitioInline {
+    bloco: u32
+    instr: u32
+    folha: u32
+    instr_add: u32
+}
+
+struct GuardaRetorno {
+    aux: u8
+    param: u32
+    limite: bir.BirOperando
+    devolvido: bir.BirOperando
+    folha_verdadeira: bool
+}
+
+struct SitioGuarda {
+    chamador: u32
+    bloco: u32
+    instr: u32
+    gr: GuardaRetorno
+}
+
+struct Folha {
+    avaliada: bool
+    avisou: bool
+    motivo: u8
+    quentes: u32
+    total: u32
+    nret: u32
+    nauto: u32
+    bytes_slots: u32
+}
+
+struct Passe {
+    p: ?^bir.BirPrograma
+    relato: ?^[dynamic]u8
+    funcao_do_simbolo: [dynamic]u32
+    folhas: ?[]Folha
+    global: u32
+    ninlines: u32
+    guarda_global: u32
+    guarda_chamador: u32
+    teto_recursao: u32
+}
+
+struct Chamador {
+    n: u32
+    cap: u32
+    usado: u32
+    nauto: u32
+    an: bir.AnalisesBir
+    tem_an: bool
+    segundo: bool
+}
+
+const MOTIVO_OK: i32 = 0
+const MOTIVO_CHAMA: i32 = 1
+const MOTIVO_RETORNO: i32 = 2
+const MOTIVO_TAMANHO: i32 = 3
+const MOTIVO_SLOTS: i32 = 4
+const MOTIVO_LACO: i32 = 5
+const MOTIVO_RECURSIVA: i32 = 6
+const INLINE_BLOCOS_MAX: u32 = 8
+const INLINE_BLOCOS_LACO_MAX: u32 = 12
+const ORC_QUENTES_LIVRE: u32 = 16
+// 0.40.0: no wasm o V8 so embute o que o proprio compilador ja embutiu (ihash_cru tem 17 quentes): o corte fora de laco sobe de 16 para 24
+const ORC_QUENTES_LIVRE_WASM: u32 = 28
+const ORC_QUENTES_LACO: u32 = 40
+const ORC_QUENTES_CORPO_LACO: u32 = 48
+const ORC_RECURSAO_INSTR: u32 = 64
+const ORC_RECURSAO_SITIOS: u32 = 2
+const ORC_RECURSAO_CRESCE_MULT: u32 = 10
+const ORC_SLOTS_BYTES: u32 = 128
+const ORC_RETORNO_BYTES: u32 = 64
+const ORC_CHAMADOR_MULT: u32 = 2
+const ORC_CHAMADOR_FOLGA: u32 = 256
+const ORC_CHAMADOR_LIVRE: u32 = 1024
+const ORC_GLOBAL_INSTR: u32 = 100000
+const ORC_GUARDA_INSTR: u32 = 5
+const ORC_GUARDA_CHAMADOR: u32 = 64
+const ORC_GUARDA_GLOBAL: u32 = 2048
+const NAO_ACHOU_2: u32 = 4294967295
+const NOME_MOTIVO: [7]str = {"", "chama", "retorno", "tamanho", "slots", "laco", "chama"}
+
+// C: nativo/optimizer/inline.c:65
+proc recusa(ps: ^Passe, g: ^bir.BirFuncao, motivo: ?str) {
+    if ps.relato == none {
+        return
+    }
+    let p: ^bir.BirPrograma = ps.p as ^bir.BirPrograma
+    let nome_g: str = p.simbolos[g.simbolo].nome or_else "(null)"
+    let texto_motivo: str = motivo or_else "(null)"
+    format(f"inline recusa {nome_g}: {texto_motivo}\n", into = (ps.relato as ^[dynamic]u8))
+}
+
+// C: nativo/optimizer/inline.c:73
+// C2F-INDECIDIVEL: saida
+proc sucessores(i: ^bir.BirInstr, saida: []u32) -> u32 {
+    if (i.op == (bir.BIR_SALTA as u8)) or (((i.op as i32) >= bir.BIR_ADD_OV) and ((i.op as i32) <= bir.BIR_NEG_OV)) {
+        saida[0] = i.alvo[0]
+        return 1
+    }
+    if i.op == (bir.BIR_DESVIA as u8) {
+        saida[0] = i.alvo[0]
+        saida[1] = i.alvo[1]
+        return 2
+    }
+    return 0
+}
+
+// C: nativo/optimizer/inline.c:88
+// C2F-INDECIDIVEL: cor
+proc ciclo_desde(g: ^bir.BirFuncao, b: u32, cor: []u8) -> bool {
+    cor[b] = 1
+    var j: u32 = 0
+    while j < g.blocos[b].n {
+        var suc: [2]u32 = {0, 0}
+        let n: u32 = sucessores(&g.blocos[b].instrs[j], suc[..])
+        var q: u32 = 0
+        while q < n {
+            let s: u32 = suc[q]
+            if (s >= g.nblocos) or (cor[s] == 1) or ((cor[s] == 0) and ciclo_desde(g, s, cor)) {
+                return true
+            }
+            q += 1
+        }
+        j += 1
+    }
+    cor[b] = 2
+    return false
+}
+
+// C: nativo/optimizer/inline.c:103
+proc tem_ciclo(g: ^bir.BirFuncao) -> bool {
+    var cor: [12]u8 = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
+    return ciclo_desde(g, 0, cor[..])
+}
+
+// C: nativo/optimizer/inline.c:110
+// C2F-13: eh fundido em nvregs (len)
+proc eh_slot(o: ^bir.BirOperando, eh: ?[]u8) -> bool {
+    return ((o.tipo == (bir.BO_VREG as u8)) and (o.id < (len((eh or_else {})) as u32))) and ((eh or_else {})[o.id] != 0)
+}
+
+// C: nativo/optimizer/inline.c:116
+// C2F-INDECIDIVEL: eh
+proc uso_de_slot_seguro(g: ^bir.BirFuncao, i: ^bir.BirInstr, eh: []u8) -> bool {
+    let nv: u32 = g.nvregs
+    if (((i.dst != bir.BIR_SEM_VREG) and (i.dst < nv)) and ((eh[i.dst] as i32) != 0)) and (i.op != (bir.BIR_END_SLOT as u8)) {
+        return false
+    }
+    let sw_1 = i.op as i32
+    if sw_1 == bir.BIR_END_SLOT or sw_1 == bir.BIR_COPIA_MEM {
+        return true
+    } else if sw_1 == bir.BIR_CARREGA or sw_1 == bir.BIR_ZERA_MEM {
+        return not eh_slot(&i.b, eh[0..<nv])
+    } else if sw_1 == bir.BIR_GRAVA {
+        return not eh_slot(&i.b, eh[0..<nv])
+    } else if sw_1 == bir.BIR_RETORNA {
+        return (g.retorno_tam > 0) or (not eh_slot(&i.a, eh[0..<nv]))
+    } else {
+        return (not eh_slot(&i.a, eh[0..<nv])) and (not eh_slot(&i.b, eh[0..<nv]))
+    }
+    return false
+}
+
+// C: nativo/optimizer/inline.c:136
+proc slots_seguros(g: ^bir.BirFuncao) -> bool {
+    var eh = make([dynamic]u8, alloc = heap, cap = (g.nvregs as int) + 1)
+    defer delete(eh)
+    var k: u32 = 0
+    while k <= g.nvregs {
+        append(&eh, item = 0)
+        k += 1
+    }
+    let ehs: []u8 = eh[..]
+    var b: u32 = 0
+    while b < g.nblocos {
+        var j: u32 = 0
+        while j < g.blocos[b].n {
+            let i: ^bir.BirInstr = &g.blocos[b].instrs[j]
+            if (i.op == (bir.BIR_END_SLOT as u8)) and (i.dst < g.nvregs) {
+                ehs[i.dst] = 1
+            }
+            j += 1
+        }
+        b += 1
+    }
+    var ok: bool = true
+    b = 0
+    while (b < g.nblocos) and ok {
+        var j: u32 = 0
+        while (j < g.blocos[b].n) and ok {
+            ok = uso_de_slot_seguro(g, &g.blocos[b].instrs[j], ehs)
+            j += 1
+        }
+        b += 1
+    }
+    return ok
+}
+
+// C: nativo/optimizer/inline.c:159
+proc retorna_valido(g: ^bir.BirFuncao, r: ^bir.BirInstr) -> bool {
+    if g.retorno_tam > 0 {
+        return (r.a.tipo == (bir.BO_VREG as u8)) and (r.a.tam == g.retorno_tam)
+    }
+    if g.retorno == (bir.BC_NADA as u8) {
+        return r.a.tipo == (bir.BO_NADA as u8)
+    }
+    return ((r.a.tipo == (bir.BO_VREG as u8)) or (r.a.tipo == (bir.BO_IMED as u8))) and ((r.a.classe as i32) == (g.retorno as i32))
+}
+
+// C: nativo/optimizer/inline.c:169
+proc varrer(p: ^bir.BirPrograma, g: ^bir.BirFuncao, fo: ^Folha) -> u8 {
+    var retorno_ruim: bool = false
+    var b: u32 = 0
+    while b < g.nblocos {
+        fo.total += g.blocos[b].n
+        if not g.blocos[b].frio {
+            fo.quentes += g.blocos[b].n
+        }
+        var j: u32 = 0
+        while j < g.blocos[b].n {
+            let i: ^bir.BirInstr = &g.blocos[b].instrs[j]
+            // 0.40.0: no wasm a CHAMA que vira opcode (floor, real -> int) nao e chamada do corpo
+            if (i.op == (bir.BIR_CHAMA_IND as u8)) or ((i.op == (bir.BIR_CHAMA as u8)) and (i.simbolo != g.simbolo) and (not bir.bir_chamada_vira_opcode(p, i))) {
+                return MOTIVO_CHAMA as u8
+            }
+            if (i.op == (bir.BIR_CHAMA as u8)) and (not bir.bir_chamada_vira_opcode(p, i)) {
+                fo.nauto += 1
+            }
+            if i.op == (bir.BIR_RETORNA as u8) {
+                fo.nret += 1
+                if not retorna_valido(g, i) {
+                    retorno_ruim = true
+                }
+            }
+            j += 1
+        }
+        b += 1
+    }
+    if retorno_ruim or (fo.nret == 0) or (g.retorno_tam > ORC_RETORNO_BYTES) {
+        return MOTIVO_RETORNO as u8
+    }
+    return MOTIVO_OK as u8
+}
+
+// C: nativo/optimizer/inline.c:192
+proc corpo_grande(g: ^bir.BirFuncao, fo: ^Folha, laco: bool) -> bool {
+    if g.nblocos > INLINE_BLOCOS_LACO_MAX {
+        return true
+    }
+    if fo.nauto > 0 {
+        return (fo.total > ORC_RECURSAO_INSTR) or (g.nblocos > INLINE_BLOCOS_MAX)
+    }
+    if laco {
+        return fo.quentes > ORC_QUENTES_CORPO_LACO
+    }
+    return (fo.quentes > ORC_QUENTES_LACO) or (g.nblocos > INLINE_BLOCOS_MAX)
+}
+
+// C: nativo/optimizer/inline.c:203
+proc classificar(p: ^bir.BirPrograma, g: ^bir.BirFuncao, fo: ^Folha) -> u8 {
+    let m: u8 = varrer(p, g, fo)
+    var laco: bool = false
+    if m != (MOTIVO_OK as u8) {
+        return m
+    }
+    if g.nblocos > INLINE_BLOCOS_LACO_MAX {
+        return MOTIVO_TAMANHO as u8
+    }
+    laco = tem_ciclo(g)
+    if (common.c2f_b2i32(laco) != 0) and (fo.nauto > 0) {
+        return MOTIVO_LACO as u8
+    }
+    if corpo_grande(g, fo, laco) {
+        return MOTIVO_TAMANHO as u8
+    }
+    for k in (0 as u32)..<g.nslots {
+        fo.bytes_slots += g.slots[k].tam
+    }
+    if (fo.bytes_slots > ORC_SLOTS_BYTES) or ((g.nslots > 0) and (not slots_seguros(g))) {
+        return MOTIVO_SLOTS as u8
+    }
+    var tern_1: i32 = MOTIVO_OK
+    if fo.nauto > 0 {
+        tern_1 = MOTIVO_RECURSIVA
+    }
+    return tern_1 as u8
+}
+
+// C: nativo/optimizer/inline.c:225
+proc folha_de_2(ps: ^Passe, j: u32) -> ^Folha {
+    let fo: ^Folha = &(ps.folhas or_else {})[j]
+    let g: ^bir.BirFuncao = &((ps.p as ^bir.BirPrograma).funcoes or_else {})[j]
+    if not fo.avaliada {
+        fo.avaliada = true
+        var tern_1: i32 = 0
+        if (common.c2f_b2i32(g.sintetica) != 0) or (g.nblocos == 0) {
+            tern_1 = MOTIVO_TAMANHO
+        } else {
+            tern_1 = classificar(ps.p as ^bir.BirPrograma, g, fo) as i32
+        }
+        fo.motivo = tern_1 as u8
+    }
+    return fo
+}
+
+// C: nativo/optimizer/inline.c:240
+proc argumento_combina(g: ^bir.BirFuncao, chama: ^bir.BirInstr, k: u32) -> bool {
+    let o: ^bir.BirOperando = &(chama.args or_else {})[k]
+    var tern_1: u32 = 0
+    if g.param_tam != none {
+        tern_1 = (g.param_tam or_else {})[k]
+    }
+    let tam: u32 = tern_1
+    if ((o.tipo != (bir.BO_VREG as u8)) and (o.tipo != (bir.BO_IMED as u8))) and (o.tipo != (bir.BO_SIMBOLO as u8)) {
+        return false
+    }
+    if ((o.tam != tam) or ((tam > 0) and (o.tipo != (bir.BO_VREG as u8)))) or (o.sysv != none) {
+        return false
+    }
+    return (o.classe as i32) == ((g.classe_vreg or_else {})[k] as i32)
+}
+
+// C: nativo/optimizer/inline.c:252
+proc argumentos_combinam(g: ^bir.BirFuncao, chama: ^bir.BirInstr) -> bool {
+    if chama.nargs != g.nparams {
+        return false
+    }
+    var k: u32 = 0
+    while k < chama.nargs {
+        if not argumento_combina(g, chama, k) {
+            return false
+        }
+        k += 1
+    }
+    return true
+}
+
+// C: nativo/optimizer/inline.c:263
+proc retorno_combina(g: ^bir.BirFuncao, f: ^bir.BirFuncao, chama: ^bir.BirInstr) -> bool {
+    if g.retorno_tam > 0 {
+        return ((chama.a.tipo == (bir.BO_VREG as u8)) and (chama.a.tam == g.retorno_tam)) and (chama.dst == bir.BIR_SEM_VREG)
+    }
+    if chama.dst == bir.BIR_SEM_VREG {
+        return true
+    }
+    return ((g.retorno != (bir.BC_NADA as u8)) and (chama.dst < f.nvregs)) and (((f.classe_vreg or_else {})[chama.dst] as i32) == (g.retorno as i32))
+}
+
+// C: nativo/optimizer/inline.c:282
+proc dentro_de_laco(ch: ^Chamador, f: ^bir.BirFuncao, bloco: u32) -> bool {
+    if not ch.tem_an {
+        bir.analises_calcular_lacos_apenas(f, &ch.an)
+        ch.tem_an = true
+    }
+    return (bloco < ch.an.nblocos) and ((ch.an.prof_laco or_else {})[bloco] > 0)
+}
+
+// C: nativo/optimizer/inline.c:291
+proc custo_do_sitio(g: ^bir.BirFuncao, fo: ^Folha, chama: ^bir.BirInstr) -> u32 {
+    let copia: bool = (g.retorno_tam > 0) or (chama.dst != bir.BIR_SEM_VREG)
+    var tern_1: u32 = 0
+    if common.c2f_b2i32(copia) != 0 {
+        tern_1 = fo.nret
+    }
+    return (fo.total + chama.nargs) + tern_1
+}
+
+// C: nativo/optimizer/inline.c:299
+proc recusar_chamada(ps: ^Passe, ch: ^Chamador, f: ^bir.BirFuncao, s: ^SitioInline) -> ?str {
+    let chama: ^bir.BirInstr = &f.blocos[s.bloco].instrs[s.instr]
+    let p: ^bir.BirPrograma = ps.p as ^bir.BirPrograma
+    let g: ^bir.BirFuncao = &(p.funcoes or_else {})[s.folha]
+    let fo: ^Folha = &(ps.folhas or_else {})[s.folha]
+    let custo: u32 = custo_do_sitio(g, fo, chama)
+    let propria: bool = g == f
+    if not argumentos_combinam(g, chama) {
+        return "extensao"
+    }
+    if not retorno_combina(g, f, chama) {
+        return "retorno"
+    }
+    if propria and (not ch.segundo) and (ch.nauto >= ORC_RECURSAO_SITIOS) {
+        return "orcamento"
+    }
+    var quentes_livre: u32 = ORC_QUENTES_LIVRE
+    if p.wasm {
+        quentes_livre = ORC_QUENTES_LIVRE_WASM
+    }
+    if (not propria) and (fo.quentes > quentes_livre) and (not dentro_de_laco(ch, f, s.bloco)) {
+        return "tamanho"
+    }
+    if (ch.usado >= ORC_CHAMADOR_LIVRE) and (not dentro_de_laco(ch, f, s.bloco)) {
+        return "orcamento"
+    }
+    if (((ch.n + ch.usado) + custo) > ch.cap) or (((ps.global + ch.usado) + custo) > ORC_GLOBAL_INSTR) {
+        return "orcamento"
+    }
+    ch.usado += custo
+    if propria {
+        ch.nauto += 1
+    }
+    return none
+}
+
+// C: nativo/optimizer/inline.c:325
+proc avaliar_chamada(ps: ^Passe, ch: ^Chamador, f: ^bir.BirFuncao, s: ^SitioInline) -> bool {
+    let i: ^bir.BirInstr = &f.blocos[s.bloco].instrs[s.instr]
+    let p: ^bir.BirPrograma = ps.p as ^bir.BirPrograma
+    if (f.blocos[s.bloco].frio) or (i.simbolo >= p.nsimbolos) or (ps.funcao_do_simbolo[i.simbolo] == NAO_ACHOU_2) {
+        return false
+    }
+    s.folha = ps.funcao_do_simbolo[i.simbolo]
+    let g: ^bir.BirFuncao = &(p.funcoes or_else {})[s.folha]
+    if ch.segundo and (g != f) {
+        return false
+    }
+    let fo: ^Folha = folha_de_2(ps, s.folha)
+    if (fo.motivo != (MOTIVO_OK as u8)) and (not ((fo.motivo == (MOTIVO_RECURSIVA as u8)) and (g == f))) {
+        if (not fo.avisou) and (not g.sintetica) {
+            recusa(ps, g, NOME_MOTIVO[fo.motivo as u32])
+        }
+        fo.avisou = true
+        return false
+    }
+    let motivo: ?str = recusar_chamada(ps, ch, f, s)
+    if motivo != none {
+        recusa(ps, g, motivo)
+    }
+    return motivo == none
+}
+
+// C: nativo/optimizer/inline.c:351
+proc contar_instrucoes(f: ^bir.BirFuncao) -> u32 {
+    var n: u32 = 0
+    for b in (0 as u32)..<f.nblocos {
+        n += f.blocos[b].n
+    }
+    return n
+}
+
+// C: nativo/optimizer/inline.c:363
+proc coletar_sitios(ps: ^Passe, f: ^bir.BirFuncao, saida: ^[dynamic]SitioInline, segundo: bool) -> u32 {
+    var ch = Chamador{n = contar_instrucoes(f), segundo = segundo}
+    var n: u32 = 0
+    var cap_chamador: u32 = ch.n + ORC_CHAMADOR_FOLGA
+    if (ch.n * ORC_CHAMADOR_MULT) > (ch.n + ORC_CHAMADOR_FOLGA) {
+        cap_chamador = ch.n * ORC_CHAMADOR_MULT
+    }
+    ch.cap = cap_chamador
+    if segundo {
+        ch.cap = ps.teto_recursao
+    }
+    var b: u32 = 0
+    while b < f.nblocos {
+        var j: u32 = 0
+        while j < f.blocos[b].n {
+            if f.blocos[b].instrs[j].op == (bir.BIR_CHAMA as u8) {
+                var s = SitioInline{bloco = b, instr = j}
+                if avaliar_chamada(ps, &ch, f, &s) {
+                    append(saida, item = s)
+                    n += 1
+                }
+            }
+            j += 1
+        }
+        b += 1
+    }
+    if ch.tem_an {
+        bir.analises_liberar(&ch.an)
+    }
+    return n
+}
+
+// C: nativo/optimizer/inline.c:393
+// C2F-13: s fundido em n (len)
+proc relatar_sitios(ps: ^Passe, chamador: u32, s: []SitioInline) {
+    let p: ^bir.BirPrograma = ps.p as ^bir.BirPrograma
+    let nome_chamador: str = p.simbolos[(p.funcoes or_else {})[chamador].simbolo].nome or_else "(null)"
+    var k: u32 = 0
+    while k < (len(s) as u32) {
+        let sitio: SitioInline = s[k]
+        let g: ^bir.BirFuncao = &(p.funcoes or_else {})[sitio.folha]
+        let nome_folha: str = p.simbolos[g.simbolo].nome or_else "(null)"
+        let bytes_slots: u32 = (ps.folhas or_else {})[sitio.folha].bytes_slots
+        ps.global += sitio.instr_add
+        ps.ninlines += 1
+        if ps.relato != none {
+            format(f"inline {nome_chamador} <- {nome_folha} b{sitio.bloco} +{sitio.instr_add} instr +{bytes_slots} B\n", into = (ps.relato as ^[dynamic]u8))
+        }
+        k += 1
+    }
+}
+
+// C: nativo/optimizer/inline.c:410
+// C2F-13: sitios fundido em n (len)
+proc inlinar_chamador(ps: ^Passe, chamador: u32, sitios: []SitioInline) {
+    let p: ^bir.BirPrograma = ps.p as ^bir.BirPrograma
+    let f: ^bir.BirFuncao = &(p.funcoes or_else {})[chamador]
+    var recursiva: bool = false
+    var k: u32 = 0
+    while (k < (len(sitios) as u32)) and (not recursiva) {
+        recursiva = sitios[k].folha == chamador
+        k += 1
+    }
+    if not recursiva {
+        inline_clonar(p, chamador, sitios, none)
+        relatar_sitios(ps, chamador, sitios)
+        return
+    }
+    var corpo = bir.BirFuncao{}
+    copiar_corpo(&p.arena, f, &corpo)
+    ps.teto_recursao = ORC_RECURSAO_CRESCE_MULT * contar_instrucoes(f)
+    inline_clonar(p, chamador, sitios, &corpo)
+    relatar_sitios(ps, chamador, sitios)
+    var segundos = make([dynamic]SitioInline, alloc = heap, cap = 8)
+    let n2: u32 = coletar_sitios(ps, f, &segundos, true)
+    if n2 > 0 {
+        inline_clonar(p, chamador, segundos[..], &corpo)
+        relatar_sitios(ps, chamador, segundos[..])
+    }
+    delete(segundos)
+    liberar_corpo(&corpo)
+}
+
+// C: nativo/optimizer/inline.c:442
+proc leaf_devolve(g: ^bir.BirFuncao, bloco: u32, param: u32, devolvido: ^bir.BirOperando) -> bool {
+    var r: ?^bir.BirInstr = none
+    if (bloco >= g.nblocos) or (g.blocos[bloco].n != 1) {
+        return false
+    }
+    r = &g.blocos[bloco].instrs[0]
+    if ((r as ^bir.BirInstr).op != (bir.BIR_RETORNA as u8)) or (not retorna_valido(g, r as ^bir.BirInstr)) {
+        return false
+    }
+    if ((r as ^bir.BirInstr).a.tipo == (bir.BO_VREG as u8)) and ((r as ^bir.BirInstr).a.id != param) {
+        return false
+    }
+    devolvido^ = (r as ^bir.BirInstr).a
+    return true
+}
+
+// C: nativo/optimizer/inline.c:458
+proc entrada_compara_parametro(g: ^bir.BirFuncao, gr: ^GuardaRetorno) -> bool {
+    var cmp: ?^bir.BirInstr = none
+    var des: ?^bir.BirInstr = none
+    if g.blocos[0].n != 2 {
+        return false
+    }
+    cmp = &g.blocos[0].instrs[0]
+    des = &g.blocos[0].instrs[1]
+    if (((((cmp as ^bir.BirInstr).op != (bir.BIR_CMP as u8)) or (((cmp as ^bir.BirInstr).aux as i32) > bir.BCOND_GE_U)) or ((cmp as ^bir.BirInstr).a.tipo != (bir.BO_VREG as u8))) or ((cmp as ^bir.BirInstr).a.id >= g.nparams)) or ((cmp as ^bir.BirInstr).b.tipo != (bir.BO_IMED as u8)) {
+        return false
+    }
+    if (((des as ^bir.BirInstr).op != (bir.BIR_DESVIA as u8)) or ((des as ^bir.BirInstr).a.tipo != (bir.BO_VREG as u8))) or ((des as ^bir.BirInstr).a.id != (cmp as ^bir.BirInstr).dst) {
+        return false
+    }
+    if (g.param_tam != none) and ((g.param_tam or_else {})[(cmp as ^bir.BirInstr).a.id] != 0) {
+        return false
+    }
+    gr.aux = (cmp as ^bir.BirInstr).aux
+    gr.param = (cmp as ^bir.BirInstr).a.id
+    gr.limite = (cmp as ^bir.BirInstr).b
+    return true
+}
+
+// C: nativo/optimizer/inline.c:479
+proc guarda_da_folha(g: ^bir.BirFuncao, gr: ^GuardaRetorno) -> bool {
+    var des: ?^bir.BirInstr = none
+    if ((((common.c2f_b2i32(g.sintetica) != 0) or (g.nblocos < 2)) or (g.retorno_tam > 0)) or (g.retorno == (bir.BC_NADA as u8))) or (not entrada_compara_parametro(g, gr)) {
+        return false
+    }
+    des = &g.blocos[0].instrs[1]
+    var lado: u8 = 0
+    while (lado as i32) < 2 {
+        if leaf_devolve(g, (des as ^bir.BirInstr).alvo[lado], gr.param, &gr.devolvido) {
+            gr.folha_verdadeira = lado == 0
+            return true
+        }
+        lado += 1
+    }
+    return false
+}
+
+// C: nativo/optimizer/inline.c:496
+proc chamada_guardavel(ps: ^Passe, f: ^bir.BirFuncao, chama: ^bir.BirInstr, gr: ^GuardaRetorno) -> bool {
+    var g: ?^bir.BirFuncao = none
+    if (chama.simbolo >= (ps.p as ^bir.BirPrograma).nsimbolos) or (ps.funcao_do_simbolo[chama.simbolo] == NAO_ACHOU_2) {
+        return false
+    }
+    g = &((ps.p as ^bir.BirPrograma).funcoes or_else {})[ps.funcao_do_simbolo[chama.simbolo]]
+    if ((chama.nargs != (g as ^bir.BirFuncao).nparams) or (not guarda_da_folha(g as ^bir.BirFuncao, gr))) or ((chama.args or_else {})[gr.param].tipo != (bir.BO_VREG as u8)) {
+        return false
+    }
+    return (common.c2f_b2i32(argumento_combina(g as ^bir.BirFuncao, chama, gr.param)) != 0) and (common.c2f_b2i32(retorno_combina(g as ^bir.BirFuncao, f, chama)) != 0)
+}
+
+// C: nativo/optimizer/inline.c:508
+proc guarda_cabe(ps: ^Passe) -> bool {
+    return ((ps.guarda_chamador + ORC_GUARDA_INSTR) <= ORC_GUARDA_CHAMADOR) and ((ps.guarda_global + ORC_GUARDA_INSTR) <= ORC_GUARDA_GLOBAL)
+}
+
+// C: nativo/optimizer/inline.c:514
+proc sitio_de_guarda(ps: ^Passe, s: ^SitioGuarda) -> bool {
+    let f: ^bir.BirFuncao = &((ps.p as ^bir.BirPrograma).funcoes or_else {})[s.chamador]
+    let bl: ^bir.BirBloco = &f.blocos[s.bloco]
+    if bl.frio {
+        return false
+    }
+    var j: u32 = 0
+    while j < bl.n {
+        if (bl.instrs[j].op == (bir.BIR_CHAMA as u8)) and (common.c2f_b2i32(chamada_guardavel(ps, f, &bl.instrs[j], &s.gr)) != 0) {
+            s.instr = j
+            return true
+        }
+        j += 1
+    }
+    return false
+}
+
+// C: nativo/optimizer/inline.c:530
+proc relatar_guarda(ps: ^Passe, s: ^SitioGuarda) {
+    let p: ^bir.BirPrograma = ps.p as ^bir.BirPrograma
+    let f: ^bir.BirFuncao = &(p.funcoes or_else {})[s.chamador]
+    let chama: ^bir.BirInstr = &f.blocos[s.bloco].instrs[s.instr]
+    let nome_chamador: str = p.simbolos[f.simbolo].nome or_else "(null)"
+    let nome_chamado: str = p.simbolos[chama.simbolo].nome or_else "(null)"
+    if ps.relato != none {
+        format(f"inline guarda {nome_chamador} <- {nome_chamado} b{s.bloco}\n", into = (ps.relato as ^[dynamic]u8))
+    }
+}
+
+// C: nativo/optimizer/inline.c:541
+proc guardar_bloco(ps: ^Passe, s: ^SitioGuarda) {
+    while (common.c2f_b2i32(guarda_cabe(ps)) != 0) and (common.c2f_b2i32(sitio_de_guarda(ps, s)) != 0) {
+        relatar_guarda(ps, s)
+        s.bloco = inline_guardar(ps.p as ^bir.BirPrograma, s)
+        ps.guarda_chamador += ORC_GUARDA_INSTR
+        ps.guarda_global += ORC_GUARDA_INSTR
+    }
+}
+
+// C: nativo/optimizer/inline.c:552
+proc aplicar_guardas_chamador(ps: ^Passe, chamador: u32) {
+    let nblocos: u32 = ((ps.p as ^bir.BirPrograma).funcoes or_else {})[chamador].nblocos
+    var s: SitioGuarda = SitioGuarda{chamador = chamador}
+    ps.guarda_chamador = 0
+    for b in (0 as u32)..<nblocos {
+        s.bloco = b
+        guardar_bloco(ps, &s)
+    }
+}
+
+// C: nativo/optimizer/inline.c:565
+proc aplicar_guardas_programa(ps: ^Passe) {
+    let p: ^bir.BirPrograma = ps.p as ^bir.BirPrograma
+    var i: u32 = 0
+    while i < p.nfuncoes {
+        if not (p.funcoes or_else {})[i].sintetica {
+            aplicar_guardas_chamador(ps, i)
+        }
+        i += 1
+    }
+    if ps.relato != none {
+        format(f"inline guarda total +{ps.guarda_global} instr (teto {ORC_GUARDA_GLOBAL})\n", into = (ps.relato as ^[dynamic]u8))
+    }
+}
+
+// C: nativo/optimizer/inline.c:575
+proc otim_inline_aplicar(programa: ^bir.BirPrograma, relato: ^[dynamic]u8) {
+    if programa.nfuncoes == 0 {
+        return
+    }
+    var ps = Passe{p = programa, relato = relato}
+    ps.funcao_do_simbolo = make([dynamic]u32, alloc = heap, cap = (programa.nsimbolos as int) + 1)
+    defer delete(ps.funcao_do_simbolo)
+    var k: u32 = 0
+    while k <= programa.nsimbolos {
+        append(&ps.funcao_do_simbolo, item = NAO_ACHOU_2)
+        k += 1
+    }
+    var folhas_dono = make([dynamic]Folha, alloc = heap, cap = (programa.nfuncoes as int))
+    defer delete(folhas_dono)
+    k = 0
+    while k < programa.nfuncoes {
+        append(&folhas_dono, item = Folha{})
+        k += 1
+    }
+    ps.folhas = folhas_dono[..]
+    k = programa.nfuncoes
+    while k > 0 {
+        k -= 1
+        let simbolo_f: u32 = (programa.funcoes or_else {})[k].simbolo
+        if ((programa.funcoes or_else {})[k].nblocos > 0) and (simbolo_f < programa.nsimbolos) {
+            ps.funcao_do_simbolo[simbolo_f] = k
+        }
+    }
+    var i: u32 = 0
+    while i < programa.nfuncoes {
+        var sitios = make([dynamic]SitioInline, alloc = heap, cap = 8)
+        let f: ^bir.BirFuncao = &(programa.funcoes or_else {})[i]
+        var n: u32 = 0
+        if f.nblocos > 0 {
+            n = coletar_sitios(&ps, f, &sitios, false)
+        }
+        if n > 0 {
+            inlinar_chamador(&ps, i, sitios[..])
+        }
+        delete(sitios)
+        i += 1
+    }
+    aplicar_guardas_programa(&ps)
+    format(f"inline total {ps.ninlines} chamadas +{ps.global} instr (teto {ORC_GLOBAL_INSTR})\n", into = relato)
+}
+
+// Testes de tem_ciclo: blocos montados a mao (SALTA com alvo, ou RETORNA).
+proc inline_teste_bloco(f: ^bir.BirFuncao, i: bir.BirInstr) {
+    let id: u32 = f.nblocos
+    if cap(f.blocos) == 0 {
+        f.blocos = make([dynamic]bir.BirBloco, alloc = heap, cap = 4)
+    }
+    append(&f.blocos, item = bir.BirBloco{})
+    f.nblocos = id + 1
+    let b: ^bir.BirBloco = &f.blocos[id]
+    b.instrs = make([dynamic]bir.BirInstr, alloc = heap, cap = 1)
+    append(&b.instrs, item = i)
+    b.n = 1
+}
+
+proc inline_teste_salta(f: ^bir.BirFuncao, alvo: u32) {
+    var i = bir.BirInstr{op = bir.BIR_SALTA as u8}
+    i.alvo[0] = alvo
+    inline_teste_bloco(f, i)
+}
+
+proc inline_teste_libera(f: ^bir.BirFuncao) {
+    var b: u32 = 0
+    while b < f.nblocos {
+        delete(f.blocos[b].instrs)
+        b += 1
+    }
+    delete(f.blocos)
+}
+
+test "inline_tem_ciclo_laco_e_reta" {
+    var laco = bir.BirFuncao{}
+    inline_teste_salta(&laco, 1)
+    inline_teste_salta(&laco, 0)
+    var reta = bir.BirFuncao{}
+    inline_teste_salta(&reta, 1)
+    inline_teste_bloco(&reta, bir.BirInstr{op = bir.BIR_RETORNA as u8})
+    expect(tem_ciclo(&laco))
+    expect(not tem_ciclo(&reta))
+    inline_teste_libera(&laco)
+    inline_teste_libera(&reta)
+}

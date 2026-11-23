@@ -1,0 +1,377 @@
+// std:binary - testes do modulo (lote A). Anexados ao texto de std:binary SO em forja test std:binary (o build normal nao os ve).
+// Versao: 0.1.0. Changelog: 0.1.0 - converte o teste antigo (programa com main que imprimia, comparado a teste.esperado) para blocos test: cada linha esperada virou um expect, mesma cobertura.
+// Sem import e sem proc main: o pedaco fica dentro do modulo, entao chama as procs dele SEM prefixo (read_u16_le, write_uleb128...).
+
+// true se os bytes de b, em hex minusculo (2 digitos por byte), sao exatamente o texto hex.
+proc hex_bate(b: []u8, hex: str) -> bool {
+    if len(hex) != len(b) * 2 {
+        return false
+    }
+    let digitos = "0123456789abcdef"
+    for i in 0..<len(b) {
+        if hex[i * 2] != digitos[(b[i] >> 4) as int] {
+            return false
+        }
+        if hex[i * 2 + 1] != digitos[(b[i] & 0x0F) as int] {
+            return false
+        }
+    }
+    return true
+}
+
+// Lista nova com o uleb128 de valor (dona do chamador: delete).
+proc uleb_de(valor: u64) -> [dynamic]u8 {
+    var out = make([dynamic]u8, alloc = heap)
+    write_uleb128(&out, valor)
+    return out
+}
+
+// Lista nova com o sleb128 de valor (dona do chamador: delete).
+proc sleb_de(valor: i64) -> [dynamic]u8 {
+    var out = make([dynamic]u8, alloc = heap)
+    write_sleb128(&out, valor)
+    return out
+}
+
+test "read_u16 le e be" {
+    var b: [8]u8 = {1, 2, 3, 4, 5, 6, 7, 8}
+    switch v in read_u16_le(b[..], 0) {
+    case u16:
+        expect(v == 0x0201)
+    case BinaryError:
+        expect(false)
+    }
+    switch v in read_u16_be(b[..], 0) {
+    case u16:
+        expect(v == 0x0102)
+    case BinaryError:
+        expect(false)
+    }
+    switch v in read_u16_be(b[..], 6) {
+    case u16:
+        expect(v == 0x0708)
+    case BinaryError:
+        expect(false)
+    }
+}
+
+test "read_u32 e read_u64 le e be" {
+    var b: [8]u8 = {1, 2, 3, 4, 5, 6, 7, 8}
+    switch v in read_u32_le(b[..], 0) {
+    case u32:
+        expect(v == 0x04030201)
+    case BinaryError:
+        expect(false)
+    }
+    switch v in read_u32_be(b[..], 4) {
+    case u32:
+        expect(v == 0x05060708)
+    case BinaryError:
+        expect(false)
+    }
+    switch v in read_u64_le(b[..], 0) {
+    case u64:
+        expect(v == 0x0807060504030201)
+    case BinaryError:
+        expect(false)
+    }
+    switch v in read_u64_be(b[..], 0) {
+    case u64:
+        expect(v == 0x0102030405060708)
+    case BinaryError:
+        expect(false)
+    }
+}
+
+test "read fora da faixa: at negativo, bytes que nao cabem e slice vazio" {
+    var b: [8]u8 = {1, 2, 3, 4, 5, 6, 7, 8}
+    switch v in read_u16_le(b[..], 7) {
+    case u16:
+        expect(false)
+    case BinaryError:
+        expect(v == BinaryError.fora_da_faixa)
+    }
+    switch v in read_u32_be(b[..], -1) {
+    case u32:
+        expect(false)
+    case BinaryError:
+        expect(v == BinaryError.fora_da_faixa)
+    }
+    switch v in read_u64_be(b[..], 1) {
+    case u64:
+        expect(false)
+    case BinaryError:
+        expect(v == BinaryError.fora_da_faixa)
+    }
+    switch v in read_u16_le(b[0..<0], 0) {
+    case u16:
+        expect(false)
+    case BinaryError:
+        expect(v == BinaryError.fora_da_faixa)
+    }
+}
+
+test "write_u16, write_u32 e write_u64 gravam os bytes certos" {
+    var out = make([dynamic]u8, alloc = heap)
+    defer delete(out)
+    write_u16_le(&out, 0x1234)
+    write_u16_be(&out, 0x1234)
+    write_u32_le(&out, 0x01020304)
+    write_u32_be(&out, 0xA1B2C3D4)
+    write_u64_le(&out, 0xFFFFFFFFFFFFFFFF)
+    write_u64_be(&out, 0x0102030405060708)
+    expect(len(out) == 28)
+    expect(out[0] == 0x34 and out[2] == 0x12 and out[4] == 0x04)
+    expect(hex_bate(out[12..<20], "ffffffffffffffff"))
+}
+
+test "leitura de volta do buffer escrito" {
+    var out = make([dynamic]u8, alloc = heap)
+    defer delete(out)
+    write_u16_le(&out, 0x1234)
+    write_u16_be(&out, 0x1234)
+    write_u32_le(&out, 0x01020304)
+    write_u32_be(&out, 0xA1B2C3D4)
+    write_u64_le(&out, 0xFFFFFFFFFFFFFFFF)
+    write_u64_be(&out, 0x0102030405060708)
+    switch v in read_u16_le(out[..], 0) {
+    case u16:
+        expect(v == 0x1234)
+    case BinaryError:
+        expect(false)
+    }
+    switch v in read_u16_be(out[..], 2) {
+    case u16:
+        expect(v == 0x1234)
+    case BinaryError:
+        expect(false)
+    }
+    switch v in read_u32_le(out[..], 4) {
+    case u32:
+        expect(v == 0x01020304)
+    case BinaryError:
+        expect(false)
+    }
+    switch v in read_u32_be(out[..], 8) {
+    case u32:
+        expect(v == 0xA1B2C3D4)
+    case BinaryError:
+        expect(false)
+    }
+    switch v in read_u64_le(out[..], 12) {
+    case u64:
+        expect(v == 0xFFFFFFFFFFFFFFFF)
+    case BinaryError:
+        expect(false)
+    }
+    switch v in read_u64_be(out[..], 20) {
+    case u64:
+        expect(v == 0x0102030405060708)
+    case BinaryError:
+        expect(false)
+    }
+    switch v in read_u16_le(out[..], 27) {
+    case u16:
+        expect(false)
+    case BinaryError:
+        expect(v == BinaryError.fora_da_faixa)
+    }
+}
+
+test "uleb128 valores pequenos e medios: bytes e leitura" {
+    var a = uleb_de(0)
+    defer delete(a)
+    expect(hex_bate(a[..], "00"))
+    switch v in read_uleb128(a[..], 0) {
+    case UVarint:
+        expect(v.value == 0)
+        expect(v.size == 1)
+    case BinaryError:
+        expect(false)
+    }
+    var b = uleb_de(624485)
+    defer delete(b)
+    expect(hex_bate(b[..], "e58e26"))
+    switch v in read_uleb128(b[..], 0) {
+    case UVarint:
+        expect(v.value == 0x98765)
+        expect(v.size == 3)
+    case BinaryError:
+        expect(false)
+    }
+    var c = uleb_de(300)
+    defer delete(c)
+    expect(hex_bate(c[..], "ac02"))
+    switch v in read_uleb128(c[..], 0) {
+    case UVarint:
+        expect(v.value == 0x12c)
+        expect(v.size == 2)
+    case BinaryError:
+        expect(false)
+    }
+    var d = uleb_de(127)
+    defer delete(d)
+    expect(hex_bate(d[..], "7f"))
+    switch v in read_uleb128(d[..], 0) {
+    case UVarint:
+        expect(v.value == 0x7f)
+        expect(v.size == 1)
+    case BinaryError:
+        expect(false)
+    }
+    var e = uleb_de(128)
+    defer delete(e)
+    expect(hex_bate(e[..], "8001"))
+    switch v in read_uleb128(e[..], 0) {
+    case UVarint:
+        expect(v.value == 0x80)
+        expect(v.size == 2)
+    case BinaryError:
+        expect(false)
+    }
+}
+
+test "uleb128 de 64 bits e erros de varint" {
+    var m = uleb_de(0xFFFFFFFFFFFFFFFF)
+    defer delete(m)
+    expect(hex_bate(m[..], "ffffffffffffffffff01"))
+    switch v in read_uleb128(m[..], 0) {
+    case UVarint:
+        expect(v.value == 0xFFFFFFFFFFFFFFFF)
+        expect(v.size == 10)
+    case BinaryError:
+        expect(false)
+    }
+    var longo: [10]u8 = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x02}
+    switch v in read_uleb128(longo[..], 0) {
+    case UVarint:
+        expect(false)
+    case BinaryError:
+        expect(v == BinaryError.varint_longo)
+    }
+    var incompleto: [2]u8 = {0x80, 0x80}
+    switch v in read_uleb128(incompleto[..], 0) {
+    case UVarint:
+        expect(false)
+    case BinaryError:
+        expect(v == BinaryError.varint_incompleto)
+    }
+    var vazio: [1]u8 = {0x00}
+    switch v in read_uleb128(vazio[0..<0], 0) {
+    case UVarint:
+        expect(false)
+    case BinaryError:
+        expect(v == BinaryError.fora_da_faixa)
+    }
+}
+
+test "sleb128 valores positivos e negativos: bytes e leitura" {
+    var a = sleb_de(2)
+    defer delete(a)
+    expect(hex_bate(a[..], "02"))
+    switch v in read_sleb128(a[..], 0) {
+    case SVarint:
+        expect(v.value == 2)
+        expect(v.size == 1)
+    case BinaryError:
+        expect(false)
+    }
+    var b = sleb_de(-2)
+    defer delete(b)
+    expect(hex_bate(b[..], "7e"))
+    switch v in read_sleb128(b[..], 0) {
+    case SVarint:
+        expect(v.value == -2)
+        expect(v.size == 1)
+    case BinaryError:
+        expect(false)
+    }
+    var c = sleb_de(127)
+    defer delete(c)
+    expect(hex_bate(c[..], "ff00"))
+    switch v in read_sleb128(c[..], 0) {
+    case SVarint:
+        expect(v.value == 127)
+        expect(v.size == 2)
+    case BinaryError:
+        expect(false)
+    }
+    var d = sleb_de(-128)
+    defer delete(d)
+    expect(hex_bate(d[..], "807f"))
+    switch v in read_sleb128(d[..], 0) {
+    case SVarint:
+        expect(v.value == -128)
+        expect(v.size == 2)
+    case BinaryError:
+        expect(false)
+    }
+    var e = sleb_de(-123456)
+    defer delete(e)
+    expect(hex_bate(e[..], "c0bb78"))
+    switch v in read_sleb128(e[..], 0) {
+    case SVarint:
+        expect(v.value == -123456)
+        expect(v.size == 3)
+    case BinaryError:
+        expect(false)
+    }
+    var f = sleb_de(-1)
+    defer delete(f)
+    expect(hex_bate(f[..], "7f"))
+    switch v in read_sleb128(f[..], 0) {
+    case SVarint:
+        expect(v.value == -1)
+        expect(v.size == 1)
+    case BinaryError:
+        expect(false)
+    }
+    var g = sleb_de(0)
+    defer delete(g)
+    expect(hex_bate(g[..], "00"))
+    switch v in read_sleb128(g[..], 0) {
+    case SVarint:
+        expect(v.value == 0)
+        expect(v.size == 1)
+    case BinaryError:
+        expect(false)
+    }
+    var meio: [1]u8 = {0x40}
+    switch v in read_sleb128(meio[..], 0) {
+    case SVarint:
+        expect(v.value == -64)
+        expect(v.size == 1)
+    case BinaryError:
+        expect(false)
+    }
+}
+
+test "sleb128 limites de 64 bits e erros de varint" {
+    var mx = sleb_de(9223372036854775807)
+    defer delete(mx)
+    expect(hex_bate(mx[..], "ffffffffffffffffff00"))
+    switch v in read_sleb128(mx[..], 0) {
+    case SVarint:
+        expect(v.value == 9223372036854775807)
+        expect(v.size == 10)
+    case BinaryError:
+        expect(false)
+    }
+    var mn = sleb_de(-9223372036854775808)
+    defer delete(mn)
+    expect(hex_bate(mn[..], "8080808080808080807f"))
+    switch v in read_sleb128(mn[..], 0) {
+    case SVarint:
+        expect(v.value == -9223372036854775808)
+        expect(v.size == 10)
+    case BinaryError:
+        expect(false)
+    }
+    var sinal_longo: [10]u8 = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01}
+    switch v in read_sleb128(sinal_longo[..], 0) {
+    case SVarint:
+        expect(false)
+    case BinaryError:
+        expect(v == BinaryError.varint_longo)
+    }
+}

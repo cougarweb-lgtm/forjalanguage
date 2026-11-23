@@ -1,0 +1,428 @@
+// driver/orquestrar_tempos.fj - porte de compiler/driver/orquestrar_tempos.c, compiler/driver/orquestrar_tempos.h
+// sha256 de driver/orquestrar_tempos.c: 20dcf944d5943c5b2ee453f3c7746fb54f26d4be8d8fb5c1d274a238eb31647d
+// sha256 de driver/orquestrar_tempos.h: 80f5d25891c6537aa3479f6c35dd97d29d257266869992759ab4b1098265e8ec
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.2.0
+// Changelog: 0.2.0 - G3 V5-O1: corpo real. QueryPerformanceCounter/Frequency -> os.time_ns (frequencia = 1e9 ticks/s; as marcas do orquestrador ja ficam em ns, ver processo_win.fj);
+//            GetSystemTimePreciseAsFileTime -> os.wall_time_ns + ns_para_filetime; fopen/fprintf -> c2f_saida_abrir/escrever (modo "wb"/"ab", sem traducao de \n); errno do fopen -> 2 (nao existe) ou 13 (existe);
+//            etapa/produto guardados em alloc = frame (o compilador nunca chama frame_reset); a lista de linhas e de heap e o tempos_gravar a solta.
+
+import "std:os"
+import "std:file"
+import "cache"
+import "common"
+
+struct TempoLinha {
+    etapa: ?str
+    produto: ?str
+    us: u64
+    ini_us: i64
+    n: i64
+}
+
+struct Tempos {
+    ativo: bool
+    caminho: ?str
+    frequencia: u64
+    inicio: u64
+    inicio_ft: u64
+    acordou_ticks: u64
+    acordou_ft: u64
+    livres: [64]u64
+    nlivres: u32
+    linhas: [dynamic]TempoLinha
+}
+
+const TEMPOS_VARIAVEL: str = "FORJA_ORQ_TEMPOS"
+const TEMPOS_CAMINHO_MAX: i32 = 1100
+const TEMPOS_ETAPA_MAX: i32 = 24
+const TEMPOS_PRODUTO_MAX: i32 = 64
+const TEMPOS_SLOTS_MAX: i32 = 64
+// os.time_ns conta em ns: 1e9 ticks por segundo (o C usava QueryPerformanceFrequency).
+const TEMPOS_TICKS_POR_SEGUNDO: u64 = 1000000000
+
+// C: ErroCrtTexto em memoria. "errno N: texto" (ou "sem codigo de erro" para 0), em alloc = frame.
+proc causa_do_errno(err: i32) -> str {
+    var buf: [256]u8 = {}
+    erro_crt_texto(err, buf[..], (ERRO_TEXTO_MAX as u64))
+    return from_bytes(buf[0..<common.c2f_strlen_b(buf[..])], alloc = frame)
+}
+
+// O fopen do C deixa o errno; aqui deduzimos: o caminho existe (13, sem permissao) ou nao (2).
+proc errno_do_arquivo(caminho: str) -> i32 {
+    var tamanho: u64 = 0
+    var mtime: u64 = 0
+    if cache.arquivo_medir(caminho, &tamanho, &mtime) {
+        return 13
+    }
+    return 2
+}
+
+// C: driver/orquestrar_tempos.c:18
+proc avisar_arquivo(acao: str, caminho: str, err: i32) {
+    let causa = causa_do_errno(err)
+    let msg = format(f"forja: aviso: nao consegui {acao} '{caminho}' dos tempos do orquestrador ({causa})\n", alloc = heap)
+    defer delete(msg)
+    escrever_stderr(msg)
+}
+
+// C: driver/orquestrar_tempos.c:26
+proc criar_arquivo(caminho: str) -> bool {
+    let f = common.c2f_saida_abrir(caminho, "wb")
+    if f == none {
+        avisar_arquivo("criar o arquivo", caminho, errno_do_arquivo(caminho))
+        return false
+    }
+    _ = common.c2f_saida_fechar(f as ^common.Saida)
+    return true
+}
+
+// C: driver/orquestrar_tempos.c:38
+proc filetime_agora() -> u64 {
+    return ns_para_filetime(os.wall_time_ns())
+}
+
+// C: driver/orquestrar_tempos.c:46
+proc tempos_iniciar(t: ^Tempos) {
+    let caminho = os.env(TEMPOS_VARIAVEL) or_else ""
+    if len(caminho) == 0 {
+        return
+    }
+    if len(caminho) >= (TEMPOS_CAMINHO_MAX as int) {
+        escrever_stderr("forja: aviso: FORJA_ORQ_TEMPOS longa demais; sem tempos do orquestrador\n")
+        return
+    }
+    t.caminho = format(f"{caminho}", alloc = frame)
+    if not criar_arquivo(t.caminho or_else "") {
+        return
+    }
+    t.frequencia = TEMPOS_TICKS_POR_SEGUNDO
+    t.linhas = make([dynamic]TempoLinha, alloc = heap)
+    t.ativo = true
+    t.inicio_ft = filetime_agora()
+    t.inicio = tempos_agora(t)
+}
+
+// C: driver/orquestrar_tempos.c:66
+proc tempos_agora(t: ^Tempos) -> u64 {
+    if not t.ativo {
+        return 0
+    }
+    return os.time_ns() as u64
+}
+
+// C: driver/orquestrar_tempos.c:76
+// Linha nova ao fim da lista, sem instante (ini_us = -1) e sem "n"; quem chama preenche us (e ini_us, se souber). O ponteiro vale ate o proximo append.
+proc nova_linha(t: ^Tempos, etapa: str, produto: ?str) -> ^TempoLinha {
+    var l = TempoLinha{ini_us = -1, n = -1}
+    l.etapa = format(f"{etapa}", alloc = frame)
+    if produto != none {
+        let nome_produto: str = produto or_else ""
+        l.produto = format(f"{nome_produto}", alloc = frame)
+    }
+    append(&t.linhas, item = l)
+    return &t.linhas[(len(t.linhas) as u64) - 1]
+}
+
+// C: driver/orquestrar_tempos.c:87
+proc tempos_anotar_us(t: ^Tempos, etapa: str, produto: str, us: u64) {
+    if not t.ativo {
+        return
+    }
+    let p_1 = nova_linha(t, etapa, produto)
+    p_1.us = us
+}
+
+// C: driver/orquestrar_tempos.c:93
+proc tempos_anotar_ticks(t: ^Tempos, etapa: str, produto: str, ticks: u64) {
+    if not t.ativo {
+        return
+    }
+    let p_1 = nova_linha(t, etapa, produto)
+    p_1.us = (ticks * 1000000) / t.frequencia
+}
+
+// C: driver/orquestrar_tempos.c:99
+proc tempos_fechar(t: ^Tempos, etapa: str, produto: ?str, ini: u64) {
+    var l: ?^TempoLinha = none
+    if not t.ativo {
+        return
+    }
+    l = nova_linha(t, etapa, produto)
+    let ptr_1: ^TempoLinha = l as ^TempoLinha
+    ptr_1.us = ((tempos_agora(t) - ini) * 1000000) / t.frequencia
+    let ptr_2: ^TempoLinha = l as ^TempoLinha
+    var tern_1: u64 = 0
+    if ini > t.inicio {
+        tern_1 = ini - t.inicio
+    }
+    ptr_2.ini_us = transmute((tern_1 * 1000000) / t.frequencia, to = i64)
+}
+
+// C: driver/orquestrar_tempos.c:109
+proc tempos_acrescentar_n(t: ^Tempos, n: i64) {
+    if (not t.ativo) or ((len(t.linhas) as u64) == 0) {
+        return
+    }
+    t.linhas[(len(t.linhas) as u64) - 1].n = n
+}
+
+// C: driver/orquestrar_tempos.c:115
+proc tempos_acordou(t: ^Tempos) {
+    if not t.ativo {
+        return
+    }
+    t.acordou_ft = filetime_agora()
+    t.acordou_ticks = tempos_agora(t)
+}
+
+// C: driver/orquestrar_tempos.c:122
+proc tempos_do_filho(t: ^Tempos, produto: str, criacao: u64, saida: u64) {
+    var vida: ?^TempoLinha = none
+    if not t.ativo {
+        return
+    }
+    vida = nova_linha(t, "vida_do_filho", produto)
+    let ptr_1: ^TempoLinha = vida as ^TempoLinha
+    var tern_1: u64 = 0
+    if saida > criacao {
+        tern_1 = (saida - criacao) / 10
+    }
+    ptr_1.us = tern_1
+    let ptr_2: ^TempoLinha = vida as ^TempoLinha
+    var tern_2: i64 = 0
+    if criacao > t.inicio_ft {
+        tern_2 = transmute((criacao - t.inicio_ft) / 10, to = i64)
+    }
+    ptr_2.ini_us = tern_2
+    var tern_3: u64 = 0
+    if t.acordou_ft > saida {
+        tern_3 = (t.acordou_ft - saida) / 10
+    }
+    tempos_anotar_us(t, "latencia", produto, tern_3)
+    if t.nlivres < (TEMPOS_SLOTS_MAX as u32) {
+        let antes_1: u32 = t.nlivres
+        t.nlivres += 1
+        t.livres[antes_1] = t.acordou_ticks
+    }
+}
+
+// C: driver/orquestrar_tempos.c:134
+proc tempos_slot_ocupado(t: ^Tempos, produto: str) {
+    if (not t.ativo) or (t.nlivres == 0) {
+        return
+    }
+    let desde: u64 = t.livres[0]
+    var k: u32 = 1
+    while k < t.nlivres {
+        t.livres[k - 1] = t.livres[k]
+        k += 1
+    }
+    t.nlivres -= 1
+    tempos_fechar(t, "ocioso_do_slot", produto, desde)
+}
+
+// C: driver/orquestrar_tempos.c:144
+proc escrever_linha(f: ^common.Saida, l: ^TempoLinha) {
+    let txt_1 = l.etapa or_else "(null)"
+    let msg_1 = format(f"{{\"etapa\":\"{txt_1}\",\"us\":{l.us},\"ini_us\":{l.ini_us}", alloc = heap)
+    defer delete(msg_1)
+    common.c2f_saida_formatar(f, msg_1)
+    let nome_produto: str = l.produto or_else ""
+    if len(nome_produto) > 0 {
+        let msg_2 = format(f",\"produto\":\"{nome_produto}\"", alloc = heap)
+        defer delete(msg_2)
+        common.c2f_saida_formatar(f, msg_2)
+    }
+    if l.n >= 0 {
+        let msg_3 = format(f",\"n\":{l.n}", alloc = heap)
+        defer delete(msg_3)
+        common.c2f_saida_formatar(f, msg_3)
+    }
+    common.c2f_saida_escrever_texto(f, "}\n")
+}
+
+// C: driver/orquestrar_tempos.c:152
+proc tempos_gravar(t: ^Tempos) {
+    if not t.ativo {
+        return
+    }
+    let caminho: str = t.caminho or_else ""
+    let f = common.c2f_saida_abrir(caminho, "ab")
+    if f == none {
+        avisar_arquivo("abrir o arquivo", caminho, errno_do_arquivo(caminho))
+    } else {
+        let saida = f as ^common.Saida
+        for k in (0 as u64)..<(len(t.linhas) as u64) {
+            escrever_linha(saida, &t.linhas[k])
+        }
+        // fclose != 0: a gravacao final falhou (o C usa o errno do fclose; aqui 5 = EIO)
+        if common.c2f_saida_fechar(saida) != 0 {
+            avisar_arquivo("gravar o arquivo", caminho, 5)
+        }
+    }
+    delete(t.linhas)
+    t.ativo = false
+}
+
+// ---------------------------------------------------------------- testes (G3 V5-O1)
+
+proc tt_texto_da_saida(s: ^common.Saida) -> str {
+    return from_bytes(s.buf[..], alloc = frame)
+}
+
+test "tempos inativo: nada anotado, sem lista" {
+    var t: Tempos = Tempos{}
+    tempos_anotar_us(&t, "a", "p", 1)
+    tempos_anotar_ticks(&t, "a", "p", 1)
+    tempos_fechar(&t, "a", none, 0)
+    tempos_acrescentar_n(&t, 3)
+    tempos_acordou(&t)
+    tempos_do_filho(&t, "p", 1, 2)
+    tempos_slot_ocupado(&t, "p")
+    tempos_gravar(&t)
+    expect(tempos_agora(&t) == 0)
+    expect(len(t.linhas) == 0)
+    expect(t.nlivres == 0)
+}
+
+test "tempos: anotar_us, anotar_ticks, acrescentar_n e fechar" {
+    var t: Tempos = Tempos{}
+    let agora: u64 = os.time_ns() as u64
+    t.ativo = true
+    t.frequencia = TEMPOS_TICKS_POR_SEGUNDO
+    t.inicio = agora - 5000000
+    t.linhas = make([dynamic]TempoLinha, alloc = heap)
+    tempos_anotar_us(&t, "canais", "p1", 42)
+    expect(len(t.linhas) == 1)
+    expect((t.linhas[0].etapa or_else "") == "canais")
+    expect((t.linhas[0].produto or_else "") == "p1")
+    expect(t.linhas[0].us == 42)
+    expect(t.linhas[0].ini_us == -1)
+    expect(t.linhas[0].n == -1)
+    tempos_anotar_ticks(&t, "criar", "p1", 3000)
+    expect(t.linhas[1].us == 3)
+    tempos_acrescentar_n(&t, 7)
+    expect(t.linhas[1].n == 7)
+    expect(t.linhas[0].n == -1)
+    tempos_fechar(&t, "avaliar", none, agora - 3000000)
+    expect(len(t.linhas) == 3)
+    expect((t.linhas[2].produto or_else "") == "")
+    expect(t.linhas[2].ini_us == 2000)
+    expect(t.linhas[2].us >= 3000)
+    tempos_fechar(&t, "antes", "p2", t.inicio - 1000)
+    expect(t.linhas[3].ini_us == 0)
+    delete(t.linhas)
+}
+
+test "tempos_do_filho, tempos_acordou e tempos_slot_ocupado" {
+    var t: Tempos = Tempos{}
+    let agora: u64 = os.time_ns() as u64
+    t.ativo = true
+    t.frequencia = TEMPOS_TICKS_POR_SEGUNDO
+    t.inicio = agora - 5000000
+    t.inicio_ft = 1000
+    t.acordou_ft = 5000
+    t.acordou_ticks = agora - 1000
+    t.linhas = make([dynamic]TempoLinha, alloc = heap)
+    tempos_do_filho(&t, "p", 2000, 4000)
+    expect(len(t.linhas) == 2)
+    expect((t.linhas[0].etapa or_else "") == "vida_do_filho")
+    expect(t.linhas[0].us == 200)
+    expect(t.linhas[0].ini_us == 100)
+    expect((t.linhas[1].etapa or_else "") == "latencia")
+    expect(t.linhas[1].us == 100)
+    expect(t.linhas[1].ini_us == -1)
+    expect(t.nlivres == 1)
+    expect(t.livres[0] == agora - 1000)
+    // criacao antes do inicio e saida antes da criacao: tudo 0 (o C usa o ternario)
+    tempos_do_filho(&t, "q", 500, 400)
+    expect(t.linhas[2].us == 0)
+    expect(t.linhas[2].ini_us == 0)
+    expect(t.linhas[3].us == 460)
+    expect(t.nlivres == 2)
+    t.livres[1] = agora - 500
+    tempos_slot_ocupado(&t, "q")
+    expect(t.nlivres == 1)
+    expect(t.livres[0] == agora - 500)
+    expect((t.linhas[4].etapa or_else "") == "ocioso_do_slot")
+    expect((t.linhas[4].produto or_else "") == "q")
+    expect(t.linhas[4].ini_us == 4999)
+    tempos_slot_ocupado(&t, "r")
+    tempos_slot_ocupado(&t, "s")
+    expect(t.nlivres == 0)
+    expect(len(t.linhas) == 6)
+    delete(t.linhas)
+}
+
+test "tempos_acordou grava o filetime e os ticks de agora" {
+    var t: Tempos = Tempos{}
+    t.ativo = true
+    tempos_acordou(&t)
+    expect(t.acordou_ft > 116444736000000000)
+    expect(t.acordou_ticks > 0)
+}
+
+test "escrever_linha: campos opcionais e ordem do C" {
+    let s = common.c2f_saida_memoria(false)
+    var l: TempoLinha = TempoLinha{etapa = "x", produto = "p", us = 5, ini_us = 6, n = 7}
+    escrever_linha(s, &l)
+    expect(tt_texto_da_saida(s) == "{\"etapa\":\"x\",\"us\":5,\"ini_us\":6,\"produto\":\"p\",\"n\":7}\n")
+    clear(&s.buf)
+    var m: TempoLinha = TempoLinha{etapa = "y", us = 1, ini_us = -1, n = -1}
+    escrever_linha(s, &m)
+    expect(tt_texto_da_saida(s) == "{\"etapa\":\"y\",\"us\":1,\"ini_us\":-1}\n")
+    clear(&s.buf)
+    var z: TempoLinha = TempoLinha{etapa = "z", produto = "", us = 0, ini_us = 0, n = 0}
+    escrever_linha(s, &z)
+    expect(tt_texto_da_saida(s) == "{\"etapa\":\"z\",\"us\":0,\"ini_us\":0,\"n\":0}\n")
+    expect(common.c2f_saida_fechar(s) == 0)
+}
+
+test "tempos_iniciar e tempos_gravar pelo FORJA_ORQ_TEMPOS" {
+    let tmp = pw_pasta_temp()
+    let caminho = format(f"{tmp}\\forja_orq_tempos_teste_{os.pid()}.jsonl", alloc = heap)
+    var t: Tempos = Tempos{}
+    _ = os.unset_env(TEMPOS_VARIAVEL)
+    tempos_iniciar(&t)
+    expect(not t.ativo)
+    _ = os.set_env(TEMPOS_VARIAVEL, "")
+    tempos_iniciar(&t)
+    expect(not t.ativo)
+    _ = os.set_env(TEMPOS_VARIAVEL, caminho)
+    tempos_iniciar(&t)
+    expect(t.ativo)
+    expect(t.frequencia == TEMPOS_TICKS_POR_SEGUNDO)
+    expect(t.inicio_ft > 116444736000000000)
+    expect(t.inicio > 0)
+    let antes_de_gravar = pw_ler_texto(caminho)
+    expect(antes_de_gravar == "")
+    delete(antes_de_gravar)
+    tempos_anotar_us(&t, "canais", "p1", 42)
+    tempos_acrescentar_n(&t, 7)
+    tempos_anotar_us(&t, "x", "", 9)
+    tempos_gravar(&t)
+    expect(not t.ativo)
+    let lido = pw_ler_texto(caminho)
+    expect(lido == "{\"etapa\":\"canais\",\"us\":42,\"ini_us\":-1,\"produto\":\"p1\",\"n\":7}\n{\"etapa\":\"x\",\"us\":9,\"ini_us\":-1}\n")
+    delete(lido)
+    _ = os.unset_env(TEMPOS_VARIAVEL)
+    _ = file.remove_file(caminho)
+    delete(caminho)
+    delete(tmp)
+}
+
+test "tempos_iniciar: pasta que nao existe nao ativa" {
+    var t: Tempos = Tempos{}
+    _ = os.set_env(TEMPOS_VARIAVEL, "C:\\forja_nao_existe_xyz\\sub\\t.jsonl")
+    tempos_iniciar(&t)
+    expect(not t.ativo)
+    _ = os.unset_env(TEMPOS_VARIAVEL)
+}
+
+test "causa_do_errno e errno_do_arquivo" {
+    expect(causa_do_errno(0) == "sem codigo de erro")
+    expect(causa_do_errno(2) == "errno 2: No such file or directory")
+    expect(errno_do_arquivo("C:\\forja_nao_existe_xyz\\a") == 2)
+    expect(errno_do_arquivo("C:\\Windows") == 13)
+}

@@ -1,0 +1,538 @@
+// nativo/fmt/wasm_escrever.fj - escritor do formato binario WebAssembly (alvo wasm32-wasip1)
+// Versao: 0.1.0
+
+pub const WASM_I32: u8 = 0x7F
+pub const WASM_I64: u8 = 0x7E
+pub const WASM_F32: u8 = 0x7D
+pub const WASM_F64: u8 = 0x7C
+pub const WASM_EXP_FUNC: u8 = 0
+pub const WASM_EXP_MEM: u8 = 2
+pub const WASM_EXP_GLOBAL: u8 = 3
+
+const WASM_SEC_CUSTOM: u8 = 0
+const WASM_SEC_TIPO: u8 = 1
+const WASM_SEC_IMPORT: u8 = 2
+const WASM_SEC_FUNCAO: u8 = 3
+const WASM_SEC_TABELA: u8 = 4
+const WASM_SEC_MEMORIA: u8 = 5
+const WASM_SEC_GLOBAL: u8 = 6
+const WASM_SEC_EXPORT: u8 = 7
+const WASM_SEC_ELEMENTO: u8 = 9
+const WASM_TIPO_FUNCREF: u8 = 0x70
+const WASM_SEC_CODIGO: u8 = 10
+const WASM_SEC_DADOS: u8 = 11
+const WASM_SEC_DATACOUNT: u8 = 12
+const WASM_OP_I32_CONST: u8 = 0x41
+const WASM_OP_I64_CONST: u8 = 0x42
+const WASM_OP_END: u8 = 0x0B
+const WASM_TIPO_FUNC: u8 = 0x60
+const WASM_KIND_FUNC: u8 = 0
+const WASM_SUB_NOMES: u8 = 1
+
+// Estado do modulo em montagem. Imports, tipos, funcoes, globais, exports e dados ficam em
+// listas de bytes ja codificadas; os contadores dizem quantas entradas cada uma tem.
+pub struct WasmModulo {
+    tipos: [dynamic]u8
+    tipos_fim: [dynamic]u32
+    imports: [dynamic]u8
+    qtd_imports: u32
+    funcoes_tipo: [dynamic]u8
+    qtd_funcoes: u32
+    codigos: [dynamic]u8
+    nomes: [dynamic]u8
+    qtd_nomes: u32
+    tem_memoria: bool
+    memoria_min: u32
+    globais: [dynamic]u8
+    qtd_globais: u32
+    exports: [dynamic]u8
+    qtd_exports: u32
+    dados: [dynamic]u8
+    qtd_dados: u32
+    tem_tabela: bool // 0.32.0: tabela 0 de funcref (proc como valor: indice na tabela = indice da funcao)
+    tabela_min: u32
+    elementos: [dynamic]u8
+    qtd_elementos: u32
+}
+
+// Os dois vetores tem o mesmo tamanho e os mesmos bytes?
+proc bytes_iguais(a: []u8, b: []u8) -> bool {
+    if len(a) != len(b) {
+        return false
+    }
+    for i in 0..<len(a) {
+        if a[i] != b[i] {
+            return false
+        }
+    }
+    return true
+}
+
+// Acrescenta os bytes de conteudo, um a um, no fim de b (fatia nao entra direto no append).
+proc bytes_acrescentar(b: ^[dynamic]u8, conteudo: []u8) {
+    for k in 0..<len(conteudo) {
+        append(b, item = conteudo[k])
+    }
+}
+
+// Acrescenta v como LEB128 sem sinal de 64 bits: 7 bits por byte, bit 7 ligado = ha byte depois.
+pub proc wasm_leb_u64(b: ^[dynamic]u8, v: u64) {
+    var resto = v
+    while true {
+        let grupo = (resto & 0x7F) as u8
+        resto = resto >> 7
+        if resto == 0 {
+            append(b, item = grupo)
+            break
+        }
+        append(b, item = grupo | 0x80)
+    }
+}
+
+// Acrescenta v como LEB128 sem sinal de 32 bits (ex.: 624485 -> E5 8E 26).
+pub proc wasm_leb_u32(b: ^[dynamic]u8, v: u32) {
+    wasm_leb_u64(b, v as u64)
+}
+
+// Acrescenta v como LEB128 com sinal de 64 bits. Sem shift nem conversao negativa para
+// sem sinal (R0002 em dev): o resto fica em 0..127 e o quociente, em piso, carrega o sinal.
+pub proc wasm_leb_s64(b: ^[dynamic]u8, v: i64) {
+    var atual = v
+    while true {
+        let trunc = atual / 128
+        let resto_bruto = atual - trunc * 128
+        var quociente = trunc
+        var resto = resto_bruto
+        if resto_bruto < 0 {
+            resto = resto_bruto + 128
+            quociente = trunc - 1
+        }
+        let baixo = resto as u8
+        let sinal = (baixo & 0x40) != 0
+        if (quociente == 0 and not sinal) or (quociente == -1 and sinal) {
+            append(b, item = baixo)
+            break
+        }
+        append(b, item = baixo | 0x80)
+        atual = quociente
+    }
+}
+
+// Acrescenta v como LEB128 com sinal de 32 bits (ex.: -123456 -> C0 BB 78).
+pub proc wasm_leb_s32(b: ^[dynamic]u8, v: i32) {
+    wasm_leb_s64(b, v as i64)
+}
+
+// Acrescenta um vetor de bytes: tamanho em LEB u32 seguido dos bytes.
+proc wasm_vetor_em(b: ^[dynamic]u8, conteudo: []u8) {
+    wasm_leb_u32(b, len(conteudo) as u32)
+    bytes_acrescentar(b, conteudo)
+}
+
+// Acrescenta um nome (vec(byte) da spec): tamanho em LEB u32 seguido do texto UTF-8.
+proc wasm_nome_em(b: ^[dynamic]u8, texto: str) {
+    wasm_leb_u32(b, len(texto) as u32)
+    append(b, item = texto)
+}
+
+// Cria um modulo vazio. Libere com wasm_modulo_liberar.
+pub proc wasm_modulo_iniciar() -> WasmModulo {
+    return WasmModulo{
+        tipos = make([dynamic]u8, alloc = heap),
+        tipos_fim = make([dynamic]u32, alloc = heap),
+        imports = make([dynamic]u8, alloc = heap),
+        qtd_imports = 0,
+        funcoes_tipo = make([dynamic]u8, alloc = heap),
+        qtd_funcoes = 0,
+        codigos = make([dynamic]u8, alloc = heap),
+        nomes = make([dynamic]u8, alloc = heap),
+        qtd_nomes = 0,
+        tem_memoria = false,
+        memoria_min = 0,
+        globais = make([dynamic]u8, alloc = heap),
+        qtd_globais = 0,
+        exports = make([dynamic]u8, alloc = heap),
+        qtd_exports = 0,
+        dados = make([dynamic]u8, alloc = heap),
+        qtd_dados = 0,
+        tem_tabela = false,
+        tabela_min = 0,
+        elementos = make([dynamic]u8, alloc = heap),
+        qtd_elementos = 0
+    }
+}
+
+// Libera todas as listas do modulo.
+pub proc wasm_modulo_liberar(m: ^WasmModulo) {
+    delete(m.tipos)
+    delete(m.tipos_fim)
+    delete(m.imports)
+    delete(m.funcoes_tipo)
+    delete(m.codigos)
+    delete(m.nomes)
+    delete(m.globais)
+    delete(m.exports)
+    delete(m.dados)
+    delete(m.elementos)
+}
+
+// Codifica uma assinatura de funcao (0x60, params, results) no fim de saida.
+proc wasm_tipo_codificar(saida: ^[dynamic]u8, params: []u8, results: []u8) {
+    append(saida, item = WASM_TIPO_FUNC)
+    wasm_leb_u32(saida, len(params) as u32)
+    bytes_acrescentar(saida, params)
+    wasm_leb_u32(saida, len(results) as u32)
+    bytes_acrescentar(saida, results)
+}
+
+// Assinatura (params -> results) do modulo. A mesma assinatura devolve o mesmo indice de tipo.
+pub proc wasm_tipo(m: ^WasmModulo, params: []u8, results: []u8) -> u32 {
+    var cand = make([dynamic]u8, alloc = heap)
+    defer delete(cand)
+    wasm_tipo_codificar(&cand, params, results)
+    var ini: int = 0
+    for k in 0..<len(m.tipos_fim) {
+        let fim = m.tipos_fim[k] as int
+        if bytes_iguais(m.tipos[ini..<fim], cand[..]) {
+            return k as u32
+        }
+        ini = fim
+    }
+    bytes_acrescentar(&m.tipos, cand[..])
+    append(&m.tipos_fim, item = len(m.tipos) as u32)
+    return (len(m.tipos_fim) - 1) as u32
+}
+
+// Importa uma funcao do host; devolve o indice de funcao. Imports ocupam os primeiros
+// indices, entao chamar depois de wasm_funcao e erro (panic).
+pub proc wasm_importar_funcao(m: ^WasmModulo, modulo: str, nome: str, tipo: u32) -> u32 {
+    if m.qtd_funcoes > 0 {
+        panic("wasm_importar_funcao: import depois de wasm_funcao; imports precisam vir antes")
+    }
+    wasm_nome_em(&m.imports, modulo)
+    wasm_nome_em(&m.imports, nome)
+    append(&m.imports, item = WASM_KIND_FUNC)
+    wasm_leb_u32(&m.imports, tipo)
+    m.qtd_imports += 1
+    return m.qtd_imports - 1
+}
+
+// Registra uma funcao definida; corpo ja vem completo (locais + instrucoes + 0x0B).
+// Devolve o indice de funcao (imports + posicao). nome vazio = sem entrada na secao name.
+pub proc wasm_funcao(m: ^WasmModulo, tipo: u32, nome: str, corpo: []u8) -> u32 {
+    let indice = m.qtd_imports + m.qtd_funcoes
+    wasm_leb_u32(&m.funcoes_tipo, tipo)
+    wasm_vetor_em(&m.codigos, corpo)
+    m.qtd_funcoes += 1
+    if len(nome) > 0 {
+        wasm_leb_u32(&m.nomes, indice)
+        wasm_nome_em(&m.nomes, nome)
+        m.qtd_nomes += 1
+    }
+    return indice
+}
+
+// Declara a memoria linear 0 com paginas_min paginas de 64 KiB (uma so).
+pub proc wasm_memoria(m: ^WasmModulo, paginas_min: u32) {
+    m.tem_memoria = true
+    m.memoria_min = paginas_min
+}
+
+// Global i64 com inicializador i64.const valor; devolve o indice do global.
+pub proc wasm_global_i64(m: ^WasmModulo, mutavel: bool, valor: i64) -> u32 {
+    append(&m.globais, item = WASM_I64)
+    if mutavel {
+        append(&m.globais, item = 1)
+    } else {
+        append(&m.globais, item = 0)
+    }
+    append(&m.globais, item = WASM_OP_I64_CONST)
+    wasm_leb_s64(&m.globais, valor)
+    append(&m.globais, item = WASM_OP_END)
+    m.qtd_globais += 1
+    return m.qtd_globais - 1
+}
+
+// Exporta item (WASM_EXP_FUNC, WASM_EXP_MEM ou WASM_EXP_GLOBAL) com o nome dado.
+pub proc wasm_exportar(m: ^WasmModulo, nome: str, tipo: u8, indice: u32) {
+    wasm_nome_em(&m.exports, nome)
+    append(&m.exports, item = tipo)
+    wasm_leb_u32(&m.exports, indice)
+    m.qtd_exports += 1
+}
+
+// Segmento de dados ativo na memoria 0 em deslocamento (i32.const deslocamento; end).
+pub proc wasm_dados(m: ^WasmModulo, deslocamento: u32, bytes: []u8) {
+    append(&m.dados, item = 0)
+    append(&m.dados, item = WASM_OP_I32_CONST)
+    wasm_leb_s32(&m.dados, deslocamento as i32)
+    append(&m.dados, item = WASM_OP_END)
+    wasm_vetor_em(&m.dados, bytes)
+    m.qtd_dados += 1
+}
+
+// Declara a tabela 0 (funcref) com `minimo` entradas (so existe com procs tomados como valor; chamada indireta = call_indirect).
+pub proc wasm_tabela(m: ^WasmModulo, minimo: u32) {
+    m.tem_tabela = true
+    m.tabela_min = minimo
+}
+
+// Segmento de elementos ativo na tabela 0: a funcao `indice_funcao` ocupa a entrada `deslocamento` (i32.const deslocamento; end).
+pub proc wasm_elemento(m: ^WasmModulo, deslocamento: u32, indice_funcao: u32) {
+    wasm_leb_u32(&m.elementos, 0)
+    append(&m.elementos, item = WASM_OP_I32_CONST)
+    wasm_leb_s32(&m.elementos, deslocamento as i32)
+    append(&m.elementos, item = WASM_OP_END)
+    wasm_leb_u32(&m.elementos, 1)
+    wasm_leb_u32(&m.elementos, indice_funcao)
+    m.qtd_elementos += 1
+}
+
+// Escreve uma secao: id, tamanho LEB e corpo = contagem LEB seguida das entradas.
+proc wasm_secao(saida: ^[dynamic]u8, id: u8, qtd: u32, entradas: []u8) {
+    var corpo = make([dynamic]u8, alloc = heap)
+    defer delete(corpo)
+    wasm_leb_u32(&corpo, qtd)
+    bytes_acrescentar(&corpo, entradas)
+    append(saida, item = id)
+    wasm_vetor_em(saida, corpo[..])
+}
+
+// Secao memory: uma entrada, limites sem maximo (flag 0) e minimo em paginas.
+proc wasm_emitir_memoria(saida: ^[dynamic]u8, paginas_min: u32) {
+    var entrada = make([dynamic]u8, alloc = heap)
+    defer delete(entrada)
+    append(&entrada, item = 0)
+    wasm_leb_u32(&entrada, paginas_min)
+    wasm_secao(saida, WASM_SEC_MEMORIA, 1, entrada[..])
+}
+
+// Secao table: uma tabela funcref, limites sem maximo (flag 0) e minimo em entradas.
+proc wasm_emitir_tabela(saida: ^[dynamic]u8, minimo: u32) {
+    var entrada = make([dynamic]u8, alloc = heap)
+    defer delete(entrada)
+    append(&entrada, item = WASM_TIPO_FUNCREF)
+    append(&entrada, item = 0)
+    wasm_leb_u32(&entrada, minimo)
+    wasm_secao(saida, WASM_SEC_TABELA, 1, entrada[..])
+}
+
+// Secao custom "name" com a subsecao 1 (nomes das funcoes definidas, pelo indice absoluto).
+proc wasm_emitir_nomes(saida: ^[dynamic]u8, m: ^WasmModulo) {
+    var sub = make([dynamic]u8, alloc = heap)
+    defer delete(sub)
+    wasm_leb_u32(&sub, m.qtd_nomes)
+    bytes_acrescentar(&sub, m.nomes[..])
+    var corpo = make([dynamic]u8, alloc = heap)
+    defer delete(corpo)
+    wasm_nome_em(&corpo, "name")
+    append(&corpo, item = WASM_SUB_NOMES)
+    wasm_vetor_em(&corpo, sub[..])
+    append(saida, item = WASM_SEC_CUSTOM)
+    wasm_vetor_em(saida, corpo[..])
+}
+
+// Acrescenta o modulo inteiro em saida. Secoes na ordem da spec; so as nao vazias.
+pub proc wasm_serializar(m: ^WasmModulo, saida: ^[dynamic]u8) {
+    var cabec: [8]u8 = {0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00}
+    bytes_acrescentar(saida, cabec[..])
+    let qtd_tipos = len(m.tipos_fim) as u32
+    if qtd_tipos > 0 {
+        wasm_secao(saida, WASM_SEC_TIPO, qtd_tipos, m.tipos[..])
+    }
+    if m.qtd_imports > 0 {
+        wasm_secao(saida, WASM_SEC_IMPORT, m.qtd_imports, m.imports[..])
+    }
+    if m.qtd_funcoes > 0 {
+        wasm_secao(saida, WASM_SEC_FUNCAO, m.qtd_funcoes, m.funcoes_tipo[..])
+    }
+    if m.tem_tabela {
+        wasm_emitir_tabela(saida, m.tabela_min)
+    }
+    if m.tem_memoria {
+        wasm_emitir_memoria(saida, m.memoria_min)
+    }
+    if m.qtd_globais > 0 {
+        wasm_secao(saida, WASM_SEC_GLOBAL, m.qtd_globais, m.globais[..])
+    }
+    if m.qtd_exports > 0 {
+        wasm_secao(saida, WASM_SEC_EXPORT, m.qtd_exports, m.exports[..])
+    }
+    if m.qtd_elementos > 0 {
+        wasm_secao(saida, WASM_SEC_ELEMENTO, m.qtd_elementos, m.elementos[..])
+    }
+    if m.qtd_dados > 0 {
+        // datacount so tem a contagem: entradas vazias (0..<0)
+        wasm_secao(saida, WASM_SEC_DATACOUNT, m.qtd_dados, m.dados[0..<0])
+    }
+    if m.qtd_funcoes > 0 {
+        wasm_secao(saida, WASM_SEC_CODIGO, m.qtd_funcoes, m.codigos[..])
+    }
+    if m.qtd_dados > 0 {
+        wasm_secao(saida, WASM_SEC_DADOS, m.qtd_dados, m.dados[..])
+    }
+    if m.qtd_nomes > 0 {
+        wasm_emitir_nomes(saida, m)
+    }
+}
+
+// Modulo A do plano: importa wasi proc_exit; _start chama proc_exit(7); memoria 1 pagina.
+proc modulo_a(nome: str, saida: ^[dynamic]u8) {
+    var m = wasm_modulo_iniciar()
+    defer wasm_modulo_liberar(&m)
+    var i32_params: [1]u8 = {WASM_I32}
+    var sem_valor: [1]u8 = {0x00}
+    let t0 = wasm_tipo(&m, i32_params[..], sem_valor[0..<0])
+    let t1 = wasm_tipo(&m, sem_valor[0..<0], sem_valor[0..<0])
+    _ = wasm_importar_funcao(&m, "wasi_snapshot_preview1", "proc_exit", t0)
+    var corpo: [6]u8 = {0x00, 0x41, 0x07, 0x10, 0x00, 0x0B}
+    let inicio = wasm_funcao(&m, t1, nome, corpo[..])
+    wasm_memoria(&m, 1)
+    wasm_exportar(&m, "memory", WASM_EXP_MEM, 0)
+    wasm_exportar(&m, "_start", WASM_EXP_FUNC, inicio)
+    wasm_serializar(&m, saida)
+}
+
+// Codifica u32 com wasm_leb_u32 e compara com os bytes esperados.
+proc teste_leb_u32(v: u32, esperado: []u8) -> bool {
+    var b = make([dynamic]u8, alloc = heap)
+    defer delete(b)
+    wasm_leb_u32(&b, v)
+    return bytes_iguais(b[..], esperado)
+}
+
+// Codifica i64 com wasm_leb_s64 e compara com os bytes esperados.
+proc teste_leb_s64(v: i64, esperado: []u8) -> bool {
+    var b = make([dynamic]u8, alloc = heap)
+    defer delete(b)
+    wasm_leb_s64(&b, v)
+    return bytes_iguais(b[..], esperado)
+}
+
+test "wasm_modulo_vazio" {
+    var m = wasm_modulo_iniciar()
+    defer wasm_modulo_liberar(&m)
+    var saida = make([dynamic]u8, alloc = heap)
+    defer delete(saida)
+    wasm_serializar(&m, &saida)
+    var esperado: [8]u8 = {0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00}
+    expect(bytes_iguais(saida[..], esperado[..]))
+}
+
+test "wasm_leb_u32" {
+    var a: [1]u8 = {0x00}
+    var b: [1]u8 = {0x7F}
+    var c: [2]u8 = {0x80, 0x01}
+    var d: [3]u8 = {0xE5, 0x8E, 0x26}
+    var e: [5]u8 = {0xFF, 0xFF, 0xFF, 0xFF, 0x0F}
+    expect(teste_leb_u32(0, a[..]))
+    expect(teste_leb_u32(127, b[..]))
+    expect(teste_leb_u32(128, c[..]))
+    expect(teste_leb_u32(624485, d[..]))
+    expect(teste_leb_u32(4294967295, e[..]))
+}
+
+test "wasm_leb_u64" {
+    var b = make([dynamic]u8, alloc = heap)
+    defer delete(b)
+    wasm_leb_u64(&b, 18446744073709551615)
+    var esperado: [10]u8 = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01}
+    expect(bytes_iguais(b[..], esperado[..]))
+}
+
+test "wasm_leb_s32" {
+    var zero: [1]u8 = {0x00}
+    var menos_um: [1]u8 = {0x7F}
+    var sessenta_e_tres: [1]u8 = {0x3F}
+    var sessenta_e_quatro: [2]u8 = {0xC0, 0x00}
+    var menos_sessenta_e_quatro: [1]u8 = {0x40}
+    var menos_sessenta_e_cinco: [2]u8 = {0xBF, 0x7F}
+    var menos_123456: [3]u8 = {0xC0, 0xBB, 0x78}
+    expect(teste_leb_s64(0, zero[..]))
+    expect(teste_leb_s64(-1, menos_um[..]))
+    expect(teste_leb_s64(63, sessenta_e_tres[..]))
+    expect(teste_leb_s64(64, sessenta_e_quatro[..]))
+    expect(teste_leb_s64(-64, menos_sessenta_e_quatro[..]))
+    expect(teste_leb_s64(-65, menos_sessenta_e_cinco[..]))
+    expect(teste_leb_s64(-123456, menos_123456[..]))
+}
+
+test "wasm_leb_s64" {
+    var minimo: [10]u8 = {0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x7F}
+    expect(teste_leb_s64(-9223372036854775807 - 1, minimo[..]))
+}
+
+test "wasm_tipo_dedup" {
+    var m = wasm_modulo_iniciar()
+    defer wasm_modulo_liberar(&m)
+    var i32_params: [1]u8 = {WASM_I32}
+    var sem_valor: [1]u8 = {0x00}
+    let a = wasm_tipo(&m, i32_params[..], sem_valor[0..<0])
+    let b = wasm_tipo(&m, i32_params[..], sem_valor[0..<0])
+    let c = wasm_tipo(&m, sem_valor[0..<0], sem_valor[0..<0])
+    expect(a == b)
+    expect(a != c)
+    expect(c == 1)
+}
+
+test "wasm_modulo_a_sem_nome" {
+    var saida = make([dynamic]u8, alloc = heap)
+    defer delete(saida)
+    modulo_a("", &saida)
+    var esperado: [96]u8 = {
+        0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00,
+        0x01, 0x08, 0x02, 0x60, 0x01, 0x7F, 0x00, 0x60, 0x00, 0x00,
+        0x02, 0x24, 0x01, 0x16, 0x77, 0x61, 0x73, 0x69, 0x5F, 0x73, 0x6E, 0x61, 0x70, 0x73, 0x68, 0x6F, 0x74, 0x5F, 0x70, 0x72, 0x65, 0x76, 0x69, 0x65, 0x77, 0x31, 0x09, 0x70, 0x72, 0x6F, 0x63, 0x5F, 0x65, 0x78, 0x69, 0x74, 0x00, 0x00,
+        0x03, 0x02, 0x01, 0x01,
+        0x05, 0x03, 0x01, 0x00, 0x01,
+        0x07, 0x13, 0x02, 0x06, 0x6D, 0x65, 0x6D, 0x6F, 0x72, 0x79, 0x02, 0x00, 0x06, 0x5F, 0x73, 0x74, 0x61, 0x72, 0x74, 0x00, 0x01,
+        0x0A, 0x08, 0x01, 0x06, 0x00, 0x41, 0x07, 0x10, 0x00, 0x0B
+    }
+    expect(bytes_iguais(saida[..], esperado[..]))
+}
+
+test "wasm_modulo_a_com_nome" {
+    var saida = make([dynamic]u8, alloc = heap)
+    defer delete(saida)
+    modulo_a("_start", &saida)
+    var esperado: [114]u8 = {
+        0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00,
+        0x01, 0x08, 0x02, 0x60, 0x01, 0x7F, 0x00, 0x60, 0x00, 0x00,
+        0x02, 0x24, 0x01, 0x16, 0x77, 0x61, 0x73, 0x69, 0x5F, 0x73, 0x6E, 0x61, 0x70, 0x73, 0x68, 0x6F, 0x74, 0x5F, 0x70, 0x72, 0x65, 0x76, 0x69, 0x65, 0x77, 0x31, 0x09, 0x70, 0x72, 0x6F, 0x63, 0x5F, 0x65, 0x78, 0x69, 0x74, 0x00, 0x00,
+        0x03, 0x02, 0x01, 0x01,
+        0x05, 0x03, 0x01, 0x00, 0x01,
+        0x07, 0x13, 0x02, 0x06, 0x6D, 0x65, 0x6D, 0x6F, 0x72, 0x79, 0x02, 0x00, 0x06, 0x5F, 0x73, 0x74, 0x61, 0x72, 0x74, 0x00, 0x01,
+        0x0A, 0x08, 0x01, 0x06, 0x00, 0x41, 0x07, 0x10, 0x00, 0x0B,
+        0x00, 0x10, 0x04, 0x6E, 0x61, 0x6D, 0x65, 0x01, 0x09, 0x01, 0x01, 0x06, 0x5F, 0x73, 0x74, 0x61, 0x72, 0x74
+    }
+    expect(bytes_iguais(saida[..], esperado[..]))
+}
+
+test "wasm_global_e_dados" {
+    var m = wasm_modulo_iniciar()
+    defer wasm_modulo_liberar(&m)
+    var saida = make([dynamic]u8, alloc = heap)
+    defer delete(saida)
+    var sem_valor: [1]u8 = {0x00}
+    let t = wasm_tipo(&m, sem_valor[0..<0], sem_valor[0..<0])
+    var corpo: [2]u8 = {0x00, 0x0B}
+    let f = wasm_funcao(&m, t, "", corpo[..])
+    let g = wasm_global_i64(&m, true, 1048576)
+    wasm_memoria(&m, 1)
+    var bytes_dados: [3]u8 = {0x61, 0x62, 0x63}
+    wasm_dados(&m, 4096, bytes_dados[..])
+    wasm_serializar(&m, &saida)
+    expect(f == 0)
+    expect(g == 0)
+    var esperado: [55]u8 = {
+        0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00,
+        0x01, 0x04, 0x01, 0x60, 0x00, 0x00,
+        0x03, 0x02, 0x01, 0x00,
+        0x05, 0x03, 0x01, 0x00, 0x01,
+        0x06, 0x09, 0x01, 0x7E, 0x01, 0x42, 0x80, 0x80, 0xC0, 0x00, 0x0B,
+        0x0C, 0x01, 0x01,
+        0x0A, 0x04, 0x01, 0x02, 0x00, 0x0B,
+        0x0B, 0x0A, 0x01, 0x00, 0x41, 0x80, 0x20, 0x0B, 0x03, 0x61, 0x62, 0x63
+    }
+    expect(bytes_iguais(saida[..], esperado[..]))
+}

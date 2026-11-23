@@ -1,0 +1,420 @@
+// driver/consultar_pos.fj - porte de compiler/driver/consultar_pos.c
+// sha256 de driver/consultar_pos.c: 86b91dbb79b947165ae744552b06122e30d40be1c37a319b18f65a94ef576cc0
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "common"
+import "frontend"
+import "semantic"
+import "std:os"
+
+struct PosicaoTexto {
+    arq: ?str
+    linha: u32
+    coluna: u32
+}
+
+struct NomeDeclarado {
+    pos: u32
+    tam: u32
+    tipo: u32 // TipoId
+    no: ?str
+}
+
+struct BuscaTipo {
+    q: ?^Consulta
+    off: u32
+    expr: ?^frontend.Expr
+    nome: NomeDeclarado
+}
+
+
+// C: driver/consultar_pos.c:24 (arq e o trecho antes do ultimo ':' que e 'arq:L:C'; tamanho maximo 275 bytes como o char[MAX_PATH + 16] do C)
+proc partir_posicao(texto: str, saida: ^PosicaoTexto) -> bool {
+    // strrchr: a ultima ':' (-1 = nenhuma)
+    var c2: int = -1
+    var i: int = 0
+    while i < len(texto) {
+        if texto[i] == 58 { // ':'
+            c2 = i
+        }
+        i += 1
+    }
+    if c2 <= 0 {
+        return false
+    }
+    var c1: int = c2 - 1
+    while (c1 > 0) and (texto[c1] != 58) {
+        c1 -= 1
+    }
+    if (texto[c1] != 58) or (c1 == 0) {
+        return false
+    }
+    // strtoul exige o numero inteiro e sem resto; vazio ("arq:1:") nao conta
+    let coluna_txt: str = texto[(c2 + 1)..<len(texto)]
+    let linha_txt: str = texto[(c1 + 1)..<c2]
+    if (len(coluna_txt) == 0) or (len(linha_txt) == 0) {
+        return false
+    }
+    var fim_coluna: int = 0
+    let coluna: u64 = common.c2f_strtoull(coluna_txt, 10, &fim_coluna)
+    if fim_coluna != len(coluna_txt) {
+        return false
+    }
+    var fim_linha: int = 0
+    let linha: u64 = common.c2f_strtoull(linha_txt, 10, &fim_linha)
+    if fim_linha != len(linha_txt) {
+        return false
+    }
+    if c1 >= 276 { // (size_t)(c1 - texto) >= sizeof saida->arq
+        return false
+    }
+    saida^ = PosicaoTexto{arq = texto[0..<c1], linha = common.c2f_trunc_u32(linha), coluna = common.c2f_trunc_u32(coluna)}
+    return true
+}
+
+// C: driver/consultar_pos.c:43
+proc consulta_arquivo_da_posicao(texto: str, destino: []u8, tam: u64) -> bool {
+    var partida: PosicaoTexto = PosicaoTexto{}
+    if not partir_posicao(texto, &partida) {
+        return false
+    }
+    let arq: str = partida.arq or_else ""
+    if (len(arq) as u64) >= tam {
+        return false
+    }
+    for k in 0..<len(arq) {
+        destino[k] = arq[k]
+    }
+    destino[len(arq)] = 0 // o NUL do C: o chamador le o buffer como string
+    return true
+}
+
+// Copia 'origem' para 'destino' em minusculas com '\' (ate tam - 1 bytes + NUL), como o Normalizar do C.
+proc escrever_normalizado(origem: str, destino: []u8, tam: u64) {
+    var i: int = 0
+    while (i < len(origem)) and ((i + 1) < (tam as int)) {
+        var c: u8 = origem[i]
+        if c == 47 { // '/' vira '\'
+            c = 92
+        } else if (c >= 65) and (c <= 90) { // 'A'..'Z' (locale "C")
+            c += 32
+        }
+        destino[i] = c
+        i += 1
+    }
+    destino[i] = 0
+}
+
+// C: driver/consultar_pos.c:53 (caminho completo se a API resolve; 'std:' e a caminho cru, como no C)
+proc normalizar(caminho: ?str, destino: []u8, tam: u64) {
+    let bruto: str = caminho or_else ""
+    if (len(bruto) >= 4) and (bruto[0..<4] == "std:") {
+        escrever_normalizado(bruto, destino, tam)
+        return
+    }
+    switch completo in os.abs_path(bruto, alloc = heap) {
+    case str:
+        if len(completo) < 260 { // MAX_PATH: GetFullPathNameA com n >= 260 cai no caminho cru
+            escrever_normalizado(completo, destino, tam)
+        } else {
+            escrever_normalizado(bruto, destino, tam)
+        }
+        delete(completo)
+    case os.OsError:
+        escrever_normalizado(bruto, destino, tam)
+    }
+}
+
+// C: driver/consultar_pos.c:64
+proc mesmo_caminho(a: ?str, b: str) -> bool {
+    var na: [276]u8 = {}
+    var nb: [276]u8 = {}
+    normalizar(a, na[..], 276)
+    normalizar(b, nb[..], 276)
+    var k: int = 0
+    while k < 276 {
+        if na[k] != nb[k] {
+            return false
+        }
+        if na[k] == 0 {
+            return true
+        }
+        k += 1
+    }
+    return true
+}
+
+// C: driver/consultar_pos.c:73
+proc consulta_ler_posicao(q: ^Consulta, texto: str, pos: ^PosicaoPedida) -> bool {
+    let f: ^common.Fonte = &(q.c as ^Compilacao).fonte
+    var partida: PosicaoTexto = PosicaoTexto{}
+    var tern_1: u32 = 1
+    if f.ntrechos > 0 {
+        tern_1 = f.ntrechos
+    }
+    let nt: u32 = tern_1
+    if ((not partir_posicao(texto, &partida)) or (partida.linha == 0)) or (partida.coluna == 0) {
+        _ = consulta_uso_errado("posicao", texto, "nao tem a forma arquivo:linha:coluna (linha e coluna a partir de 1)")
+        return false
+    }
+    let arq: ?str = partida.arq
+    let linha: u32 = partida.linha
+    let coluna: u32 = partida.coluna
+    for k in (0 as u32)..<nt {
+        var tern_2: ?str = f.caminho
+        if f.ntrechos > 0 {
+            tern_2 = (f.trechos or_else {})[k].caminho
+        }
+        let caminho: ?str = tern_2
+        var tern_3: u32 = 0
+        if f.ntrechos > 0 {
+            tern_3 = (f.trechos or_else {})[k].linha_base
+        }
+        let base: u32 = tern_3
+        var tern_4: u32 = 0
+        if f.ntrechos > 0 {
+            tern_4 = (f.trechos or_else {})[k].fim
+        } else {
+            tern_4 = common.c2f_trunc_u32(f.tam)
+        }
+        let fim: u32 = tern_4
+        let global: u64 = (linha as u64) + (base as u64)
+        if not mesmo_caminho(caminho, (arq or_else "")) {
+            continue
+        }
+        if ((f.inicio_linha == none) or (global > (f.ninicios as u64))) or ((((f.inicio_linha or_else {})[global - 1] + coluna) - 1) >= fim) {
+            break
+        }
+        pos^ = PosicaoPedida{off = ((f.inicio_linha or_else {})[global - 1] + coluna) - 1, linha = linha, coluna = coluna, arquivo = caminho}
+        return true
+    }
+    _ = consulta_uso_errado("posicao", texto, "esta fora dos arquivos do projeto (arquivo desconhecido ou linha/coluna alem do fim)")
+    return false
+}
+
+// C: driver/consultar_pos.c:101
+proc consulta_decl_em(q: ^Consulta, off: u32) -> ?^frontend.Decl {
+    var d: ?^frontend.Decl = ((q.c as ^Compilacao).sem.programa as ^frontend.Programa).primeira
+    while d != none {
+        if ((d as ^frontend.Decl).tipo_no == (frontend.D_IMPORT as u8)) or ((d as ^frontend.Decl).tipo_no == (frontend.D_LINK as u8)) {
+            d = (d as ^frontend.Decl).prox
+            continue
+        }
+        if (consulta_inicio_decl(q, d) <= off) and (off < frontend.ast_fim_decl(&q.fim, d)) {
+            return d
+        }
+        d = (d as ^frontend.Decl).prox
+    }
+    return none
+}
+
+// C: driver/consultar_pos.c:124
+proc eh_indice_sintetico(e: ?^frontend.Expr) -> bool {
+    return ((e as ^frontend.Expr).tipo_no == (frontend.EX_INT as u8)) and ((e as ^frontend.Expr).ref == (frontend.REF_COMPONENTE as u8))
+}
+
+// C: driver/consultar_pos.c:129
+proc visitar_expr(b: ^BuscaTipo, e: ?^frontend.Expr) {
+    if (e == none) or (common.c2f_b2i32(eh_indice_sintetico(e)) != 0) {
+        return
+    }
+    if ((e as ^frontend.Expr).pos <= b.off) and (b.off < frontend.ast_fim_expr(&(b.q as ^Consulta).fim, e)) {
+        b.expr = e
+    }
+    visitar_expr(b, (e as ^frontend.Expr).a)
+    visitar_expr(b, (e as ^frontend.Expr).b)
+    if ((e as ^frontend.Expr).tipo_no == (frontend.EX_CONVERSAO as u8)) or ((e as ^frontend.Expr).tipo_no == (frontend.EX_TIPO as u8)) {
+        return
+    }
+    for i in (0 as u32)..<(e as ^frontend.Expr).nargs {
+        visitar_expr(b, ((e as ^frontend.Expr).args or_else {})[i].valor)
+    }
+}
+
+// C: driver/consultar_pos.c:140 (o nome comeca depois da palavra-chave e dos espacos que a seguem)
+proc nome_do_let(b: ^BuscaTipo, s: ?^frontend.Stmt) {
+    let q: ^Consulta = b.q as ^Consulta
+    let f: ^common.Fonte = &(q.c as ^Compilacao).fonte
+    let nomes: ^common.Interner = &(q.c as ^Compilacao).nomes
+    let st: ^frontend.Stmt = s as ^frontend.Stmt
+    var p: u32 = st.pos
+    while (p as u64) < f.tam {
+        let c: u8 = f.texto[p as int]
+        if not (((c >= 65) and (c <= 90)) or ((c >= 97) and (c <= 122))) { // isalpha
+            break
+        }
+        p += 1
+    }
+    while ((p as u64) < f.tam) and ((f.texto[p as int] == 32) or (f.texto[p as int] == 9)) {
+        p += 1
+    }
+    if st.nome < 0 {
+        return
+    }
+    let tam_nome: int = common.interner_tam(nomes, st.nome) as int
+    if ((p as u64) + (tam_nome as u64)) > f.tam {
+        return
+    }
+    let texto_nome: str = common.interner_texto(nomes, st.nome)
+    var k: int = 0
+    while k < tam_nome {
+        if f.texto[(p as int) + k] != texto_nome[k] {
+            return
+        }
+        k += 1
+    }
+    var no_txt: str = "let"
+    if st.tipo_no == (frontend.ST_VAR as u8) {
+        no_txt = "var"
+    }
+    if (b.off >= p) and (b.off < (p + (tam_nome as u32))) {
+        b.nome = NomeDeclarado{pos = p, tam = tam_nome as u32, tipo = st.tipo_local, no = no_txt}
+    }
+}
+
+// C: driver/consultar_pos.c:152
+proc visitar_casos(b: ^BuscaTipo, s: ?^frontend.Stmt) {
+    var i: u32 = 0
+    while ((s as ^frontend.Stmt).tipo_no == (frontend.ST_SWITCH as u8)) and (i < (s as ^frontend.Stmt).ncasos) {
+        visitar_stmts(b, ((s as ^frontend.Stmt).casos or_else {})[i].corpo)
+        i += 1
+    }
+}
+
+// C: driver/consultar_pos.c:157
+proc visitar_stmts(b: ^BuscaTipo, s: ?^frontend.Stmt) {
+    var s_v: ?^frontend.Stmt = s
+    while s_v != none {
+        if (b.off < (s_v as ^frontend.Stmt).pos) or (b.off >= frontend.ast_fim_stmt(&(b.q as ^Consulta).fim, s_v)) {
+            s_v = (s_v as ^frontend.Stmt).prox
+            continue
+        }
+        if ((s_v as ^frontend.Stmt).tipo_no == (frontend.ST_LET as u8)) or ((s_v as ^frontend.Stmt).tipo_no == (frontend.ST_VAR as u8)) {
+            nome_do_let(b, s_v)
+        }
+        visitar_expr(b, (s_v as ^frontend.Stmt).expr)
+        visitar_expr(b, (s_v as ^frontend.Stmt).expr2)
+        visitar_expr(b, (s_v as ^frontend.Stmt).alvo)
+        visitar_casos(b, s_v)
+        visitar_stmts(b, (s_v as ^frontend.Stmt).corpo)
+        visitar_stmts(b, (s_v as ^frontend.Stmt).senao)
+        s_v = (s_v as ^frontend.Stmt).prox
+    }
+}
+
+// C: driver/consultar_pos.c:172
+proc nome_de_param_ou_campo(b: ^BuscaTipo, nome: i32, cand: NomeDeclarado) {
+    var cand_v: NomeDeclarado = cand
+    var tern_1: u32 = 0
+    if nome >= 0 {
+        tern_1 = common.interner_tam(&((b.q as ^Consulta).c as ^Compilacao).nomes, nome)
+    }
+    cand_v.tam = tern_1
+    if (b.off >= cand_v.pos) and (b.off < (cand_v.pos + cand_v.tam)) {
+        b.nome = cand_v
+    }
+}
+
+// C: driver/consultar_pos.c:178
+proc visitar_decl(b: ^BuscaTipo, d: ?^frontend.Decl) {
+    visitar_expr(b, (d as ^frontend.Decl).init)
+    var i: u32 = 0
+    while i < (d as ^frontend.Decl).nparams {
+        nome_de_param_ou_campo(b, ((d as ^frontend.Decl).params or_else {})[i].nome, NomeDeclarado{pos = ((d as ^frontend.Decl).params or_else {})[i].pos, tam = 0, tipo = ((d as ^frontend.Decl).params or_else {})[i].tipo.tipo, no = "param"})
+        visitar_expr(b, ((d as ^frontend.Decl).params or_else {})[i].padrao)
+        i += 1
+    }
+    var i_2: u32 = 0
+    while i_2 < (d as ^frontend.Decl).ncampos {
+        nome_de_param_ou_campo(b, ((d as ^frontend.Decl).campos or_else {})[i_2].nome, NomeDeclarado{pos = ((d as ^frontend.Decl).campos or_else {})[i_2].pos, tam = 0, tipo = ((d as ^frontend.Decl).campos or_else {})[i_2].tipo.tipo, no = "campo"})
+        visitar_expr(b, ((d as ^frontend.Decl).campos or_else {})[i_2].padrao)
+        i_2 += 1
+    }
+    visitar_stmts(b, (d as ^frontend.Decl).corpo)
+}
+
+// C: driver/consultar_pos.c:192
+proc resposta_do_nome(q: ^Consulta, n: ^NomeDeclarado) {
+    let arg_1: u64 = len((n.no or_else "")) as u64
+    let arg_2: ?str = n.no
+    let arg_3: str = "no"
+    let arg_4: ^Consulta = q
+    consulta_chave_texto(arg_4, arg_3, arg_2, arg_1)
+    consulta_chave_pos(q, "pos", n.pos)
+    consulta_chave_pos(q, "fim", n.pos + n.tam)
+    consulta_chave_trecho(q, "texto", n.pos, n.pos + n.tam)
+    consulta_chave_tipo(q, "tipo", n.tipo)
+}
+
+// C: driver/consultar_pos.c:201
+proc resposta_da_expr(q: ^Consulta, e: ?^frontend.Expr) {
+    let fim: u32 = frontend.ast_fim_expr(&q.fim, e)
+    let arg_1: u64 = len(semantic.ast_nome_da_expr((e as ^frontend.Expr).tipo_no)) as u64
+    let arg_2: str = semantic.ast_nome_da_expr((e as ^frontend.Expr).tipo_no)
+    let arg_3: str = "no"
+    let arg_4: ^Consulta = q
+    consulta_chave_texto(arg_4, arg_3, arg_2, arg_1)
+    consulta_chave_pos(q, "pos", (e as ^frontend.Expr).pos)
+    consulta_chave_pos(q, "fim", fim)
+    consulta_chave_trecho(q, "texto", (e as ^frontend.Expr).pos, fim)
+    consulta_chave_tipo(q, "tipo", (e as ^frontend.Expr).tipo)
+}
+
+// C: driver/consultar_pos.c:212
+proc consultar_tipo(q: ^Consulta, p: ^PedidoConsulta) -> i32 {
+    var pos: PosicaoPedida = PosicaoPedida{}
+    if not consulta_ler_posicao(q, (p.arg or_else ""), &pos) {
+        return CONSULTAR_USO
+    }
+    var busca: BuscaTipo = BuscaTipo{}
+    busca.q = q
+    busca.off = pos.off
+    let d: ?^frontend.Decl = consulta_decl_em(q, pos.off)
+    if d != none {
+        visitar_decl(&busca, d)
+    }
+    consulta_abrir(q, "tipo")
+    let arquivo: str = pos.arquivo or_else ""
+    consulta_chave_texto(q, "arquivo", arquivo, len(arquivo) as u64)
+    consulta_chave_int(q, "linha", pos.linha as i64)
+    consulta_chave_int(q, "coluna", pos.coluna as i64)
+    if busca.expr != none {
+        resposta_da_expr(q, busca.expr)
+    } else if busca.nome.no != none {
+        resposta_do_nome(q, &busca.nome)
+    } else {
+        let motivo: str = "nenhuma expressao nem nome declarado nessa posicao"
+        consulta_chave_texto(q, "no", none, 0)
+        consulta_chave_tipo(q, "tipo", frontend.TIPO_NAO_RESOLVIDO as u32)
+        consulta_chave_texto(q, "motivo", motivo, len(motivo) as u64)
+    }
+    consulta_fechar(q)
+    return CONSULTAR_OK
+}
+
+test "consultar_pos: partir_posicao separa arq:L:C e recusa as formas erradas" {
+    var p: PosicaoTexto = PosicaoTexto{}
+    expect(partir_posicao("a/b.fj:12:7", &p))
+    expect((p.arq or_else "") == "a/b.fj")
+    expect(p.linha == 12)
+    expect(p.coluna == 7)
+    expect(not partir_posicao("a.fj:12", &p))
+    expect(not partir_posicao("a.fj:0:1x", &p))
+    expect(not partir_posicao("a.fj::3", &p))
+    expect(not partir_posicao("a.fj:x:2", &p))
+    expect(not partir_posicao(":1:2", &p))
+}
+
+test "consultar_pos: consulta_arquivo_da_posicao copia o arquivo com NUL e respeita tam" {
+    var destino: [16]u8 = {}
+    expect(consulta_arquivo_da_posicao("a.fj:1:2", destino[..], 16))
+    expect(destino[3] == 106 and destino[4] == 0)
+    expect(not consulta_arquivo_da_posicao("a.fj:1:2", destino[..], 4))
+}
+
+test "consultar_pos: mesmo_caminho ignora caixa e barra; std: fica como nome" {
+    expect(mesmo_caminho("C:/Projeto/A.fj", "c:\\projeto\\a.FJ"))
+    expect(mesmo_caminho("std:mem", "std:MEM"))
+    expect(not mesmo_caminho("std:mem", "std:fs"))
+}

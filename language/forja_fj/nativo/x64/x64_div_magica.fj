@@ -1,0 +1,543 @@
+// nativo/x64/x64_div_magica.fj - porte de compiler/nativo/x64/x64_div_magica.c, compiler/nativo/x64/x64_div_magica.h
+// sha256 de nativo/x64/x64_div_magica.c: b852b2ea6201630f958c31baa8eaf0ad928349ff0b6b703ccdebb84aa257236c
+// sha256 de nativo/x64/x64_div_magica.h: d127b7c97687c62de1dbe8b813e534cca09ba852975ad3b8d0619890cd1494c8
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "common"
+
+struct DivMagicaPlano {
+    estrategia: i32
+    bits: u32
+    com_sinal: bool
+    divisor: u64
+    magic: u64
+    shift: u32
+    produto_64: bool
+    soma_a: bool
+    soma_bit_sinal: bool
+    negar: bool
+}
+
+const DIV_MAGICA_NAO_OTIMIZAR: i32 = 0
+const DIV_MAGICA_UM: i32 = 1
+const DIV_MAGICA_POT2: i32 = 2
+const DIV_MAGICA_POT2_SINAL: i32 = 3
+const DIV_MAGICA_LEMIRE: i32 = 4
+const DIV_MAGICA_SEM_SINAL_64: i32 = 5
+const DIV_MAGICA_MAIOR_SEM_SINAL: i32 = 6
+const DIV_MAGICA_SINAL_MUL: i32 = 7
+const DIV_MAGICA_SINAL_64: i32 = 8
+const DIV_MAGICA_SINAL_MIN: i32 = 9
+const DIV_MAGICA_TOPO_64: u64 = 9223372036854775808
+
+// C: nativo/x64/x64_div_magica.c:12
+proc mascara(bits: u32) -> u64 {
+    var tern_1: u64 = (1 << ((bits as u64) & 63)) - 1
+    if bits >= 64 {
+        tern_1 = ~0
+    }
+    return tern_1
+}
+
+// C: nativo/x64/x64_div_magica.c:17
+proc bits_validos(bits: u32) -> bool {
+    return (((bits == 8) or (bits == 16)) or (bits == 32)) or (bits == 64)
+}
+
+// C: nativo/x64/x64_div_magica.c:23
+proc estender_sinal(padrao: u64, bits: u32) -> i64 {
+    var valor: u64 = padrao & mascara(bits)
+    if (bits < 64) and (((valor >> (((bits - 1) as u64) & 63)) & 1) != 0) {
+        valor = valor | (~mascara(bits))
+    }
+    return transmute(valor, to = i64)
+}
+
+// C: nativo/x64/x64_div_magica.c:31
+proc eh_pot_dois(x: u64) -> bool {
+    return (x & (x - 1)) == 0
+}
+
+// C: nativo/x64/x64_div_magica.c:37
+proc log2_exato(x: u64) -> u32 {
+    var k: u32 = 0
+    while (k < 63) and ((1 << ((k as u64) & 63)) < x) {
+        k += 1
+    }
+    return k
+}
+
+// C: nativo/x64/x64_div_magica.c:46
+proc log2_teto(x: u64) -> u32 {
+    var l: u32 = 0
+    while (l < 63) and ((1 << ((l as u64) & 63)) < x) {
+        l += 1
+    }
+    return l
+}
+
+// C: nativo/x64/x64_div_magica.c:56
+proc divisao_pot_dois(d: u64, p: u32, qlo: ^u64, qhi: ^u64) {
+    var resto: u64 = 0
+    var lo: u64 = 0
+    var hi: u64 = 0
+    // os bits do dividendo vao do mais alto (p) ao mais baixo (0), como no laco do C
+    for k in (0 as u32)..=p {
+        let i: u32 = p - k
+        // o resto pode ter 65 bits depois do deslocamento: o bit que sai vai para transbordo
+        let transbordo: bool = (resto >> 63) != 0
+        resto = resto << 1
+        if i == p {
+            resto = resto | 1
+        }
+        if transbordo or (resto >= d) {
+            resto = wrapping_sub(resto, d)
+            if i >= 64 {
+                hi = hi | ((1 as u64) << ((i - 64) as u64))
+            } else {
+                lo = lo | ((1 as u64) << ((i as u64) & 63))
+            }
+        }
+    }
+    qlo^ = lo
+    qhi^ = hi
+}
+
+// C: nativo/x64/x64_div_magica.c:75
+proc planejar_sem_sinal(saida: ^DivMagicaPlano) -> bool {
+    let d: u64 = saida.divisor
+    var l: u32 = 0
+    var qlo: u64 = 0
+    var qhi: u64 = 0
+    if d == 0 {
+        return false
+    }
+    if d == 1 {
+        saida.estrategia = DIV_MAGICA_UM
+        return true
+    }
+    if eh_pot_dois(d) {
+        saida.estrategia = DIV_MAGICA_POT2
+        saida.shift = log2_exato(d)
+        return true
+    }
+    if saida.bits <= 32 {
+        saida.estrategia = DIV_MAGICA_LEMIRE
+        saida.magic = ((~0) / d) + 1
+        return true
+    }
+    if d >= DIV_MAGICA_TOPO_64 {
+        saida.estrategia = DIV_MAGICA_MAIOR_SEM_SINAL
+        return true
+    }
+    l = log2_teto(d)
+    divisao_pot_dois(d, 64 + l, &qlo, &qhi)
+    saida.estrategia = DIV_MAGICA_SEM_SINAL_64
+    saida.magic = wrapping_add(qlo, 1)
+    saida.shift = l
+    return true
+}
+
+// C: nativo/x64/x64_div_magica.c:111
+proc planejar_sinal_nao_pot_dois(saida: ^DivMagicaPlano, mag: u64) -> bool {
+    let l: u32 = log2_teto(mag)
+    var k: u32 = 0
+    var qlo: u64 = 0
+    var qhi: u64 = 0
+    saida.soma_bit_sinal = true
+    if saida.bits <= 32 {
+        k = (saida.bits - 1) + l
+        saida.estrategia = DIV_MAGICA_SINAL_MUL
+        saida.magic = ((1 << ((k as u64) & 63)) / mag) + 1
+        saida.shift = k
+        saida.produto_64 = saida.bits == 32
+        return true
+    }
+    divisao_pot_dois(mag, 63 + l, &qlo, &qhi)
+    saida.estrategia = DIV_MAGICA_SINAL_64
+    saida.magic = wrapping_add(qlo, 1)
+    saida.shift = l - 1
+    saida.soma_a = transmute(saida.magic, to = i64) < 0
+    return true
+}
+
+// C: nativo/x64/x64_div_magica.c:136
+proc planejar_sinal(saida: ^DivMagicaPlano) -> bool {
+    let n: i64 = estender_sinal(saida.divisor, saida.bits)
+    var mag: u64 = 0
+    if (n == 0) or (n == -1) {
+        return false
+    }
+    if saida.divisor == (1 << (((saida.bits - 1) as u64) & 63)) {
+        saida.estrategia = DIV_MAGICA_SINAL_MIN
+        return true
+    }
+    saida.negar = n < 0
+    var tern_1: u64 = common.c2f_s2u_64(n)
+    if common.c2f_b2i32(saida.negar) != 0 {
+        tern_1 = wrapping_sub(0, common.c2f_s2u_64(n))
+    }
+    mag = tern_1
+    if mag == 1 {
+        saida.estrategia = DIV_MAGICA_UM
+        return true
+    }
+    if eh_pot_dois(mag) {
+        saida.estrategia = DIV_MAGICA_POT2_SINAL
+        saida.shift = log2_exato(mag)
+        return true
+    }
+    return planejar_sinal_nao_pot_dois(saida, mag)
+}
+
+// C: nativo/x64/x64_div_magica.c:161
+proc div_magica_planejar(bits: u32, com_sinal: bool, divisor: u64, saida: ^DivMagicaPlano) -> bool {
+    saida^ = DivMagicaPlano{estrategia = DIV_MAGICA_NAO_OTIMIZAR, bits = bits, com_sinal = com_sinal, divisor = divisor & mascara(bits)}
+    if not bits_validos(bits) {
+        return false
+    }
+    var tern_1: i32 = 0
+    if common.c2f_b2i32(com_sinal) != 0 {
+        tern_1 = common.c2f_b2i32(planejar_sinal(saida))
+    } else {
+        tern_1 = common.c2f_b2i32(planejar_sem_sinal(saida))
+    }
+    return tern_1 != 0
+}
+
+// C: nativo/x64/x64_div_magica.c:171
+proc hi64(u: u64, v: u64) -> u64 {
+    let u0: u64 = u & 4294967295
+    let u1: u64 = u >> 32
+    let v0: u64 = v & 4294967295
+    let v1: u64 = v >> 32
+    let w0: u64 = u0 * v0
+    let t: u64 = (u1 * v0) + (w0 >> 32)
+    var w1: u64 = t & 4294967295
+    let w2: u64 = t >> 32
+    w1 = (u0 * v1) + w1
+    return ((u1 * v1) + w2) + (w1 >> 32)
+}
+
+// C: nativo/x64/x64_div_magica.c:184
+proc hi_sinal64(x: i64, y: i64) -> u64 {
+    var hi: u64 = hi64(common.c2f_s2u_64(x), common.c2f_s2u_64(y))
+    if x < 0 {
+        hi = wrapping_sub(hi, common.c2f_s2u_64(y))
+    }
+    if y < 0 {
+        hi = wrapping_sub(hi, common.c2f_s2u_64(x))
+    }
+    return hi
+}
+
+// C: nativo/x64/x64_div_magica.c:194
+proc quociente_sem_sinal(plano: ^DivMagicaPlano, a: u64) -> u64 {
+    var t: u64 = 0
+    let sw_1 = common.c2f_s2u_32(plano.estrategia)
+    if sw_1 == (DIV_MAGICA_UM as u32) {
+        return a
+    } else if sw_1 == (DIV_MAGICA_POT2 as u32) {
+        return a >> ((plano.shift as u64) & 63)
+    } else if sw_1 == (DIV_MAGICA_LEMIRE as u32) {
+        return hi64(a, plano.magic)
+    } else if sw_1 == (DIV_MAGICA_MAIOR_SEM_SINAL as u32) {
+        var tern_1: u32 = 0
+        if a >= plano.divisor {
+            tern_1 = 1
+        }
+        return tern_1 as u64
+    } else if sw_1 == (DIV_MAGICA_SEM_SINAL_64 as u32) {
+        t = hi64(a, plano.magic)
+        return (((a - t) >> 1) + t) >> (((plano.shift - 1) as u64) & 63)
+    } else {
+        return 0
+    }
+    return 0
+}
+
+// C: nativo/x64/x64_div_magica.c:216
+proc quociente_pot2_sinal(plano: ^DivMagicaPlano, n: i64) -> u64 {
+    let vies: u64 = common.c2f_s2u_64(common.c2f_sar_i64(n, 63)) >> (((64 - plano.shift) as u64) & 63)
+    return common.c2f_s2u_64(common.c2f_sar_i64(transmute(wrapping_add(common.c2f_s2u_64(n), vies), to = i64), plano.shift))
+}
+
+// C: nativo/x64/x64_div_magica.c:223
+proc quociente_multiplicacao(plano: ^DivMagicaPlano, n: i64) -> u64 {
+    var produto: i64 = 0
+    if plano.produto_64 {
+        produto = transmute(wrapping_mul(common.c2f_s2u_64(n), plano.magic), to = i64)
+    } else {
+        // imul de 32 bits: o dividendo entra pelos 32 bits baixos (sinal ja estendido), o produto da a volta em 32
+        let n_32: u32 = (common.c2f_s2u_64(n) & 4294967295) as u32
+        let magic_32: u32 = (plano.magic & 4294967295) as u32
+        produto = transmute(wrapping_mul(n_32, magic_32), to = i32) as i64
+    }
+    return common.c2f_s2u_64(common.c2f_sar_i64(produto, plano.shift))
+}
+
+// C: nativo/x64/x64_div_magica.c:235
+proc quociente_sinal64(plano: ^DivMagicaPlano, n: i64) -> u64 {
+    var t: u64 = hi_sinal64(n, transmute(plano.magic, to = i64))
+    if plano.soma_a {
+        t = wrapping_add(t, common.c2f_s2u_64(n))
+    }
+    return common.c2f_s2u_64(common.c2f_sar_i64(transmute(t, to = i64), plano.shift))
+}
+
+// C: nativo/x64/x64_div_magica.c:245
+proc quociente_com_sinal(plano: ^DivMagicaPlano, n: i64, a: u64) -> u64 {
+    var q: u64 = 0
+    let sw_1 = common.c2f_s2u_32(plano.estrategia)
+    if sw_1 == (DIV_MAGICA_UM as u32) {
+        return common.c2f_s2u_64(n)
+    } else if sw_1 == (DIV_MAGICA_POT2_SINAL as u32) {
+        return quociente_pot2_sinal(plano, n)
+    } else if sw_1 == (DIV_MAGICA_SINAL_MUL as u32) {
+        q = quociente_multiplicacao(plano, n)
+    } else if sw_1 == (DIV_MAGICA_SINAL_64 as u32) {
+        q = quociente_sinal64(plano, n)
+    } else if sw_1 == (DIV_MAGICA_SINAL_MIN as u32) {
+        var tern_1: u32 = 0
+        if a == plano.divisor {
+            tern_1 = 1
+        }
+        return tern_1 as u64
+    } else {
+        return 0
+    }
+    if (common.c2f_b2i32(plano.soma_bit_sinal) != 0) and (n < 0) {
+        q = wrapping_add(q, 1)
+    }
+    return q
+}
+
+// C: nativo/x64/x64_div_magica.c:270
+proc emular_com_sinal(plano: ^DivMagicaPlano, a: u64) -> u64 {
+    let n: i64 = estender_sinal(a, plano.bits)
+    var q: u64 = quociente_com_sinal(plano, n, a)
+    if plano.negar {
+        q = wrapping_sub(0, q)
+    }
+    return q
+}
+
+// C: nativo/x64/x64_div_magica.c:281
+proc modulo_do_divisor(plano: ^DivMagicaPlano) -> u64 {
+    let d: i64 = estender_sinal(plano.divisor, plano.bits)
+    var tern_1: u64 = common.c2f_s2u_64(d)
+    if d < 0 {
+        tern_1 = wrapping_sub(0, common.c2f_s2u_64(d))
+    }
+    return tern_1
+}
+
+// C: nativo/x64/x64_div_magica.c:291
+proc resto_com_sinal(plano: ^DivMagicaPlano, dividendo: u64) -> u64 {
+    let n: i64 = estender_sinal(dividendo, plano.bits)
+    let mag: u64 = modulo_do_divisor(plano)
+    var q0: u64 = 0
+    var t: u64 = 0
+    if common.c2f_s2u_32(plano.estrategia) == (DIV_MAGICA_POT2_SINAL as u32) {
+        t = common.c2f_s2u_64(common.c2f_sar_i64(n, 63)) >> (((64 - plano.shift) as u64) & 63)
+        return wrapping_sub(wrapping_add(common.c2f_s2u_64(n), t) & (((1 as u64) << ((plano.shift as u64) & 63)) - 1), t)
+    }
+    var tern_1: u64 = 0
+    if common.c2f_s2u_32(plano.estrategia) == (DIV_MAGICA_SINAL_MUL as u32) {
+        tern_1 = quociente_multiplicacao(plano, n)
+    } else {
+        tern_1 = quociente_sinal64(plano, n)
+    }
+    q0 = tern_1
+    var tern_2: u64 = 0
+    if n < 0 {
+        tern_2 = mag
+    }
+    return wrapping_sub(wrapping_sub(common.c2f_s2u_64(n), tern_2), wrapping_mul(q0, mag))
+}
+
+// C: nativo/x64/x64_div_magica.c:307
+proc resto_do_plano(plano: ^DivMagicaPlano, dividendo: u64, q: u64) -> u64 {
+    let e: i32 = plano.estrategia
+    if (common.c2f_b2i32(plano.com_sinal) != 0) and (((common.c2f_s2u_32(e) == (DIV_MAGICA_SINAL_MUL as u32)) or (common.c2f_s2u_32(e) == (DIV_MAGICA_SINAL_64 as u32))) or (common.c2f_s2u_32(e) == (DIV_MAGICA_POT2_SINAL as u32))) {
+        return resto_com_sinal(plano, dividendo)
+    }
+    return wrapping_sub(dividendo, wrapping_mul(q, plano.divisor))
+}
+
+// C: nativo/x64/x64_div_magica.c:316
+// resto e anulavel: o C aceita resto == NULL (so o quociente)
+proc div_magica_emular(plano: ^DivMagicaPlano, a: u64, resto: ?^u64) -> u64 {
+    let mascara_bits: u64 = mascara(plano.bits)
+    let dividendo: u64 = a & mascara_bits
+    var q: u64 = 0
+    if plano.com_sinal {
+        q = emular_com_sinal(plano, dividendo)
+    } else {
+        q = quociente_sem_sinal(plano, dividendo)
+    }
+    q = q & mascara_bits
+    if resto != none {
+        let r: ^u64 = resto as ^u64
+        r^ = resto_do_plano(plano, dividendo, q) & mascara_bits
+    }
+    return q
+}
+
+// ---- testes dirigidos (prova diferencial contra o C: valores tirados do harness gcc x9, com o C original) ----
+
+// divisores de teste (i64); 0 e -1 nao planejam (NAO_OTIMIZAR), MIN com sinal cai em SINAL_MIN
+const DMT_DIVS: [44]i64 = {0, -1, 1, 2, 3, 5, 6, 7, 9, 10, 11, 25, 100, 127, 128, 255, 256, 641, 1000, 1023, 1024, 4096, 65535, 65536, 1000000007, 2147483647, 2147483648, 4294967295, 4294967296, 1099511627776, 1099511627777, 4611686018427387904, 9223372036854775807, -2, -3, -7, -10, -100, -128, -641, -1000, -65536, -2147483648, (-9223372036854775807 - 1)}
+
+// FNV-1a de 8 bytes do valor (mesma conta do harness C)
+proc dmt_fnv(h: u64, v: u64) -> u64 {
+    var x: u64 = h
+    for i in (0 as u32)..<8 {
+        x = x ~ ((v >> ((i as u64) * 8)) & 255)
+        x = wrapping_mul(x, 1099511628211)
+    }
+    return x
+}
+
+proc dmt_bit(b: bool) -> u64 {
+    if b {
+        return 1
+    }
+    return 0
+}
+
+// sinal de um padrao de bits de largura N (complemento de dois)
+proc dmt_com_sinal(v: u64, bits: u32) -> i64 {
+    let m: u64 = mascara(bits)
+    let s: u64 = (1 as u64) << (((bits - 1) as u64) & 63)
+    return transmute(wrapping_sub((v & m) ~ s, s), to = i64)
+}
+
+// dividendos de borda + 6 pseudoaleatorios (xorshift64 fixo); devolve a quantidade (13)
+proc dmt_dividendos(bits: u32, out: []u64) -> u32 {
+    let m: u64 = mascara(bits)
+    let half: u64 = (1 as u64) << (((bits - 1) as u64) & 63)
+    var x: u64 = 0x9E3779B97F4A7C15
+    out[0] = 0
+    out[1] = 1
+    out[2] = m
+    out[3] = m - 1
+    out[4] = half
+    out[5] = half - 1
+    out[6] = (half + 1) & m
+    for i in (0 as u32)..<6 {
+        x = x ~ (x << 13)
+        x = x ~ (x >> 7)
+        x = x ~ (x << 17)
+        out[7 + i] = x & m
+    }
+    return 13
+}
+
+// hash de todos os planos e quocientes/restos de um grupo (largura, com/sem sinal); *mism conta divergencias com a divisao direta
+proc dmt_grupo(bits: u32, com_sinal: bool, mism: ^i64) -> u64 {
+    var h: u64 = 14695981039346656037
+    var dv: [13]u64 = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
+    for j in (0 as u32)..<44 {
+        let dm: u64 = transmute(DMT_DIVS[j], to = u64) & mascara(bits)
+        var plano = DivMagicaPlano{bits = bits, com_sinal = com_sinal}
+        let ok: bool = div_magica_planejar(bits, com_sinal, dm, &plano)
+        h = dmt_fnv(h, plano.estrategia as u64)
+        h = dmt_fnv(h, plano.magic)
+        h = dmt_fnv(h, plano.shift as u64)
+        h = dmt_fnv(h, dmt_bit(plano.produto_64))
+        h = dmt_fnv(h, dmt_bit(plano.soma_a))
+        h = dmt_fnv(h, dmt_bit(plano.soma_bit_sinal))
+        h = dmt_fnv(h, dmt_bit(plano.negar))
+        h = dmt_fnv(h, plano.divisor)
+        if not ok {
+            continue
+        }
+        let n: u32 = dmt_dividendos(bits, dv[..])
+        for i in (0 as u32)..<n {
+            var r: u64 = 0
+            let q: u64 = div_magica_emular(&plano, dv[i], &r)
+            h = dmt_fnv(h, q)
+            h = dmt_fnv(h, r)
+            let a: u64 = dv[i] & mascara(bits)
+            var qd: u64 = 0
+            var rd: u64 = 0
+            if com_sinal {
+                let nn: i64 = dmt_com_sinal(a, bits)
+                let dd: i64 = dmt_com_sinal(dm, bits)
+                qd = transmute(nn / dd, to = u64) & mascara(bits)
+                rd = transmute(nn % dd, to = u64) & mascara(bits)
+            } else {
+                qd = a / dm
+                rd = a % dm
+            }
+            if (q != qd) or (r != rd) {
+                mism^ += 1
+            }
+        }
+    }
+    return h
+}
+
+test "div_magica: planos e emulacao de 8/16/32/64 bits sem sinal batem com o C (hash + divisao direta)" {
+    var m8: i64 = 0
+    var m16: i64 = 0
+    var m32: i64 = 0
+    var m64: i64 = 0
+    expect(dmt_grupo(8, false, &m8) == 15245982615615980736)
+    expect(dmt_grupo(16, false, &m16) == 15576661264029313437)
+    expect(dmt_grupo(32, false, &m32) == 18058059672971389962)
+    expect(dmt_grupo(64, false, &m64) == 10726402571857720748)
+    expect((m8 + m16 + m32 + m64) == 0)
+}
+
+test "div_magica: planos e emulacao de 8/16/32/64 bits com sinal batem com o C (hash + divisao direta)" {
+    var m8: i64 = 0
+    var m16: i64 = 0
+    var m32: i64 = 0
+    var m64: i64 = 0
+    expect(dmt_grupo(8, true, &m8) == 11774086987746431553)
+    expect(dmt_grupo(16, true, &m16) == 15817193868678370333)
+    expect(dmt_grupo(32, true, &m32) == 10966716064974787261)
+    expect(dmt_grupo(64, true, &m64) == 16251936753146093360)
+    expect((m8 + m16 + m32 + m64) == 0)
+}
+
+test "div_magica: divisao_pot_dois (qhi:qlo de 2^p / d) bate com o C em casos de 64 e 128 bits" {
+    var lo: u64 = 0
+    var hi: u64 = 0
+    divisao_pot_dois(10, 127, &lo, &hi)
+    expect(hi == 922337203685477580)
+    expect(lo == 14757395258967641292)
+    divisao_pot_dois(7, 64, &lo, &hi)
+    expect(hi == 0)
+    expect(lo == 2635249153387078802)
+    divisao_pot_dois(3, 100, &lo, &hi)
+    expect(hi == 22906492245)
+    expect(lo == 6148914691236517205)
+    divisao_pot_dois(1000, 127, &lo, &hi)
+    expect(hi == 9223372036854775)
+    expect(lo == 14904969211557317705)
+    divisao_pot_dois(9223372036854775807, 127, &lo, &hi)
+    expect(hi == 1)
+    expect(lo == 2)
+    divisao_pot_dois(641, 76, &lo, &hi)
+    expect(hi == 6)
+    expect(lo == 7194517969465503750)
+    divisao_pot_dois(5, 64, &lo, &hi)
+    expect(hi == 0)
+    expect(lo == 3689348814741910323)
+    divisao_pot_dois(3, 66, &lo, &hi)
+    expect(hi == 1)
+    expect(lo == 6148914691236517205)
+}
+
+test "div_magica: resto nulo (none) so devolve o quociente; com resto grava a - q*d" {
+    var plano = DivMagicaPlano{bits = 32, com_sinal = false}
+    expect(div_magica_planejar(32, false, 7, &plano))
+    expect(div_magica_emular(&plano, 100, none) == 14)
+    var r: u64 = 0
+    expect(div_magica_emular(&plano, 100, &r) == 14)
+    expect(r == 2)
+}

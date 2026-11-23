@@ -1,0 +1,99 @@
+SUBCONJUNTO DA FORJA PARA O BENCHMARK (versao 1.0.0, congelado em 2026-11-07)
+Base: MEM-LJ-SPEC (spec v0). Em conflito, ESTE arquivo vence para o benchmark.
+Entrada: arquivo .fj em UTF-8, LF. Os arquivos do corpus sao ASCII.
+
+1. LEXICO
+- Comentario: // ate o fim da linha. /// idem (ignorado).
+- Identificador: [A-Za-z_][A-Za-z0-9_]*.
+- Inteiro: [0-9]+. Real: [0-9]+ "." [0-9]+. Nao existe 1. nem .5.
+- String: "..." sem escape, sem quebra de linha; so e tokenizada (nenhuma regra a usa, entao aparecendo vira E0101). Sem fechar na linha = E0001.
+- Qualquer outro caractere fora de espaco, tab, CR, LF e dos simbolos abaixo = E0001.
+- Simbolos: ( ) { } , : = + - * / % == != < <= > >= += -= -> .. ..< ..= . ^ &
+- Palavras-chave: const let var proc struct unit if else for in while return as and or not true false
+- Tipos embutidos (nomes, nao palavras-chave): i32 int f32 bool
+- NAO existe ';'. Fim de linha encerra o comando. Linhas em branco e comentarios sao ignorados.
+
+2. GRAMATICA (cada comando em sua linha; '{' termina a linha do cabecalho; '}' sozinho na linha, ou '} else {' / '} else if ... {')
+arquivo      := declaracao*
+declaracao   := unit | const | struct | proc
+unit         := "unit" Nome ":" "f32"
+              | "unit" Nome "=" NomeUnit ("*" | "/") NomeUnit
+const        := "const" NOME ":" Tipo "=" expr
+struct       := "struct" Nome "{" NL (campo NL)* "}"
+campo        := nome ":" Tipo ["in" limite ("..=" | "..<") limite] ["=" expr]
+limite       := ["-"] INTEIRO
+proc         := "proc" nome "(" [param ("," param)*] ")" ["->" Tipo] "{" NL comando* "}"
+param        := nome ":" ("^" Nome | Tipo) ["=" expr]
+Tipo         := i32 | int | f32 | bool | NomeUnit | NomeStruct
+comando      := "let" nome [":" Tipo] "=" expr
+              | "var" nome [":" Tipo] "=" expr
+              | lvalor ("=" | "+=" | "-=") expr
+              | "if" expr "{" NL comando* "}" [ "else" ( "{" NL comando* "}" | if-encadeado ) ]
+              | "while" expr "{" NL comando* "}"
+              | "for" nome "in" expr "..<" expr "{" NL comando* "}"
+              | "return" [expr]
+              | chamada
+lvalor       := nome ("." nome)?
+expr         := ou
+ou           := e ("or" e)*
+e            := cmp ("and" cmp)*
+cmp          := soma [("==" | "!=" | "<" | "<=" | ">" | ">=") soma]      (nao associativo: a < b < c = E0101)
+soma         := mult (("+" | "-") mult)*
+mult         := cast (("*" | "/" | "%") cast)*
+cast         := unario ("as" Tipo)*
+unario       := ("-" | "not" | "&") unario | posfixo
+posfixo      := primario ("." nome | chamada-args)*     (chamada so sobre nome de proc)
+primario     := INTEIRO | REAL | "true" | "false" | nome | "(" expr ")" | literal-struct
+literal-struct := NomeStruct "{" [nome "=" expr ("," nome "=" expr)*] "}"   (uma linha so; NAO vale dentro do cabecalho de if/while/for)
+chamada      := nome "(" [expr ("," nome "=" expr)*] ")"
+- Nome de tipo/unidade/struct comeca com maiuscula; NOME_DE_CONSTANTE e todo maiusculo; resto minusculo.
+- print(x) e o unico embutido: 1 argumento posicional, tipo i32, int ou bool. Fora disso = E0301.
+- proc main() sem parametros e sem retorno e obrigatorio (senao E0201 em 1:1).
+- '&' so sobre o nome de uma variavel de struct (tipo ^Struct). '^T' so como tipo de parametro.
+- Fora do subconjunto (nao implementar): enum union switch T!E ?T try or_else defer fatias dynamic map matrix soa f"..." import foreign test alocadores break continue arrays campo de tipo ponteiro struct dentro de struct.
+
+3. TIPOS E REGRAS
+Categorias: INT32 (i32), INT64 (int), REAL (f32 e toda unidade), BOOL, STRUCT(Nome), PTR(Nome).
+- Sem conversao implicita entre categorias, e i32 x int sao categorias diferentes => E0301.
+- Dimensao (so para REAL): f32 puro = adimensional. unit X: f32 cria uma dimensao base nova. unit Y = A/B ou A*B combina as dimensoes. Duas unidades de mesma dimensao sao o mesmo tipo.
+- + - == != < <= > >= : operandos da mesma categoria; em REAL a mesma dimensao (senao E0412; f32 puro x unidade tambem e E0412). Resultado de + e - tem a dimensao do operando; comparacao da bool.
+- * e / : INT32 x INT32 e INT64 x INT64 ficam no mesmo tipo; REAL x REAL combina dimensoes (soma ou subtracao dos expoentes); a dimensao resultante precisa ser adimensional ou ter uma unidade declarada (senao E0412 no operador). Misturar categorias = E0301. % so em inteiros do mesmo tipo.
+- and or not : operandos bool.
+- Literal inteiro adota INT32 ou INT64 do contexto (sem contexto: int). Literal real adota a dimensao do contexto (em * e / com outro REAL, o literal e adimensional; em + - comparacao, adota o outro operando; sem contexto: f32). Inteiro nunca vira REAL (E0301).
+- "e as Tipo": converte entre i32, int, f32 e unidades (todas as direcoes entre essas categorias numericas, REAL para inteiro trunca para zero). bool e struct nao convertem (E0301 no inicio da expressao).
+- let/var sem tipo infere da expressao. Atribuir a let, a parametro ou a variavel de for nao e testado: o corpus nunca faz; os prototipos podem aceitar.
+- Condicao de if/while precisa ser bool (E0301 no inicio da expressao).
+- for i in a..<b : a e b da mesma categoria inteira; i e imutavel do tipo deles.
+- proc com "-> T": o ultimo comando do corpo (nivel de cima) precisa ser return (senao E0302 no } final). return expr confere o tipo (E0301/E0412 no inicio da expressao). proc sem retorno: return sem valor, opcional.
+- Literal de struct: campos nomeados em qualquer ordem; omitido = padrao do campo (sem padrao: zero/0.0/false); campo inexistente = E0504; valor confere tipo; valor literal inteiro fora da faixa = E0420.
+- Faixa: so em campos i32 ou int (faixa em outro tipo nao e testada). O padrao do campo, se constante literal (com '-' opcional), precisa estar na faixa (E0420 no inicio do valor). ..= inclusiva, ..< exclusiva. Nao ha checagem em tempo de execucao neste benchmark.
+- Padrao de campo e de parametro: expressao constante (literal, '-' literal, ou NOME de const).
+
+4. CHAMADAS (regras de argumento)
+- Proc declarado com parametros p0, p1, ..., pn. O 1o argumento da chamada e posicional e liga a p0. Os demais sao "nome = expr".
+- 1o argumento nomeado => E0502 (no nome). Argumento posicional depois do 1o => E0502 (no inicio da expressao).
+- Nome que nao e parametro => E0504 (no nome).
+- Os nomeados seguem a ordem declarada; vao-se guardando o indice do ultimo; um nomeado cujo indice e menor ou igual ao ultimo => E0501 (no nome).
+- Conferidos os argumentos, qualquer parametro sem padrao e sem argumento => E0503 (no nome do proc chamado).
+- Ordem de verificacao dentro de uma chamada: argumentos da esquerda para a direita (estrutura acima), depois tipos de cada argumento ja ligado, depois faltantes.
+- Tipo do argumento confere com o do parametro (E0301/E0412 no inicio da expressao do argumento). Parametro ^Struct recebe &variavel ou um nome ja do tipo ^Struct.
+
+5. ORDEM DE ANALISE (para parar sempre no mesmo primeiro erro)
+1) Lexico do arquivo inteiro (E0001 no primeiro). 2) Sintaxe (E0101 no primeiro). 3) Passe A, na ordem do fonte: unit, const, struct, assinaturas de proc (nomes, tipos de parametro, padroes). 4) Passe B, na ordem do fonte: corpos de proc. 5) Existencia de main (E0201 1:1). Para na primeira ocorrencia.
+
+6. SEMANTICA DE EXECUCAO (o que o C gerado deve fazer)
+- i32 = 32 bits, int = 64 bits, ambos com sinal, sem estouro nos casos. f32 = float IEEE. bool = true/false.
+- Divisao e % inteiras como em C (truncam para zero). Divisao real como float. as: float para inteiro trunca para zero.
+- and/or em curto-circuito. for i in a..<b : b avaliado uma vez antes do laco.
+- print(x): imprime o valor e LF. i32 e int em decimal (%d / %lld). bool como true ou false.
+- Passagem de struct a ^Struct e por ponteiro; atribuicao de struct a let/var copia.
+- main retorna 0.
+
+7. EMISSAO
+Livre (formatacao do C nao e comparada). O C gerado so pode usar a biblioteca padrao (stdint.h, stdbool.h, stdio.h). Exige compilar com as flags do contrato.json, secao equivalencia.
+
+8. ADENDO 1.0.1 (2026-11-07, vale para os 3 prototipos; resposta a duvida levantada durante a Etapa 2)
+- Passe A (secao 5) resolve POR CATEGORIAS: 1o todas as unit, 2o todas as const, 3o todas as struct, 4o as assinaturas de proc; dentro de cada categoria, na ordem do fonte. Assim uma struct ou unit pode ser declarada depois do proc ou da struct que a usa (caso dourado ok_17_declaracao_fora_de_ordem). Duplicidade de nome ainda nao e testada.
+- Fim de arquivo conta como fim de linha: arquivo sem LF final e aceito.
+- Posicoes nao testadas, adotadas por todos: return sem valor em proc com retorno = E0301 no return; print com numero de argumentos diferente de 1 = E0301 no nome print; += ou -= em alvo nao numerico = E0301 no inicio da expressao do lado direito.
+- O manifesto.json do corpus dourado ja tem o sha256 de cada arquivo; nenhum prototipo precisa calcular.

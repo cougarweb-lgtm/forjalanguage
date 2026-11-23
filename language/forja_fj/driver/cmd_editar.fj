@@ -1,0 +1,516 @@
+// driver/cmd_editar.fj - porte de compiler/driver/cmd_editar.c, compiler/driver/cmd_editar.h
+// sha256 de driver/cmd_editar.c: 29b771842baa9df50fd442c1cb9f955980156840b30abdf2aab3afc36743c093
+// sha256 de driver/cmd_editar.h: d5c7089989ec611f2096400f67047d082c97c79be30f8246ec9c404ff7ce7495
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "cache"
+import "common"
+
+struct Pedido2 {
+    alvo: ?str
+    ops: ?str
+    aplicar: bool
+}
+
+// Uma operacao do ops.json: nome, as chaves que podem trazer o alvo (a 1a presente vale), a chave do texto e a tag do executar.
+// "" = chave ausente (C: NULL). Nenhuma chave real e vazia, entao "" nunca casa com o JSON.
+struct TipoDeOperacao {
+    nome: str
+    chaves_alvo: [4]str
+    chave_texto: str
+    executar: u16
+}
+
+struct Contexto2 {
+    pedido: ?^Pedido2
+    ops: ?^JsonValor
+}
+
+// A arena do plano vive num bloco de heap: o plano guarda o endereco dela, e um local nao pode ser guardado (E0706).
+struct MemoriaDoPlano {
+    arena: common.Arena
+}
+
+// O que a conferencia reune: os textos novos (um por arquivo), o diff, o check da copia e a resposta.
+struct Conferencia {
+    plano: ^Plano
+    pedido: ^Pedido2
+    novos: [dynamic]str
+    diff: [dynamic]u8
+    depois: ResultadoCheck
+    resposta: Resposta
+    motivo: ?str
+}
+
+const TIPOS_DE_OPERACAO_TOTAL: u16 = 6
+
+pub const TIPO_DE_OPERACAO_EXECUTAR_EDITAR_INSERIR_DECL: u16 = 1
+pub const TIPO_DE_OPERACAO_EXECUTAR_EDITAR_REMOVER_DECL: u16 = 2
+pub const TIPO_DE_OPERACAO_EXECUTAR_EDITAR_MOVER_DECL: u16 = 3
+pub const TIPO_DE_OPERACAO_EXECUTAR_EDITAR_TROCAR_NO: u16 = 4
+pub const TIPO_DE_OPERACAO_EXECUTAR_EDITAR_TROCAR_CORPO: u16 = 5
+pub const TIPO_DE_OPERACAO_EXECUTAR_EDITAR_RENOMEAR: u16 = 6
+pub proc chamar_tipo_de_operacao_executar(tag: u16, p: ^Plano, alvo: str, texto: str) -> bool {
+    if tag == 1 {
+        return editar_inserir_decl(p, alvo, texto)
+    }
+    if tag == 2 {
+        return editar_remover_decl(p, alvo, texto)
+    }
+    if tag == 3 {
+        return editar_mover_decl(p, alvo, texto)
+    }
+    if tag == 4 {
+        return editar_trocar_no(p, alvo, texto)
+    }
+    if tag == 5 {
+        return editar_trocar_corpo(p, alvo, texto)
+    }
+    if tag == 6 {
+        return editar_renomear(p, alvo, texto)
+    }
+    panic("forja editar: tag de operacao desconhecida (bug interno)")
+    return false
+}
+
+// C: driver/cmd_editar.c:38
+proc uso_errado_3(motivo: ?str) -> i32 {
+    let txt_1 = motivo or_else "(null)"
+    let msg_1 = format(f"forja: editar: {txt_1}\n", alloc = heap)
+    defer delete(msg_1)
+    common.c2f_saida_formatar(common.c2f_saida_stderr(), msg_1)
+    common.c2f_saida_escrever_texto(common.c2f_saida_stderr(), "uso: forja editar [<arq.fj | pasta>] --ops <ops.json> [--aplicar]\n")
+    return EDITAR_USO
+}
+
+// C: driver/cmd_editar.c:45
+// Le --aplicar, --ops <arq> e o alvo. Devolve o motivo do uso errado ou none.
+proc ler_argumentos_2(argc: i32, argv: []str, p: ^Pedido2) -> ?str {
+    var k: i32 = 0
+    while k < argc {
+        let arg: str = argv[k as int]
+        if arg == "--aplicar" {
+            p.aplicar = true
+        } else if arg == "--ops" {
+            if (k + 1) >= argc {
+                return "--ops exige o arquivo das operacoes (ex.: --ops ops.json)"
+            }
+            k += 1
+            p.ops = argv[k as int]
+        } else if (len(arg) > 0) and (arg[0] == 45) { // '-'
+            return "opcao desconhecida (valem --ops e --aplicar)"
+        } else if p.alvo != none {
+            return "so um alvo por vez"
+        } else {
+            p.alvo = arg
+        }
+        k += 1
+    }
+    if p.ops == none {
+        return "falta --ops <ops.json>"
+    }
+    return none
+}
+
+// C: driver/cmd_editar.c:OPERACOES (a tabela). Uma funcao com um return por tag: a Forja nao tem var de topo.
+proc tipo_de_operacao(tag: u16) -> TipoDeOperacao {
+    if tag == TIPO_DE_OPERACAO_EXECUTAR_EDITAR_INSERIR_DECL {
+        return TipoDeOperacao{nome = "inserir_decl", chaves_alvo = {"modulo", "arquivo", "depois_de", "antes_de"}, chave_texto = "texto", executar = tag}
+    }
+    if tag == TIPO_DE_OPERACAO_EXECUTAR_EDITAR_REMOVER_DECL {
+        return TipoDeOperacao{nome = "remover_decl", chaves_alvo = {"id", "", "", ""}, chave_texto = "", executar = tag}
+    }
+    if tag == TIPO_DE_OPERACAO_EXECUTAR_EDITAR_MOVER_DECL {
+        return TipoDeOperacao{nome = "mover_decl", chaves_alvo = {"id", "", "", ""}, chave_texto = "para", executar = tag}
+    }
+    if tag == TIPO_DE_OPERACAO_EXECUTAR_EDITAR_TROCAR_NO {
+        return TipoDeOperacao{nome = "trocar_no", chaves_alvo = {"id", "", "", ""}, chave_texto = "texto", executar = tag}
+    }
+    if tag == TIPO_DE_OPERACAO_EXECUTAR_EDITAR_TROCAR_CORPO {
+        return TipoDeOperacao{nome = "trocar_corpo", chaves_alvo = {"id", "proc", "", ""}, chave_texto = "texto", executar = tag}
+    }
+    if tag == TIPO_DE_OPERACAO_EXECUTAR_EDITAR_RENOMEAR {
+        return TipoDeOperacao{nome = "renomear", chaves_alvo = {"id", "nome", "", ""}, chave_texto = "novo", executar = tag}
+    }
+    return TipoDeOperacao{}
+}
+
+// C: driver/cmd_editar.c:67
+// A tag (1..6) da operacao de nome 'nome'; 0 se nao existe.
+proc achar_tipo(nome: ?str) -> u16 {
+    let texto: str = nome or_else ""
+    var tag: u16 = 1
+    while tag <= TIPOS_DE_OPERACAO_TOTAL {
+        let t: TipoDeOperacao = tipo_de_operacao(tag)
+        if t.nome == texto {
+            return tag
+        }
+        tag += 1
+    }
+    return 0
+}
+
+// C: driver/cmd_editar.c:74
+// O alvo: o valor da 1a chave de t.chaves_alvo que o item tem (none = nenhuma).
+proc alvo_da_operacao(item: ?^JsonValor, t: TipoDeOperacao) -> ?str {
+    var k: u64 = 0
+    while k < 4 {
+        if t.chaves_alvo[k] != "" {
+            let alvo: ?str = json_texto_de(item, t.chaves_alvo[k])
+            if alvo != none {
+                return alvo
+            }
+        }
+        k += 1
+    }
+    return none
+}
+
+// C: driver/cmd_editar.c:94 (a frase de falta: "faltam <chave do alvo> e <chave do texto>")
+proc mensagem_de_falta(arena: ^common.Arena, numero: u32, t: TipoDeOperacao) -> ?str {
+    var rotulo: str = t.chave_texto
+    if rotulo == "" {
+        rotulo = "(sem texto)"
+    }
+    let nome: str = t.nome
+    let chave_alvo: str = t.chaves_alvo[0]
+    return limitar_frase(format(f"operacao {numero} ({nome}): faltam \"{chave_alvo}\" e \"{rotulo}\"", alloc = common.arena_mem(arena)))
+}
+
+// C: driver/cmd_editar.c:85
+// A operacao do ops.json esta completa? Devolve o motivo (cortado como o C) ou none.
+proc validar_operacao(arena: ^common.Arena, item: ?^JsonValor, numero: u32) -> ?str {
+    var tag: u16 = 0
+    if (item as ^JsonValor).tipo == JSON_OBJETO {
+        tag = achar_tipo(json_texto_de(item, "op"))
+    }
+    if tag == 0 {
+        return limitar_frase(format(f"operacao {numero}: falta \"op\" ou nao e uma destas: renomear, trocar_no, trocar_corpo, inserir_decl, remover_decl, mover_decl", alloc = common.arena_mem(arena)))
+    }
+    let t: TipoDeOperacao = tipo_de_operacao(tag)
+    let sem_alvo: bool = alvo_da_operacao(item, t) == none
+    let sem_texto: bool = (t.chave_texto != "") and (json_texto_de(item, t.chave_texto) == none)
+    if sem_alvo or sem_texto {
+        return mensagem_de_falta(arena, numero, t)
+    }
+    return none
+}
+
+// C: driver/cmd_editar.c:102 (o laco de ValidarOperacao sobre a lista)
+proc validar_lista(arena: ^common.Arena, doc: ?^JsonValor) -> ?str {
+    var numero: u32 = 0
+    var item: ?^JsonValor = (doc as ^JsonValor).filho
+    while item != none {
+        numero += 1
+        let motivo: ?str = validar_operacao(arena, item, numero)
+        if motivo != none {
+            return motivo
+        }
+        item = (item as ^JsonValor).prox
+    }
+    return none
+}
+
+// JSON de 'texto': a lista de operacoes, ou {"operacoes": [...]}. none se nao e JSON valido nessa forma.
+proc documento_das_operacoes(arena: ^common.Arena, texto: str, tam: u64) -> ?^JsonValor {
+    var doc: ?^JsonValor = json_ler(arena, texto, tam)
+    if doc == none {
+        return none
+    }
+    if (doc as ^JsonValor).tipo == JSON_OBJETO {
+        doc = json_membro(doc, "operacoes")
+    }
+    if doc == none {
+        return none
+    }
+    if (doc as ^JsonValor).tipo != JSON_LISTA {
+        return none
+    }
+    return doc
+}
+
+// C: driver/cmd_editar.c:102
+// Le e confere o ops.json (BOM tirado): a lista de operacoes em lista^. Devolve o motivo do uso errado ou none.
+proc ler_operacoes(arena: ^common.Arena, caminho: ?str, lista: ^?^JsonValor) -> ?str {
+    let arquivo: str = caminho or_else ""
+    var dados: [dynamic]u8 = make([dynamic]u8, alloc = heap)
+    defer delete(dados)
+    if not cache.arquivo_ler_inteiro(arquivo, &dados) {
+        return limitar_frase(format(f"nao consegui abrir '{arquivo}' para leitura", alloc = common.arena_mem(arena)))
+    }
+    // arquivo_ler_inteiro acrescenta um NUL depois dos bytes: o tamanho do arquivo e um a menos
+    let tam: u64 = (len(dados) as u64) - 1
+    var bom: u64 = 0
+    if edicoes_tem_bom(dados[..], tam) {
+        bom = EDICOES_BOM_TAM as u64
+    }
+    let texto: str = from_bytes(dados[(bom as int)..<(tam as int)], alloc = common.arena_mem(arena))
+    let doc: ?^JsonValor = documento_das_operacoes(arena, texto, tam - bom)
+    if doc == none {
+        return "o arquivo das operacoes tem de ser JSON valido: uma lista de operacoes, ou {\"operacoes\": [...]}"
+    }
+    let erro: ?str = validar_lista(arena, doc)
+    if erro != none {
+        return erro
+    }
+    lista^ = doc
+    return none
+}
+
+// C: driver/cmd_editar.c:128 (corpo do laco de ExecutarOperacoes)
+// Uma operacao: achada a tag, executada no plano; se falha, a frase vira "operacao N (tipo): causa" em p.erro.
+proc executar_uma_operacao(p: ^Plano, item: ?^JsonValor, numero: u32) {
+    let tag: u16 = achar_tipo(json_texto_de(item, "op"))
+    let t: TipoDeOperacao = tipo_de_operacao(tag)
+    let alvo: ?str = alvo_da_operacao(item, t)
+    var texto: ?str = none
+    if t.chave_texto != "" {
+        texto = json_texto_de(item, t.chave_texto)
+    }
+    let antes: u32 = plano_total_edicoes(p)
+    p.item = item
+    if chamar_tipo_de_operacao_executar(tag, p, alvo or_else "", texto or_else "") {
+        plano_registrar(p, t.nome, alvo, texto, antes)
+        return
+    }
+    let causa: str = p.erro or_else ""
+    let causa_curta: str = causa[0..<min(len(causa), 300)]
+    let nome: str = t.nome
+    p.erro = limitar_frase(format(f"operacao {numero} ({nome}): {causa_curta}", alloc = common.arena_mem(p.arena as ^common.Arena)))
+}
+
+// C: driver/cmd_editar.c:128
+// Executa as operacoes na ordem; a 1a que falha deixa a frase (com o numero dela) em p.erro e para.
+proc executar_operacoes(p: ^Plano, ops: ?^JsonValor) {
+    var numero: u32 = 0
+    var item: ?^JsonValor = (ops as ^JsonValor).filho
+    while (item != none) and ((p.erro or_else "") == "") {
+        numero += 1
+        executar_uma_operacao(p, item, numero)
+        item = (item as ^JsonValor).prox
+    }
+}
+
+// C: driver/cmd_editar.c:152
+// O texto novo de cada arquivo (BOM e demais bytes iguais; so as edicoes mudam). false = duas operacoes tocam o mesmo trecho (erro em p.erro).
+proc montar_textos(p: ^Plano, novos: ^[dynamic]str) -> bool {
+    var k: u32 = 0
+    while k < p.narquivos {
+        let a: ^ArquivoEditado = &p.arquivos[k]
+        let mem = common.arena_mem(p.arena as ^common.Arena)
+        var buf: [dynamic]u8 = make([dynamic]u8, alloc = mem)
+        var lista: ?^Edicao = none
+        if a.n > 0 {
+            lista = &a.edicoes[0]
+        }
+        let original: str = a.original or_else ""
+        if not edicoes_montar_arquivo(original, a.tam, lista, a.n, &buf) {
+            let relativo: str = a.relativo or_else ""
+            return plano_erro(p, format(f"duas operacoes tocam o mesmo trecho de '{relativo}'", alloc = mem))
+        }
+        append(novos, item = from_bytes(buf[..], alloc = mem))
+        k += 1
+    }
+    return true
+}
+
+// C: driver/cmd_editar.c:162
+proc montar_diff(p: ^Plano, diff: ^[dynamic]u8) {
+    var k: u32 = 0
+    while k < p.narquivos {
+        let a: ^ArquivoEditado = &p.arquivos[k]
+        var tam: u64 = 0
+        let texto: str = texto_de(a, &tam)
+        var lista: ?^Edicao = none
+        if a.n > 0 {
+            lista = &a.edicoes[0]
+        }
+        _ = edicoes_diff(texto, tam, lista, a.n, a.relativo or_else "", diff)
+        k += 1
+    }
+}
+
+// C: driver/cmd_editar.c:173
+// Grava os textos novos, um arquivo por vez e de forma atomica; se um falha, devolve os ja gravados ao original. false = erro em p.erro.
+proc gravar_textos(p: ^Plano, novos: []str) -> bool {
+    var k: u32 = 0
+    while k < p.narquivos {
+        let a: ^ArquivoEditado = &p.arquivos[k]
+        let texto: str = novos[k as int]
+        if not common.arquivo_gravar_atomico(a.caminho, texto, len(texto) as u64, none) {
+            desfazer_ja_gravados(p, k)
+            let relativo: str = a.relativo or_else ""
+            return plano_erro(p, format(f"nao consegui gravar '{relativo}' (os arquivos ja gravados foram devolvidos ao original)", alloc = common.arena_mem(p.arena as ^common.Arena)))
+        }
+        k += 1
+    }
+    return true
+}
+
+// Devolve ao original os arquivos 0..<ate (os gravados antes de um que falhou).
+proc desfazer_ja_gravados(p: ^Plano, ate: u32) {
+    var j: u32 = 0
+    while j < ate {
+        let b: ^ArquivoEditado = &p.arquivos[j]
+        _ = edicoes_desfazer(b.caminho, b.original, b.tam)
+        j += 1
+    }
+}
+
+// C: driver/cmd_editar.c:184
+// O diagnostico do check da copia que justifica recusar a edicao (o 1o), numa frase.
+proc motivo_da_recusa(arena: ^common.Arena, r: ^Resposta) -> str {
+    let depois: ^ResultadoCheck = r.depois as ^ResultadoCheck
+    let itens: []DiagLido = depois.itens or_else {}
+    let d: DiagLido = itens[0]
+    let prefixo: str = r.prefixo_copia or_else ""
+    var arquivo: str = d.arquivo or_else "?"
+    if (len(prefixo) > 0) and common.c2f_prefixo_igual(arquivo, prefixo, len(prefixo)) {
+        arquivo = arquivo[len(prefixo)..<len(arquivo)]
+    }
+    let codigo: str = d.codigo or_else "(null)"
+    let n_erros: u32 = depois.n
+    let linha: u32 = d.linha
+    return limitar_frase(format(f"a edicao deixaria {n_erros} erro(s) no projeto (que passava limpo): {codigo} em {arquivo}:{linha}; nenhum arquivo foi alterado", alloc = common.arena_mem(arena)))
+}
+
+// C: driver/cmd_editar.c:198
+// Roda o check da copia e decide se a edicao vale; grava se pedido. Devolve o exit.
+proc conferir_e_gravar(cf: ^Conferencia, arena: ^common.Arena) -> i32 {
+    let p: ^Plano = cf.plano
+    let pedido: ^Pedido2 = cf.pedido
+    cf.resposta = Resposta{alvo = pedido.alvo or_else ".", aplicar = pedido.aplicar, erros_depois = -1, diff = &cf.diff}
+    if plano_total_edicoes(p) == 0 {
+        cf.resposta.valido = true
+        return EDITAR_OK
+    }
+    var prefixo: ?str = none
+    if not editar_verificar_copia(p, cf.novos[..], arena, &cf.depois, &prefixo) {
+        cf.resposta.motivo = p.erro
+        return EDITAR_INTERNO
+    }
+    cf.resposta.prefixo_copia = prefixo
+    cf.resposta.depois = &cf.depois
+    cf.resposta.erros_depois = cf.depois.n as i64
+    cf.resposta.valido = cf.depois.n == 0
+    if not cf.resposta.valido {
+        cf.motivo = motivo_da_recusa(arena, &cf.resposta)
+        cf.resposta.motivo = cf.motivo
+        return EDITAR_RECUSADO
+    }
+    if pedido.aplicar and (not gravar_textos(p, cf.novos[..])) {
+        cf.resposta.motivo = p.erro
+        return EDITAR_INTERNO
+    }
+    cf.resposta.aplicado = pedido.aplicar
+    return EDITAR_OK
+}
+
+// C: fprintf(stderr, "forja: editar: %s\n", motivo)
+proc avisar_erro(motivo: str) {
+    let msg_erro = format(f"forja: editar: {motivo}\n", alloc = heap)
+    defer delete(msg_erro)
+    common.c2f_saida_formatar(common.c2f_saida_stderr(), msg_erro)
+}
+
+// C: driver/cmd_editar.c:231
+// Operacoes ja no plano: monta os textos e o diff, confere e responde.
+proc concluir(p: ^Plano, pedido: ^Pedido2, arena: ^common.Arena) -> i32 {
+    var cf: Conferencia = Conferencia{plano = p, pedido = pedido, novos = make([dynamic]str, alloc = heap), diff = make([dynamic]u8, alloc = heap)}
+    defer delete(cf.novos)
+    defer delete(cf.diff)
+    plano_ordenar(p)
+    var codigo: i32 = EDITAR_RECUSADO
+    if montar_textos(p, &cf.novos) {
+        montar_diff(p, &cf.diff)
+        codigo = conferir_e_gravar(&cf, arena)
+    } else {
+        cf.resposta = Resposta{alvo = pedido.alvo or_else ".", aplicar = pedido.aplicar, erros_depois = -1, motivo = p.erro}
+    }
+    editar_emitir_resposta(p, &cf.resposta)
+    if cf.resposta.motivo != none {
+        avisar_erro(cf.resposta.motivo or_else "")
+    }
+    return codigo
+}
+
+// C: driver/cmd_editar.c:255
+// O projeto compilou sem erro (Consulta pronta): aplica as operacoes e responde. Tag FUNCAO_RESPOSTA_RESPONDER do consultar_interno.
+proc responder(q: ^Consulta, pc: ^PedidoConsulta) -> i32 {
+    let ctx: ^Contexto2 = pc.contexto as ^Contexto2
+    let pedido: ^Pedido2 = ctx.pedido as ^Pedido2
+    let memoria: ^MemoriaDoPlano = new(MemoriaDoPlano, alloc = heap)
+    let plano: ^Plano = new(Plano, alloc = heap)
+    plano.q = q
+    plano.arena = &memoria.arena
+    plano.arquivos = make([dynamic]ArquivoEditado, alloc = heap)
+    plano.operacoes = make([dynamic]Operacao, alloc = heap)
+    executar_operacoes(plano, ctx.ops)
+    var codigo: i32 = EDITAR_RECUSADO
+    if (plano.erro or_else "") == "" {
+        codigo = concluir(plano, pedido, &memoria.arena)
+    } else {
+        var r: Resposta = Resposta{alvo = pedido.alvo or_else ".", aplicar = pedido.aplicar, erros_depois = -1, motivo = plano.erro}
+        editar_emitir_resposta(plano, &r)
+        avisar_erro(plano.erro or_else "")
+    }
+    plano_liberar(plano)
+    common.arena_liberar(&memoria.arena)
+    delete(plano)
+    delete(memoria)
+    return codigo
+}
+
+// C: driver/cmd_editar.c:277
+// 'forja editar <arq.fj | pasta> --ops <ops.json> [--aplicar]'
+proc rodar_editar(argc: i32, argv: []str) -> i32 {
+    var pedido: Pedido2 = Pedido2{}
+    var arena: common.Arena = common.Arena{}
+    var ops: ?^JsonValor = none
+    var erro: ?str = ler_argumentos_2(argc, argv, &pedido)
+    if erro == none {
+        erro = ler_operacoes(&arena, pedido.ops, &ops)
+    }
+    if erro != none {
+        common.arena_liberar(&arena)
+        return uso_errado_3(erro)
+    }
+    var ctx: Contexto2 = Contexto2{pedido = &pedido, ops = ops}
+    var pc: PedidoConsulta = PedidoConsulta{pergunta = "editar", alvo = pedido.alvo, contexto = &ctx as rawptr}
+    let codigo: i32 = consulta_executar(&pc, FUNCAO_RESPOSTA_RESPONDER)
+    common.arena_liberar(&arena)
+    return codigo
+}
+
+test "achar_tipo acha a tag pelo nome" {
+    expect(achar_tipo("renomear") == 6)
+    expect(achar_tipo("inserir_decl") == 1)
+    expect(achar_tipo("trocar_corpo") == 5)
+    expect(achar_tipo("nao_existe") == 0)
+    expect(achar_tipo(none) == 0)
+}
+
+test "tipo_de_operacao traz as chaves na ordem do C" {
+    let t: TipoDeOperacao = tipo_de_operacao(1)
+    expect(t.nome == "inserir_decl")
+    expect(t.chaves_alvo[3] == "antes_de")
+    expect(t.chave_texto == "texto")
+    let r: TipoDeOperacao = tipo_de_operacao(2)
+    expect(r.nome == "remover_decl")
+    expect(r.chave_texto == "")
+}
+
+test "ler_argumentos_2 le o alvo e --ops" {
+    var p: Pedido2 = Pedido2{}
+    var argv: [3]str = {"pasta", "--ops", "ops.json"}
+    expect(ler_argumentos_2(3, argv[..], &p) == none)
+    expect((p.ops or_else "") == "ops.json")
+    expect((p.alvo or_else "") == "pasta")
+}
+
+test "ler_argumentos_2 recusa --ops sem arquivo" {
+    var p: Pedido2 = Pedido2{}
+    var argv: [1]str = {"--ops"}
+    expect((ler_argumentos_2(1, argv[..], &p) or_else "") == "--ops exige o arquivo das operacoes (ex.: --ops ops.json)")
+}

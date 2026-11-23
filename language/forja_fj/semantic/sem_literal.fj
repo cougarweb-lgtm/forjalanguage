@@ -1,0 +1,264 @@
+// semantic/sem_literal.fj - porte de compiler/semantic/sem_literal.c
+// sha256 de semantic/sem_literal.c: 4171dcccc943a0d16e3ef2dbb0278ad3517c060912d88020384b8752d6253f23
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "common"
+import "frontend"
+
+const DIGITOS_SEMPRE_EXATOS: i32 = 7
+const TEXTO_SUGESTAO_MAX: i32 = 150
+const LIMITE_INTEIRO_F64: u64 = 9223372036854775808
+
+// Texto de um tipo (o char[cap] de SemDescrever do C): copia na heap ate o 1o byte 0; o chamador faz delete.
+// Helper do porte (o C passava um char[] local): a sem_descrever escreve num []u8 de cap bytes.
+proc texto_do_tipo(s: ^Semantica, tipo: u32, cap: int) -> str {
+    var b = make([dynamic]u8, alloc = heap, cap = cap)
+    defer delete(b)
+    resize(&b, cap)
+    sem_descrever(s, tipo, b[..], cap as u64)
+    return from_bytes(b[0..<common.c2f_strlen_b(b[..])], alloc = heap)
+}
+
+// Digitos do numero que comeca em pos na fonte (o `texto + pos` do C ia ate o NUL; o leitor de inteiro para no 1o byte que nao e digito
+// da base, entao a corrida de [0-9A-Za-z_] basta). Copia na heap; o chamador faz delete.
+proc numero_da_fonte(s: ^Semantica, pos: u32) -> str {
+    let t: []u8 = (s.fonte as ^common.Fonte).texto
+    var fim: int = pos as int
+    while char_de_palavra(t[fim]) {
+        fim += 1
+    }
+    return from_bytes(t[(pos as int)..<fim], alloc = heap)
+}
+
+// C: semantic/sem_literal.c:19
+proc inteiro_exato_em_real(mag: u64, tipo: u32) -> bool {
+    if tipo == (TIPO_F64 as u32) {
+        return (mag <= LIMITE_INTEIRO_F64) and (((mag as f64) as u64) == mag)
+    }
+    let f: f32 = mag as f32
+    return (f < 18446744073709551616.0) and ((f as u64) == mag)
+}
+
+// C: semantic/sem_literal.c:26
+proc sem_literal_inteiro_em_real(s: ^Semantica, literal: ^frontend.Expr, ctx: u32) -> bool {
+    var mag: u64 = 0
+    literal.tipo = ctx
+    if (literal.op as i32) <= DIGITOS_SEMPRE_EXATOS {
+        return true
+    }
+    let nome = texto_do_tipo(s, ctx, 96)
+    defer delete(nome)
+    let digitos = numero_da_fonte(s, literal.pos_op)
+    defer delete(digitos)
+    if not tipo_ler_literal_u64(as_bytes(digitos), &mag) {
+        let msg_1 = format(f"o literal passa de 64 bits e nao existe exato em {nome}", alloc = heap)
+        defer delete(msg_1)
+        return sem_erro(s, common.E0330, literal.pos, msg_1)
+    }
+    if inteiro_exato_em_real(mag, ctx) {
+        return true
+    }
+    var vira: f64 = (mag as f32) as f64
+    if ctx == (TIPO_F64 as u32) {
+        vira = mag as f64
+    }
+    let msg_2 = format(f"o literal {mag} nao existe exato em {nome} (vira {vira:.1})", alloc = heap)
+    defer delete(msg_2)
+    return sem_erro(s, common.E0330, literal.pos, msg_2)
+}
+
+// C: semantic/sem_literal.c:43
+// isalnum/isdigit do C na localidade "C": so ASCII
+proc char_de_palavra(c: u8) -> bool {
+    let alnum: bool = ((c >= 48) and (c <= 57)) or ((c >= 65) and (c <= 90)) or ((c >= 97) and (c <= 122)) // '0'-'9' 'A'-'Z' 'a'-'z'
+    return alnum or (c == 95) // '_'
+}
+
+// C: semantic/sem_literal.c:46
+proc ponto_de_real(t: []u8, i: u32) -> bool {
+    return (t[i] == 46) and (t[i + 1] >= 48) and (t[i + 1] <= 57) // '.' e digito
+}
+
+// C: semantic/sem_literal.c:49
+proc sinal_de_expoente(t: []u8, ini: u32, i: u32) -> bool {
+    let decimal: bool = (t[ini] >= 48) and (t[ini] <= 57) and (t[ini + 1] != 120) // digito e nao 'x'
+    let sinal: bool = (t[i] == 43) or (t[i] == 45) // '+' '-'
+    return decimal and sinal and (i > ini) and ((t[i - 1] == 101) or (t[i - 1] == 69)) // 'e' 'E'
+}
+
+// C: semantic/sem_literal.c:57
+proc fim_do_token(t: []u8, ini: u32) -> u32 {
+    var i: u32 = ini
+    while char_de_palavra(t[i]) or ponto_de_real(t, i) or sinal_de_expoente(t, ini, i) {
+        i += 1
+    }
+    return i
+}
+
+// C: semantic/sem_literal.c:65
+proc fim_da_expressao(t: []u8, e: ?^frontend.Expr) -> u32 {
+    let sw_1 = (e as ^frontend.Expr).tipo_no as i32
+    if sw_1 == frontend.EX_INT or sw_1 == frontend.EX_REAL or sw_1 == frontend.EX_NOME or sw_1 == frontend.EX_CAMPO {
+        return fim_do_token(t, (e as ^frontend.Expr).pos_op)
+    } else if sw_1 == frontend.EX_UNARIO {
+        var tern_1: u32 = 0
+        if (e as ^frontend.Expr).op == (frontend.OP_NEGAR as u8) {
+            tern_1 = fim_da_expressao(t, (e as ^frontend.Expr).a)
+        }
+        return tern_1
+    } else if sw_1 == frontend.EX_BINARIO {
+        return fim_da_expressao(t, (e as ^frontend.Expr).b)
+    } else {
+        return 0
+    }
+    return 0
+}
+
+// C: semantic/sem_literal.c:79
+proc parenteses_fecham(t: []u8, ini: u32, fim: ^u32) -> bool {
+    var abertos: i32 = 0
+    for i in ini..<fim^ {
+        if t[i] == 40 { // '('
+            abertos += 1
+        } else if t[i] == 41 { // ')'
+            abertos -= 1
+        }
+        if abertos < 0 {
+            return false
+        }
+    }
+    while (abertos > 0) and (t[fim^] == 41) { // ')'
+        fim^ += 1
+        abertos -= 1
+    }
+    return abertos == 0
+}
+
+// C: semantic/sem_literal.c:94
+proc trecho_da_expressao(s: ^Semantica, e: ?^frontend.Expr, fim: ^u32) -> bool {
+    let t: []u8 = (s.fonte as ^common.Fonte).texto
+    fim^ = fim_da_expressao(t, e)
+    if (fim^ <= (e as ^frontend.Expr).pos) or ((fim^ - (e as ^frontend.Expr).pos) > (TEXTO_SUGESTAO_MAX as u32)) {
+        return false
+    }
+    return parenteses_fecham(t, (e as ^frontend.Expr).pos, fim)
+}
+
+// C: semantic/sem_literal.c:102
+proc pede_parenteses(t: []u8, e: ?^frontend.Expr, fim: u32) -> bool {
+    let entre_parenteses: bool = (t[(e as ^frontend.Expr).pos] == 40) and (t[fim - 1] == 41) // '(' ')'
+    return ((e as ^frontend.Expr).tipo_no == (frontend.EX_BINARIO as u8)) and (not entre_parenteses)
+}
+
+// C: semantic/sem_literal.c:108
+// c.novo e o char novo[288] do C: texto no alloc frame (sem dono que o libere), cortado em 287 bytes (snprintf)
+proc sem_conversao_obvia(s: ^Semantica, e: ?^frontend.Expr, esperado: u32, c: ^Conversao) -> bool {
+    let t: []u8 = (s.fonte as ^common.Fonte).texto
+    var fim: u32 = 0
+    if (not tipo_eh_numerico(&s.tipos, (e as ^frontend.Expr).tipo)) or (not tipo_eh_numerico(&s.tipos, esperado)) {
+        return false
+    }
+    if not trecho_da_expressao(s, e, &fim) {
+        return false
+    }
+    let tipo = texto_do_tipo(s, esperado, 96)
+    defer delete(tipo)
+    let parenteses: bool = pede_parenteses(t, e, fim)
+    c.ini = (e as ^frontend.Expr).pos
+    c.fim = fim
+    let trecho: []u8 = t[((e as ^frontend.Expr).pos as int)..<(fim as int)]
+    var b = make([dynamic]u8, alloc = heap)
+    defer delete(b)
+    if parenteses {
+        append(&b, item = "(")
+    }
+    append(&b, items = trecho[0..<common.c2f_strlen_b(trecho)]) // %.*s para no NUL
+    if parenteses {
+        append(&b, item = ")")
+    }
+    append(&b, item = " as ")
+    append(&b, item = tipo)
+    c.novo = from_bytes(b[0..<min(len(b), 287)], alloc = frame)
+    return true
+}
+
+// C: semantic/sem_literal.c:123
+proc sem_sugerir_conversao(s: ^Semantica, e: ?^frontend.Expr, esperado: u32) {
+    var c: Conversao = Conversao{}
+    if not sem_conversao_obvia(s, e, esperado, &c) {
+        return
+    }
+    var b = make([dynamic]u8, alloc = heap)
+    defer delete(b)
+    append(&b, item = "\"")
+    append(&b, item = c.novo or_else "")
+    append(&b, item = "\"")
+    let json = from_bytes(b[0..<min(len(b), 295)], alloc = heap) // char json[sizeof novo + 8]: corte em 295
+    defer delete(json)
+    common.diag_acrescentar_extra(s.diag as ^common.Diag, "sugestao", json)
+}
+
+// Texto de teste com os 4 zeros de sentinela que a Fonte do compilador garante (o C le t[i + 1] sem checar).
+proc texto_de_teste(texto: str) -> [dynamic]u8 {
+    var b = make([dynamic]u8, alloc = heap)
+    append(&b, items = as_bytes(texto))
+    for k in 0..<4 {
+        append(&b, item = 0 as u8)
+    }
+    return b
+}
+
+// Valores esperados lidos do C (sem_literal.c:19..92): contas a mao sobre as mesmas entradas.
+test "sem_literal: inteiro_exato_em_real" {
+    expect(inteiro_exato_em_real(0, TIPO_F64 as u32))
+    expect(inteiro_exato_em_real(9007199254740992, TIPO_F64 as u32)) // 2^53
+    expect(not inteiro_exato_em_real(9007199254740993, TIPO_F64 as u32)) // 2^53 + 1 arredonda para par
+    expect(inteiro_exato_em_real(9223372036854775808, TIPO_F64 as u32)) // 2^63 = LIMITE_INTEIRO_F64
+    expect(not inteiro_exato_em_real(9223372036854775809, TIPO_F64 as u32)) // acima do limite
+    expect(inteiro_exato_em_real(16777216, TIPO_F32 as u32)) // 2^24
+    expect(not inteiro_exato_em_real(16777217, TIPO_F32 as u32))
+    expect(inteiro_exato_em_real(1099511627776, TIPO_F32 as u32)) // 2^40
+    expect(not inteiro_exato_em_real(18446744073709551615, TIPO_F32 as u32)) // vira 2^64: f < 2^64 falha
+}
+
+test "sem_literal: char_de_palavra, ponto_de_real, sinal_de_expoente" {
+    expect(char_de_palavra(97) and char_de_palavra(90) and char_de_palavra(48) and char_de_palavra(57) and char_de_palavra(95))
+    expect(not char_de_palavra(45) and not char_de_palavra(46) and not char_de_palavra(32) and not char_de_palavra(200) and not char_de_palavra(0))
+    expect(not char_de_palavra(47) and not char_de_palavra(58) and not char_de_palavra(64) and not char_de_palavra(91) and not char_de_palavra(96) and not char_de_palavra(123))
+    var t1 = texto_de_teste("1.5 a.x .")
+    defer delete(t1)
+    expect(ponto_de_real(t1[0..<len(t1)], 1))
+    expect(not ponto_de_real(t1[0..<len(t1)], 0))
+    expect(not ponto_de_real(t1[0..<len(t1)], 5)) // '.' seguido de 'x'
+    expect(not ponto_de_real(t1[0..<len(t1)], 8)) // '.' seguido de sentinela
+    var t2 = texto_de_teste("1e+5 0xe+5 1E-5 a-1 -1")
+    defer delete(t2)
+    let b2: []u8 = t2[0..<len(t2)]
+    expect(sinal_de_expoente(b2, 0, 2)) // 1e+
+    expect(not sinal_de_expoente(b2, 5, 8)) // 0xe+: 'x' veda o expoente
+    expect(sinal_de_expoente(b2, 11, 13)) // 1E-
+    expect(not sinal_de_expoente(b2, 16, 17)) // a-1: nao comeca em digito
+    expect(not sinal_de_expoente(b2, 20, 20)) // i == ini
+}
+
+test "sem_literal: fim_do_token e parenteses_fecham" {
+    var t = texto_de_teste("123 + 4 1.5e+10) x.y abc_1 0x1e+5 (a+b) a) (a")
+    defer delete(t)
+    let b: []u8 = t[0..<len(t)]
+    expect(fim_do_token(b, 0) == 3)
+    expect(fim_do_token(b, 8) == 15) // 1.5e+10
+    expect(fim_do_token(b, 17) == 18) // x.y para no '.' seguido de letra
+    expect(fim_do_token(b, 21) == 26) // abc_1
+    expect(fim_do_token(b, 27) == 31) // 0x1e: o '+' nao vira expoente em hexa
+    var fim: u32 = 0
+    fim = 39
+    expect(parenteses_fecham(b, 34, &fim) and fim == 39) // (a+b) ja balanceado: fim nao avanca
+    fim = 38
+    expect(parenteses_fecham(b, 34, &fim) and fim == 39) // (a+b sem o ')': avanca ate o ')' que falta
+    fim = 42
+    expect(not parenteses_fecham(b, 40, &fim)) // a): ')' sem '(' antes
+    fim = 45
+    expect(not parenteses_fecham(b, 43, &fim)) // (a sem fecho
+    expect(fim == 45)
+}

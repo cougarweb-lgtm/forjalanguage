@@ -1,0 +1,226 @@
+// nativo/a64/a64_isel_real.fj - reais f32/f64 no isel so-slots (contrato_a64 §2.5, §3.1, §4): operandos em v16/v17 (v30/v31 para a 3a fonte de SELECIONA), resultado em v16 e STR no slot
+// Versao: 0.1.0
+// Changelog: 0.1.0 - A1.3(iii): CONST real (FMOV imm8 ou mov+FMOV), ADD/SUB/MUL/DIV (fadd..fdiv, nunca fmadd), NEG (fneg), RAIZ (fsqrt),
+//                    CMP real (fcmp + cset com as condicoes ordenadas: NaN da falso, exceto FNE), SELECIONA real (fcmp + fcsel),
+//                    I_PARA_F (scvtf/ucvtf), F_PARA_F (fcvt), e carga/guarda de real entre slot e v0-v7 (convencao Forja-A64).
+
+import "nativo/bir"
+
+const A64_VREG_REAL_A: u32 = 16
+const A64_VREG_REAL_B: u32 = 17
+const A64_VREG_REAL_C: u32 = 30
+const A64_VREG_REAL_D: u32 = 31
+// condicao A64 de cada comparacao real, indice = BCOND_FEQ..BCOND_FGE: eq ne lt(mi) le(ls) gt ge
+const A64_COND_REAL: [6]u32 = {0, 1, 4, 9, 12, 10}
+
+// 1 para F64 (campo type do encoder, bit 22); 0 para F32
+proc a64_tipo_real(classe: u8) -> u32 {
+    if (classe as i32) == bir.BC_F64 {
+        return 1
+    }
+    return 0
+}
+
+// operando real de comparacao/SELECIONA: BCOND_FEQ..BCOND_FGE
+proc a64_eh_cond_real(cond: i32) -> bool {
+    return (cond >= bir.BCOND_FEQ) and (cond <= bir.BCOND_FGE)
+}
+
+// slot do vreg real (mesmo quadro dos inteiros: 8 B; STR de 64 bits guarda o s/d de baixo)
+proc a64_gravar_real(c: ^A64Ctx, vs: u32, v: u32) {
+    a64_acesso(c, A64F_STR_D, vs, R_FP, a64_slot_do_vreg(c, v))
+}
+
+// resultado real (vs) no vreg destino da instrucao, se ela tiver um
+proc a64_resultado_real(c: ^A64Ctx, ins: ^bir.BirInstr, vs: u32) {
+    if ins.dst != bir.BIR_SEM_VREG {
+        a64_gravar_real(c, vs, ins.dst)
+    }
+}
+
+// constante real em vd: FMOV imm8 quando o padrao cabe; senao mov_imm em x9 + FMOV Dd,Xn (f64) / Sd,Wn (f32)
+proc a64_const_real(c: ^A64Ctx, vd: u32, bits: u64, classe: u8) -> bool {
+    let dupla = (classe as i32) == bir.BC_F64
+    var padrao = bits
+    if not dupla {
+        padrao = bits & 4294967295
+    }
+    var imm8: u32 = 0
+    if a64_fmov_imm8(padrao, dupla, &imm8) {
+        a64_op(c, A64F_FMOV_IMM, false, A64Ops{rd = vd, imm = imm8, imm2 = a64_tipo_real(classe)})
+        return true
+    }
+    a64_const(c, R_T0, padrao, dupla)
+    if dupla {
+        a64_op(c, A64F_FMOV_DD_XN, false, A64Ops{rd = vd, rn = R_T0})
+    } else {
+        a64_op(c, A64F_FMOV_SD_WN, false, A64Ops{rd = vd, rn = R_T0})
+    }
+    return true
+}
+
+// operando real em vd: vreg vem do slot (LDR d); imediato vira constante; o resto e recusado
+proc a64_carregar_real(c: ^A64Ctx, vd: u32, op: ^bir.BirOperando) -> bool {
+    let tipo = op.tipo as i32
+    if tipo == bir.BO_VREG {
+        a64_acesso(c, A64F_LDR_D, vd, R_FP, a64_slot_do_vreg(c, op.id))
+        return true
+    }
+    if tipo == bir.BO_IMED {
+        return a64_const_real(c, vd, op.imed as u64, op.classe)
+    }
+    return a64_recusa(c, "operando real que nao e vreg nem imediato")
+}
+
+// ADD SUB MUL DIV reais: v16 = a OP b (fadd/fsub/fmul/fdiv; nunca fmadd)
+proc a64_isel_binaria_real(c: ^A64Ctx, ins: ^bir.BirInstr) -> bool {
+    if (not a64_carregar_real(c, A64_VREG_REAL_A, &ins.a)) or (not a64_carregar_real(c, A64_VREG_REAL_B, &ins.b)) {
+        return false
+    }
+    var forma: u32 = A64F_FADD
+    let op = ins.op as i32
+    if op == bir.BIR_SUB {
+        forma = A64F_FSUB
+    } else if op == bir.BIR_MUL {
+        forma = A64F_FMUL
+    } else if op == bir.BIR_DIV {
+        forma = A64F_FDIV
+    }
+    a64_op(c, forma, false, A64Ops{rd = A64_VREG_REAL_A, rn = A64_VREG_REAL_A, rm = A64_VREG_REAL_B, imm2 = a64_tipo_real(ins.classe)})
+    a64_resultado_real(c, ins, A64_VREG_REAL_A)
+    return true
+}
+
+// NEG (fneg) e RAIZ (fsqrt): um operando real em v16
+proc a64_isel_unaria_real(c: ^A64Ctx, ins: ^bir.BirInstr) -> bool {
+    if not a64_carregar_real(c, A64_VREG_REAL_A, &ins.a) {
+        return false
+    }
+    var forma: u32 = A64F_FNEG
+    if (ins.op as i32) == bir.BIR_RAIZ {
+        forma = A64F_FSQRT
+    }
+    a64_op(c, forma, false, A64Ops{rd = A64_VREG_REAL_A, rn = A64_VREG_REAL_A, imm2 = a64_tipo_real(ins.classe)})
+    a64_resultado_real(c, ins, A64_VREG_REAL_A)
+    return true
+}
+
+// CONST real: imediato (ou vreg) carregado e gravado no destino
+proc a64_isel_const_real(c: ^A64Ctx, ins: ^bir.BirInstr) -> bool {
+    if not a64_carregar_real(c, A64_VREG_REAL_A, &ins.a) {
+        return false
+    }
+    a64_resultado_real(c, ins, A64_VREG_REAL_A)
+    return true
+}
+
+// CMP real: fcmp a,b ; cset com a condicao ordenada (NaN da falso em tudo, menos FNE)
+proc a64_isel_cmp_real(c: ^A64Ctx, ins: ^bir.BirInstr) -> bool {
+    let cond = ins.aux as i32
+    if not a64_eh_cond_real(cond) {
+        return a64_recusa(c, "comparacao entre reais com condicao inteira")
+    }
+    if (not a64_carregar_real(c, A64_VREG_REAL_A, &ins.a)) or (not a64_carregar_real(c, A64_VREG_REAL_B, &ins.b)) {
+        return false
+    }
+    a64_op(c, A64F_FCMP, false, A64Ops{rn = A64_VREG_REAL_A, rm = A64_VREG_REAL_B, imm2 = a64_tipo_real(ins.a.classe)})
+    a64_op(c, A64F_CSINC, false, A64Ops{rd = R_T0, rn = R_XZR, rm = R_XZR, imm = A64_COND_REAL[cond - bir.BCOND_FEQ] ~ 1})
+    a64_resultado(c, ins, R_T0)
+    return true
+}
+
+// SELECIONA real: fcmp dos args ; fcsel dst, a, b com a mesma condicao ordenada
+proc a64_isel_seleciona_real(c: ^A64Ctx, ins: ^bir.BirInstr) -> bool {
+    let cond = ins.aux as i32
+    if not a64_eh_cond_real(cond) {
+        return a64_recusa(c, "selecao entre reais com condicao inteira")
+    }
+    let args: []bir.BirOperando = ins.args or_else {}
+    if (not a64_carregar_real(c, A64_VREG_REAL_A, &args[0])) or (not a64_carregar_real(c, A64_VREG_REAL_B, &args[1])) {
+        return false
+    }
+    if (not a64_carregar_real(c, A64_VREG_REAL_C, &ins.a)) or (not a64_carregar_real(c, A64_VREG_REAL_D, &ins.b)) {
+        return false
+    }
+    a64_op(c, A64F_FCMP, false, A64Ops{rn = A64_VREG_REAL_A, rm = A64_VREG_REAL_B, imm2 = a64_tipo_real(args[0].classe)})
+    a64_op(c, A64F_FCSEL, false, A64Ops{rd = A64_VREG_REAL_A, rn = A64_VREG_REAL_C, rm = A64_VREG_REAL_D, imm = A64_COND_REAL[cond - bir.BCOND_FEQ], imm2 = a64_tipo_real(ins.classe)})
+    a64_resultado_real(c, ins, A64_VREG_REAL_A)
+    return true
+}
+
+// I_PARA_F: inteiro (estendido se i8/i16, pelo sinal de aux) -> scvtf (com sinal) ou ucvtf
+proc a64_isel_i_para_f(c: ^A64Ctx, ins: ^bir.BirInstr) -> bool {
+    if not a64_operando(c, R_T0, &ins.a) {
+        return false
+    }
+    let com_sinal = (ins.aux as i32) == bir.BIR_SINAL
+    a64_estender(c, R_T0, ins.a.classe, com_sinal)
+    var forma: u32 = A64F_UCVTF
+    if com_sinal {
+        forma = A64F_SCVTF
+    }
+    a64_op(c, forma, a64_x(ins.a.classe), A64Ops{rd = A64_VREG_REAL_A, rn = R_T0, imm2 = a64_tipo_real(ins.classe)})
+    a64_resultado_real(c, ins, A64_VREG_REAL_A)
+    return true
+}
+
+// F_PARA_F: f32 -> f64 (fcvt S->D, destino F64) ou f64 -> f32 (fcvt D->S)
+proc a64_isel_f_para_f(c: ^A64Ctx, ins: ^bir.BirInstr) -> bool {
+    if not a64_carregar_real(c, A64_VREG_REAL_A, &ins.a) {
+        return false
+    }
+    var forma: u32 = A64F_FCVT_D_S
+    if (ins.classe as i32) == bir.BC_F64 {
+        forma = A64F_FCVT_S_D
+    }
+    a64_op(c, forma, false, A64Ops{rd = A64_VREG_REAL_A, rn = A64_VREG_REAL_A})
+    a64_resultado_real(c, ins, A64_VREG_REAL_A)
+    return true
+}
+
+// a op usa o caminho real: operacoes de ponto flutuante (CONST/aritmetica/NEG/RAIZ/SELECIONA com classe real) e CMP/I_PARA_F/F_PARA_F
+proc a64_eh_op_real(ins: ^bir.BirInstr) -> bool {
+    let op = ins.op as i32
+    if op == bir.BIR_CMP {
+        return a64_classe_real(ins.a.classe)
+    }
+    if (op == bir.BIR_I_PARA_F) or (op == bir.BIR_F_PARA_F) or (op == bir.BIR_RAIZ) {
+        return true
+    }
+    let aritmetica = (op == bir.BIR_CONST) or (op == bir.BIR_ADD) or (op == bir.BIR_SUB) or (op == bir.BIR_MUL) or (op == bir.BIR_DIV) or (op == bir.BIR_NEG) or (op == bir.BIR_SELECIONA)
+    return aritmetica and a64_classe_real(ins.classe)
+}
+
+// despacho das ops reais (a64_eh_op_real); COPIA/CARREGA/GRAVA/CHAMA/RETORNA seguem pelo caminho inteiro (bits crus)
+proc a64_selecionar_real(c: ^A64Ctx, ins: ^bir.BirInstr) -> bool {
+    let op = ins.op as i32
+    if op == bir.BIR_CONST {
+        return a64_isel_const_real(c, ins)
+    }
+    if op == bir.BIR_CMP {
+        return a64_isel_cmp_real(c, ins)
+    }
+    if op == bir.BIR_SELECIONA {
+        return a64_isel_seleciona_real(c, ins)
+    }
+    if op == bir.BIR_I_PARA_F {
+        return a64_isel_i_para_f(c, ins)
+    }
+    if op == bir.BIR_F_PARA_F {
+        return a64_isel_f_para_f(c, ins)
+    }
+    if (op == bir.BIR_NEG) or (op == bir.BIR_RAIZ) {
+        return a64_isel_unaria_real(c, ins)
+    }
+    return a64_isel_binaria_real(c, ins)
+}
+
+test "a64_isel_real: FMOV imm8 de 1.0 e de 0.5 em f32/f64 e tipo do encoder" {
+    expect(a64_tipo_real(bir.BC_F64 as u8) == 1)
+    expect(a64_tipo_real(bir.BC_F32 as u8) == 0)
+    var imm8: u32 = 0
+    expect(a64_fmov_imm8(4607182418800017408, true, &imm8))
+    expect(imm8 == 112)
+    expect(a64_eh_cond_real(bir.BCOND_FLT))
+    expect(not a64_eh_cond_real(bir.BCOND_GE_U))
+}

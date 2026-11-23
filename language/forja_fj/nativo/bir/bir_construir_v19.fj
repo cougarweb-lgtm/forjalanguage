@@ -1,0 +1,755 @@
+// nativo/bir/bir_construir_v19.fj - porte de compiler/nativo/bir/bir_construir_v19.c
+// sha256 de nativo/bir/bir_construir_v19.c: 6bc63989e238b6b6246c3ab66f5d763c55b86d817ef794775ba094df61ba01b0
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "common"
+import "ir"
+import "semantic"
+
+struct MatrizForma {
+    linhas: u32
+    colunas: u32
+    tam: u32
+    classe: u8
+    elemento: u32 // TipoId
+}
+
+struct Mat {
+    c: ?^BirCtx
+    i: ?^ir.IrInstr
+    f: MatrizForma
+    a: u32
+    b: u32
+    dst: u32
+    k: u32
+    escalar: BirOperando
+}
+
+struct FormaElementar {
+    op: u8
+    esq: i32
+    dir: i32
+}
+
+struct Soma {
+    base_a: u32
+    base_b: u32
+    ini_a: u32
+    ini_b: u32
+    passo_a: u32
+    termos: u32
+    tam: u32
+    classe: u8
+}
+
+struct Acesso {
+    base: u32
+    f: MatrizForma
+    linha: BirOperando
+    coluna: BirOperando
+}
+
+const FONTE_A: i32 = 0
+const FONTE_B: i32 = 1
+const FONTE_ESCALAR: i32 = 2
+const FONTE_NENHUMA: i32 = 3
+const BITS_I64: i32 = 64
+const MATRIZ_TERMOS_MAX: u32 = 4096
+const MARCO_V19: str = "M2"
+const OP_CONJUNTO_PRIMEIRO: i32 = 2
+const OP_CONJUNTO_ULTIMO: i32 = 8
+const OP_MATRIZ_PRODUTO: i32 = 2
+const OP_MATRIZ_ESCALAR_ESQ: i32 = 4
+// C2F:? tabela REGRAS_CONJUNTO (const BirRegraFn[7]): folha nao escalar {'ref': 'ConjuntoDiferenca'}
+// C2F:? tabela ELEMENTAR (const FormaElementar[7]): folha {'txt': '[ 0 ] = { BIR_ADD , FONTE_A , FONTE_B }'} para FormaElementar
+// C2F:? tabela FORMAS_MATRIZ (const MatrizFn[9]): folha nao escalar {'ref': 'Elementar'}
+
+pub const MATRIZ_FN_ELEMENTAR: u16 = 1
+pub const MATRIZ_FN_PRODUTO: u16 = 2
+pub const MATRIZ_FN_VETOR: u16 = 3
+pub const MATRIZ_FN_TRANSPOSTA: u16 = 4
+pub const MATRIZ_FN_LITERAL: u16 = 5
+pub proc chamar_matriz_fn(tag: u16, m: ^Mat) -> bool {
+    if tag == 1 {
+        return elementar(m)
+    }
+    if tag == 2 {
+        return produto(m)
+    }
+    if tag == 3 {
+        return vetor(m)
+    }
+    if tag == 4 {
+        return transposta(m)
+    }
+    if tag == 5 {
+        return literal(m)
+    }
+    return bir_falha_inconsistente(m.c as ^BirCtx, "IR_MATRIZ com tag de forma desconhecida")
+}
+
+// C: nativo/bir/bir_construir_v19.c:28
+proc bir_classe_do_conjunto(tipos: ^semantic.Tipos, tipo: u32, classe: ^u8) -> bool {
+    if common.c2f_s2u_32(semantic.tipo_classe_de(tipos, tipo)) != (semantic.TC_BIT_SET as u32) {
+        return false
+    }
+    let membros: u32 = semantic.tipo_de(tipos, tipo).b as u32
+    if membros <= 8 {
+        classe^ = BC_I8 as u8
+    } else if membros <= 16 {
+        classe^ = BC_I16 as u8
+    } else if membros <= 32 {
+        classe^ = BC_I32 as u8
+    } else {
+        classe^ = BC_I64 as u8
+    }
+    return true
+}
+
+// C: nativo/bir/bir_construir_v19.c:39
+proc em_vreg(c: ^BirCtx, o: BirOperando) -> BirOperando {
+    var o_v: BirOperando = o
+    _ = bir_operando_vreg(c, o_v, &o_v)
+    return o_v
+}
+
+// C: nativo/bir/bir_construir_v19.c:46
+proc alargado64(c: ^BirCtx, o: BirOperando, extensao: i32) -> BirOperando {
+    var o_v: BirOperando = o
+    o_v = em_vreg(c, o_v)
+    if o_v.classe == (BC_I64 as u8) {
+        return o_v
+    }
+    return op_vreg(bir_conta_nova(c, BC_I64 as u8, BirPedido{op = extensao as u8, a = o_v}), BC_I64 as u8)
+}
+
+// C: nativo/bir/bir_construir_v19.c:55
+proc bit_variavel(c: ^BirCtx, n: BirOperando) -> BirOperando {
+    let fim: u32 = bir_novo_bloco(c, false)
+    let zero: u32 = bir_novo_bloco(c, false)
+    let calcula: u32 = bir_novo_bloco(c, false)
+    let bit: u32 = bir_novo_vreg(c, BC_I64 as u8)
+    let fora: u32 = bir_comparar(c, BCOND_GE_U as u8, n, op_imed(BITS_I64 as i64, BC_I64 as u8))
+    bir_desvia(c, op_vreg(fora, BC_I8 as u8), zero, calcula)
+    c.cur = zero
+    bir_mover(c, bit, op_imed(0, BC_I64 as u8))
+    bir_salta(c, fim)
+    c.cur = calcula
+    _ = bir_emitir_pedido(c, BirPedido{op = BIR_SHL as u8, aux = BIR_SEM_SINAL as u8, dst = bit, a = op_imed(1, BC_I64 as u8), b = n})
+    bir_salta(c, fim)
+    c.cur = fim
+    return op_vreg(bit, BC_I64 as u8)
+}
+
+// C: nativo/bir/bir_construir_v19.c:73
+proc bit_do_membro(c: ^BirCtx, b: BirOperando) -> BirOperando {
+    if b.tipo == (BO_IMED as u8) {
+        var tern_1: i64 = 0
+        if common.c2f_s2u_64(b.imed) < (BITS_I64 as u64) {
+            tern_1 = transmute(1 << (common.c2f_s2u_64(b.imed) & 63), to = i64)
+        }
+        return em_vreg(c, op_imed(tern_1, BC_I64 as u8))
+    }
+    return bit_variavel(c, alargado64(c, b, BIR_EXT_S))
+}
+
+// C: nativo/bir/bir_construir_v19.c:81
+proc bit_na_largura(c: ^BirCtx, bit: BirOperando, classe: u8) -> BirOperando {
+    if classe == (BC_I64 as u8) {
+        return bit
+    }
+    return op_vreg(bir_conta_nova(c, classe, BirPedido{op = BIR_TRUNC as u8, a = bit}), classe)
+}
+
+// C: nativo/bir/bir_construir_v19.c:90
+// Saida por fatia: o [2] por valor perdia a escrita (mesmo defeito de arquivo_e_linha_3, C: BirOperando ab[2] por ponteiro).
+proc operandos_do_conjunto(c: ^BirCtx, i: ^ir.IrInstr, ab: []BirOperando) -> bool {
+    return (common.c2f_b2i32(bir_operando_de(c, i, &i.a, &ab[0])) != 0) and (common.c2f_b2i32(bir_operando_de(c, i, &i.b, &ab[1])) != 0)
+}
+
+// C: nativo/bir/bir_construir_v19.c:96
+proc conjunto_diferenca(c: ^BirCtx, i: ^ir.IrInstr) -> bool {
+    var ab: [2]BirOperando = {BirOperando{}, BirOperando{}}
+    var dst: u32 = 0
+    var nao_b: u32 = 0
+    if (not operandos_do_conjunto(c, i, ab[..])) or (not bir_definir_destino(c, ab[0].classe, &dst)) {
+        return false
+    }
+    ab[0] = em_vreg(c, ab[0])
+    ab[1] = em_vreg(c, ab[1])
+    nao_b = bir_conta_nova(c, ab[1].classe, BirPedido{op = BIR_NOT as u8, a = ab[1]})
+    _ = bir_emitir_pedido(c, BirPedido{op = BIR_AND as u8, dst = dst, a = ab[0], b = op_vreg(nao_b, ab[1].classe)})
+    return true
+}
+
+// C: nativo/bir/bir_construir_v19.c:111
+proc conjunto_tem(c: ^BirCtx, i: ^ir.IrInstr) -> bool {
+    var ab: [2]BirOperando = {BirOperando{}, BirOperando{}}
+    var valor: BirOperando = BirOperando{}
+    var bit: BirOperando = BirOperando{}
+    var dst: u32 = 0
+    var comum: u32 = 0
+    if (not operandos_do_conjunto(c, i, ab[..])) or (not bir_definir_destino(c, BC_I8 as u8, &dst)) {
+        return false
+    }
+    valor = alargado64(c, ab[0], BIR_EXT_Z)
+    bit = bit_do_membro(c, ab[1])
+    comum = bir_conta_nova(c, BC_I64 as u8, BirPedido{op = BIR_AND as u8, a = valor, b = bit})
+    _ = bir_emitir_pedido(c, BirPedido{op = BIR_CMP as u8, aux = BCOND_NE as u8, dst = dst, a = op_vreg(comum, BC_I64 as u8), b = op_imed(0, BC_I64 as u8)})
+    return true
+}
+
+// C: nativo/bir/bir_construir_v19.c:126
+proc conjunto_altera(c: ^BirCtx, i: ^ir.IrInstr) -> bool {
+    var ab: [2]BirOperando = {BirOperando{}, BirOperando{}}
+    var bit: BirOperando = BirOperando{}
+    var classe: u8 = BC_NADA as u8
+    var atual: u32 = 0
+    var novo: u32 = 0
+    var op_novo: u8 = BIR_OR as u8
+    let tipos: ^semantic.Tipos = (c.e as ^BirEntrada).tipos as ^semantic.Tipos
+    if not bir_classe_do_tipo(tipos, semantic.tipo_de(tipos, i.a.tipo).a, &classe) {
+        return bir_falha_tipo(c, i, "-", i.a.tipo)
+    }
+    if not operandos_do_conjunto(c, i, ab[..]) {
+        return false
+    }
+    ab[0] = em_vreg(c, ab[0])
+    atual = bir_novo_vreg(c, classe)
+    bir_emitir_carrega(c, atual, ab[0].id, 0)
+    bit = bit_na_largura(c, bit_do_membro(c, ab[1]), classe)
+    if i.op_aux == 5 {
+        bit = op_vreg(bir_conta_nova(c, classe, BirPedido{op = BIR_NOT as u8, a = bit}), classe)
+        op_novo = BIR_AND as u8
+    }
+    novo = bir_conta_nova(c, classe, BirPedido{op = op_novo, a = op_vreg(atual, classe), b = bit})
+    bir_emitir_grava(c, ab[0].id, 0, op_vreg(novo, classe))
+    return true
+}
+
+// C: nativo/bir/bir_construir_v19.c:148
+proc conjunto_conta(c: ^BirCtx, i: ^ir.IrInstr) -> bool {
+    var a: BirOperando = BirOperando{}
+    var dst: u32 = 0
+    var conta: u32 = 0
+    if (not bir_operando_de(c, i, &i.a, &a)) or (not bir_definir_destino(c, BC_I64 as u8, &dst)) {
+        return false
+    }
+    var args: []BirOperando = arena_fatia_bir_operando(&(c.p as ^BirPrograma).arena, 1)
+    args[0] = alargado64(c, a, BIR_EXT_Z)
+    var lit_1 = BirChamadaRt{funcao = "forja_rt_conta_bits", retorno = BC_I64 as u8, nargs = 1}
+    conta = bir_chamar_runtime(c, &lit_1, args)
+    bir_mover(c, dst, op_vreg(conta, BC_I64 as u8))
+    return true
+}
+
+// C: nativo/bir/bir_construir_v19.c:164
+proc conjunto_adiciona(c: ^BirCtx, i: ^ir.IrInstr) -> bool {
+    var ab: [2]BirOperando = {BirOperando{}, BirOperando{}}
+    var bit: BirOperando = BirOperando{}
+    var classe: u8 = BC_NADA as u8
+    var dst: u32 = 0
+    let tipos: ^semantic.Tipos = (c.e as ^BirEntrada).tipos as ^semantic.Tipos
+    if (not operandos_do_conjunto(c, i, ab[..])) or (not bir_classe_do_tipo(tipos, i.tipo, &classe)) or (not bir_definir_destino(c, classe, &dst)) {
+        return false
+    }
+    ab[0] = em_vreg(c, ab[0])
+    bit = bit_na_largura(c, bit_do_membro(c, ab[1]), classe)
+    _ = bir_emitir_pedido(c, BirPedido{op = BIR_OR as u8, dst = dst, a = ab[0], b = bit})
+    return true
+}
+
+// C: nativo/bir/bir_construir_v19.c:179
+proc conjunto_membro(c: ^BirCtx, i: ^ir.IrInstr) -> bool {
+    var b: BirOperando = BirOperando{}
+    var dst: u32 = 0
+    if (not bir_operando_de(c, i, &i.b, &b)) or (not bir_definir_destino(c, BC_I32 as u8, &dst)) {
+        return false
+    }
+    if b.tipo == (BO_IMED as u8) {
+        bir_mover(c, dst, op_imed(common.c2f_trunc_i32(common.c2f_s2u_64(b.imed)) as i64, BC_I32 as u8))
+    } else if b.classe == (BC_I64 as u8) {
+        _ = bir_emitir_pedido(c, BirPedido{op = BIR_TRUNC as u8, dst = dst, a = b})
+    } else {
+        bir_mover(c, dst, b)
+    }
+    return true
+}
+
+// C: nativo/bir/bir_construir_v19.c:202
+// Tabela REGRAS_CONJUNTO do C (indexada por op_aux - 2) virou despacho por valor (C2F-80).
+proc bir_regra_conjunto(c: ^BirCtx, i: ^ir.IrInstr) -> bool {
+    let op: i32 = i.op_aux as i32
+    if (op < OP_CONJUNTO_PRIMEIRO) or (op > OP_CONJUNTO_ULTIMO) {
+        return bir_falha_inconsistente(c, "IR_CONJUNTO com op_aux fora de 2..8")
+    }
+    if op == 2 {
+        return conjunto_diferenca(c, i)
+    }
+    if op == 3 {
+        return conjunto_tem(c, i)
+    }
+    if (op == 4) or (op == 5) {
+        return conjunto_altera(c, i)
+    }
+    if op == 6 {
+        return conjunto_conta(c, i)
+    }
+    if op == 7 {
+        return conjunto_adiciona(c, i)
+    }
+    return conjunto_membro(c, i)
+}
+
+// C: nativo/bir/bir_construir_v19.c:214
+proc forma_da_matriz(c: ^BirCtx, tipo: u32, f: ^MatrizForma) -> bool {
+    var tipo_v: u32 = tipo
+    let tipos: ?^semantic.Tipos = (c.e as ^BirEntrada).tipos
+    var slot: BirSlot = BirSlot{}
+    if common.c2f_s2u_32(semantic.tipo_classe_de(tipos as ^semantic.Tipos, tipo_v)) == (semantic.TC_PONTEIRO as u32) {
+        tipo_v = semantic.tipo_de(tipos as ^semantic.Tipos, tipo_v).a
+    }
+    if common.c2f_s2u_32(semantic.tipo_classe_de(tipos as ^semantic.Tipos, tipo_v)) != (semantic.TC_MATRIZ as u32) {
+        return bir_falha_inconsistente(c, "operacao de matrix com operando que nao e matrix")
+    }
+    f.linhas = semantic.tipo_matriz_linhas(tipos as ^semantic.Tipos, tipo_v)
+    f.colunas = semantic.tipo_matriz_colunas(tipos as ^semantic.Tipos, tipo_v)
+    f.elemento = semantic.tipo_de(tipos as ^semantic.Tipos, tipo_v).a
+    if (not bir_classe_do_tipo(tipos as ^semantic.Tipos, f.elemento, &f.classe)) or (not bir_classe_eh_real(f.classe as i32)) {
+        return bir_falha_inconsistente(c, "matrix com elemento que nao e f32 nem f64")
+    }
+    if not bir_forma(c, f.elemento, &slot) {
+        return false
+    }
+    f.tam = slot.tam
+    return true
+}
+
+// C: nativo/bir/bir_construir_v19.c:234
+proc ler_elemento(c: ^BirCtx, base: u32, desloc: u32, classe: u8) -> BirOperando {
+    let v: u32 = bir_novo_vreg(c, classe)
+    bir_emitir_carrega(c, v, base, transmute(desloc, to = i32))
+    return op_vreg(v, classe)
+}
+
+// C: nativo/bir/bir_construir_v19.c:252
+// C: nativo/bir/bir_construir_v19.c:252
+proc limite_de_termos(m: ^Mat, termos: u32) -> bool {
+    if termos <= MATRIZ_TERMOS_MAX {
+        return true
+    }
+    let partes: [3]str = {"IR_MATRIZ", "desenrolada grande", "-"}
+    return bir_falha_x0001(m.c as ^BirCtx, (m.i as ^ir.IrInstr).pos, partes, MARCO_V19)
+}
+
+// C: nativo/bir/bir_construir_v19.c:273
+proc escalar_de(m: ^Mat) -> bool {
+    var tern_1: ^ir.Valor = &(m.i as ^ir.IrInstr).b
+    if (m.i as ^ir.IrInstr).op_aux == (OP_MATRIZ_ESCALAR_ESQ as u8) {
+        tern_1 = &(m.i as ^ir.IrInstr).a
+    }
+    let v: ^ir.Valor = tern_1
+    var o: BirOperando = BirOperando{}
+    if ((m.i as ^ir.IrInstr).op_aux != 3) and ((m.i as ^ir.IrInstr).op_aux != (OP_MATRIZ_ESCALAR_ESQ as u8)) {
+        return true
+    }
+    if not bir_operando_de(m.c as ^BirCtx, m.i, v, &o) {
+        return false
+    }
+    m.escalar = em_vreg(m.c as ^BirCtx, o)
+    return true
+}
+
+// C: nativo/bir/bir_construir_v19.c:286
+proc enderecos_elementar(m: ^Mat) -> bool {
+    let i: ?^ir.IrInstr = m.i
+    let usa_a: bool = (i as ^ir.IrInstr).op_aux != (OP_MATRIZ_ESCALAR_ESQ as u8)
+    let usa_b: bool = (((i as ^ir.IrInstr).op_aux as i32) <= 1) or ((i as ^ir.IrInstr).op_aux == (OP_MATRIZ_ESCALAR_ESQ as u8))
+    if (common.c2f_b2i32(usa_a) != 0) and (not bir_endereco_de(m.c as ^BirCtx, i as ^ir.IrInstr, &(i as ^ir.IrInstr).a, &m.a)) {
+        return false
+    }
+    if (common.c2f_b2i32(usa_b) != 0) and (not bir_endereco_de(m.c as ^BirCtx, i as ^ir.IrInstr, &(i as ^ir.IrInstr).b, &m.b)) {
+        return false
+    }
+    return bir_slot_do_destino(m.c as ^BirCtx, i as ^ir.IrInstr, &m.dst)
+}
+
+// C: nativo/bir/bir_construir_v19.c:299
+proc fonte_elemento(m: ^Mat, fonte: i32, desloc: u32) -> BirOperando {
+    if common.c2f_s2u_32(fonte) == (FONTE_ESCALAR as u32) {
+        return m.escalar
+    }
+    var tern_1: u32 = m.b
+    if common.c2f_s2u_32(fonte) == (FONTE_A as u32) {
+        tern_1 = m.a
+    }
+    return ler_elemento(m.c as ^BirCtx, tern_1, desloc, m.f.classe)
+}
+
+// C: nativo/bir/bir_construir_v19.c:307
+// Tabela ELEMENTAR do C indexada por op_aux (so 0, 1, 3, 4 e 6 chegam aqui; as outras entradas do C sao zeradas e inalcancaveis).
+proc forma_elementar(op_aux: u8) -> FormaElementar {
+    if op_aux == 0 {
+        return FormaElementar{op = BIR_ADD as u8, esq = FONTE_A, dir = FONTE_B}
+    }
+    if op_aux == 1 {
+        return FormaElementar{op = BIR_SUB as u8, esq = FONTE_A, dir = FONTE_B}
+    }
+    if op_aux == 3 {
+        return FormaElementar{op = BIR_MUL as u8, esq = FONTE_A, dir = FONTE_ESCALAR}
+    }
+    if op_aux == 4 {
+        return FormaElementar{op = BIR_MUL as u8, esq = FONTE_ESCALAR, dir = FONTE_B}
+    }
+    if op_aux == 6 {
+        return FormaElementar{op = BIR_NEG as u8, esq = FONTE_A, dir = FONTE_NENHUMA}
+    }
+    return FormaElementar{}
+}
+
+// C: nativo/bir/bir_construir_v19.c:307
+proc elemento_elementar(m: ^Mat, q: u32) {
+    let c: ^BirCtx = m.c as ^BirCtx
+    let forma: FormaElementar = forma_elementar((m.i as ^ir.IrInstr).op_aux)
+    let desloc: u32 = q * m.f.tam
+    let v: u32 = bir_novo_vreg(c, m.f.classe)
+    let esq: BirOperando = fonte_elemento(m, forma.esq, desloc)
+    if forma.op == (BIR_NEG as u8) {
+        bir_negar_real_em(c, esq, v)
+    } else {
+        let dir: BirOperando = fonte_elemento(m, forma.dir, desloc)
+        _ = bir_emitir_pedido(c, BirPedido{op = forma.op, dst = v, a = esq, b = dir})
+    }
+    bir_emitir_grava(c, m.dst, transmute(desloc, to = i32), op_vreg(v, m.f.classe))
+}
+
+// C: nativo/bir/bir_construir_v19.c:320
+proc elementar(m: ^Mat) -> bool {
+    if (not forma_da_matriz(m.c as ^BirCtx, (m.i as ^ir.IrInstr).tipo, &m.f)) or (not limite_de_termos(m, m.f.linhas * m.f.colunas)) {
+        return false
+    }
+    if (not escalar_de(m)) or (not enderecos_elementar(m)) {
+        return false
+    }
+    for q in (0 as u32)..<(m.f.linhas * m.f.colunas) {
+        elemento_elementar(m, q)
+    }
+    return true
+}
+
+// C: nativo/bir/bir_construir_v19.c:336
+proc soma_de_produtos(c: ^BirCtx, s: ^Soma) -> u32 {
+    let acc: u32 = bir_novo_vreg(c, s.classe)
+    bir_mover(c, acc, op_imed(0, s.classe))
+    var k: u32 = 0
+    while k < s.termos {
+        let x: BirOperando = ler_elemento(c, s.base_a, s.ini_a + (k * s.passo_a), s.classe)
+        let y: BirOperando = ler_elemento(c, s.base_b, s.ini_b + (k * s.tam), s.classe)
+        let produto: u32 = bir_conta_nova(c, s.classe, BirPedido{op = BIR_MUL as u8, a = x, b = y})
+        _ = bir_emitir_pedido(c, BirPedido{op = BIR_ADD as u8, dst = acc, a = op_vreg(acc, s.classe), b = op_vreg(produto, s.classe)})
+        k += 1
+    }
+    return acc
+}
+
+// C: nativo/bir/bir_construir_v19.c:352
+proc gravar_soma(m: ^Mat, lin: u32, col: u32) {
+    let f: ^MatrizForma = &m.f
+    var s: Soma = Soma{base_a = m.a, base_b = m.b, ini_a = lin * f.tam, ini_b = (col * m.k) * f.tam, passo_a = f.linhas * f.tam, termos = m.k, tam = f.tam, classe = f.classe}
+    let soma: u32 = soma_de_produtos(m.c as ^BirCtx, &s)
+    let arg_1: BirOperando = op_vreg(soma, f.classe)
+    let arg_2: i32 = transmute(((col * f.linhas) + lin) * f.tam, to = i32)
+    let arg_3: u32 = m.dst
+    let arg_4: ^BirCtx = m.c as ^BirCtx
+    bir_emitir_grava(arg_4, arg_3, arg_2, arg_1)
+}
+
+// C: nativo/bir/bir_construir_v19.c:363
+proc preparar_soma(m: ^Mat, forma_de: u32, termos: u32) -> bool {
+    let i: ?^ir.IrInstr = m.i
+    var colunas: u32 = 0
+    if not forma_da_matriz(m.c as ^BirCtx, forma_de, &m.f) {
+        return false
+    }
+    m.k = termos
+    var tern_1: u32 = 1
+    if (i as ^ir.IrInstr).op_aux == (OP_MATRIZ_PRODUTO as u8) {
+        tern_1 = m.f.colunas
+    }
+    colunas = tern_1
+    if not limite_de_termos(m, (m.f.linhas * colunas) * termos) {
+        return false
+    }
+    if (not bir_endereco_de(m.c as ^BirCtx, i as ^ir.IrInstr, &(i as ^ir.IrInstr).a, &m.a)) or (not bir_endereco_de(m.c as ^BirCtx, i as ^ir.IrInstr, &(i as ^ir.IrInstr).b, &m.b)) {
+        return false
+    }
+    return bir_slot_do_destino(m.c as ^BirCtx, i as ^ir.IrInstr, &m.dst)
+}
+
+// C: nativo/bir/bir_construir_v19.c:380
+proc produto(m: ^Mat) -> bool {
+    var a: MatrizForma = MatrizForma{}
+    if (not forma_da_matriz(m.c as ^BirCtx, (m.i as ^ir.IrInstr).a.tipo, &a)) or (not preparar_soma(m, (m.i as ^ir.IrInstr).tipo, a.colunas)) {
+        return false
+    }
+    var col: u32 = 0
+    while col < m.f.colunas {
+        for lin in (0 as u32)..<m.f.linhas {
+            gravar_soma(m, lin, col)
+        }
+        col += 1
+    }
+    return true
+}
+
+// C: nativo/bir/bir_construir_v19.c:394
+proc vetor(m: ^Mat) -> bool {
+    var a: MatrizForma = MatrizForma{}
+    if (not forma_da_matriz(m.c as ^BirCtx, (m.i as ^ir.IrInstr).a.tipo, &a)) or (not preparar_soma(m, (m.i as ^ir.IrInstr).a.tipo, a.colunas)) {
+        return false
+    }
+    for lin in (0 as u32)..<m.f.linhas {
+        gravar_soma(m, lin, 0)
+    }
+    return true
+}
+
+// C: nativo/bir/bir_construir_v19.c:408
+proc copiar_transposta(m: ^Mat) {
+    var col: u32 = 0
+    while col < m.f.colunas {
+        var lin: u32 = 0
+        while lin < m.f.linhas {
+            let v: BirOperando = ler_elemento(m.c as ^BirCtx, m.a, ((col * m.f.linhas) + lin) * m.f.tam, m.f.classe)
+            bir_emitir_grava(m.c as ^BirCtx, m.dst, transmute(((lin * m.f.colunas) + col) * m.f.tam, to = i32), v)
+            lin += 1
+        }
+        col += 1
+    }
+}
+
+// C: nativo/bir/bir_construir_v19.c:420
+proc transposta(m: ^Mat) -> bool {
+    let i: ?^ir.IrInstr = m.i
+    if (not forma_da_matriz(m.c as ^BirCtx, (i as ^ir.IrInstr).a.tipo, &m.f)) or (not limite_de_termos(m, m.f.linhas * m.f.colunas)) {
+        return false
+    }
+    if (not bir_endereco_de(m.c as ^BirCtx, i as ^ir.IrInstr, &(i as ^ir.IrInstr).a, &m.a)) or (not bir_slot_do_destino(m.c as ^BirCtx, i as ^ir.IrInstr, &m.dst)) {
+        return false
+    }
+    copiar_transposta(m)
+    return true
+}
+
+// C: nativo/bir/bir_construir_v19.c:433
+proc gravar_args_do_literal(m: ^Mat) -> bool {
+    let i: ?^ir.IrInstr = m.i
+    var k: u32 = 0
+    while k < (i as ^ir.IrInstr).nargs {
+        let indice: u32 = ((k % m.f.colunas) * m.f.linhas) + (k / m.f.colunas)
+        var alvo: BirAlvoMem = BirAlvoMem{base = m.dst, offset = indice * m.f.tam, tipo = m.f.elemento}
+        if not bir_gravar_em(m.c as ^BirCtx, i as ^ir.IrInstr, &alvo, &((i as ^ir.IrInstr).args or_else {})[k]) {
+            return false
+        }
+        k += 1
+    }
+    return true
+}
+
+// C: nativo/bir/bir_construir_v19.c:448
+proc literal(m: ^Mat) -> bool {
+    let i: ?^ir.IrInstr = m.i
+    if not forma_da_matriz(m.c as ^BirCtx, (i as ^ir.IrInstr).tipo, &m.f) {
+        return false
+    }
+    if (i as ^ir.IrInstr).nargs != (m.f.linhas * m.f.colunas) {
+        return bir_falha_inconsistente(m.c as ^BirCtx, "literal de matrix com elementos diferentes de R*C")
+    }
+    if (not limite_de_termos(m, (i as ^ir.IrInstr).nargs)) or (not bir_slot_do_destino(m.c as ^BirCtx, i as ^ir.IrInstr, &m.dst)) {
+        return false
+    }
+    return gravar_args_do_literal(m)
+}
+
+// C: nativo/bir/bir_construir_v19.c:466
+// Tabela FORMAS_MATRIZ do C (indice op_aux 0..8 -> forma) vira tag de chamar_matriz_fn: 1 elementar, 2 produto, 3 vetor, 4 transposta, 5 literal.
+proc tag_da_forma_matriz(op_aux: u32) -> u16 {
+    if op_aux == 2 {
+        return MATRIZ_FN_PRODUTO
+    }
+    if op_aux == 5 {
+        return MATRIZ_FN_VETOR
+    }
+    if op_aux == 7 {
+        return MATRIZ_FN_TRANSPOSTA
+    }
+    if op_aux == 8 {
+        return MATRIZ_FN_LITERAL
+    }
+    return MATRIZ_FN_ELEMENTAR
+}
+
+// C: nativo/bir/bir_construir_v19.c:466
+proc bir_regra_matriz(c: ^BirCtx, i: ^ir.IrInstr) -> bool {
+    var m: Mat = Mat{c = c, i = i}
+    let op: u32 = i.op_aux as u32
+    if op > 8 {
+        return bir_falha_inconsistente(c, "IR_MATRIZ com op_aux fora de 0..8")
+    }
+    return chamar_matriz_fn(tag_da_forma_matriz(op), &m)
+}
+
+// C: nativo/bir/bir_construir_v19.c:480
+proc base_da_matriz(c: ^BirCtx, i: ^ir.IrInstr, base: ^u32) -> bool {
+    var ponteiro: BirOperando = BirOperando{}
+    if common.c2f_s2u_32(semantic.tipo_classe_de((c.e as ^BirEntrada).tipos as ^semantic.Tipos, i.a.tipo)) != (semantic.TC_PONTEIRO as u32) {
+        return bir_endereco_de(c, i, &i.a, base)
+    }
+    if not bir_operando_de(c, i, &i.a, &ponteiro) {
+        return false
+    }
+    base^ = em_vreg(c, ponteiro).id
+    return true
+}
+
+// C: nativo/bir/bir_construir_v19.c:493
+// Linha e coluna em 64 bits; em dev conferidas nessa ordem. Release: literal dentro do limite fica imediato, sem vreg nem conferencia.
+proc preparar_acesso(c: ^BirCtx, i: ^ir.IrInstr, a: ^Acesso) -> bool {
+    var linha_no_limite: bool = false
+    var coluna_no_limite: bool = false
+    if (not forma_da_matriz(c, i.a.tipo, &a.f)) or (not base_da_matriz(c, i, &a.base)) {
+        return false
+    }
+    if (not bir_inteiro64(c, i, &i.b, &a.linha)) or (not bir_inteiro64(c, i, &(i.args or_else {})[0], &a.coluna)) {
+        return false
+    }
+    // BirConfereLimites do C (macro): dev ou checagem ligada
+    if not (((c.p as ^BirPrograma).modo == (BM_DEV as u8)) or (c.p as ^BirPrograma).checagem) {
+        return true
+    }
+    linha_no_limite = bir_indice_no_limite(c, a.linha, a.f.linhas as i64)
+    coluna_no_limite = bir_indice_no_limite(c, a.coluna, a.f.colunas as i64)
+    if not linha_no_limite {
+        a.linha = em_vreg(c, a.linha)
+    }
+    if not coluna_no_limite {
+        a.coluna = em_vreg(c, a.coluna)
+    }
+    if not linha_no_limite {
+        bir_conferir_indice(c, i, a.linha, op_imed(a.f.linhas as i64, BC_I64 as u8))
+    }
+    if not coluna_no_limite {
+        bir_conferir_indice(c, i, a.coluna, op_imed(a.f.colunas as i64, BC_I64 as u8))
+    }
+    return true
+}
+
+// C: nativo/bir/bir_construir_v19.c:516
+proc multiplicar(c: ^BirCtx, x: BirOperando, k: u32) -> BirOperando {
+    if x.tipo == (BO_IMED as u8) {
+        return op_imed(x.imed * (k as i64), BC_I64 as u8)
+    }
+    if k == 1 {
+        return x
+    }
+    return op_vreg(bir_conta_nova(c, BC_I64 as u8, BirPedido{op = BIR_MUL as u8, a = x, b = op_imed(k as i64, BC_I64 as u8)}), BC_I64 as u8)
+}
+
+// C: nativo/bir/bir_construir_v19.c:525
+proc imediato_zero(o: BirOperando) -> bool {
+    return (o.tipo == (BO_IMED as u8)) and (o.imed == 0)
+}
+
+// C: nativo/bir/bir_construir_v19.c:530
+proc somar(c: ^BirCtx, x: BirOperando, y: BirOperando) -> BirOperando {
+    if (x.tipo == (BO_IMED as u8)) and (y.tipo == (BO_IMED as u8)) {
+        return op_imed(x.imed + y.imed, BC_I64 as u8)
+    }
+    if imediato_zero(y) {
+        return x
+    }
+    if imediato_zero(x) {
+        return y
+    }
+    return op_vreg(bir_conta_nova(c, BC_I64 as u8, BirPedido{op = BIR_ADD as u8, a = x, b = y}), BC_I64 as u8)
+}
+
+// C: nativo/bir/bir_construir_v19.c:542
+proc endereco_do_acesso(c: ^BirCtx, a: ^Acesso, base: ^u32, desloc: ^i32) {
+    let arg_1: BirOperando = a.linha
+    let arg_2: BirOperando = multiplicar(c, a.coluna, a.f.linhas)
+    let arg_3: ^BirCtx = c
+    let arg_4: u32 = a.f.tam
+    let arg_5: BirOperando = somar(arg_3, arg_2, arg_1)
+    let arg_6: ^BirCtx = c
+    let posicao: BirOperando = multiplicar(arg_6, arg_5, arg_4)
+    if posicao.tipo == (BO_IMED as u8) {
+        base^ = a.base
+        desloc^ = posicao.imed as i32
+        return
+    }
+    base^ = bir_conta_nova(c, BC_I64 as u8, BirPedido{op = BIR_ADD as u8, a = op_vreg(a.base, BC_I64 as u8), b = posicao})
+    desloc^ = 0
+}
+
+// C: nativo/bir/bir_construir_v19.c:555
+proc bir_regra_matriz_elemento(c: ^BirCtx, i: ^ir.IrInstr) -> bool {
+    var a: Acesso = Acesso{}
+    var base: u32 = 0
+    var dst: u32 = 0
+    var desloc: i32 = 0
+    if (not preparar_acesso(c, i, &a)) or (not bir_definir_destino(c, a.f.classe, &dst)) {
+        return false
+    }
+    endereco_do_acesso(c, &a, &base, &desloc)
+    bir_emitir_carrega(c, dst, base, desloc)
+    return true
+}
+
+// C: nativo/bir/bir_construir_v19.c:568
+proc bir_regra_matriz_end_elemento(c: ^BirCtx, i: ^ir.IrInstr) -> bool {
+    var a: Acesso = Acesso{}
+    var base: u32 = 0
+    var dst: u32 = 0
+    var desloc: i32 = 0
+    if (not preparar_acesso(c, i, &a)) or (not bir_definir_destino(c, BC_I64 as u8, &dst)) {
+        return false
+    }
+    endereco_do_acesso(c, &a, &base, &desloc)
+    _ = bir_emitir_pedido(c, BirPedido{op = BIR_COPIA as u8, dst = dst, a = op_vreg(bir_endereco_mais(c, base, common.c2f_s2u_32(desloc)), BC_I64 as u8)})
+    return true
+}
+
+test "bir_construir_v19: tabela FORMAS_MATRIZ vira tag" {
+    expect(tag_da_forma_matriz(0) == MATRIZ_FN_ELEMENTAR)
+    expect(tag_da_forma_matriz(1) == MATRIZ_FN_ELEMENTAR)
+    expect(tag_da_forma_matriz(2) == MATRIZ_FN_PRODUTO)
+    expect(tag_da_forma_matriz(3) == MATRIZ_FN_ELEMENTAR)
+    expect(tag_da_forma_matriz(4) == MATRIZ_FN_ELEMENTAR)
+    expect(tag_da_forma_matriz(5) == MATRIZ_FN_VETOR)
+    expect(tag_da_forma_matriz(6) == MATRIZ_FN_ELEMENTAR)
+    expect(tag_da_forma_matriz(7) == MATRIZ_FN_TRANSPOSTA)
+    expect(tag_da_forma_matriz(8) == MATRIZ_FN_LITERAL)
+}
+
+test "bir_construir_v19: tabela ELEMENTAR (soma, subtracao, escalar, negacao)" {
+    let s = forma_elementar(0)
+    expect(s.op == (BIR_ADD as u8))
+    expect(s.esq == FONTE_A)
+    expect(s.dir == FONTE_B)
+    let e = forma_elementar(4)
+    expect(e.op == (BIR_MUL as u8))
+    expect(e.esq == FONTE_ESCALAR)
+    expect(e.dir == FONTE_B)
+    let n = forma_elementar(6)
+    expect(n.op == (BIR_NEG as u8))
+    expect(n.dir == FONTE_NENHUMA)
+}
+
+test "bir_construir_v19: limite de termos aceita o teto" {
+    var m = Mat{}
+    expect(limite_de_termos(&m, MATRIZ_TERMOS_MAX))
+    expect(limite_de_termos(&m, 1))
+    expect(MARCO_V19 == "M2")
+}

@@ -1,0 +1,497 @@
+// nativo/obj/coff_ler.fj - porte de compiler/nativo/obj/coff_ler.c
+// sha256 de nativo/obj/coff_ler.c: e7d2a5c3cdf9801dc2bca856fe31157b71f8533ee794cf3e771eca21bec29753
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "common"
+
+struct CoffSimboloLido {
+    i: u32
+    nome: ?str
+    sec: i16
+    valor: u32
+}
+
+const COFF_RELOC_ABSOLUTA: u32 = 0
+const COFF_RELOCS: [10]CoffRelocSuportada = {CoffRelocSuportada{codigo = 1, tipo = 1, tam = 8, delta = 0}, CoffRelocSuportada{codigo = 3, tipo = 2, tam = 4, delta = 0}, CoffRelocSuportada{codigo = 4, tipo = 0, tam = 4, delta = 0}, CoffRelocSuportada{codigo = 5, tipo = 0, tam = 4, delta = -1}, CoffRelocSuportada{codigo = 6, tipo = 0, tam = 4, delta = -2}, CoffRelocSuportada{codigo = 7, tipo = 0, tam = 4, delta = -3}, CoffRelocSuportada{codigo = 8, tipo = 0, tam = 4, delta = -4}, CoffRelocSuportada{codigo = 9, tipo = 0, tam = 4, delta = -5}, CoffRelocSuportada{codigo = 10, tipo = 3, tam = 2, delta = 0}, CoffRelocSuportada{codigo = 11, tipo = 4, tam = 4, delta = 0}}
+
+// C: nativo/obj/coff_ler.c:34
+proc coff_cabe(n: u64, off: u64, tam: u64) -> bool {
+    return (off <= n) and (tam <= (n - off))
+}
+
+// C: nativo/obj/coff_ler.c:40
+// C2F-13: p fundido em n (len)
+proc coff_le(p: []u8) -> u64 {
+    var v: u64 = 0
+    for k in (0 as u32)..<(len(p) as u32) {
+        v = v | ((p[k] as u64) << (((k * COFF_BITS_BYTE) as u64) & 63))
+    }
+    return v
+}
+
+// C: nativo/obj/coff_ler.c:48
+proc coff_falha(erro: ^common.Diag, motivo: str) -> bool {
+    let msg_1 = format(f"COFF: {motivo}", alloc = heap)
+    defer delete(msg_1)
+    return common.diag_relatar(erro, common.X0903, 0, msg_1)
+}
+
+// C: nativo/obj/coff_ler.c:54
+// C2F-33: o texto sai copiado na arena dada (a Forja nao tem visao str de bytes)
+proc coff_texto_strtab(l: ^CoffLeitor, off: u64, arena: ^common.Arena) -> ?str {
+    if off >= (l.tam_strtab as u64) {
+        return none
+    }
+    let bytes: []u8 = l.b or_else {}
+    let ini: u64 = l.ini_strtab + off
+    let fim: u64 = l.ini_strtab + (l.tam_strtab as u64)
+    var k: u64 = ini
+    while k < fim {
+        if bytes[k] == 0 {
+            return from_bytes(bytes[(ini as int)..<(k as int)], alloc = common.arena_mem(arena))
+        }
+        k += 1
+    }
+    return none
+}
+
+// C: nativo/obj/coff_ler.c:65
+// C2F-33: o nome sai copiado na arena dada (o buf de 9 bytes do C some)
+proc coff_nome_em_linha(campo: []u8, arena: ^common.Arena) -> str {
+    var tam: int = 0
+    while (tam < (COFF_TAM_NOME as int)) and (campo[tam] != 0) {
+        tam += 1
+    }
+    return from_bytes(campo[0..<tam], alloc = common.arena_mem(arena))
+}
+
+// C: nativo/obj/coff_ler.c:76
+// C2F-INDECIDIVEL: campo
+proc coff_nome_secao(l: ^CoffLeitor, campo: []u8, arena: ^common.Arena) -> ?str {
+    if campo[0] != 47 { // '/'
+        return coff_nome_em_linha(campo, arena)
+    }
+    var off: u64 = 0
+    var k: int = 1
+    while (k < (COFF_TAM_NOME as int)) and (campo[k] >= 48) and (campo[k] <= 57) { // '0' a '9'
+        off = (off * 10) + ((campo[k] - 48) as u64)
+        k += 1
+    }
+    return coff_texto_strtab(l, off, arena)
+}
+
+// C: nativo/obj/coff_ler.c:87
+proc coff_nome_simbolo(l: ^CoffLeitor, campo: []u8, arena: ^common.Arena) -> ?str {
+    if common.c2f_ler_u32_le(campo, 0) != 0 {
+        return coff_nome_em_linha(campo, arena)
+    }
+    return coff_texto_strtab(l, common.c2f_ler_u32_le(campo, 4) as u64, arena)
+}
+
+// C: nativo/obj/coff_ler.c:95
+proc coff_alinhamento(carac: u32) -> u32 {
+    let k: u32 = (carac & COFF_CARAC_ALINHA_MASCARA) >> 20
+    if k == 0 {
+        return COFF_ALINHA_PADRAO
+    }
+    return 1 << ((k - 1) & 31)
+}
+
+// C: nativo/obj/coff_ler.c:104
+// C2F-33: nome nulo (none) nunca casa; base e comparada byte a byte como o strncmp do C
+proc coff_eh_secao(nome: ?str, base: str) -> bool {
+    let txt: str = nome or_else ""
+    let n: int = len(base)
+    if len(txt) < n {
+        return false
+    }
+    if not common.c2f_prefixo_igual(txt, base, n) {
+        return false
+    }
+    if len(txt) == n {
+        return true
+    }
+    return (txt[n] == 36) or (txt[n] == 46) // '$' e '.'
+}
+
+// C: nativo/obj/coff_ler.c:111
+proc coff_tipo_por_nome(nome: ?str) -> i32 {
+    if coff_eh_secao(nome, ".pdata") {
+        return OS_PDATA
+    }
+    if coff_eh_secao(nome, ".xdata") {
+        return OS_XDATA
+    }
+    return OS_RDATA
+}
+
+// C: nativo/obj/coff_ler.c:120
+proc coff_tipo(nome: ?str, carac: u32) -> i32 {
+    if (carac & COFF_CARAC_CODIGO) != 0 {
+        return OS_TEXTO
+    }
+    if (carac & COFF_CARAC_BSS) != 0 {
+        return OS_BSS
+    }
+    if (carac & COFF_CARAC_GRAVAVEL) != 0 {
+        return OS_DATA
+    }
+    return coff_tipo_por_nome(nome)
+}
+
+// C: nativo/obj/coff_ler.c:131
+// C2F-INDECIDIVEL: o ponteiro do cabecalho vira fatia de 40 bytes dentro de l.b
+proc coff_cabecalho_secao(l: ^CoffLeitor, i: u32) -> []u8 {
+    let ini: int = (l.ini_secoes + ((i as u64) * (COFF_TAM_SECAO as u64))) as int
+    let bytes: []u8 = l.b or_else {}
+    return bytes[ini..<(ini + (COFF_TAM_SECAO as int))]
+}
+
+// C: nativo/obj/coff_ler.c:137
+// C2F-INDECIDIVEL: s e bytes = ObjSecao e Buf do C; o Buf vira append na lista da secao
+proc coff_preencher_secao(l: ^CoffLeitor, idx: u32, h: []u8) -> bool {
+    let s: ^ObjSecao = &(l.o as ^Objeto).secoes[idx as u64]
+    let vsz: u32 = common.c2f_ler_u32_le(h, COFF_OFF_SEC_VSZ as int)
+    let raw: u32 = common.c2f_ler_u32_le(h, COFF_OFF_SEC_RAW as int)
+    let ptr: u32 = common.c2f_ler_u32_le(h, COFF_OFF_SEC_PTR as int)
+    if s.tipo == OS_BSS {
+        if raw > vsz {
+            s.tam_bss = raw
+        } else {
+            s.tam_bss = vsz
+        }
+        return true
+    }
+    if raw == 0 {
+        return true
+    }
+    if not coff_cabe(l.n, ptr as u64, raw as u64) {
+        let nome_txt = s.nome or_else "(null)"
+        let msg_1 = format(f"COFF: dados da secao '{nome_txt}' fora do arquivo", alloc = heap)
+        defer delete(msg_1)
+        return common.diag_relatar(l.erro as ^common.Diag, common.X0903, 0, msg_1)
+    }
+    let bytes: []u8 = l.b or_else {}
+    append(&s.bytes, items = bytes[(ptr as int)..<(((ptr as u64) + (raw as u64)) as int)])
+    return true
+}
+
+// C: nativo/obj/coff_ler.c:155
+proc coff_abrir_secao(l: ^CoffLeitor, i: u32) -> bool {
+    let h: []u8 = coff_cabecalho_secao(l, i)
+    let arena: ^common.Arena = &(l.o as ^Objeto).nomes
+    let nome: ?str = coff_nome_secao(l, h[0..<(COFF_TAM_NOME as int)], arena)
+    if nome == none {
+        return coff_falha(l.erro as ^common.Diag, "nome de secao fora da tabela de strings")
+    }
+    let carac: u32 = common.c2f_ler_u32_le(h, COFF_OFF_SEC_CARAC as int)
+    let idx: u32 = obj_secao_abrir(l.o as ^Objeto, nome, coff_tipo(nome, carac), coff_alinhamento(carac))
+    if idx != i {
+        let msg_2 = format(f"coff: secao {i} abriu no indice {idx}", alloc = heap)
+        defer delete(msg_2)
+        common.falha_interna(msg_2)
+    }
+    return coff_preencher_secao(l, idx, h)
+}
+
+// C: nativo/obj/coff_ler.c:169
+proc coff_ler_secoes(l: ^CoffLeitor) -> bool {
+    var i: u32 = 0
+    while i < l.nsec {
+        if not coff_abrir_secao(l, i) {
+            return false
+        }
+        i += 1
+    }
+    return true
+}
+
+// C: nativo/obj/coff_ler.c:179
+proc coff_tipo_reloc(codigo: u16, achado: ^CoffRelocSuportada) -> bool {
+    var k: u64 = 0
+    while k < (160 / 16) {
+        if (COFF_RELOCS[k].codigo as i32) == (codigo as i32) {
+            achado^ = COFF_RELOCS[k]
+            return true
+        }
+        k += 1 // C2F: sizeof COFF_RELOCS C2F: sizeof COFF_RELOCS [ 0 ]
+    }
+    return false
+}
+
+// C: nativo/obj/coff_ler.c:191
+// C2F-INDECIDIVEL: p + tam viram a fatia p (tam = len(p))
+proc coff_adendo(p: []u8) -> i64 {
+    let v: u64 = coff_le(p)
+    if len(p) == (COFF_TAM_CAMPO as int) {
+        return common.c2f_trunc_i32(v) as i64
+    }
+    return v as i64
+}
+
+// C: nativo/obj/coff_ler.c:199
+proc coff_simbolo_da_reloc(l: ^CoffLeitor, simb: u32, alvo: ^u32) -> bool {
+    if (simb as u64) >= (len(l.mapa) as u64) {
+        return false
+    }
+    alvo^ = l.mapa[simb as u64]
+    return alvo^ != COFF_SIMBOLO_NAO_MAPEADO
+}
+
+// C: nativo/obj/coff_ler.c:207
+// C2F-INDECIDIVEL: s (ObjSecao) e tipo (CoffRelocSuportada) viram locais
+proc coff_ler_reloc(l: ^CoffLeitor, sec: u32, r: []u8) -> bool {
+    let va: u32 = common.c2f_ler_u32_le(r, 0)
+    let simb: u32 = common.c2f_ler_u32_le(r, 4)
+    let codigo: u16 = common.c2f_ler_u16_le(r, 8)
+    var tipo: CoffRelocSuportada = CoffRelocSuportada{}
+    var alvo: u32 = 0
+    let s: ^ObjSecao = &(l.o as ^Objeto).secoes[sec as u64]
+    if (codigo as u32) == COFF_RELOC_ABSOLUTA {
+        return true
+    }
+    if not coff_tipo_reloc(codigo, &tipo) {
+        let nome_txt = s.nome or_else "(null)"
+        let msg_3 = format(f"COFF: relocacao de tipo 0x{codigo:x} na secao '{nome_txt}' (aceitas: ADDR64, ADDR32NB, REL32, REL32_1..5, SECTION, SECREL)", alloc = heap)
+        defer delete(msg_3)
+        return common.diag_relatar(l.erro as ^common.Diag, common.X0903, 0, msg_3)
+    }
+    if not coff_simbolo_da_reloc(l, simb, &alvo) {
+        let nome_txt = s.nome or_else "(null)"
+        let msg_4 = format(f"COFF: relocacao na secao '{nome_txt}' aponta para o simbolo {simb}, que nao entrou no objeto", alloc = heap)
+        defer delete(msg_4)
+        return common.diag_relatar(l.erro as ^common.Diag, common.X0903, 0, msg_4)
+    }
+    if (s.tipo == OS_BSS) or (not coff_cabe(len(s.bytes) as u64, va as u64, tipo.tam as u64)) {
+        let nome_txt = s.nome or_else "(null)"
+        let msg_5 = format(f"COFF: relocacao em 0x{va:x} fora dos bytes da secao '{nome_txt}'", alloc = heap)
+        defer delete(msg_5)
+        return common.diag_relatar(l.erro as ^common.Diag, common.X0903, 0, msg_5)
+    }
+    let ini_campo: int = va as int
+    let fim_campo: int = ((va as u64) + (tipo.tam as u64)) as int
+    let adendo: i64 = coff_adendo(s.bytes[ini_campo..<fim_campo])
+    for k in (0 as u64)..<(tipo.tam as u64) {
+        s.bytes[(va as u64) + k] = 0
+    }
+    obj_relocar(l.o as ^Objeto, ObjAlvoReloc{secao = sec, off = va}, ObjCorrecao{tipo = tipo.tipo, simbolo = alvo, adendo = adendo + (tipo.delta as i64)})
+    return true
+}
+
+// C: nativo/obj/coff_ler.c:229
+proc coff_ler_relocs_da_secao(l: ^CoffLeitor, sec: u32) -> bool {
+    let h: []u8 = coff_cabecalho_secao(l, sec)
+    let ptr: u64 = common.c2f_ler_u32_le(h, COFF_OFF_SEC_PTR_RELOC as int) as u64
+    let qtd: u32 = common.c2f_ler_u16_le(h, COFF_OFF_SEC_QTD_RELOC as int) as u32
+    if not coff_cabe(l.n, ptr, (qtd as u64) * (COFF_TAM_RELOC as u64)) {
+        return coff_falha(l.erro as ^common.Diag, "tabela de relocacoes fora do arquivo")
+    }
+    let bytes: []u8 = l.b or_else {}
+    var k: u32 = 0
+    while k < qtd {
+        let ini_reloc: int = (ptr + ((k as u64) * (COFF_TAM_RELOC as u64))) as int
+        if not coff_ler_reloc(l, sec, bytes[ini_reloc..<(ini_reloc + (COFF_TAM_RELOC as int))]) {
+            return false
+        }
+        k += 1
+    }
+    return true
+}
+
+// C: nativo/obj/coff_ler.c:243
+proc coff_ler_relocacoes(l: ^CoffLeitor) -> bool {
+    var i: u32 = 0
+    while i < l.nsec {
+        if not coff_ler_relocs_da_secao(l, i) {
+            return false
+        }
+        i += 1
+    }
+    return true
+}
+
+// C: nativo/obj/coff_ler.c:252
+proc coff_mapear(l: ^CoffLeitor, i: u32, idx: u32) {
+    l.mapa[i as u64] = idx
+}
+
+// C: nativo/obj/coff_ler.c:265
+proc coff_definir_simbolo(l: ^CoffLeitor, s: ^CoffSimboloLido) -> bool {
+    if (s.sec as i32) > transmute(l.nsec, to = i32) {
+        let txt_1 = s.nome or_else "(null)"
+        let msg_1 = format(f"COFF: simbolo '{txt_1}' aponta para a secao {s.sec as i32}, que nao existe", alloc = heap)
+        defer delete(msg_1)
+        return common.diag_relatar(l.erro as ^common.Diag, common.X0903, 0, msg_1)
+    }
+    let idx: u32 = obj_simbolo_referir(l.o as ^Objeto, s.nome)
+    let obj_c: ^ObjSimbolo = &(l.o as ^Objeto).simbolos[idx as u64]
+    if obj_c.secao != OBJ_SECAO_INDEFINIDA {
+        let txt_2 = s.nome or_else "(null)"
+        let msg_2 = format(f"COFF: simbolo '{txt_2}' definido duas vezes", alloc = heap)
+        defer delete(msg_2)
+        return common.diag_relatar(l.erro as ^common.Diag, common.X0903, 0, msg_2)
+    }
+    _ = obj_simbolo_definir(l.o as ^Objeto, s.nome, (s.sec as i32) - 1, s.valor)
+    coff_mapear(l, s.i, idx)
+    return true
+}
+
+// C: nativo/obj/coff_ler.c:279
+proc coff_ler_simbolo(l: ^CoffLeitor, i: u32, e: []u8) -> bool {
+    let arena: ^common.Arena = &(l.o as ^Objeto).nomes
+    let nome: ?str = coff_nome_simbolo(l, e, arena)
+    let sec: i16 = common.c2f_trunc_i16(common.c2f_ler_u16_le(e, COFF_OFF_SIM_SECAO as int) as u64)
+    if nome == none {
+        return coff_falha(l.erro as ^common.Diag, "nome de simbolo fora da tabela de strings")
+    }
+    if sec == 0 {
+        coff_mapear(l, i, obj_simbolo_referir(l.o as ^Objeto, nome))
+        return true
+    }
+    if sec < 0 {
+        return true
+    }
+    var lido: CoffSimboloLido = CoffSimboloLido{i = i, nome = nome, sec = sec, valor = common.c2f_ler_u32_le(e, COFF_OFF_SIM_VALOR as int)}
+    return coff_definir_simbolo(l, &lido)
+}
+
+// C: nativo/obj/coff_ler.c:296
+proc coff_ler_simbolos(l: ^CoffLeitor) -> bool {
+    var i: u32 = 0
+    while i < l.nsim {
+        append(&l.mapa, item = 0)
+        coff_mapear(l, i, COFF_SIMBOLO_NAO_MAPEADO)
+        i += 1
+    }
+    let bytes: []u8 = l.b or_else {}
+    i = 0
+    while i < l.nsim {
+        let ini: int = (l.ini_simbolos + ((i as u64) * (COFF_TAM_SIMBOLO as u64))) as int
+        let e: []u8 = bytes[ini..<(ini + (COFF_TAM_SIMBOLO as int))]
+        let aux: u32 = e[COFF_OFF_SIM_AUX as u64] as u32
+        if ((i as u64) + 1 + (aux as u64)) > (l.nsim as u64) {
+            return coff_falha(l.erro as ^common.Diag, "simbolo auxiliar passa do fim da tabela")
+        }
+        if not coff_ler_simbolo(l, i, e) {
+            return false
+        }
+        i += 1 + aux
+    }
+    return true
+}
+
+// C: nativo/obj/coff_ler.c:314
+proc coff_ler_tabela_simbolos(l: ^CoffLeitor) -> bool {
+    if not coff_cabe(l.n, l.ini_simbolos, (l.nsim as u64) * (COFF_TAM_SIMBOLO as u64)) {
+        return coff_falha(l.erro as ^common.Diag, "tabela de simbolos fora do arquivo")
+    }
+    return coff_ler_simbolos(l)
+}
+
+// C: nativo/obj/coff_ler.c:322
+proc coff_ler_tabela_strings(l: ^CoffLeitor) {
+    l.ini_strtab = l.ini_simbolos + ((l.nsim as u64) * (COFF_TAM_SIMBOLO as u64))
+    l.tam_strtab = 0
+    if not coff_cabe(l.n, l.ini_strtab, COFF_TAM_CAMPO as u64) {
+        return
+    }
+    let bytes: []u8 = l.b or_else {}
+    let tam: u32 = common.c2f_ler_u32_le(bytes, l.ini_strtab as int)
+    if coff_cabe(l.n, l.ini_strtab, tam as u64) {
+        l.tam_strtab = tam
+    }
+}
+
+// C: nativo/obj/coff_ler.c:333
+proc coff_ler_cabecalho(l: ^CoffLeitor) -> bool {
+    if not coff_cabe(l.n, 0, COFF_TAM_CABECALHO as u64) {
+        return coff_falha(l.erro as ^common.Diag, "arquivo menor que o cabecalho COFF")
+    }
+    let bytes: []u8 = l.b or_else {}
+    let maquina: u32 = common.c2f_ler_u16_le(bytes, 0) as u32
+    if maquina != COFF_MAQUINA_AMD64 {
+        let msg_1 = format(f"COFF: maquina 0x{maquina:x}, o backend x64 aceita so 0x8664", alloc = heap)
+        defer delete(msg_1)
+        return common.diag_relatar(l.erro as ^common.Diag, common.X0903, 0, msg_1)
+    }
+    l.nsec = common.c2f_ler_u16_le(bytes, COFF_OFF_CAB_SECOES as int) as u32
+    l.nsim = common.c2f_ler_u32_le(bytes, COFF_OFF_CAB_NSIMBOLOS as int)
+    l.ini_simbolos = common.c2f_ler_u32_le(bytes, COFF_OFF_CAB_SIMBOLOS as int) as u64
+    l.ini_secoes = (COFF_TAM_CABECALHO as u64) + (common.c2f_ler_u16_le(bytes, COFF_OFF_CAB_TAM_OPC as int) as u64)
+    if not coff_cabe(l.n, l.ini_secoes, (l.nsec as u64) * (COFF_TAM_SECAO as u64)) {
+        return coff_falha(l.erro as ^common.Diag, "tabela de secoes fora do arquivo")
+    }
+    return true
+}
+
+// C: nativo/obj/coff_ler.c:348
+// C2F-70: o CoffLeitor do C (com mapa de vetor) vira var local; o mapa e liberado em todo retorno
+pub proc coff_ler(b: ^u8, n: u64, o: ^Objeto, erro: ^common.Diag) -> bool {
+    var l = CoffLeitor{b = slice_from(b, len = n as int), n = n, o = o, erro = erro, mapa = make([dynamic]u32, alloc = heap)}
+    defer delete(l.mapa)
+    if not coff_ler_cabecalho(&l) {
+        return false
+    }
+    coff_ler_tabela_strings(&l)
+    if not coff_ler_secoes(&l) {
+        return false
+    }
+    if not coff_ler_tabela_simbolos(&l) {
+        return false
+    }
+    return coff_ler_relocacoes(&l)
+}
+
+// C: nativo/obj/coff_ler.c:362
+proc coff_eh_indefinido(e: []u8) -> bool {
+    return ((e[COFF_OFF_SIM_CLASSE as u64] as u32) == COFF_CLASSE_EXTERNA) and (common.c2f_ler_u16_le(e, COFF_OFF_SIM_SECAO as int) == 0) and (common.c2f_ler_u32_le(e, COFF_OFF_SIM_VALOR as int) == 0)
+}
+
+// C: nativo/obj/coff_ler.c:367
+// C2F-INDECIDIVEL: e vira fatia da entrada de simbolo; o nome ja sai copiado na arena do destino
+proc coff_anotar_indefinido(l: ^CoffLeitor, e: []u8, destino: ^CoffDestinoNomes) -> bool {
+    let arena: ^common.Arena = destino.arena as ^common.Arena
+    let nome: ?str = coff_nome_simbolo(l, e, arena)
+    if nome == none {
+        return coff_falha(l.erro as ^common.Diag, "nome de simbolo fora da tabela de strings")
+    }
+    append(destino.lista as ^[dynamic]str, item = nome or_else "")
+    return true
+}
+
+// C: nativo/obj/coff_ler.c:378
+// C2F: varre a tabela pulando os auxiliares, como em CoffLerSimbolos
+proc coff_anotar_indefinidos(l: ^CoffLeitor, destino: ^CoffDestinoNomes) -> bool {
+    let bytes: []u8 = l.b or_else {}
+    var i: u32 = 0
+    while i < l.nsim {
+        let ini: int = (l.ini_simbolos + ((i as u64) * (COFF_TAM_SIMBOLO as u64))) as int
+        let e: []u8 = bytes[ini..<(ini + (COFF_TAM_SIMBOLO as int))]
+        let aux: u32 = e[COFF_OFF_SIM_AUX as u64] as u32
+        if ((i as u64) + 1 + (aux as u64)) > (l.nsim as u64) {
+            return coff_falha(l.erro as ^common.Diag, "simbolo auxiliar passa do fim da tabela")
+        }
+        if coff_eh_indefinido(e) {
+            if not coff_anotar_indefinido(l, e, destino) {
+                return false
+            }
+        }
+        i += 1 + aux
+    }
+    return true
+}
+
+// C: nativo/obj/coff_ler.c:392
+// C2F-70: o leitor local nao tem objeto (o none) e nao aloca mapa: so anota os nomes
+pub proc coff_listar_indefinidos(b: ^u8, n: u64, destino: ^CoffDestinoNomes, erro: ^common.Diag) -> bool {
+    var l = CoffLeitor{b = slice_from(b, len = n as int), n = n, erro = erro}
+    if not coff_ler_cabecalho(&l) {
+        return false
+    }
+    coff_ler_tabela_strings(&l)
+    if not coff_cabe(l.n, l.ini_simbolos, (l.nsim as u64) * (COFF_TAM_SIMBOLO as u64)) {
+        return coff_falha(erro, "tabela de simbolos fora do arquivo")
+    }
+    return coff_anotar_indefinidos(&l, destino)
+}

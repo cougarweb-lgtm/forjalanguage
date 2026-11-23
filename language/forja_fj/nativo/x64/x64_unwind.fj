@@ -1,0 +1,161 @@
+// nativo/x64/x64_unwind.fj - porte de compiler/nativo/x64/x64_unwind.c
+// sha256 de nativo/x64/x64_unwind.c: 5e744305b8aace2742acfd40c06dbb300ea2e78f1dab23dd3f323349bd6d8018
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "nativo/obj"
+
+struct UnwindInfo {
+    bytes: [32]u8
+    tam: u32
+    codigos: u32
+}
+
+const UWOP_PUSH_NONVOL: i32 = 0
+const UWOP_ALLOC_LARGE: i32 = 1
+const UWOP_ALLOC_SMALL: i32 = 2
+const UWOP_SET_FPREG: i32 = 3
+const UNWIND_VERSAO: u32 = 1
+const UNWIND_CABECALHO: u32 = 4
+const UNWIND_TAM_CODIGO: u32 = 2
+const UNWIND_MAX_CODIGOS: u32 = 14
+const UNWIND_REGS: u32 = 16
+const UNWIND_TAM_MAX: u32 = 32
+const UNWIND_RBP: u32 = 5
+const UNWIND_PEQUENO_MAX: u32 = 128
+const UNWIND_GRANDE16_MAX: u32 = 524280
+const UNWIND_ENTRADA_PDATA: u32 = 12
+const UNWIND_BYTES_PALAVRA: u32 = 8
+const ZEROS: [12]u8 = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
+
+// C: nativo/x64/x64_unwind.c:35
+proc anexar_codigo(u: ^UnwindInfo, offset: u8, op_info: u8, op: i32) {
+    u.bytes[u.tam as int] = offset
+    u.tam += 1
+    u.bytes[u.tam as int] = (((op_info as u32) << 4) | (op as u32)) as u8
+    u.tam += 1
+    u.codigos += 1
+}
+
+// C: nativo/x64/x64_unwind.c:43
+proc anexar_operando_2(u: ^UnwindInfo, valor: u32, bytes: u32) {
+    var k: u32 = 0
+    while k < bytes {
+        let byte_k = (valor >> (k * UNWIND_BYTES_PALAVRA)) & 255
+        u.bytes[u.tam as int] = byte_k as u8
+        u.tam += 1
+        k += 1
+    }
+    u.codigos += bytes / UNWIND_TAM_CODIGO
+}
+
+// C: nativo/x64/x64_unwind.c:51
+proc anexar_alocacao(u: ^UnwindInfo, tam: u32, offset: u8) {
+    if tam <= UNWIND_PEQUENO_MAX {
+        anexar_codigo(u, offset, ((tam - UNWIND_BYTES_PALAVRA) / UNWIND_BYTES_PALAVRA) as u8, UWOP_ALLOC_SMALL)
+    } else if tam <= UNWIND_GRANDE16_MAX {
+        anexar_codigo(u, offset, 0, UWOP_ALLOC_LARGE)
+        anexar_operando_2(u, tam / UNWIND_BYTES_PALAVRA, 2)
+    } else {
+        anexar_codigo(u, offset, 1, UWOP_ALLOC_LARGE)
+        anexar_operando_2(u, tam, 4)
+    }
+}
+
+// C: nativo/x64/x64_unwind.c:66
+proc fechar_cabecalho(u: ^UnwindInfo, tam_prologo: u8) {
+    let reais = u.codigos
+    if reais % 2 != 0 {
+        u.bytes[u.tam as int] = 0
+        u.tam += 1
+        u.bytes[u.tam as int] = 0
+        u.tam += 1
+    }
+    u.bytes[0] = UNWIND_VERSAO as u8
+    u.bytes[1] = tam_prologo
+    u.bytes[2] = reais as u8
+    u.bytes[3] = UNWIND_RBP as u8
+}
+
+// C: nativo/x64/x64_unwind.c:81
+proc anexar_salvos(u: ^UnwindInfo, c: ^X64Ctx) {
+    var k: u32 = 0
+    var reg: u32 = 0
+    while reg < UNWIND_REGS {
+        if ((c.quadro.regs_salvos >> reg) & 1) != 0 {
+            k += 1
+        }
+        reg += 1
+    }
+    reg = UNWIND_REGS
+    while reg > 0 {
+        reg -= 1
+        if ((c.quadro.regs_salvos >> reg) & 1) != 0 {
+            k -= 1
+            anexar_codigo(u, ((c.prologo.salvo[k as int]) & 255) as u8, reg as u8, UWOP_PUSH_NONVOL)
+        }
+    }
+}
+
+// C: nativo/x64/x64_unwind.c:95
+proc montar_unwind(c: ^X64Ctx) -> UnwindInfo {
+    var u: UnwindInfo = UnwindInfo{tam = UNWIND_CABECALHO}
+    let arg_1: u8 = c.prologo.alocacao as u8
+    let arg_2: u32 = quadro_alocacao(&c.quadro)
+    let arg_3: ^UnwindInfo = &u
+    anexar_alocacao(arg_3, arg_2, arg_1)
+    anexar_salvos(&u, c)
+    anexar_codigo(&u, c.prologo.fpreg as u8, 0, UWOP_SET_FPREG)
+    anexar_codigo(&u, c.prologo.push as u8, UNWIND_RBP as u8, UWOP_PUSH_NONVOL)
+    fechar_cabecalho(&u, c.prologo.alocacao as u8)
+    return u
+}
+
+// C: nativo/x64/x64_unwind.c:108
+proc registrar_funcao(c: ^X64Ctx, fim: u32, offset_xdata: u32) {
+    let pdata: ^obj.ObjSecao = &(c.o as ^obj.Objeto).secoes[c.pdata as u64]
+    let base = len(pdata.bytes) as u32
+    for k in 0..<(UNWIND_ENTRADA_PDATA as int) {
+        append(&pdata.bytes, item = ZEROS[k])
+    }
+    obj.obj_relocar(c.o as ^obj.Objeto, obj.ObjAlvoReloc{secao = c.pdata, off = base}, obj.ObjCorrecao{tipo = obj.OR_ADDR32NB, simbolo = c.func_sim, adendo = 0})
+    obj.obj_relocar(c.o as ^obj.Objeto, obj.ObjAlvoReloc{secao = c.pdata, off = base + 4}, obj.ObjCorrecao{tipo = obj.OR_ADDR32NB, simbolo = c.func_sim, adendo = wrapping_sub(fim, c.inicio) as i64})
+    obj.obj_relocar(c.o as ^obj.Objeto, obj.ObjAlvoReloc{secao = c.pdata, off = base + 8}, obj.ObjCorrecao{tipo = obj.OR_ADDR32NB, simbolo = c.sim_xdata, adendo = offset_xdata as i64})
+}
+
+// C: nativo/x64/x64_unwind.c:120
+proc x64_unwind_registrar(c: ^X64Ctx) {
+    let xdata: ^obj.ObjSecao = &(c.o as ^obj.Objeto).secoes[c.xdata as u64]
+    let fim = x64_offset(c)
+    var u = montar_unwind(c)
+    let offset_xdata = len(xdata.bytes) as u32
+    for k in 0..<(u.tam as int) {
+        append(&xdata.bytes, item = u.bytes[k])
+    }
+    registrar_funcao(c, fim, offset_xdata)
+    if c.lista != none {
+        x64_listar_quadro(c, fim, u.bytes[0..<(u.tam as int)])
+    }
+}
+
+// Teste dirigido (prova do porte): alocacao pequena de 40 bytes = sub rsp,40 com info 4 e UWOP_ALLOC_SMALL.
+test "x64_unwind_alocacao_pequena" {
+    var u: UnwindInfo = UnwindInfo{tam = UNWIND_CABECALHO}
+    anexar_alocacao(&u, 40, 4)
+    expect(u.codigos == 1)
+    expect(u.bytes[4] == 4)
+    expect(u.bytes[5] == 66)
+    expect(u.tam == 6)
+}
+
+// Teste dirigido: cabecalho com 1 codigo (impar) acrescenta padding zerado e fica com CountOfCodes 1.
+test "x64_unwind_cabecalho_com_padding" {
+    var u: UnwindInfo = UnwindInfo{tam = UNWIND_CABECALHO}
+    anexar_codigo(&u, 4, 0, UWOP_SET_FPREG)
+    fechar_cabecalho(&u, 40)
+    expect(u.tam == 8)
+    expect(u.bytes[0] == 1)
+    expect(u.bytes[1] == 40)
+    expect(u.bytes[2] == 1)
+    expect(u.bytes[3] == 5)
+}

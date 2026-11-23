@@ -1,0 +1,721 @@
+// nativo/optimizer/endereco.fj - porte de compiler/nativo/optimizer/endereco.c, compiler/nativo/optimizer/endereco.h
+// sha256 de nativo/optimizer/endereco.c: 61ecdc195d4869693b88ff6b10e0142584a5f6092c21aee267472c87970a6722
+// sha256 de nativo/optimizer/endereco.h: 7cad0073ff87a6287833a011e6ec075b4c0a41732fadb8457bb0cd0e82804808
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "common"
+import "nativo/bir"
+
+// Listas donas (heap): o C usava calloc; OtimEnderecoUsosLiberar as libera.
+struct EnderecoUsos {
+    n: u32
+    usos: [dynamic]u32
+    usos_base: [dynamic]u32
+}
+
+struct PosEnd {
+    b: u32
+    j: u32
+}
+
+struct Plano {
+    b: u32
+    j: u32
+    pt: PosEnd
+    pm: PosEnd
+    pw: PosEnd
+    tem_w: bool
+    t: bir.BirInstr
+    m: bir.BirInstr
+    w: bir.BirInstr
+}
+
+// Tabelas por vreg/bloco: listas donas (heap), liberadas em liberar_contexto.
+// marca: marca_f em [0, nb) e marca_b em [nb, 2*nb).
+struct EndCtx {
+    f: ?^bir.BirFuncao
+    prog: ?^bir.BirPrograma
+    an: bir.AnalisesBir
+    uso: EnderecoUsos
+    defs: [dynamic]u32
+    def_b: [dynamic]u32
+    def_j: [dynamic]u32
+    inicio: [dynamic]u32
+    fila: [dynamic]u32
+    morta: [dynamic]u8
+    marca: [dynamic]u8
+    plano: [dynamic]Plano
+    nplano: u32
+}
+
+// Busca em largura: n sementes em fila[0..n), bloco evitar nao se atravessa; adiante = sucessores, senao predecessores.
+struct Busca {
+    n: u32
+    evitar: u32
+    adiante: bool
+}
+
+const ENDERECO_BLOCOS_MAX: u32 = 2048
+const ENDERECO_IMED_MIN: i64 = -2147483648
+const ENDERECO_IMED_MAX: i64 = 2147483647
+
+// Preenche a lista (ja feita com make) com n zeros: o C usa calloc(n+1).
+proc zeros_u32(v: ^[dynamic]u32, n: u32) {
+    var k: u32 = 0
+    while k < n {
+        append(v, item = 0)
+        k += 1
+    }
+}
+
+proc zeros_u8(v: ^[dynamic]u8, n: u32) {
+    var k: u32 = 0
+    while k < n {
+        append(v, item = 0)
+        k += 1
+    }
+}
+
+// C: nativo/optimizer/endereco.c:38
+proc operando_simples(o: ^bir.BirOperando) -> bool {
+    return ((o.tam == 0) and (o.extensao == (bir.BE_NENHUMA as u8))) and (o.sysv == none)
+}
+
+// C: nativo/optimizer/endereco.c:43
+proc simples_i64(o: ^bir.BirOperando) -> bool {
+    return (common.c2f_b2i32(operando_simples(o)) != 0) and (o.classe == (bir.BC_I64 as u8))
+}
+
+// C: nativo/optimizer/endereco.c:48
+proc eh_acesso(i: ^bir.BirInstr) -> bool {
+    return (i.op == (bir.BIR_CARREGA as u8)) or (i.op == (bir.BIR_GRAVA as u8))
+}
+
+// C: nativo/optimizer/endereco.c:55
+proc somar_uso(vet: []u32, n: u32, o: ^bir.BirOperando) {
+    if (o.tipo == (bir.BO_VREG as u8)) and (o.id < n) {
+        vet[o.id] += 1
+    }
+}
+
+// C: nativo/optimizer/endereco.c:61
+proc otim_endereco_usos_calcular(funcao: ^bir.BirFuncao, u: ^EnderecoUsos) {
+    u.n = funcao.nvregs
+    u.usos = make([dynamic]u32, alloc = heap, cap = (u.n as int) + 1)
+    u.usos_base = make([dynamic]u32, alloc = heap, cap = (u.n as int) + 1)
+    zeros_u32(&u.usos, u.n + 1)
+    zeros_u32(&u.usos_base, u.n + 1)
+    var b: u32 = 0
+    while b < funcao.nblocos {
+        var j: u32 = 0
+        while j < funcao.blocos[b].n {
+            let i: ^bir.BirInstr = &funcao.blocos[b].instrs[j]
+            somar_uso(u.usos[..], u.n, &i.a)
+            somar_uso(u.usos[..], u.n, &i.b)
+            let args: []bir.BirOperando = i.args or_else {}
+            var k: u32 = 0
+            while k < i.nargs {
+                somar_uso(u.usos[..], u.n, &args[k])
+                k += 1
+            }
+            let grava_mesmo_vreg: bool = (i.op == (bir.BIR_GRAVA as u8)) and (i.b.tipo == (bir.BO_VREG as u8)) and (i.a.tipo == (bir.BO_VREG as u8)) and (i.b.id == i.a.id)
+            if eh_acesso(i) and operando_simples(&i.a) and (not grava_mesmo_vreg) {
+                somar_uso(u.usos_base[..], u.n, &i.a)
+            }
+            j += 1
+        }
+        b += 1
+    }
+}
+
+// C: nativo/optimizer/endereco.c:82
+proc otim_endereco_usos_liberar(u: ^EnderecoUsos) {
+    delete(u.usos)
+    delete(u.usos_base)
+}
+
+// C: nativo/optimizer/endereco.c:89
+proc otim_endereco_soma_fundivel(u: ?^EnderecoUsos, soma: ^bir.BirInstr) -> bool {
+    let eu: ^EnderecoUsos = u as ^EnderecoUsos
+    var imed: ^bir.BirOperando = &soma.a
+    var outro: ^bir.BirOperando = &soma.b
+    if soma.b.tipo == (bir.BO_IMED as u8) {
+        imed = &soma.b
+        outro = &soma.a
+    }
+    if (soma.op != (bir.BIR_ADD as u8)) or (soma.classe != (bir.BC_I64 as u8)) or (not simples_i64(imed)) or (not simples_i64(outro)) or (imed.tipo != (bir.BO_IMED as u8)) or (outro.tipo != (bir.BO_VREG as u8)) {
+        return false
+    }
+    if (imed.imed < ENDERECO_IMED_MIN) or (imed.imed > ENDERECO_IMED_MAX) or (soma.dst >= eu.n) {
+        return false
+    }
+    return (eu.usos[soma.dst] == 1) and (eu.usos_base[soma.dst] == 1)
+}
+
+// C: nativo/optimizer/endereco.c:113
+proc contar_funcao(c: ^EndCtx) {
+    let f: ^bir.BirFuncao = c.f as ^bir.BirFuncao
+    var total: u32 = 0
+    var v: u32 = 0
+    while (v < f.nparams) and (v < f.nvregs) {
+        c.defs[v] += 1
+        v += 1
+    }
+    var b: u32 = 0
+    while b < f.nblocos {
+        c.inicio[b] = total
+        total += f.blocos[b].n
+        var j: u32 = 0
+        while j < f.blocos[b].n {
+            let d: u32 = f.blocos[b].instrs[j].dst
+            if (d != bir.BIR_SEM_VREG) and (d < f.nvregs) {
+                c.defs[d] += 1
+                c.def_b[d] = b
+                c.def_j[d] = j
+            }
+            j += 1
+        }
+        b += 1
+    }
+    c.inicio[f.nblocos] = total
+    c.morta = make([dynamic]u8, alloc = heap, cap = (total as int) + 1)
+    zeros_u8(&c.morta, total + 1)
+}
+
+// C: nativo/optimizer/endereco.c:137
+proc preparar_contexto(c: ^EndCtx) {
+    let f: ^bir.BirFuncao = c.f as ^bir.BirFuncao
+    c.defs = make([dynamic]u32, alloc = heap, cap = (f.nvregs as int) + 1)
+    zeros_u32(&c.defs, f.nvregs + 1)
+    c.def_b = make([dynamic]u32, alloc = heap, cap = (f.nvregs as int) + 1)
+    zeros_u32(&c.def_b, f.nvregs + 1)
+    c.def_j = make([dynamic]u32, alloc = heap, cap = (f.nvregs as int) + 1)
+    zeros_u32(&c.def_j, f.nvregs + 1)
+    c.inicio = make([dynamic]u32, alloc = heap, cap = (f.nblocos as int) + 1)
+    zeros_u32(&c.inicio, f.nblocos + 1)
+    c.fila = make([dynamic]u32, alloc = heap, cap = (f.nblocos as int) + 1)
+    zeros_u32(&c.fila, f.nblocos + 1)
+    c.marca = make([dynamic]u8, alloc = heap, cap = (2 * (f.nblocos as int)) + 1)
+    zeros_u8(&c.marca, (2 * f.nblocos) + 1)
+    c.plano = make([dynamic]Plano, alloc = heap, cap = 16)
+    otim_endereco_usos_calcular(f, &c.uso)
+    contar_funcao(c)
+    bir.analises_calcular_lacos_apenas(f, &c.an)
+}
+
+// C: nativo/optimizer/endereco.c:156
+proc liberar_contexto(c: ^EndCtx) {
+    otim_endereco_usos_liberar(&c.uso)
+    delete(c.defs)
+    delete(c.def_b)
+    delete(c.def_j)
+    delete(c.inicio)
+    delete(c.fila)
+    delete(c.morta)
+    delete(c.marca)
+    delete(c.plano)
+    bir.analises_liberar(&c.an)
+}
+
+// C: nativo/optimizer/endereco.c:165
+proc def_unica(c: ^EndCtx, v: u32, pos: ^PosEnd) -> ?^bir.BirInstr {
+    let f: ^bir.BirFuncao = c.f as ^bir.BirFuncao
+    if (v >= f.nvregs) or (v < f.nparams) or (c.defs[v] != 1) {
+        return none
+    }
+    pos.b = c.def_b[v]
+    pos.j = c.def_j[v]
+    return &f.blocos[pos.b].instrs[pos.j]
+}
+
+// C: nativo/optimizer/endereco.c:174
+proc op_i64_vreg(i: ?^bir.BirInstr, op: u8) -> bool {
+    return ((((((i != none) and (((i as ^bir.BirInstr).op as i32) == (op as i32))) and ((i as ^bir.BirInstr).classe == (bir.BC_I64 as u8))) and ((i as ^bir.BirInstr).nargs == 0)) and ((i as ^bir.BirInstr).dst != bir.BIR_SEM_VREG)) and (common.c2f_b2i32(simples_i64(&(i as ^bir.BirInstr).a)) != 0)) and (common.c2f_b2i32(simples_i64(&(i as ^bir.BirInstr).b)) != 0)
+}
+
+// C: nativo/optimizer/endereco.c:180
+proc casar_mul(c: ^EndCtx, v: u32, p: ^Plano) -> bool {
+    let di: ?^bir.BirInstr = def_unica(c, v, &p.pm)
+    if not op_i64_vreg(di, (bir.BIR_MUL as u8)) {
+        return false
+    }
+    let d: ^bir.BirInstr = di as ^bir.BirInstr
+    var imed: ^bir.BirOperando = &d.a
+    var ind: ^bir.BirOperando = &d.b
+    if d.b.tipo == (bir.BO_IMED as u8) {
+        imed = &d.b
+        ind = &d.a
+    }
+    if (imed.tipo != (bir.BO_IMED as u8)) or (ind.tipo != (bir.BO_VREG as u8)) or (ind.id == v) {
+        return false
+    }
+    if (imed.imed != 1) and (imed.imed != 2) and (imed.imed != 4) and (imed.imed != 8) {
+        return false
+    }
+    p.m = d^
+    return true
+}
+
+// C: nativo/optimizer/endereco.c:198
+proc casar_soma_imediata(c: ^EndCtx, v: u32, p: ^Plano) -> bool {
+    let di: ?^bir.BirInstr = def_unica(c, v, &p.pw)
+    if not op_i64_vreg(di, (bir.BIR_ADD as u8)) {
+        return false
+    }
+    let d: ^bir.BirInstr = di as ^bir.BirInstr
+    var imed: ^bir.BirOperando = &d.a
+    var x: ^bir.BirOperando = &d.b
+    if d.b.tipo == (bir.BO_IMED as u8) {
+        imed = &d.b
+        x = &d.a
+    }
+    if (imed.tipo != (bir.BO_IMED as u8)) or (x.tipo != (bir.BO_VREG as u8)) or (x.id == v) or (imed.imed < ENDERECO_IMED_MIN) or (imed.imed > ENDERECO_IMED_MAX) {
+        return false
+    }
+    p.w = d^
+    return true
+}
+
+// C: nativo/optimizer/endereco.c:214
+proc casar_cadeia(c: ^EndCtx, t: u32, p: ^Plano) -> bool {
+    let di: ?^bir.BirInstr = def_unica(c, t, &p.pt)
+    if not op_i64_vreg(di, (bir.BIR_ADD as u8)) {
+        return false
+    }
+    let d: ^bir.BirInstr = di as ^bir.BirInstr
+    if (d.a.tipo != (bir.BO_VREG as u8)) or (d.b.tipo != (bir.BO_VREG as u8)) or (d.dst == d.a.id) or (d.dst == d.b.id) {
+        return false
+    }
+    var outro: u32 = d.b.id
+    if casar_mul(c, d.a.id, p) {
+        outro = d.b.id
+    } else if casar_mul(c, d.b.id, p) {
+        outro = d.a.id
+    } else {
+        return false
+    }
+    if outro == p.m.dst {
+        return false
+    }
+    p.t = d^
+    p.tem_w = casar_soma_imediata(c, outro, p)
+    return true
+}
+
+// C: nativo/optimizer/endereco.c:237
+proc def_no_bloco(c: ^EndCtx, v: u32, de: PosEnd, ate: u32) -> bool {
+    let blk: ^bir.BirBloco = &(c.f as ^bir.BirFuncao).blocos[de.b]
+    var j: u32 = de.j
+    while (j < ate) and (j < blk.n) {
+        if blk.instrs[j].dst == v {
+            return true
+        }
+        j += 1
+    }
+    return false
+}
+
+// C: nativo/optimizer/endereco.c:251
+proc alcancar(c: ^EndCtx, bu: Busca) {
+    let f: ^bir.BirFuncao = c.f as ^bir.BirFuncao
+    var base: u32 = f.nblocos
+    var vizinhos: []u32 = c.an.pred or_else {}
+    var ponteiros: []u32 = c.an.pred_ini or_else {}
+    if bu.adiante {
+        base = 0
+        vizinhos = c.an.suc or_else {}
+        ponteiros = c.an.suc_ini or_else {}
+    }
+    var n: u32 = bu.n
+    var k: u32 = 0
+    while k < n {
+        let b: u32 = c.fila[k]
+        var m: u32 = ponteiros[b]
+        while m < ponteiros[b + 1] {
+            let viz: u32 = vizinhos[m]
+            if (viz != bu.evitar) and (c.marca[base + viz] == 0) {
+                c.marca[base + viz] = 1
+                c.fila[n] = viz
+                n += 1
+            }
+            m += 1
+        }
+        k += 1
+    }
+}
+
+// C: nativo/optimizer/endereco.c:270
+proc def_na_regiao(c: ^EndCtx, v: u32, db: u32, ub: u32) -> bool {
+    let nb: u32 = (c.f as ^bir.BirFuncao).nblocos
+    var k: u32 = 0
+    while k < (2 * nb) + 1 {
+        c.marca[k] = 0
+        k += 1
+    }
+    c.fila[0] = db
+    alcancar(c, Busca{n = 1, evitar = db, adiante = true})
+    c.fila[0] = ub
+    c.marca[nb + ub] = 1
+    alcancar(c, Busca{n = 1, evitar = db, adiante = false})
+    var x: u32 = 0
+    while x < nb {
+        if (c.marca[x] != 0) and (c.marca[nb + x] != 0) and def_no_bloco(c, v, PosEnd{b = x, j = 0}, 4294967295) {
+            return true
+        }
+        x += 1
+    }
+    return false
+}
+
+// C: nativo/optimizer/endereco.c:289
+proc estavel(c: ^EndCtx, v: u32, d: PosEnd, uso: PosEnd) -> bool {
+    let f: ^bir.BirFuncao = c.f as ^bir.BirFuncao
+    var limite: u32 = 0
+    if v < f.nparams {
+        limite = 1
+    }
+    if c.defs[v] <= limite {
+        return true
+    }
+    if d.b == uso.b {
+        return (d.j < uso.j) and (not def_no_bloco(c, v, PosEnd{b = d.b, j = d.j + 1}, uso.j))
+    }
+    if (not bir.analises_domina(&c.an, d.b, uso.b)) or def_no_bloco(c, v, PosEnd{b = d.b, j = d.j + 1}, 4294967295) {
+        return false
+    }
+    return not def_na_regiao(c, v, d.b, uso.b)
+}
+
+// C: nativo/optimizer/endereco.c:301
+proc folha_de(i: ^bir.BirInstr) -> u32 {
+    var tern_1: u32 = i.b.id
+    if i.b.tipo == (bir.BO_IMED as u8) {
+        tern_1 = i.a.id
+    }
+    return tern_1
+}
+
+// C: nativo/optimizer/endereco.c:307
+proc definicao_domina_acesso(c: ^EndCtx, d: PosEnd, uso: PosEnd) -> bool {
+    if d.b == uso.b {
+        return d.j < uso.j
+    }
+    return bir.analises_domina(&c.an, d.b, uso.b)
+}
+
+// C: nativo/optimizer/endereco.c:313
+proc cadeia_estavel(c: ^EndCtx, p: ^Plano, uso: PosEnd) -> bool {
+    if (not definicao_domina_acesso(c, p.pt, uso)) or (not estavel(c, folha_de(&p.m), p.pm, uso)) {
+        return false
+    }
+    if p.tem_w {
+        return estavel(c, folha_de(&p.w), p.pw, uso)
+    }
+    var outro: u32 = p.t.a.id
+    if p.t.a.id == p.m.dst {
+        outro = p.t.b.id
+    }
+    return estavel(c, outro, p.pt, uso)
+}
+
+// C: nativo/optimizer/endereco.c:327
+proc acrescentar_plano(c: ^EndCtx, p: ^Plano) {
+    append(&c.plano, item = p^)
+    c.nplano += 1
+}
+
+// C: nativo/optimizer/endereco.c:339
+proc base_compartilhada(c: ^EndCtx, acesso: ^bir.BirInstr) -> bool {
+    let t: u32 = acesso.a.id
+    let f: ^bir.BirFuncao = c.f as ^bir.BirFuncao
+    if (acesso.a.tipo != (bir.BO_VREG as u8)) or (not simples_i64(&acesso.a)) or (t >= f.nvregs) {
+        return false
+    }
+    return (c.uso.usos_base[t] >= 2) and (c.uso.usos_base[t] == c.uso.usos[t])
+}
+
+// C: nativo/optimizer/endereco.c:346
+proc coletar_plano(c: ^EndCtx) {
+    let f: ^bir.BirFuncao = c.f as ^bir.BirFuncao
+    var b: u32 = 0
+    while b < f.nblocos {
+        var j: u32 = 0
+        while j < f.blocos[b].n {
+            let i: ^bir.BirInstr = &f.blocos[b].instrs[j]
+            if eh_acesso(i) and base_compartilhada(c, i) {
+                var p: Plano = Plano{}
+                if casar_cadeia(c, i.a.id, &p) and cadeia_estavel(c, &p, PosEnd{b = b, j = j}) {
+                    p.b = b
+                    p.j = j
+                    acrescentar_plano(c, &p)
+                }
+            }
+            j += 1
+        }
+        b += 1
+    }
+}
+
+// C: nativo/optimizer/endereco.c:369
+proc marcar_morta(c: ^EndCtx, pos: PosEnd, def: ^bir.BirInstr) {
+    let f: ^bir.BirFuncao = c.f as ^bir.BirFuncao
+    let g: u32 = c.inicio[pos.b] + pos.j
+    if c.morta[g] != 0 {
+        return
+    }
+    c.morta[g] = 1
+    if (def.a.tipo == (bir.BO_VREG as u8)) and (def.a.id < f.nvregs) {
+        c.uso.usos[def.a.id] -= 1
+    }
+    if (def.b.tipo == (bir.BO_VREG as u8)) and (def.b.id < f.nvregs) {
+        c.uso.usos[def.b.id] -= 1
+    }
+}
+
+// C: nativo/optimizer/endereco.c:383
+proc marcar_mortas(c: ^EndCtx) -> u32 {
+    var k: u32 = 0
+    while k < c.nplano {
+        c.uso.usos[c.plano[k].t.dst] -= 1
+        k += 1
+    }
+    k = 0
+    while k < c.nplano {
+        if c.uso.usos[c.plano[k].t.dst] == 0 {
+            marcar_morta(c, c.plano[k].pt, &c.plano[k].t)
+        }
+        k += 1
+    }
+    k = 0
+    while k < c.nplano {
+        if c.uso.usos[c.plano[k].m.dst] == 0 {
+            marcar_morta(c, c.plano[k].pm, &c.plano[k].m)
+        }
+        if c.plano[k].tem_w and (c.uso.usos[c.plano[k].w.dst] == 0) {
+            marcar_morta(c, c.plano[k].pw, &c.plano[k].w)
+        }
+        k += 1
+    }
+    var n: u32 = 0
+    let total: u32 = c.inicio[(c.f as ^bir.BirFuncao).nblocos]
+    var g: u32 = 0
+    while g < total {
+        n += (c.morta[g] as u32)
+        g += 1
+    }
+    return n
+}
+
+// C: nativo/optimizer/endereco.c:404
+proc trocar_vreg(i: ^bir.BirInstr, de: u32, para: u32) {
+    if (i.a.tipo == (bir.BO_VREG as u8)) and (i.a.id == de) {
+        i.a.id = para
+    }
+    if (i.b.tipo == (bir.BO_VREG as u8)) and (i.b.id == de) {
+        i.b.id = para
+    }
+}
+
+// C: nativo/optimizer/endereco.c:413
+// Escreve a cadeia nova (w', m', t') no fim de saida; *prox e o proximo vreg livre; *vt recebe o endereco novo.
+proc emitir_cadeia(p: ^Plano, saida: ^[dynamic]bir.BirInstr, prox: ^u32, vt: ^u32) {
+    var vw: u32 = bir.BIR_SEM_VREG
+    if p.tem_w {
+        vw = prox^
+        prox^ += 1
+        var w: bir.BirInstr = p.w
+        w.dst = vw
+        append(saida, item = w)
+    }
+    let vm: u32 = prox^
+    prox^ += 1
+    var m: bir.BirInstr = p.m
+    m.dst = vm
+    append(saida, item = m)
+    vt^ = prox^
+    prox^ += 1
+    var t: bir.BirInstr = p.t
+    trocar_vreg(&t, p.m.dst, vm)
+    if p.tem_w {
+        trocar_vreg(&t, p.w.dst, vw)
+    }
+    t.dst = vt^
+    append(saida, item = t)
+}
+
+// C: nativo/optimizer/endereco.c:434
+// classe_vreg cresce para nvregs + n: o C faz realloc; a Forja aloca fatia nova na arena do programa e copia.
+// Compartilhado com o licm (NovoVreg). Nao muda f.nvregs: quem chama o faz.
+proc crescer_classes_vreg(programa: ^bir.BirPrograma, f: ^bir.BirFuncao, n: u32, classe: u8) {
+    let nova: []u8 = common.arena_fatia_u8(&programa.arena, ((f.nvregs + n) as int) + 1)
+    let velha: []u8 = f.classe_vreg or_else {}
+    var k: u32 = 0
+    while k < f.nvregs {
+        nova[k] = velha[k]
+        k += 1
+    }
+    k = 0
+    while k < n {
+        nova[f.nvregs + k] = classe
+        k += 1
+    }
+    f.classe_vreg = nova
+}
+
+// C: nativo/optimizer/endereco.c:434
+proc novos_vregs(c: ^EndCtx, n: u32) {
+    crescer_classes_vreg(c.prog as ^bir.BirPrograma, c.f as ^bir.BirFuncao, n, (bir.BC_I64 as u8))
+}
+
+// C: nativo/optimizer/endereco.c:446
+// Reconstroi o bloco b: sem as mortas, com a cadeia nova na frente de cada acesso do plano a partir de k^.
+proc reconstruir_bloco(c: ^EndCtx, b: u32, k: ^u32, prox: ^u32) {
+    let blk: ^bir.BirBloco = &(c.f as ^bir.BirFuncao).blocos[b]
+    let extra: u32 = 3 * (c.nplano - k^)
+    var nova = make([dynamic]bir.BirInstr, alloc = heap, cap = ((blk.n + extra) as int) + 1)
+    defer delete(nova)
+    var j: u32 = 0
+    while j < blk.n {
+        if c.morta[c.inicio[b] + j] == 0 {
+            if (k^ < c.nplano) and (c.plano[k^].b == b) and (c.plano[k^].j == j) {
+                var vt: u32 = 0
+                emitir_cadeia(&c.plano[k^], &nova, prox, &vt)
+                var acesso: bir.BirInstr = blk.instrs[j]
+                acesso.a.id = vt
+                append(&nova, item = acesso)
+                k^ += 1
+            } else {
+                append(&nova, item = blk.instrs[j])
+            }
+        }
+        j += 1
+    }
+    delete(blk.instrs)
+    let nb: u32 = len(nova) as u32
+    blk.instrs = make([dynamic]bir.BirInstr, alloc = heap, cap = (nb as int) + 1)
+    var q: u32 = 0
+    while q < nb {
+        append(&blk.instrs, item = nova[q])
+        q += 1
+    }
+    blk.n = nb
+    blk.cap = (cap(blk.instrs) as u64) as u32
+}
+
+// C: nativo/optimizer/endereco.c:474
+proc aplicar_plano(c: ^EndCtx, removidas: ^u32) -> u32 {
+    let f: ^bir.BirFuncao = c.f as ^bir.BirFuncao
+    var k: u32 = 0
+    var prox: u32 = f.nvregs
+    var novos: u32 = 0
+    var i: u32 = 0
+    while i < c.nplano {
+        if c.plano[i].tem_w {
+            novos += 3
+        } else {
+            novos += 2
+        }
+        i += 1
+    }
+    removidas^ = marcar_mortas(c)
+    novos_vregs(c, novos)
+    var b: u32 = 0
+    while b < f.nblocos {
+        reconstruir_bloco(c, b, &k, &prox)
+        b += 1
+    }
+    f.nvregs = prox
+    return c.nplano
+}
+
+// C: nativo/optimizer/endereco.c:489
+proc endereco_funcao(programa: ^bir.BirPrograma, f: ^bir.BirFuncao, removidas: ^u32) -> u32 {
+    var c = EndCtx{f = f, prog = programa}
+    var n: u32 = 0
+    if (not cfg_elegivel(programa, f)) or (f.nblocos > ENDERECO_BLOCOS_MAX) {
+        return 0
+    }
+    preparar_contexto(&c)
+    coletar_plano(&c)
+    if c.nplano > 0 {
+        n = aplicar_plano(&c, removidas)
+    }
+    liberar_contexto(&c)
+    return n
+}
+
+// C: nativo/optimizer/endereco.c:504
+proc otim_endereco_aplicar(programa: ^bir.BirPrograma, relato: ^[dynamic]u8) {
+    var i: u32 = 0
+    while i < programa.nfuncoes {
+        let f: ^bir.BirFuncao = &(programa.funcoes or_else {})[i]
+        var removidas: u32 = 0
+        let n: u32 = endereco_funcao(programa, f, &removidas)
+        if n > 0 {
+            let txt_1 = programa.simbolos[f.simbolo].nome or_else "(null)"
+            format(f"endereco {txt_1}: {n} cadeias recolocadas, {removidas} instrucoes removidas\n", into = relato)
+        }
+        i += 1
+    }
+}
+
+test "endereco_zeros_e_soma_uso" {
+    var v = make([dynamic]u32, alloc = heap, cap = 4)
+    zeros_u32(&v, 3)
+    expect(len(v) == 3)
+    var op = bir.BirOperando{tipo = (bir.BO_VREG as u8), id = 1}
+    somar_uso(v[..], 3, &op)
+    op.id = 7
+    somar_uso(v[..], 3, &op)
+    expect(v[1] == 1)
+    expect(v[2] == 0)
+    delete(v)
+}
+
+test "endereco_soma_fundivel_so_imediato_unico" {
+    var u = EnderecoUsos{}
+    u.n = 4
+    u.usos = make([dynamic]u32, alloc = heap, cap = 5)
+    zeros_u32(&u.usos, 5)
+    u.usos_base = make([dynamic]u32, alloc = heap, cap = 5)
+    zeros_u32(&u.usos_base, 5)
+    u.usos[2] = 1
+    u.usos_base[2] = 1
+    var soma = bir.BirInstr{op = (bir.BIR_ADD as u8), classe = (bir.BC_I64 as u8), dst = 2}
+    soma.a = bir.BirOperando{tipo = (bir.BO_VREG as u8), classe = (bir.BC_I64 as u8), id = 1}
+    soma.b = bir.BirOperando{tipo = (bir.BO_IMED as u8), classe = (bir.BC_I64 as u8), imed = 8}
+    expect(otim_endereco_soma_fundivel(&u, &soma))
+    soma.b.imed = 4294967296
+    expect(not otim_endereco_soma_fundivel(&u, &soma))
+    soma.b.imed = 8
+    u.usos[2] = 2
+    expect(not otim_endereco_soma_fundivel(&u, &soma))
+    otim_endereco_usos_liberar(&u)
+}
+
+test "endereco_casa_duas_cadeias_no_acesso" {
+    var f = bir.BirFuncao{}
+    f.nvregs = 8
+    f.nparams = 2
+    f.nblocos = 1
+    f.blocos = make([dynamic]bir.BirBloco, alloc = heap, cap = 2)
+    append(&f.blocos, item = bir.BirBloco{})
+    f.blocos[0].instrs = make([dynamic]bir.BirInstr, alloc = heap, cap = 8)
+    let c_i64: u8 = bir.BC_I64 as u8
+    append(&f.blocos[0].instrs, item = bir.BirInstr{op = (bir.BIR_MUL as u8), classe = c_i64, dst = 2, a = bir.BirOperando{tipo = (bir.BO_VREG as u8), classe = c_i64, id = 1}, b = bir.BirOperando{tipo = (bir.BO_IMED as u8), classe = c_i64, imed = 4}})
+    append(&f.blocos[0].instrs, item = bir.BirInstr{op = (bir.BIR_ADD as u8), classe = c_i64, dst = 3, a = bir.BirOperando{tipo = (bir.BO_VREG as u8), classe = c_i64, id = 2}, b = bir.BirOperando{tipo = (bir.BO_VREG as u8), classe = c_i64, id = 0}})
+    append(&f.blocos[0].instrs, item = bir.BirInstr{op = (bir.BIR_CARREGA as u8), classe = c_i64, dst = 4, a = bir.BirOperando{tipo = (bir.BO_VREG as u8), classe = c_i64, id = 3}})
+    append(&f.blocos[0].instrs, item = bir.BirInstr{op = (bir.BIR_CARREGA as u8), classe = c_i64, dst = 5, a = bir.BirOperando{tipo = (bir.BO_VREG as u8), classe = c_i64, id = 3}})
+    f.blocos[0].n = 4
+    var c = EndCtx{f = &f}
+    preparar_contexto(&c)
+    coletar_plano(&c)
+    expect(c.nplano == 2)
+    expect(c.plano[0].tem_w == false)
+    expect(c.plano[0].t.dst == 3)
+    expect(c.plano[0].m.dst == 2)
+    liberar_contexto(&c)
+    delete(f.blocos[0].instrs)
+    delete(f.blocos)
+}

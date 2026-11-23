@@ -1,0 +1,850 @@
+// driver/main.fj - porte de compiler/driver/main.c
+// sha256 de driver/main.c: 9120664e19adfae2e2d79bd9cb129a7c93b5f0b74abed352bb147c49816aaf42
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.2.7
+// Changelog: 0.2.8 - I3: o alvo iOS recebe o prefixo de runtime a64 mais std:a64_ios.
+//            0.2.7 - I2: o alvo iOS nao recebe o prefixo de runtime a64 (sem runtime ate a I3).
+//            0.2.6 - J1d: IMPORT_RUNTIME_A64 traz tambem std:a64_errno (os.error_text).
+//            0.2.5 - J1a: IMPORT_RUNTIME_A64 traz tambem std:a64_proc e std:a64_es_fs2 (teto de 800 linhas).
+//            0.2.4 - A3.3h: IMPORT_RUNTIME_A64 traz tambem std:a64_es_fs.
+//            0.2.3 - A-E1: IMPORT_RUNTIME_A64 traz std:a64_mem, std:a64_mapa e std:a64_es (vazios); modulo_runtime_aceito_no_alvo usa modulos_std_eh_a64_so.
+//            0.2.2 - A3.3a: alvo a64 injeta os runtimes wasm com alias a64_* (IMPORT_RUNTIME_WASM_A64); pacote do usuario wasm_rt deixa de dar E1001 so no a64.
+//            0.2.1 - A2.2(a): alvo a64 leva os wasm_* reusados, a libm e o std:a64_rt (IMPORT_RUNTIME_A64); modulo_runtime_aceito_no_alvo decide por alvo.
+//            0.2.0 - G3 P-driver DA: corpo real. O SaidaDiag unico (C2F-70) nasce em principal e desce por `sd` ate relatar_falha e dll_sem_exportados (some o `var sd` provisorio);
+//            argv dos procs vira []str (era ^?^u8); pasta_do_modulo devolve str de heap, "" = sem FORJA_ENGINE (era buffer de saida + bool); ler_load_arquivo devolve os bytes em ^[dynamic]u8 (era char ** + size_t *);
+//            linha de comando em buffer []u8 do principal (o texto de Opcoes.linha e do alocador frame). Texto no stdout/stderr pelo shim c2f_saida (modo texto, CRLF).
+
+import "std:os"
+import "common"
+import "frontend"
+import "ir"
+import "backend"
+import "semantic"
+import "nativo"
+
+const MAIN_TAM_LINHA: i32 = 2048
+const LOAD_TAM_MAX: u64 = 16777216
+const PASTA_MODULO_MAX: int = 600
+const VARIANTE_RUN_MAX: int = 64
+const ARQ_EXE_RUN_MAX: int = 512
+// No alvo wasm o driver poe este import no inicio da 1a linha da raiz: o runtime em Forja (language\runtime\wasm\rt_wasm.fj) entra como o modulo std:wasm_rt
+const IMPORT_RUNTIME_WASM: str = "import \"std:wasm_rt\" as wasm_rt\nimport \"std:wasm_real\" as wasm_real\nimport \"std:wasm_ordenar\" as wasm_ordenar\n"
+// A2.2(a): no alvo a64 o runtime e o mesmo IMPORT_RUNTIME_WASM mais o host proprio std:a64_rt (ainda sem procs)
+const IMPORT_RUNTIME_IOS: str = "import \"std:a64_ios\" as a64_ios\n"
+const IMPORT_RUNTIME_A64: str = "import \"std:a64_rt\" as a64_rt\nimport \"std:a64_mem\" as a64_mem\nimport \"std:a64_mapa\" as a64_mapa\nimport \"std:a64_es\" as a64_es\nimport \"std:a64_es_fs\" as a64_es_fs\nimport \"std:a64_es_fs2\" as a64_es_fs2\nimport \"std:a64_proc\" as a64_proc\nimport \"std:a64_errno\" as a64_errno\n"
+// A3.3a: no a64 os aliases do runtime wasm reusado ganham prefixo, para o pacote do usuario chamado wasm_rt nao dar E1001 (apelido ja usado);
+// o alvo wasm segue com IMPORT_RUNTIME_WASM. Os modulos importam std:wasm_rt sem alias, entao o alias so vale neste arquivo.
+const IMPORT_RUNTIME_WASM_A64: str = "import \"std:wasm_rt\" as a64_wasm_rt\nimport \"std:wasm_real\" as a64_wasm_real\nimport \"std:wasm_ordenar\" as a64_wasm_ordenar\n"
+// os 5 modulos de libm do alvo wasm entram so quando o grafo importa std:math (ler_modulo poe estes imports no texto do std:math)
+const IMPORT_LIBM_WASM: str = "import \"std:wasm_math\" as wasm_math\nimport \"std:wasm_trig\" as wasm_trig\nimport \"std:wasm_atan\" as wasm_atan\nimport \"std:wasm_exp\" as wasm_exp\nimport \"std:wasm_pow\" as wasm_pow\n"
+// 0.33.0: `forja test` no alvo wasm acrescenta o executor de testes (language\runtime\wasm\rt_wasm_teste.fj) ao runtime; build e run nao o pagam
+const IMPORT_TESTE_WASM: str = "import \"std:wasm_teste\" as wasm_teste\n"
+// O import do executor de testes entra so em `forja test`
+proc prefixo_de_teste_wasm(o: ^Opcoes) -> str {
+    if comando_eh(o, "test") {
+        return IMPORT_TESTE_WASM
+    }
+    return ""
+}
+// 0.33.0: run e test no alvo wasm rodam o .wasm no Node por este executor (language\runtime\wasm\executor_wasm.mjs): WASI minima (proc_exit e fd_write) e, no test, retomada depois de cada queda
+const EXECUTOR_WASM: str = #load("../runtime/wasm/executor_wasm.mjs")
+
+// Texto no stderr (fprintf(stderr, ...)): o objeto de saida e novo a cada chamada e fechado aqui. Usado pelos comandos do driver (cmd_ast, limites).
+proc driver_stderr_texto(texto: str) {
+    let erro = common.c2f_saida_stderr()
+    common.c2f_saida_escrever_texto(erro, texto)
+    _ = common.c2f_saida_fechar(erro)
+}
+
+// bytes ate o 1o NUL do buffer []u8, como texto de heap (quem chama faz delete)
+proc buffer_para_texto(buffer: []u8) -> str {
+    return from_bytes(buffer[0..<common.c2f_strlen_b(buffer)], alloc = heap)
+}
+
+// C: driver/main.c:130
+proc iniciar_compilacao(c: ?^Compilacao) {
+    common.interner_iniciar(&(c as ^Compilacao).nomes, &(c as ^Compilacao).arena)
+    frontend.lexer_nomes_iniciais(&(c as ^Compilacao).nomes)
+    let ptr_1: ^Compilacao = c as ^Compilacao
+    ptr_1.lexer = frontend.Lexer{fonte = &(c as ^Compilacao).fonte, nomes = &(c as ^Compilacao).nomes, diag = &(c as ^Compilacao).diag, erros = &(c as ^Compilacao).sem.lista}
+    frontend.modulos_iniciar(&(c as ^Compilacao).modulos, &(c as ^Compilacao).nomes, (c as ^Compilacao).fonte.caminho)
+    let ptr_2: ^Compilacao = c as ^Compilacao
+    ptr_2.cargas = make([dynamic]?^frontend.Expr, alloc = heap)
+    let ptr_3: ^Compilacao = c as ^Compilacao
+    ptr_3.resolvidos = make([dynamic]nativo.NativoCarga, alloc = heap)
+    let ptr_4: ^Compilacao = c as ^Compilacao
+    ptr_4.pastas_carregadas = make([dynamic]nativo.NativoPacote, alloc = heap)
+    let ptr_5: ^Compilacao = c as ^Compilacao
+    ptr_5.parser = frontend.Parser{fonte = &(c as ^Compilacao).fonte, nomes = &(c as ^Compilacao).nomes, arena = &(c as ^Compilacao).arena, diag = &(c as ^Compilacao).diag, erros = &(c as ^Compilacao).sem.lista, modulos = &(c as ^Compilacao).modulos, cargas = &(c as ^Compilacao).cargas}
+}
+
+// C: driver/main.c:142
+// semantica_liberar so vale depois de semantica_iniciar: `tipos.tabela != NULL` do C (TiposIniciar cria os tipos fixos, entao a lista de itens deixa de ser vazia; TiposLiberar a esvazia)
+proc liberar_compilacao(c: ?^Compilacao) {
+    let cc: ^Compilacao = c as ^Compilacao
+    if len(cc.sem.tipos.itens) > 0 {
+        semantic.semantica_liberar(&cc.sem)
+    }
+    frontend.parser_liberar(&cc.parser)
+    delete(cc.cargas)
+    delete(cc.resolvidos)
+    delete(cc.pastas_carregadas)
+    frontend.modulos_liberar(&cc.modulos)
+    frontend.lexer_liberar(&cc.lexer)
+    common.interner_liberar(&cc.nomes)
+    common.arena_liberar(&cc.arena)
+    common.fonte_liberar(&cc.fonte)
+}
+
+// C: driver/main.c:159
+// Pasta do .fj de um modulo de arquivo: ao lado da raiz (MOD_ARQUIVO), vendor\ (MOD_VENDOR) ou %FORJA_ENGINE%\forja (MOD_ENGINE). none = MOD_ENGINE sem a variavel FORJA_ENGINE.
+// O destino[600] do C vira texto de heap cortado em 599 bytes (quem recebe faz delete). "" = o false do C (a pasta de um modulo nunca e vazia).
+proc pasta_do_modulo(c: ?^Compilacao, mod: ^frontend.Modulo) -> str {
+    if mod.origem == (frontend.MOD_ENGINE as u8) {
+        let engine: str = os.env("FORJA_ENGINE") or_else ""
+        if len(engine) == 0 {
+            return common.c2f_cortar("", 0)
+        }
+        let completo_engine = format(f"{engine}\\forja", alloc = heap)
+        defer delete(completo_engine)
+        return common.c2f_cortar(completo_engine, PASTA_MODULO_MAX - 1)
+    }
+    let pasta: str = pasta_do_fonte(c)
+    if mod.origem == (frontend.MOD_VENDOR as u8) {
+        let completo_vendor = format(f"{pasta}\\vendor", alloc = heap)
+        defer delete(completo_vendor)
+        return common.c2f_cortar(completo_vendor, PASTA_MODULO_MAX - 1)
+    }
+    return common.c2f_cortar(pasta, PASTA_MODULO_MAX - 1)
+}
+
+// "<pasta>\<resto><sufixo>" em heap, cortado em 1299 bytes (char caminho[1300]); a '/' do resto vira '\' (a troca comeca depois da pasta e da barra).
+proc montar_caminho(pasta: str, resto: str, sufixo: str) -> str {
+    let completo = format(f"{pasta}\\{resto}{sufixo}", alloc = heap)
+    defer delete(completo)
+    var bytes = make([dynamic]u8, alloc = heap)
+    defer delete(bytes)
+    append(&bytes, items = as_bytes(completo)[0..<min(len(completo), (CAMINHO_MAX as int) - 1)])
+    var i: int = len(pasta) + 1
+    while i < len(bytes) {
+        if bytes[i] == 47 { // '/'
+            bytes[i] = 92 // '\\'
+        }
+        i += 1
+    }
+    return from_bytes(bytes[..], alloc = heap)
+}
+
+// C: driver/main.c:176
+// Caminho do .fj do modulo: pasta + '\' + resto do import ('/' vira '\') + ".fj", copiado na arena.
+proc caminho_do_arquivo_2(c: ?^Compilacao, pasta: str, resto: str) -> str {
+    let caminho: str = montar_caminho(pasta, resto, ".fj")
+    defer delete(caminho)
+    return from_bytes(as_bytes(caminho), alloc = common.arena_mem(&(c as ^Compilacao).arena))
+}
+
+// C: driver/main.c:187
+// IA1-L2: import "os" (sem o prefixo, e sem um os.fj ao lado) e o jeito de Python e Go: E0110 com a troca por "std:os". false = o nome nao e de modulo da std.
+proc relatar_std_sem_prefixo(c: ?^Compilacao, mod: ^frontend.Modulo, import_c: str) -> bool {
+    let cc: ^Compilacao = c as ^Compilacao
+    var troca: common.IdiomaTroca = common.IdiomaTroca{}
+    let tam: u32 = len(import_c) as u32
+    if not frontend.modulos_std_tem(import_c, tam) {
+        return false
+    }
+    _ = common.idioma_relatar(&cc.diag, common.IDI_IMPORT_SEM_STD, mod.pos_import, import_c)
+    let novo_inteiro = format(f"\"std:{import_c}\"", alloc = heap)
+    defer delete(novo_inteiro)
+    // char novo[DIAG_NOVO_MAX]: o snprintf corta em 31 bytes
+    let novo: str = novo_inteiro[0..<min(len(novo_inteiro), (common.DIAG_NOVO_MAX as int) - 1)]
+    if cc.fonte.texto[mod.pos_import as int] == 34 { // '"'
+        common.idioma_troca_somar(&troca, cc.fonte.texto, mod.pos_import, mod.pos_import + tam + 2, novo)
+    }
+    common.idioma_sugerir(&cc.diag, common.DIAG_CERTA, "escreva o caminho com o prefixo std: (a biblioteca padrao)", &troca)
+    return true
+}
+
+// C: driver/main.c:202
+// P79: vendor: ausente cita o parecido do mesmo grupo e lista os modulos disponiveis (std + vendor da pasta do arquivo raiz). false = E1001.
+proc relatar_vendor_ausente(c: ?^Compilacao, mod: ^frontend.Modulo, import_c: str, resto: str) -> bool {
+    let cc: ^Compilacao = c as ^Compilacao
+    let pasta: str = cc.modulos.pasta or_else ""
+    var lista_buf = make([dynamic]u8, alloc = heap, len = 440)
+    defer delete(lista_buf)
+    var parecido_buf = make([dynamic]u8, alloc = heap, len = 128)
+    defer delete(parecido_buf)
+    _ = frontend.modulos_listar_disponiveis(pasta, lista_buf[..], 440)
+    let lista: str = buffer_para_texto(lista_buf[..])
+    defer delete(lista)
+    if frontend.modulos_parecido(pasta, import_c, parecido_buf[..], 128) {
+        let parecido: str = buffer_para_texto(parecido_buf[..])
+        defer delete(parecido)
+        let msg_1 = format(f"arquivo '{import_c}' nao encontrado: quis dizer {parecido}? (disponiveis: {lista})", alloc = heap)
+        defer delete(msg_1)
+        return common.diag_relatar(&cc.diag, common.E1001, mod.pos_import, msg_1)
+    }
+    let msg_2 = format(f"arquivo '{import_c}' nao encontrado: o modulo vendor fica em vendor\\{resto}.fj, ao lado do arquivo raiz (disponiveis: {lista})", alloc = heap)
+    defer delete(msg_2)
+    return common.diag_relatar(&cc.diag, common.E1001, mod.pos_import, msg_2)
+}
+
+// C: driver/main.c:215
+// Modulo de arquivo (relativo, vendor: ou engine:) ou de pasta (v1.13: *pacote = true, os trechos ja foram anexados e analisados). false = diagnostico no import que o trouxe.
+proc ler_modulo_arquivo(c: ?^Compilacao, k: u32, pacote: ^bool) -> bool {
+    let cc: ^Compilacao = c as ^Compilacao
+    let mod: ^frontend.Modulo = &cc.modulos.itens[k]
+    let import_c: str = common.interner_texto(&cc.nomes, mod.caminho)
+    var resto: str = import_c
+    if mod.origem != (frontend.MOD_ARQUIVO as u8) {
+        resto = import_c[min(7, len(import_c))..<len(import_c)] // import + 7: o "vendor:" ou "engine:"
+    }
+    let pasta: str = pasta_do_modulo(c, mod)
+    defer delete(pasta)
+    if len(pasta) == 0 {
+        let msg_1 = format(f"\"{import_c}\" precisa da variavel FORJA_ENGINE (pasta da engine): o modulo fica em %FORJA_ENGINE%\\forja\\{resto}.fj", alloc = heap)
+        defer delete(msg_1)
+        return common.diag_relatar(&cc.diag, common.E1001, mod.pos_import, msg_1)
+    }
+    let caminho: str = caminho_do_arquivo_2(c, pasta, resto)
+    let carga: i32 = carga_pacote(c, k, caminho)
+    if carga != CARGA_SEGUE_ARQUIVO {
+        pacote^ = carga == CARGA_PACOTE_CARREGADO
+        return pacote^
+    }
+    if carga_ja_entrou(c, caminho) {
+        return carga_relatar_repetido(c, mod, caminho)
+    }
+    if common.fonte_anexar_arquivo(&cc.fonte, caminho) {
+        return true
+    }
+    if mod.origem == (frontend.MOD_VENDOR as u8) {
+        return relatar_vendor_ausente(c, mod, import_c, resto)
+    }
+    if mod.origem == (frontend.MOD_ENGINE as u8) {
+        let msg_2 = format(f"arquivo '{import_c}' nao encontrado em {caminho}", alloc = heap)
+        defer delete(msg_2)
+        return common.diag_relatar(&cc.diag, common.E1001, mod.pos_import, msg_2)
+    }
+    if (mod.origem == (frontend.MOD_ARQUIVO as u8)) and relatar_std_sem_prefixo(c, mod, import_c) {
+        return false
+    }
+    let msg_3 = format(f"arquivo '{import_c}' nao encontrado (o caminho e relativo a pasta do arquivo raiz)", alloc = heap)
+    defer delete(msg_3)
+    return common.diag_relatar(&cc.diag, common.E1001, mod.pos_import, msg_3)
+}
+
+// C: driver/main.c:237
+proc eh_alvo_do_teste(c: ?^Compilacao, import_c: str) -> bool {
+    return (((c as ^Compilacao).opcoes != none) and (((c as ^Compilacao).opcoes as ^Opcoes).alvo_teste != none)) and ((((c as ^Compilacao).opcoes as ^Opcoes).alvo_teste or_else "") == import_c)
+}
+
+// A2.2(a): modulo de runtime aceito no alvo. Os wasm_* valem no wasm e no a64 (reuso); std:a64_rt so no a64
+proc modulo_runtime_aceito_no_alvo(o: ?^Opcoes, nome_std: str) -> bool {
+    if frontend.modulos_std_eh_a64_so(nome_std) {
+        return alvo_eh_a64(o)
+    }
+    return alvo_eh_wasm(o) or alvo_eh_a64(o)
+}
+
+// C: driver/main.c:243
+// Anexa ao texto da Fonte o conteudo do modulo k (arquivo ou std embutida). false = E1001 no import que o trouxe.
+proc ler_modulo(c: ?^Compilacao, k: u32, pacote: ^bool) -> bool {
+    let cc: ^Compilacao = c as ^Compilacao
+    let mod: ^frontend.Modulo = &cc.modulos.itens[k]
+    let import_c: str = common.interner_texto(&cc.nomes, mod.caminho)
+    if mod.origem != (frontend.MOD_STD as u8) {
+        return ler_modulo_arquivo(c, k, pacote)
+    }
+    var tam: u64 = 0
+    let nome_std: str = import_c[min(4, len(import_c))..<len(import_c)] // import + 4: o "std:"
+    let alvo_linux: bool = (cc.opcoes != none) and (alvo_eh_linux(cc.opcoes) or alvo_eh_a64(cc.opcoes))
+    var texto: ?str = frontend.modulos_texto_std_alvo(nome_std, alvo_linux, &cc.arena, &tam)
+    // std:wasm_rt so existe no alvo wasm (o driver o injeta; no a64 os wasm_* tambem valem) e std:a64_rt so no a64; nos demais alvos o import do usuario e E1001, como no forja 0.27.0
+    if frontend.modulos_std_eh_runtime_wasm(nome_std) and not ((cc.opcoes != none) and modulo_runtime_aceito_no_alvo(cc.opcoes, nome_std)) {
+        texto = none
+    }
+    if texto == none {
+        let msg_1 = format(f"{import_c} nao existe", alloc = heap)
+        defer delete(msg_1)
+        return common.diag_relatar(&cc.diag, common.E1001, mod.pos_import, msg_1)
+    }
+    if eh_alvo_do_teste(c, import_c) {
+        texto = frontend.modulos_texto_std_com_testes(nome_std, texto, &cc.arena, &tam)
+    }
+    // no alvo wasm e no a64, std:math leva na frente os 5 imports da libm (texto na arena do chamador; quem importa std:math, direta ou transitivamente, passa aqui)
+    if (nome_std == "math") and (cc.opcoes != none) and (alvo_eh_wasm(cc.opcoes) or alvo_eh_a64(cc.opcoes)) {
+        let base: str = texto or_else ""
+        let com_libm: str = format(f"{IMPORT_LIBM_WASM}{base}", alloc = common.arena_mem(&cc.arena))
+        texto = com_libm
+        tam = len(com_libm) as u64
+    }
+    if common.fonte_anexar_texto(&cc.fonte, import_c, texto, tam) {
+        return true
+    }
+    let msg_2 = format(f"arquivo '{import_c}' nao encontrado (o caminho e relativo a pasta do arquivo raiz)", alloc = heap)
+    defer delete(msg_2)
+    return common.diag_relatar(&cc.diag, common.E1001, mod.pos_import, msg_2)
+}
+
+// C: driver/main.c:257
+proc analisar_modulo(c: ^Compilacao, k: u32) -> bool {
+    let t0: u64 = common.relogio_ns()
+    c.parser.arquivo_atual = c.fonte.ntrechos - 1
+    frontend.modulos_registrar_arquivo(&c.modulos, c.parser.arquivo_atual, k as u8)
+    c.lexer.inicio = (c.fonte.trechos or_else {})[c.fonte.ntrechos - 1].inicio
+    var ok: bool = frontend.lexer_analisar(&c.lexer)
+    let t1: u64 = common.relogio_ns()
+    c.tempos.lex_ns += t1 - t0
+    if not ok {
+        return false
+    }
+    c.parser.modulo_atual = k as u8
+    ok = frontend.parser_analisar(&c.parser)
+    c.tempos.parse_ns += common.relogio_ns() - t1
+    return ok
+}
+
+// C: driver/main.c:274
+proc carregar_modulos(c: ?^Compilacao) -> bool {
+    var k: u32 = 1
+    while k < (c as ^Compilacao).modulos.n {
+        var pacote: bool = false
+        if (not ler_modulo(c, k, &pacote)) or ((not pacote) and (not analisar_modulo(c as ^Compilacao, k))) {
+            return false
+        }
+        k += 1
+    }
+    if not frontend.modulos_conferir_ciclos(&(c as ^Compilacao).modulos, &(c as ^Compilacao).parser.programa, &(c as ^Compilacao).diag) {
+        return false
+    }
+    if (c as ^Compilacao).modulos.n > 1 {
+        frontend.modulos_ordenar_decls(&(c as ^Compilacao).modulos, &(c as ^Compilacao).parser.programa)
+    }
+    return true
+}
+
+// C: driver/main.c:287
+proc analisar_sintaxe(c: ?^Compilacao, carregar: bool) -> bool {
+    let t0: u64 = common.relogio_ns()
+    var ok: bool = frontend.lexer_analisar(&(c as ^Compilacao).lexer)
+    let t1: u64 = common.relogio_ns()
+    let ptr_1: ^Compilacao = c as ^Compilacao
+    ptr_1.tempos.lex_ns = t1 - t0
+    if not ok {
+        return false
+    }
+    let ptr_2: ^Compilacao = c as ^Compilacao
+    ptr_2.parser.tokens = &(c as ^Compilacao).lexer.tokens
+    ok = frontend.parser_analisar(&(c as ^Compilacao).parser)
+    let ptr_3: ^Compilacao = c as ^Compilacao
+    ptr_3.tempos.parse_ns = common.relogio_ns() - t1
+    if ((common.c2f_b2i32(ok) != 0) and (common.c2f_b2i32(carregar) != 0)) and ((len((c as ^Compilacao).modulos.apelidos) as u64) > 0) {
+        return carregar_modulos(c)
+    }
+    return ok
+}
+
+// C: driver/main.c:302
+proc modulo_alvo_do_teste(c: ?^Compilacao) -> u32 {
+    if ((c as ^Compilacao).opcoes == none) or (((c as ^Compilacao).opcoes as ^Opcoes).alvo_teste == none) {
+        return 0
+    }
+    var k: u32 = 1
+    while k < (c as ^Compilacao).modulos.n {
+        if common.interner_texto(&(c as ^Compilacao).nomes, (c as ^Compilacao).modulos.itens[k].caminho) == (((c as ^Compilacao).opcoes as ^Opcoes).alvo_teste or_else "") {
+            return k
+        }
+        k += 1
+    }
+    return 0
+}
+
+// C: driver/main.c:313
+proc selecionar_testes_de_modulos(c: ?^Compilacao) {
+    var alvo: u32 = 0
+    if ((c as ^Compilacao).opcoes == none) or (not comando_eh((c as ^Compilacao).opcoes, "test")) {
+        return
+    }
+    alvo = modulo_alvo_do_teste(c)
+    var k: u32 = 1
+    while k < (c as ^Compilacao).modulos.n {
+        let ptr_1: ^Compilacao = c as ^Compilacao
+        var tern_1: i32 = 0
+        if alvo != 0 {
+            tern_1 = common.c2f_b2i32(k == alvo)
+        } else {
+            tern_1 = common.c2f_b2i32((c as ^Compilacao).modulos.itens[k].origem == (frontend.MOD_ARQUIVO as u8))
+        }
+        ptr_1.sem.modulo_testado[k] = tern_1 != 0
+        k += 1
+    }
+}
+
+// C: driver/main.c:325
+proc marcar_import_do_alvo(c: ?^Compilacao) {
+    let alvo: u32 = modulo_alvo_do_teste(c)
+    if (alvo != 0) and ((c as ^Compilacao).sem.import_usado != none) {
+        let ptr_1: ^Compilacao = c as ^Compilacao
+        let p_1 = ptr_1.sem.import_usado or_else {}
+        p_1[alvo] = 1
+    }
+}
+
+// C: driver/main.c:336
+// B12: le o arquivo inteiro (bytes crus, sem tirar BOM) para `dados`; false = nao abre, passa de LOAD_TAM_MAX ou nao le tudo (dados fica vazio).
+// O C media o arquivo antes de ler (fseek/ftell) e recusava sem ler o que passava de 16 MiB; aqui le e confere o tamanho depois (mesmo resultado).
+proc ler_load_arquivo(caminho: str, dados: ^[dynamic]u8) -> bool {
+    var motivo: str = ""
+    if not common.c2f_ler_arquivo(caminho, dados, &motivo) {
+        return false
+    }
+    if (len(dados^) as u64) > LOAD_TAM_MAX {
+        clear(dados)
+        return false
+    }
+    return true
+}
+
+// C: driver/main.c:358
+// B12: um #load: caminho = pasta do arquivo raiz + '\' + o texto ('/' vira '\'); o no troca o nome pelo conteudo internado e a Compilacao guarda (no, caminho, Hash64).
+proc resolver_um_load(c: ?^Compilacao, pasta: str, no: ^frontend.Expr) -> bool {
+    let cc: ^Compilacao = c as ^Compilacao
+    let resto: str = common.interner_texto(&cc.nomes, no.nome)
+    // L4b: caminho com unidade (C:...) nao junta com a pasta raiz; a causa e essa, nao 'nao abre'.
+    if (len(resto) > 1) and (resto[1] == 58) { // ':'
+        let msg_1 = format(f"#load(\"{resto}\"): caminho absoluto (com unidade, ex.: C:) nao e aceito; o caminho e relativo a pasta do arquivo raiz", alloc = heap)
+        defer delete(msg_1)
+        return common.diag_relatar(&cc.diag, common.E1007, no.pos, msg_1)
+    }
+    let caminho: str = montar_caminho(pasta, resto, "")
+    defer delete(caminho)
+    var dados = make([dynamic]u8, alloc = heap)
+    defer delete(dados)
+    if not ler_load_arquivo(caminho, &dados) {
+        let msg_2 = format(f"#load(\"{resto}\"): o arquivo nao abre ou passa de {LOAD_TAM_MAX} bytes (16 MiB)", alloc = heap)
+        defer delete(msg_2)
+        return common.diag_relatar(&cc.diag, common.E1007, no.pos, msg_2)
+    }
+    let id_caminho: i32 = common.internar(&cc.nomes, caminho, len(caminho) as u32)
+    append(&cc.resolvidos, item = nativo.NativoCarga{caminho = common.interner_texto(&cc.nomes, id_caminho), hash = common.hash64(dados[..], len(dados) as u64, common.HASH64_SEMENTE)})
+    let conteudo: str = from_bytes(dados[..], alloc = heap)
+    defer delete(conteudo)
+    no.nome = common.internar(&cc.nomes, conteudo, len(conteudo) as u32)
+    return true
+}
+
+// C: driver/main.c:385
+// B12: antes da semantica, cada #load do parser (Compilacao.cargas, em ordem) le o arquivo; o 1o erro para (E1007).
+proc resolver_loads(c: ?^Compilacao) -> bool {
+    let cc: ^Compilacao = c as ^Compilacao
+    let pasta: str = pasta_do_fonte(c)
+    for k in 0..<len(cc.cargas) {
+        if not resolver_um_load(c, pasta, cc.cargas[k] as ^frontend.Expr) {
+            return false
+        }
+    }
+    return true
+}
+
+// C: driver/main.c:396
+// Semantica sobre a AST (tipos, unidades, nomes, resultado, fluxo, test), medindo o tempo. false = diagnostico em c.diag.
+// Semantica.nomes e .modulos sao fatias (contrato G3): aqui, fatias de 1 elemento sobre o Interner e os Modulos da Compilacao (slice_from emprestada, sem copia).
+proc analisar_semantica(c: ^Compilacao) -> bool {
+    let t0: u64 = common.relogio_ns()
+    if not resolver_loads(c) {
+        return false
+    }
+    c.sem.modulos = slice_from(&c.modulos, len = 1)
+    c.sem.qtd_modulos = c.modulos.n
+    c.sem.fonte = &c.fonte
+    c.sem.nomes = slice_from(&c.nomes, len = 1)
+    c.sem.arena = &c.arena
+    c.sem.diag = &c.diag
+    c.sem.programa = &c.parser.programa
+    selecionar_testes_de_modulos(c)
+    semantic.semantica_iniciar(&c.sem)
+    c.sem.alvo_lp64 = (c.opcoes != none) and (alvo_eh_linux(c.opcoes) or alvo_eh_a64(c.opcoes))
+    marcar_import_do_alvo(c)
+    let ok: bool = semantic.semantica_analisar(&c.sem)
+    c.tempos.check_ns = common.relogio_ns() - t0
+    return ok
+}
+
+// C: driver/main.c:418
+// Diagnostico: a lista da semantica (uma linha JSON por erro, ja ordenada) ou o Diag unico do lexico, sintaxe, lowering e demais; exit 1. Falha sem diagnostico = erro interno, exit 3.
+// `sd` e o SaidaDiag unico do principal (C2F-70).
+proc relatar_falha(c: ?^Compilacao, sd: ^common.SaidaDiag) -> i32 {
+    let cc: ^Compilacao = c as ^Compilacao
+    if cc.sem.lista.n > 0 {
+        let saida_lista = common.c2f_saida_stdout()
+        common.diag_lista_imprimir(&cc.sem.lista, &cc.fonte, saida_lista, sd)
+        _ = common.c2f_saida_fechar(saida_lista)
+        return nativo.SAIDA_DIAGNOSTICO
+    }
+    if not cc.diag.tem {
+        return nativo.SAIDA_INTERNO
+    }
+    let saida_diag = common.c2f_saida_stdout()
+    common.diag_imprimir_json(&cc.diag, &cc.fonte, saida_diag, sd)
+    _ = common.c2f_saida_fechar(saida_diag)
+    return nativo.SAIDA_DIAGNOSTICO
+}
+
+// C: driver/main.c:430
+proc baixar_ir_medido(c: ?^Compilacao) -> bool {
+    let t0: u64 = common.relogio_ns()
+    let ok: bool = ir.lower_programa(&(c as ^Compilacao).sem, &(c as ^Compilacao).ir)
+    let ptr_1: ^Compilacao = c as ^Compilacao
+    ptr_1.tempos.ir_ns = common.relogio_ns() - t0
+    return ok
+}
+
+// C: driver/main.c:440
+// --backend x64: front-end e IR do main, depois o nativo gera o exe (ou a DLL, com o .h do mesmo emitir_cabecalho) em 'saida' (BIR -> x64 -> PE, sem gcc nem ld).
+proc gerar_exe_nativo(o: ^Opcoes, c: ^Compilacao, saida: ?str, sd: ^common.SaidaDiag) -> i32 {
+    var pedido: nativo.NativoPedido = pedido_nativo(o, c, saida)
+    pedido.sd = sd
+    var pastas: PastasDeLigacao = PastasDeLigacao{}
+    var codigo: i32 = 0
+    c.nativo_medido = true
+    if ((not analisar_sintaxe(c, true)) or (not analisar_semantica(c))) or (not baixar_ir_medido(c)) {
+        return relatar_falha(c, sd)
+    }
+    if pedido.dll and (backend.contar_exportados(&c.ir) == 0) {
+        return dll_sem_exportados(sd)
+    }
+    pastas_do_programa(c, &pastas) // M3 P19: onde o nativo acha as bibliotecas dos 'link' (a busca do -L)
+    pedido.pasta_libs = pastas.raiz
+    pedido.pastas_extra = pastas.extras[..]
+    pedido.npastas_extra = pastas.nextras
+    codigo = nativo.nativo_construir_exe(&pedido)
+    if (codigo == nativo.SAIDA_OK) and pedido.dll {
+        return gravar_cabecalho(o, saida or_else "", c)
+    }
+    return codigo
+}
+
+// C: driver/main.c:458
+// build --backend x64 --suporte --json <arq.fj>: front-end e IR, depois o relatorio do que o nativo recusa (exit 0).
+proc rodar_suporte(o: ^Opcoes, c: ?^Compilacao, sd: ^common.SaidaDiag) -> i32 {
+    var pedido: nativo.NativoPedido = pedido_nativo(o, c, none)
+    if ((not analisar_sintaxe(c, true)) or (not analisar_semantica(c as ^Compilacao))) or (not ir.lower_programa(&(c as ^Compilacao).sem, &(c as ^Compilacao).ir)) {
+        return relatar_falha(c, sd)
+    }
+    return nativo.nativo_suporte_programa(&pedido)
+}
+
+// C: driver/main.c:467
+proc rodar_build(o: ^Opcoes, c: ?^Compilacao, sd: ^common.SaidaDiag) -> i32 {
+    if o.suporte {
+        return rodar_suporte(o, c, sd)
+    }
+    return gerar_exe_nativo(o, c as ^Compilacao, o.saida, sd)
+}
+
+// C: driver/main.c:475
+proc executar_programa(o: ^Opcoes, arq_exe: str, sd: ^common.SaidaDiag) -> i32 {
+    return limites_executar(o, arq_exe, sd)
+}
+
+// C: driver/main.c:482
+// Programa com 'link': o loader acha a .dll na pasta do .fj porque ela entra no inicio do PATH do PROPRIO forja (o filho herda; nada fora do processo muda).
+proc pasta_do_fonte_no_path(c: ?^Compilacao) {
+    var pastas: PastasDeLigacao = PastasDeLigacao{}
+    if (c as ^Compilacao).ir.nbibliotecas == 0 {
+        return
+    }
+    pastas_do_programa(c, &pastas)
+    var novo = make([dynamic]u8, alloc = heap)
+    defer delete(novo)
+    append(&novo, items = as_bytes(pastas.raiz))
+    for k in 0..<(pastas.nextras as int) {
+        append(&novo, item = 59) // ';'
+        append(&novo, items = as_bytes(pastas.extras[k]))
+    }
+    append(&novo, item = 59)
+    append(&novo, items = as_bytes(os.env("PATH") or_else ""))
+    let texto: str = from_bytes(novo[..], alloc = heap)
+    defer delete(texto)
+    _ = os.set_env("PATH", texto)
+}
+
+// C: driver/main.c:498
+proc executar_e_apagar(o: ^Opcoes, c: ?^Compilacao, arq_exe: str, codigo: i32, sd: ^common.SaidaDiag) -> i32 {
+    var codigo_v: i32 = codigo
+    if codigo_v == nativo.SAIDA_OK {
+        pasta_do_fonte_no_path(c)
+    }
+    if codigo_v == nativo.SAIDA_OK {
+        codigo_v = executar_programa(o, arq_exe, sd)
+    }
+    proc_apagar_exe_do_run(arq_exe)
+    return codigo_v
+}
+
+// C: driver/main.c:508
+// Exe temporario do run/test: %TEMP%\forja_run\<hash do caminho do fonte>\<nome>.exe, sem pid (D-IA1, M-D6: o argv[0] do programa e o mesmo em toda execucao).
+// A variante (comando, backend, release) entra no hash para execucoes simultaneas do mesmo fonte nao se pisarem.
+proc exe_temporario_do_run(o: ^Opcoes, arq_exe: []u8, tam: u64) -> bool {
+    var release: i32 = 0
+    if o.release {
+        release = 1
+    }
+    let comando: str = o.comando or_else "(null)"
+    let backend_texto: str = o.backend or_else "c"
+    var alvo_texto: str = ""
+    if alvo_eh_wasm(o) { // 0.33.0: o mesmo fonte em x64 e em wasm nao pode dividir o arquivo temporario
+        alvo_texto = "/w"
+    }
+    let variante_inteira = format(f"{comando}/{backend_texto}/{release}{alvo_texto}", alloc = heap)
+    defer delete(variante_inteira)
+    // char variante[64]: o snprintf corta em 63 bytes
+    let variante: str = variante_inteira[0..<min(len(variante_inteira), VARIANTE_RUN_MAX - 1)]
+    return proc_exe_do_run(arq_exe, tam, o.entrada, variante)
+}
+
+// C: driver/main.c:517
+// forja run: o exe temporario vem do nativo, roda e e apagado.
+proc rodar_run_nativo(o: ^Opcoes, c: ?^Compilacao, sd: ^common.SaidaDiag) -> i32 {
+    var arq_exe_buf = make([dynamic]u8, alloc = heap, len = ARQ_EXE_RUN_MAX)
+    defer delete(arq_exe_buf)
+    if not exe_temporario_do_run(o, arq_exe_buf[..], ARQ_EXE_RUN_MAX as u64) {
+        return nativo.SAIDA_INTERNO
+    }
+    let arq_exe: str = buffer_para_texto(arq_exe_buf[..])
+    defer delete(arq_exe)
+    let codigo: i32 = gerar_exe_nativo(o, c as ^Compilacao, arq_exe, sd)
+    if alvo_eh_wasm(o) {
+        return executar_wasm_e_apagar(o, arq_exe, codigo, sd)
+    }
+    return executar_e_apagar(o, c, arq_exe, codigo, sd)
+}
+
+// 0.33.0: run e test no alvo wasm: grava o executor ao lado do .wasm temporario, roda `node --no-warnings <executor> <wasm>` sob os limites e apaga os dois
+proc executar_wasm_e_apagar(o: ^Opcoes, arq_wasm: str, codigo: i32, sd: ^common.SaidaDiag) -> i32 {
+    var codigo_v: i32 = codigo
+    let script = format(f"{arq_wasm}.mjs", alloc = heap)
+    defer delete(script)
+    if (codigo_v == nativo.SAIDA_OK) and (not common.arquivo_gravar(script, EXECUTOR_WASM, len(EXECUTOR_WASM) as u64)) {
+        driver_stderr_texto("forja: nao consegui gravar o executor do wasm ao lado do .wasm temporario\n")
+        codigo_v = nativo.SAIDA_INTERNO
+    }
+    if codigo_v == nativo.SAIDA_OK {
+        var prefixo: [4]str = {"--no-warnings", script, arq_wasm, o.comando or_else "run"}
+        codigo_v = limites_executar_node(o, prefixo[..], sd)
+    }
+    proc_apagar_arquivo_do_run(script)
+    proc_apagar_exe_do_run(arq_wasm)
+    return codigo_v
+}
+
+// C: driver/main.c:527
+proc rodar_test(o: ^Opcoes, c: ?^Compilacao, sd: ^common.SaidaDiag) -> i32 {
+    opcoes_ambiente_do_teste(o)
+    if alvo_eh_linux(o) {
+        return gerar_exe_nativo(o, c as ^Compilacao, o.saida, sd)
+    }
+    return rodar_run_nativo(o, c, sd)
+}
+
+// C: driver/main.c:535
+proc rodar_run(o: ^Opcoes, c: ?^Compilacao, sd: ^common.SaidaDiag) -> i32 {
+    return rodar_run_nativo(o, c, sd)
+}
+
+// C: driver/main.c:541
+proc conferir_layout_no_check(c: ?^Compilacao) -> bool {
+    return (not (c as ^Compilacao).sem.usa_layout) or (common.c2f_b2i32(ir.lower_programa(&(c as ^Compilacao).sem, &(c as ^Compilacao).ir)) != 0)
+}
+
+// C: driver/main.c:547
+// check: lexico, parser, semantica e o layout; o ast tem comando proprio (driver\cmd_ast).
+proc rodar_analise(o: ^Opcoes, c: ?^Compilacao, sd: ^common.SaidaDiag) -> i32 {
+    if comando_eh(o, "ast") {
+        return rodar_ast(o, c, sd)
+    }
+    if (analisar_sintaxe(c, true) and analisar_semantica(c as ^Compilacao)) and conferir_layout_no_check(c) {
+        if conferir_canonico_se_ha(o.canonico, &(c as ^Compilacao).fonte, sd) {
+            return nativo.SAIDA_OK
+        }
+        return nativo.SAIDA_DIAGNOSTICO
+    }
+    return relatar_falha(c, sd)
+}
+
+// C: driver/main.c:553
+proc rodar_comando(o: ^Opcoes, c: ?^Compilacao, sd: ^common.SaidaDiag) -> i32 {
+    if comando_eh(o, "build") {
+        return rodar_build(o, c, sd)
+    }
+    if comando_eh(o, "test") {
+        return rodar_test(o, c, sd)
+    }
+    if comando_eh(o, "run") {
+        return rodar_run(o, c, sd)
+    }
+    return rodar_analise(o, c, sd)
+}
+
+// C: driver/main.c:562
+proc rodar_explicar(codigo: ?str) -> i32 {
+    let indice: i32 = common.diag_codigo_por_texto(codigo)
+    if indice < 0 {
+        let txt_1 = codigo or_else "(null)"
+        let msg_1 = format(f"forja: codigo de diagnostico desconhecido: {txt_1}\n", alloc = heap)
+        defer delete(msg_1)
+        common.c2f_saida_formatar(common.c2f_saida_stderr(), msg_1)
+        return nativo.SAIDA_USO
+    }
+    common.diag_explicar_json(indice, common.c2f_saida_stdout())
+    return nativo.SAIDA_OK
+}
+
+// C: driver/main.c:575
+// --tempos: sem o build x64 (check, ast), as etapas do front-end, o emit_ns (0: o emissor C saiu) e o total; no build x64, o registro completo (nativo_tempos_gravar, a mesma tabela do .debug.jsonl).
+proc gravar_tempos(caminho: ?str, c: ?^Compilacao, total_ns: u64) -> bool {
+    let cc: ^Compilacao = c as ^Compilacao
+    if cc.nativo_medido {
+        return nativo.nativo_tempos_gravar(caminho, cc.emit_ns, &cc.tempos, &cc.fonte)
+    }
+    let linhas: u64 = common.fonte_contar_linhas(&cc.fonte)
+    let texto = format(f"{{\"lex_ns\": {cc.tempos.lex_ns}, \"parse_ns\": {cc.tempos.parse_ns}, \"check_ns\": {cc.tempos.check_ns}, \"emit_ns\": {cc.emit_ns}, \"total_ns\": {total_ns}, \"linhas\": {linhas}}}\n", alloc = heap)
+    defer delete(texto)
+    return (len(texto) > 0) and common.arquivo_gravar(caminho, texto, len(texto) as u64)
+}
+
+// C: driver/main.c:589
+// S4 P2: o alvo de forja test <modulo> nao tem arquivo: a raiz sintetica (raiz_alvo) entra em memoria sob o caminho virtual.
+proc ler_entrada(o: ^Opcoes, f: ^common.Fonte) -> bool {
+    if o.alvo_teste != none {
+        let raiz: str = o.raiz_alvo or_else ""
+        return common.fonte_adotar_texto(f, o.entrada, raiz, len(raiz) as u64)
+    }
+    if o.stdin_fonte {
+        let entrada_padrao = common.c2f_saida_stdout() // o FILE * do C era stdin; fonte_ler_de_stream le a entrada padrao do processo e nao usa este objeto
+        let lido: bool = common.fonte_ler_de_stream(f, entrada_padrao, o.entrada)
+        _ = common.c2f_saida_fechar(entrada_padrao)
+        return lido
+    }
+    return common.fonte_ler(f, o.entrada)
+}
+
+// C: driver/main.c:596
+// Comandos que leem o .fj: le o arquivo, roda o comando e grava --tempos se pedido. C2F-21: calloc -> new (zerado); o "memoria esgotada" do C nao existe aqui.
+proc executar_compilacao(o: ^Opcoes, sd: ^common.SaidaDiag) -> i32 {
+    let inicio: u64 = common.relogio_ns()
+    let c: ^Compilacao = new(Compilacao, alloc = heap)
+    var codigo: i32 = 0
+    if not ler_entrada(o, &c.fonte) {
+        delete(c)
+        return nativo.SAIDA_USO
+    }
+    if alvo_eh_wasm(o) and (comando_eh(o, "build") or comando_eh(o, "run") or comando_eh(o, "test")) {
+        // 0.33.0: um prefixo so (cada chamada de fonte_prefixar_raiz desloca os numeros de linha do usuario pelas linhas do prefixo anterior)
+        let imports = format(f"{IMPORT_RUNTIME_WASM}{prefixo_de_teste_wasm(o)}", alloc = heap)
+        defer delete(imports)
+        common.fonte_prefixar_raiz(&c.fonte, imports)
+    }
+    // A2.2(a): o alvo a64 leva o runtime do wasm (wasm_* reusados) e o host std:a64_rt; um so prefixo (o ramo do wasm e exclusivo)
+    // I3: o iOS leva o mesmo prefixo mais std:a64_ios (rt_syscall: syscalls Linux do runtime -> libSystem)
+    if alvo_eh_a64(o) and (comando_eh(o, "build") or comando_eh(o, "run") or comando_eh(o, "test")) {
+        var extra: str = ""
+        if alvo_eh_ios(o) {
+            extra = IMPORT_RUNTIME_IOS
+        }
+        let imports_a64 = format(f"{IMPORT_RUNTIME_WASM_A64}{IMPORT_RUNTIME_A64}{extra}", alloc = heap)
+        defer delete(imports_a64)
+        common.fonte_prefixar_raiz(&c.fonte, imports_a64)
+    }
+    iniciar_compilacao(c)
+    c.opcoes = o
+    c.tempos.inicio_ns = inicio
+    c.sem.lista.teto = opcoes_max_erros(o)
+    codigo = rodar_comando(o, c, sd)
+    if (o.tempos != none) and (not gravar_tempos(o.tempos, c, common.relogio_ns() - inicio)) {
+        codigo = nativo.SAIDA_USO
+    }
+    liberar_compilacao(c)
+    delete(c)
+    return codigo
+}
+
+// C: driver/main.c:620
+// Le e valida as opcoes de check/ast/build/run/test/explicar; devolve o motivo do uso errado ou none. 'linha' guarda a linha de comando para o pacote de relato (o texto
+// de Opcoes.linha e uma copia no alocador frame: o buffer e do principal).
+// LIMITE: parametros 6 (argc+argv e o par da linha de comando; o buffer linha+tam e a saida; o SaidaDiag unico vai junto; funcao de uso unico, struct nao ganha clareza).
+proc preparar_opcoes(argc: i32, argv: []str, o: ^Opcoes, linha: []u8, tam: u64, sd: ^common.SaidaDiag) -> ?str {
+    var erro: ?str = opcoes_ler(argc, argv, o)
+    opcoes_linha_de_comando(argc, argv, linha, tam)
+    o.linha = from_bytes(linha[0..<common.c2f_strlen_b(linha)], alloc = frame)
+    if (erro == none) and (not opcoes_conferir_aposentados(o, sd)) {
+        erro = "" // "" = X0003 ja impresso: a validacao nao roda (--modo c sem -o)
+    }
+    if erro == none {
+        erro = opcoes_validar(o)
+    }
+    if erro == none {
+        erro = opcoes_preparar_alvo_do_teste(o)
+    }
+    if erro == none {
+        erro = limites_preparar_argumentos(o)
+    }
+    return erro
+}
+
+// C: driver/main.c:634
+// Opcoes validas: resolve o backend e despacha o comando. `sd` e o SaidaDiag unico do principal (C2F-70): o resumo liga aqui.
+proc rodar_com_opcoes(o: ^Opcoes, sd: ^common.SaidaDiag) -> i32 {
+    common.diag_modo_resumo(sd, o.resumo)
+    opcoes_resolver_backend(o)
+    if not opcoes_conferir_backend_alvo(o, sd) {
+        return nativo.SAIDA_USO
+    }
+    if comando_eh(o, "explicar") {
+        return rodar_explicar(o.entrada)
+    }
+    if comando_eh(o, "ast") and (not ast_resolver_entrada(o)) {
+        return nativo.SAIDA_USO
+    }
+    if o.projeto and (not comando_eh(o, "ast")) {
+        return orquestrar_projeto(o, sd)
+    }
+    if o.suporte and (o.entrada == none) {
+        return nativo.nativo_suporte_tabela()
+    }
+    return executar_compilacao(o, sd)
+}
+
+// C: driver/main.c:646
+// Ponto de entrada (main do C): cria o SaidaDiag unico (C2F-70) e o desce por todo o driver; a raiz forja.fj sai por os.exit com o codigo devolvido.
+pub proc principal(args: []str) -> i32 {
+    let argc: i32 = len(args) as i32
+    var sd: common.SaidaDiag = common.SaidaDiag{}
+    let o: ^Opcoes = new(Opcoes, alloc = heap) // c.opcoes guarda o ponteiro: o objeto nao pode ser local
+    defer delete(o)
+    var linha = make([dynamic]u8, alloc = heap, len = (MAIN_TAM_LINHA as int))
+    defer delete(linha)
+    var codigo: i32 = 0
+    if argc < 2 {
+        return main_uso_errado("falta o comando")
+    }
+    if despachar_subcomando(argc, args, &codigo) {
+        return codigo
+    }
+    if (argc == 2) and (args[1] == "--versao") {
+        let versao_texto = format(f"forja {FORJA_VERSAO} (Linguagem v1.13)\n", alloc = heap)
+        defer delete(versao_texto)
+        let saida = common.c2f_saida_stdout()
+        common.c2f_saida_escrever_texto(saida, versao_texto)
+        _ = common.c2f_saida_fechar(saida)
+        return nativo.SAIDA_OK
+    }
+    let erro: ?str = preparar_opcoes(argc, args, o, linha[..], (MAIN_TAM_LINHA as u64), &sd)
+    if (erro != none) and (len(erro or_else "") == 0) {
+        return nativo.SAIDA_USO
+    }
+    if erro != none {
+        return main_uso_errado(erro)
+    }
+    return rodar_com_opcoes(o, &sd)
+}

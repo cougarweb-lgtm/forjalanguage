@@ -1,0 +1,297 @@
+// std:shaping 0.1.0 - shaping de texto UTF-8 e subset de fonte (PDF) por cima do HarfBuzz 15.1.0 (licenca Old MIT) em vendor\libharfbuzz.a (Windows) e vendor\linux\libharfbuzz.a (Linux).
+// Versao: 0.1.0
+// Changelog: 0.1.0 - primeira versao: open/close, metricas, cmap (glifo do codepoint), avanco, shape (glifos com avanco e deslocamento, direcao, script, idioma, features), subset (TTF/OTF com os glifos dados) e version. Fonte: uma face (indice 0), escala = units_per_em (posicoes em unidades da fonte).
+//
+// COMO USAR (o .fj raiz precisa de uma pasta vendor\ ao lado: libharfbuzz.a, shaping\shaping.fj, shaping\shaping_c.fj; ver MEM-FORJA-GUIA-10):
+//     import "vendor:shaping/shaping"
+//     ...
+//     let dados = try file.read_all("fonte.ttf", alloc = heap)     // [dynamic]u8 DONA
+//     defer delete(dados)
+//     let fonte = try shaping.open(dados[..])                      // copia os bytes: pode liberar dados logo depois
+//     defer shaping.close(fonte)
+//     let glifos = try shaping.shape(fonte, "office", shaping.ShapeOptions{})
+//     defer delete(glifos)
+//     let subconjunto = try shaping.subset(fonte, gids[..], shaping.SUBSET_SEM_HINTS)
+//     defer delete(subconjunto)
+//
+// TEXTO: todo parametro de texto publico e `str` (script, idioma e features viram cstr em heap dentro da proc e sao liberados ali). Texto UTF-8 invalido vira glifo 0 (.notdef) no shape.
+//
+// DONOS E EMPRESTADOS:
+//   - open devolve Font DONA do handle do HarfBuzz: shaping.close(fonte) UMA vez.
+//   - shape devolve [dynamic]Glyph DONA: delete(lista) quando acabar.
+//   - subset devolve [dynamic]u8 DONA (bytes da fonte subset): delete(bytes) quando acabar.
+//   - open e shape EMPRESTAM dados e texto: o resultado nao depende deles.
+//
+// ERRO: ShapingError.
+//   invalid_font   = bytes vazios, maiores que 256 MiB, fonte truncada ou sem glifos, ou Font ja fechada.
+//   invalid_input  = direcao/script/idioma/features com sintaxe errada, ou subset sem nenhum glifo.
+//   invalid_glyph  = gid fora da faixa da fonte (metricas/avanco/subset).
+//   out_of_memory  = o HarfBuzz nao conseguiu alocar.
+//
+// VERIFICAR: forja run language\exemplos_libs\shaping_basico.fj   (e: python -I language\exemplos_libs\oraculos\shaping.py <pasta da fonte>)
+
+import "vendor:shaping/shaping_c" as sc
+
+pub enum ShapingError {
+    invalid_font
+    invalid_input
+    invalid_glyph
+    out_of_memory
+}
+
+pub enum Direction {
+    auto
+    ltr
+    rtl
+    ttb
+    btt
+}
+
+// Fonte aberta. Dona do handle do HarfBuzz: shaping.close uma vez.
+pub struct Font {
+    handle: ?^sc.HbfFont
+}
+
+// Metricas horizontais em unidades da fonte (ascender > 0, descender < 0 em fonte comum).
+pub struct FontMetrics {
+    ascender: i32
+    descender: i32
+    line_gap: i32
+}
+
+// Um glifo do shape. Posicoes em unidades da fonte (divida por units_per_em para escala).
+pub struct Glyph {
+    gid: u32
+    cluster: u32
+    x_advance: i32
+    y_advance: i32
+    x_offset: i32
+    y_offset: i32
+}
+
+// Opcoes do shape. script "" e idioma "" = adivinhar pelo texto; features "kern,-liga,ss01=1" ou "".
+pub struct ShapeOptions {
+    direction: Direction = Direction.auto
+    script: str = ""
+    language: str = ""
+    features: str = ""
+}
+
+// Flags do subset (combinadas por |): sem hinting; manter os gids originais (senao renumera).
+pub const SUBSET_SEM_HINTS: u32 = 1
+pub const SUBSET_MANTER_GIDS: u32 = 2
+
+const SHAPING_FONTE_MAXIMA: int = 268435456
+const SHAPING_REGISTRO_GLIFO: int = 24
+
+// Abre a fonte (face 0) a partir dos bytes. Erro: invalid_font.
+pub proc open(dados: []u8) -> Font ! ShapingError {
+    if len(dados) == 0 {
+        return ShapingError.invalid_font
+    }
+    if len(dados) > SHAPING_FONTE_MAXIMA {
+        return ShapingError.invalid_font
+    }
+    let handle = sc.hbf_font_open(&dados[0], len(dados) as u64, 0)
+    if handle == none {
+        return ShapingError.invalid_font
+    }
+    return Font{handle = handle}
+}
+
+// Libera a fonte. Chame uma vez por Font.
+pub proc close(fonte: Font) {
+    sc.hbf_font_close(fonte.handle)
+}
+
+// units_per_em da fonte. Erro: invalid_font.
+pub proc units_per_em(fonte: Font) -> i32 ! ShapingError {
+    if fonte.handle == none {
+        return ShapingError.invalid_font
+    }
+    var valor: i32 = 0
+    if sc.hbf_units_per_em(fonte.handle, &valor) != sc.HBF_OK {
+        return ShapingError.invalid_font
+    }
+    return valor
+}
+
+// Metricas horizontais (ascender, descender, line_gap). Erro: invalid_font.
+pub proc metrics(fonte: Font) -> FontMetrics ! ShapingError {
+    if fonte.handle == none {
+        return ShapingError.invalid_font
+    }
+    var ascender: i32 = 0
+    var descender: i32 = 0
+    var line_gap: i32 = 0
+    if sc.hbf_font_metricas(fonte.handle, &ascender, &descender, &line_gap) != sc.HBF_OK {
+        return ShapingError.invalid_font
+    }
+    return FontMetrics{ascender = ascender, descender = descender, line_gap = line_gap}
+}
+
+// Quantidade de glifos da fonte. Erro: invalid_font.
+pub proc glyph_count(fonte: Font) -> i32 ! ShapingError {
+    if fonte.handle == none {
+        return ShapingError.invalid_font
+    }
+    var total: i32 = 0
+    if sc.hbf_glyph_count(fonte.handle, &total) != sc.HBF_OK {
+        return ShapingError.invalid_font
+    }
+    return total
+}
+
+// Glifo do codepoint pelo cmap; 0 = ausente na fonte. Erro: invalid_font.
+pub proc glyph_for_char(fonte: Font, codepoint: u32) -> u32 ! ShapingError {
+    if fonte.handle == none {
+        return ShapingError.invalid_font
+    }
+    var gid: u32 = 0
+    if sc.hbf_glyph_for_codepoint(fonte.handle, codepoint, &gid) != sc.HBF_OK {
+        return ShapingError.invalid_input
+    }
+    return gid
+}
+
+// Avanco horizontal do glifo em unidades da fonte. Erros: invalid_font, invalid_glyph (gid fora da faixa).
+pub proc glyph_advance(fonte: Font, gid: u32) -> i32 ! ShapingError {
+    if fonte.handle == none {
+        return ShapingError.invalid_font
+    }
+    var avanco: i32 = 0
+    let codigo = sc.hbf_glyph_advance(fonte.handle, gid, &avanco)
+    if codigo == sc.HBF_ERR_GLIFO {
+        return ShapingError.invalid_glyph
+    }
+    if codigo != sc.HBF_OK {
+        return ShapingError.invalid_font
+    }
+    return avanco
+}
+
+// Codigo da direcao para a ponte. Enum sem caso cai no codigo automatico.
+proc codigo_da_direcao(direcao: Direction) -> i32 {
+    switch direcao {
+    case Direction.ltr:
+        return sc.HBF_DIRECAO_LTR
+    case Direction.rtl:
+        return sc.HBF_DIRECAO_RTL
+    case Direction.ttb:
+        return sc.HBF_DIRECAO_TTB
+    case Direction.btt:
+        return sc.HBF_DIRECAO_BTT
+    case Direction.auto:
+        return sc.HBF_DIRECAO_AUTO
+    }
+    return sc.HBF_DIRECAO_AUTO
+}
+
+// Le um inteiro de 32 bits little-endian da visao de bytes (posicao = primeiro byte do campo).
+proc ler_u32(bytes: []u8, posicao: int) -> u32 {
+    let b0 = bytes[posicao] as u32
+    let b1 = bytes[posicao + 1] as u32
+    let b2 = bytes[posicao + 2] as u32
+    let b3 = bytes[posicao + 3] as u32
+    return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+}
+
+// Copia o texto (str) para o handle do shape: ponteiro nulo quando vazio (a ponte aceita len 0).
+proc ponteiro_do_texto(bytes: []u8) -> ?^u8 {
+    if len(bytes) == 0 {
+        return none
+    }
+    return &bytes[0]
+}
+
+// Decodifica o registro do glifo i (24 bytes) para Glyph. Campos com sinal saem por transmute (bits crus).
+proc glifo_do_registro(bytes: []u8, indice: int) -> Glyph {
+    let base = indice * SHAPING_REGISTRO_GLIFO
+    return Glyph{
+        gid = ler_u32(bytes, base),
+        cluster = ler_u32(bytes, base + 4),
+        x_advance = transmute(ler_u32(bytes, base + 8), to = i32),
+        y_advance = transmute(ler_u32(bytes, base + 12), to = i32),
+        x_offset = transmute(ler_u32(bytes, base + 16), to = i32),
+        y_offset = transmute(ler_u32(bytes, base + 20), to = i32),
+    }
+}
+
+// Shape do texto. Erros: invalid_font, invalid_input (sintaxe de direcao/script/idioma/features), out_of_memory.
+pub proc shape(fonte: Font, texto: str, opcoes: ShapeOptions) -> [dynamic]Glyph ! ShapingError {
+    if fonte.handle == none {
+        return ShapingError.invalid_font
+    }
+    let bytes = as_bytes(texto)
+    let script_c = format_c(f"{opcoes.script}", alloc = heap)
+    defer delete(script_c)
+    let idioma_c = format_c(f"{opcoes.language}", alloc = heap)
+    defer delete(idioma_c)
+    let features_c = format_c(f"{opcoes.features}", alloc = heap)
+    defer delete(features_c)
+    let execucao = sc.hbf_shape(fonte.handle, ponteiro_do_texto(bytes), len(bytes) as u64, codigo_da_direcao(opcoes.direction), script_c, idioma_c, features_c)
+    defer sc.hbf_run_free(execucao)
+    if execucao == none {
+        return ShapingError.invalid_input
+    }
+    let corrida = execucao as ^sc.HbfRun
+    var total: i32 = 0
+    if sc.hbf_run_len(corrida, &total) != sc.HBF_OK {
+        return ShapingError.invalid_input
+    }
+    var glifos = make([dynamic]Glyph, alloc = heap)
+    if total == 0 {
+        return glifos
+    }
+    var bruto = make([dynamic]u8, alloc = heap)
+    defer delete(bruto)
+    resize(&bruto, total as int * SHAPING_REGISTRO_GLIFO)
+    if sc.hbf_run_copy(corrida, &bruto[0], total as u64 * SHAPING_REGISTRO_GLIFO as u64) != sc.HBF_OK {
+        delete(glifos)
+        return ShapingError.out_of_memory
+    }
+    let visao = bruto[..]
+    for i in 0..<(total as int) {
+        append(&glifos, item = glifo_do_registro(visao, i))
+    }
+    return glifos
+}
+
+// Subset da fonte com os gids dados (o glifo 0 entra sempre). flags: SUBSET_SEM_HINTS | SUBSET_MANTER_GIDS. Erros: invalid_font, invalid_input (lista vazia), invalid_glyph (gid fora da faixa), out_of_memory.
+pub proc subset(fonte: Font, gids: []u32, flags: u32) -> [dynamic]u8 ! ShapingError {
+    if fonte.handle == none {
+        return ShapingError.invalid_font
+    }
+    if len(gids) == 0 {
+        return ShapingError.invalid_input
+    }
+    let pacote = sc.hbf_subset(fonte.handle, &gids[0], len(gids) as u64, flags)
+    defer sc.hbf_bytes_free(pacote)
+    if pacote == none {
+        return ShapingError.invalid_glyph
+    }
+    let bytes_subset = pacote as ^sc.HbfBytes
+    var tamanho: u64 = 0
+    if sc.hbf_bytes_len(bytes_subset, &tamanho) != sc.HBF_OK {
+        return ShapingError.out_of_memory
+    }
+    var saida = make([dynamic]u8, alloc = heap)
+    resize(&saida, tamanho as int)
+    if sc.hbf_bytes_copy(bytes_subset, &saida[0], tamanho) != sc.HBF_OK {
+        delete(saida)
+        return ShapingError.out_of_memory
+    }
+    return saida
+}
+
+// Versao do HarfBuzz em uso (ex.: "15.1.0").
+pub proc version() -> str {
+    let texto = sc.hbf_version()
+    return (texto or_else "") as str
+}
+
+// Encerra a lib para o runtime do dev nao contar o cache de idiomas do HarfBuzz como R0009 (ends).
+// Chamar 1x no fim do programa, so depois que TODAS as threads que usam shaping terminaram; usar shaping de novo depois e valido.
+pub proc shutdown() {
+    sc.hbf_shutdown()
+}

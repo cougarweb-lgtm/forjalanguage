@@ -1,0 +1,113 @@
+// semantic/escopo.fj - porte de compiler/semantic/escopo.c, compiler/semantic/escopo.h
+// sha256 de semantic/escopo.c: 644327b8625d3803af2f787ff297ed2e95ae6bc4975afdb1d895c36b0d21b20b
+// sha256 de semantic/escopo.h: d21e8f9df3d86984db245294782b18925cc61f6415723a6b1d510d66dc891cb1
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "common"
+
+struct LocalInfo {
+    nome: i32
+    tipo: u32 // TipoId
+    natureza: u8
+    origem: u8
+    id: i32
+    anterior: i32
+    pos: u32
+    usos: u8
+    grupo: i32
+}
+
+struct Escopo {
+    pilha: [dynamic]LocalInfo
+    cabeca: ?[]i32
+}
+
+const LOC_LET: i32 = 0
+const LOC_VAR: i32 = 1
+const LOC_PARAM: i32 = 2
+const LOC_FOR: i32 = 3
+const LOC_LIGACAO: i32 = 4
+const ORIGEM_LITERAL: i32 = 7
+const ORIGEM_C: i32 = 8
+const LOCAL_LIDO: i32 = 1
+const LOCAL_ALTERADO: i32 = 2
+
+// C: semantic/escopo.h:43
+proc escopo_altura(e: ^Escopo) -> u32 {
+    return (len(e.pilha) as u64) as u32
+}
+
+// C: semantic/escopo.h:49
+proc escopo_buscar_mut(e: ^Escopo, nome: i32) -> ?^LocalInfo {
+    return escopo_buscar(e, nome)
+}
+
+// C: semantic/escopo.c:8
+proc escopo_iniciar(e: ^Escopo, arena: ^common.Arena, qtd_nomes: u32) {
+    e.pilha = make([dynamic]LocalInfo, alloc = heap)
+    e.cabeca = common.arena_fatia_i32(arena, qtd_nomes as int)
+}
+
+// C: semantic/escopo.c:14
+proc escopo_buscar(e: ^Escopo, nome: i32) -> ?^LocalInfo {
+    let topo: i32 = (e.cabeca or_else {})[nome]
+    var tern_1: ?^LocalInfo = none
+    if topo == 0 {
+        tern_1 = none
+    } else {
+        tern_1 = &e.pilha[common.c2f_s2u_64(topo as i64) - 1]
+    }
+    return tern_1
+}
+
+// C: semantic/escopo.c:20
+proc escopo_empurrar(e: ^Escopo, local: ^LocalInfo) {
+    append(&e.pilha, item = LocalInfo{})
+    let novo: ^LocalInfo = &e.pilha[len(e.pilha) - 1]
+    novo^ = local^
+    novo.anterior = (e.cabeca or_else {})[local.nome]
+    let p_1 = e.cabeca or_else {}
+    p_1[local.nome] = (len(e.pilha) as u64) as i32
+}
+
+// C: semantic/escopo.c:28
+proc escopo_recuar(e: ^Escopo, altura: u32) {
+    let cab = e.cabeca or_else {}
+    while (len(e.pilha) as u64) > (altura as u64) {
+        let nome: i32 = e.pilha[len(e.pilha) - 1].nome
+        let anterior: i32 = e.pilha[len(e.pilha) - 1].anterior
+        cab[nome] = anterior
+        truncate(&e.pilha, len(e.pilha) - 1)
+    }
+}
+
+// C: semantic/escopo.c:37
+proc escopo_liberar(e: ^Escopo) {
+    delete(e.pilha)
+}
+
+// Do TestaEscopo do teste_common.c, mais sombra do mesmo nome (empurrar/recuar restaura o anterior)
+test "escopo" {
+    var a: common.Arena = common.Arena{}
+    var e: Escopo = Escopo{}
+    escopo_iniciar(&e, &a, 8)
+    var x: LocalInfo = LocalInfo{nome = 3, tipo = TIPO_INT as u32, natureza = LOC_VAR as u8}
+    var y: LocalInfo = LocalInfo{nome = 4, tipo = TIPO_BOOL as u32, natureza = LOC_LET as u8, id = 1}
+    escopo_empurrar(&e, &x)
+    let altura: u32 = escopo_altura(&e)
+    escopo_empurrar(&e, &y)
+    expect((escopo_buscar_mut(&e, 3) as ^LocalInfo).tipo == (TIPO_INT as u32))
+    expect((escopo_buscar_mut(&e, 4) as ^LocalInfo).id == 1 and escopo_buscar(&e, 5) == none)
+    escopo_recuar(&e, altura)
+    expect(escopo_buscar(&e, 4) == none and escopo_buscar(&e, 3) != none)
+    var x2: LocalInfo = LocalInfo{nome = 3, tipo = TIPO_BOOL as u32, id = 9}
+    escopo_empurrar(&e, &x2)
+    expect(escopo_altura(&e) == 2 and (escopo_buscar_mut(&e, 3) as ^LocalInfo).id == 9 and (escopo_buscar_mut(&e, 3) as ^LocalInfo).anterior == 1)
+    escopo_recuar(&e, 1)
+    expect((escopo_buscar_mut(&e, 3) as ^LocalInfo).tipo == (TIPO_INT as u32) and escopo_altura(&e) == 1)
+    escopo_recuar(&e, 0)
+    expect(escopo_buscar(&e, 3) == none and escopo_buscar_mut(&e, 3) == none and escopo_altura(&e) == 0)
+    escopo_liberar(&e)
+    common.arena_liberar(&a)
+}

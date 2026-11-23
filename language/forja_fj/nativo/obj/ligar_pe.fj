@@ -1,0 +1,136 @@
+// nativo/obj/ligar_pe.fj - porte de compiler/nativo/obj/ligar_pe.c, compiler/nativo/obj/ligar_pe.h
+// sha256 de nativo/obj/ligar_pe.c: d00a722e2c724f3db2580b0a2b12f16496a70cce7094038d9f78b39a49130f8c
+// sha256 de nativo/obj/ligar_pe.h: de9f4b86dd137e90301ff4d03b8da8712d5b643b614f30510096feccbc7fdbbb
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "common"
+import "nativo/fmt" as pefmt
+
+const PE_TAM_ENTRADA_PDATA: u32 = 12
+const PE_TAM_RVA: u32 = 4
+const PE_BITS_BYTE: u32 = 8
+
+// C: nativo/obj/ligar_pe.c:14
+// C2F-B0: o void * do qsort vira ^u32 (o cast some); ordem total, o retorno e o do C
+proc compara_rva(a: ^u32, b: ^u32) -> i32 {
+    if a^ > b^ {
+        return 1
+    }
+    if a^ < b^ {
+        return -1
+    }
+    return 0
+}
+
+// C2F-B0: o par `_menor` do sort_by. Valores u32 iguais sao indistinguiveis, entao o desempate do qsort nao aparece na saida.
+proc compara_rva_menor(a: ^u32, b: ^u32) -> bool {
+    return compara_rva(a, b) < 0
+}
+
+// C: nativo/obj/ligar_pe.c:22
+proc ordenar_dir64(im: ^pefmt.Imagem) {
+    if len(im.dir64) > 1 {
+        sort_by(im.dir64[..], less = compara_rva_menor)
+    }
+}
+
+// C: nativo/obj/ligar_pe.c:28
+// C2F-INDECIDIVEL: p
+proc le_rva(p: []u8) -> u32 {
+    var v: u32 = 0
+    for k in (0 as u32)..<PE_TAM_RVA {
+        v = v | ((p[k] as u32) << ((k * PE_BITS_BYTE) & 31))
+    }
+    return v
+}
+
+// C: nativo/obj/ligar_pe.c:37
+proc pdata_ordenado(im: ^pefmt.Imagem, idx_pdata: i32, erro: ^common.Diag) -> bool {
+    if idx_pdata < 0 {
+        return true
+    }
+    let ps: ^pefmt.PeSecao = &im.secoes[idx_pdata as u32]
+    let qtd: u64 = (len(ps.bytes) as u64) / (PE_TAM_ENTRADA_PDATA as u64)
+    var i: u64 = 1
+    while i < qtd {
+        let ant: u64 = (i - 1) * (PE_TAM_ENTRADA_PDATA as u64)
+        let atu: u64 = ant + (PE_TAM_ENTRADA_PDATA as u64)
+        if le_rva(ps.bytes[ant..<atu]) > le_rva(ps.bytes[atu..<(atu + (PE_TAM_ENTRADA_PDATA as u64))]) {
+            let msg = format(f"autoconferencia do PE: .pdata fora de ordem na entrada {i}", alloc = heap)
+            defer delete(msg)
+            return common.diag_relatar(erro, common.X0905, 0, msg)
+        }
+        i += 1
+    }
+    return true
+}
+
+// C: nativo/obj/ligar_pe.c:52
+proc ligar_pe_finalizar(im: ^pefmt.Imagem, idx_pdata: i32, erro: ^common.Diag) -> bool {
+    ordenar_dir64(im)
+    return pdata_ordenado(im, idx_pdata, erro)
+}
+
+test "ligar_pe: compara_rva, ordenar_dir64 e le_rva" {
+    var a: u32 = 5
+    var b: u32 = 9
+    expect(compara_rva(&a, &b) == -1)
+    expect(compara_rva(&b, &a) == 1)
+    expect(compara_rva(&a, &a) == 0)
+    expect(compara_rva_menor(&a, &b))
+    expect(not compara_rva_menor(&b, &a))
+    var im: pefmt.Imagem = pefmt.Imagem{}
+    im.dir64 = make([dynamic]u32, alloc = heap)
+    defer delete(im.dir64)
+    ordenar_dir64(&im) // vazio: nada
+    append(&im.dir64, item = 4294967295)
+    ordenar_dir64(&im) // 1 so: nada
+    expect(len(im.dir64) == 1)
+    append(&im.dir64, item = 30)
+    append(&im.dir64, item = 10)
+    append(&im.dir64, item = 20)
+    append(&im.dir64, item = 10)
+    ordenar_dir64(&im)
+    expect(len(im.dir64) == 5)
+    expect(im.dir64[0] == 10)
+    expect(im.dir64[1] == 10)
+    expect(im.dir64[2] == 20)
+    expect(im.dir64[3] == 30)
+    expect(im.dir64[4] == 4294967295)
+    var campo: [4]u8 = {1, 2, 3, 128}
+    expect(le_rva(campo[..]) == 2147680769) // 0x80030201
+}
+
+test "ligar_pe: pdata_ordenado e ligar_pe_finalizar" {
+    var im: pefmt.Imagem = pefmt.Imagem{}
+    im.dir64 = make([dynamic]u32, alloc = heap)
+    defer delete(im.dir64)
+    var erro: common.Diag = common.Diag{tem = false}
+    expect(pdata_ordenado(&im, -1, &erro)) // sem .pdata
+    // 3 entradas de 12 bytes; o 1o u32 de cada e o RVA de inicio: 3, 7, 7 (ordenado, iguais valem)
+    im.secoes[0].bytes = make([dynamic]u8, alloc = heap)
+    defer delete(im.secoes[0].bytes)
+    var k: u32 = 0
+    while k < 36 {
+        append(&im.secoes[0].bytes, item = 0)
+        k += 1
+    }
+    im.secoes[0].bytes[0] = 3
+    im.secoes[0].bytes[12] = 7
+    im.secoes[0].bytes[24] = 7
+    expect(pdata_ordenado(&im, 0, &erro))
+    expect(ligar_pe_finalizar(&im, 0, &erro))
+    expect(not erro.tem)
+    // a 3a entrada passa a ser menor que a 2a: fora de ordem na entrada 2
+    im.secoes[0].bytes[24] = 6
+    expect(not pdata_ordenado(&im, 0, &erro))
+    expect(erro.codigo == common.X0905)
+    expect((erro.causa or_else "") == "autoconferencia do PE: .pdata fora de ordem na entrada 2")
+    // bytes sobrando (menos de 12) nao contam como entrada
+    var erro2: common.Diag = common.Diag{tem = false}
+    delete(im.secoes[0].bytes)
+    im.secoes[0].bytes = make([dynamic]u8, alloc = heap)
+    append(&im.secoes[0].bytes, item = 9)
+    expect(pdata_ordenado(&im, 0, &erro2))
+}

@@ -1,0 +1,310 @@
+// driver/cmd_consultar.fj - porte de compiler/driver/cmd_consultar.c, compiler/driver/cmd_consultar.h
+// sha256 de driver/cmd_consultar.c: b4dcc8e4d0f6c12f03e591c976f11f6f0e71c9105b94fad66465bb6af3ae0289
+// sha256 de driver/cmd_consultar.h: 56602a6f720f1f9ee6758453ebd89c62fb2f01c33e286aff8d69347365cbbac2
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "common"
+import "frontend"
+import "semantic"
+import "std:file"
+import "std:os"
+
+struct Pergunta {
+    nome: ?str
+    uso: ?str
+    com_arg: bool
+    responder: u16
+}
+
+struct Posicionais {
+    itens: [3]str
+    n: i32
+}
+
+const N_PERGUNTAS: i32 = 12
+const POSICIONAIS_MAX: i32 = 3
+const ENTRADA_TAM: i32 = 276
+const CONSULTA_CAMINHO_MAX: i32 = 260 // char base[MAX_PATH] do C
+const SUFIXO_API_COM_NUL: i32 = 18 // sizeof "\\consultar_api.fj" do C: 17 bytes + NUL
+const RAIZ_API_TAM: i32 = 256 // char raiz[256] do C
+
+// C: driver/cmd_consultar.c:20 (PERGUNTAS, na mesma ordem)
+const PERGUNTAS: [12]Pergunta = {
+    Pergunta{nome = "simbolos", uso = "simbolos [<alvo>] [--modulo <caminho>]", com_arg = false, responder = FUNCAO_RESPOSTA_CONSULTAR_SIMBOLOS},
+    Pergunta{nome = "escopo", uso = "escopo <arq:L:C> [<alvo>]", com_arg = true, responder = FUNCAO_RESPOSTA_CONSULTAR_ESCOPO},
+    Pergunta{nome = "refs", uso = "refs <nome> [<alvo>]", com_arg = true, responder = FUNCAO_RESPOSTA_CONSULTAR_REFS},
+    Pergunta{nome = "tipo", uso = "tipo <arq:L:C> [<alvo>]", com_arg = true, responder = FUNCAO_RESPOSTA_CONSULTAR_TIPO},
+    Pergunta{nome = "assinatura", uso = "assinatura <nome> [<alvo>]", com_arg = true, responder = FUNCAO_RESPOSTA_CONSULTAR_ASSINATURA},
+    Pergunta{nome = "campos", uso = "campos <Tipo> [<alvo>]", com_arg = true, responder = FUNCAO_RESPOSTA_CONSULTAR_CAMPOS},
+    Pergunta{nome = "callers", uso = "callers <nome> [<alvo>]", com_arg = true, responder = FUNCAO_RESPOSTA_CONSULTAR_CALLERS},
+    Pergunta{nome = "callees", uso = "callees <nome> [<alvo>]", com_arg = true, responder = FUNCAO_RESPOSTA_CONSULTAR_CALLEES},
+    Pergunta{nome = "imports", uso = "imports [<alvo>]", com_arg = false, responder = FUNCAO_RESPOSTA_CONSULTAR_IMPORTS},
+    Pergunta{nome = "api", uso = "api <modulo> [<alvo>]", com_arg = true, responder = FUNCAO_RESPOSTA_CONSULTAR_API},
+    Pergunta{nome = "testes", uso = "testes [<alvo>]", com_arg = false, responder = FUNCAO_RESPOSTA_CONSULTAR_TESTES},
+    Pergunta{nome = "entrada", uso = "entrada [<alvo>]", com_arg = false, responder = FUNCAO_RESPOSTA_CONSULTAR_ENTRADA},
+}
+
+// C: driver/cmd_consultar.c:36
+proc uso_errado(motivo: ?str) -> i32 {
+    let texto_motivo: str = motivo or_else ""
+    var msg = make([dynamic]u8, alloc = heap)
+    defer delete(msg)
+    format(f"forja: consultar: {texto_motivo}\nperguntas:\n", into = &msg)
+    var i: i32 = 0
+    while i < N_PERGUNTAS {
+        let uso_pergunta: str = PERGUNTAS[i as int].uso or_else ""
+        format(f"     forja consultar {uso_pergunta} [--json]\n", into = &msg)
+        i += 1
+    }
+    common.c2f_saida_escrever(common.c2f_saida_stderr(), msg[..])
+    return CONSULTAR_USO
+}
+
+// C: driver/cmd_consultar.c:43 (o indice da pergunta na tabela; -1 = nao existe)
+proc achar_pergunta(nome: str) -> i32 {
+    var i: i32 = 0
+    while i < N_PERGUNTAS {
+        if (PERGUNTAS[i as int].nome or_else "") == nome {
+            return i
+        }
+        i += 1
+    }
+    return -1
+}
+
+// C: driver/cmd_consultar.c:57
+proc ler_posicionais(argc: i32, argv: []str, p: ^PedidoConsulta, pos: ^Posicionais) -> ?str {
+    var k: i32 = 0
+    while k < argc {
+        let arg: str = argv[k as int]
+        k += 1
+        if arg == "--json" {
+            continue
+        }
+        if arg == "--modulo" {
+            if k >= argc {
+                return "--modulo exige o caminho do modulo (ex.: --modulo std:mem)"
+            }
+            p.modulo = argv[k as int]
+            k += 1
+        } else if common.c2f_prefixo_igual(arg, "--", 2) {
+            return "opcao desconhecida (valem --json e, em simbolos, --modulo)"
+        } else if pos.n < POSICIONAIS_MAX {
+            pos.itens[pos.n as int] = arg
+            pos.n += 1
+        } else {
+            return "argumentos demais"
+        }
+    }
+    return none
+}
+
+// C: driver/cmd_consultar.c:75 (pergunta: o indice da pergunta em PERGUNTAS)
+proc ler_pedido(argc: i32, argv: []str, p: ^PedidoConsulta, pergunta: ^i32) -> ?str {
+    p^ = PedidoConsulta{}
+    var pos = Posicionais{}
+    let motivo_posicao: ?str = ler_posicionais(argc, argv, p, &pos)
+    if motivo_posicao != none {
+        return motivo_posicao
+    }
+    let n: i32 = pos.n
+    if n == 0 {
+        return "falta a pergunta"
+    }
+    let indice: i32 = achar_pergunta(pos.itens[0])
+    if indice < 0 {
+        return "pergunta desconhecida"
+    }
+    pergunta^ = indice
+    let perg: Pergunta = PERGUNTAS[indice as int]
+    p.pergunta = perg.nome
+    var prox: i32 = 1
+    if perg.com_arg {
+        if n < 2 {
+            return "falta o argumento da pergunta"
+        }
+        p.arg = pos.itens[prox as int]
+        prox += 1
+    }
+    if n > prox {
+        p.alvo = pos.itens[prox as int]
+        prox += 1
+    }
+    if n > prox {
+        return "argumentos demais"
+    }
+    if (p.modulo != none) and ((p.pergunta or_else "") != "simbolos") {
+        return "--modulo so vale em simbolos"
+    }
+    return none
+}
+
+// C: driver/cmd_consultar.c:99 (EhPasta: GetFileAttributesA + DIRECTORY)
+proc eh_pasta_3(caminho: str) -> bool {
+    return file.is_dir(caminho)
+}
+
+// snprintf(destino, tam, "%s", texto) do C: copia o que cabe e termina em NUL.
+proc escrever_texto(destino: []u8, texto: str) {
+    let bytes: []u8 = as_bytes(texto)
+    var n: int = len(bytes)
+    if n > (len(destino) - 1) {
+        n = len(destino) - 1
+    }
+    var k: int = 0
+    while k < n {
+        destino[k] = bytes[k]
+        k += 1
+    }
+    destino[n] = 0
+}
+
+// Texto do buffer ate o 1o NUL (o char[] do C), copiado na heap: quem chamou faz delete.
+proc texto_do_buffer(b: []u8) -> str {
+    return from_bytes(b[0..<common.c2f_strlen_b(b)], alloc = heap)
+}
+
+// A pasta vira <pasta>\main.fj; o buffer do C (ENTRADA_TAM bytes) corta o que passa do limite.
+proc caminho_de_entrada(base: str) -> str {
+    var b = make([dynamic]u8, alloc = heap)
+    defer delete(b)
+    if eh_pasta_3(base) {
+        format(f"{base}\\main.fj", into = &b)
+    } else {
+        append(&b, items = as_bytes(base))
+    }
+    let n: int = min(len(b), (ENTRADA_TAM - 1) as int)
+    return from_bytes(b[0..<n], alloc = heap)
+}
+
+// C: driver/cmd_consultar.c:106 (o .fj raiz: o alvo, o arquivo da posicao, ou "." ; pasta -> main.fj)
+proc resolver_entrada(p: ^PedidoConsulta) -> str {
+    var base: [260]u8 = {}
+    let por_posicao: bool = ((p.pergunta or_else "") == "escopo") or ((p.pergunta or_else "") == "tipo")
+    if p.alvo != none {
+        escrever_texto(base[..], p.alvo or_else "")
+    } else {
+        var achou: bool = false
+        if por_posicao {
+            achou = consulta_arquivo_da_posicao(p.arg or_else "", base[..], CONSULTA_CAMINHO_MAX as u64)
+        }
+        if not achou {
+            escrever_texto(base[..], ".")
+        }
+    }
+    let base_texto: str = texto_do_buffer(base[..])
+    defer delete(base_texto)
+    return caminho_de_entrada(base_texto)
+}
+
+// C: driver/cmd_consultar.c:118 (o indice e as posicoes finais; a resposta sai em stdout se devolver CONSULTAR_OK)
+proc responder_projeto(c: ?^Compilacao, p: ^PedidoConsulta, responder: u16) -> i32 {
+    let comp: ^Compilacao = c as ^Compilacao
+    let q: ^Consulta = new(Consulta, alloc = heap)
+    defer delete(q)
+    q.c = c
+    q.saida = make([dynamic]u8, alloc = heap)
+    defer delete(q.saida)
+    semantic.indice_montar(&q.indice, &comp.sem)
+    if not frontend.ast_fim_iniciar(&q.fim, &comp.fonte, &comp.nomes, &comp.diag) {
+        semantic.indice_liberar(&q.indice)
+        common.c2f_saida_escrever_texto(common.c2f_saida_stderr(), "forja: consultar: erro lexico ao reler o fonte para as posicoes finais\n")
+        return CONSULTAR_INTERNO
+    }
+    let codigo: i32 = chamar_funcao_resposta(responder, q, p)
+    if codigo == CONSULTAR_OK {
+        common.c2f_saida_escrever(common.c2f_saida_stdout(), q.saida[..])
+    }
+    frontend.ast_fim_liberar(&q.fim)
+    semantic.indice_liberar(&q.indice)
+    return codigo
+}
+
+// C: driver/cmd_consultar.c:138 (D0653-2: 'api std:<m>' ou 'vendor:<m>' sem <alvo> nao tem arquivo hospedeiro)
+proc eh_api_sem_host(p: ^PedidoConsulta) -> bool {
+    return (((p.pergunta or_else "") == "api") and (p.alvo == none)) and (common.c2f_prefixo_igual((p.arg or_else ""), "std:", 4) or common.c2f_prefixo_igual((p.arg or_else ""), "vendor:", 7))
+}
+
+// C: driver/cmd_consultar.c:145 (AbrirRaizDeApi): a raiz sintetica "import <arg> as alvo_teste" fica em memoria sob <pasta atual>\consultar_api.fj
+// (so se cabe no buffer de ENTRADA_TAM); devolve o caminho virtual (heap, quem chamou faz delete) ou none se falhou.
+proc abrir_raiz_de_api(p: ^PedidoConsulta, c: ^Compilacao) -> ?str {
+    let alvo: str = p.arg or_else ""
+    let raiz: str = format(f"import \"{alvo}\" as alvo_teste\nproc main() {{\n}}\n", alloc = heap)
+    defer delete(raiz)
+    if len(raiz) >= (RAIZ_API_TAM as int) {
+        return none
+    }
+    switch r in os.cwd(alloc = heap) {
+    case str:
+        if (len(r) == 0) or ((len(r) as i32) + SUFIXO_API_COM_NUL > ENTRADA_TAM) {
+            delete(r)
+            return none
+        }
+        let caminho: str = format(f"{r}\\consultar_api.fj", alloc = frame)
+        delete(r)
+        if not common.fonte_adotar_texto(&c.fonte, caminho, raiz, len(raiz) as u64) {
+            return none
+        }
+        return caminho
+    case os.OsError:
+        return none
+    }
+    return none
+}
+
+// C: driver/cmd_consultar.c:161 (compilacao + indice + resposta; o mesmo fluxo do 'check')
+proc compilar_consulta(p: ^PedidoConsulta, c: ^Compilacao, o: ^Opcoes, responder: u16) -> i32 {
+    iniciar_compilacao(c)
+    c.opcoes = o
+    c.sem.lista.teto = opcoes_max_erros(c.opcoes)
+    var sd = common.SaidaDiag{}
+    var falhou: bool = not analisar_sintaxe(c, true)
+    if not falhou {
+        falhou = not analisar_semantica(c)
+    }
+    var codigo: i32 = 0
+    if falhou {
+        codigo = relatar_falha(c, &sd)
+    } else {
+        codigo = responder_projeto(c, p, responder)
+    }
+    liberar_compilacao(c)
+    return codigo
+}
+
+// C: driver/cmd_consultar.c:161
+proc consulta_executar(p: ^PedidoConsulta, responder: u16) -> i32 {
+    let c: ^Compilacao = new(Compilacao, alloc = heap)
+    defer delete(c)
+    let o: ^Opcoes = new(Opcoes, alloc = heap)
+    defer delete(o)
+    o.comando = "check"
+    if eh_api_sem_host(p) {
+        let caminho_api: ?str = abrir_raiz_de_api(p, c)
+        if caminho_api == none {
+            return CONSULTAR_USO
+        }
+        o.entrada = caminho_api
+        o.alvo_teste = p.arg
+        return compilar_consulta(p, c, o, responder)
+    }
+    let entrada: str = resolver_entrada(p)
+    defer delete(entrada)
+    o.entrada = entrada
+    if not common.fonte_ler(&c.fonte, entrada) {
+        return CONSULTAR_USO
+    }
+    return compilar_consulta(p, c, o, responder)
+}
+
+// C: driver/cmd_consultar.c:192
+proc rodar_consultar(argc: i32, argv: []str) -> i32 {
+    var p: PedidoConsulta = PedidoConsulta{}
+    var pergunta: i32 = -1
+    let motivo: ?str = ler_pedido(argc, argv, &p, &pergunta)
+    if motivo != none {
+        return uso_errado(motivo)
+    }
+    return consulta_executar(&p, PERGUNTAS[pergunta as int].responder)
+}

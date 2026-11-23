@@ -1,0 +1,389 @@
+// frontend/parser.fj - porte de compiler/frontend/parser.c, compiler/frontend/parser.h
+// sha256 de frontend/parser.c: 02365b0f7e0dbbbaf5f31a0a934383b2fbfb126abaa3712c7dd5de3e7a9eb285
+// sha256 de frontend/parser.h: d5bd8354195252ff8cb4b5b3db1f5200094e839e4caf059d61f6afc236b7caec
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.2.0
+// Changelog: 0.2.0 - G3 P-front B: corpo real. As 5 pilhas do Parser deixam de ser INDECIDIVEL: cada uma e [dynamic] do seu tipo (Arg, Campo, Param, Membro, Caso); CopiarLista (void *)
+//            vira 5 procs tipados copiar_lista_arg/_campo/_param/_membro/_caso(p, base) -> ?[]T (fatia da arena; none se vazia) que esvaziam a pilha ate base (C2F-14, N3).
+//            Parser.toks e a visao []Token do vetor do lexer, refeita em parser_analisar.
+
+import "common"
+
+pub struct Parser {
+    fonte: ?^common.Fonte
+    tokens: ?^[dynamic]Token
+    nomes: ?^common.Interner
+    arena: ?^common.Arena
+    diag: ?^common.Diag
+    erros: ?^common.DiagLista
+    modulos: ?^Modulos
+    modulo_atual: u8
+    arquivo_atual: u32
+    cargas: ?^[dynamic]?^Expr
+    chaves_literal: ?^[dynamic]u32
+    programa: Programa
+    toks: []Token // visao de tokens^ (refeita em parser_analisar)
+    cur: u32
+    sem_literal_struct: bool
+    viu_declaracao: bool
+    napelidos: u8
+    pilha_args: [dynamic]Arg
+    pilha_campos: [dynamic]Campo
+    pilha_params: [dynamic]Param
+    pilha_membros: [dynamic]Membro
+    pilha_casos: [dynamic]Caso
+}
+
+const SEM_FIM: u32 = 4294967295
+const CLASSES: [2]i32 = {4, 5}
+
+// C: frontend/parser.c:23
+proc eh_nao_suportada(tipo: i32) -> bool {
+    return (common.c2f_s2u_32(tipo) == (KW_UNION as u32)) or (common.c2f_s2u_32(tipo) == (KW_NONE as u32))
+}
+
+// O %.*s do C: os bytes do token ate o 1o NUL; texto novo no heap, o chamador faz delete.
+proc texto_do_token(p: ^Parser, t: ^Token) -> str {
+    let f = p.fonte as ^common.Fonte
+    let ini = t.off as int
+    let bytes = f.texto[ini..<(ini + (t.len_c as int))]
+    return from_bytes(bytes[0..<common.c2f_strlen_b(bytes)], alloc = heap)
+}
+
+// C: frontend/parser.c:28
+proc erro_sintaxe(p: ^Parser, esperado: str) -> bool {
+    let t = token_atual(p)
+    if parser_idioma(p, esperado) {
+        return false // IA1-L1: forma de outra linguagem = E0110
+    }
+    let texto = texto_do_token(p, t)
+    defer delete(texto)
+    let d = p.diag as ^common.Diag
+    let tipo = t.tipo as i32
+    if eh_nao_suportada(tipo) {
+        let msg_ns = format(f"construcao ainda nao suportada na Fase 5: '{texto}'", alloc = heap)
+        defer delete(msg_ns)
+        return common.diag_relatar(d, common.E0101, t.off, msg_ns)
+    }
+    if tipo == TK_NL {
+        let msg_nl = format(f"fim de linha inesperado; esperado {esperado}", alloc = heap)
+        defer delete(msg_nl)
+        _ = common.diag_relatar(d, common.E0101, t.off, msg_nl)
+    } else if tipo == TK_EOF {
+        let msg_eof = format(f"fim de arquivo inesperado; esperado {esperado}", alloc = heap)
+        defer delete(msg_eof)
+        _ = common.diag_relatar(d, common.E0101, t.off, msg_eof)
+    } else {
+        let msg_tk = format(f"token inesperado '{texto}'; esperado {esperado}", alloc = heap)
+        defer delete(msg_tk)
+        _ = common.diag_relatar(d, common.E0101, t.off, msg_tk)
+    }
+    parser_forma_esperado(p, esperado)
+    return false
+}
+
+// C: frontend/parser.c:42
+proc esperar(p: ^Parser, tipo: i32, esperado: str) -> bool {
+    if common.c2f_s2u_32(tipo_atual(p)) != common.c2f_s2u_32(tipo) {
+        return erro_sintaxe(p, esperado)
+    }
+    p.cur += 1
+    return true
+}
+
+// C: frontend/parser.c:49
+proc esperar_fim_de_linha(p: ^Parser) -> bool {
+    if common.c2f_s2u_32(tipo_atual(p)) == (TK_EOF as u32) {
+        return true
+    }
+    return esperar(p, TK_NL, "fim de linha")
+}
+
+// C: frontend/parser.c:55
+proc ler_nome_2(p: ^Parser, nome: ^i32, pos: ^u32, esperado: str) -> bool {
+    if common.c2f_s2u_32(tipo_atual(p)) != (TK_IDENT as u32) {
+        return erro_sintaxe(p, esperado)
+    }
+    nome^ = token_atual(p).sym
+    pos^ = token_atual(p).off
+    p.cur += 1
+    return true
+}
+
+// C: frontend/parser.c:64
+proc esperar_abre_bloco(p: ^Parser) -> bool {
+    return (common.c2f_b2i32(esperar(p, TK_LBRACE, "'{'")) != 0) and (common.c2f_b2i32(esperar(p, TK_NL, "fim de linha depois de '{'")) != 0)
+}
+
+// C: frontend/parser.c:69
+// C2F-14/N3: CopiarLista(p, &pilha, base) -> um proc por tipo de pilha. Copia pilha[base..n) para a arena e esvazia a pilha ate base; none se vazia.
+proc copiar_lista_arg(p: ^Parser, base: u64) -> ?[]Arg {
+    let b = base as int
+    let total = len(p.pilha_args)
+    var saida: ?[]Arg = none
+    if total > b {
+        var l = make([dynamic]Arg, alloc = common.arena_mem(p.arena as ^common.Arena), cap = total - b)
+        for i in b..<total {
+            append(&l, item = p.pilha_args[i])
+        }
+        saida = l[..]
+    }
+    truncate(&p.pilha_args, b)
+    return saida
+}
+
+proc copiar_lista_campo(p: ^Parser, base: u64) -> ?[]Campo {
+    let b = base as int
+    let total = len(p.pilha_campos)
+    var saida: ?[]Campo = none
+    if total > b {
+        var l = make([dynamic]Campo, alloc = common.arena_mem(p.arena as ^common.Arena), cap = total - b)
+        for i in b..<total {
+            append(&l, item = p.pilha_campos[i])
+        }
+        saida = l[..]
+    }
+    truncate(&p.pilha_campos, b)
+    return saida
+}
+
+proc copiar_lista_param(p: ^Parser, base: u64) -> ?[]Param {
+    let b = base as int
+    let total = len(p.pilha_params)
+    var saida: ?[]Param = none
+    if total > b {
+        var l = make([dynamic]Param, alloc = common.arena_mem(p.arena as ^common.Arena), cap = total - b)
+        for i in b..<total {
+            append(&l, item = p.pilha_params[i])
+        }
+        saida = l[..]
+    }
+    truncate(&p.pilha_params, b)
+    return saida
+}
+
+proc copiar_lista_membro(p: ^Parser, base: u64) -> ?[]Membro {
+    let b = base as int
+    let total = len(p.pilha_membros)
+    var saida: ?[]Membro = none
+    if total > b {
+        var l = make([dynamic]Membro, alloc = common.arena_mem(p.arena as ^common.Arena), cap = total - b)
+        for i in b..<total {
+            append(&l, item = p.pilha_membros[i])
+        }
+        saida = l[..]
+    }
+    truncate(&p.pilha_membros, b)
+    return saida
+}
+
+proc copiar_lista_caso(p: ^Parser, base: u64) -> ?[]Caso {
+    let b = base as int
+    let total = len(p.pilha_casos)
+    var saida: ?[]Caso = none
+    if total > b {
+        var l = make([dynamic]Caso, alloc = common.arena_mem(p.arena as ^common.Arena), cap = total - b)
+        for i in b..<total {
+            append(&l, item = p.pilha_casos[i])
+        }
+        saida = l[..]
+    }
+    truncate(&p.pilha_casos, b)
+    return saida
+}
+
+// C: frontend/parser.c:80
+proc guardar_erro_pendente(p: ^Parser) -> bool {
+    parser_forma_da_regra(p)
+    return common.diag_lista_guardar(p.erros, p.diag as ^common.Diag, p.modulo_atual as u32)
+}
+
+// C: frontend/parser.c:89
+// C2F-N2: RenomeadoAchar devolve copia no heap (o C devolvia &tabela[k]): delete ao sair da volta.
+proc canonizar_membro(p: ^Parser, modulo: u8) {
+    let t = &p.toks[p.cur]
+    let nomes = p.nomes as ^common.Interner
+    let caminho = common.interner_texto(nomes, (p.modulos as ^Modulos).itens[modulo].caminho)
+    let nome = common.interner_texto(nomes, t.sym)
+    for k in 0..<2 {
+        var era_antigo = false
+        let ren = common.renomeado_achar(CLASSES[k], caminho, nome, &era_antigo)
+        if ren == none {
+            continue
+        }
+        defer delete(ren)
+        if not era_antigo {
+            continue
+        }
+        common.renomeado_notar_tabela(p.diag as ^common.Diag, t.off, t.len_c as u32, ren)
+        if common.renomeado_recusa_em(p.diag as ^common.Diag, ren) and p.erros != none {
+            _ = common.renomeado_recusar(p.diag as ^common.Diag, t.off, t.len_c as u32, ren)
+            _ = guardar_erro_pendente(p)
+        }
+        let novo = (ren as ^common.Renomeado).novo or_else "(null)"
+        t.sym = common.internar(nomes, novo, len(novo) as u32)
+        return
+    }
+}
+
+// C: frontend/parser.c:111
+proc notar_qualificador_antigo(p: ^Parser) {
+    let t: ^Token = token_atual(p)
+    var novo: i32 = 0
+    if (p.diag as ^common.Diag).trocas == none {
+        return
+    }
+    novo = modulos_apelido_novo(p.modulos, p.arquivo_atual, t.sym)
+    if novo < 0 {
+        return
+    }
+    var lit_1 = common.RenTroca{off = t.off, tam = t.len_c as u32, classe = common.REN_QUALIFICADOR, antigo = common.interner_texto(p.nomes as ^common.Interner, t.sym), novo = common.interner_texto(p.nomes as ^common.Interner, novo)}
+    let arg_1: ^common.RenTroca = &lit_1
+    let arg_2: ^common.Diag = p.diag as ^common.Diag
+    common.renomeado_notar(arg_2, arg_1)
+}
+
+// C: frontend/parser.c:124
+proc ler_apelido(p: ^Parser, pos: ^u32) -> u8 {
+    if tipo_atual(p) != TK_IDENT or tipo_seguinte(p) != TK_DOT or (p.toks[p.cur + 2].tipo as i32) != TK_IDENT {
+        return 0
+    }
+    let modulo = modulos_apelido(p.modulos, p.arquivo_atual, token_atual(p).sym)
+    if modulo == 0 {
+        return 0
+    }
+    notar_qualificador_antigo(p)
+    pos^ = token_atual(p).off
+    p.cur += 2
+    canonizar_membro(p, modulo)
+    return modulo
+}
+
+// C: frontend/parser.c:136
+proc abre_bloco(tipo: i32) -> bool {
+    return (((common.c2f_s2u_32(tipo) == (KW_IF as u32)) or (common.c2f_s2u_32(tipo) == (KW_WHILE as u32))) or (common.c2f_s2u_32(tipo) == (KW_FOR as u32))) or (common.c2f_s2u_32(tipo) == (KW_SWITCH as u32))
+}
+
+// C: frontend/parser.c:145
+proc fim_do_comando(p: ^Parser, ini: u32, abriu_bloco: ^bool) -> u32 {
+    var profundidade: i32 = 0
+    abriu_bloco^ = false
+    var k: u32 = ini
+    while true {
+        let tipo = p.toks[k].tipo as i32
+        if tipo == TK_EOF {
+            return SEM_FIM
+        }
+        if tipo == TK_LBRACE {
+            profundidade += 1
+            abriu_bloco^ = true
+        }
+        if tipo == TK_RBRACE {
+            profundidade -= 1
+        }
+        if profundidade < 0 {
+            return SEM_FIM
+        }
+        if tipo == TK_NL and k >= p.cur and profundidade == 0 {
+            return k
+        }
+        k += 1
+    }
+    return SEM_FIM
+}
+
+// C: frontend/parser.c:163
+proc parser_recuperar_comando(p: ^Parser, ini: u32) -> bool {
+    var abriu_bloco = false
+    if p.erros == none or not (p.diag as ^common.Diag).tem {
+        return false
+    }
+    for k in ini..<p.cur {
+        if (p.toks[k].tipo as i32) == TK_NL {
+            return false // o erro esta numa linha de baixo do comando: o resto dele e imprevisivel
+        }
+    }
+    let fim = fim_do_comando(p, ini, &abriu_bloco)
+    if fim == SEM_FIM {
+        return false
+    }
+    if not abriu_bloco and abre_bloco(p.toks[ini].tipo as i32) {
+        return false // cabecalho sem '{': as linhas de baixo eram o corpo e viram cascata
+    }
+    if not guardar_erro_pendente(p) {
+        return false
+    }
+    p.cur = fim + 1
+    p.sem_literal_struct = false
+    return true
+}
+
+// C: frontend/parser.c:181
+proc comeca_declaracao_no_topo(p: ^Parser) -> bool {
+    let t: ^Token = token_atual(p)
+    let tipo: i32 = t.tipo as i32
+    let palavra: bool = (((((((((((common.c2f_s2u_32(tipo) == (KW_PUB as u32)) or (common.c2f_s2u_32(tipo) == (KW_EXPORT as u32))) or (common.c2f_s2u_32(tipo) == (KW_IMPORT as u32))) or (common.c2f_s2u_32(tipo) == (KW_UNIT as u32))) or (common.c2f_s2u_32(tipo) == (KW_CONST as u32))) or (common.c2f_s2u_32(tipo) == (KW_STRUCT as u32))) or (common.c2f_s2u_32(tipo) == (KW_ENUM as u32))) or (common.c2f_s2u_32(tipo) == (KW_UNION as u32))) or (common.c2f_s2u_32(tipo) == (KW_PROC as u32))) or (common.c2f_s2u_32(tipo) == (KW_TEST as u32))) or (common.c2f_s2u_32(tipo) == (KW_FOREIGN as u32))) or ((common.c2f_s2u_32(tipo) == (TK_IDENT as u32)) and (t.sym == SYM_STATIC_ASSERT))
+    return (common.c2f_b2i32(palavra) != 0) and ((t.off == 0) or ((p.fonte as ^common.Fonte).texto[t.off - 1] == 10)) // '\n'
+}
+
+// C: frontend/parser.c:192
+proc recuperar_declaracao(p: ^Parser, ini: u32) -> bool {
+    if p.erros == none {
+        return false
+    }
+    if (common.c2f_b2i32((p.diag as ^common.Diag).tem) != 0) and (not guardar_erro_pendente(p)) {
+        return false
+    }
+    if (p.erros as ^common.DiagLista).cortado {
+        return false
+    }
+    if (p.cur <= ini) and (common.c2f_s2u_32(tipo_atual(p)) != (TK_EOF as u32)) {
+        p.cur += 1
+    }
+    while (common.c2f_s2u_32(tipo_atual(p)) != (TK_EOF as u32)) and (not comeca_declaracao_no_topo(p)) {
+        p.cur += 1
+    }
+    p.sem_literal_struct = false
+    return true
+}
+
+// C: frontend/parser.c:203
+// C2F-N3: Vec zerado do C aceita push; [dynamic] zero da R0007 no 1o append: as pilhas nascem aqui (cap > 0 = ja iniciadas, ParserAnalisar e reentrante).
+pub proc parser_analisar(p: ^Parser) -> bool {
+    var ok = true
+    let lista_tokens = p.tokens as ^[dynamic]Token
+    p.toks = lista_tokens^[..]
+    p.cur = 0
+    p.sem_literal_struct = false
+    p.viu_declaracao = false
+    p.napelidos = 0
+    if cap(p.pilha_args) == 0 {
+        p.pilha_args = make([dynamic]Arg, alloc = heap, cap = 16)
+        p.pilha_campos = make([dynamic]Campo, alloc = heap, cap = 16)
+        p.pilha_params = make([dynamic]Param, alloc = heap, cap = 16)
+        p.pilha_membros = make([dynamic]Membro, alloc = heap, cap = 16)
+        p.pilha_casos = make([dynamic]Caso, alloc = heap, cap = 16)
+    }
+    while tipo_atual(p) != TK_EOF {
+        let ini = p.cur
+        if analisar_declaracao(p) {
+            continue
+        }
+        ok = false
+        if recuperar_declaracao(p, ini) {
+            continue
+        }
+        parser_forma_da_regra(p) // so age no E0101 que o ErroSintaxe nao cobriu (regra fixa)
+        return false
+    }
+    return ok and (p.erros == none or (p.erros as ^common.DiagLista).n == 0)
+}
+
+// C: frontend/parser.c:231
+pub proc parser_liberar(p: ^Parser) {
+    delete(p.pilha_args)
+    delete(p.pilha_campos)
+    delete(p.pilha_params)
+    delete(p.pilha_membros)
+    delete(p.pilha_casos)
+}

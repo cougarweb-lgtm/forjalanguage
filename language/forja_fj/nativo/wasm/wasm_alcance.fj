@@ -1,0 +1,173 @@
+// nativo/wasm/wasm_alcance.fj - poda tardia do alvo wasm: so as funcoes da BIR alcancaveis de `_start` (ou dos exports do reactor) entram no modulo
+// Versao: 0.2.0 (0.40.0: CHAMA inline de wasm_eh_as_real_direto nao marca o proc de runtime; 0.30.0)
+// Contrato: a poda do front-end trata todo proc do std:wasm_rt como raiz (bir_alcance.fj), entao um runtime grande (real, math) incharia todo .wasm;
+// aqui o alcance e refeito sobre a BIR pronta, seguindo as chamadas diretas (BIR_CHAMA) pela tabela de indices ORIGINAIS (IMPORTS_DO_MODULO + k).
+// Layout da `tabela` depois de wasm_alcance_aplicar: [0, nsimbolos) = indice original por simbolo (como antes); [nsimbolos, nsimbolos + nfuncoes) = indice
+// FINAL da funcao k (SEM_FUNCAO se podada); [nsimbolos + nfuncoes] = quantidade de funcoes vivas; [nsimbolos + nfuncoes + 1] = quantidade de imports do modulo
+// (2, ou 4 com os de argumentos, 0.34.0). wasm_indice_final traduz original -> final (os indices ORIGINAIS partem sempre de IMPORTS_DO_MODULO = 2).
+// Verificacao: python tests\nativo\wasm\verificar_wasm.py --modos dev,release (saida igual; o 01_ola.wasm encolhe)
+
+import "nativo/bir"
+
+// Marca a funcao k como viva e a poe na fila, se ainda nao estava marcada
+proc wasm_alcance_marcar(k: u32, vivas: ^[dynamic]bool, pendentes: ^[dynamic]u32) {
+    if vivas[k] {
+        return
+    }
+    vivas[k] = true
+    append(pendentes, item = k)
+}
+
+// Marca as funcoes que a funcao k chama direto: CHAMA cujo simbolo a tabela original liga a uma funcao da BIR (BS_FUNCAO ou proc do runtime em Forja)
+// e os simbolos de texto/dado cujo endereco ela toma (END_SIMBOLO): so esses vao a memoria linear (wasm_posicionar_dados)
+proc wasm_alcance_chamadas(prog: ^bir.BirPrograma, funcoes: []bir.BirFuncao, tabela: []u32, k: u32, vivas: ^[dynamic]bool, pendentes: ^[dynamic]u32, usados: ^[dynamic]bool) {
+    let f: ^bir.BirFuncao = &funcoes[k]
+    wasm_alcance_quadro_chama_falha(prog, funcoes, k, vivas, pendentes)
+    for b in (0 as u32)..<f.nblocos {
+        let bloco: ^bir.BirBloco = &f.blocos[b]
+        for i in (0 as u32)..<bloco.n {
+            let ins: ^bir.BirInstr = &bloco.instrs[i]
+            if ((ins.op as i32) == bir.BIR_END_SIMBOLO) and ((ins.a.tipo as i32) == bir.BO_SIMBOLO) {
+                usados[ins.a.id] = true
+                // 0.32.0: proc tomado como valor (BS_FUNCAO) tambem fica vivo e ganha entrada na tabela de funcref
+                let alvo: u32 = tabela[ins.a.id]
+                if ((prog.simbolos[ins.a.id].tipo as i32) == bir.BS_FUNCAO) and (alvo >= IMPORTS_DO_MODULO) and (alvo < IMPORTS_DO_MODULO + prog.nfuncoes) {
+                    wasm_alcance_marcar(alvo - IMPORTS_DO_MODULO, vivas, pendentes)
+                }
+            }
+            // 0.35.0: ARMADILHA tambem chama o runtime de falha (wasm_emitir_armadilha); se o proc de falha e Forja (falha_alocacao), tem de ficar vivo
+            if ((ins.op as i32) != bir.BIR_CHAMA) and ((ins.op as i32) != bir.BIR_ARMADILHA) {
+                continue
+            }
+            // 0.40.0: CHAMA que sai inline (wasm_eh_as_real_direto: floor/ceil/trunc/round, as_i32/i64) nao chama o proc de runtime, que fica morto
+            if (ins.op as i32) == bir.BIR_CHAMA {
+                if ((prog.simbolos[ins.simbolo].tipo as i32) == bir.BS_RUNTIME) and wasm_eh_as_real_direto(prog, ins, prog.simbolos[ins.simbolo].nome or_else "") {
+                    continue
+                }
+            }
+            let destino: u32 = tabela[ins.simbolo]
+            if (destino >= IMPORTS_DO_MODULO) and (destino < IMPORTS_DO_MODULO + prog.nfuncoes) {
+                wasm_alcance_marcar(destino - IMPORTS_DO_MODULO, vivas, pendentes)
+            }
+        }
+    }
+}
+
+// R0016: o prologo da pilha sombra (wasm_pilha) chama falha_pilha sem instrucao da BIR; se a funcao viva k tem quadro, falha_pilha entra no alcance
+proc wasm_alcance_quadro_chama_falha(prog: ^bir.BirPrograma, funcoes: []bir.BirFuncao, k: u32, vivas: ^[dynamic]bool, pendentes: ^[dynamic]u32) {
+    let f: ^bir.BirFuncao = &funcoes[k]
+    var tem_quadro: bool = false
+    for s in (0 as u32)..<f.nslots {
+        if f.slots[s].tam > 0 {
+            tem_quadro = true
+        }
+    }
+    if not tem_quadro {
+        return
+    }
+    let kf: u32 = wasm_alcance_posicao_falha(prog, funcoes)
+    if kf != SEM_FUNCAO {
+        wasm_alcance_marcar(kf, vivas, pendentes)
+    }
+}
+
+// Posicao em `funcoes` do proc falha_pilha do std:wasm_rt (rt_wasm.fj), ou SEM_FUNCAO
+pub proc wasm_alcance_posicao_falha(prog: ^bir.BirPrograma, funcoes: []bir.BirFuncao) -> u32 {
+    for k in (0 as u32)..<prog.nfuncoes {
+        if wasm_eh_proc_de_runtime(wasm_nome_da_funcao(prog, &funcoes[k]), "falha_pilha") {
+            return k
+        }
+    }
+    return SEM_FUNCAO
+}
+
+// Indice FINAL de falha_pilha no modulo (tabela ja podada), para o prologo chamar; SEM_FUNCAO se a poda o tirou
+pub proc wasm_alcance_indice_falha_pilha(prog: ^bir.BirPrograma, tabela: []u32) -> u32 {
+    let funcoes: []bir.BirFuncao = prog.funcoes or_else {}
+    let kf: u32 = wasm_alcance_posicao_falha(prog, funcoes)
+    if kf == SEM_FUNCAO {
+        return SEM_FUNCAO
+    }
+    return tabela[(len(prog.simbolos) as u32) + kf]
+}
+
+// Calcula o alcance a partir das raizes (posicoes k em `funcoes`) e acrescenta a `tabela` o mapa k -> indice final e a contagem de vivas; devolve a contagem
+// `usados[s]` fica true para o simbolo de texto/dado s tomado por END_SIMBOLO de uma funcao viva
+pub proc wasm_alcance_aplicar(prog: ^bir.BirPrograma, funcoes: []bir.BirFuncao, tabela: ^[dynamic]u32, raizes: []u32, usados: ^[dynamic]bool) -> u32 {
+    var vivas = make([dynamic]bool, alloc = heap)
+    defer delete(vivas)
+    for _k in (0 as u32)..<prog.nfuncoes {
+        append(&vivas, item = false)
+    }
+    for _s in 0..<len(prog.simbolos) {
+        append(usados, item = false)
+    }
+    var pendentes = make([dynamic]u32, alloc = heap)
+    defer delete(pendentes)
+    for r in 0..<len(raizes) {
+        wasm_alcance_marcar(raizes[r], &vivas, &pendentes)
+    }
+    let originais: []u32 = tabela^[..] // visao valida so ate o 1o append abaixo
+    while len(pendentes) > 0 {
+        let k: u32 = pop(&pendentes) or_else 0
+        wasm_alcance_chamadas(prog, funcoes, originais, k, &vivas, &pendentes, usados)
+    }
+    // 0.34.0: os 2 imports da WASI de argumentos (indices finais 2 e 3) so existem quando alguma funcao viva os chama
+    var nimports: u32 = IMPORTS_DO_MODULO
+    if wasm_alcance_usa_args(prog, funcoes, vivas[..]) {
+        nimports += IMPORTS_DE_ARGS
+    }
+    var nvivas: u32 = 0
+    for k in (0 as u32)..<prog.nfuncoes {
+        if vivas[k] {
+            append(tabela, item = nimports + nvivas)
+            nvivas += 1
+        } else {
+            append(tabela, item = SEM_FUNCAO)
+        }
+    }
+    append(tabela, item = nvivas)
+    append(tabela, item = nimports)
+    return nvivas
+}
+
+// Alguma funcao viva chama os intrinsecos de argumentos (WASI args_sizes_get/args_get)?
+proc wasm_alcance_usa_args(prog: ^bir.BirPrograma, funcoes: []bir.BirFuncao, vivas: []bool) -> bool {
+    for k in (0 as u32)..<prog.nfuncoes {
+        if not vivas[k] {
+            continue
+        }
+        let f: ^bir.BirFuncao = &funcoes[k]
+        for b in (0 as u32)..<f.nblocos {
+            let bloco: ^bir.BirBloco = &f.blocos[b]
+            for i in (0 as u32)..<bloco.n {
+                let ins: ^bir.BirInstr = &bloco.instrs[i]
+                if ((ins.op as i32) == bir.BIR_CHAMA) and ((prog.simbolos[ins.simbolo].tipo as i32) == bir.BS_RUNTIME) and wasm_eh_intrinseco_args(prog.simbolos[ins.simbolo].nome or_else "") {
+                    return true
+                }
+            }
+        }
+    }
+    return false
+}
+
+// Quantidade de imports FINAL do modulo: 2 (proc_exit, fd_write), ou 4 quando o programa usa os argumentos
+proc wasm_nimports(prog: ^bir.BirPrograma, tabela: []u32) -> u32 {
+    return tabela[(len(prog.simbolos) as u32) + prog.nfuncoes + 1]
+}
+
+// A funcao k da BIR entrou no modulo (nao foi podada)?
+proc wasm_funcao_viva(prog: ^bir.BirPrograma, tabela: []u32, k: u32) -> bool {
+    return tabela[(len(prog.simbolos) as u32) + k] != SEM_FUNCAO
+}
+
+// Indice final (no modulo podado) de um indice ORIGINAL: funcao da BIR = mapa k -> final; runtime em bytecode (wasm_rt.fj) = deslocado pela quantidade podada
+proc wasm_indice_final(prog: ^bir.BirPrograma, tabela: []u32, original: u32) -> u32 {
+    let base_mapa: u32 = len(prog.simbolos) as u32
+    let primeiro_rt: u32 = IMPORTS_DO_MODULO + prog.nfuncoes
+    if original < primeiro_rt {
+        return tabela[base_mapa + (original - IMPORTS_DO_MODULO)]
+    }
+    let nvivas: u32 = tabela[base_mapa + prog.nfuncoes]
+    return (original - primeiro_rt) + wasm_nimports(prog, tabela) + nvivas
+}

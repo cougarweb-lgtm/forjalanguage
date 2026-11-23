@@ -1,0 +1,126 @@
+// runtime/a64/rt_a64_es_fs2.fj - std:file (copia e renomeio) do alvo aarch64-linux em Forja (A3.3h, separado em J1a): modulo std:a64_es_fs2
+// Versao: 0.1.0
+// Changelog: 0.1.0 - J1a: fs_copiar, fs_renomear e o laco de blocos da copia saem de rt_a64_es_fs.fj (teto de 800 linhas); mesmos procs e semantica.
+// Os helpers de handle, erro e stat ficam em std:a64_es_fs (alias fs, pub); as constantes FS_ usadas aqui sao copias das de rt_a64_es_fs.fj.
+
+import "std:wasm_rt" as wasm_rt
+import "std:a64_es" as es
+import "std:a64_es_fs" as fs
+
+foreign {
+    proc sys_chamar = "forja_rt_syscall"(num: int, a0: int, a1: int, a2: int, a3: int, a4: int, a5: int) -> int
+}
+
+const FS_SYS_UNLINKAT: int = 35
+const FS_SYS_RENAMEAT: int = 38
+const FS_SYS_READ: int = 63
+const FS_SYS_WRITE: int = 64
+const FS_SYS_FSTAT: int = 80
+const FS_AT_FDCWD: int = -100
+const FS_RET_EINTR: int = -4
+const FS_O_LER: int = 524288
+const FS_O_GRAVAR: int = 524865
+const FS_MODO_PERMISSOES: uint = 4095
+const FS_MASCARA_32: uint = 4294967295
+const FS_STAT_MODO: uint = 16
+const FS_BLOCO_COPIA: int = 65536
+const FS_TIPO_ARQUIVO: uint = 0
+const FS_TIPO_PASTA: uint = 1
+const FS_ERR_NAO_EXISTE: int = 1
+const FS_ERR_OUTRO: int = 3
+const FS_ERR_DIRETORIO: int = 5
+const FS_EXDEV: int = 18
+const FS_ENOTDIR: int = 20
+
+// Copia origem para destino (sobrescreve), em blocos de 64 KiB, com as permissoes da origem: 0 ou o codigo neutro
+proc fs_copiar_arquivo(origem: uint, destino: uint) -> int {
+    if fs.fs_vazio(origem) or fs.fs_vazio(destino) {
+        return FS_ERR_NAO_EXISTE
+    }
+    let entrada: int = es.es_abrir(origem, FS_O_LER, 0)
+    if entrada < 0 {
+        return fs.fs_falha_arquivo(origem, entrada)
+    }
+    let base: uint = es.es_scratch()
+    if sys_chamar(FS_SYS_FSTAT, entrada, base as int, 0, 0, 0, 0) != 0 {
+        fs.fs_fechar_fd(entrada)
+        return FS_ERR_OUTRO
+    }
+    let modo: uint = wasm_rt.memoria_ler_u64(base + FS_STAT_MODO) & FS_MASCARA_32
+    if fs.fs_tipo_do_modo(modo) == FS_TIPO_PASTA {
+        fs.fs_fechar_fd(entrada)
+        return FS_ERR_DIRETORIO
+    }
+    let saida: int = es.es_abrir(destino, FS_O_GRAVAR, (modo & FS_MODO_PERMISSOES) as int)
+    if saida < 0 {
+        fs.fs_fechar_fd(entrada)
+        return fs.fs_erro_base(saida)
+    }
+    let codigo: int = fs_copiar_blocos(entrada, saida)
+    fs.fs_fechar_fd(entrada)
+    fs.fs_fechar_fd(saida)
+    return codigo
+}
+
+// Laco de leitura e escrita em blocos (EINTR repete; escrita parcial continua): 0 ou o codigo neutro
+proc fs_copiar_blocos(entrada: int, saida: int) -> int {
+    let bloco: uint = fs.fs_bloco_copia()
+    var codigo: int = 0
+    while true {
+        let lidos: int = sys_chamar(FS_SYS_READ, entrada, bloco as int, FS_BLOCO_COPIA, 0, 0, 0)
+        if lidos == FS_RET_EINTR {
+            continue
+        }
+        if lidos < 0 {
+            codigo = fs.fs_erro_base(lidos)
+            break
+        }
+        if lidos == 0 {
+            break
+        }
+        var feitos: int = 0
+        while (feitos < lidos) and (codigo == 0) {
+            let r: int = sys_chamar(FS_SYS_WRITE, saida, (bloco as int) + feitos, lidos - feitos, 0, 0, 0)
+            if r == FS_RET_EINTR {
+                continue
+            }
+            if r < 0 {
+                codigo = fs.fs_erro_base(r)
+            } else if r == 0 {
+                codigo = FS_ERR_OUTRO
+            } else {
+                feitos += r
+            }
+        }
+        if codigo != 0 {
+            break
+        }
+    }
+    return codigo
+}
+
+pub proc fs_copiar(origem: uint, destino: uint) -> i32 {
+    return fs_copiar_arquivo(origem, destino) as i32
+}
+
+// Renomeia sobrescrevendo o destino; entre sistemas de arquivos (EXDEV) de arquivo regular, copia e apaga a origem
+pub proc fs_renomear(origem: uint, destino: uint) -> i32 {
+    if fs.fs_vazio(origem) or fs.fs_vazio(destino) {
+        return FS_ERR_NAO_EXISTE as i32
+    }
+    let r: int = sys_chamar(FS_SYS_RENAMEAT, FS_AT_FDCWD, origem as int, FS_AT_FDCWD, destino as int, 0, 0)
+    if r == 0 {
+        return 0
+    }
+    if (r == (0 - FS_EXDEV)) and (fs.fs_tipo_caminho(origem) == (FS_TIPO_ARQUIVO as int)) {
+        let codigo: int = fs_copiar_arquivo(origem, destino)
+        if codigo == 0 {
+            _ = sys_chamar(FS_SYS_UNLINKAT, FS_AT_FDCWD, origem as int, 0, 0, 0, 0)
+        }
+        return codigo as i32
+    }
+    if (r == (0 - FS_ENOTDIR)) and (fs.fs_tipo_caminho(origem) == (FS_TIPO_PASTA as int)) {
+        return FS_ERR_DIRETORIO as i32
+    }
+    return fs.fs_falha_arquivo(origem, r) as i32
+}

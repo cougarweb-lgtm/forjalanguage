@@ -1,0 +1,664 @@
+// semantic/sem_higiene.fj - porte de compiler/semantic/sem_higiene.c
+// sha256 de semantic/sem_higiene.c: 884a262d5cb0c7544134425ad86be92d0dddea5a8319b35b47a6c4680226551b
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "common"
+import "frontend"
+
+// C: semantic/sem_higiene.c:24
+// C2F-37: `fmt, ...` virou `msg: str` (mensagem ja pronta)
+proc sem_higiene_propor(s: ^Semantica, codigo: i32, pos: u32, msg: str) -> bool {
+    if s.higiene.tem and (s.higiene.pos <= pos) {
+        return false
+    }
+    s.higiene.tem = true
+    s.higiene.codigo = codigo
+    s.higiene.pos = pos
+    s.higiene.sug.n = 0
+    // char causa[240] (SemHigiene): corta em 239 bytes; o texto fica sem dono que o libere = alloc frame (R-S8)
+    let m: int = min(239, len(msg))
+    s.higiene.causa = from_bytes(as_bytes(msg)[0..<m], alloc = frame)
+    return true
+}
+
+// C: semantic/sem_higiene.c:38
+// C2F-37: `fmt, ...` virou `msg: str` (mensagem ja pronta)
+// O corte em DIAG_DESCRICAO_MAX - 1 (texto[120] do C e de novo dentro de DiagSugerir) acontece dentro de diag_sugerir.
+proc sem_higiene_sugerir(s: ^Semantica, confianca: i32, msg: str) {
+    _ = common.diag_sugerir(&s.higiene.sug, confianca, msg)
+}
+
+// C: semantic/sem_higiene.c:49
+proc sem_higiene_editar(s: ^Semantica, ini: u32, fim: u32, novo: str) {
+    _ = common.diag_editar(&s.higiene.sug, ini, fim, novo)
+}
+
+// C: semantic/sem_higiene.c:54
+proc eh_caractere_de_nome(c: u8) -> bool {
+    return char_de_nome(c) // isalnum(c) || c == '_' (sem_allocator.fj, igual ao C)
+}
+
+// C: semantic/sem_higiene.c:59
+proc eh_espaco_de_linha(c: u8) -> bool {
+    return (c == 32) or (c == 9) // ' ' '\t'
+}
+
+// C: semantic/sem_higiene.c:65
+proc eh_elo_da_cadeia(x: ?^frontend.Expr) -> bool {
+    if (x as ^frontend.Expr).tipo_no == (frontend.EX_UNARIO as u8) {
+        return (x as ^frontend.Expr).op == (frontend.OP_DEREF as u8)
+    }
+    return (((x as ^frontend.Expr).tipo_no == (frontend.EX_CAMPO as u8)) or ((x as ^frontend.Expr).tipo_no == (frontend.EX_INDICE as u8))) or ((x as ^frontend.Expr).tipo_no == (frontend.EX_FATIA as u8))
+}
+
+// C: semantic/sem_higiene.c:72
+proc raiz_local(s: ^Semantica, x: ?^frontend.Expr) -> ?^LocalInfo {
+    var x_v: ?^frontend.Expr = x
+    while eh_elo_da_cadeia(x_v) {
+        x_v = (x_v as ^frontend.Expr).a
+    }
+    if ((x_v as ^frontend.Expr).tipo_no != (frontend.EX_NOME as u8)) or ((x_v as ^frontend.Expr).modulo != 0) {
+        return none
+    }
+    return escopo_buscar_mut(&s.escopo, (x_v as ^frontend.Expr).nome)
+}
+
+// C: semantic/sem_higiene.c:80
+proc sem_higiene_alterar(s: ^Semantica, alvo: ?^frontend.Expr) {
+    let local: ?^LocalInfo = raiz_local(s, alvo)
+    if local != none {
+        let ptr_1: ^LocalInfo = local as ^LocalInfo
+        ptr_1.usos = ptr_1.usos | (LOCAL_ALTERADO as u8)
+    }
+}
+
+// C: semantic/sem_higiene.c:87
+proc sem_higiene_raiz_lida(s: ^Semantica, alvo: ?^frontend.Expr) -> bool {
+    let local: ?^LocalInfo = raiz_local(s, alvo)
+    return (local == none) or (common.c2f_e_i32((local as ^LocalInfo).usos as i32, LOCAL_LIDO) != 0)
+}
+
+// C: semantic/sem_higiene.c:94
+proc sem_higiene_escrita(s: ^Semantica, alvo: ?^frontend.Expr, lida_antes: bool) {
+    let raiz: ?^frontend.Expr = sem_raiz_da_cadeia(s, alvo)
+    if (((common.c2f_b2i32(lida_antes) != 0) or (raiz == none)) or ((raiz as ^frontend.Expr).tipo_no != (frontend.EX_NOME as u8))) or ((raiz as ^frontend.Expr).modulo != 0) {
+        return
+    }
+    let local: ?^LocalInfo = escopo_buscar_mut(&s.escopo, (raiz as ^frontend.Expr).nome)
+    if local != none {
+        let ptr_1: ^LocalInfo = local as ^LocalInfo
+        ptr_1.usos = ptr_1.usos & common.c2f_trunc_u8(common.c2f_s2u_64((common.c2f_trunc_u8(common.c2f_s2u_64(common.c2f_nao_i32(LOCAL_LIDO) as i64)) as i32) as i64))
+    }
+}
+
+// C: semantic/sem_higiene.c:103
+proc declaracao_alterada(s: ^Semantica, l: ^LocalInfo, altura: u32) -> bool {
+    if common.c2f_e_i32(l.usos as i32, LOCAL_ALTERADO) != 0 {
+        return true
+    }
+    if l.grupo == 0 {
+        return false
+    }
+    var i: u32 = altura
+    while i < escopo_altura(&s.escopo) {
+        let outro: ^LocalInfo = &s.escopo.pilha[i as u64]
+        if (outro.grupo == l.grupo) and (common.c2f_e_i32(outro.usos as i32, LOCAL_ALTERADO) != 0) {
+            return true
+        }
+        i += 1
+    }
+    return false
+}
+
+// C: semantic/sem_higiene.c:115
+// G3: `nome` virou str (era []u8): nome[1] do C le o NUL; aqui c2f_nul_em.
+proc nome_isento_de_uso(nome: str) -> bool {
+    return (common.c2f_nul_em(nome, 0) == 95) and (common.c2f_nul_em(nome, 1) != 0) // '_' '\0'
+}
+
+// C: semantic/sem_higiene.c:121
+// G3: `texto` virou []u8 (o texto da fonte).
+proc var_antes_do_nome(texto: []u8, pos: u32, ini: ^u32) -> bool {
+    var fim: int = pos as int
+    while (fim > 0) and eh_espaco_de_linha(texto[fim - 1]) {
+        fim -= 1
+    }
+    // fim < 3 || memcmp(texto + fim - 3, "var", 3) != 0
+    if (fim < 3) or (texto[fim - 3] != 118) or (texto[fim - 2] != 97) or (texto[fim - 1] != 114) { // 'v' 'a' 'r'
+        return false
+    }
+    if (fim > 3) and eh_caractere_de_nome(texto[fim - 4]) {
+        return false
+    }
+    ini^ = (fim - 3) as u32
+    return true
+}
+
+// C: semantic/sem_higiene.c:133
+proc sugerir_var_para_let(s: ^Semantica, l: ^LocalInfo, nome: str) {
+    var ini: u32 = 0
+    if not var_antes_do_nome((s.fonte as ^common.Fonte).texto, l.pos, &ini) {
+        let msg_1 = format(f"troque 'var' por 'let' na declaracao que traz '{nome}'", alloc = heap)
+        defer delete(msg_1)
+        sem_higiene_sugerir(s, common.DIAG_SO_DICA, msg_1)
+        return
+    }
+    let msg_2 = format(f"troque 'var' por 'let' na declaracao de '{nome}'", alloc = heap)
+    defer delete(msg_2)
+    sem_higiene_sugerir(s, common.DIAG_CERTA, msg_2)
+    sem_higiene_editar(s, ini, ini + 3, "let")
+}
+
+// C: semantic/sem_higiene.c:147
+proc sugerir_nome_com_sublinhado(s: ^Semantica, l: ^LocalInfo, nome: str) {
+    let alterado: bool = common.c2f_e_i32(l.usos as i32, LOCAL_ALTERADO) != 0
+    if (nome[0] != 95) and (not alterado) { // '_'
+        let msg_1 = format(f"troque o nome '{nome}' por '_{nome}' (o sublinhado avisa que nao ler e de proposito)", alloc = heap)
+        defer delete(msg_1)
+        sem_higiene_sugerir(s, common.DIAG_CERTA, msg_1)
+        sem_higiene_editar(s, l.pos, l.pos, "_")
+    }
+    var tern_1: str = ""
+    if common.c2f_b2i32(alterado) != 0 {
+        tern_1 = " e as atribuicoes a ela"
+    }
+    let msg_2 = format(f"use o valor de '{nome}' ou remova a declaracao{tern_1}", alloc = heap)
+    defer delete(msg_2)
+    sem_higiene_sugerir(s, common.DIAG_SO_DICA, msg_2)
+}
+
+// C: semantic/sem_higiene.c:158
+proc achado_do_local(s: ^Semantica, l: ^LocalInfo, altura: u32) {
+    let nome: str = sem_nome_texto(s, l.nome)
+    let lido: bool = common.c2f_e_i32(l.usos as i32, LOCAL_LIDO) != 0
+    if (not lido) and (not s.em_teste) and (not nome_isento_de_uso(nome)) {
+        var natureza: str = "let"
+        if l.natureza == (LOC_VAR as u8) {
+            natureza = "var"
+        }
+        let msg_1 = format(f"'{nome}' nunca e lido: remova o {natureza}, use o valor, ou troque o nome por '_{nome}' (para descartar um retorno: _ = f() ou let _r = f())", alloc = heap)
+        defer delete(msg_1)
+        if sem_higiene_propor(s, common.E0708, l.pos, msg_1) {
+            sugerir_nome_com_sublinhado(s, l, nome)
+        }
+    } else if (l.natureza == (LOC_VAR as u8)) and (not declaracao_alterada(s, l, altura)) {
+        let msg_2 = format(f"'{nome}' nunca e alterada: troque var por let", alloc = heap)
+        defer delete(msg_2)
+        if sem_higiene_propor(s, common.E0707, l.pos, msg_2) {
+            sugerir_var_para_let(s, l, nome)
+        }
+    }
+}
+
+// C: semantic/sem_higiene.c:172
+proc sem_higiene_fechar(s: ^Semantica, altura: u32) {
+    var i: u32 = altura
+    while i < escopo_altura(&s.escopo) {
+        let l: ^LocalInfo = &s.escopo.pilha[i as u64]
+        if (l.natureza == (LOC_LET as u8)) or (l.natureza == (LOC_VAR as u8)) {
+            achado_do_local(s, l, altura)
+        }
+        i += 1
+    }
+}
+
+// C: semantic/sem_higiene.c:181
+// G3: `texto` virou []u8 (o texto da fonte).
+proc inicio_do_comando(texto: []u8, pos: u32) -> u32 {
+    var ini: int = pos as int
+    while (ini > 0) and (eh_caractere_de_nome(texto[ini - 1]) or (texto[ini - 1] == 46)) { // '.'
+        ini -= 1
+    }
+    var antes: int = ini
+    while (antes > 0) and eh_espaco_de_linha(texto[antes - 1]) {
+        antes -= 1
+    }
+    // memcmp(texto + antes - 3, "try", 3) == 0
+    if (antes < ini) and (antes >= 3) and (texto[antes - 3] == 116) and (texto[antes - 2] == 114) and (texto[antes - 1] == 121) and ((antes == 3) or (not eh_caractere_de_nome(texto[antes - 4]))) { // 't' 'r' 'y'
+        return (antes - 3) as u32
+    }
+    return ini as u32
+}
+
+// C: semantic/sem_higiene.c:194
+proc sem_higiene_retorno_descartado(s: ^Semantica, comando: ?^frontend.Expr) {
+    let cmd: ^frontend.Expr = comando as ^frontend.Expr
+    let com_try: bool = cmd.tipo_no == (frontend.EX_TRY as u8) // v1.11 L10a-bis: 'try f()' solto tambem perde o payload de 'T ! E'
+    var chamada: ?^frontend.Expr = comando
+    if com_try {
+        chamada = cmd.a
+    }
+    if ((chamada as ^frontend.Expr).tipo_no != (frontend.EX_CHAMADA as u8)) or ((chamada as ^frontend.Expr).ref != (frontend.REF_PROC as u8)) or (cmd.tipo == (TIPO_VAZIO as u32)) {
+        return
+    }
+    let nome: str = sem_nome_texto(s, (chamada as ^frontend.Expr).nome)
+    var tentar: str = ""
+    if com_try {
+        tentar = "try "
+    }
+    let msg_1 = format(f"o valor devolvido por '{nome}' foi descartado: guarde (let r = {tentar}{nome}(...)), use, ou descarte de proposito com _ = {tentar}{nome}(...)", alloc = heap)
+    defer delete(msg_1)
+    if not sem_higiene_propor(s, common.E0709, cmd.pos, msg_1) {
+        return
+    }
+    let ini: u32 = inicio_do_comando((s.fonte as ^common.Fonte).texto, cmd.pos)
+    let msg_2 = format(f"descarte de proposito: escreva '_ = ' antes de '{tentar}{nome}(...)'", alloc = heap)
+    defer delete(msg_2)
+    sem_higiene_sugerir(s, common.DIAG_CERTA, msg_2)
+    sem_higiene_editar(s, ini, ini, "_ = ")
+}
+
+// C: semantic/sem_higiene.c:210
+proc sem_higiene_sugerir_descarte_inutil(s: ^Semantica, st_pos: u32, valor_e_chamada: bool) {
+    let texto: []u8 = (s.fonte as ^common.Fonte).texto
+    var fim: u32 = st_pos + 1
+    if not valor_e_chamada {
+        let msg_1 = format(f"'_ =' so descarta o retorno de uma chamada: use o valor, ou apague o comando", alloc = heap)
+        defer delete(msg_1)
+        sem_higiene_sugerir(s, common.DIAG_SO_DICA, msg_1)
+        return
+    }
+    while eh_espaco_de_linha(texto[fim]) {
+        fim += 1
+    }
+    if texto[fim] == 61 { // '='
+        fim += 1
+    }
+    while eh_espaco_de_linha(texto[fim]) {
+        fim += 1
+    }
+    let msg_2 = format(f"a chamada nao devolve valor: tire o '_ = '", alloc = heap)
+    defer delete(msg_2)
+    sem_higiene_sugerir(s, common.DIAG_CERTA, msg_2)
+    sem_higiene_editar(s, st_pos, fim, "")
+}
+
+// C: semantic/sem_higiene.c:227
+proc sem_higiene_iniciar_corpo(s: ^Semantica) {
+    s.higiene.tem = false
+}
+
+// C: semantic/sem_higiene.c:233
+proc sem_higiene_guardar(s: ^Semantica, d: ?^frontend.Decl) {
+    if not s.higiene.tem {
+        return
+    }
+    s.higiene.tem = false
+    if s.tocou_veneno {
+        return
+    }
+    s.higiene.decl = d
+    append(&s.higienes, item = SemHigiene{})
+    s.higienes[len(s.higienes) - 1] = s.higiene
+}
+
+// C: semantic/sem_higiene.c:243
+proc sem_higiene_relatar(s: ^Semantica) -> bool {
+    var ok: bool = true
+    if s.lista.n > 0 {
+        return true
+    }
+    var i: u64 = 0
+    while (i < (len(s.higienes) as u64)) and (not s.lista.cortado) {
+        let h: ^SemHigiene = &s.higienes[i]
+        ok = false
+        let ptr_1: ^frontend.Decl = h.decl as ^frontend.Decl
+        ptr_1.com_erro = true
+        let txt_1 = h.causa or_else "(null)"
+        let msg_1 = format(f"{txt_1}", alloc = heap)
+        defer delete(msg_1)
+        _ = sem_erro(s, h.codigo, h.pos, msg_1)
+        let ptr_2: ^common.Diag = s.diag as ^common.Diag
+        ptr_2.sug = h.sug
+        if not sem_guardar_erro(s, (h.decl as ^frontend.Decl).modulo) {
+            break
+        }
+        i += 1
+    }
+    return ok
+}
+
+// C: semantic/sem_higiene.c:259
+proc sem_higiene_import_usado(s: ^Semantica, modulo: u8) {
+    if (s.import_usado == none) or (modulo == 0) {
+        return
+    }
+    let p_1 = s.import_usado or_else {}
+    p_1[((s.arquivo_atual as u64) * (s.qtd_modulos as u64)) + (modulo as u64)] = 1
+}
+
+// C: semantic/sem_higiene.c:266
+proc import_sem_uso(s: ^Semantica, d: ?^frontend.Decl) -> bool {
+    if (d as ^frontend.Decl).tipo_no != (frontend.D_IMPORT as u8) {
+        return false
+    }
+    // o driver injeta "std:wasm_rt" sozinho no alvo wasm (runtime em Forja): ninguem escreve wasm_rt.nome, nao e erro
+    let nome_import: str = sem_nome_texto(s, (d as ^frontend.Decl).nome)
+    if (len(nome_import) > 4) and (nome_import[0..<4] == "std:") and frontend.modulos_std_eh_runtime_wasm(nome_import[4..<len(nome_import)]) {
+        return false
+    }
+    return (s.import_usado or_else {})[((common.fonte_trecho_do_offset(s.fonte, (d as ^frontend.Decl).pos) as u64) * (s.qtd_modulos as u64)) + common.c2f_s2u_64((d as ^frontend.Decl).indice as i64)] == 0
+}
+
+// C: semantic/sem_higiene.c:273
+proc sem_higiene_imports(s: ^Semantica) -> bool {
+    var ok: bool = true
+    if s.import_usado == none {
+        return true
+    }
+    var d: ?^frontend.Decl = (s.programa as ^frontend.Programa).primeira
+    while (d != none) and (not s.lista.cortado) {
+        if not import_sem_uso(s, d) {
+            d = (d as ^frontend.Decl).prox
+            continue
+        }
+        ok = false
+        let msg_1 = format(f"o import \"{sem_nome_texto(s, (d as ^frontend.Decl).nome)}\" nunca e usado: nenhum '{sem_nome_texto(s, (d as ^frontend.Decl).nome_a)}.nome' no arquivo; remova a linha do import", alloc = heap)
+        defer delete(msg_1)
+        _ = sem_erro(s, common.E1005, (d as ^frontend.Decl).pos, msg_1)
+        if not sem_guardar_erro(s, (d as ^frontend.Decl).modulo) {
+            break
+        }
+        d = (d as ^frontend.Decl).prox
+    }
+    return ok
+}
+
+// G3 S7: propor (o achado mais cedo fica, causa em 239 bytes), sugerir/editar (limite de 2 sugestoes), texto antes do nome e do comando (valores do C a mao)
+test "sem_higiene: propor, sugerir, editar e texto" {
+    var sv: Semantica = Semantica{}
+    expect(sem_higiene_propor(&sv, common.E0708, 50, "a") and sv.higiene.tem and sv.higiene.codigo == common.E0708 and sv.higiene.pos == 50 and (sv.higiene.causa or_else "") == "a")
+    sv.higiene.sug.n = 1
+    expect(not sem_higiene_propor(&sv, common.E0707, 50, "b") and not sem_higiene_propor(&sv, common.E0707, 60, "b") and (sv.higiene.causa or_else "") == "a" and sv.higiene.sug.n == 1)
+    expect(sem_higiene_propor(&sv, common.E0707, 40, "c") and sv.higiene.codigo == common.E0707 and sv.higiene.pos == 40 and (sv.higiene.causa or_else "") == "c" and sv.higiene.sug.n == 0)
+    sem_higiene_iniciar_corpo(&sv)
+    expect(not sv.higiene.tem)
+    var longo = make([dynamic]u8, alloc = heap)
+    defer delete(longo)
+    for _k in 0..<300 {
+        append(&longo, item = 120)
+    }
+    let texto_longo = from_bytes(longo[..], alloc = heap)
+    defer delete(texto_longo)
+    expect(sem_higiene_propor(&sv, common.E0709, 5, texto_longo) and len(sv.higiene.causa or_else "") == 239)
+    sem_higiene_sugerir(&sv, common.DIAG_CERTA, "txt")
+    sem_higiene_sugerir(&sv, common.DIAG_SO_DICA, "dica")
+    sem_higiene_sugerir(&sv, common.DIAG_CERTA, "terceira")
+    expect(sv.higiene.sug.n == 2 and sv.higiene.sug.itens[0].confianca == (common.DIAG_CERTA as u8) and (sv.higiene.sug.itens[0].descricao or_else "") == "txt")
+    expect(sv.higiene.sug.itens[1].confianca == (common.DIAG_SO_DICA as u8) and (sv.higiene.sug.itens[1].descricao or_else "") == "dica")
+    sem_higiene_editar(&sv, 2, 5, "let")
+    expect(sv.higiene.sug.itens[1].nedicoes == 1 and sv.higiene.sug.itens[1].edicoes[0].ini == 2 and sv.higiene.sug.itens[1].edicoes[0].fim == 5 and (sv.higiene.sug.itens[1].edicoes[0].novo or_else "") == "let")
+    expect(eh_caractere_de_nome(95) and eh_caractere_de_nome(65) and eh_caractere_de_nome(122) and eh_caractere_de_nome(48) and not eh_caractere_de_nome(46) and not eh_caractere_de_nome(32) and not eh_caractere_de_nome(0))
+    expect(nome_isento_de_uso("_r") and nome_isento_de_uso("_unused") and not nome_isento_de_uso("_") and not nome_isento_de_uso("r") and not nome_isento_de_uso("") and not nome_isento_de_uso("a_"))
+    var ini: u32 = 99
+    expect(var_antes_do_nome(as_bytes("    var x"), 8, &ini) and ini == 4)
+    expect(var_antes_do_nome(as_bytes("var x"), 4, &ini) and ini == 0)
+    expect(var_antes_do_nome(as_bytes("a\tvar \t x"), 8, &ini) and ini == 2)
+    ini = 99
+    expect(not var_antes_do_nome(as_bytes("xvar y"), 5, &ini) and ini == 99)
+    expect(not var_antes_do_nome(as_bytes("let x"), 4, &ini) and not var_antes_do_nome(as_bytes("va x"), 3, &ini) and not var_antes_do_nome(as_bytes("var a, x"), 7, &ini) and not var_antes_do_nome(as_bytes("x"), 0, &ini))
+    expect(inicio_do_comando(as_bytes("    try mod.f(x)"), 12) == 4)
+    expect(inicio_do_comando(as_bytes("try f()"), 4) == 0)
+    expect(inicio_do_comando(as_bytes("xtry f()"), 5) == 5)
+    expect(inicio_do_comando(as_bytes("f()"), 0) == 0)
+    expect(inicio_do_comando(as_bytes("a.b.f()"), 4) == 0)
+    expect(inicio_do_comando(as_bytes("  mod.f(1)"), 6) == 2)
+    expect(inicio_do_comando(as_bytes("try\tf()"), 4) == 0)
+    expect(inicio_do_comando(as_bytes("retry f()"), 6) == 6)
+    var f_desc: common.Fonte = sem_allocator_teste_fonte("  _ = f()")
+    defer delete(f_desc.dono_texto)
+    sv.fonte = &f_desc
+    _ = sem_higiene_propor(&sv, common.E0709, 1, "x")
+    sv.higiene.sug.n = 0
+    sem_higiene_sugerir_descarte_inutil(&sv, 2, true)
+    expect(sv.higiene.sug.n == 1 and sv.higiene.sug.itens[0].confianca == (common.DIAG_CERTA as u8) and (sv.higiene.sug.itens[0].descricao or_else "") == "a chamada nao devolve valor: tire o '_ = '")
+    expect(sv.higiene.sug.itens[0].nedicoes == 1 and sv.higiene.sug.itens[0].edicoes[0].ini == 2 and sv.higiene.sug.itens[0].edicoes[0].fim == 6 and (sv.higiene.sug.itens[0].edicoes[0].novo or_else "?") == "")
+    sv.higiene.sug.n = 0
+    sem_higiene_sugerir_descarte_inutil(&sv, 2, false)
+    expect(sv.higiene.sug.n == 1 and sv.higiene.sug.itens[0].confianca == (common.DIAG_SO_DICA as u8) and sv.higiene.sug.itens[0].nedicoes == 0)
+    expect((sv.higiene.sug.itens[0].descricao or_else "") == "'_ =' so descarta o retorno de uma chamada: use o valor, ou apague o comando")
+}
+
+// G3 S7: higiene com escopo montado a mao: achados por local (E0707/E0708, sugestoes), alterar/raiz_lida/escrita, fechar, retorno descartado, guardar/relatar e imports
+test "sem_higiene: locais, achados, relatorio e imports" {
+    var arenas = make([dynamic]common.Arena, alloc = heap) // E0706: a arena do interner sobrevive a chamada, entao nao pode ser local
+    defer delete(arenas)
+    append(&arenas, item = common.Arena{})
+    let arena: ^common.Arena = &arenas[0]
+    defer common.arena_liberar(arena)
+    var ins = make([dynamic]common.Interner, alloc = heap)
+    defer delete(ins)
+    append(&ins, item = common.Interner{})
+    common.interner_iniciar(&ins[0], arena)
+    defer common.interner_liberar(&ins[0])
+    let n_abc = common.internar(&ins[0], "abc", 3)
+    let n_d = common.internar(&ins[0], "d", 1)
+    let n_r = common.internar(&ins[0], "_r", 2)
+    let n_e = common.internar(&ins[0], "e", 1)
+    let n_f = common.internar(&ins[0], "f", 1)
+    let n_g = common.internar(&ins[0], "g", 1)
+    var f1: common.Fonte = sem_allocator_teste_fonte("var abc = 1\nlet d = 2\nvar _r = 3\nvar e, f = 4\n  mod.g(1)\n  try mod.g(2)")
+    defer delete(f1.dono_texto)
+    var dg: common.Diag = common.Diag{}
+    var sv: Semantica = Semantica{}
+    sv.arena = arena
+    sv.nomes = ins[0..<1]
+    sv.fonte = &f1
+    sv.diag = &dg
+    sv.qtd_nomes = 16
+    sv.higienes = make([dynamic]SemHigiene, alloc = heap)
+    defer delete(sv.higienes)
+    escopo_iniciar(&sv.escopo, arena, 16)
+    defer escopo_liberar(&sv.escopo)
+    // texto: abc em 4, d em 16, _r em 26, e em 37, f em 40
+    var l_abc: LocalInfo = LocalInfo{nome = n_abc, natureza = LOC_VAR as u8, pos = 4, usos = LOCAL_LIDO as u8}
+    var l_d: LocalInfo = LocalInfo{nome = n_d, natureza = LOC_LET as u8, pos = 16}
+    var l_r: LocalInfo = LocalInfo{nome = n_r, natureza = LOC_VAR as u8, pos = 26}
+    var l_e: LocalInfo = LocalInfo{nome = n_e, natureza = LOC_VAR as u8, pos = 37, grupo = 5, usos = LOCAL_LIDO as u8}
+    var l_f: LocalInfo = LocalInfo{nome = n_f, natureza = LOC_VAR as u8, pos = 40, grupo = 5, usos = (LOCAL_LIDO + LOCAL_ALTERADO) as u8}
+    var l_p: LocalInfo = LocalInfo{nome = n_g, natureza = LOC_PARAM as u8, pos = 0}
+    // E0707: var lido e nunca alterado, com 'var' antes do nome: sugestao certa + edicao
+    achado_do_local(&sv, &l_abc, 0)
+    expect(sv.higiene.tem and sv.higiene.codigo == common.E0707 and sv.higiene.pos == 4 and (sv.higiene.causa or_else "") == "'abc' nunca e alterada: troque var por let")
+    expect(sv.higiene.sug.n == 1 and sv.higiene.sug.itens[0].confianca == (common.DIAG_CERTA as u8) and (sv.higiene.sug.itens[0].descricao or_else "") == "troque 'var' por 'let' na declaracao de 'abc'")
+    expect(sv.higiene.sug.itens[0].nedicoes == 1 and sv.higiene.sug.itens[0].edicoes[0].ini == 0 and sv.higiene.sug.itens[0].edicoes[0].fim == 3 and (sv.higiene.sug.itens[0].edicoes[0].novo or_else "") == "let")
+    // um achado mais tarde nao troca o pendente
+    achado_do_local(&sv, &l_d, 0)
+    expect(sv.higiene.codigo == common.E0707 and sv.higiene.pos == 4 and sv.higiene.sug.n == 1)
+    // E0708: let nunca lido: '_' na frente (certa, edicao) e dica
+    sem_higiene_iniciar_corpo(&sv)
+    achado_do_local(&sv, &l_d, 0)
+    expect(sv.higiene.tem and sv.higiene.codigo == common.E0708 and sv.higiene.pos == 16)
+    expect((sv.higiene.causa or_else "") == "'d' nunca e lido: remova o let, use o valor, ou troque o nome por '_d' (para descartar um retorno: _ = f() ou let _r = f())")
+    expect(sv.higiene.sug.n == 2 and sv.higiene.sug.itens[0].confianca == (common.DIAG_CERTA as u8) and (sv.higiene.sug.itens[0].descricao or_else "") == "troque o nome 'd' por '_d' (o sublinhado avisa que nao ler e de proposito)")
+    expect(sv.higiene.sug.itens[0].edicoes[0].ini == 16 and sv.higiene.sug.itens[0].edicoes[0].fim == 16 and (sv.higiene.sug.itens[0].edicoes[0].novo or_else "") == "_")
+    expect(sv.higiene.sug.itens[1].confianca == (common.DIAG_SO_DICA as u8) and (sv.higiene.sug.itens[1].descricao or_else "") == "use o valor de 'd' ou remova a declaracao")
+    // var nunca lido e alterado: so a dica, com as atribuicoes
+    sem_higiene_iniciar_corpo(&sv)
+    l_abc.usos = LOCAL_ALTERADO as u8
+    achado_do_local(&sv, &l_abc, 0)
+    expect(sv.higiene.codigo == common.E0708 and (sv.higiene.causa or_else "") == "'abc' nunca e lido: remova o var, use o valor, ou troque o nome por '_abc' (para descartar um retorno: _ = f() ou let _r = f())")
+    expect(sv.higiene.sug.n == 1 and sv.higiene.sug.itens[0].confianca == (common.DIAG_SO_DICA as u8) and (sv.higiene.sug.itens[0].descricao or_else "") == "use o valor de 'abc' ou remova a declaracao e as atribuicoes a ela")
+    // em teste ou nome com '_': nao ha E0708 (let) / cai no E0707 (var)
+    sem_higiene_iniciar_corpo(&sv)
+    sv.em_teste = true
+    achado_do_local(&sv, &l_d, 0)
+    expect(not sv.higiene.tem)
+    sv.em_teste = false
+    achado_do_local(&sv, &l_r, 0)
+    expect(sv.higiene.codigo == common.E0707 and (sv.higiene.causa or_else "") == "'_r' nunca e alterada: troque var por let" and sv.higiene.sug.n == 1)
+    expect((sv.higiene.sug.itens[0].descricao or_else "") == "troque 'var' por 'let' na declaracao de '_r'" and sv.higiene.sug.itens[0].edicoes[0].ini == 22 and sv.higiene.sug.itens[0].edicoes[0].fim == 25)
+    // 'var e, f = 4': o 2o nome nao tem 'var' antes (so dica) e o grupo alterado isenta os dois
+    sem_higiene_iniciar_corpo(&sv)
+    escopo_empurrar(&sv.escopo, &l_e)
+    escopo_empurrar(&sv.escopo, &l_f)
+    achado_do_local(&sv, &l_e, 0)
+    expect(not sv.higiene.tem and declaracao_alterada(&sv, &l_e, 0) and not declaracao_alterada(&sv, &l_e, 2))
+    l_f.usos = LOCAL_LIDO as u8
+    sv.escopo.pilha[1].usos = LOCAL_LIDO as u8
+    expect(not declaracao_alterada(&sv, &l_e, 0))
+    sem_higiene_iniciar_corpo(&sv)
+    achado_do_local(&sv, &l_f, 0)
+    expect(sv.higiene.codigo == common.E0707 and sv.higiene.sug.n == 1 and sv.higiene.sug.itens[0].confianca == (common.DIAG_SO_DICA as u8) and sv.higiene.sug.itens[0].nedicoes == 0)
+    expect((sv.higiene.sug.itens[0].descricao or_else "") == "troque 'var' por 'let' na declaracao que traz 'f'")
+    // alterar / raiz_lida / escrita pela raiz da cadeia (campo de nome local); raiz de outro modulo ou nao local = nada
+    let li: ^LocalInfo = &sv.escopo.pilha[0]
+    var e_nome: frontend.Expr = frontend.Expr{tipo_no = frontend.EX_NOME as u8, nome = n_e}
+    var e_campo: frontend.Expr = frontend.Expr{tipo_no = frontend.EX_CAMPO as u8, a = &e_nome}
+    var e_idx: frontend.Expr = frontend.Expr{tipo_no = frontend.EX_INDICE as u8, a = &e_campo}
+    var e_outro: frontend.Expr = frontend.Expr{tipo_no = frontend.EX_NOME as u8, nome = n_e, modulo = 1}
+    var e_nao_local: frontend.Expr = frontend.Expr{tipo_no = frontend.EX_NOME as u8, nome = n_g}
+    expect(li.usos == (LOCAL_LIDO as u8) and sem_higiene_raiz_lida(&sv, &e_idx) and sem_higiene_raiz_lida(&sv, &e_nao_local) and sem_higiene_raiz_lida(&sv, &e_outro))
+    sem_higiene_alterar(&sv, &e_idx)
+    sem_higiene_alterar(&sv, &e_outro)
+    sem_higiene_alterar(&sv, &e_nao_local)
+    expect(li.usos == ((LOCAL_LIDO + LOCAL_ALTERADO) as u8))
+    sem_higiene_escrita(&sv, &e_nome, true)
+    expect(li.usos == ((LOCAL_LIDO + LOCAL_ALTERADO) as u8))
+    sem_higiene_escrita(&sv, &e_outro, false)
+    expect(li.usos == ((LOCAL_LIDO + LOCAL_ALTERADO) as u8))
+    sem_higiene_escrita(&sv, &e_nome, false)
+    expect(li.usos == (LOCAL_ALTERADO as u8) and not sem_higiene_raiz_lida(&sv, &e_nome))
+    // fechar: so let/var a partir da altura entram (parametro nao); a altura do bloco corta os de fora
+    let altura_antes: u32 = escopo_altura(&sv.escopo)
+    escopo_empurrar(&sv.escopo, &l_p)
+    escopo_empurrar(&sv.escopo, &l_d)
+    sem_higiene_iniciar_corpo(&sv)
+    sem_higiene_fechar(&sv, altura_antes)
+    expect(altura_antes == 2 and sv.higiene.tem and sv.higiene.pos == 16 and sv.higiene.codigo == common.E0708)
+    sem_higiene_iniciar_corpo(&sv)
+    sem_higiene_fechar(&sv, altura_antes + 1) // so o l_d (let) a partir daqui
+    expect(sv.higiene.tem and sv.higiene.pos == 16)
+    sem_higiene_iniciar_corpo(&sv)
+    sem_higiene_fechar(&sv, altura_antes + 2) // altura = pilha: nada a conferir
+    expect(not sv.higiene.tem)
+    sem_higiene_iniciar_corpo(&sv)
+    sem_higiene_fechar(&sv, altura_antes) // o parametro l_p (LOC_PARAM) nao entra: so o achado do l_d
+    expect(sv.higiene.pos == 16 and sv.higiene.sug.n == 2)
+    // retorno descartado: chamada de proc com valor; 'try f()' recua ate o 'try'; sem valor (TIPO_VAZIO), nao chamada ou nao proc = nada
+    var chamada: frontend.Expr = frontend.Expr{tipo_no = frontend.EX_CHAMADA as u8, ref = frontend.REF_PROC as u8, nome = n_g, tipo = TIPO_INT as u32, pos = 52}
+    sem_higiene_iniciar_corpo(&sv)
+    sem_higiene_retorno_descartado(&sv, &chamada)
+    expect(sv.higiene.tem and sv.higiene.codigo == common.E0709 and sv.higiene.pos == 52)
+    expect((sv.higiene.causa or_else "") == "o valor devolvido por 'g' foi descartado: guarde (let r = g(...)), use, ou descarte de proposito com _ = g(...)")
+    expect(sv.higiene.sug.n == 1 and sv.higiene.sug.itens[0].confianca == (common.DIAG_CERTA as u8) and (sv.higiene.sug.itens[0].descricao or_else "") == "descarte de proposito: escreva '_ = ' antes de 'g(...)'")
+    expect(sv.higiene.sug.itens[0].edicoes[0].ini == 48 and sv.higiene.sug.itens[0].edicoes[0].fim == 48 and (sv.higiene.sug.itens[0].edicoes[0].novo or_else "") == "_ = ")
+    var com_try: frontend.Expr = frontend.Expr{tipo_no = frontend.EX_TRY as u8, a = &chamada, tipo = TIPO_INT as u32, pos = 67}
+    sem_higiene_iniciar_corpo(&sv)
+    sem_higiene_retorno_descartado(&sv, &com_try)
+    expect(sv.higiene.tem and sv.higiene.pos == 67 and (sv.higiene.causa or_else "") == "o valor devolvido por 'g' foi descartado: guarde (let r = try g(...)), use, ou descarte de proposito com _ = try g(...)")
+    expect((sv.higiene.sug.itens[0].descricao or_else "") == "descarte de proposito: escreva '_ = ' antes de 'try g(...)'" and sv.higiene.sug.itens[0].edicoes[0].ini == 59)
+    sv.higiene.pos = 10 // achado mais cedo pendente: este nao entra e nao ha sugestao nova
+    sv.higiene.sug.n = 0
+    sem_higiene_retorno_descartado(&sv, &chamada)
+    expect(sv.higiene.pos == 10 and sv.higiene.sug.n == 0)
+    sem_higiene_iniciar_corpo(&sv)
+    chamada.tipo = TIPO_VAZIO as u32
+    sem_higiene_retorno_descartado(&sv, &chamada)
+    chamada.tipo = TIPO_INT as u32
+    chamada.ref = frontend.REF_EMBUTIDO as u8
+    sem_higiene_retorno_descartado(&sv, &chamada)
+    chamada.ref = frontend.REF_PROC as u8
+    chamada.tipo_no = frontend.EX_NOME as u8
+    sem_higiene_retorno_descartado(&sv, &chamada)
+    expect(not sv.higiene.tem)
+}
+
+// G3 S7: guardar (veneno descarta), relatar (so com a lista vazia; 1 erro por proc; corte da lista) e imports (import_usado por arquivo)
+test "sem_higiene: guardar, relatar e imports" {
+    var arenas = make([dynamic]common.Arena, alloc = heap) // E0706: a arena do interner sobrevive a chamada, entao nao pode ser local
+    defer delete(arenas)
+    append(&arenas, item = common.Arena{})
+    let arena: ^common.Arena = &arenas[0]
+    defer common.arena_liberar(arena)
+    var ins = make([dynamic]common.Interner, alloc = heap)
+    defer delete(ins)
+    append(&ins, item = common.Interner{})
+    common.interner_iniciar(&ins[0], arena)
+    defer common.interner_liberar(&ins[0])
+    let n_apelido = common.internar(&ins[0], "ap", 2)
+    let n_path = common.internar(&ins[0], "caminho/mod", 11)
+    let n_outro = common.internar(&ins[0], "outro", 5)
+    let n_ap2 = common.internar(&ins[0], "ap2", 3)
+    var f1: common.Fonte = sem_allocator_teste_fonte("import \"x\"")
+    defer delete(f1.dono_texto)
+    var dg: common.Diag = common.Diag{}
+    var sv: Semantica = Semantica{}
+    sv.arena = arena
+    sv.nomes = ins[0..<1]
+    sv.fonte = &f1
+    sv.diag = &dg
+    sv.qtd_nomes = 16
+    sv.higienes = make([dynamic]SemHigiene, alloc = heap)
+    defer delete(sv.higienes)
+    var d1: frontend.Decl = frontend.Decl{}
+    var d2: frontend.Decl = frontend.Decl{}
+    var d3: frontend.Decl = frontend.Decl{}
+    // guardar: sem achado = nada; com achado vai para a lista com a decl; tocou_veneno descarta (o achado some)
+    sem_higiene_guardar(&sv, &d1)
+    expect(len(sv.higienes) == 0)
+    _ = sem_higiene_propor(&sv, common.E0707, 7, "causa 1")
+    _ = common.diag_sugerir(&sv.higiene.sug, common.DIAG_CERTA, "dica 1")
+    sem_higiene_guardar(&sv, &d1)
+    expect(len(sv.higienes) == 1 and not sv.higiene.tem and sv.higienes[0].pos == 7 and sv.higienes[0].codigo == common.E0707 and (sv.higienes[0].causa or_else "") == "causa 1" and sv.higienes[0].sug.n == 1)
+    expect(sv.higienes[0].decl == &d1)
+    sv.tocou_veneno = true
+    _ = sem_higiene_propor(&sv, common.E0708, 9, "causa x")
+    sem_higiene_guardar(&sv, &d2)
+    expect(len(sv.higienes) == 1 and not sv.higiene.tem)
+    sv.tocou_veneno = false
+    _ = sem_higiene_propor(&sv, common.E0708, 20, "causa 2")
+    sem_higiene_guardar(&sv, &d2)
+    expect(len(sv.higienes) == 2 and sv.higienes[1].decl == &d2)
+    // relatar: lista com erro = nada (true); lista vazia = 1 erro por proc, com_erro e a sugestao guardada
+    sv.lista.n = 1
+    expect(sem_higiene_relatar(&sv) and not d1.com_erro and sv.lista.n == 1)
+    sv.lista.n = 0
+    sv.lista.teto = 1
+    expect(not sem_higiene_relatar(&sv))
+    expect(d1.com_erro and d2.com_erro and sv.lista.n == 1 and sv.lista.cortado)
+    expect(sv.lista.itens[0].codigo == common.E0707 and sv.lista.itens[0].off == 7 and (sv.lista.itens[0].causa or_else "") == "causa 1" and sv.lista.itens[0].sug.n == 1 and (sv.lista.itens[0].sug.itens[0].descricao or_else "") == "dica 1")
+    d1.com_erro = false
+    d2.com_erro = false
+    sv.lista = common.DiagLista{}
+    expect(not sem_higiene_relatar(&sv) and sv.lista.n == 2 and not sv.lista.cortado and d1.com_erro and d2.com_erro and sv.lista.itens[1].codigo == common.E0708 and sv.lista.itens[1].off == 20)
+    sv.lista = common.DiagLista{}
+    delete(sv.higienes)
+    sv.higienes = make([dynamic]SemHigiene, alloc = heap)
+    expect(sem_higiene_relatar(&sv) and sv.lista.n == 0)
+    // import_usado: so com o vetor, modulo != 0, por arquivo (arquivo_atual * qtd_modulos + modulo)
+    sem_higiene_import_usado(&sv, 2)
+    sv.qtd_modulos = 3
+    sv.arquivo_atual = 1
+    sv.import_usado = common.arena_fatia_u8(arena, 6)
+    sem_higiene_import_usado(&sv, 0)
+    sem_higiene_import_usado(&sv, 2)
+    let usado: []u8 = sv.import_usado or_else {}
+    expect(usado[0] == 0 and usado[1] == 0 and usado[2] == 0 and usado[3] == 0 and usado[4] == 0 and usado[5] == 1)
+    // imports: E1005 so para o D_IMPORT sem uso (indice = modulo do apelido); sem vetor, true
+    d1 = frontend.Decl{tipo_no = frontend.D_IMPORT as u8, indice = 1, pos = 0, nome = n_path, nome_a = n_apelido}
+    d2 = frontend.Decl{tipo_no = frontend.D_IMPORT as u8, indice = 2, pos = 0, nome = n_outro, nome_a = n_ap2}
+    d3 = frontend.Decl{tipo_no = frontend.D_CONST as u8, indice = 1}
+    d1.prox = &d2
+    d2.prox = &d3
+    var prog: frontend.Programa = frontend.Programa{primeira = &d1, ultima = &d3}
+    sv.programa = &prog
+    sv.arquivo_atual = 0
+    expect(import_sem_uso(&sv, &d1) and not import_sem_uso(&sv, &d3))
+    sv.import_usado = none
+    expect(sem_higiene_imports(&sv) and sv.lista.n == 0)
+    sv.import_usado = usado
+    sem_higiene_import_usado(&sv, 2) // o import do arquivo 0 (trecho 0) olha usado[0 * 3 + indice]
+    expect(usado[2] == 1 and import_sem_uso(&sv, &d1) and not import_sem_uso(&sv, &d2) and not import_sem_uso(&sv, &d3))
+    expect(not sem_higiene_imports(&sv) and sv.lista.n == 1 and sv.lista.itens[0].codigo == common.E1005 and sv.lista.itens[0].off == 0)
+    expect((sv.lista.itens[0].causa or_else "") == "o import \"caminho/mod\" nunca e usado: nenhum 'ap.nome' no arquivo; remova a linha do import")
+    usado[1] = 1
+    sv.lista = common.DiagLista{}
+    expect(sem_higiene_imports(&sv) and sv.lista.n == 0)
+    usado[1] = 0
+    usado[2] = 0
+    sv.lista.teto = 1
+    sv.arquivo_atual = 0
+    expect(not sem_higiene_imports(&sv) and sv.lista.n == 1 and sv.lista.cortado)
+}

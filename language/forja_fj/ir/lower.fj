@@ -1,0 +1,351 @@
+// ir/lower.fj - porte de compiler/ir/lower.c, compiler/ir/lower.h
+// sha256 de ir/lower.c: 53b4e8f855a9714a3e0d6cb96151065779767e3a4d11ea3484a3dc990e14af84
+// sha256 de ir/lower.h: fc4c385951b27e733826b6161586c01e5b161fd624e3b60734f0680358ffe6b5
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "common"
+import "frontend"
+import "semantic"
+
+struct Contagem {
+    funcoes: u32
+    externos: u32
+    links: u32
+}
+
+// C: ir/lower.c:33
+proc eh_teste_lowerado(sem: ^semantic.Semantica, d: ?^frontend.Decl) -> bool {
+    return ((d as ^frontend.Decl).tipo_no == (frontend.D_TEST as u8)) and (((d as ^frontend.Decl).modulo == 0) or (common.c2f_b2i32(sem.modulo_testado[(d as ^frontend.Decl).modulo]) != 0))
+}
+
+// C: ir/lower.c:38
+proc contar_declaracoes(sem: ^semantic.Semantica) -> Contagem {
+    var n: Contagem = Contagem{funcoes = 0, externos = 0, links = 0}
+    var d: ?^frontend.Decl = (sem.programa as ^frontend.Programa).primeira
+    while d != none {
+        if ((d as ^frontend.Decl).tipo_no == (frontend.D_PROC as u8)) and (common.c2f_b2i32((d as ^frontend.Decl).externo) != 0) {
+            n.externos += 1
+        } else if ((d as ^frontend.Decl).tipo_no == (frontend.D_PROC as u8)) or (common.c2f_b2i32(eh_teste_lowerado(sem, d)) != 0) {
+            n.funcoes += 1
+        } else if (d as ^frontend.Decl).tipo_no == (frontend.D_LINK as u8) {
+            n.links += 1
+        }
+        d = (d as ^frontend.Decl).prox
+    }
+    return n
+}
+
+// C2F-1A: LwAlocar tipado das fatias do programa (zeradas, na arena), como os arena_fatia_<tipo> do pacote.
+proc lower_fatia_funcao(a: ^common.Arena, n: int) -> []IrFuncao {
+    var l = make([dynamic]IrFuncao, alloc = common.arena_mem(a), cap = n)
+    for i in 0..<n {
+        append(&l, item = IrFuncao{})
+    }
+    return l[..]
+}
+
+proc lower_fatia_externo(a: ^common.Arena, n: int) -> []IrExterno {
+    var l = make([dynamic]IrExterno, alloc = common.arena_mem(a), cap = n)
+    for i in 0..<n {
+        append(&l, item = IrExterno{})
+    }
+    return l[..]
+}
+
+proc lower_fatia_param(a: ^common.Arena, n: int) -> []IrParam {
+    var l = make([dynamic]IrParam, alloc = common.arena_mem(a), cap = n)
+    for i in 0..<n {
+        append(&l, item = IrParam{})
+    }
+    return l[..]
+}
+
+// C: ir/lower.c:50 (zera o estado da funcao nova e aponta o ctx para o corpo dela; a funcao vem da fatia pre-alocada, sem crescer)
+proc iniciar_funcao(c: ^LowerCtx, d: ?^frontend.Decl) -> ^IrFuncao {
+    let decl: ^frontend.Decl = d as ^frontend.Decl
+    let prog: ^IrPrograma = c.prog as ^IrPrograma
+    let antes: u32 = prog.nfuncoes
+    prog.nfuncoes += 1
+    let funcoes: []IrFuncao = prog.funcoes or_else {}
+    let f: ^IrFuncao = &funcoes[antes as int]
+    c.funcao = f
+    c.decl = d
+    c.atual = &f.corpo
+    c.ntemps = 0
+    c.prox_local = decl.nlocais
+    f.nomes_locais = decl.nomes_locais
+    f.nnomes_locais = 0
+    if decl.nomes_locais != none {
+        f.nnomes_locais = decl.nlocais
+    }
+    // c.defers.n = 0 e c.escopos.n = 0 do C: resize so vale para inteiro/real/bool, entao a pilha vazia e refeita
+    delete(c.defers)
+    c.defers = make([dynamic]?^frontend.Stmt, alloc = heap, cap = 16)
+    delete(c.escopos)
+    c.escopos = make([dynamic]LwEscopo, alloc = heap, cap = 16)
+    return f
+}
+
+// C: ir/lower.c:65
+proc fechar_funcao(c: ^LowerCtx) {
+    let ptr_1: ^IrFuncao = c.funcao as ^IrFuncao
+    ptr_1.ntemps = c.ntemps
+    let ptr_2: ^IrFuncao = c.funcao as ^IrFuncao
+    ptr_2.nlocais = c.prox_local
+}
+
+// C: ir/lower.c:71
+proc termina_em_return(lista: ^frontend.Stmt) -> bool {
+    var ultimo: ?^frontend.Stmt = lista
+    while (ultimo != none) and ((ultimo as ^frontend.Stmt).prox != none) {
+        ultimo = (ultimo as ^frontend.Stmt).prox
+    }
+    return (ultimo != none) and ((ultimo as ^frontend.Stmt).tipo_no == (frontend.ST_RETURN as u8))
+}
+
+// C: ir/lower.c:79
+proc fim_implicito_do_resultado(c: ^LowerCtx, d: ?^frontend.Decl) {
+    if (common.c2f_s2u_32(semantic.tipo_classe_de(&(c.sem as ^semantic.Semantica).tipos, (d as ^frontend.Decl).retorno.tipo)) != (semantic.TC_RESULTADO as u32)) or (common.c2f_b2i32(termina_em_return((d as ^frontend.Decl).corpo as ^frontend.Stmt)) != 0) {
+        return
+    }
+    let ok: ^IrInstr = lw_nova_instr(c, IR_RES_OK, (d as ^frontend.Decl).pos_fim)
+    ok.destino = lw_novo_temp(c)
+    ok.tipo = (d as ^frontend.Decl).retorno.tipo
+    ok.a = lw_valor_nenhum()
+    let ret: ^IrInstr = lw_nova_instr(c, IR_RETORNA, (d as ^frontend.Decl).pos_fim)
+    ret.a = lw_valor_temp(ok.destino, ok.tipo)
+}
+
+// C: ir/lower.c:90
+proc lw_funcao_proc(c: ^LowerCtx, d: ?^frontend.Decl) {
+    let decl: ^frontend.Decl = d as ^frontend.Decl
+    let sem: ^semantic.Semantica = c.sem as ^semantic.Semantica
+    let nomes: []common.Interner = sem.nomes or_else {}
+    let f: ^IrFuncao = iniciar_funcao(c, d)
+    f.nome = decl.chave
+    f.retorno = decl.retorno.tipo
+    f.nparams = decl.nparams
+    f.params = lower_fatia_param(c.arena as ^common.Arena, decl.nparams as int)
+    let params: []IrParam = f.params or_else {}
+    let origem: []frontend.Param = decl.params or_else {}
+    for i in 0..<decl.nparams {
+        params[i as int] = IrParam{nome = origem[i as int].nome, tipo = origem[i as int].tipo.tipo}
+    }
+    // C: `d->modulo == 0 && d->nome == Internar("main")`: o Internar so roda para proc da raiz (ordem de internar = ids)
+    f.e_main = false
+    if decl.modulo == 0 {
+        f.e_main = decl.nome == common.internar(&nomes[0], "main", 4)
+    }
+    f.exportado = decl.exportado
+    if decl.exportado {
+        f.linha = common.fonte_localizar_no_arquivo(sem.fonte, decl.pos).linha
+    }
+    lw_bloco(c, decl.corpo, false)
+    fim_implicito_do_resultado(c, d)
+    fechar_funcao(c)
+}
+
+// S4 P1: rotulo do test de modulo = "[<caminho do import>] <titulo>" (ex.: "[mods/geo] area"); o texto sai do heap e o interner copia.
+// C: ir/lower.c:111
+proc rotulo_do_teste_modulo(c: ^LowerCtx, d: ?^frontend.Decl) -> i32 {
+    let decl: ^frontend.Decl = d as ^frontend.Decl
+    let sem: ^semantic.Semantica = c.sem as ^semantic.Semantica
+    let nomes: []common.Interner = sem.nomes or_else {}
+    let modulos: []frontend.Modulos = sem.modulos or_else {}
+    let caminho: str = common.interner_texto(&nomes[0], modulos[0].itens[decl.modulo as int].caminho)
+    let titulo: str = common.interner_texto(&nomes[0], decl.nome)
+    let rotulo = format(f"[{caminho}] {titulo}", alloc = heap)
+    defer delete(rotulo)
+    return common.internar(&nomes[0], rotulo, len(rotulo) as u32)
+}
+
+// S4 P1: nome interno 0teste_<n> na raiz (inalterado) e 0teste_m<k>_<n> no modulo k (contador proprio). O texto sai do heap e o interner copia.
+// C: ir/lower.c:122
+proc nome_do_teste_lowerado(c: ^LowerCtx, d: ?^frontend.Decl) -> i32 {
+    let decl: ^frontend.Decl = d as ^frontend.Decl
+    let sem: ^semantic.Semantica = c.sem as ^semantic.Semantica
+    let nomes: []common.Interner = sem.nomes or_else {}
+    if decl.modulo == 0 {
+        let seq: u32 = c.seq_teste
+        c.seq_teste += 1
+        let nome = format(f"0teste_{seq}", alloc = heap)
+        defer delete(nome)
+        return common.internar(&nomes[0], nome, len(nome) as u32)
+    }
+    let seq_mod: u32 = c.seq_teste_modulo
+    c.seq_teste_modulo += 1
+    let nome_mod = format(f"0teste_m{decl.modulo}_{seq_mod}", alloc = heap)
+    defer delete(nome_mod)
+    return common.internar(&nomes[0], nome_mod, len(nome_mod) as u32)
+}
+
+// Testes dirigidos (valores do C: lower.c). Interner e Semantica montados a mao.
+test "lower: nomes internos de teste e fatia da funcao" {
+    var arenas = make([dynamic]common.Arena, alloc = heap, cap = 1)
+    append(&arenas, item = common.Arena{})
+    let a: ^common.Arena = &(arenas[..])[0]
+    var lista = make([dynamic]common.Interner, alloc = heap, cap = 1)
+    append(&lista, item = common.Interner{})
+    common.interner_iniciar(&lista[0], a)
+    var sem = semantic.Semantica{}
+    sem.nomes = lista[..]
+    var c = LowerCtx{}
+    c.sem = &sem
+    c.arena = a
+    var d1 = frontend.Decl{modulo = 0}
+    expect(common.interner_texto(&lista[0], nome_do_teste_lowerado(&c, &d1)) == "0teste_0")
+    expect(common.interner_texto(&lista[0], nome_do_teste_lowerado(&c, &d1)) == "0teste_1")
+    var d2 = frontend.Decl{modulo = 3}
+    expect(common.interner_texto(&lista[0], nome_do_teste_lowerado(&c, &d2)) == "0teste_m3_0")
+    common.interner_liberar(&lista[0])
+    delete(lista)
+    common.arena_liberar(a)
+    delete(arenas)
+}
+
+test "lower: iniciar funcao usa a fatia pre-alocada" {
+    var a = common.Arena{}
+    var prog = IrPrograma{}
+    prog.funcoes = lower_fatia_funcao(&a, 2)
+    var c = LowerCtx{}
+    c.prog = &prog
+    c.arena = &a
+    c.defers = make([dynamic]?^frontend.Stmt, alloc = heap, cap = 4)
+    c.escopos = make([dynamic]LwEscopo, alloc = heap, cap = 4)
+    var d = frontend.Decl{nlocais = 3}
+    let f: ^IrFuncao = iniciar_funcao(&c, &d)
+    expect(prog.nfuncoes == 1 and c.prox_local == 3 and c.ntemps == 0)
+    expect((c.funcao as ^IrFuncao) == f and (c.atual as ^IrBloco) == &f.corpo)
+    expect(len(c.defers) == 0 and len(c.escopos) == 0)
+    delete(c.defers)
+    delete(c.escopos)
+    common.arena_liberar(&a)
+}
+
+// C: ir/lower.c:132
+proc lw_funcao_teste(c: ^LowerCtx, d: ?^frontend.Decl) {
+    let f: ^IrFuncao = iniciar_funcao(c, d)
+    f.nome = nome_do_teste_lowerado(c, d)
+    f.retorno = semantic.TIPO_VAZIO as u32
+    f.e_teste = true
+    var tern_1: i32 = 0
+    if (d as ^frontend.Decl).modulo == 0 {
+        tern_1 = (d as ^frontend.Decl).nome
+    } else {
+        tern_1 = rotulo_do_teste_modulo(c, d)
+    }
+    f.titulo = tern_1
+    lw_bloco(c, (d as ^frontend.Decl).corpo, false)
+    fechar_funcao(c)
+}
+
+// Foreign interno (D13): declarado na std embutida e com simbolo C forja_* (o alias conta). C: ir/lower.c:144
+proc eh_externo_interno(c: ^LowerCtx, d: ?^frontend.Decl) -> bool {
+    let decl: ^frontend.Decl = d as ^frontend.Decl
+    let sem: ^semantic.Semantica = c.sem as ^semantic.Semantica
+    if (sem.modulos == none) or (sem.qtd_modulos <= 1) {
+        return false
+    }
+    let modulos: []frontend.Modulos = sem.modulos or_else {}
+    if (modulos[0].itens[decl.modulo as int].origem as i32) != frontend.MOD_STD {
+        return false
+    }
+    var id: i32 = decl.nome
+    if decl.simbolo >= 0 {
+        id = decl.simbolo
+    }
+    let nomes: []common.Interner = sem.nomes or_else {}
+    let texto: str = common.interner_texto(&nomes[0], id)
+    return (len(texto) >= 6) and (texto[0..<6] == "forja_")
+}
+
+// Proc de 'foreign': so a assinatura; o corpo esta na biblioteca C. C: ir/lower.c:152
+proc lw_externo(c: ^LowerCtx, d: ?^frontend.Decl) {
+    let decl: ^frontend.Decl = d as ^frontend.Decl
+    let prog: ^IrPrograma = c.prog as ^IrPrograma
+    let sem: ^semantic.Semantica = c.sem as ^semantic.Semantica
+    let antes: u32 = prog.nexternos
+    prog.nexternos += 1
+    let externos: []IrExterno = prog.externos or_else {}
+    let e: ^IrExterno = &externos[antes as int]
+    e.nome = decl.chave
+    e.simbolo = decl.nome
+    if decl.simbolo >= 0 {
+        e.simbolo = decl.simbolo
+    }
+    e.retorno = decl.retorno.tipo
+    e.nparams = decl.nparams
+    e.params = lower_fatia_param(c.arena as ^common.Arena, decl.nparams as int)
+    let params: []IrParam = e.params or_else {}
+    let origem: []frontend.Param = decl.params or_else {}
+    for i in 0..<decl.nparams {
+        params[i as int] = IrParam{nome = origem[i as int].nome, tipo = origem[i as int].tipo.tipo}
+    }
+    e.arquivo = common.fonte_trecho_do_offset(sem.fonte, decl.pos)
+    e.interno = eh_externo_interno(c, d)
+    e.linha = common.fonte_localizar_no_arquivo(sem.fonte, decl.pos).linha
+    if (decl.posse_c as i32) == frontend.POSSE_C_ENCERRA {
+        let fins: []i32 = prog.fins or_else {}
+        fins[prog.nfins as int] = e.simbolo
+        prog.nfins += 1
+    }
+}
+
+// C: ir/lower.c:172
+proc lw_link(c: ^LowerCtx, d: ?^frontend.Decl) {
+    let p: ?^IrPrograma = c.prog
+    for i in (0 as u32)..<(p as ^IrPrograma).nbibliotecas {
+        if ((p as ^IrPrograma).bibliotecas or_else {})[i] == (d as ^frontend.Decl).nome {
+            return
+        }
+    }
+    let ptr_1: ^IrPrograma = p as ^IrPrograma
+    let ptr_2: ^IrPrograma = p as ^IrPrograma
+    let antes_1: u32 = ptr_2.nbibliotecas
+    ptr_2.nbibliotecas += 1
+    let p_1 = ptr_1.bibliotecas or_else {}
+    p_1[antes_1] = (d as ^frontend.Decl).nome
+}
+
+// C: ir/lower.c:181
+proc liberar_contexto(c: ^LowerCtx) {
+    delete(c.defers)
+    delete(c.escopos)
+}
+
+// C: ir/lower.c:187 (ordem do fonte: proc, foreign, test e link; a fatia de cada tabela sai com a folga do C)
+pub proc lower_programa(sem: ^semantic.Semantica, saida: ^IrPrograma) -> bool {
+    var c = LowerCtx{}
+    c.sem = sem
+    c.arena = sem.arena
+    c.prog = saida
+    c.defers = make([dynamic]?^frontend.Stmt, alloc = heap, cap = 16)
+    c.escopos = make([dynamic]LwEscopo, alloc = heap, cap = 16)
+    let arena: ^common.Arena = sem.arena as ^common.Arena
+    let n: Contagem = contar_declaracoes(sem)
+    saida.funcoes = lower_fatia_funcao(arena, (n.funcoes + sem.qtd_enum) as int)
+    saida.externos = lower_fatia_externo(arena, (n.externos + 1) as int)
+    saida.bibliotecas = common.arena_fatia_i32(arena, n.links as int)
+    saida.trampolins = none
+    saida.ntrampolins = 0
+    saida.fins = common.arena_fatia_i32(arena, (n.externos + 1) as int)
+    saida.nfins = 0
+    lw_declaracoes(&c)
+    var d: ?^frontend.Decl = (sem.programa as ^frontend.Programa).primeira
+    while (d != none) and not (sem.diag as ^common.Diag).tem {
+        let decl: ^frontend.Decl = d as ^frontend.Decl
+        if (decl.tipo_no as i32 == frontend.D_PROC) and (decl.externo) {
+            lw_externo(&c, d)
+        } else if decl.tipo_no as i32 == frontend.D_PROC {
+            lw_funcao_proc(&c, d)
+        } else if eh_teste_lowerado(sem, d) {
+            lw_funcao_teste(&c, d)
+        } else if decl.tipo_no as i32 == frontend.D_LINK {
+            lw_link(&c, d)
+        }
+        d = decl.prox
+    }
+    liberar_contexto(&c)
+    return not (sem.diag as ^common.Diag).tem
+}

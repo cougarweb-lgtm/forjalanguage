@@ -1,0 +1,287 @@
+// std:time, pedaco fuso (parte do modulo std:time: veja time.fj): fuso local, deslocamento no ISO 8601 e data RFC 5322.
+// Versao: 0.1.0. Changelog: 0.1.0 - R2: primeira versao (local_offset_s, now_local, format_iso_offset, parse_iso_offset, format_rfc5322; parser TZif v2/v3 em Forja pura).
+// Todo DateTime aqui e UTC; o fuso e o deslocamento em segundos a leste de Greenwich (Sao Paulo = -10800), passado ao lado (offset_s).
+// Windows: o deslocamento vem do kernel32 (forja_os_fuso_s, horario de verao incluso). Linux: le o arquivo TZif (RFC 8536, v2 e v3, tempos de 64 bits).
+// Linux, variavel TZ: ausente ou vazia = /etc/localtime; ":<caminho>" = esse arquivo (relativo = sob /usr/share/zoneinfo/); "UTC", qualquer texto que
+// nao comece com ":" (string POSIX como "EST5EDT" ou nome sem ":") e arquivo ausente ou invalido = UTC (deslocamento 0). Documentado: a string POSIX NAO e interpretada.
+// Limite do TZif: depois da ultima transicao vale o ultimo tipo; o rodape POSIX do arquivo (regra de verao perpetua dos arquivos "slim") nao e lido.
+// format_iso_offset e format_rfc5322 descartam os segundos do deslocamento (so hh:mm); offsets de 24 h ou mais nao sao validos.
+
+// Instante em UTC mais o deslocamento do fuso em que o texto foi escrito (a Forja nao aceita tupla com `! E`, entao parse_iso_offset devolve esta struct).
+pub struct ZonedTime {
+    dt_utc: DateTime
+    offset_s: int = 0
+}
+
+// Valor que forja_os_fuso_s devolve no Linux: "o runtime nao resolve fuso".
+const FUSO_INDISPONIVEL: int = -2147483648
+const TZ_ARQUIVO_PADRAO: str = "/etc/localtime"
+const TZ_PASTA_ZONEINFO: str = "/usr/share/zoneinfo/"
+const TZ_VARIAVEL: str = "TZ"
+const CHAR_SLASH: u8 = 47
+const CHAR_PLUS: u8 = 43
+const CHAR_VERSION_2: u8 = 50
+const CHAR_VERSION_3: u8 = 51
+const TZIF_MAGIC_0: u8 = 84
+const TZIF_MAGIC_1: u8 = 90
+const TZIF_MAGIC_2: u8 = 105
+const TZIF_MAGIC_3: u8 = 102
+const TZIF_VERSION_AT: int = 4
+const TZIF_HEADER_LEN: int = 44
+const TZIF_ISUT_COUNT_AT: int = 20
+const TZIF_ISSTD_COUNT_AT: int = 24
+const TZIF_LEAP_COUNT_AT: int = 28
+const TZIF_TIME_COUNT_AT: int = 32
+const TZIF_TYPE_COUNT_AT: int = 36
+const TZIF_CHAR_COUNT_AT: int = 40
+const TZIF_V1_TIME_LEN: int = 4
+const TZIF_V2_TIME_LEN: int = 8
+const TZIF_V1_LEAP_LEN: int = 8
+const TZIF_V2_LEAP_LEN: int = 12
+const TZIF_TYPE_LEN: int = 6
+const TWO_POW_31: int = 2147483648
+const TWO_POW_32: int = 4294967296
+const BYTE_RANGE: int = 256
+const BYTES_PER_I64: int = 8
+const OFFSET_TEXT_LEN: int = 6
+const OFFSET_SIGN_FROM_END: int = 6
+const OFFSET_HOUR_FROM_END: int = 5
+const OFFSET_COLON_FROM_END: int = 3
+const OFFSET_MINUTE_FROM_END: int = 2
+const MAX_OFFSET_HOUR: int = 23
+const DAY_NAMES: str = "SunMonTueWedThuFriSat"
+const MONTH_NAMES: str = "JanFebMarAprMayJunJulAugSepOctNovDec"
+const NAME_LEN: int = 3
+
+// Inteiro sem sinal de 32 bits (big-endian) em at.
+proc be_u32(data: []u8, at: int) -> int {
+    var value = 0
+    for i in 0..<4 {
+        value = value * BYTE_RANGE + (data[at + i] as int)
+    }
+    return value
+}
+
+// Inteiro com sinal de 32 bits (big-endian) em at.
+proc be_i32(data: []u8, at: int) -> int {
+    let value = be_u32(data, at = at)
+    if value >= TWO_POW_31 {
+        return value - TWO_POW_32
+    }
+    return value
+}
+
+// Inteiro com sinal de 64 bits (big-endian) em at.
+proc be_i64(data: []u8, at: int) -> int {
+    var value: u64 = 0
+    for i in 0..<BYTES_PER_I64 {
+        value = value * (BYTE_RANGE as u64) + (data[at + i] as u64)
+    }
+    return transmute(value, to = i64) as int
+}
+
+// Os 4 bytes de at sao "TZif"?
+proc tzif_magic_at(data: []u8, at: int) -> bool {
+    if len(data) < at + 4 {
+        return false
+    }
+    return data[at] == TZIF_MAGIC_0 and data[at + 1] == TZIF_MAGIC_1 and data[at + 2] == TZIF_MAGIC_2 and data[at + 3] == TZIF_MAGIC_3
+}
+
+// Tamanho do bloco de dados de um cabecalho TZif em header_at (tempos de time_len bytes, leap de leap_len).
+proc tzif_block_size(data: []u8, header_at: int, time_len: int, leap_len: int) -> int {
+    let time_count = be_u32(data, at = header_at + TZIF_TIME_COUNT_AT)
+    let type_count = be_u32(data, at = header_at + TZIF_TYPE_COUNT_AT)
+    let char_count = be_u32(data, at = header_at + TZIF_CHAR_COUNT_AT)
+    let leap_count = be_u32(data, at = header_at + TZIF_LEAP_COUNT_AT)
+    let isstd_count = be_u32(data, at = header_at + TZIF_ISSTD_COUNT_AT)
+    let isut_count = be_u32(data, at = header_at + TZIF_ISUT_COUNT_AT)
+    return time_count * (time_len + 1) + type_count * TZIF_TYPE_LEN + char_count + leap_count * leap_len + isstd_count + isut_count
+}
+
+// Quantas transicoes (de 64 bits, ordenadas, a partir de times_at) sao <= unix_s; o indice da ultima e esse numero - 1.
+proc transitions_not_after(data: []u8, times_at: int, count: int, unix_s: int) -> int {
+    var low = 0
+    var high = count
+    while low < high {
+        let middle = (low + high) / 2
+        if be_i64(data, at = times_at + middle * TZIF_V2_TIME_LEN) <= unix_s {
+            low = middle + 1
+        } else {
+            high = middle
+        }
+    }
+    return low
+}
+
+// Deslocamento (segundos) do arquivo TZif data no instante unix_s (UTC). Usa o bloco v2/v3 (64 bits); antes da 1a transicao vale o tipo 0.
+// invalid_text: nao e TZif v2/v3 ou o arquivo esta truncado.
+pub proc tzif_offset(data: []u8, unix_s: int) -> int ! TimeError {
+    if len(data) < TZIF_HEADER_LEN or not tzif_magic_at(data, at = 0) {
+        return TimeError.invalid_text
+    }
+    if data[TZIF_VERSION_AT] != CHAR_VERSION_2 and data[TZIF_VERSION_AT] != CHAR_VERSION_3 {
+        return TimeError.invalid_text
+    }
+    let header_2_at = TZIF_HEADER_LEN + tzif_block_size(data, header_at = 0, time_len = TZIF_V1_TIME_LEN, leap_len = TZIF_V1_LEAP_LEN)
+    if not tzif_magic_at(data, at = header_2_at) or len(data) < header_2_at + TZIF_HEADER_LEN {
+        return TimeError.invalid_text
+    }
+    let data_at = header_2_at + TZIF_HEADER_LEN
+    let block_size = tzif_block_size(data, header_at = header_2_at, time_len = TZIF_V2_TIME_LEN, leap_len = TZIF_V2_LEAP_LEN)
+    let time_count = be_u32(data, at = header_2_at + TZIF_TIME_COUNT_AT)
+    let type_count = be_u32(data, at = header_2_at + TZIF_TYPE_COUNT_AT)
+    if len(data) < data_at + block_size or type_count < 1 {
+        return TimeError.invalid_text
+    }
+    let index_at = data_at + time_count * TZIF_V2_TIME_LEN
+    let types_at = index_at + time_count
+    var type_index = 0
+    let passed = transitions_not_after(data, times_at = data_at, count = time_count, unix_s = unix_s)
+    if passed > 0 {
+        type_index = data[index_at + passed - 1] as int
+    }
+    if type_index >= type_count {
+        return TimeError.invalid_text
+    }
+    return be_i32(data, at = types_at + type_index * TZIF_TYPE_LEN)
+}
+
+// Deslocamento do arquivo path no instante; 0 (UTC) se o arquivo falta ou nao e TZif.
+proc tz_file_offset(path: str, unix_s: int) -> int {
+    var offset = 0
+    switch bytes in file.read_all(path, alloc = heap) {
+    case [dynamic]u8:
+        offset = tzif_offset(bytes[..], unix_s) or_else 0
+        delete(bytes)
+    case file.FileError:
+        offset = 0
+    }
+    return offset
+}
+
+// Valor de TZ depois do ":" (caminho absoluto, ou relativo a /usr/share/zoneinfo/; vazio = /etc/localtime).
+proc tz_named_offset(name: str, unix_s: int) -> int {
+    if len(name) == 0 {
+        return tz_file_offset(TZ_ARQUIVO_PADRAO, unix_s)
+    }
+    if name[0] == CHAR_SLASH {
+        return tz_file_offset(name, unix_s)
+    }
+    let path = format(f"{TZ_PASTA_ZONEINFO}{name}", alloc = heap)
+    defer delete(path)
+    return tz_file_offset(path, unix_s)
+}
+
+// Deslocamento no Linux pelo valor da variavel TZ (regras no cabecalho do pedaco).
+proc tz_env_offset(value: str, unix_s: int) -> int {
+    if len(value) == 0 {
+        return tz_file_offset(TZ_ARQUIVO_PADRAO, unix_s)
+    }
+    if value[0] == CHAR_COLON {
+        return tz_named_offset(value[1..<len(value)], unix_s)
+    }
+    return 0
+}
+
+// Deslocamento do fuso local, em segundos, no instante dt (UTC). Windows: kernel32; Linux: TZ e TZif (veja o cabecalho do pedaco).
+pub proc local_offset_s(dt: DateTime) -> int {
+    let unix_s = unix_seconds(dt)
+    let native = forja_os_fuso_s(unix_s as i64) as int
+    if native != FUSO_INDISPONIVEL {
+        return native
+    }
+    var offset = 0
+    switch value in os.env(TZ_VARIAVEL) {
+    case str:
+        offset = tz_env_offset(value, unix_s)
+    case none:
+        offset = tz_file_offset(TZ_ARQUIVO_PADRAO, unix_s)
+    }
+    return offset
+}
+
+// O instante de agora: dt em UTC (como now()) e o deslocamento do fuso local naquele instante.
+pub proc now_local() -> (dt: DateTime, offset_s: int) {
+    let utc = now()
+    return utc, local_offset_s(utc)
+}
+
+// "+" para offset_s >= 0, "-" para negativo.
+proc offset_sign(offset_s: int) -> str {
+    if offset_s < 0 {
+        return "-"
+    }
+    return "+"
+}
+
+// Valor absoluto de offset_s em minutos inteiros (os segundos soltos caem).
+proc offset_minutes(offset_s: int) -> int {
+    if offset_s < 0 {
+        return (0 - offset_s) / SECONDS_PER_MINUTE
+    }
+    return offset_s / SECONDS_PER_MINUTE
+}
+
+// Texto ISO 8601 do instante dt_utc na hora local de offset_s: "2026-11-18T21:05:00-03:00" (com fracao como format_iso; offset 0 sai "+00:00"). O texto e DONO do alocador que o chamador passou.
+pub proc format_iso_offset(dt_utc: DateTime, offset_s: int, alloc: Allocator) -> str {
+    let utc_text = format_iso(add_seconds(dt_utc, seconds = offset_s), alloc = heap)
+    defer delete(utc_text)
+    let body = utc_text[0..<len(utc_text) - 1]
+    let minutes = offset_minutes(offset_s)
+    return format(f"{body}{offset_sign(offset_s)}{minutes / 60:02}:{minutes % 60:02}", alloc = alloc)
+}
+
+// O texto tem o deslocamento "+hh:mm" ou "-hh:mm" no fim (so a forma, sem faixa)?
+proc has_offset_suffix(s: str) -> bool {
+    let n = len(s)
+    if n < CLOCK_END_AT + OFFSET_TEXT_LEN {
+        return false
+    }
+    let sign = s[n - OFFSET_SIGN_FROM_END]
+    if sign != CHAR_PLUS and sign != CHAR_DASH {
+        return false
+    }
+    return s[n - OFFSET_COLON_FROM_END] == CHAR_COLON
+}
+
+// Deslocamento em segundos do sufixo "+hh:mm"/"-hh:mm" de s (has_offset_suffix ja conferido); invalid_text se hh ou mm nao sao digitos, invalid_field se fora da faixa.
+proc read_offset_suffix(s: str) -> int ! TimeError {
+    let n = len(s)
+    let hour = read_digits(s, pos = n - OFFSET_HOUR_FROM_END, count = 2)
+    let minute = read_digits(s, pos = n - OFFSET_MINUTE_FROM_END, count = 2)
+    if hour < 0 or minute < 0 {
+        return TimeError.invalid_text
+    }
+    if hour > MAX_OFFSET_HOUR or minute > LAST_MINUTE_OR_SECOND {
+        return TimeError.invalid_field
+    }
+    let seconds = hour * SECONDS_PER_HOUR + minute * SECONDS_PER_MINUTE
+    if s[n - OFFSET_SIGN_FROM_END] == CHAR_DASH {
+        return 0 - seconds
+    }
+    return seconds
+}
+
+// Le ISO 8601 com deslocamento: "2026-11-18T21:05:00-03:00", "...Z", "...+05:30" (fracao opcional). Devolve o instante em UTC e o deslocamento do texto.
+// Sem sufixo vale como parse_iso (UTC, deslocamento 0). Erros: os de parse_iso (invalid_text, invalid_field).
+pub proc parse_iso_offset(s: str) -> ZonedTime ! TimeError {
+    if not has_offset_suffix(s) {
+        let utc = try parse_iso(s)
+        return ZonedTime{dt_utc = utc}
+    }
+    let offset = try read_offset_suffix(s)
+    let local = try parse_iso(s[0..<len(s) - OFFSET_TEXT_LEN])
+    return ZonedTime{dt_utc = add_seconds(local, seconds = 0 - offset), offset_s = offset}
+}
+
+// Data RFC 5322 do instante dt_utc na hora local de offset_s: "Wed, 18 Nov 2026 21:05:00 -0300" (nomes em ingles, a fracao de segundo cai). O texto e DONO do alocador que o chamador passou.
+pub proc format_rfc5322(dt_utc: DateTime, offset_s: int, alloc: Allocator) -> str {
+    let local = add_seconds(dt_utc, seconds = offset_s)
+    let day_at = weekday(local) * NAME_LEN
+    let month_at = (local.month - 1) * NAME_LEN
+    let day_name = DAY_NAMES[day_at..<day_at + NAME_LEN]
+    let month_name = MONTH_NAMES[month_at..<month_at + NAME_LEN]
+    let minutes = offset_minutes(offset_s)
+    return format(f"{day_name}, {local.day:02} {month_name} {local.year:04} {local.hour:02}:{local.minute:02}:{local.second:02} {offset_sign(offset_s)}{minutes / 60:02}{minutes % 60:02}", alloc = alloc)
+}

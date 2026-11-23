@@ -1,0 +1,377 @@
+// std:os - argumentos, variavel de ambiente, saida do processo, sleep_ms, time_ns, wall_time_ns e as constantes TARGET e ARCH (IA1-L9b) (Linguagem v1.11, M5 P26b; renomeado de std:proc no IA1-b01; sleep_ms/time_ns no IA1-L6; wall_time_ns no IA1-LT). API em ingles (ADR-39); o corpo chama o runtime direto.
+// Posse: args() e env() devolvem texto EMPRESTADO do runtime, vivo ate o fim do programa; nao se da delete neles.
+// TARGET e ARCH: o alvo da compilacao, resolvidos pelo compilador (o --target x86_64-linux troca o texto de TARGET ao carregar este modulo; sem runtime).
+// Pasta e ambiente (A52): cwd, abs_path, exe_path, temp_dir, set_env, unset_env e random_bytes; texto de caminho em UTF-8, erro por OsError. env() le o ambiente VIVO (GetEnvironmentVariableW nos 2 backends), entao ve o que set_env gravou; o environ da CRT nao e atualizado (SetEnvironmentVariableW mexe so no bloco do processo).
+// Posse: cwd, abs_path, exe_path e temp_dir devolvem texto DONO do alocador que o chamador passou: quem recebe faz delete. No Linux (P28b-1): cwd = getcwd; abs_path e lexico (sem disco); exe_path = AT_EXECFN do auxv, sem resolver symlink; temp_dir = TMPDIR ou /tmp; set_env e unset_env mexem num ambiente no heap; random_bytes = getrandom 318 (fallback /dev/urandom); leitura de stdin pelo runtime do Linux.
+// Stderr e pico de memoria (M5 P28b-2b, D0638): write_stderr(bytes) escreve bytes CRUS em stderr (sem CRLF, sem buffer: cada chamada sai na hora); print_stderr(text) e o text mais um LF (o mesmo contrato do print do stdout, que fecha a linha). peak_memory() devolve o pico do PROPRIO processo em bytes (Windows: PeakWorkingSetSize por K32GetProcessMemoryInfo; Linux: ru_maxrss * 1024 por getrusage); erro por OsError.
+// Changelog: D-G3-L2b (0.4.0 deste cabecalho) - mem_available, pid_alive, last_error e error_text no Linux (sysinfo, kill(pid, 0), rt_os_ultimo_erro, texto vazio); so comentarios nas procs. D-G3-L2a bloco A (0.3.0 deste cabecalho) - mem_available, pid_alive, last_error, error_text, write_stdout e flush_stdout (kernel32: GlobalMemoryStatusEx, OpenProcess, FormatMessageW; rt_os_win.c, forja_rt_proc.h). M8 K1 (D-M8-8) - pid e cpu_count (forja_os_pid e forja_os_cpu_count). M5 P28b-2b - write_stderr, print_stderr e peak_memory. M5 P28b-1 (so o comentario do Linux, sem codigo). A52 (0.2.0 deste cabecalho) - OsError, cwd, abs_path, exe_path, temp_dir, set_env, unset_env e random_bytes pelo runtime forja_proc_* (rt_os_win.c, forja_rt_proc.h; GetCurrentDirectoryW, GetFullPathNameW, GetModuleFileNameW, GetTempPathW, SetEnvironmentVariableW e SystemFunction036 da ADVAPI32). S3 P5b-2 -read_line (str ! InputError) e read_all_stdin ([dynamic]u8 ! InputError) pelo runtime forja_stdin_* (rt_es_win.c, forja_rt_stdin.h, D7); InputError { end, other }.
+pub const TARGET: str = "x86_64-windows"
+pub const ARCH: str = "x86_64"
+
+foreign {
+    proc forja_proc_argumentos(quantos: ^int) -> rawptr
+    proc forja_proc_ambiente(nome: cstr) -> ?cstr
+    proc forja_proc_sair(codigo: int)
+    proc forja_proc_dormir_ms(ms: int)
+    proc forja_proc_multithread_ligar()
+    proc forja_proc_tempo_ns() -> int
+    proc forja_proc_hora_ns() -> int
+    proc forja_stdin_ler(destino: ^u8, n: i64) -> i64
+    proc forja_stdin_ler_linha(destino: ^u8, n: i64, achou_lf: ^i32) -> i64
+    proc forja_proc_pasta_atual(destino: ^u8, n: i64) -> i64
+    proc forja_proc_caminho_absoluto(caminho: cstr, destino: ^u8, n: i64) -> i64
+    proc forja_proc_caminho_exe(destino: ^u8, n: i64) -> i64
+    proc forja_proc_pasta_temp(destino: ^u8, n: i64) -> i64
+    proc forja_proc_definir_ambiente(nome: cstr, valor: ?cstr) -> i32
+    proc forja_proc_bytes_aleatorios(destino: ^u8, n: i64) -> i32
+    proc forja_proc_escrever_erro(dados: ^u8, n: i64)
+    proc forja_proc_pico_memoria() -> i64
+    proc forja_os_pid() -> int
+    proc forja_os_cpu_count() -> int
+    proc forja_os_mem_available() -> i64
+    proc forja_os_pid_alive(pid: i64) -> i32
+    proc forja_os_last_error() -> i64
+    proc forja_os_error_text(codigo: i64, destino: ^u8, n: i64) -> i64
+    proc forja_os_write_stdout(dados: ^u8, n: i64)
+    proc forja_os_flush_stdout()
+}
+
+// Erro da entrada padrao: end = fim da entrada sem nenhum byte; other = falha de leitura.
+pub enum InputError { end, other }
+
+// Argumentos do processo em UTF-8; args()[0] e o programa, como o sistema entregou.
+pub proc args() -> []str {
+    var n: int = 0
+    let p = forja_proc_argumentos(&n) as ^str
+    return slice_from(p, len = n)
+}
+
+// Valor da variavel de ambiente: none se nao existe, "" se existe e esta vazia.
+pub proc env(name: str) -> ?str {
+    let c = format_c(f"{name}", alloc = heap)
+    defer delete(c)
+    var r: ?str = none
+    switch x in forja_proc_ambiente(c) {
+    case cstr:
+        r = x as str
+    case none:
+        r = none
+    }
+    return r
+}
+
+// Dorme ms milissegundos (zero ou negativo volta na hora). Bloqueia so este programa.
+pub proc sleep_ms(ms: int) {
+    forja_proc_dormir_ms(ms)
+}
+
+// Liga as travas do runtime (estado compartilhado entre threads). Chame ANTES de criar a primeira thread (CreateThread, std:thread): uma thread que ja esteja dentro de uma secao do runtime quando isto liga segue sem trava. Pegajoso: nao desliga.
+pub proc multithread_on() {
+    forja_proc_multithread_ligar()
+}
+
+// Relogio monotonico em nanossegundos, de um ponto fixo do sistema: nao e data nem hora, so serve para medir diferencas (time_ns() - inicio).
+pub proc time_ns() -> int {
+    return forja_proc_tempo_ns()
+}
+
+// Hora de parede em nanossegundos desde 1970-01-01 00:00:00 UTC (hora do sistema, UTC). NAO e monotonica: o relogio do sistema pode ser acertado; para medir duracao use time_ns.
+pub proc wall_time_ns() -> int {
+    return forja_proc_hora_ns()
+}
+
+// Descarrega stdout e sai com o codigo (0..255; outro valor e R0012). Nao roda o relatorio de vazamento (R0009).
+pub proc exit(code: int) {
+    forja_proc_sair(code)
+}
+
+// Uma linha da entrada padrao, sem o LF e sem um CR logo antes dele; bytes crus, sem validar UTF-8. Linha vazia ("\n") devolve "" e nao e fim.
+// Posse: o texto e DONO do alocador que o chamador passou: quem recebe faz delete(linha) (com alloc = heap).
+pub proc read_line(alloc: Allocator) -> str ! InputError {
+    var linha = make([dynamic]u8, alloc = alloc)
+    defer delete(linha)
+    var parte: [4096]u8 = {}
+    var viu = false
+    while true {
+        var achou: i32 = 0
+        let lidos = forja_stdin_ler_linha(&parte[0], n = len(parte) as i64, achou_lf = &achou)
+        if lidos < 0 {
+            return InputError.other
+        }
+        if lidos == 0 and achou == 0 {
+            if not viu {
+                return InputError.end
+            }
+            break
+        }
+        viu = true
+        if lidos > 0 {
+            append(&linha, items = parte[0..<lidos])
+        }
+        if achou == 1 {
+            break
+        }
+    }
+    return to_str(&linha)
+}
+
+// Toda a entrada padrao ate o fim, em bytes crus: lista vazia se nao veio nada (nao e erro).
+// Posse: a lista e DONA dos bytes, do alocador que o chamador passou: quem recebe faz delete(dados).
+pub proc read_all_stdin(alloc: Allocator) -> [dynamic]u8 ! InputError {
+    var dados = make([dynamic]u8, alloc = alloc)
+    var bloco: [65536]u8 = {}
+    var lidos: i64 = 1
+    while lidos > 0 {
+        lidos = forja_stdin_ler(&bloco[0], n = len(bloco) as i64)
+        if lidos < 0 {
+            delete(dados)
+            return InputError.other
+        }
+        if lidos > 0 {
+            append(&dados, items = bloco[0..<lidos])
+        }
+    }
+    return dados
+}
+
+// Erro de pasta, ambiente e bytes aleatorios: invalid_input = nome ou caminho que o sistema nao aceita (vazio, com byte 0 ou, em nome de variavel, com "="); other = o resto.
+pub enum OsError { not_found, no_permission, invalid_input, other }
+
+// Codigos neutros do runtime (rt_sys.h: SYS_ARQ_*): 1 = not_found, 2 = no_permission, qualquer outro = other.
+const OS_ERRO_NAO_ACHADO: i64 = 1
+const OS_ERRO_SEM_PERMISSAO: i64 = 2
+// Qual texto do sistema pedir ao runtime (os_chamar_texto).
+const OS_PASTA_ATUAL: i32 = 0
+const OS_CAMINHO_ABSOLUTO: i32 = 1
+const OS_CAMINHO_EXE: i32 = 2
+const OS_PASTA_TEMP: i32 = 3
+// Primeira tentativa com 512 bytes; se nao couber o runtime diz o tamanho exato e a 2a tentativa basta (a 3a cobre a pasta que mudou no meio).
+const OS_BLOCO_TEXTO: i64 = 512
+const OS_TENTATIVAS_TEXTO: int = 3
+const OS_BYTE_IGUAL: u8 = 61
+
+proc os_erro(codigo: i64) -> OsError {
+    if codigo == OS_ERRO_NAO_ACHADO {
+        return OsError.not_found
+    }
+    if codigo == OS_ERRO_SEM_PERMISSAO {
+        return OsError.no_permission
+    }
+    return OsError.other
+}
+
+// Codigo do runtime (0 = deu certo) -> erro opcional.
+proc os_erro_ou(codigo: i32) -> ?OsError {
+    if codigo == 0 {
+        return none
+    }
+    return os_erro(codigo as i64)
+}
+
+// O texto tem algum byte 0? O runtime le texto C e cortaria ali.
+proc os_tem_nul(texto: str) -> bool {
+    for b in as_bytes(texto) {
+        if b == 0 {
+            return true
+        }
+    }
+    return false
+}
+
+// Nome de variavel de ambiente: nao vazio, sem byte 0 e sem "=".
+proc os_nome_valido(nome: str) -> bool {
+    if len(nome) == 0 or os_tem_nul(nome) {
+        return false
+    }
+    for b in as_bytes(nome) {
+        if b == OS_BYTE_IGUAL {
+            return false
+        }
+    }
+    return true
+}
+
+// Despacho para o runtime: devolve os bytes necessarios (>= 0) ou -codigo, gravando em destino so se couber.
+proc os_chamar_texto(qual: i32, entrada: cstr, destino: ^u8, n: i64) -> i64 {
+    if qual == OS_PASTA_ATUAL {
+        return forja_proc_pasta_atual(destino, n)
+    }
+    if qual == OS_CAMINHO_ABSOLUTO {
+        return forja_proc_caminho_absoluto(entrada, destino = destino, n = n)
+    }
+    if qual == OS_CAMINHO_EXE {
+        return forja_proc_caminho_exe(destino, n)
+    }
+    return forja_proc_pasta_temp(destino, n)
+}
+
+// Pede o texto ao runtime e devolve DONO do alocador do chamador: tenta com 512 bytes e, se nao coube, repete com o tamanho exato.
+proc os_ler_texto(qual: i32, entrada: cstr, alloc: Allocator) -> str ! OsError {
+    var cap: i64 = OS_BLOCO_TEXTO
+    for _tentativa in 0..<OS_TENTATIVAS_TEXTO {
+        var dados = make([dynamic]u8, alloc = alloc, len = cap as int)
+        defer delete(dados)
+        let r = os_chamar_texto(qual, entrada, &dados[0], cap)
+        if r < 0 {
+            return os_erro(-r)
+        }
+        if r < cap {
+            resize(&dados, len = r as int)
+            return to_str(&dados)
+        }
+        cap = r + 1
+    }
+    return OsError.other
+}
+
+// Pasta atual do processo, em UTF-8, sem barra final (exceto na raiz, C:\).
+// Posse: o texto e DONO do alocador que o chamador passou: quem recebe faz delete.
+pub proc cwd(alloc: Allocator) -> str ! OsError {
+    return os_ler_texto(OS_PASTA_ATUAL, "", alloc = alloc)
+}
+
+// Caminho absoluto de path (GetFullPathNameW): resolve "." e "..", troca "/" por "\" e parte da pasta atual; nao consulta o disco. Vazio ou com byte 0 = invalid_input. (Nao se chama abs: colide com o embutido.)
+// Posse: o texto e DONO do alocador que o chamador passou: quem recebe faz delete.
+pub proc abs_path(path: str, alloc: Allocator) -> str ! OsError {
+    if len(path) == 0 or os_tem_nul(path) {
+        return OsError.invalid_input
+    }
+    let c = format_c(f"{path}", alloc = heap)
+    defer delete(c)
+    return os_ler_texto(OS_CAMINHO_ABSOLUTO, c, alloc = alloc)
+}
+
+// Caminho do executavel em execucao (GetModuleFileNameW; cresce o buffer ate 32768 unidades).
+// Posse: o texto e DONO do alocador que o chamador passou: quem recebe faz delete.
+pub proc exe_path(alloc: Allocator) -> str ! OsError {
+    return os_ler_texto(OS_CAMINHO_EXE, "", alloc = alloc)
+}
+
+// Pasta temporaria do usuario (GetTempPathW: TMP, TEMP, USERPROFILE, a do Windows), sem a barra final, exceto na raiz (C:\). A pasta nao e criada nem conferida.
+// Posse: o texto e DONO do alocador que o chamador passou: quem recebe faz delete.
+pub proc temp_dir(alloc: Allocator) -> str ! OsError {
+    return os_ler_texto(OS_PASTA_TEMP, "", alloc = alloc)
+}
+
+// Define a variavel de ambiente do processo (valor vazio vale). Nome vazio, com "=" ou com byte 0, e valor com byte 0 = invalid_input.
+pub proc set_env(name: str, value: str) -> ?OsError {
+    if not os_nome_valido(name) or os_tem_nul(value) {
+        return OsError.invalid_input
+    }
+    let n = format_c(f"{name}", alloc = heap)
+    defer delete(n)
+    let v = format_c(f"{value}", alloc = heap)
+    defer delete(v)
+    return os_erro_ou(forja_proc_definir_ambiente(n, v))
+}
+
+// Remove a variavel de ambiente do processo; remover a que nao existe NAO e erro. Nome invalido = invalid_input.
+pub proc unset_env(name: str) -> ?OsError {
+    if not os_nome_valido(name) {
+        return OsError.invalid_input
+    }
+    let n = format_c(f"{name}", alloc = heap)
+    defer delete(n)
+    return os_erro_ou(forja_proc_definir_ambiente(n, none))
+}
+
+// Enche a fatia do chamador com bytes aleatorios do sistema (criptograficamente fortes; nao aloca). Fatia vazia = sem erro.
+pub proc random_bytes(into: []u8) -> ?OsError {
+    if len(into) == 0 {
+        return none
+    }
+    return os_erro_ou(forja_proc_bytes_aleatorios(&into[0], n = len(into) as i64))
+}
+
+// Escreve os bytes em stderr exatamente como vieram (sem CRLF e sem LF acrescentado); sem buffer. Lista vazia nao faz nada.
+pub proc write_stderr(bytes: []u8) {
+    if len(bytes) == 0 {
+        return
+    }
+    forja_proc_escrever_erro(&bytes[0], n = len(bytes) as i64)
+}
+
+// Escreve o texto em stderr e fecha com um LF (como o print fecha a linha no stdout); sem CRLF e sem buffer. (Nao se chama eprint: o nome e reservado pelo embutido eprint(f"..."), que no Windows traduz o LF em CRLF.)
+pub proc print_stderr(text: str) {
+    write_stderr(as_bytes(text))
+    var lf: [1]u8 = {10}
+    write_stderr(lf[..])
+}
+
+// Pico de memoria do proprio processo, em bytes.
+pub proc peak_memory() -> u64 ! OsError {
+    let r = forja_proc_pico_memoria()
+    if r < 0 {
+        return os_erro(-r)
+    }
+    return r as u64
+}
+
+// Pid do proprio processo (getpid no Linux, GetCurrentProcessId no Windows). Nao falha.
+pub proc pid() -> int {
+    return forja_os_pid()
+}
+
+// Processadores disponiveis ao processo (1 a 4096): Windows conta todos os grupos; Linux conta o conjunto de afinidade. Erro do sistema vira 1.
+pub proc cpu_count() -> int {
+    return forja_os_cpu_count()
+}
+
+// Memoria RAM livre do sistema, em bytes: serve para limitar o paralelismo pela memoria. Falha do sistema = other.
+// Windows: GlobalMemoryStatusEx (ullAvailPhys, inclui a lista standby). Linux: sysinfo (freeram * mem_unit): NAO e o MemAvailable do /proc (que soma o cache recuperavel); conta so paginas livres, entao e MENOR que o do Windows.
+pub proc mem_available() -> u64 ! OsError {
+    let r = forja_os_mem_available()
+    if r < 0 {
+        return os_erro(-r)
+    }
+    return r as u64
+}
+
+// Diz se o processo de pid ainda existe. Acesso negado conta como vivo (o sistema nao deixa olhar, mas ele roda). Pid <= 0 ou acima de 2^32-1 = false.
+// Linux: kill(pid, 0) (EPERM = vivo, ESRCH = morto); um filho que ja saiu mas o pai ainda nao colheu (zumbi) conta como vivo.
+pub proc pid_alive(pid: int) -> bool {
+    return forja_os_pid_alive(pid as i64) != 0
+}
+
+// Codigo do ultimo erro do sistema nesta thread (GetLastError); 0 = nenhum. Use logo depois da chamada que falhou.
+// Linux: o errno positivo da ultima falha de open (std:file) ou de spawn (std:process), guardado numa variavel do runtime UNICA do processo (nao por thread); spawn que falha no exec grava o equivalente do erro (2 nao achou, 13 sem permissao).
+pub proc last_error() -> int {
+    return forja_os_last_error() as int
+}
+
+// Texto do erro do sistema em ingles (FormatMessageW; idioma neutro se faltar), sem o CR/LF do fim. Codigo sem texto = "".
+// Posse: o texto e DONO do alocador que o chamador passou: quem recebe faz delete.
+// Linux: sempre "" (sem libc nao ha strerror; o runtime nao carrega tabela de mensagens): use last_error() para o numero.
+pub proc error_text(code: int, alloc: Allocator) -> str {
+    var cap: i64 = OS_BLOCO_TEXTO
+    for _tentativa in 0..<OS_TENTATIVAS_TEXTO {
+        var dados = make([dynamic]u8, alloc = alloc, len = cap as int)
+        defer delete(dados)
+        let r = forja_os_error_text(code as i64, &dados[0], cap)
+        if r < 0 {
+            resize(&dados, len = 0)
+            return to_str(&dados)
+        }
+        if r < cap {
+            resize(&dados, len = r as int)
+            return to_str(&dados)
+        }
+        cap = r + 1
+    }
+    var vazio = make([dynamic]u8, alloc = alloc)
+    defer delete(vazio)
+    return to_str(&vazio)
+}
+
+// Escreve os bytes no stdout exatamente como vieram (sem CRLF e sem LF acrescentado), pelo mesmo buffer do print. Lista vazia nao faz nada.
+pub proc write_stdout(bytes: []u8) {
+    if len(bytes) == 0 {
+        return
+    }
+    forja_os_write_stdout(&bytes[0], n = len(bytes) as i64)
+}
+
+// Descarrega o stdout agora (o print ja faz isso no console; exit faz sozinho).
+pub proc flush_stdout() {
+    forja_os_flush_stdout()
+}

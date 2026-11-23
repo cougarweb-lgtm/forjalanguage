@@ -1,0 +1,82 @@
+// driver/erro_sistema.fj - porte de compiler/driver/erro_sistema.c, compiler/driver/erro_sistema.h
+// sha256 de driver/erro_sistema.c: 93de7df0e8f731512d18d457b71634c7911f4512268783676a63fff08ccfa263
+// sha256 de driver/erro_sistema.h: 07076f678bc9f4baea4464ddc45c45e8a5322abda262f7005b1259dbf36edb34
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.2.0
+// Changelog: 0.2.0 - G3 P-driver DA: corpo real. FormatMessageA(MAKELANGID(ENGLISH, US)) -> os.error_text (mesmo FormatMessage FROM_SYSTEM | IGNORE_INSERTS, lingua 0x0409;
+//            L2a); strerror da UCRT -> tabela de texto abaixo (os.error_text e do Win32, nao do errno da CRT; a tabela foi tirada do strerror do gcc/ucrt do E0).
+
+import "std:os"
+import "common"
+
+const ERRO_TEXTO_MAX: i32 = 256
+
+// strerror(0..43) da UCRT (mingw-w64 ucrt, o E0); os "Unknown error" do meio estao no texto do ELSE
+const ERRNO_TEXTOS_BAIXOS: [44]str = {"No error", "Operation not permitted", "No such file or directory", "No such process", "Interrupted function call", "Input/output error", "No such device or address", "Arg list too long", "Exec format error", "Bad file descriptor", "No child processes", "Resource temporarily unavailable", "Not enough space", "Permission denied", "Bad address", "Unknown error", "Resource device", "File exists", "Improper link", "No such device", "Not a directory", "Is a directory", "Invalid argument", "Too many open files in system", "Too many open files", "Inappropriate I/O control operation", "Unknown error", "File too large", "No space left on device", "Invalid seek", "Read-only file system", "Too many links", "Broken pipe", "Domain error", "Result too large", "Unknown error", "Resource deadlock avoided", "Unknown error", "Filename too long", "No locks available", "Function not implemented", "Directory not empty", "Illegal byte sequence", "Unknown error"}
+
+// strerror(100..140) da UCRT
+const ERRNO_TEXTOS_ALTOS: [41]str = {"address in use", "address not available", "address family not supported", "connection already in progress", "bad message", "operation canceled", "connection aborted", "connection refused", "connection reset", "destination address required", "host unreachable", "identifier removed", "operation in progress", "already connected", "too many symbolic link levels", "message size", "network down", "network reset", "network unreachable", "no buffer space", "no message available", "no link", "no message", "no protocol option", "no stream resources", "not a stream", "not connected", "state not recoverable", "not a socket", "not supported", "operation not supported", "Unknown error", "value too large", "owner dead", "protocol error", "protocol not supported", "wrong protocol type", "stream timeout", "timed out", "text file busy", "operation would block"}
+
+// strerror(codigo) da UCRT; fora das duas faixas e "Unknown error" (inclui negativo)
+proc texto_do_errno(codigo: i32) -> str {
+    if codigo >= 0 and codigo <= 43 {
+        return ERRNO_TEXTOS_BAIXOS[codigo]
+    }
+    if codigo >= 100 and codigo <= 140 {
+        return ERRNO_TEXTOS_ALTOS[codigo - 100]
+    }
+    return "Unknown error"
+}
+
+// C: driver/erro_sistema.c:14
+// O FormatMessage termina o texto com ".\r\n": tira o fim de linha e os espacos. texto e o buffer terminado em NUL do C (o NUL corta, como o strlen).
+proc apara_fim(texto: []u8) {
+    var n: int = common.c2f_strlen_b(texto)
+    while n > 0 and (texto[n - 1] == 10 or texto[n - 1] == 13 or texto[n - 1] == 32) { // '\n' '\r' ' '
+        n -= 1
+        texto[n] = 0
+    }
+}
+
+// C: driver/erro_sistema.c:21
+// C2F-63: FormatMessageA -> os.error_text (ja sem o CR/LF do fim). Diferencas conhecidas do os.error_text: (1) cai para o idioma neutro se faltar o texto em ingles (o C
+// dava so "erro N"); (2) devolve texto de ate 1024 caracteres (o C, com buffer de 256, falhava e dava "erro N" para texto de 253 bytes ou mais: reproduzido abaixo).
+// Nenhum codigo usado pelo driver (CreateProcess, CreateJobObject...) cai em (1) ou (2).
+proc erro_win_texto(codigo: u32, destino: []u8, tam: u64) {
+    var sistema: [ERRO_TEXTO_MAX]u8 = {}
+    let texto = os.error_text(codigo as int, alloc = heap)
+    defer delete(texto)
+    // FormatMessageA com buffer de 256: o texto cru (o os.error_text ja tirou o "\r\n", 2 bytes) mais o NUL tem de caber: len + 2 + 1 <= 256
+    if len(texto) + 3 <= (ERRO_TEXTO_MAX as int) {
+        for i in 0..<len(texto) {
+            sistema[i] = texto[i]
+        }
+    }
+    apara_fim(sistema[..])
+    let limite: int = min(tam as int, len(destino))
+    let alvo = destino[0..<limite]
+    if sistema[0] == 0 {
+        let msg = format(f"erro {codigo}", alloc = heap)
+        defer delete(msg)
+        _ = common.c2f_snprintf(alvo, msg)
+        return
+    }
+    let corpo = from_bytes(sistema[0..<common.c2f_strlen_b(sistema[..])], alloc = heap)
+    defer delete(corpo)
+    let msg = format(f"erro {codigo}: {corpo}", alloc = heap)
+    defer delete(msg)
+    _ = common.c2f_snprintf(alvo, msg)
+}
+
+// C: driver/erro_sistema.c:34
+proc erro_crt_texto(codigo: i32, destino: []u8, tam: u64) {
+    let limite: int = min(tam as int, len(destino))
+    let alvo = destino[0..<limite]
+    if codigo == 0 {
+        _ = common.c2f_snprintf(alvo, "sem codigo de erro")
+        return
+    }
+    let msg = format(f"errno {codigo}: {texto_do_errno(codigo)}", alloc = heap)
+    defer delete(msg)
+    _ = common.c2f_snprintf(alvo, msg)
+}

@@ -1,0 +1,431 @@
+// mundo.fj 0.4.0 (10/11/2026) - engine:mundo (M0-b/M0-c do contrato_graphics_f2.txt): entidades com geracao, registro Entidade -> (tipo, linha) com lista livre
+// e uma tabela soa por tipo (colunas dono, transf_a, transf_b, vel, tile, flags). Sem tela: nao importa janela/gpu/render/dx12/plataforma (verificar_fronteiras).
+// Uso: import "motor/mundo" as mundo ; var m = mundo.mundo_novo(capacidade = 1024) ; let e = mundo.mundo_criar(&m, tipo = mundo.TipoEntidade.ator) ; ... ; mundo.mundo_destruir(&m)
+// Contrato: Entidade{indice, geracao}; geracao comeca em 1 (Entidade{0, 0} nunca e valida). mundo_remover troca a linha removida com a ultima viva da tabela
+//   e conserta o registro de quem foi movido. A lista soa nunca encolhe (a Forja 0.18.1 nao tem pop/clear em lista): o mundo guarda quantas linhas estao vivas
+//   (TabelaTipo.vivas) e reaproveita as de fora. Slot cuja geracao chegaria ao maximo de u32 sai de circulacao (nao volta para a lista livre).
+// tile_de_posicao: face do cubo pelo maior |eixo| (empate: x, depois y, depois z); faces 0=+X 1=-X 2=+Y 3=-Y 4=+Z 5=-Z; u = eixo (a+1)%3 e v = eixo (a+2)%3 da posicao
+//   dividida por |maior|, em [-1, 1], mapeados a grade 2^nivel x 2^nivel (projecao gnomonica; orientacao provisoria ate o T1/T2 do terreno).
+// Transformacao {pos: [3]f64, rot: quat, escala: [3]f32}. Duas colunas por linha: transf_b = estado ATUAL do tick, transf_a = estado do tick ANTERIOR; mundo_avancar_transf
+//   faz A = B e grava o novo B (uma vez por tick); mundo_definir_transf grava A = B = t (nascimento, teletransporte: nao interpola). mundo_interpolar(m, e, alfa) devolve o
+//   estado entre A (alfa 0) e B (alfa 1): posicao e escala por lerp (a*(1-t) + b*t, exato nas pontas), rotacao por nlerp pelo caminho curto (soma ponderada normalizada com sqrt).
+//   alfa e f64 em [0, 1) (mundo_tick.relogio_alfa); fora disso e preso a [0, 1]. Rotacao deve entrar unitaria (rotacao_normalizar).
+// tile_da_esfera / coordenada_da_esfera (G44): a inversa do mapeamento cube-sphere QUADRATICO do terreno (ponto do planeta -> tile); tile_de_posicao (gnomonica) fica como estava para a F2.
+// Changelog: 0.4.0 - G44: CoordenadaEsfera, coordenada_da_esfera, tile_da_esfera (tile_de_posicao intacta: o hash do m0_headless e os testes da F2 dependem da gnomonica). 0.3.0 - G38: constantes do planeta PLANETA_RAIO (63660 m) e PLANETA_G (9.81 m/s2); tile_de_posicao intacta (G44). 0.2.1 - G18: o struct privado Slot virou SlotMundo (nome de topo e unico no programa: colidia com rhi.Slot quando o jogo importa render e mundo). 0.2.0 - M0-c: Transformacao, colunas transf_a/transf_b, rotacao_normalizar/rotacao_nlerp, transformacao_lerp, mundo_interpolar. 0.1.0 - M0-b da trilha M0 (engine:mundo).
+// Verificar: forja test C:\ENGINE_GAME3D\testes_mundo\teste_mundo.fj (+ teste_interpolacao.fj, teste_matriz.fj) ; python C:\ENGINE_GAME3D\testes_mundo\m0_headless\verificar_m0.py
+
+import "motor/rotacao"
+
+pub const MUNDO_NIVEL_MAX: u8 = 30
+// Planeta (D-F3-6, G38): esfera de raio PLANETA_RAIO centrada na origem do mundo, gravidade radial -PLANETA_G * normalize(pos). Unica fonte destas constantes (a fisica le daqui).
+pub const PLANETA_RAIO: f64 = 63660.0
+pub const PLANETA_G: f32 = 9.81
+const MUNDO_GERACAO_INICIAL: u32 = 1
+const MUNDO_GERACAO_MAX: u32 = 4294967295
+const MUNDO_SEM_LIVRE: i32 = -1
+
+pub enum TipoEntidade {
+    cenario
+    ator
+    projetil
+}
+
+pub enum FlagEntidade {
+    ativa
+    visivel
+    movel
+}
+
+pub enum ErroMundo {
+    desconhecida
+    vencida
+}
+
+pub struct Entidade {
+    indice: u32
+    geracao: u32
+}
+
+pub struct Transformacao {
+    pos: [3]f64
+    rot: quat
+    escala: [3]f32
+}
+
+pub struct Velocidade {
+    linear: [3]f32
+    angular: [3]f32
+}
+
+pub struct IdTile {
+    face: u8
+    nivel: u8
+    x: u32
+    y: u32
+}
+
+pub struct PosicaoNaTabela {
+    tipo: TipoEntidade
+    linha: u32
+}
+
+struct LinhaMundo {
+    dono: u32
+    transf_a: Transformacao
+    transf_b: Transformacao
+    vel: Velocidade
+    tile: IdTile
+    flags: bit_set[FlagEntidade]
+}
+
+struct TabelaTipo {
+    linhas: soa[dynamic]LinhaMundo
+    vivas: u32
+}
+
+struct SlotMundo {
+    tipo: TipoEntidade
+    linha: u32
+    geracao: u32
+    viva: bool
+    proximo_livre: i32
+}
+
+pub struct Mundo {
+    slots: [dynamic]SlotMundo
+    tabelas: [dynamic]TabelaTipo
+    livre: i32
+    vivas: u32
+}
+
+pub proc velocidade_zero() -> Velocidade {
+    return Velocidade{linear = {0.0, 0.0, 0.0}, angular = {0.0, 0.0, 0.0}}
+}
+
+pub proc tile_zero() -> IdTile {
+    return IdTile{face = 0, nivel = 0, x = 0, y = 0}
+}
+
+pub proc transformacao_identidade() -> Transformacao {
+    return Transformacao{pos = {0.0, 0.0, 0.0}, rot = quat{w = 1.0}, escala = {1.0, 1.0, 1.0}}
+}
+
+// Posicao do tipo no vetor de tabelas (a ordem e a do enum).
+proc tipo_indice(tipo: TipoEntidade) -> int {
+    if tipo == TipoEntidade.cenario {
+        return 0
+    }
+    if tipo == TipoEntidade.ator {
+        return 1
+    }
+    return 2
+}
+
+proc tabela_nova(capacidade: int) -> TabelaTipo {
+    return TabelaTipo{linhas = make(soa[dynamic]LinhaMundo, alloc = heap, cap = capacidade), vivas = 0}
+}
+
+pub proc mundo_novo(capacidade: int) -> Mundo {
+    var m = Mundo{slots = make([dynamic]SlotMundo, alloc = heap, cap = capacidade), tabelas = make([dynamic]TabelaTipo, alloc = heap, cap = 3),
+        livre = MUNDO_SEM_LIVRE, vivas = 0}
+    append(&m.tabelas, item = tabela_nova(capacidade))
+    append(&m.tabelas, item = tabela_nova(capacidade))
+    append(&m.tabelas, item = tabela_nova(capacidade))
+    return m
+}
+
+pub proc mundo_destruir(m: ^Mundo) {
+    for &t in m^.tabelas {
+        delete(t.linhas)
+    }
+    delete(m^.tabelas)
+    delete(m^.slots)
+}
+
+pub proc mundo_contar(m: ^Mundo) -> u32 {
+    return m^.vivas
+}
+
+pub proc mundo_contar_tipo(m: ^Mundo, tipo: TipoEntidade) -> u32 {
+    return m^.tabelas[tipo_indice(tipo)].vivas
+}
+
+// Escolhe o indice do slot: reaproveita a cabeca da lista livre ou abre um novo.
+proc slot_obter(m: ^Mundo) -> u32 {
+    if m^.livre != MUNDO_SEM_LIVRE {
+        let indice = m^.livre as u32
+        m^.livre = m^.slots[indice as int].proximo_livre
+        return indice
+    }
+    append(&m^.slots, item = SlotMundo{tipo = TipoEntidade.cenario, linha = 0, geracao = MUNDO_GERACAO_INICIAL, viva = false, proximo_livre = MUNDO_SEM_LIVRE})
+    return (len(m^.slots) - 1) as u32
+}
+
+// Devolve a linha (dentro da tabela do tipo) onde a entidade nova mora, zerada.
+proc tabela_alocar(t: ^TabelaTipo, dono: u32) -> u32 {
+    let linha = t^.vivas
+    let nova = LinhaMundo{dono = dono, transf_a = transformacao_identidade(), transf_b = transformacao_identidade(), vel = velocidade_zero(),
+        tile = tile_zero(), flags = {}}
+    if linha as int < len(t^.linhas) {
+        t^.linhas[linha as int] = nova
+    } else {
+        append(&t^.linhas, item = nova)
+    }
+    t^.vivas = linha + 1
+    return linha
+}
+
+pub proc mundo_criar(m: ^Mundo, tipo: TipoEntidade) -> Entidade {
+    let indice = slot_obter(m)
+    let geracao = m^.slots[indice as int].geracao
+    let linha = tabela_alocar(&m^.tabelas[tipo_indice(tipo)], dono = indice)
+    m^.slots[indice as int] = SlotMundo{tipo = tipo, linha = linha, geracao = geracao, viva = true, proximo_livre = MUNDO_SEM_LIVRE}
+    m^.vivas = m^.vivas + 1
+    return Entidade{indice = indice, geracao = geracao}
+}
+
+// Registro Entidade -> (tipo, linha); falha com o motivo (desconhecida = indice fora do registro, vencida = geracao antiga ou ja removida).
+pub proc mundo_posicao(m: ^Mundo, e: Entidade) -> PosicaoNaTabela ! ErroMundo {
+    if e.indice as int >= len(m^.slots) {
+        return ErroMundo.desconhecida
+    }
+    let s = m^.slots[e.indice as int]
+    if not s.viva or s.geracao != e.geracao {
+        return ErroMundo.vencida
+    }
+    return PosicaoNaTabela{tipo = s.tipo, linha = s.linha}
+}
+
+pub proc mundo_viva(m: ^Mundo, e: Entidade) -> bool {
+    var viva = false
+    switch _p in mundo_posicao(m, e = e) {
+        case PosicaoNaTabela:
+            viva = true
+        case ErroMundo:
+            viva = false
+    }
+    return viva
+}
+
+// Copia a linha origem sobre a linha destino e conserta o registro de quem morava na origem.
+proc tabela_mover_linha(m: ^Mundo, tipo: TipoEntidade, origem: u32, destino: u32) {
+    let t = &m^.tabelas[tipo_indice(tipo)]
+    let dono = t^.linhas[origem as int].dono
+    t^.linhas[destino as int] = t^.linhas[origem as int]
+    m^.slots[dono as int].linha = destino
+}
+
+pub proc mundo_remover(m: ^Mundo, e: Entidade) -> bool ! ErroMundo {
+    let p = try mundo_posicao(m, e = e)
+    let ultima = m^.tabelas[tipo_indice(p.tipo)].vivas - 1
+    if p.linha != ultima {
+        tabela_mover_linha(m, tipo = p.tipo, origem = ultima, destino = p.linha)
+    }
+    m^.tabelas[tipo_indice(p.tipo)].vivas = ultima
+    slot_liberar(m, indice = e.indice)
+    m^.vivas = m^.vivas - 1
+    return true
+}
+
+// Marca o slot como morto e o devolve a lista livre, salvo se a geracao esgotou (nesse caso o slot sai de circulacao).
+proc slot_liberar(m: ^Mundo, indice: u32) {
+    let s = &m^.slots[indice as int]
+    s^.viva = false
+    if s^.geracao == MUNDO_GERACAO_MAX {
+        return
+    }
+    s^.geracao = s^.geracao + 1
+    s^.proximo_livre = m^.livre
+    m^.livre = indice as i32
+}
+
+pub proc mundo_vel(m: ^Mundo, e: Entidade) -> Velocidade ! ErroMundo {
+    let p = try mundo_posicao(m, e = e)
+    return m^.tabelas[tipo_indice(p.tipo)].linhas[p.linha as int].vel
+}
+
+pub proc mundo_definir_vel(m: ^Mundo, e: Entidade, v: Velocidade) -> bool ! ErroMundo {
+    let p = try mundo_posicao(m, e = e)
+    m^.tabelas[tipo_indice(p.tipo)].linhas[p.linha as int].vel = v
+    return true
+}
+
+pub proc mundo_tile(m: ^Mundo, e: Entidade) -> IdTile ! ErroMundo {
+    let p = try mundo_posicao(m, e = e)
+    return m^.tabelas[tipo_indice(p.tipo)].linhas[p.linha as int].tile
+}
+
+pub proc mundo_definir_tile(m: ^Mundo, e: Entidade, t: IdTile) -> bool ! ErroMundo {
+    let p = try mundo_posicao(m, e = e)
+    m^.tabelas[tipo_indice(p.tipo)].linhas[p.linha as int].tile = t
+    return true
+}
+
+pub proc mundo_flags(m: ^Mundo, e: Entidade) -> bit_set[FlagEntidade] ! ErroMundo {
+    let p = try mundo_posicao(m, e = e)
+    return m^.tabelas[tipo_indice(p.tipo)].linhas[p.linha as int].flags
+}
+
+pub proc mundo_definir_flags(m: ^Mundo, e: Entidade, f: bit_set[FlagEntidade]) -> bool ! ErroMundo {
+    let p = try mundo_posicao(m, e = e)
+    m^.tabelas[tipo_indice(p.tipo)].linhas[p.linha as int].flags = f
+    return true
+}
+
+// Estado ATUAL (coluna transf_b).
+pub proc mundo_transf(m: ^Mundo, e: Entidade) -> Transformacao ! ErroMundo {
+    let p = try mundo_posicao(m, e = e)
+    return m^.tabelas[tipo_indice(p.tipo)].linhas[p.linha as int].transf_b
+}
+
+// Estado do tick ANTERIOR (coluna transf_a).
+pub proc mundo_transf_anterior(m: ^Mundo, e: Entidade) -> Transformacao ! ErroMundo {
+    let p = try mundo_posicao(m, e = e)
+    return m^.tabelas[tipo_indice(p.tipo)].linhas[p.linha as int].transf_a
+}
+
+// Grava A = B = t: a entidade aparece (ou salta) em t sem interpolar.
+pub proc mundo_definir_transf(m: ^Mundo, e: Entidade, t: Transformacao) -> bool ! ErroMundo {
+    let p = try mundo_posicao(m, e = e)
+    m^.tabelas[tipo_indice(p.tipo)].linhas[p.linha as int].transf_a = t
+    m^.tabelas[tipo_indice(p.tipo)].linhas[p.linha as int].transf_b = t
+    return true
+}
+
+// Fecha um tick para a entidade: A recebe o B de agora e B recebe o estado novo t.
+pub proc mundo_avancar_transf(m: ^Mundo, e: Entidade, t: Transformacao) -> bool ! ErroMundo {
+    let p = try mundo_posicao(m, e = e)
+    let atual = m^.tabelas[tipo_indice(p.tipo)].linhas[p.linha as int].transf_b
+    m^.tabelas[tipo_indice(p.tipo)].linhas[p.linha as int].transf_a = atual
+    m^.tabelas[tipo_indice(p.tipo)].linhas[p.linha as int].transf_b = t
+    return true
+}
+
+proc lerp3_f64(a: [3]f64, b: [3]f64, t: f64) -> [3]f64 {
+    return a * (1.0 - t) + b * t
+}
+
+proc lerp3_f32(a: [3]f32, b: [3]f32, t: f32) -> [3]f32 {
+    return a * (1.0 - t) + b * t
+}
+
+// Estado entre a (alfa 0) e b (alfa 1): pos e escala por lerp, rot por nlerp. alfa preso a [0, 1].
+pub proc transformacao_lerp(a: Transformacao, b: Transformacao, alfa: f64) -> Transformacao {
+    let t = clamp(alfa, lo = 0.0, hi = 1.0)
+    let tf = t as f32
+    return Transformacao{pos = lerp3_f64(a.pos, b = b.pos, t = t), rot = rotacao.rotacao_nlerp(a.rot, b = b.rot, t = tf), escala = lerp3_f32(a.escala, b = b.escala, t = tf)}
+}
+
+// Estado desenhavel da entidade entre o tick anterior (alfa 0) e o atual (alfa 1).
+pub proc mundo_interpolar(m: ^Mundo, e: Entidade, alfa: f64) -> Transformacao ! ErroMundo {
+    let p = try mundo_posicao(m, e = e)
+    let linha = m^.tabelas[tipo_indice(p.tipo)].linhas[p.linha as int]
+    return transformacao_lerp(linha.transf_a, b = linha.transf_b, alfa = alfa)
+}
+
+// Indice do eixo de maior |valor| (0 = x, 1 = y, 2 = z); empate vai para o eixo de menor indice.
+proc eixo_dominante(pos: [3]f64) -> int {
+    var eixo = 0
+    var maior = abs(pos[0])
+    if abs(pos[1]) > maior {
+        eixo = 1
+        maior = abs(pos[1])
+    }
+    if abs(pos[2]) > maior {
+        eixo = 2
+    }
+    return eixo
+}
+
+// Celula (0 .. 2^nivel - 1) de uma coordenada em [-1, 1]; o extremo +1 cai na ultima celula.
+proc celula_de(coord: f64, nivel: u8) -> u32 {
+    let lado: u32 = 1 << (nivel as u32)
+    let indice = ((coord + 1.0) * 0.5 * (lado as f64)) as u32
+    if indice >= lado {
+        return lado - 1
+    }
+    return indice
+}
+
+pub proc tile_de_posicao(pos: [3]f64, nivel: u8) -> IdTile {
+    var n = nivel
+    if n > MUNDO_NIVEL_MAX {
+        n = MUNDO_NIVEL_MAX
+    }
+    let eixo = eixo_dominante(pos)
+    let maior = abs(pos[eixo])
+    var face = (eixo * 2) as u8
+    if pos[eixo] < 0.0 {
+        face = face + 1
+    }
+    var u: f64 = 0.0
+    var v: f64 = 0.0
+    if maior > 0.0 {
+        u = pos[(eixo + 1) % 3] / maior
+        v = pos[(eixo + 2) % 3] / maior
+    }
+    return IdTile{face = face, nivel = n, x = celula_de(u, nivel = n), y = celula_de(v, nivel = n)}
+}
+
+// ---------------- planeta cube-sphere (G44): ponto no espaco -> tile do terreno ----------------
+
+pub struct CoordenadaEsfera {
+    face: u8
+    u: f64
+    v: f64
+}
+
+// Inversa da curva g(w) = w * (w + 2) / 3 do terreno (terreno_c_curva_g): t em [-1, 1] -> w em [-1, 1], impar. Sem libm: so + - * / sqrt, como a ida.
+proc curva_inversa(t: f64) -> f64 {
+    let w = sqrt(1.0 + 3.0 * abs(t)) - 1.0
+    if t < 0.0 {
+        return -w
+    }
+    return w
+}
+
+proc nivel_limitado(nivel: u8) -> u8 {
+    if nivel > MUNDO_NIVEL_MAX {
+        return MUNDO_NIVEL_MAX
+    }
+    return nivel
+}
+
+// Coordenada fracionaria do ponto na grade de vertices da face, em celulas do nivel (0 .. 64 * 2^nivel; o vertice k da grade global do nivel tem u = k exato). A direcao so importa: a distancia
+//   ao centro nao entra (o mesmo pos e pos * 2 caem na mesma coordenada). Face = eixo de maior |valor| (empate: x, depois y, depois z, igual ao tile_de_posicao); sinal pelo valor desse eixo
+//   (zero conta como positivo). Ponto na aresta ou no canto do cubo pertence a face de menor indice entre as empatadas; os dois lados dao o MESMO ponto inteiro canonico, logo a mesma direcao
+//   do terreno_c_direcao. pos = (0, 0, 0) cai no centro da face 0.
+pub proc coordenada_da_esfera(pos: [3]f64, nivel: u8) -> CoordenadaEsfera {
+    let eixo = eixo_dominante(pos)
+    let maior = abs(pos[eixo])
+    var face = (eixo * 2) as u8
+    if pos[eixo] < 0.0 {
+        face = face + 1
+    }
+    var u: f64 = 0.0
+    var v: f64 = 0.0
+    if maior > 0.0 {
+        u = curva_inversa(pos[(eixo + 1) % 3] / maior)
+        v = curva_inversa(pos[(eixo + 2) % 3] / maior)
+    }
+    let lado: u64 = 1 << (nivel_limitado(nivel) as u64)
+    let metade = (lado as f64) * 32.0
+    return CoordenadaEsfera{face = face, u = (u + 1.0) * metade, v = (v + 1.0) * metade}
+}
+
+// Tile (65 x 65 vertices, 64 x 64 celulas) que contem o ponto: a celula da coordenada fracionaria; ponto exatamente na borda entre dois tiles fica no de indice MAIOR (o extremo da face, no ultimo).
+proc celula_do_tile(coordenada: f64, nivel: u8) -> u32 {
+    let lado: u32 = 1 << (nivel as u32)
+    let indice = (coordenada / 64.0) as u32
+    if indice >= lado {
+        return lado - 1
+    }
+    return indice
+}
+
+// Mesmo mapeamento do terreno (faces 0=+X 1=-X 2=+Y 3=-Y 4=+Z 5=-Z, u = eixo (a+1)%3, v = eixo (a+2)%3, curva quadratica): o tile de nivel `nivel` (limitado a MUNDO_NIVEL_MAX) sob o ponto `pos`.
+pub proc tile_da_esfera(pos: [3]f64, nivel: u8) -> IdTile {
+    let n = nivel_limitado(nivel)
+    let c = coordenada_da_esfera(pos, nivel = n)
+    return IdTile{face = c.face, nivel = n, x = celula_do_tile(c.u, nivel = n), y = celula_do_tile(c.v, nivel = n)}
+}

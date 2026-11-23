@@ -1,0 +1,650 @@
+// nativo/optimizer/licm.fj - porte de compiler/nativo/optimizer/licm.c, compiler/nativo/optimizer/licm.h
+// sha256 de nativo/optimizer/licm.c: 557dc0c24a5649f2e8be3ad97674adf320c86ab93a77045f8f8ffe09b65a2527
+// sha256 de nativo/optimizer/licm.h: 8c17ade6ca6e29d475500c48c6c24be614ebd8b21a2b4aa813663922b17d9efe
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "common"
+import "nativo/bir"
+
+// vivo_pendente: a vivacidade de an ainda nao foi calculada (C: ponteiro para o bool de licm_funcao).
+struct LicmGlobal {
+    prog: ?^bir.BirPrograma
+    usos: ?^EnderecoUsos
+    constante: [dynamic]u8
+    nconstante: u32
+    vivo_pendente: bool
+}
+
+// Listas donas (heap), liberadas em tentar_laco. sobem: instrucoes que sobem para o pre-cabecalho, em ordem.
+struct LacoCtx {
+    f: ?^bir.BirFuncao
+    an: ?^bir.AnalisesBir
+    laco: ?^bir.LacoBir
+    g: ?^LicmGlobal
+    usos: ?^EnderecoUsos
+    no_laco: [dynamic]u8
+    cada_volta: [dynamic]u8
+    defs: [dynamic]u32
+    saidas: [dynamic]u32
+    sobem: [dynamic]bir.BirInstr
+    orcamento: u32
+    pre: u32
+    ins: u32
+}
+
+const LICM_CONST_REAL_MAX: u32 = 4
+const LICM_GPR_LIVRES: u32 = 6
+
+// C: nativo/optimizer/licm.c:52
+proc operando_simples_2(o: ^bir.BirOperando) -> bool {
+    return ((o.tam == 0) and (o.extensao == (bir.BE_NENHUMA as u8))) and (o.sysv == none)
+}
+
+// C: nativo/optimizer/licm.c:58
+proc operacao_sobe(i: ^bir.BirInstr) -> bool {
+    let real: bool = bir.bir_classe_eh_real(i.classe as i32)
+    if i.classe == (bir.BC_V128 as u8) {
+        return false
+    }
+    let sw_1 = i.op as i32
+    if sw_1 == bir.BIR_CONST or sw_1 == bir.BIR_COPIA or sw_1 == bir.BIR_ADD or sw_1 == bir.BIR_SUB or sw_1 == bir.BIR_MUL or sw_1 == bir.BIR_NEG {
+        return true
+    } else if sw_1 == bir.BIR_AND or sw_1 == bir.BIR_OR or sw_1 == bir.BIR_XOR or sw_1 == bir.BIR_NOT or sw_1 == bir.BIR_EXT_S or sw_1 == bir.BIR_EXT_Z or sw_1 == bir.BIR_TRUNC {
+        return not real
+    } else if sw_1 == bir.BIR_END_SLOT or sw_1 == bir.BIR_END_SIMBOLO {
+        return true
+    } else {
+        return false
+    }
+    return false
+}
+
+// C: nativo/optimizer/licm.c:77
+proc operando_invariante(c: ^LacoCtx, o: ^bir.BirOperando) -> bool {
+    if not operando_simples_2(o) {
+        return false
+    }
+    if o.tipo != (bir.BO_VREG as u8) {
+        return true
+    }
+    let f: ^bir.BirFuncao = c.f as ^bir.BirFuncao
+    return (o.id < f.nvregs) and (c.defs[o.id] == 0)
+}
+
+// C: nativo/optimizer/licm.c:86
+proc operando_constante(g: ^LicmGlobal, o: ^bir.BirOperando) -> bool {
+    if (not operando_simples_2(o)) or (o.tipo == (bir.BO_SIMBOLO as u8)) {
+        return false
+    }
+    return (o.tipo != (bir.BO_VREG as u8)) or ((o.id < g.nconstante) and (g.constante[o.id] != 0))
+}
+
+// C: nativo/optimizer/licm.c:93
+proc conta_de_constantes(g: ^LicmGlobal, i: ^bir.BirInstr, nvregs: u32) -> bool {
+    if (((common.c2f_b2i32(bir.bir_classe_eh_xmm(i.classe as i32)) != 0) or (i.nargs != 0)) or (i.dst == bir.BIR_SEM_VREG)) or (i.dst >= nvregs) {
+        return false
+    }
+    let sw_1 = i.op as i32
+    if sw_1 == bir.BIR_CONST or sw_1 == bir.BIR_COPIA or sw_1 == bir.BIR_ADD or sw_1 == bir.BIR_SUB or sw_1 == bir.BIR_MUL or sw_1 == bir.BIR_NEG or sw_1 == bir.BIR_AND or sw_1 == bir.BIR_OR or sw_1 == bir.BIR_XOR or sw_1 == bir.BIR_NOT or sw_1 == bir.BIR_EXT_S or sw_1 == bir.BIR_EXT_Z or sw_1 == bir.BIR_TRUNC {
+        return (common.c2f_b2i32(operando_constante(g, &i.a)) != 0) and (common.c2f_b2i32(operando_constante(g, &i.b)) != 0)
+    } else {
+        return false
+    }
+    return false
+}
+
+// C: nativo/optimizer/licm.c:110
+// Marca os vregs inteiros de definicao unica que so dependem de imediatos; ponto fixo: cada volta so acrescenta marcas.
+// LIMITE: niveis a contagem de definicoes e o ponto fixo sao dois percursos bloco x instrucao; separar so repassaria o ctx.
+// LIMITE: cognitiva idem (dois percursos aninhados).
+proc constantes_da_funcao(f: ^bir.BirFuncao, g: ^LicmGlobal) {
+    var defs = make([dynamic]u32, alloc = heap, cap = (f.nvregs as int) + 1)
+    defer delete(defs)
+    zeros_u32(&defs, f.nvregs + 1)
+    g.constante = make([dynamic]u8, alloc = heap, cap = (f.nvregs as int) + 1)
+    zeros_u8(&g.constante, f.nvregs + 1)
+    g.nconstante = f.nvregs
+    var b: u32 = 0
+    while b < f.nblocos {
+        var m: u32 = 0
+        while m < f.blocos[b].n {
+            let d: u32 = f.blocos[b].instrs[m].dst
+            if (d != bir.BIR_SEM_VREG) and (d < f.nvregs) {
+                defs[d] += 1
+            }
+            m += 1
+        }
+        b += 1
+    }
+    var mudou: bool = true
+    while mudou {
+        mudou = false
+        b = 0
+        while b < f.nblocos {
+            var m: u32 = 0
+            while m < f.blocos[b].n {
+                let i: ^bir.BirInstr = &f.blocos[b].instrs[m]
+                if conta_de_constantes(g, i, f.nvregs) and (defs[i.dst] == 1) and (g.constante[i.dst] == 0) {
+                    g.constante[i.dst] = 1
+                    mudou = true
+                }
+                m += 1
+            }
+            b += 1
+        }
+    }
+}
+
+// C: nativo/optimizer/licm.c:143
+proc vivo_na_saida(c: ^LacoCtx, vreg: u32) -> bool {
+    let an: ^bir.AnalisesBir = c.an as ^bir.AnalisesBir
+    let lc: ^bir.LacoBir = c.laco as ^bir.LacoBir
+    if bir.analises_vivo_entra(an, lc.cabecalho, vreg) {
+        return true
+    }
+    var k: u32 = 0
+    while k < (len(c.saidas) as u32) {
+        if bir.analises_vivo_entra(an, c.saidas[k], vreg) {
+            return true
+        }
+        k += 1
+    }
+    return false
+}
+
+// C: nativo/optimizer/licm.c:154
+proc le_vreg(o: ^bir.BirOperando, vreg: u32) -> bool {
+    return (o.tipo == (bir.BO_VREG as u8)) and (o.id == vreg)
+}
+
+// C: nativo/optimizer/licm.c:160
+proc fim_toca(k: ^bir.BirInstr, vreg: u32) -> bool {
+    return ((k.dst == vreg) or le_vreg(&k.a, vreg)) or le_vreg(&k.b, vreg)
+}
+
+// C: nativo/optimizer/licm.c:166
+proc compativel_com_fim(c: ^LacoCtx, i: ^bir.BirInstr) -> bool {
+    let p: ^bir.BirBloco = &(c.f as ^bir.BirFuncao).blocos[c.pre]
+    var k: u32 = c.ins
+    while k < p.n {
+        let fk: ^bir.BirInstr = &p.instrs[k]
+        if fim_toca(fk, i.dst) or ((fk.dst != bir.BIR_SEM_VREG) and (le_vreg(&i.a, fk.dst) or le_vreg(&i.b, fk.dst))) {
+            return false
+        }
+        k += 1
+    }
+    return true
+}
+
+// C: nativo/optimizer/licm.c:177
+proc pode_subir(c: ^LacoCtx, i: ^bir.BirInstr) -> bool {
+    let f: ^bir.BirFuncao = c.f as ^bir.BirFuncao
+    let g: ^LicmGlobal = c.g as ^LicmGlobal
+    if (not operacao_sobe(i)) or (i.nargs != 0) or (i.dst == bir.BIR_SEM_VREG) or (i.dst >= f.nvregs) or (c.defs[i.dst] != 1) {
+        return false
+    }
+    if (not operando_invariante(c, &i.a)) or (not operando_invariante(c, &i.b)) {
+        return false
+    }
+    if (c.usos != none) and otim_endereco_soma_fundivel(c.usos, i) {
+        return false
+    }
+    if (i.dst < g.nconstante) and (g.constante[i.dst] != 0) {
+        return false
+    }
+    if (c.orcamento == 0) and (not bir.bir_classe_eh_xmm(i.classe as i32)) {
+        return false
+    }
+    return compativel_com_fim(c, i) and (not vivo_na_saida(c, i.dst))
+}
+
+// C: nativo/optimizer/licm.c:190
+// Na Forja a lista so cresce por append: garante len(instrs) >= n (n e o contador do BirBloco).
+proc garantir_capacidade(b: ^bir.BirBloco, n: u32) {
+    while (len(b.instrs) as u32) < n {
+        append(&b.instrs, item = bir.BirInstr{})
+    }
+    b.cap = (cap(b.instrs) as u64) as u32
+}
+
+// C: nativo/optimizer/licm.c:204
+// Termina em SALTA para h, ou em DESVIA com so um dos alvos em h (o outro alvo vai para saidas: o que sobe tambem roda por la).
+proc fim_do_pre_cabecalho(c: ^LacoCtx, pre: u32) -> bool {
+    let f: ^bir.BirFuncao = c.f as ^bir.BirFuncao
+    let h: u32 = (c.laco as ^bir.LacoBir).cabecalho
+    let p: ^bir.BirBloco = &f.blocos[pre]
+    let t: ^bir.BirInstr = &p.instrs[p.n - 1]
+    c.pre = pre
+    c.ins = p.n - 1
+    if t.op == (bir.BIR_SALTA as u8) {
+        return t.alvo[0] == h
+    }
+    if (t.op != (bir.BIR_DESVIA as u8)) or ((t.alvo[0] == h) == (t.alvo[1] == h)) {
+        return false
+    }
+    if t.alvo[0] == h {
+        append(&c.saidas, item = t.alvo[1])
+    } else {
+        append(&c.saidas, item = t.alvo[0])
+    }
+    if (p.n >= 2) and (p.instrs[p.n - 2].op == (bir.BIR_CMP as u8)) and le_vreg(&t.a, p.instrs[p.n - 2].dst) {
+        c.ins = p.n - 2
+    }
+    return true
+}
+
+// C: nativo/optimizer/licm.c:223
+proc achar_pre_cabecalho(c: ^LacoCtx) -> bool {
+    let an: ^bir.AnalisesBir = c.an as ^bir.AnalisesBir
+    let f: ^bir.BirFuncao = c.f as ^bir.BirFuncao
+    let h: u32 = (c.laco as ^bir.LacoBir).cabecalho
+    let pred_ini: []u32 = an.pred_ini or_else {}
+    let pred: []u32 = an.pred or_else {}
+    var fora: u32 = 0
+    var pre: u32 = bir.BIR_SEM_BLOCO
+    var k: u32 = pred_ini[h]
+    while k < pred_ini[h + 1] {
+        if c.no_laco[pred[k]] == 0 {
+            fora += 1
+            pre = pred[k]
+        }
+        k += 1
+    }
+    if (fora != 1) or (pre == h) or (f.blocos[pre].n == 0) {
+        return false
+    }
+    return fim_do_pre_cabecalho(c, pre)
+}
+
+// C: nativo/optimizer/licm.c:240
+// So sobe o que roda em toda volta (subir de um ramo raro gasta um registrador o laco inteiro).
+proc marcar_cada_volta(c: ^LacoCtx) {
+    let an: ^bir.AnalisesBir = c.an as ^bir.AnalisesBir
+    let lc: ^bir.LacoBir = c.laco as ^bir.LacoBir
+    let h: u32 = lc.cabecalho
+    let pred_ini: []u32 = an.pred_ini or_else {}
+    let pred: []u32 = an.pred or_else {}
+    var k: u32 = 0
+    while k < lc.ncorpo {
+        let b: u32 = (lc.corpo or_else {})[k]
+        c.cada_volta[b] = 1
+        var m: u32 = pred_ini[h]
+        while m < pred_ini[h + 1] {
+            let volta: u32 = pred[m]
+            if (c.no_laco[volta] != 0) and (not bir.analises_domina(an, b, volta)) {
+                c.cada_volta[b] = 0
+            }
+            m += 1
+        }
+        k += 1
+    }
+}
+
+// C: nativo/optimizer/licm.c:259
+// Pressao de GPR: quantos inteiros novos o laco aguenta vivos alem dos que ja atravessam o cabecalho.
+proc orcamento_de_inteiros(c: ^LacoCtx) -> u32 {
+    let g: ^LicmGlobal = c.g as ^LicmGlobal
+    let f: ^bir.BirFuncao = c.f as ^bir.BirFuncao
+    let an: ^bir.AnalisesBir = c.an as ^bir.AnalisesBir
+    let lc: ^bir.LacoBir = c.laco as ^bir.LacoBir
+    if g.vivo_pendente {
+        bir.analises_completar_vivo(f, an)
+        g.vivo_pendente = false
+    }
+    let vivos_entra: []bir.ConjuntoVivo = an.vivo_entra or_else {}
+    let entra: ^bir.ConjuntoVivo = &vivos_entra[lc.cabecalho]
+    let lista: []u32 = entra.v or_else {}
+    let classes: []u8 = f.classe_vreg or_else {}
+    var gpr_vivos: u32 = 0
+    var k: u32 = 0
+    while k < entra.n {
+        let v: u32 = lista[k]
+        if (v < f.nvregs) and (not bir.bir_classe_eh_xmm(classes[v] as i32)) {
+            gpr_vivos += 1
+        }
+        k += 1
+    }
+    if gpr_vivos >= LICM_GPR_LIVRES {
+        return 0
+    }
+    return LICM_GPR_LIVRES - gpr_vivos
+}
+
+// C: nativo/optimizer/licm.c:280
+// Marca o corpo, acha o pre-cabecalho, conta as definicoes de cada vreg no laco e lista as saidas. false = laco recusado.
+proc preparar_laco(c: ^LacoCtx) -> bool {
+    let f: ^bir.BirFuncao = c.f as ^bir.BirFuncao
+    let an: ^bir.AnalisesBir = c.an as ^bir.AnalisesBir
+    let lc: ^bir.LacoBir = c.laco as ^bir.LacoBir
+    var k: u32 = 0
+    while k < lc.ncorpo {
+        c.no_laco[(lc.corpo or_else {})[k]] = 1
+        k += 1
+    }
+    if not achar_pre_cabecalho(c) {
+        return false
+    }
+    marcar_cada_volta(c)
+    c.orcamento = orcamento_de_inteiros(c)
+    let suc_ini: []u32 = an.suc_ini or_else {}
+    let suc: []u32 = an.suc or_else {}
+    k = 0
+    while k < lc.ncorpo {
+        let b: u32 = (lc.corpo or_else {})[k]
+        let blk: ^bir.BirBloco = &f.blocos[b]
+        var m: u32 = 0
+        while m < blk.n {
+            let d: u32 = blk.instrs[m].dst
+            if (d != bir.BIR_SEM_VREG) and (d < f.nvregs) {
+                c.defs[d] += 1
+            }
+            m += 1
+        }
+        var s: u32 = suc_ini[b]
+        while s < suc_ini[b + 1] {
+            if c.no_laco[suc[s]] == 0 {
+                append(&c.saidas, item = suc[s])
+            }
+            s += 1
+        }
+        k += 1
+    }
+    return true
+}
+
+// C: nativo/optimizer/licm.c:310
+// Tira a instrucao k do bloco e a poe em c.sobem (o C grava em sobem[]).
+proc retirar(c: ^LacoCtx, b: ^bir.BirBloco, k: u32) {
+    append(&c.sobem, item = b.instrs[k])
+    var x: u32 = k
+    while x + 1 < b.n {
+        b.instrs[x] = b.instrs[x + 1]
+        x += 1
+    }
+    b.n -= 1
+}
+
+// C: nativo/optimizer/licm.c:318
+// Tira do bloco o que pode subir (c.sobem cresce com cada uma).
+proc colher_do_bloco(c: ^LacoCtx, b: ^bir.BirBloco) {
+    var m: u32 = 0
+    while (m < b.n) and (not b.frio) {
+        let i: ^bir.BirInstr = &b.instrs[m]
+        if not pode_subir(c, i) {
+            m += 1
+        } else {
+            let d: u32 = i.dst
+            let xmm: bool = bir.bir_classe_eh_xmm(i.classe as i32)
+            c.defs[d] -= 1
+            if not xmm {
+                c.orcamento -= 1
+            }
+            retirar(c, b, m)
+        }
+    }
+}
+
+// C: nativo/optimizer/licm.c:333
+// Varre o corpo ate nao subir mais nada (uma que sobe libera quem a le).
+proc colher_invariantes(c: ^LacoCtx, f: ^bir.BirFuncao) {
+    let lc: ^bir.LacoBir = c.laco as ^bir.LacoBir
+    var antes: u32 = 4294967295
+    var n: u32 = 0
+    while antes != n {
+        antes = n
+        var k: u32 = 0
+        while k < lc.ncorpo {
+            let b: u32 = (lc.corpo or_else {})[k]
+            if c.cada_volta[b] != 0 {
+                colher_do_bloco(c, &f.blocos[b])
+            }
+            k += 1
+        }
+        n = len(c.sobem) as u32
+    }
+}
+
+// C: nativo/optimizer/licm.c:348
+// Vreg novo da classe dada: a numeracao cresce pelo programa (crescer_classes_vreg, em endereco.fj).
+proc novo_vreg_2(programa: ^bir.BirPrograma, f: ^bir.BirFuncao, classe: u8) -> u32 {
+    crescer_classes_vreg(programa, f, 1, classe)
+    let v: u32 = f.nvregs
+    f.nvregs += 1
+    return v
+}
+
+// C: nativo/optimizer/licm.c:361
+// CMP real com imediato num bloco quente do laco: o imediato vira CONST vreg no pre-cabecalho (ate LICM_CONST_REAL_MAX por laco).
+proc icar_imediatos_reais(c: ^LacoCtx, f: ^bir.BirFuncao) {
+    let g: ^LicmGlobal = c.g as ^LicmGlobal
+    let lc: ^bir.LacoBir = c.laco as ^bir.LacoBir
+    var feitos: u32 = 0
+    var k: u32 = 0
+    while (k < lc.ncorpo) and (feitos < LICM_CONST_REAL_MAX) {
+        let b: ^bir.BirBloco = &f.blocos[(lc.corpo or_else {})[k]]
+        var m: u32 = 0
+        while (m < b.n) and (not b.frio) and (feitos < LICM_CONST_REAL_MAX) {
+            let i: ^bir.BirInstr = &b.instrs[m]
+            if (i.op == (bir.BIR_CMP as u8)) and bir.bir_classe_eh_real(i.a.classe as i32) and (i.b.tipo == (bir.BO_IMED as u8)) and (i.b.tam == 0) and (i.b.sysv == none) {
+                let classe_imed: u8 = i.b.classe
+                let v: u32 = novo_vreg_2(g.prog as ^bir.BirPrograma, f, classe_imed)
+                var konst = bir.BirInstr{}
+                konst.op = (bir.BIR_CONST as u8)
+                konst.classe = classe_imed
+                konst.dst = v
+                konst.a = i.b
+                konst.pos = i.pos
+                konst.alvo[0] = bir.BIR_SEM_BLOCO
+                konst.alvo[1] = bir.BIR_SEM_BLOCO
+                konst.simbolo = bir.BIR_SEM_SIMBOLO
+                append(&c.sobem, item = konst)
+                i.b = bir.BirOperando{tipo = (bir.BO_VREG as u8), classe = classe_imed, id = v}
+                feitos += 1
+            }
+            m += 1
+        }
+        k += 1
+    }
+}
+
+// C: nativo/optimizer/licm.c:383
+// Poe as instrucoes que subiram no ponto de insercao do pre-cabecalho, na ordem em que subiram.
+proc inserir_no_pre_cabecalho(f: ^bir.BirFuncao, c: ^LacoCtx) {
+    let p: ^bir.BirBloco = &f.blocos[c.pre]
+    let nsob: u32 = len(c.sobem) as u32
+    garantir_capacidade(p, p.n + nsob)
+    var j: u32 = p.n
+    while j > c.ins {
+        j -= 1
+        p.instrs[j + nsob] = p.instrs[j]
+    }
+    var q: u32 = 0
+    while q < nsob {
+        p.instrs[c.ins + q] = c.sobem[q]
+        q += 1
+    }
+    p.n += nsob
+}
+
+// C: nativo/optimizer/licm.c:393
+proc instrucoes_do_laco(f: ^bir.BirFuncao, laco: ^bir.LacoBir) -> u32 {
+    var n: u32 = 0
+    var k: u32 = 0
+    while k < laco.ncorpo {
+        n += f.blocos[(laco.corpo or_else {})[k]].n
+        k += 1
+    }
+    return n
+}
+
+// C: nativo/optimizer/licm.c:403
+// Um laco: devolve quantas instrucoes subiram (0 = recusado ou nada a subir).
+proc tentar_laco(f: ^bir.BirFuncao, an: ^bir.AnalisesBir, laco: ^bir.LacoBir, g: ^LicmGlobal) -> u32 {
+    let nb: u32 = f.nblocos
+    var c = LacoCtx{f = f, an = an, laco = laco, g = g, usos = g.usos}
+    c.no_laco = make([dynamic]u8, alloc = heap, cap = (nb as int) + 1)
+    zeros_u8(&c.no_laco, nb + 1)
+    c.cada_volta = make([dynamic]u8, alloc = heap, cap = (nb as int) + 1)
+    zeros_u8(&c.cada_volta, nb + 1)
+    c.defs = make([dynamic]u32, alloc = heap, cap = (f.nvregs as int) + 1)
+    zeros_u32(&c.defs, f.nvregs + 1)
+    c.saidas = make([dynamic]u32, alloc = heap, cap = ((an.suc_ini or_else {})[nb] as int) + 2)
+    c.sobem = make([dynamic]bir.BirInstr, alloc = heap, cap = (instrucoes_do_laco(f, laco) as int) + 1)
+    var n: u32 = 0
+    if preparar_laco(&c) {
+        colher_invariantes(&c, f)
+        icar_imediatos_reais(&c, f)
+        n = len(c.sobem) as u32
+        if n > 0 {
+            inserir_no_pre_cabecalho(f, &c)
+        }
+    }
+    delete(c.no_laco)
+    delete(c.cada_volta)
+    delete(c.defs)
+    delete(c.saidas)
+    delete(c.sobem)
+    return n
+}
+
+// C: nativo/optimizer/licm.c:431
+// Indices dos lacos do menor para o maior (insercao estavel; o interno tem menos blocos que o que o contem).
+proc ordem_interno_primeiro(an: ^bir.AnalisesBir, ordem: []u32) {
+    let lacos: []bir.LacoBir = an.lacos or_else {}
+    var k: u32 = 0
+    while k < an.nlacos {
+        var j: u32 = k
+        while (j > 0) and (lacos[ordem[j - 1]].ncorpo > lacos[k].ncorpo) {
+            ordem[j] = ordem[j - 1]
+            j -= 1
+        }
+        ordem[j] = k
+        k += 1
+    }
+}
+
+// C: nativo/optimizer/licm.c:449
+proc licm_funcao(p: ^bir.BirPrograma, f: ^bir.BirFuncao) -> u32 {
+    if not cfg_elegivel(p, f) {
+        return 0
+    }
+    var an = bir.AnalisesBir{}
+    bir.analises_calcular_lacos_apenas(f, &an)
+    if an.nlacos == 0 {
+        bir.analises_liberar(&an)
+        return 0
+    }
+    var usos = EnderecoUsos{}
+    var g = LicmGlobal{prog = p, vivo_pendente = true}
+    if p.endereco_ligado {
+        g.usos = &usos
+        otim_endereco_usos_calcular(f, &usos)
+    }
+    constantes_da_funcao(f, &g)
+    var ordem = make([dynamic]u32, alloc = heap, cap = (an.nlacos as int) + 1)
+    zeros_u32(&ordem, an.nlacos + 1)
+    ordem_interno_primeiro(&an, ordem[..])
+    var total: u32 = 0
+    var k: u32 = 0
+    while k < an.nlacos {
+        let laco_atual: ^bir.LacoBir = &(an.lacos or_else {})[ordem[k]]
+        let n: u32 = tentar_laco(f, &an, laco_atual, &g)
+        if n > 0 {
+            total += n
+            bir.analises_liberar(&an)
+            bir.analises_calcular(f, &an)
+            g.vivo_pendente = false
+        }
+        k += 1
+    }
+    delete(ordem)
+    delete(g.constante)
+    if p.endereco_ligado {
+        otim_endereco_usos_liberar(&usos)
+    }
+    bir.analises_liberar(&an)
+    return total
+}
+
+// C: nativo/optimizer/licm.c:486
+proc otim_licm_aplicar(programa: ^bir.BirPrograma, relato: ^[dynamic]u8) {
+    var i: u32 = 0
+    while i < programa.nfuncoes {
+        let f: ^bir.BirFuncao = &(programa.funcoes or_else {})[i]
+        let n: u32 = licm_funcao(programa, f)
+        if n > 0 {
+            let txt_1 = programa.simbolos[f.simbolo].nome or_else "(null)"
+            format(f"licm {txt_1}: {n} instrucoes subiram\n", into = relato)
+        }
+        i += 1
+    }
+}
+
+test "licm_operacao_sobe_por_classe" {
+    var soma = bir.BirInstr{op = (bir.BIR_ADD as u8), classe = (bir.BC_I64 as u8)}
+    expect(operacao_sobe(&soma))
+    var carga = bir.BirInstr{op = (bir.BIR_CARREGA as u8), classe = (bir.BC_I64 as u8)}
+    expect(not operacao_sobe(&carga))
+    var e_real = bir.BirInstr{op = (bir.BIR_AND as u8), classe = (bir.BC_F64 as u8)}
+    expect(not operacao_sobe(&e_real))
+    var e_int = bir.BirInstr{op = (bir.BIR_AND as u8), classe = (bir.BC_I64 as u8)}
+    expect(operacao_sobe(&e_int))
+    var cmp = bir.BirInstr{op = (bir.BIR_CMP as u8), classe = (bir.BC_I64 as u8)}
+    expect(not operacao_sobe(&cmp))
+}
+
+test "licm_operando_constante_por_tabela" {
+    var g = LicmGlobal{nconstante = 3}
+    g.constante = make([dynamic]u8, alloc = heap, cap = 4)
+    zeros_u8(&g.constante, 4)
+    g.constante[1] = 1
+    var imed = bir.BirOperando{tipo = (bir.BO_IMED as u8)}
+    var simbolo = bir.BirOperando{tipo = (bir.BO_SIMBOLO as u8)}
+    var v1 = bir.BirOperando{tipo = (bir.BO_VREG as u8), id = 1}
+    var v0 = bir.BirOperando{tipo = (bir.BO_VREG as u8), id = 0}
+    expect(operando_constante(&g, &imed))
+    expect(not operando_constante(&g, &simbolo))
+    expect(operando_constante(&g, &v1))
+    expect(not operando_constante(&g, &v0))
+    delete(g.constante)
+}
+
+test "licm_ordem_interno_primeiro_e_estavel" {
+    var an = bir.AnalisesBir{}
+    an.nlacos = 3
+    var lacos = make([dynamic]bir.LacoBir, alloc = heap, cap = 3)
+    append(&lacos, item = bir.LacoBir{ncorpo = 3})
+    append(&lacos, item = bir.LacoBir{ncorpo = 1})
+    append(&lacos, item = bir.LacoBir{ncorpo = 2})
+    an.lacos = lacos[..]
+    var ordem = make([dynamic]u32, alloc = heap, cap = 3)
+    zeros_u32(&ordem, 3)
+    ordem_interno_primeiro(&an, ordem[..])
+    expect(ordem[0] == 1)
+    expect(ordem[1] == 2)
+    expect(ordem[2] == 0)
+    delete(ordem)
+    delete(lacos)
+}
+
+test "licm_insere_no_pre_cabecalho_na_ordem" {
+    var f = bir.BirFuncao{}
+    f.blocos = make([dynamic]bir.BirBloco, alloc = heap, cap = 2)
+    append(&f.blocos, item = bir.BirBloco{})
+    f.blocos[0].instrs = make([dynamic]bir.BirInstr, alloc = heap, cap = 2)
+    append(&f.blocos[0].instrs, item = bir.BirInstr{op = 1})
+    append(&f.blocos[0].instrs, item = bir.BirInstr{op = 2})
+    f.blocos[0].n = 2
+    var c = LacoCtx{pre = 0, ins = 1}
+    c.sobem = make([dynamic]bir.BirInstr, alloc = heap, cap = 2)
+    append(&c.sobem, item = bir.BirInstr{op = 7})
+    inserir_no_pre_cabecalho(&f, &c)
+    expect(f.blocos[0].n == 3)
+    expect(f.blocos[0].instrs[0].op == 1)
+    expect(f.blocos[0].instrs[1].op == 7)
+    expect(f.blocos[0].instrs[2].op == 2)
+    delete(c.sobem)
+    delete(f.blocos[0].instrs)
+    delete(f.blocos)
+}

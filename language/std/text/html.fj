@@ -1,0 +1,133 @@
+// std:text, pedaco html (parte do modulo std:text: veja text.fj): escapar e desfazer escape de HTML. html_escape troca & < > " ' por &amp; &lt; &gt; &quot; &#39;; html_unescape desfaz as 5 entidades nomeadas (amp lt gt quot apos) e as numericas &#n; e &#xh; ate U+10FFFF. Forja pura (sem foreign).
+// Versao: 0.1.0. Changelog: 0.1.0 - R1 do marco rede: html_escape e html_unescape. Entidade invalida fica como texto: nome desconhecido, numero 0, surrogate ou acima de U+10FFFF, ';' ausente no limite de 8 bytes do corpo.
+// Posse: html_escape e html_unescape devolvem texto DONO do alocador que o chamador passou (delete so se for heap, sempre, mesmo quando nada muda). Nao falham: entidade invalida e texto comum.
+// Usa do mesmo modulo: DIGITO_ZERO e LETRA_* (text.fj), valor_do_digito e LETRA_X_* (parse.fj), runa_valida, RUNA_MAXIMA e encode (utf8.fj).
+
+const E_COMERCIAL: u8 = 38
+const APOSTROFO: u8 = 39
+const ASPAS_DUPLAS: u8 = 34
+const MENOR_QUE: u8 = 60
+const MAIOR_QUE: u8 = 62
+const CERQUILHA: u8 = 35
+const PONTO_E_VIRGULA: u8 = 59
+const BASE_DECIMAL_ENTIDADE: int = 10
+const BASE_HEXA_ENTIDADE: int = 16
+// Ate aqui, o ';' tem de aparecer: o corpo cabe em 8 bytes ("#x10FFFF"). Mais longo que isso o '&' fica como texto.
+const TAMANHO_MAXIMO_ENTIDADE: int = 10
+const NOMES_ENTIDADE: [5]str = {"amp", "lt", "gt", "quot", "apos"}
+const VALORES_ENTIDADE: [5]int = {38, 60, 62, 34, 39}
+
+// Escreve c no buf: como entidade se for um dos 5 caracteres escapados, senao ele mesmo.
+proc acrescentar_escape(buf: ^[dynamic]u8, c: u8) {
+    if c == E_COMERCIAL {
+        append(buf, item = "&amp;")
+    } else if c == MENOR_QUE {
+        append(buf, item = "&lt;")
+    } else if c == MAIOR_QUE {
+        append(buf, item = "&gt;")
+    } else if c == ASPAS_DUPLAS {
+        append(buf, item = "&quot;")
+    } else if c == APOSTROFO {
+        append(buf, item = "&#39;")
+    } else {
+        append(buf, item = c)
+    }
+}
+
+// Texto seguro para HTML (conteudo e atributo entre aspas): & < > " ' viram &amp; &lt; &gt; &quot; &#39;.
+pub proc html_escape(s: str, alloc: Allocator) -> str {
+    var saida = make([dynamic]u8, alloc = alloc, cap = len(s))
+    defer delete(saida)
+    for i in 0..<len(s) {
+        acrescentar_escape(&saida, s[i])
+    }
+    return to_str(&saida)
+}
+
+// Posicao do ';' que fecha a entidade que abre em i, ou -1 se nao ha ';' dentro de TAMANHO_MAXIMO_ENTIDADE bytes.
+proc fim_da_entidade(s: str, i: int) -> int {
+    let limite = min(len(s), i + TAMANHO_MAXIMO_ENTIDADE)
+    let inicio = i + 1
+    for k in inicio..<limite {
+        if s[k] == PONTO_E_VIRGULA {
+            return k
+        }
+    }
+    return -1
+}
+
+// Valor do nome (corpo sem & e ;) entre os 5 nomeados, ou -1.
+proc valor_nomeado(corpo: str) -> int {
+    for k in 0..<len(NOMES_ENTIDADE) {
+        if corpo == NOMES_ENTIDADE[k] {
+            return VALORES_ENTIDADE[k]
+        }
+    }
+    return -1
+}
+
+// Valor de "#n" ou "#xh" (corpo comeca com '#'): pelo menos um digito da base, e a runa tem de ser valida (1..U+10FFFF, sem surrogate). -1 se nao.
+proc valor_numerico(corpo: str) -> int {
+    var base = BASE_DECIMAL_ENTIDADE
+    var inicio = 1
+    if len(corpo) > 1 and (corpo[1] == LETRA_X_MINUSCULA or corpo[1] == LETRA_X_MAIUSCULA) {
+        base = BASE_HEXA_ENTIDADE
+        inicio = 2
+    }
+    if inicio >= len(corpo) {
+        return -1
+    }
+    var valor = 0
+    for k in inicio..<len(corpo) {
+        let d = valor_do_digito(corpo[k])
+        if d < 0 or d >= base {
+            return -1
+        }
+        valor = valor * base + d
+        if valor > (RUNA_MAXIMA as int) {
+            return -1
+        }
+    }
+    if valor == 0 or not runa_valida(valor as i32) {
+        return -1
+    }
+    return valor
+}
+
+// Entidade que abre em s[i] (um '&'): (runa, tamanho em bytes contando & e ;). Tamanho 0 = nao e entidade valida; o '&' fica como texto.
+proc ler_entidade(s: str, i: int) -> (runa: int, tam: int) {
+    if s[i] != E_COMERCIAL {
+        return 0, 0
+    }
+    let fim = fim_da_entidade(s, i)
+    if fim < 0 {
+        return 0, 0
+    }
+    let corpo = s[i + 1..<fim]
+    var valor = valor_nomeado(corpo)
+    if len(corpo) > 0 and corpo[0] == CERQUILHA {
+        valor = valor_numerico(corpo)
+    }
+    if valor < 0 {
+        return 0, 0
+    }
+    return valor, fim - i + 1
+}
+
+// Texto com as entidades desfeitas (nomeadas e numericas). O que nao e entidade valida sai como esta.
+pub proc html_unescape(s: str, alloc: Allocator) -> str {
+    var saida = make([dynamic]u8, alloc = alloc, cap = len(s))
+    defer delete(saida)
+    var i = 0
+    while i < len(s) {
+        let runa, tam = ler_entidade(s, i)
+        if tam > 0 {
+            encode(runa as i32, &saida)
+            i += tam
+        } else {
+            append(&saida, item = s[i])
+            i += 1
+        }
+    }
+    return to_str(&saida)
+}

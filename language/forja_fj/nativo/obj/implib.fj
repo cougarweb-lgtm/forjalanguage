@@ -1,0 +1,420 @@
+// nativo/obj/implib.fj - porte de compiler/nativo/obj/implib.c, compiler/nativo/obj/implib.h
+// sha256 de nativo/obj/implib.c: 6ac7a698388972bb4710558de19dbde9d1e925a71e1f850641ec2b51875cc8ba
+// sha256 de nativo/obj/implib.h: 56b35b8be238b95aa89404b50f210b4d40aa8f2c40ace06ac41a69aacbe35759
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "common"
+
+struct ImplibEntrada {
+    dll: ?str
+    nome: ?str
+    simbolo: ?str
+    tipo: i32
+}
+
+struct ImplibEntradas {
+    textos: common.Arena
+    itens: [dynamic]ImplibEntrada
+}
+
+struct Faixa {
+    p: ?[]u8
+    n: u64
+}
+
+struct Leitor {
+    saida: ?^ImplibEntradas
+    erro: ?^common.Diag
+    dll_gnu: ?str
+    varias_dlls_gnu: bool
+}
+
+const IMPLIB_CODIGO: i32 = 0
+const IMPLIB_DADO: i32 = 1
+const IMPLIB_ORDINAL: i32 = 2
+const IMPL_MAQUINA_AMD64: u32 = 34404
+const IMPL_MAQUINA_I386: u32 = 332
+const IMPL_TAM_CURTO: u32 = 20
+const IMPL_OFF_SIG2: u32 = 2
+const IMPL_SIG2: u32 = 65535
+const IMPL_OFF_VERSAO: u32 = 4
+const IMPL_OFF_MAQUINA_CURTO: u32 = 6
+const IMPL_OFF_TAM_DADOS: u32 = 12
+const IMPL_OFF_TIPOS: u32 = 18
+const IMPL_TIPO_MASCARA: u32 = 3
+const IMPL_NOME_DESLOCAMENTO: u32 = 2
+const IMPL_NOME_MASCARA: u32 = 7
+const IMPL_TIPO_CODIGO: u32 = 0
+const IMPL_NOME_ORDINAL: u32 = 0
+const IMPL_NOME_NOME: u32 = 1
+const IMPL_NOME_SEM_PREFIXO: u32 = 2
+const IMPL_NOME_SEM_DECORACAO: u32 = 3
+const IMPL_NOME_EXPORTAS: u32 = 4
+const IMPL_QTD_TEXTOS: u32 = 3
+const IMPL_TAM_COFF: u32 = 20
+const IMPL_OFF_NSECOES: u32 = 2
+const IMPL_OFF_TAM_OPCIONAL: u32 = 16
+const IMPL_TAM_SECAO: u32 = 40
+const IMPL_TAM_NOME_SECAO: u32 = 8
+const IMPL_OFF_SECAO_TAM: u32 = 16
+const IMPL_OFF_SECAO_PTR: u32 = 20
+const IMPL_TAM_DICA: u32 = 2
+
+// C: nativo/obj/implib.c:54
+// C2F-INDECIDIVEL: p
+proc imp_le16(p: []u8) -> u16 {
+    return common.c2f_trunc_u16(common.c2f_s2u_64(common.c2f_ou_i32(p[0] as i32, common.c2f_shl_i32(p[1] as i32, 8)) as i64))
+}
+
+// C: nativo/obj/implib.c:59
+// C2F-INDECIDIVEL: p
+proc imp_le32(p: []u8) -> u32 {
+    return (((p[0] as u32) | ((p[1] as u32) << 8)) | ((p[2] as u32) << 16)) | ((p[3] as u32) << 24)
+}
+
+// C: nativo/obj/implib.c:64
+proc imp_malformado(l: ^Leitor, motivo: str) -> bool {
+    let msg_1 = format(f"import library malformada: {motivo}", alloc = heap)
+    defer delete(msg_1)
+    return common.diag_relatar(l.erro as ^common.Diag, common.X0105, 0, msg_1)
+}
+
+// C: nativo/obj/implib.c:70
+proc imp_maquina_ok(l: ^Leitor, maquina: u16) -> bool {
+    if (maquina as u32) == IMPL_MAQUINA_AMD64 {
+        return true
+    }
+    if (maquina as u32) == IMPL_MAQUINA_I386 {
+        return common.diag_relatar(l.erro as ^common.Diag, common.X0105, 0, "biblioteca de 32 bits (import library i386); o backend nativo liga so x64")
+    }
+    let msg_1 = format(f"import library para a maquina 0x{maquina:x}; o backend nativo liga so x64 (0x8664)", alloc = heap)
+    defer delete(msg_1)
+    return common.diag_relatar(l.erro as ^common.Diag, common.X0105, 0, msg_1)
+}
+
+// C: nativo/obj/implib.c:79
+// C2F-33: os textos ja chegam copiados na arena de saida; a entrada so guarda as vistas
+proc imp_nova_entrada(l: ^Leitor, dll: ?str, simbolo: str, nome: str) -> ^ImplibEntrada {
+    let saida: ^ImplibEntradas = l.saida as ^ImplibEntradas
+    append(&saida.itens, item = ImplibEntrada{dll = dll, nome = nome, simbolo = simbolo})
+    return &saida.itens[len(saida.itens) - 1]
+}
+
+// C: nativo/obj/implib.c:92
+// C2F-33: as ate 3 strings NUL do corpo saem copiadas na arena; devolve quantas achou, ou -1 se a ultima nao termina
+proc imp_textos(corpo: []u8, arena: ^common.Arena, textos: []str) -> i32 {
+    var qtd: i32 = 0
+    var ini: int = 0
+    let fim: int = len(corpo)
+    while (ini < fim) and ((qtd as u32) < IMPL_QTD_TEXTOS) {
+        var nul: int = ini
+        while (nul < fim) and (corpo[nul] != 0) {
+            nul += 1
+        }
+        if nul >= fim {
+            return -1
+        }
+        textos[qtd as int] = from_bytes(corpo[ini..<nul], alloc = common.arena_mem(arena))
+        qtd += 1
+        ini = nul + 1
+    }
+    return qtd
+}
+
+// C: nativo/obj/implib.c:107
+// C2F-33: a Forja nao tem substring de str sem copia: o recorte sai copiado na arena
+proc imp_sem_prefixo(simbolo: str, cortar_arroba: bool, arena: ^common.Arena) -> str {
+    let bytes: []u8 = as_bytes(simbolo)
+    var ini: int = 0
+    if (len(bytes) > 0) and ((bytes[0] == 63) or (bytes[0] == 64) or (bytes[0] == 95)) { // '?' '@' '_'
+        ini = 1
+    }
+    var fim: int = len(bytes)
+    if cortar_arroba {
+        var k: int = ini
+        while k < len(bytes) {
+            if bytes[k] == 64 { // '@'
+                fim = k
+                break
+            }
+            k += 1
+        }
+    }
+    return from_bytes(bytes[ini..<fim], alloc = common.arena_mem(arena))
+}
+
+// C: nativo/obj/implib.c:116
+proc imp_nome_importado(tipo_nome: u32, simbolo: str, extra: ?str, arena: ^common.Arena) -> ?str {
+    if tipo_nome <= IMPL_NOME_NOME {
+        return simbolo
+    }
+    if tipo_nome == IMPL_NOME_EXPORTAS {
+        return extra
+    }
+    if (tipo_nome == IMPL_NOME_SEM_PREFIXO) or (tipo_nome == IMPL_NOME_SEM_DECORACAO) {
+        return imp_sem_prefixo(simbolo, tipo_nome == IMPL_NOME_SEM_DECORACAO, arena)
+    }
+    return none
+}
+
+// C: nativo/obj/implib.c:131
+proc imp_tipo_curto(tipo: u32, tipo_nome: u32) -> i32 {
+    if tipo_nome == IMPL_NOME_ORDINAL {
+        return IMPLIB_ORDINAL
+    }
+    var tern_1: i32 = IMPLIB_DADO
+    if tipo == IMPL_TIPO_CODIGO {
+        tern_1 = IMPLIB_CODIGO
+    }
+    return tern_1
+}
+
+// C: nativo/obj/implib.c:138
+proc imp_curto(l: ^Leitor, m: ^ArMembro) -> bool {
+    let corpo: []u8 = m.dados or_else {}
+    var textos: [3]str = {}
+    let tipos: u32 = common.c2f_ler_u16_le(corpo, IMPL_OFF_TIPOS as int) as u32
+    let tipo_nome: u32 = (tipos >> IMPL_NOME_DESLOCAMENTO) & IMPL_NOME_MASCARA
+    let tam_dados: u64 = common.c2f_ler_u32_le(corpo, IMPL_OFF_TAM_DADOS as int) as u64
+    let arena: ^common.Arena = &(l.saida as ^ImplibEntradas).textos
+    if not imp_maquina_ok(l, common.c2f_ler_u16_le(corpo, IMPL_OFF_MAQUINA_CURTO as int)) {
+        return false
+    }
+    var qtd: i32 = 0
+    if tam_dados <= (m.tam - (IMPL_TAM_CURTO as u64)) {
+        let fim_dados: int = (((IMPL_TAM_CURTO as u64) + tam_dados) as int)
+        qtd = imp_textos(corpo[(IMPL_TAM_CURTO as int)..<fim_dados], arena, textos[..])
+    }
+    if qtd < 2 {
+        return imp_malformado(l, "membro curto sem as strings do simbolo e da DLL")
+    }
+    var extra: ?str = none
+    if qtd >= 3 {
+        extra = textos[2]
+    }
+    let nome: ?str = imp_nome_importado(tipo_nome, textos[0], extra, arena)
+    if nome == none {
+        return imp_malformado(l, "NameType desconhecido ou EXPORTAS sem o nome de exportacao")
+    }
+    let e: ^ImplibEntrada = imp_nova_entrada(l, textos[1], textos[0], textos[0])
+    e.nome = nome
+    e.tipo = imp_tipo_curto(tipos & IMPL_TIPO_MASCARA, tipo_nome)
+    return true
+}
+
+// C: nativo/obj/implib.c:160
+// C2F-33: a faixa guarda o corpo a partir do ponteiro ate o fim do membro (o C so usa n bytes)
+proc imp_secao(m: ^ArMembro, nome: str, faixa: ^Faixa) -> bool {
+    let corpo: []u8 = m.dados or_else {}
+    let tabela: u64 = (IMPL_TAM_COFF as u64) + (common.c2f_ler_u16_le(corpo, IMPL_OFF_TAM_OPCIONAL as int) as u64)
+    let qtd: u64 = common.c2f_ler_u16_le(corpo, IMPL_OFF_NSECOES as int) as u64
+    var i: u64 = 0
+    while i < qtd {
+        let off: u64 = tabela + (i * (IMPL_TAM_SECAO as u64))
+        if off + (IMPL_TAM_SECAO as u64) > m.tam {
+            return false
+        }
+        if common.c2f_memcmp(corpo[(off as int)..<((off + (IMPL_TAM_NOME_SECAO as u64)) as int)], as_bytes(nome)) == 0 {
+            let tam: u64 = common.c2f_ler_u32_le(corpo, (off + (IMPL_OFF_SECAO_TAM as u64)) as int) as u64
+            let ptr: u64 = common.c2f_ler_u32_le(corpo, (off + (IMPL_OFF_SECAO_PTR as u64)) as int) as u64
+            let ok: bool = (ptr <= m.tam) and (tam <= (m.tam - ptr))
+            if ok {
+                faixa.p = corpo[(ptr as int)..<(m.tam as int)]
+                faixa.n = tam
+            }
+            return ok
+        }
+        i += 1
+    }
+    return false
+}
+
+// C: nativo/obj/implib.c:178
+// C2F-33: o nome sai copiado na arena de saida (o C apontava para o membro)
+proc imp_gnu_simbolo(l: ^Leitor, s6: ^Faixa) -> bool {
+    let corpo: []u8 = s6.p or_else {}
+    let tam: int = s6.n as int
+    var nul: int = IMPL_TAM_DICA as int
+    while (nul < tam) and (corpo[nul] != 0) {
+        nul += 1
+    }
+    if nul >= tam {
+        return imp_malformado(l, "nome do simbolo sem NUL no .idata$6")
+    }
+    let saida: ^ImplibEntradas = l.saida as ^ImplibEntradas
+    let nome: str = from_bytes(corpo[(IMPL_TAM_DICA as int)..<nul], alloc = common.arena_mem(&saida.textos))
+    let e: ^ImplibEntrada = imp_nova_entrada(l, none, nome, nome)
+    e.tipo = IMPLIB_CODIGO
+    return true
+}
+
+// C: nativo/obj/implib.c:188
+// C2F-33: o nome da DLL do tail sai copiado na arena; a comparacao com a ja guardada e byte a byte
+proc imp_gnu_dll(l: ^Leitor, s7: ^Faixa) -> bool {
+    let corpo: []u8 = s7.p or_else {}
+    var tam: int = 0
+    while (tam < (s7.n as int)) and (corpo[tam] != 0) {
+        tam += 1
+    }
+    if l.dll_gnu == none {
+        let saida: ^ImplibEntradas = l.saida as ^ImplibEntradas
+        l.dll_gnu = from_bytes(corpo[0..<tam], alloc = common.arena_mem(&saida.textos))
+    } else {
+        let atual: str = l.dll_gnu or_else ""
+        if (len(atual) != tam) or (common.c2f_memcmp(as_bytes(atual), corpo[0..<tam]) != 0) {
+            l.varias_dlls_gnu = true
+        }
+    }
+    return true
+}
+
+// C: nativo/obj/implib.c:200
+proc imp_eh_simbolo_gnu(m: ^ArMembro, s6: ^Faixa) -> bool {
+    var s5: Faixa = Faixa{}
+    return (((common.c2f_b2i32(imp_secao(m, ".idata$5", &s5)) != 0) and (s5.n > 0)) and (common.c2f_b2i32(imp_secao(m, ".idata$6", s6)) != 0)) and (s6.n > (IMPL_TAM_DICA as u64))
+}
+
+// C: nativo/obj/implib.c:207
+proc imp_eh_cauda_gnu(m: ^ArMembro, s7: ^Faixa) -> bool {
+    return ((common.c2f_b2i32(imp_secao(m, ".idata$7", s7)) != 0) and (s7.n > 0)) and ((s7.p or_else {})[0] != 0)
+}
+
+// C: nativo/obj/implib.c:212
+proc imp_gnu(l: ^Leitor, m: ^ArMembro) -> bool {
+    var s6: Faixa = Faixa{}
+    var s7: Faixa = Faixa{}
+    if m.tam < (IMPL_TAM_COFF as u64) {
+        return true
+    }
+    let simbolo: bool = imp_eh_simbolo_gnu(m, &s6)
+    if (not simbolo) and (not imp_eh_cauda_gnu(m, &s7)) {
+        return true
+    }
+    if not imp_maquina_ok(l, imp_le16((m.dados or_else {}))) {
+        return false
+    }
+    var tern_1: i32 = 0
+    if common.c2f_b2i32(simbolo) != 0 {
+        tern_1 = common.c2f_b2i32(imp_gnu_simbolo(l, &s6))
+    } else {
+        tern_1 = common.c2f_b2i32(imp_gnu_dll(l, &s7))
+    }
+    return tern_1 != 0
+}
+
+// C: nativo/obj/implib.c:226
+proc imp_atribuir_dll_gnu(l: ^Leitor) -> bool {
+    let v: ^[dynamic]ImplibEntrada = &(l.saida as ^ImplibEntradas).itens
+    var i: u64 = 0
+    while i < (len(v^) as u64) {
+        let e: ^ImplibEntrada = &v[i]
+        if e.dll != none {
+            i += 1
+            continue
+        }
+        if (l.dll_gnu == none) or (common.c2f_b2i32(l.varias_dlls_gnu) != 0) {
+            var tern_1: str = "import library GNU com mais de uma DLL"
+            if l.dll_gnu == none {
+                tern_1 = "import library GNU sem o nome da DLL (.idata$7 do tail)"
+            }
+            return imp_malformado(l, tern_1)
+        }
+        e.dll = l.dll_gnu
+        i += 1
+    }
+    return true
+}
+
+// C: nativo/obj/implib.c:240
+// C2F-VOID: a, b (qsort) viram as duas entradas por valor; a ordem total do C e a mesma
+proc imp_comparar(x: ImplibEntrada, y: ImplibEntrada) -> i32 {
+    var r: i32 = common.c2f_strcmp(x.nome or_else "", y.nome or_else "")
+    if r == 0 {
+        r = common.c2f_strcmp(x.dll or_else "", y.dll or_else "")
+    }
+    if r == 0 {
+        r = common.c2f_strcmp(x.simbolo or_else "", y.simbolo or_else "")
+    }
+    if r != 0 {
+        return r
+    }
+    if x.tipo < y.tipo {
+        return -1
+    }
+    if x.tipo > y.tipo {
+        return 1
+    }
+    return 0
+}
+
+// C2F-VOID: qsort do C trocado por insercao estavel: a ordem e total (ImpComparar), entao o resultado e o mesmo
+proc imp_ordenar_entradas(itens: []ImplibEntrada) {
+    var i: int = 1
+    while i < len(itens) {
+        var j: int = i
+        while (j > 0) and (imp_comparar(itens[j - 1], itens[j]) > 0) {
+            let troca: ImplibEntrada = itens[j - 1]
+            itens[j - 1] = itens[j]
+            itens[j] = troca
+            j -= 1
+        }
+        i += 1
+    }
+}
+
+// C: nativo/obj/implib.c:252
+proc imp_eh_curto(m: ^ArMembro) -> bool {
+    let corpo: []u8 = m.dados or_else {}
+    return (m.tam >= (IMPL_TAM_CURTO as u64)) and ((common.c2f_ler_u16_le(corpo, 0) as u32) == 0) and ((common.c2f_ler_u16_le(corpo, IMPL_OFF_SIG2 as int) as u32) == IMPL_SIG2)
+}
+
+// C: nativo/obj/implib.c:258
+// C2F: versao diferente de 0 e objeto anonimo (/GL): fica de fora
+proc imp_membro(l: ^Leitor, m: ^ArMembro) -> bool {
+    if not imp_eh_curto(m) {
+        return imp_gnu(l, m)
+    }
+    let corpo: []u8 = m.dados or_else {}
+    if common.c2f_ler_u16_le(corpo, IMPL_OFF_VERSAO as int) != 0 {
+        return true
+    }
+    return imp_curto(l, m)
+}
+
+// C: nativo/obj/implib.c:265
+proc imp_ler_membros(l: ^Leitor, bytes: ^u8, n: u64) -> bool {
+    var it: ArIterador = ArIterador{}
+    var m: ArMembro = ArMembro{}
+    if not ar_iniciar(&it, bytes, n, l.erro as ^common.Diag) {
+        return false
+    }
+    while ar_proximo(&it, &m, l.erro as ^common.Diag) {
+        if (common.c2f_s2u_32(m.tipo) == (AR_OBJETO as u32)) and (not imp_membro(l, &m)) {
+            return false
+        }
+    }
+    return not (l.erro as ^common.Diag).tem
+}
+
+// C: nativo/obj/implib.c:278
+// C2F-70: o Leitor do C vira var local; a lista nasce com alocador e o texto vai na arena de saida
+proc implib_ler(bytes: ^u8, n: u64, saida: ^ImplibEntradas, erro: ^common.Diag) -> bool {
+    var l = Leitor{saida = saida, erro = erro}
+    saida.textos = common.Arena{}
+    saida.itens = make([dynamic]ImplibEntrada, alloc = heap)
+    if not imp_ler_membros(&l, bytes, n) {
+        return false
+    }
+    if not imp_atribuir_dll_gnu(&l) {
+        return false
+    }
+    imp_ordenar_entradas(saida.itens[..])
+    return true
+}
+
+// C: nativo/obj/implib.c:289
+proc implib_liberar(saida: ^ImplibEntradas) {
+    delete(saida.itens)
+    common.arena_liberar(&saida.textos)
+}

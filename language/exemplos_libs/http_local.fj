@@ -1,0 +1,215 @@
+// Marco rede R4: cliente HTTP de vendor:net/net contra o servidor de mentira tests\rede\servidor_http.py (127.0.0.1, porta efemera, sem internet).
+// O argumento 1 e a base do servidor ("http://127.0.0.1:<porta>"): o verificar_libs.py sobe o servidor, passa a base e o derruba.
+// COMPILAR/RODAR: python language\exemplos_libs\verificar_libs.py --so http_local --backend x64   (SAIDA ESPERADA: http_local.esperado)
+
+import "std:mem"
+import "std:os"
+import "std:thread"
+import "vendor:json/json"
+import "vendor:net/net"
+
+const THREADS: int = 4
+const PEDIDOS_POR_THREAD: int = 25
+const TAMANHO_GRANDE: int = 5242880
+const PERIODO_DOS_BYTES: int = 256
+const MARGEM_DO_TIMEOUT_NS: int = 1500000000
+
+struct Trabalho {
+    base: str
+    ok: int
+    falhas: int
+}
+
+// Quantos bytes do corpo fogem do padrao do servidor (o byte i vale i % 256).
+proc contar_fora_do_padrao(corpo: str) -> int {
+    var erros = 0
+    for i in 0..<len(corpo) {
+        if (corpo[i] as int) != i % PERIODO_DOS_BYTES {
+            erros += 1
+        }
+    }
+    return erros
+}
+
+// Soma dos bytes do corpo.
+proc somar_bytes(corpo: str) -> int {
+    var soma = 0
+    for i in 0..<len(corpo) {
+        soma += corpo[i] as int
+    }
+    return soma
+}
+
+// Confere no JSON do /eco o metodo, os cabecalhos Authorization e Content-Type, o user agent e o corpo que o servidor recebeu.
+proc mostrar_eco(rotulo: str, status: int, corpo: str) -> ! json.JsonError {
+    let doc = try json.parse_str(corpo)
+    defer json.close(doc)
+    let metodo = try json.field_text(doc, name = "method")
+    let cabecalhos = try json.field(doc, name = "headers")
+    let auth = try json.field_text(cabecalhos, name = "authorization")
+    let tipo = try json.field_text(cabecalhos, name = "content-type")
+    let agente = try json.field_text(cabecalhos, name = "user-agent")
+    let recebido = try json.field_text(doc, name = "body")
+    let tamanho = try json.field_int(doc, name = "body_len")
+    print(f"{rotulo} {status} metodo={metodo} auth={auth} tipo={tipo} ua={agente} corpo=[{recebido}] bytes={tamanho}")
+}
+
+// Um pedido ao /eco com o verbo dado; post, put, patch e delete levam corpo, get nao.
+proc provar_eco(base: str, metodo: net.Method, rotulo: str, corpo: str) -> ! net.NetError {
+    let a = mem.arena_create()
+    defer mem.arena_destroy(a)
+    var cabecalhos: [2]net.Header = {net.Header{name = "Authorization", value = "Bearer abc"}, net.Header{name = "Content-Type", value = "text/plain"}}
+    var req = net.Request{method = metodo, url = format(f"{base}/eco?x=1", alloc = a), headers = cabecalhos[..], body = as_bytes(corpo)}
+    let resp = try net.http_request(&req, alloc = a)
+    switch e in mostrar_eco(rotulo, status = resp.status, corpo = resp.body) {
+    case json.JsonError:
+        print(f"{rotulo} json invalido")
+    default:
+        print(f"{rotulo} conferido")
+    }
+}
+
+// HEAD: so cabecalhos (header_get sem diferenciar caixa), corpo vazio.
+proc provar_head(base: str) -> ! net.NetError {
+    let a = mem.arena_create()
+    defer mem.arena_destroy(a)
+    var nenhum: [1]net.Header = {}
+    var sem_corpo: [1]u8 = {}
+    var req = net.Request{method = net.Method.head, url = format(f"{base}/binario/100", alloc = a), headers = nenhum[0..<0], body = sem_corpo[0..<0]}
+    var resp = try net.http_request(&req, alloc = a)
+    let tipo = net.header_get(&resp, name = "CONTENT-TYPE") or_else "?"
+    let tamanho = net.header_get(&resp, name = "content-length") or_else "?"
+    print(f"head {resp.status} tipo={tipo} content-length={tamanho} corpo={len(resp.body)}")
+}
+
+// 404 volta em Response.status, sem erro.
+proc provar_status(base: str) -> ! net.NetError {
+    let a = mem.arena_create()
+    defer mem.arena_destroy(a)
+    let resp = try net.http_get(format(f"{base}/status/404", alloc = a), alloc = a)
+    print(f"status {resp.status} corpo={resp.body}")
+}
+
+// /atraso/2000 com timeout de 300 ms: NetError.timeout, e rapido (nao esperou os 2 s).
+proc provar_timeout(base: str) {
+    let a = mem.arena_create()
+    defer mem.arena_destroy(a)
+    var nenhum: [1]net.Header = {}
+    var sem_corpo: [1]u8 = {}
+    var req = net.Request{method = net.Method.get, url = format(f"{base}/atraso/2000", alloc = a), headers = nenhum[0..<0], body = sem_corpo[0..<0], timeout_ms = 300}
+    let inicio = os.time_ns()
+    switch r in net.http_request(&req, alloc = a) {
+    case net.Response:
+        print("timeout: nao deu erro")
+    case net.NetError:
+        let rapido = os.time_ns() - inicio < MARGEM_DO_TIMEOUT_NS
+        print(f"timeout {r == net.NetError.timeout} rapido={rapido}")
+    }
+}
+
+// /redir/3 segue ate o fim (200); /redir/11 passa de max_redirects = 10 e falha; sem follow_redirects volta o 302 com o Location.
+proc provar_redirecionamento(base: str) -> ! net.NetError {
+    let a = mem.arena_create()
+    defer mem.arena_destroy(a)
+    let segue = try net.http_get(format(f"{base}/redir/3", alloc = a), alloc = a)
+    print(f"redir 3 status {segue.status} corpo={segue.body}")
+    switch r in net.http_get(format(f"{base}/redir/11", alloc = a), alloc = a) {
+    case net.Response:
+        print(f"redir 11 status {r.status}")
+    case net.NetError:
+        print(f"redir 11 erro other={r == net.NetError.other}")
+    }
+    var nenhum: [1]net.Header = {}
+    var sem_corpo: [1]u8 = {}
+    var req = net.Request{method = net.Method.get, url = format(f"{base}/redir/2", alloc = a), headers = nenhum[0..<0], body = sem_corpo[0..<0], follow_redirects = false}
+    var resp = try net.http_request(&req, alloc = a)
+    let destino = net.header_get(&resp, name = "location") or_else "?"
+    print(f"redir sem seguir status {resp.status} location={destino}")
+}
+
+// Corpo binario (byte 0 incluso) integro, e 5 MiB inteiros (tamanho, padrao byte a byte e soma).
+proc provar_binarios(base: str) -> ! net.NetError {
+    let a = mem.arena_create()
+    defer mem.arena_destroy(a)
+    var pequeno = try net.http_get(format(f"{base}/binario/1000", alloc = a), alloc = a)
+    let tipo = net.header_get(&pequeno, name = "content-type") or_else "?"
+    print(f"binario status {pequeno.status} tamanho {len(pequeno.body)} fora_do_padrao {contar_fora_do_padrao(pequeno.body)} primeiro {pequeno.body[0]} tipo={tipo}")
+    let grande = try net.http_get(format(f"{base}/grande", alloc = a), alloc = a)
+    print(f"grande status {grande.status} tamanho {len(grande.body)} esperado {TAMANHO_GRANDE} fora_do_padrao {contar_fora_do_padrao(grande.body)} soma {somar_bytes(grande.body)}")
+}
+
+// Corpo da thread: 25 GETs, cada um com o seu handle do curl; conta os que voltaram 200 com o corpo certo.
+proc trabalhar(q: rawptr) -> u32 {
+    let t = q as ^Trabalho
+    let a = mem.arena_create()
+    defer mem.arena_destroy(a)
+    for i in 0..<PEDIDOS_POR_THREAD {
+        let tamanho = 16 + i
+        switch r in net.http_get(format(f"{t.base}/binario/{tamanho}", alloc = a), alloc = a) {
+        case net.Response:
+            if r.status == 200 and len(r.body) == tamanho and contar_fora_do_padrao(r.body) == 0 {
+                t.ok += 1
+            }
+        case net.NetError:
+            t.falhas += 1
+        }
+    }
+    return 0
+}
+
+// 4 threads std:thread com 25 GETs cada contra o mesmo servidor.
+proc provar_threads(base: str) {
+    os.multithread_on()
+    var trabalhos: [4]Trabalho = {}
+    var fios: [4]thread.Thread = {}
+    var criadas = 0
+    for k in 0..<THREADS {
+        trabalhos[k].base = base
+        switch t in thread.spawn(trabalhar, arg = &trabalhos[k] as rawptr) {
+        case thread.Thread:
+            fios[k] = t
+            criadas += 1
+        case thread.ThreadError:
+            print("thread nao criada")
+        }
+    }
+    var total = 0
+    var falhas = 0
+    for k in 0..<criadas {
+        _ = thread.join(fios[k])
+        total += trabalhos[k].ok
+        falhas += trabalhos[k].falhas
+    }
+    print(f"threads {criadas} pedidos_ok {total} de {THREADS * PEDIDOS_POR_THREAD} falhas {falhas}")
+}
+
+// Os 6 verbos no /eco, HEAD, 404, redirecionamentos, binarios e 5 MiB; o primeiro NetError inesperado interrompe e sobe.
+proc rodar_pedidos(base: str) -> ! net.NetError {
+    try provar_eco(base, metodo = net.Method.get, rotulo = "get", corpo = "")
+    try provar_eco(base, metodo = net.Method.post, rotulo = "post", corpo = "corpo-post")
+    try provar_eco(base, metodo = net.Method.put, rotulo = "put", corpo = "corpo-put")
+    try provar_eco(base, metodo = net.Method.patch, rotulo = "patch", corpo = "corpo-patch")
+    try provar_eco(base, metodo = net.Method.delete, rotulo = "delete", corpo = "corpo-delete")
+    try provar_head(base)
+    try provar_status(base)
+    try provar_redirecionamento(base)
+    try provar_binarios(base)
+}
+
+proc main() {
+    defer net.shutdown()
+    let args = os.args()
+    if len(args) < 2 {
+        print("uso: http_local <base do servidor>")
+        os.exit(2)
+    }
+    let base = args[1]
+    switch e in rodar_pedidos(base) {
+    case net.NetError:
+        print("falha de rede inesperada")
+    default:
+        print("pedidos ok")
+    }
+    provar_timeout(base)
+    provar_threads(base)
+}

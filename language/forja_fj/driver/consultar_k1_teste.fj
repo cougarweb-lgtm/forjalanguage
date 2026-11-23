@@ -1,0 +1,111 @@
+// driver/consultar_k1_teste.fj - testes do porte de driver\{cmd_consultar, consultar_json, consultar_modulos}.c (G3, V5-K1)
+// Versao: 0.1.0
+// Changelog: 0.1.0 - V5-K1: funcoes puras e de texto conferidas contra o C (cmd_consultar.c: LerPedido/LerPosicionais/ResolverEntrada; consultar_json.c: ConsultaChaveTrecho/AnexarTrecho; consultar_modulos.c: ConsultaOrigemDoModulo).
+
+import "common"
+
+test "consultar_k1: ler_pedido com pergunta, argumento e alvo" {
+    var argv: [3]str = {"callers", "soma", "x"}
+    var p: PedidoConsulta = PedidoConsulta{}
+    var indice: i32 = -1
+    let erro: ?str = ler_pedido(3, argv[..], &p, &indice)
+    expect(erro == none)
+    expect(indice == 6)
+    expect((p.pergunta or_else "") == "callers")
+    expect((p.arg or_else "") == "soma")
+    expect((p.alvo or_else "") == "x")
+}
+
+test "consultar_k1: ler_pedido devolve o motivo do uso errado" {
+    var vazio: [1]str = {""}
+    var p: PedidoConsulta = PedidoConsulta{}
+    var indice: i32 = -1
+    expect((ler_pedido(0, vazio[..], &p, &indice) or_else "") == "falta a pergunta")
+    var desconhecida: [1]str = {"nao_existe"}
+    expect((ler_pedido(1, desconhecida[..], &p, &indice) or_else "") == "pergunta desconhecida")
+    var sem_arg: [1]str = {"callers"}
+    expect((ler_pedido(1, sem_arg[..], &p, &indice) or_else "") == "falta o argumento da pergunta")
+    var modulo_sem_valor: [2]str = {"simbolos", "--modulo"}
+    expect((ler_pedido(2, modulo_sem_valor[..], &p, &indice) or_else "") == "--modulo exige o caminho do modulo (ex.: --modulo std:mem)")
+    var modulo_fora: [3]str = {"imports", "--modulo", "std:mem"}
+    expect((ler_pedido(3, modulo_fora[..], &p, &indice) or_else "") == "--modulo so vale em simbolos")
+    var opcao: [2]str = {"simbolos", "--zz"}
+    expect((ler_pedido(2, opcao[..], &p, &indice) or_else "") == "opcao desconhecida (valem --json e, em simbolos, --modulo)")
+    var demais_posicionais: [4]str = {"refs", "a", "b", "c"}
+    expect((ler_pedido(4, demais_posicionais[..], &p, &indice) or_else "") == "argumentos demais")
+    var alvo_demais: [4]str = {"imports", "a", "b", "c"}
+    expect((ler_pedido(4, alvo_demais[..], &p, &indice) or_else "") == "argumentos demais")
+}
+
+test "consultar_k1: ler_pedido ignora --json e aceita --modulo em simbolos" {
+    var argv: [4]str = {"simbolos", "--json", "--modulo", "std:mem"}
+    var p: PedidoConsulta = PedidoConsulta{}
+    var indice: i32 = -1
+    expect(ler_pedido(4, argv[..], &p, &indice) == none)
+    expect(indice == 0)
+    expect((p.modulo or_else "") == "std:mem")
+    expect(p.alvo == none)
+}
+
+test "consultar_k1: achar_pergunta acha pela tabela e devolve -1 se nao existe" {
+    expect(achar_pergunta("simbolos") == 0)
+    expect(achar_pergunta("tipo") == 3)
+    expect(achar_pergunta("entrada") == 11)
+    expect(achar_pergunta("nope") == -1)
+}
+
+test "consultar_k1: escrever_texto corta no buffer e termina em NUL" {
+    var b: [4]u8 = {}
+    escrever_texto(b[..], "abcdef")
+    let t = texto_do_buffer(b[..])
+    defer delete(t)
+    expect(t == "abc")
+    expect(b[3] == 0)
+}
+
+test "consultar_k1: caminho_de_entrada mantem o caminho de arquivo que nao e pasta" {
+    let c = caminho_de_entrada("pasta_inexistente_k1\\a.fj")
+    defer delete(c)
+    expect(c == "pasta_inexistente_k1\\a.fj")
+}
+
+test "consultar_k1: eh_api_sem_host so vale para api std: ou vendor: sem alvo" {
+    var p: PedidoConsulta = PedidoConsulta{pergunta = "api", arg = "std:mem"}
+    expect(eh_api_sem_host(&p))
+    p.arg = "vendor:x"
+    expect(eh_api_sem_host(&p))
+    p.arg = "user:x"
+    expect(not eh_api_sem_host(&p))
+    p.arg = "std:mem"
+    p.alvo = "a.fj"
+    expect(not eh_api_sem_host(&p))
+    p.alvo = none
+    p.pergunta = "refs"
+    expect(not eh_api_sem_host(&p))
+}
+
+test "consultar_k1: consulta_origem_do_modulo traduz o campo origem" {
+    let c = new(Compilacao, alloc = heap)
+    defer delete(c)
+    c.modulos.itens[0].origem = 2
+    c.modulos.itens[1].origem = 4
+    var q: Consulta = Consulta{c = c}
+    expect(consulta_origem_do_modulo(&q, 0) == "std")
+    expect(consulta_origem_do_modulo(&q, 1) == "engine")
+}
+
+test "consultar_k1: consulta_chave_trecho e anexar_trecho cortam o fonte" {
+    let c = new(Compilacao, alloc = heap)
+    defer delete(c)
+    defer common.fonte_liberar(&c.fonte)
+    expect(common.fonte_adotar_texto(&c.fonte, none, "abcdef", 6))
+    var q: Consulta = Consulta{c = c, saida = make([dynamic]u8, alloc = heap)}
+    defer delete(q.saida)
+    q.primeiro = true
+    consulta_chave_trecho(&q, "t", 1, 4)
+    expect(from_bytes(q.saida[..], alloc = frame) == "\"t\": \"bcd\"")
+    var s: [dynamic]u8 = make([dynamic]u8, alloc = heap)
+    defer delete(s)
+    anexar_trecho(&q, &s, 0, 3)
+    expect(from_bytes(s[..], alloc = frame) == "abc")
+}

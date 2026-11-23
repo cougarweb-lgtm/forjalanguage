@@ -1,0 +1,239 @@
+// semantic/sem_interno.fj - porte de compiler/semantic/sem_interno.h
+// sha256 de semantic/sem_interno.h: e4fdebcd1c0d3ba191bd030c2e396ba36a335c89231a8dd058aba1c1186cdbd3
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "common"
+import "frontend"
+
+struct SemParecido {
+    busca: common.Parecidos
+    codigo: i32
+    pos: u32
+}
+
+struct NovoLocal {
+    nome: i32
+    pos: u32
+    tipo: u32 // TipoId
+    natureza: u8
+    origem: u8
+}
+
+struct NomeUsado {
+    nome: i32
+    pos: u32
+    modulo: u8
+}
+
+struct Conversao {
+    ini: u32
+    fim: u32
+    novo: ?str
+}
+
+struct LocalRastreado {
+    local_id: i32
+    nome: i32
+    pos: u32
+    tipo: u32 // TipoId
+    origem: u8
+    estado: u8
+    de_chamada: u8
+}
+
+struct TrocaDeNome {
+    pos: u32
+    antigo: ?str
+    tam_antigo: u64
+    novo: ?str
+}
+
+const CAIXA_PASCAL: i32 = 0
+const CAIXA_MAIUSCULA: i32 = 1
+const CAIXA_SNAKE: i32 = 2
+const SEM_MEMBRO_RECUSADO: i32 = -2
+const DONO_COPIA: i32 = 0
+const DONO_FOR: i32 = 1
+const DONO_PARAMETRO: i32 = 2
+const DONO_CAMPO_PADRAO: i32 = 3
+const FORMA_NENHUMA: i32 = 0
+const FORMA_ARRAY: i32 = 1
+const FORMA_PONTEIRO_ARRAY: i32 = 2
+const FORMA_FATIA: i32 = 3
+const FORMA_DINAMICO: i32 = 4
+const FORMA_PONTEIRO_DINAMICO: i32 = 5
+const POSSE_VIVO: i32 = 0
+const POSSE_ENTREGUE: i32 = 1
+const POSSE_LIBERADO: i32 = 2
+const POSSE_GUARDADO: i32 = 3
+const PONTO_COPIA: i32 = 0
+const PONTO_GUARDA: i32 = 1
+const PONTO_SAIDA: i32 = 2
+const PONTO_ARGUMENTO: i32 = 3
+const PONTO_EMPRESTIMO: i32 = 4
+const PONTO_EMPRESTIMO_FORJA: i32 = 5
+const ALOC_HANDLE: i32 = 9
+
+// C: semantic/sem_interno.h:106
+proc sem_simbolo_veneno(y: ?^Simbolo) -> bool {
+    return ((y as ^Simbolo).tipo == (TIPO_VENENO as u32)) or ((((y as ^Simbolo).envenenado as i32) != 0) and ((y as ^Simbolo).categoria != (SIM_PROC as u8)))
+}
+
+// C: semantic/sem_interno.h:108
+proc sem_uso_de_veneno(s: ^Semantica) -> u32 {
+    s.tocou_veneno = true
+    return TIPO_VENENO as u32
+}
+
+// C: semantic/sem_interno.h:127
+proc sem_origem_restritiva(origem: u8) -> bool {
+    return (((((origem == (frontend.ALOC_PARAM as u8)) or (origem == (frontend.ALOC_ARENA as u8))) or (origem == (frontend.ALOC_FRAME as u8))) or (origem == (frontend.ALOC_POOL as u8))) or (origem == (ORIGEM_LITERAL as u8))) or (origem == (ORIGEM_C as u8))
+}
+
+// C: semantic/sem_interno.h:133
+proc sem_origem_mais_restritiva(a: u8, b: u8) -> u8 {
+    if (a == (frontend.ALOC_PARAM as u8)) or (b == (frontend.ALOC_PARAM as u8)) {
+        return frontend.ALOC_PARAM as u8
+    }
+    if sem_origem_restritiva(a) {
+        return a
+    }
+    if sem_origem_restritiva(b) {
+        return b
+    }
+    var tern_1: i32 = frontend.ALOC_NENHUM
+    if (a == (frontend.ALOC_HEAP as u8)) and (b == (frontend.ALOC_HEAP as u8)) {
+        tern_1 = frontend.ALOC_HEAP
+    }
+    return tern_1 as u8
+}
+
+// C: semantic/sem_interno.h:143
+proc sem_origem_do_valor(e: ?^frontend.Expr) -> u8 {
+    if ((e as ^frontend.Expr).tipo_no == (frontend.EX_EMBRULHA as u8)) or ((e as ^frontend.Expr).tipo_no == (frontend.EX_TRY as u8)) {
+        return sem_origem_do_valor((e as ^frontend.Expr).a)
+    }
+    if (e as ^frontend.Expr).tipo_no == (frontend.EX_OR_ELSE as u8) {
+        let arg_1: u8 = sem_origem_do_valor((e as ^frontend.Expr).b)
+        let arg_2: u8 = sem_origem_do_valor((e as ^frontend.Expr).a)
+        return sem_origem_mais_restritiva(arg_2, arg_1)
+    }
+    if (e as ^frontend.Expr).tipo_no == (frontend.EX_CHAMADA as u8) {
+        return (e as ^frontend.Expr).alocacao
+    }
+    var tern_1: i32 = 0
+    if (e as ^frontend.Expr).tipo_no == (frontend.EX_TEXTO as u8) {
+        tern_1 = ORIGEM_LITERAL
+    }
+    return tern_1 as u8
+}
+
+// C: semantic/sem_interno.h:157
+proc sem_visivel(s: ^Semantica, y: ?^Simbolo, u: ^NomeUsado) -> bool {
+    if s.qtd_modulos <= 1 {
+        return true
+    }
+    if (u.modulo == 0) and (((y as ^Simbolo).decl == none) or ((((y as ^Simbolo).decl as ^frontend.Decl).modulo as i32) == (s.modulo_atual as i32))) {
+        return true
+    }
+    return sem_visivel_lento(s, y, u)
+}
+
+// C: semantic/sem_interno.h:165
+proc sem_entrar_na_decl(s: ^Semantica, d: ?^frontend.Decl) {
+    s.modulo_atual = (d as ^frontend.Decl).modulo
+    s.arquivo_atual = common.fonte_trecho_do_offset(s.fonte, (d as ^frontend.Decl).pos)
+}
+
+// C: semantic/sem_interno.h:180
+proc tipo_ref_so_erro(t: ^frontend.TipoRef) -> bool {
+    return (t.forma == (frontend.TR_NOME as u8)) and (t.nome < 0)
+}
+
+// C: semantic/sem_interno.h:185
+proc sem_marcar_ponteiro_do_corpo(s: ^Semantica, t: u32) {
+    if (not s.corpo_tem_ponteiro) and ((t >= (TIPO_FIXOS_QTD as u32)) or (t == (TIPO_RAWPTR as u32))) {
+        s.corpo_tem_ponteiro = sem_fuga_tipo_tem_ponteiro(s, t)
+    }
+}
+
+// C: semantic/sem_interno.h:192
+proc sem_embutido_muta_colecao(id: i32) -> bool {
+    return ((((((id == frontend.EMB_APPEND) or (id == frontend.EMB_INSERT)) or (id == frontend.EMB_INSERT_AT)) or (id == frontend.EMB_REMOVE)) or (id == frontend.EMB_DELETE)) or (id == frontend.EMB_CLEAR)) or (id == frontend.EMB_RESIZE)
+}
+
+// C: semantic/sem_interno.h:205
+proc sem_coagir(s: ^Semantica, e: ?^frontend.Expr, esperado: u32, pos: u32) -> bool {
+    return ((e as ^frontend.Expr).tipo == esperado) or (common.c2f_b2i32(sem_coagir_lento(s, e, esperado, pos)) != 0)
+}
+
+// C: semantic/sem_interno.h:212
+proc sem_tipo_eh_opaco(s: ^Semantica, t: u32) -> bool {
+    return (common.c2f_s2u_32(tipo_classe_de(&s.tipos, t)) == (TC_STRUCT as u32)) and (common.c2f_b2i32((sem_decl_da_struct(s, t) as ^frontend.Decl).externo) != 0)
+}
+
+// C: semantic/sem_interno.h:239
+proc sem_ctx_sem_opcional(s: ^Semantica, ctx: u32) -> u32 {
+    if (not s.tipos.tem_opcional) or (ctx == (TIPO_VAZIO as u32)) {
+        return ctx
+    }
+    let k: ^TipoInfo = tipo_de(&s.tipos, ctx)
+    var tern_1: u32 = ctx
+    if k.classe == (TC_OPCIONAL as u8) {
+        tern_1 = k.a
+    }
+    return tern_1
+}
+
+// C: semantic/sem_interno.h:283
+proc forma_tem_tamanho_fixo(f: i32) -> bool {
+    return (common.c2f_s2u_32(f) == (FORMA_ARRAY as u32)) or (common.c2f_s2u_32(f) == (FORMA_PONTEIRO_ARRAY as u32))
+}
+
+// C: semantic/sem_interno.h:306
+proc sem_conferir_movimento(s: ^Semantica, e: ?^frontend.Expr) -> bool {
+    if (common.c2f_b2i32(s.tem_nao_copiavel) != 0) and (not sem_conferir_nao_copiavel(s, e)) {
+        return false
+    }
+    return (not s.tipos.tem_dinamico) or (common.c2f_b2i32(sem_conferir_movimento_dono(s, e)) != 0)
+}
+
+// C: semantic/sem_interno.h:366
+proc sem_conferir_posse(s: ^Semantica, e: ?^frontend.Expr, ponto: i32) -> bool {
+    return ((len(s.rastreados) as u64) == 0) or (common.c2f_b2i32(sem_conferir_posse_lento(s, e, ponto)) != 0)
+}
+
+// C: semantic/sem_interno.h:370
+proc sem_conferir_reatribuicao(s: ^Semantica, st: ^frontend.Stmt) -> bool {
+    return ((len(s.rastreados) as u64) == 0) or (common.c2f_b2i32(sem_conferir_reatribuicao_lento(s, st)) != 0)
+}
+
+// C: semantic/sem_interno.h:374
+proc sem_posse_dos_argumentos(s: ^Semantica, chamada: ^frontend.Expr, proc_c: ?^frontend.Decl) -> bool {
+    return ((len(s.rastreados) as u64) == 0) or (common.c2f_b2i32(sem_posse_dos_argumentos_lento(s, chamada, proc_c)) != 0)
+}
+
+// C: semantic/sem_interno.h:378
+proc sem_conferir_saida(s: ^Semantica, marca: u32, st: ^frontend.Stmt) -> bool {
+    return ((len(s.rastreados) as u64) == 0) or (common.c2f_b2i32(sem_conferir_saida_lenta(s, marca, st)) != 0)
+}
+
+// C: semantic/sem_interno.h:457
+proc sem_eh_quat(s: ^Semantica, t: u32) -> bool {
+    return (s.tipo_quat != 0) and (t == s.tipo_quat)
+}
+
+// C: semantic/sem_interno.h:471
+proc sem_eh_allocator(s: ^Semantica, t: u32) -> bool {
+    return (s.tipo_allocator != 0) and (t == s.tipo_allocator)
+}
+
+// C: semantic/sem_interno.h:481
+proc sem_achar_simbolo(s: ^Semantica, nome: i32, qualificador: u8) -> ^Simbolo {
+    let y: ^Simbolo = &(s.globais or_else {})[nome]
+    if (s.qtd_modulos <= 1) or (((qualificador == 0) and (s.modulo_atual == 0)) and (y.categoria != (SIM_NENHUM as u8))) {
+        return y
+    }
+    return sem_achar_simbolo_lento(s, nome, qualificador)
+}

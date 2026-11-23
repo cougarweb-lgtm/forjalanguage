@@ -1,0 +1,96 @@
+// L3c2: vendor:banco com as formas ANTIGAS (import vendor:banco/banco, banco., procs, tipos Banco/Consulta, membros de ErroBanco e rotulos caminho/indice/valor): valem em silencio e a saida e a de db_novo.fj. Precisa de vendor\ ao lado.
+import "vendor:banco/banco"
+
+proc nome_do_erro(e: banco.ErroBanco) -> str {
+    switch e {
+    case banco.ErroBanco.nao_abriu:
+        return "not_opened"
+    case banco.ErroBanco.sql_invalido:
+        return "invalid_sql"
+    case banco.ErroBanco.execucao:
+        return "execution"
+    case banco.ErroBanco.parametro:
+        return "parameter"
+    case banco.ErroBanco.sem_memoria:
+        return "out_of_memory"
+    }
+    return "?"
+}
+
+proc preencher(bd: banco.Banco) -> ! banco.ErroBanco {
+    try banco.executar(bd, sql = "CREATE TABLE t(id INTEGER PRIMARY KEY, nome TEXT, peso REAL, extra TEXT)")
+    let q = try banco.preparar(bd, sql = "INSERT INTO t(nome, peso, extra) VALUES (?, ?, ?)")
+    defer banco.finalizar(q)
+    try banco.ligar_texto(q, indice = 1, valor = "aguia")
+    try banco.ligar_numero(q, indice = 2, valor = 2.5)
+    try banco.ligar_nulo(q, indice = 3)
+    _ = try banco.proxima(q)
+    banco.reiniciar(q)
+    try banco.ligar_texto(q, indice = 1, valor = "leao")
+    try banco.ligar_numero(q, indice = 2, valor = 190.0)
+    try banco.ligar_texto(q, indice = 3, valor = "x")
+    _ = try banco.proxima(q)
+}
+
+proc listar(bd: banco.Banco) -> ! banco.ErroBanco {
+    let q = try banco.preparar(bd, sql = "SELECT id, nome, peso FROM t ORDER BY id")
+    defer banco.finalizar(q)
+    print(f"colunas {banco.colunas(q)}")
+    while try banco.proxima(q) {
+        print(f"  #{banco.coluna_inteiro(q, indice = 0)} {banco.coluna_texto(q, indice = 1)} peso={banco.coluna_numero(q, indice = 2) as int}")
+    }
+}
+
+proc fora_da_faixa(bd: banco.Banco) -> ! banco.ErroBanco {
+    let q = try banco.preparar(bd, sql = "SELECT id FROM t WHERE id > ?")
+    defer banco.finalizar(q)
+    try banco.ligar_inteiro(q, indice = 9, valor = 1)
+}
+
+proc main() {
+    print(f"SQLite {banco.versao()}")
+    switch aberto in banco.abrir(caminho = ":memory:") {
+    case banco.Banco:
+        switch r in preencher(aberto) {
+        case banco.ErroBanco:
+            print(f"preencher: {nome_do_erro(r)}")
+        default:
+            print("preencher ok")
+        }
+        print(f"ultimo id {banco.ultimo_id(aberto)}, alteradas {banco.alteradas(aberto)}")
+        switch r in listar(aberto) {
+        case banco.ErroBanco:
+            print(f"listar: {nome_do_erro(r)}")
+        default:
+            print("listar ok")
+        }
+        switch r in fora_da_faixa(aberto) {
+        case banco.ErroBanco:
+            print(f"fora da faixa: {nome_do_erro(r)} {r == banco.ErroBanco.parametro}")
+        default:
+            print("inesperado")
+        }
+        switch r in banco.executar(aberto, sql = "SELEC 1") {
+        case banco.ErroBanco:
+            print(f"exec: {nome_do_erro(r)} {r == banco.ErroBanco.execucao}: {banco.mensagem(aberto)}")
+        default:
+            print("inesperado")
+        }
+        switch q in banco.preparar(aberto, sql = "SELEC 2") {
+        case banco.Consulta:
+            print("inesperado")
+        case banco.ErroBanco:
+            print(f"prepare: {nome_do_erro(q)} {q == banco.ErroBanco.sql_invalido}")
+        }
+        banco.fechar(aberto)
+    case banco.ErroBanco:
+        print("nao abriu")
+    }
+    switch falha in banco.abrir(caminho = "pasta_que_nao_existe/x/y.db") {
+    case banco.Banco:
+        print("inesperado")
+    case banco.ErroBanco:
+        print(f"open: {nome_do_erro(falha)} {falha == banco.ErroBanco.nao_abriu}")
+    }
+    print(nome_do_erro(banco.ErroBanco.sem_memoria))
+}

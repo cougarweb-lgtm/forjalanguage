@@ -1,0 +1,195 @@
+// nativo/bir/bir_construir_opcional.fj - porte de compiler/nativo/bir/bir_construir_opcional.c
+// sha256 de nativo/bir/bir_construir_opcional.c: ba6bae4fffe4d3b944d54710760b90939a96ad188ef769324cf05a5c7e53d7c6
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "common"
+import "ir"
+import "semantic"
+
+// C: nativo/bir/bir_construir_opcional.c:14
+proc bir_eh_ponteiro_opcional(tipos: ^semantic.Tipos, tipo: u32) -> bool {
+    return (common.c2f_s2u_32(semantic.tipo_classe_de(tipos, tipo)) == (semantic.TC_ANULAVEL as u32)) or (common.c2f_b2i32(semantic.tipo_opcional_nicho(tipos, tipo)) != 0)
+}
+
+// C: nativo/bir/bir_construir_opcional.c:20
+proc bir_nulo_agregado(c: ^BirCtx, tipo: u32, endereco: ^u32) -> bool {
+    var forma: BirSlot = BirSlot{}
+    if not bir_forma(c, tipo, &forma) {
+        return false
+    }
+    let arg_1: u32 = bir_novo_vreg(c, BC_I64 as u8)
+    let arg_2: u32 = bir_novo_slot(c, forma.tam, forma.alinhamento)
+    let arg_3: ^BirCtx = c
+    endereco^ = bir_emitir_end_slot(arg_3, arg_2, arg_1)
+    bir_zera_bloco(c, endereco^, forma.tam)
+    return true
+}
+
+// C: nativo/bir/bir_construir_opcional.c:31
+proc offset_do(c: ^BirCtx, tipo: u32, membro: u32) -> i32 {
+    return transmute(ir.layout_offset_campo(bir_layouts(c), tipo, membro), to = i32)
+}
+
+// C: nativo/bir/bir_construir_opcional.c:39
+proc embrulha_ponteiro(c: ^BirCtx, i: ^ir.IrInstr) -> bool {
+    var valor: BirOperando = BirOperando{}
+    var dst: u32 = 0
+    if (not bir_operando_de(c, i, &i.a, &valor)) or (not bir_definir_destino(c, BC_I64 as u8, &dst)) {
+        return false
+    }
+    bir_mover(c, dst, valor)
+    return true
+}
+
+// C: nativo/bir/bir_construir_opcional.c:51
+proc embrulha_opcional(c: ^BirCtx, i: ^ir.IrInstr) -> bool {
+    var alvo: BirAlvoMem = BirAlvoMem{offset = common.c2f_s2u_32(offset_do(c, i.tipo, OPC_MEMBRO_VALOR)), tipo = semantic.tipo_de((c.e as ^BirEntrada).tipos as ^semantic.Tipos, i.tipo).a}
+    if not bir_slot_do_destino(c, i, &alvo.base) {
+        return false
+    }
+    let arg_1: BirOperando = op_imed(1, BC_I8 as u8)
+    let arg_2: i32 = offset_do(c, i.tipo, OPC_MEMBRO_TEM)
+    let arg_3: u32 = alvo.base
+    let arg_4: ^BirCtx = c
+    bir_emitir_grava(arg_4, arg_3, arg_2, arg_1)
+    return bir_gravar_em(c, i, &alvo, &i.a)
+}
+
+// C: nativo/bir/bir_construir_opcional.c:62
+proc embrulha_uniao(c: ^BirCtx, i: ^ir.IrInstr) -> bool {
+    let u: ?^ir.IrUniao = ir.layout_uniao((c.e as ^BirEntrada).tipos as ^semantic.Tipos, (c.e as ^BirEntrada).ir as ^ir.IrPrograma, i.tipo)
+    let tag: u32 = i.b.inteiro as u32
+    var alvo: BirAlvoMem = BirAlvoMem{offset = common.c2f_s2u_32(offset_do(c, i.tipo, UNIAO_MEMBRO_VARIANTE))}
+    if (u == none) or (tag >= (u as ^ir.IrUniao).nvariantes) {
+        return bir_falha_inconsistente(c, "IR_EMBRULHA de union com tag fora das variantes")
+    }
+    alvo.tipo = ((u as ^ir.IrUniao).variantes or_else {})[tag]
+    if not bir_slot_do_destino(c, i, &alvo.base) {
+        return false
+    }
+    let arg_1: BirOperando = op_imed(tag as i64, BC_I32 as u8)
+    let arg_2: i32 = offset_do(c, i.tipo, UNIAO_MEMBRO_TAG)
+    let arg_3: u32 = alvo.base
+    let arg_4: ^BirCtx = c
+    bir_emitir_grava(arg_4, arg_3, arg_2, arg_1)
+    return bir_gravar_em(c, i, &alvo, &i.a)
+}
+
+// C: nativo/bir/bir_construir_opcional.c:77
+proc bir_regra_embrulha(c: ^BirCtx, i: ^ir.IrInstr) -> bool {
+    if common.c2f_s2u_32(semantic.tipo_classe_de((c.e as ^BirEntrada).tipos as ^semantic.Tipos, i.tipo)) == (semantic.TC_UNIAO as u32) {
+        return embrulha_uniao(c, i)
+    }
+    if bir_eh_ponteiro_opcional((c.e as ^BirEntrada).tipos as ^semantic.Tipos, i.tipo) {
+        return embrulha_ponteiro(c, i)
+    }
+    if common.c2f_s2u_32(semantic.tipo_classe_de((c.e as ^BirEntrada).tipos as ^semantic.Tipos, i.tipo)) != (semantic.TC_OPCIONAL as u32) {
+        return bir_falha_tipo(c, i, "-", i.tipo)
+    }
+    return embrulha_opcional(c, i)
+}
+
+// C: nativo/bir/bir_construir_opcional.c:91
+proc tem_ponteiro(c: ^BirCtx, i: ^ir.IrInstr) -> bool {
+    var ponteiro: BirOperando = BirOperando{}
+    var dst: u32 = 0
+    if ((not bir_operando_de(c, i, &i.a, &ponteiro)) or (not bir_operando_vreg(c, ponteiro, &ponteiro))) or (not bir_definir_destino(c, BC_I8 as u8, &dst)) {
+        return false
+    }
+    var tern_1: i32 = BCOND_NE
+    if i.op_aux != 0 {
+        tern_1 = BCOND_EQ
+    }
+    _ = bir_emitir_pedido(c, BirPedido{op = BIR_CMP as u8, aux = tern_1 as u8, dst = dst, a = ponteiro, b = op_imed(0, BC_I64 as u8)})
+    return true
+}
+
+// C: nativo/bir/bir_construir_opcional.c:103
+proc tem_opcional(c: ^BirCtx, i: ^ir.IrInstr) -> bool {
+    var base: u32 = 0
+    var dst: u32 = 0
+    var tem: u32 = 0
+    if (not bir_endereco_de(c, i, &i.a, &base)) or (not bir_definir_destino(c, BC_I8 as u8, &dst)) {
+        return false
+    }
+    var tern_1: u32 = dst
+    if i.op_aux != 0 {
+        tern_1 = bir_novo_vreg(c, BC_I8 as u8)
+    }
+    tem = tern_1
+    bir_emitir_carrega(c, tem, base, offset_do(c, i.a.tipo, OPC_MEMBRO_TEM))
+    if tem != dst {
+        _ = bir_emitir_pedido(c, BirPedido{op = BIR_XOR as u8, dst = dst, a = op_vreg(tem, BC_I8 as u8), b = op_imed(1, BC_I8 as u8)})
+    }
+    return true
+}
+
+// C: nativo/bir/bir_construir_opcional.c:116
+proc bir_regra_opc_tem(c: ^BirCtx, i: ^ir.IrInstr) -> bool {
+    if bir_eh_ponteiro_opcional((c.e as ^BirEntrada).tipos as ^semantic.Tipos, i.a.tipo) {
+        return tem_ponteiro(c, i)
+    }
+    if common.c2f_s2u_32(semantic.tipo_classe_de((c.e as ^BirEntrada).tipos as ^semantic.Tipos, i.a.tipo)) != (semantic.TC_OPCIONAL as u32) {
+        return bir_falha_tipo(c, i, "-", i.a.tipo)
+    }
+    return tem_opcional(c, i)
+}
+
+// C: nativo/bir/bir_construir_opcional.c:127
+proc bir_regra_opc_valor(c: ^BirCtx, i: ^ir.IrInstr) -> bool {
+    var valor: BirCampoInfo = BirCampoInfo{}
+    var ponteiro: BirOperando = BirOperando{}
+    var base: u32 = 0
+    var dst: u32 = 0
+    if bir_eh_ponteiro_opcional((c.e as ^BirEntrada).tipos as ^semantic.Tipos, i.a.tipo) {
+        if (not bir_operando_de(c, i, &i.a, &ponteiro)) or (not bir_definir_destino(c, BC_I64 as u8, &dst)) {
+            return false
+        }
+        bir_mover(c, dst, ponteiro)
+        return true
+    }
+    if common.c2f_s2u_32(semantic.tipo_classe_de((c.e as ^BirEntrada).tipos as ^semantic.Tipos, i.a.tipo)) != (semantic.TC_OPCIONAL as u32) {
+        return bir_falha_tipo(c, i, "-", i.a.tipo)
+    }
+    if not bir_endereco_de(c, i, &i.a, &base) {
+        return false
+    }
+    valor = BirCampoInfo{offset = common.c2f_s2u_32(offset_do(c, i.a.tipo, OPC_MEMBRO_VALOR)), tipo = semantic.tipo_de((c.e as ^BirEntrada).tipos as ^semantic.Tipos, i.a.tipo).a}
+    return bir_temp_do_campo(c, i, base, &valor)
+}
+
+// C: nativo/bir/bir_construir_opcional.c:149
+proc bir_regra_tupla(c: ^BirCtx, i: ^ir.IrInstr) -> bool {
+    var base: u32 = 0
+    if (common.c2f_s2u_32(semantic.tipo_classe_de((c.e as ^BirEntrada).tipos as ^semantic.Tipos, i.tipo)) != (semantic.TC_TUPLA as u32)) or (i.nargs != semantic.tipo_tupla_qtd((c.e as ^BirEntrada).tipos as ^semantic.Tipos, i.tipo)) {
+        return bir_falha_inconsistente(c, "IR_TUPLA com valores diferentes dos elementos do tipo")
+    }
+    if not bir_slot_do_destino(c, i, &base) {
+        return false
+    }
+    var k: u32 = 0
+    while k < i.nargs {
+        var alvo: BirAlvoMem = BirAlvoMem{base = base, offset = common.c2f_s2u_32(offset_do(c, i.tipo, k)), tipo = semantic.tipo_tupla_elemento((c.e as ^BirEntrada).tipos as ^semantic.Tipos, i.tipo, k)}
+        if not bir_gravar_em(c, i, &alvo, &(i.args or_else {})[k]) {
+            return false
+        }
+        k += 1
+    }
+    return true
+}
+
+// C: nativo/bir/bir_construir_opcional.c:166
+proc bir_regra_tupla_elemento(c: ^BirCtx, i: ^ir.IrInstr) -> bool {
+    let k: u32 = i.b.inteiro as u32
+    var elemento: BirCampoInfo = BirCampoInfo{}
+    var base: u32 = 0
+    if (common.c2f_s2u_32(semantic.tipo_classe_de((c.e as ^BirEntrada).tipos as ^semantic.Tipos, i.a.tipo)) != (semantic.TC_TUPLA as u32)) or (k >= semantic.tipo_tupla_qtd((c.e as ^BirEntrada).tipos as ^semantic.Tipos, i.a.tipo)) {
+        return bir_falha_inconsistente(c, "IR_TUPLA_ELEMENTO com indice fora da tupla")
+    }
+    if not bir_endereco_de(c, i, &i.a, &base) {
+        return false
+    }
+    elemento = BirCampoInfo{offset = common.c2f_s2u_32(offset_do(c, i.a.tipo, k)), tipo = semantic.tipo_tupla_elemento((c.e as ^BirEntrada).tipos as ^semantic.Tipos, i.a.tipo, k)}
+    return bir_temp_do_campo(c, i, base, &elemento)
+}

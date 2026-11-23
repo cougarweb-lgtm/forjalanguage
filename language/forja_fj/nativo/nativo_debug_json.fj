@@ -1,0 +1,387 @@
+// nativo/nativo_debug_json.fj - porte de compiler/nativo/nativo_debug_json.c
+// sha256 de nativo/nativo_debug_json.c: ec9a8a84e84be9dba1f380bd13da9c606ea349b2838444c5acb1a47139adcef3
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "common"
+import "nativo/bir"
+import "nativo/dbg"
+import "nativo/x64"
+
+// C: nativo/nativo_debug_json.c:26
+proc chave(b: ^[dynamic]u8, nome: str) {
+    format(f", \"{nome}\": ", into = b)
+}
+
+// C: nativo/nativo_debug_json.c:31
+proc campo_texto(b: ^[dynamic]u8, nome: str, valor: ?str) {
+    chave(b, nome)
+    json_texto(b, valor, len((valor or_else "")) as u64)
+}
+
+// C: nativo/nativo_debug_json.c:37
+proc campo_numero(b: ^[dynamic]u8, nome: str, valor: u64) {
+    format(f", \"{nome}\": {valor}", into = b)
+}
+
+// C: nativo/nativo_debug_json.c:42
+// C2F-13: bytes fundido em tam (len)
+proc campo_hex(b: ^[dynamic]u8, nome: str, bytes: []u8) {
+    chave(b, nome)
+    append(b, item = "\""[0..<1])
+    for k in (0 as u32)..<(len(bytes) as u32) {
+        format(f"{bytes[k] as u32:02x}", into = b)
+    }
+    append(b, item = "\""[0..<1])
+}
+
+// C: nativo/nativo_debug_json.c:52
+proc abrir(b: ^[dynamic]u8, tipo: str) {
+    format(f"{{\"tipo\": \"{tipo}\"", into = b)
+}
+
+// C: nativo/nativo_debug_json.c:57
+proc fechar(b: ^[dynamic]u8) {
+    append(b, item = "}\n")
+}
+
+// C: nativo/nativo_debug_json.c:62
+proc campo_posicao(b: ^[dynamic]u8, arquivo: ?str, linha: u32, coluna: u32) {
+    if arquivo == none {
+        return
+    }
+    chave(b, "arquivo")
+    json_caminho(b, arquivo)
+    campo_numero(b, "linha", linha as u64)
+    if coluna != 0 {
+        campo_numero(b, "coluna", coluna as u64)
+    }
+}
+
+// C: nativo/nativo_debug_json.c:74
+proc campo_slots_agregado(b: ^[dynamic]u8, q: ^x64.ListaFuncao) {
+    chave(b, "slots_agregado")
+    append(b, item = "["[0..<1])
+    var k: u32 = 0
+    while k < q.nslots_agregado {
+        let s: ^x64.ListaSlot = &q.slots_agregado[k]
+        var tern_1: str = ", "
+        if k == 0 {
+            tern_1 = ""
+        }
+        format(f"{tern_1}{{\"slot\": {k}, \"tamanho\": {s.tam}, \"alinhamento\": {s.alinhamento}, \"offset\": {s.offset}}}", into = b)
+        k += 1
+    }
+    append(b, item = "]"[0..<1])
+}
+
+// C: nativo/nativo_debug_json.c:87
+proc json_funcao(b: ^[dynamic]u8, f: ^RegFuncao) {
+    let q: ^x64.ListaFuncao = f.quadro as ^x64.ListaFuncao
+    abrir(b, "funcao")
+    campo_texto(b, "nome", f.nome)
+    campo_numero(b, "rva", f.rva as u64)
+    campo_numero(b, "tamanho", f.tamanho as u64)
+    campo_numero(b, "quadro", q.quadro as u64)
+    var sondagem: str = "false"
+    if q.sondagem != 0 {
+        sondagem = "true"
+    }
+    format(f", \"sondagem\": {sondagem}", into = b)
+    campo_numero(b, "slots", q.slots as u64)
+    campo_numero(b, "maxargs", q.maxargs as u64)
+    campo_numero(b, "push", q.push as u64)
+    campo_numero(b, "fpreg", q.fpreg as u64)
+    campo_numero(b, "alocacao", q.alocacao as u64)
+    campo_slots_agregado(b, q)
+    var unwind: [32]u8 = q.unwind or_else {}
+    campo_hex(b, "unwind", unwind[0..<(q.tam_unwind as u64)])
+    campo_posicao(b, f.arquivo, f.linha, 0)
+    fechar(b)
+}
+
+// C: nativo/nativo_debug_json.c:109
+proc campo_bir(b: ^[dynamic]u8, i: ^RegInstr) {
+    chave(b, "bir")
+    if i.bloco == x64.LISTA_SEM_INDICE {
+        append(b, item = "\"\"")
+    } else {
+        format(f"\"b{i.bloco}.{i.indice}\"", into = b)
+    }
+}
+
+// C: nativo/nativo_debug_json.c:118
+proc json_instr(b: ^[dynamic]u8, i: ^RegInstr) {
+    abrir(b, "instr")
+    campo_texto(b, "funcao", i.funcao)
+    campo_numero(b, "rva", i.rva as u64)
+    var sem_bytes: [1]u8 = {}
+    if i.tam == 0 or i.bytes == none {
+        campo_hex(b, "bytes", sem_bytes[0..<0])
+    } else {
+        campo_hex(b, "bytes", slice_from(i.bytes as ^u8, len = i.tam as int))
+    }
+    campo_texto(b, "asm", i.texto_asm)
+    campo_bir(b, i)
+    campo_posicao(b, i.arquivo, i.linha, i.coluna)
+    campo_texto(b, "origem", debug_nome_origem(i.origem))
+    if i.simbolo != none {
+        campo_texto(b, "simbolo", i.simbolo)
+    }
+    fechar(b)
+}
+
+// C: nativo/nativo_debug_json.c:133
+proc json_bir(b: ^[dynamic]u8, r: ^RegBir, tipo: str) {
+    abrir(b, tipo)
+    campo_texto(b, "funcao", r.funcao)
+    chave(b, "texto")
+    json_texto(b, r.texto, r.tam)
+    fechar(b)
+}
+
+// C: nativo/nativo_debug_json.c:142
+proc json_reloc(b: ^[dynamic]u8, r: ^RegReloc) {
+    abrir(b, "reloc")
+    campo_texto(b, "secao", r.secao)
+    campo_numero(b, "offset", r.offset as u64)
+    campo_numero(b, "rva", r.rva as u64)
+    campo_texto(b, "kind", r.kind)
+    campo_texto(b, "simbolo", r.simbolo)
+    format(f", \"adendo\": {r.adendo}", into = b)
+    fechar(b)
+}
+
+// C: nativo/nativo_debug_json.c:154
+proc json_secao(b: ^[dynamic]u8, s: ^RegSecao) {
+    abrir(b, "secao")
+    campo_texto(b, "nome", s.nome)
+    campo_numero(b, "rva", s.rva as u64)
+    campo_numero(b, "tamanho_virtual", s.tam_virtual as u64)
+    campo_numero(b, "tamanho_bruto", s.tam_bruto as u64)
+    campo_numero(b, "caracteristicas", s.caracteristicas as u64)
+    fechar(b)
+}
+
+// C: nativo/nativo_debug_json.c:165
+proc json_formato(b: ^[dynamic]u8, f: ^RegFormato) {
+    abrir(b, "formato")
+    var tern_1: str = "PE32+"
+    if common.c2f_b2i32(f.elf) != 0 {
+        tern_1 = "ELF64"
+    }
+    campo_texto(b, "formato", tern_1)
+    var tern_2: str = "0x8664"
+    if common.c2f_b2i32(f.elf) != 0 {
+        tern_2 = "0x3e"
+    }
+    campo_texto(b, "machine", tern_2)
+    campo_numero(b, "imagem_base", f.imagem_base)
+    campo_numero(b, "entrada_rva", f.entrada_rva as u64)
+    campo_numero(b, "tamanho_arquivo", f.tam_arquivo)
+    if not f.elf {
+        campo_numero(b, "linker_maior", f.linker_maior as u64)
+        campo_numero(b, "linker_menor", f.linker_menor as u64)
+    }
+    fechar(b)
+}
+
+// C: nativo/nativo_debug_json.c:180
+proc json_segmento(b: ^[dynamic]u8, s: ^RegSegmento) {
+    abrir(b, "segmento")
+    campo_texto(b, "tipo_ph", s.tipo)
+    campo_texto(b, "flags", s.flags)
+    campo_numero(b, "offset", s.offset)
+    campo_numero(b, "vaddr", s.vaddr)
+    campo_numero(b, "filesz", s.filesz)
+    campo_numero(b, "memsz", s.memsz)
+    campo_numero(b, "alinhamento", s.alinhamento)
+    fechar(b)
+}
+
+// C: nativo/nativo_debug_json.c:193
+proc json_tempos(b: ^[dynamic]u8, t: ^NativoTempos) {
+    abrir(b, "tempos")
+    nativo_tempos_anexar_json(b, t)
+    fechar(b)
+}
+
+// C: nativo/nativo_debug_json.c:200
+proc json_cabecalho(b: ^[dynamic]u8, c: ^RegCabecalho) {
+    abrir(b, "cabecalho")
+    campo_texto(b, "debug_versao", DEBUG_VERSAO)
+    campo_texto(b, "forja_versao", c.forja)
+    campo_texto(b, "alvo", c.alvo)
+    campo_texto(b, "modo", c.modo)
+    fechar(b)
+}
+
+// C: nativo/nativo_debug_json.c:210
+proc json_import(b: ^[dynamic]u8, i: ^RegImport) {
+    abrir(b, "import")
+    campo_texto(b, "dll", i.dll)
+    campo_texto(b, "nome", i.nome)
+    campo_numero(b, "iat_rva", i.iat_rva as u64)
+    campo_numero(b, "descritor", i.descritor as u64)
+    fechar(b)
+}
+
+// C: nativo/nativo_debug_json.c:220
+proc json_export(b: ^[dynamic]u8, x: ^RegExport) {
+    abrir(b, "export")
+    campo_texto(b, "nome", x.nome)
+    campo_numero(b, "rva", x.rva as u64)
+    campo_numero(b, "ordinal", x.ordinal as u64)
+    fechar(b)
+}
+
+// C: nativo/nativo_debug_json.c:229
+proc json_poda(b: ^[dynamic]u8, r: ^RegPoda) {
+    abrir(b, "poda")
+    campo_numero(b, "procs_total", r.procs_total as u64)
+    campo_numero(b, "procs_gerados", r.procs_gerados as u64)
+    campo_numero(b, "procs_podados", (r.procs_total - r.procs_gerados) as u64)
+    fechar(b)
+}
+
+// C: nativo/nativo_debug_json.c:239
+proc campo_pos_do_fonte(b: ^[dynamic]u8, fonte: ?^common.Fonte, pos: u32) {
+    var p: common.FontePosicao = common.FontePosicao{}
+    if (pos == bir.BIR_SEM_POS) or (fonte == none) {
+        return
+    }
+    p = common.fonte_localizar_no_arquivo(fonte, pos)
+    campo_posicao(b, p.caminho, p.linha, p.coluna)
+}
+
+// C: nativo/nativo_debug_json.c:250
+proc campo_linhas_do_proc(b: ^[dynamic]u8, r: ^RegLinhas) {
+    chave(b, "linhas")
+    append(b, item = "["[0..<1])
+    var k: u32 = 0
+    while k < (r.proc_c as ^dbg.DbgProc).nlinhas {
+        let l: ^dbg.DbgLinha = &(r.dbg as ^dbg.DbgPrograma).linhas[((r.proc_c as ^dbg.DbgProc).linha_ini + k) as u64]
+        var tern_1: str = ", "
+        if k == 0 {
+            tern_1 = ""
+        }
+        format(f"{tern_1}{{\"off\": {l.off}", into = b)
+        campo_pos_do_fonte(b, r.fonte, l.pos)
+        append(b, item = "}"[0..<1])
+        k += 1
+    }
+    append(b, item = "]"[0..<1])
+}
+
+// C: nativo/nativo_debug_json.c:265
+proc campo_variaveis(b: ^[dynamic]u8, r: ^RegLinhas, chave: str, parametros: bool) {
+    let proc_c: ^dbg.DbgProc = r.proc_c as ^dbg.DbgProc
+    let programa: ^dbg.DbgPrograma = r.dbg as ^dbg.DbgPrograma
+    format(f", \"{chave}\": ", into = b)
+    append(b, item = "[")
+    var n: u32 = 0
+    var k: u32 = 0
+    while k < proc_c.nvars {
+        let v: ^dbg.DbgVar = &programa.vars[(proc_c.var_ini + k) as u64]
+        if v.parametro == parametros {
+            var sep: str = ", "
+            if n == 0 {
+                sep = ""
+            }
+            format(f"{sep}{{\"id\": {v.local_id}", into = b)
+            n += 1
+            campo_texto(b, "nome", v.nome)
+            campo_texto(b, "tipo", v.tipo_nome)
+            campo_numero(b, "tid", v.tipo as u64)
+            var indireto: str = "false"
+            if v.loc.indireto {
+                indireto = "true"
+            }
+            format(f", \"rbp\": {v.loc.rbp_off}, \"indireto\": {indireto}}}", into = b)
+        }
+        k += 1
+    }
+    append(b, item = "]")
+}
+
+// C: nativo/nativo_debug_json.c:285
+proc json_linhas(b: ^[dynamic]u8, r: ^RegLinhas) {
+    abrir(b, "linhas")
+    campo_texto(b, "funcao", (r.proc_c as ^dbg.DbgProc).nome)
+    campo_texto(b, "simbolo", (r.proc_c as ^dbg.DbgProc).simbolo)
+    campo_pos_do_fonte(b, r.fonte, (r.proc_c as ^dbg.DbgProc).pos)
+    campo_numero(b, "inicio", (r.proc_c as ^dbg.DbgProc).inicio as u64)
+    campo_numero(b, "fim", (r.proc_c as ^dbg.DbgProc).fim as u64)
+    campo_numero(b, "quadro", (r.proc_c as ^dbg.DbgProc).rbp_quadro as u64)
+    campo_linhas_do_proc(b, r)
+    campo_variaveis(b, r, "parametros", true)
+    campo_variaveis(b, r, "locais", false)
+    fechar(b)
+}
+
+// C: nativo/nativo_debug_json.c:300
+proc json_faixa(b: ^[dynamic]u8, f: ^RegFaixa) {
+    abrir(b, "faixa")
+    campo_numero(b, "rva", f.rva as u64)
+    campo_numero(b, "tamanho", f.tamanho as u64)
+    campo_texto(b, "origem", f.origem)
+    fechar(b)
+}
+
+// C: nativo/nativo_debug_json.c:309
+// C2F-VOID: estado
+proc escrever_json(estado: rawptr, reg: ^DebugReg) {
+    let b: ^[dynamic]u8 = estado as ^[dynamic]u8
+    let tipo: i32 = reg.tipo as i32
+    // LIMITE: cognitiva 17 despacho plano, um if por tipo de registro (tabela de despacho, sem logica)
+    if tipo == REG_CABECALHO {
+        json_cabecalho(b, &reg.cabecalho)
+    } else if tipo == REG_FUNCAO {
+        json_funcao(b, &reg.funcao)
+    } else if tipo == REG_INSTR {
+        json_instr(b, &reg.instr)
+    } else if tipo == REG_BIR {
+        json_bir(b, &reg.bir, "bir")
+    } else if tipo == REG_LOCAIS {
+        json_bir(b, &reg.bir, "locais")
+    } else if tipo == REG_LINHAS {
+        json_linhas(b, &reg.linhas)
+    } else if tipo == REG_RELOC {
+        json_reloc(b, &reg.reloc)
+    } else if tipo == REG_SECAO {
+        json_secao(b, &reg.secao)
+    } else if tipo == REG_IMPORT {
+        json_import(b, &reg.import_c)
+    } else if tipo == REG_FORMATO {
+        json_formato(b, &reg.formato)
+    } else if tipo == REG_FAIXA {
+        json_faixa(b, &reg.faixa)
+    } else if tipo == REG_EXPORT {
+        json_export(b, &reg.exporta)
+    } else if tipo == REG_PODA {
+        json_poda(b, &reg.poda)
+    } else if tipo == REG_SEGMENTO {
+        json_segmento(b, &reg.segmento)
+    } else if tipo == REG_OTIM or tipo == REG_INTERFACE or tipo == REG_PERFIL or tipo == REG_PASSES {
+        // o item so existe no texto
+        return
+    } else {
+        json_tempos(b, reg.tempos.tempos as ^NativoTempos)
+    }
+}
+
+// C: nativo/nativo_debug_json.c:336
+proc debug_montar_json(e: ^DebugEntrada, saida: ^[dynamic]u8) {
+    debug_percorrer(e, DEBUG_ESCRITOR_ESCREVER_JSON, saida as rawptr)
+}
+
+// testes: texto do registro conferido a mao contra nativo_debug_json.c (campo_variaveis, formato de bytes vazios)
+test "campo_hex de zero bytes sai como texto vazio" {
+    var b: [dynamic]u8 = make([dynamic]u8, alloc = heap)
+    defer delete(b)
+    var vazio: [1]u8 = {}
+    campo_hex(&b, "bytes", vazio[0..<0])
+    let s: str = from_bytes(b[..], alloc = heap)
+    defer delete(s)
+    expect(s == ", \"bytes\": \"\"")
+}

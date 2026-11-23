@@ -1,0 +1,187 @@
+// ir/ir_numerar.fj - porte de compiler/ir/ir_numerar.c, compiler/ir/ir_numerar.h
+// sha256 de ir/ir_numerar.c: 953fe8fb682287f058e48a2de36ef067d9401aac78dd7a5506387d8c29c6c87a
+// sha256 de ir/ir_numerar.h: 992292f459ce39f7f9b8e5a310c8908b2997bbba37adb817b3850f42b402b3ad
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+// R-I1: o C ordenava os pares pelo endereco da instrucao (qsort + busca binaria). Na Forja o par fica na ordem de pre-ordem
+// (que e a ordem do indice), sem ordenar; IrIndiceDe varre linearmente. O resultado e o mesmo (cada instrucao aparece uma vez).
+
+import "common"
+import "semantic"
+
+pub struct IrNumeroPar {
+    instr: ?^IrInstr
+    indice: u32
+}
+
+pub struct IrNumeracao {
+    pares: ?[]IrNumeroPar
+    n: u32
+}
+
+pub struct IrTracoForma {
+    bits: u8
+    real: bool
+}
+
+struct Colhedor {
+    pares: ?[]IrNumeroPar
+    n: u32
+}
+
+pub const IR_SEM_INDICE: u32 = 4294967295
+
+// C2F-1A: ArenaAlocar tipado da fatia de pares (zerada), como os arena_fatia_<tipo> do pacote.
+proc arena_fatia_numero_par(a: ^common.Arena, n: int) -> []IrNumeroPar {
+    var l = make([dynamic]IrNumeroPar, alloc = common.arena_mem(a), cap = n)
+    for i in 0..<n {
+        append(&l, item = IrNumeroPar{})
+    }
+    return l[..]
+}
+
+// C: ir/ir_numerar.c:16 (passo de contagem quando c.pares e none; de preenchimento quando nao e)
+proc colher_instr(c: ^Colhedor, i: ?^IrInstr) {
+    let instr: ^IrInstr = i as ^IrInstr
+    if c.pares != none {
+        let slots: []IrNumeroPar = c.pares or_else {}
+        slots[c.n as int] = IrNumeroPar{instr = i, indice = c.n}
+    }
+    c.n += 1
+    colher_bloco(c, &instr.cond)
+    colher_bloco(c, &instr.corpo)
+    colher_bloco(c, &instr.senao)
+    for k in 0..<instr.ncasos {
+        colher_bloco(c, &(instr.casos or_else {})[k as int].corpo)
+    }
+}
+
+// C: ir/ir_numerar.c:28
+proc colher_bloco(c: ^Colhedor, b: ^IrBloco) {
+    var i: ?^IrInstr = b.primeira
+    while i != none {
+        colher_instr(c, i)
+        i = (i as ^IrInstr).prox
+    }
+}
+
+// C: ir/ir_numerar.c:41
+pub proc ir_numerar_funcao(f: ^IrFuncao, arena: ^common.Arena, saida: ^IrNumeracao) {
+    var conta = Colhedor{}
+    colher_bloco(&conta, &f.corpo)
+    saida.pares = arena_fatia_numero_par(arena, (conta.n + 1) as int)
+    saida.n = conta.n
+    var preenche = Colhedor{pares = saida.pares}
+    colher_bloco(&preenche, &f.corpo)
+}
+
+// C: ir/ir_numerar.c:52 (busca linear: ver R-I1 no cabecalho)
+pub proc ir_indice_de(num: ^IrNumeracao, instr: ?^IrInstr) -> u32 {
+    let pares: []IrNumeroPar = num.pares or_else {}
+    for k in 0..<num.n {
+        if pares[k as int].instr == instr {
+            return pares[k as int].indice
+        }
+    }
+    return IR_SEM_INDICE
+}
+
+// C: ir/ir_numerar.c:69
+pub proc ir_traco_forma_de(tipos: ^semantic.Tipos, tipo: u32) -> IrTracoForma {
+    if tipo == (semantic.TIPO_BOOL as u32) or tipo == (semantic.TIPO_I8 as u32) or tipo == (semantic.TIPO_U8 as u32) {
+        return IrTracoForma{bits = 8, real = false}
+    } else if tipo == (semantic.TIPO_I16 as u32) or tipo == (semantic.TIPO_U16 as u32) {
+        return IrTracoForma{bits = 16, real = false}
+    } else if tipo == (semantic.TIPO_I32 as u32) or tipo == (semantic.TIPO_U32 as u32) {
+        return IrTracoForma{bits = 32, real = false}
+    } else if tipo == (semantic.TIPO_INT as u32) or tipo == (semantic.TIPO_UINT as u32) {
+        return IrTracoForma{bits = 64, real = false}
+    } else if tipo == (semantic.TIPO_F64 as u32) {
+        return IrTracoForma{bits = 64, real = true}
+    }
+    if common.c2f_s2u_32(semantic.tipo_classe_de(tipos, tipo)) == (semantic.TC_REAL as u32) {
+        return IrTracoForma{bits = 32, real = true}
+    }
+    return IrTracoForma{bits = 0, real = false}
+}
+
+// C2F-71: tabela SEM_DESTINO (const _Bool[64]) virou cadeia de comparacoes: ops que nao gravam local nem temporario.
+proc op_sem_destino(op: i32) -> bool {
+    return op == IR_VERIFICA_FAIXA or op == IR_IMPRIME or op == IR_SE or op == IR_ENQUANTO or op == IR_PARA or op == IR_CHAVEIA or op == IR_RETORNA or op == IR_PARE or op == IR_CONTINUA or op == IR_EXPECT or op == IR_ASSERT or op == IR_PANIC or op == IR_GRAVA_PONTEIRO or op == IR_ANEXA or op == IR_LIBERA or op == IR_FRAME_RESET or op == IR_SOA_GRAVA or op == IR_SOA_ANEXA or op == IR_MAPA_INSERE or op == IR_MAPA_REMOVE
+}
+
+// C: ir/ir_numerar.c:92
+pub proc ir_traco_destino(i: ?^IrInstr, e_local: ^bool) -> bool {
+    let instr: ^IrInstr = i as ^IrInstr
+    let op: i32 = instr.op as i32
+    e_local^ = (op == IR_LOCAL) or (op == IR_ATRIBUICAO)
+    if op == IR_LOCAL {
+        return true
+    }
+    if op == IR_ATRIBUICAO {
+        return instr.nome < 0
+    }
+    return op <= IR_CHAMADA_IND and not op_sem_destino(op) and instr.destino >= 0
+}
+
+// Testes dirigidos (valores do C: ir_numerar.c com SEM_DESTINO de 20 ops, pre-ordem instr, cond, corpo, senao, casos).
+test "ir_numerar: tabela SEM_DESTINO tem 20 ops" {
+    var n: i32 = 0
+    var k: i32 = 0
+    while k < 64 {
+        if op_sem_destino(k) {
+            n += 1
+        }
+        k += 1
+    }
+    expect(n == 20)
+    expect(op_sem_destino(IR_PANIC) and op_sem_destino(IR_MAPA_REMOVE))
+    expect(not op_sem_destino(IR_LOCAL) and not op_sem_destino(IR_BINARIO))
+}
+
+test "ir_numerar: destino do traco" {
+    var e: bool = false
+    var loc = IrInstr{op = IR_LOCAL as u8}
+    expect(ir_traco_destino(&loc, &e) and e)
+    var at = IrInstr{op = IR_ATRIBUICAO as u8, nome = -1}
+    expect(ir_traco_destino(&at, &e) and e)
+    at.nome = 3
+    expect(not ir_traco_destino(&at, &e) and e)
+    var se = IrInstr{op = IR_SE as u8, destino = 0}
+    expect(not ir_traco_destino(&se, &e) and not e)
+    var soma = IrInstr{op = IR_BINARIO as u8, destino = 2}
+    expect(ir_traco_destino(&soma, &e) and not e)
+    soma.destino = -1
+    expect(not ir_traco_destino(&soma, &e))
+}
+
+test "ir_numerar: forma do traco nos tipos de builtin" {
+    var tp = semantic.Tipos{}
+    expect(ir_traco_forma_de(&tp, semantic.TIPO_BOOL as u32).bits == 8)
+    expect(ir_traco_forma_de(&tp, semantic.TIPO_I16 as u32).bits == 16)
+    expect(ir_traco_forma_de(&tp, semantic.TIPO_INT as u32).bits == 64)
+    expect(ir_traco_forma_de(&tp, semantic.TIPO_F64 as u32).real)
+    expect(ir_traco_forma_de(&tp, semantic.TIPO_F64 as u32).bits == 64)
+}
+
+test "ir_numerar: numeracao em pre-ordem e busca" {
+    var a = common.Arena{}
+    var f = IrFuncao{}
+    var s1 = IrInstr{op = IR_SE as u8}
+    var f1 = IrInstr{op = IR_RETORNA as u8}
+    var f2 = IrInstr{op = IR_LOCAL as u8}
+    f.corpo.primeira = &s1
+    f.corpo.ultima = &f2
+    s1.prox = &f2
+    s1.corpo.primeira = &f1
+    s1.corpo.ultima = &f1
+    var num = IrNumeracao{}
+    ir_numerar_funcao(&f, &a, &num)
+    expect(num.n == 3)
+    expect(ir_indice_de(&num, &s1) == 0)
+    expect(ir_indice_de(&num, &f1) == 1)
+    expect(ir_indice_de(&num, &f2) == 2)
+    var fora = IrInstr{}
+    expect(ir_indice_de(&num, &fora) == IR_SEM_INDICE)
+    common.arena_liberar(&a)
+}

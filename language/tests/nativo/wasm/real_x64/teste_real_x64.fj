@@ -1,0 +1,1233 @@
+// runtime/wasm/rt_wasm_real.fj - texto de f32/f64 do alvo wasm32-wasip1 (print, f"{x}", f"{x:.N}"), porte para Forja pura do runtime nativo
+// Versao: 0.1.0 (Ryu d2s/f2s: digitos mais curtos que voltam ao mesmo valor, posicionais; musl fmt_fp: {x:.N} exato para N 0..30)
+// Contrato: fmt_f64_curto, fmt_f32_curto, fmt_f64 e fmt_f32 (v: f64, fmt: u32) acrescentam o texto ao buffer de formatacao
+//   via wasm_rt.fmt_bytes (largura, alinhamento e zeros vem de fmt). f32 chega alargado a f64 (como no x64): fmt_f32_curto
+//   arredonda para f32 antes do Ryu. curto_texto_f64 e curto_texto_f32 (v: f64, saida: []u8) -> int devolvem o tamanho.
+// Fonte C (D4, mesma fonte = bits iguais): third/ryu/d2s.c, f2s.c; runtime/nativo/rt_real_curto.c, rt_fmt_fixo.c, rt_formata.c.
+// Escolha de tabela: d2s com a tabela pequena (RYU_OPTIMIZE_SIZE, mesma do x64); f2s com a tabela cheia (RYU_FLOAT_FULL_TABLE).
+//   O Ryu e exato: as duas tabelas dao os mesmos digitos (a prova e o teste contra o x64).
+// Verificacao: python language/tests/nativo/wasm/real_x64/gerar_e_rodar.py (copia do modulo no x64 + compara com print/format do x64).
+// Regra do modulo: sem alocacao; buffers locais [N]u8 e enderecos pelo forja_rt_endereco_de (o bloco PLATAFORMA e o unico trecho de wasm).
+
+// PLATAFORMA x64 (teste): o texto e conferido pelo buffer do proprio teste; emite_texto so existe para o modulo compilar
+proc emite_texto(p: ^u8, n: int, fmt: u32) {
+    let _tamanho = n
+}
+
+// ---- constantes ----
+// Maior texto: -5e-324 sai com 327 bytes; 1.7976931348623157e308 com 309 digitos; precisao 30 com sinal ~341 bytes
+const RT_REAL_SAIDA_MAX: int = 352
+const RT_REAL_PRECISAO_PADRAO: int = 6
+const RT_FMT_PRECISAO_DESLOC: u32 = 8
+const RT_FMT_PRECISAO_MASCARA: u32 = 31
+const RT_ASCII_MENOS: u8 = 45
+const RT_ASCII_PONTO: u8 = 46
+const RT_ASCII_ZERO: u8 = 48
+const RT_ASCII_I: u8 = 105
+const RT_ASCII_N: u8 = 110
+const RT_ASCII_F: u8 = 102
+const RT_ASCII_A: u8 = 97
+const RYU_TAM_TABELA: int = 26
+const RYU_BITS_POW5_D: int = 125
+const RYU_BITS_POW5_INV_D: int = 125
+const RYU_BITS_POW5_F: int = 61
+const RYU_BITS_POW5_INV_F: int = 59
+const RYU_D_BIAS: int = 1023
+const RYU_D_MANT: int = 52
+const RYU_D_EXP_MASCARA: u64 = 2047
+const RYU_D_MANT_MASCARA: u64 = 4503599627370495
+const RYU_F_BIAS: int = 127
+const RYU_F_MANT: int = 23
+const RYU_F_EXP_MASCARA: u64 = 255
+const RYU_F_MANT_MASCARA: u64 = 8388607
+const FIXO_SLOTS: int = 128
+const FIXO_BASE: u64 = 1000000000
+const FIXO_NOVE_MAX: u64 = 999999999
+const FIXO_MANT_LDBL_TERCO: int = 21
+const FIXO_MAX_EXP_LDBL: int = 16384
+const FIXO_DOIS_28: f64 = 268435456.0
+const FIXO_DOIS_53: f64 = 9007199254740992.0
+const FIXO_BASE_F64: f64 = 1000000000.0
+
+// ---- tabelas do Ryu (geradas de third/ryu por gerar_tabelas.py; mesma fonte do x64) ----
+const RYU_POW5_INV_SPLIT2: [30]u64 = {
+    1, 2305843009213693952, 5955668970331000884, 1784059615882449851, 8982663654677661702, 1380349269358112757,
+    7286864317269821294, 2135987035920910082, 7005857020398200553, 1652639921975621497, 17965325103354776697, 1278668206209430417,
+    8928596168509315048, 1978643211784836272, 10075671573058298858, 1530901034580419511, 597001226353042382, 1184477304306571148,
+    1527430471115325346, 1832889850782397517, 12533209867169019542, 1418129833677084982, 5577825024675947042, 2194449627517475473,
+    11006974540203867551, 1697873161311732311, 10313493231639821582, 1313665730009899186, 12701016819766672773, 2032799256770390445
+}
+
+const RYU_POW5_INV_OFFSETS: [22]u32 = {
+    1414808916, 67458373, 268701696, 4195348, 1073807360, 1091917141,
+    1108, 65604, 1073741824, 1140850753, 1346716752, 1431634004,
+    1365595476, 1073758208, 16777217, 66816, 1364284433, 89478484,
+    1346442496, 1074003968, 84148496, 0
+}
+
+const RYU_POW5_SPLIT2: [26]u64 = {
+    0, 1152921504606846976, 0, 1490116119384765625, 1032610780636961552, 1925929944387235853,
+    7910200175544436838, 1244603055572228341, 16941905809032713930, 1608611746708759036, 13024893955298202172, 2079081953128979843,
+    6607496772837067824, 1343575221513417750, 17332926989895652603, 1736530273035216783, 13037379183483547984, 2244412773384604712,
+    1605989338741628675, 1450417759929778918, 9630225068416591280, 1874621017369538693, 665883850346957067, 1211445438634777304,
+    14931890668723713708, 1565756531257009982
+}
+
+const RYU_POW5_OFFSETS: [21]u32 = {
+    0, 0, 0, 0, 1073741824, 1500076437,
+    1431590229, 1448432917, 1091896580, 1079333904, 1146442053, 1146111296,
+    1163220304, 1073758208, 2521039936, 1431721317, 1413824581, 1075134801,
+    1431671125, 1363170645, 261
+}
+
+const RYU_POW5_TABELA: [26]u64 = {
+    1, 5, 25, 125, 625, 3125,
+    15625, 78125, 390625, 1953125, 9765625, 48828125,
+    244140625, 1220703125, 6103515625, 30517578125, 152587890625, 762939453125,
+    3814697265625, 19073486328125, 95367431640625, 476837158203125, 2384185791015625, 11920928955078125,
+    59604644775390625, 298023223876953125
+}
+
+const RYU_FLT_POW5_INV: [55]u64 = {
+    576460752303423489, 461168601842738791, 368934881474191033, 295147905179352826, 472236648286964522, 377789318629571618,
+    302231454903657294, 483570327845851670, 386856262276681336, 309485009821345069, 495176015714152110, 396140812571321688,
+    316912650057057351, 507060240091291761, 405648192073033409, 324518553658426727, 519229685853482763, 415383748682786211,
+    332306998946228969, 531691198313966350, 425352958651173080, 340282366920938464, 544451787073501542, 435561429658801234,
+    348449143727040987, 557518629963265579, 446014903970612463, 356811923176489971, 570899077082383953, 456719261665907162,
+    365375409332725730, 292300327466180584, 467680523945888934, 374144419156711148, 299315535325368918, 478904856520590269,
+    383123885216472215, 306499108173177772, 490398573077084435, 392318858461667548, 313855086769334039, 502168138830934462,
+    401734511064747569, 321387608851798056, 514220174162876889, 411376139330301511, 329100911464241209, 526561458342785934,
+    421249166674228747, 336999333339382998, 539198933343012796, 431359146674410237, 345087317339528190, 552139707743245103,
+    441711766194596083
+}
+
+const RYU_FLT_POW5: [47]u64 = {
+    1152921504606846976, 1441151880758558720, 1801439850948198400, 2251799813685248000, 1407374883553280000, 1759218604441600000,
+    2199023255552000000, 1374389534720000000, 1717986918400000000, 2147483648000000000, 1342177280000000000, 1677721600000000000,
+    2097152000000000000, 1310720000000000000, 1638400000000000000, 2048000000000000000, 1280000000000000000, 1600000000000000000,
+    2000000000000000000, 1250000000000000000, 1562500000000000000, 1953125000000000000, 1220703125000000000, 1525878906250000000,
+    1907348632812500000, 1192092895507812500, 1490116119384765625, 1862645149230957031, 1164153218269348144, 1455191522836685180,
+    1818989403545856475, 2273736754432320594, 1421085471520200371, 1776356839400250464, 2220446049250313080, 1387778780781445675,
+    1734723475976807094, 2168404344971008868, 1355252715606880542, 1694065894508600678, 2117582368135750847, 1323488980084844279,
+    1654361225106055349, 2067951531382569187, 1292469707114105741, 1615587133892632177, 2019483917365790221
+}
+
+// ---- estruturas ----
+struct Dupla128 {
+    baixo: u64 = 0
+    alto: u64 = 0
+}
+
+struct Produto192 {
+    baixo: u64 = 0
+    meio: u64 = 0
+    alto: u64 = 0
+}
+
+struct RyuDecimal {
+    mantissa: u64 = 0
+    expoente: int = 0
+}
+
+struct RyuEntrada {
+    m2: u64 = 0
+    e2: int = 0
+    mm_shift: u64 = 0
+    aceita: bool = false
+}
+
+// vr/vp/vm: a escala; e10: expoente do 1o digito antes de remover; removidos/ultimo/saida: a remocao de digitos
+struct RyuEstado {
+    vr: u64 = 0
+    vp: u64 = 0
+    vm: u64 = 0
+    e10: int = 0
+    removidos: int = 0
+    ultimo: u64 = 0
+    vr_zeros: bool = false
+    vm_zeros: bool = false
+    saida: u64 = 0
+}
+
+// Digitos de um RyuDecimal sem zeros finais; total = digitos da mantissa com zeros; e10 = expoente do 1o digito
+struct RyuTexto {
+    mantissa: u64 = 0
+    total: int = 0
+    nd: int = 0
+    e10: int = 0
+}
+
+struct FixoNormal {
+    y: f64 = 0.0
+    e2: int = 0
+}
+
+struct FixoEstado {
+    a: int = 0
+    r: int = 0
+    z: int = 0
+    e2: int = 0
+    precisao: int = 0
+}
+
+// ---- util de bits do Ryu (common.h) ----
+// ceil(log2(5^e)) pela aproximacao do Ryu; e >= 0
+proc ryu_pow5_bits(e: int) -> int {
+    let escalado: u64 = (e as u64) * 1217359
+    return ((escalado >> 19) + 1) as int
+}
+
+// floor(log10(2^e)) e floor(log10(5^e)) pela aproximacao do Ryu
+proc ryu_log10_pow2(e: int) -> int {
+    return (((e as u64) * 78913) >> 18) as int
+}
+
+proc ryu_log10_pow5(e: int) -> int {
+    return (((e as u64) * 732923) >> 20) as int
+}
+
+// (hi:lo) >> dist, parte baixa de 64 bits; dist 0 da lo (deslocar 64 da 0 no Forja, como o shiftright128 usado)
+proc ryu_deslocar_128(lo: u64, hi: u64, dist: int) -> u64 {
+    return (hi << ((64 - dist) as u64)) | (lo >> (dist as u64))
+}
+
+// m * (mul1 * 2^64 + mul0) em 192 bits: baixo = parte baixa de m*mul0; meio = soma com o vai-um; alto = parte alta
+proc ryu_produto_192(m: u64, mul0: u64, mul1: u64) -> Produto192 {
+    let alto0: u64 = mul_hi_u64(m, mul0)
+    var alto1: u64 = mul_hi_u64(m, mul1)
+    let meio: u64 = wrapping_add(alto0, wrapping_mul(m, mul1))
+    if meio < alto0 {
+        alto1 = wrapping_add(alto1, 1)
+    }
+    return Produto192{baixo = wrapping_mul(m, mul0), meio = meio, alto = alto1}
+}
+
+// (m * mul) >> j, parte baixa de 64 bits (mulShift64 do Ryu)
+proc ryu_mulshift64(m: u64, mul: Dupla128, j: int) -> u64 {
+    let p = ryu_produto_192(m, mul.baixo, mul.alto)
+    return ryu_deslocar_128(p.meio, p.alto, j - 64)
+}
+
+// vp, vm e vr de uma vez (mulShiftAll64 do Ryu) para a entrada en
+proc ryu_tres_mulshift(en: RyuEntrada, mul: Dupla128, j: int) -> RyuEstado {
+    let m: u64 = en.m2
+    return RyuEstado{
+        vr = ryu_mulshift64(4 * m, mul, j),
+        vp = ryu_mulshift64(4 * m + 2, mul, j),
+        vm = ryu_mulshift64(4 * m - 1 - en.mm_shift, mul, j),
+    }
+}
+
+// Pedaco de 2 bits da tabela de offsets do Ryu para o expoente i
+proc ryu_bits_ajuste(valor: u32, i: int) -> u64 {
+    let deslocamento: u64 = ((i % 16) * 2) as u64
+    return (((valor as u64) >> deslocamento) & 3)
+}
+
+// 5^i no formato do Ryu (computePow5 com a tabela pequena): base * 26 + offset
+proc ryu_pow5_direto(i: int) -> Dupla128 {
+    let base: int = i / RYU_TAM_TABELA
+    let base2: int = base * RYU_TAM_TABELA
+    let offset: int = i - base2
+    let mul0: u64 = RYU_POW5_SPLIT2[2 * base]
+    let mul1: u64 = RYU_POW5_SPLIT2[2 * base + 1]
+    if offset == 0 {
+        return Dupla128{baixo = mul0, alto = mul1}
+    }
+    let p = ryu_produto_192(RYU_POW5_TABELA[offset], mul0, mul1)
+    let delta: int = ryu_pow5_bits(i) - ryu_pow5_bits(base2)
+    let ajuste: u64 = ryu_bits_ajuste(RYU_POW5_OFFSETS[i / 16], i)
+    return Dupla128{
+        baixo = wrapping_add(ryu_deslocar_128(p.baixo, p.meio, delta), ajuste),
+        alto = ryu_deslocar_128(p.meio, p.alto, delta),
+    }
+}
+
+// 5^-i no formato do Ryu (computeInvPow5 com a tabela pequena)
+proc ryu_pow5_inverso(i: int) -> Dupla128 {
+    let base: int = (i + RYU_TAM_TABELA - 1) / RYU_TAM_TABELA
+    let base2: int = base * RYU_TAM_TABELA
+    let offset: int = base2 - i
+    let mul0: u64 = RYU_POW5_INV_SPLIT2[2 * base]
+    let mul1: u64 = RYU_POW5_INV_SPLIT2[2 * base + 1]
+    if offset == 0 {
+        return Dupla128{baixo = mul0, alto = mul1}
+    }
+    let p = ryu_produto_192(RYU_POW5_TABELA[offset], mul0 - 1, mul1)
+    let delta: int = ryu_pow5_bits(base2) - ryu_pow5_bits(i)
+    let ajuste: u64 = 1 + ryu_bits_ajuste(RYU_POW5_INV_OFFSETS[i / 16], i)
+    return Dupla128{
+        baixo = wrapping_add(ryu_deslocar_128(p.baixo, p.meio, delta), ajuste),
+        alto = ryu_deslocar_128(p.meio, p.alto, delta),
+    }
+}
+
+// valor e multiplo de 5^p? (pow5Factor >= p, parando em p)
+proc ryu_multiplo_5(valor: u64, p: int) -> bool {
+    var v: u64 = valor
+    var fatores: int = 0
+    while fatores < p and v % 5 == 0 {
+        v = v / 5
+        fatores += 1
+    }
+    return fatores >= p
+}
+
+// valor e multiplo de 2^p
+proc ryu_multiplo_2(valor: u64, p: int) -> bool {
+    let mascara: u64 = ((1 as u64) << (p as u64)) - 1
+    return (valor & mascara) == 0
+}
+
+// mulShift32 do f2s.c: (m * fator) >> j com fator de 64 bits, parte baixa
+proc ryu_mulshift32(m: u64, fator: u64, j: int) -> u64 {
+    let fator_baixo: u64 = fator & 4294967295
+    let fator_alto: u64 = fator >> 32
+    let bits0: u64 = m * fator_baixo
+    let bits1: u64 = m * fator_alto
+    let soma: u64 = (bits0 >> 32) + bits1
+    return soma >> ((j - 32) as u64)
+}
+
+proc ryu_mulpow5_inv_div2(m: u64, q: int, j: int) -> u64 {
+    return ryu_mulshift32(m, RYU_FLT_POW5_INV[q], j)
+}
+
+proc ryu_mulpow5_div2(m: u64, i: int, j: int) -> u64 {
+    return ryu_mulshift32(m, RYU_FLT_POW5[i], j)
+}
+
+// ---- escala do d2s e do f2s (passo 3 do Ryu) ----
+// q <= 21 do d2s.c: so um entre mp, mv e mm pode ser multiplo de 5
+proc ryu_zeros_5(est: ^RyuEstado, mv: u64, q: int, en: RyuEntrada) {
+    if mv % 5 == 0 {
+        est.vr_zeros = ryu_multiplo_5(mv, q)
+    } else if en.aceita {
+        est.vm_zeros = ryu_multiplo_5(mv - 1 - en.mm_shift, q)
+    } else if ryu_multiplo_5(mv + 2, q) {
+        est.vp -= 1
+    }
+}
+
+proc ryu_escala_d2s_pos(en: RyuEntrada) -> RyuEstado {
+    var q: int = ryu_log10_pow2(en.e2)
+    if en.e2 > 3 {
+        q -= 1
+    }
+    let k: int = RYU_BITS_POW5_INV_D + ryu_pow5_bits(q) - 1
+    let i: int = -en.e2 + q + k
+    var est: RyuEstado = ryu_tres_mulshift(en, ryu_pow5_inverso(q), i)
+    est.e10 = q
+    if q <= 21 {
+        ryu_zeros_5(&est, 4 * en.m2, q, en)
+    }
+    return est
+}
+
+proc ryu_escala_d2s_neg(en: RyuEntrada) -> RyuEstado {
+    var q: int = ryu_log10_pow5(-en.e2)
+    if -en.e2 > 1 {
+        q -= 1
+    }
+    let i: int = -en.e2 - q
+    let k: int = ryu_pow5_bits(i) - RYU_BITS_POW5_D
+    let j: int = q - k
+    var est: RyuEstado = ryu_tres_mulshift(en, ryu_pow5_direto(i), j)
+    est.e10 = q + en.e2
+    if q <= 1 {
+        est.vr_zeros = true
+        if en.aceita {
+            est.vm_zeros = en.mm_shift == 1
+        } else {
+            est.vp -= 1
+        }
+    } else if q < 63 {
+        est.vr_zeros = ryu_multiplo_2(4 * en.m2, q)
+    }
+    return est
+}
+
+proc ryu_escala_f2s_pos(en: RyuEntrada) -> RyuEstado {
+    let q: int = ryu_log10_pow2(en.e2)
+    let k: int = RYU_BITS_POW5_INV_F + ryu_pow5_bits(q) - 1
+    let i: int = -en.e2 + q + k
+    let mv: u64 = 4 * en.m2
+    var est = RyuEstado{
+        vr = ryu_mulpow5_inv_div2(mv, q, i),
+        vp = ryu_mulpow5_inv_div2(mv + 2, q, i),
+        vm = ryu_mulpow5_inv_div2(mv - 1 - en.mm_shift, q, i),
+        e10 = q,
+    }
+    if q != 0 and ((est.vp - 1) / 10) <= (est.vm / 10) {
+        let l: int = RYU_BITS_POW5_INV_F + ryu_pow5_bits(q - 1) - 1
+        est.ultimo = ryu_mulpow5_inv_div2(mv, q - 1, -en.e2 + q - 1 + l) % 10
+    }
+    if q <= 9 {
+        ryu_zeros_5(&est, mv, q, en)
+    }
+    return est
+}
+
+proc ryu_escala_f2s_neg(en: RyuEntrada) -> RyuEstado {
+    let q: int = ryu_log10_pow5(-en.e2)
+    let i: int = -en.e2 - q
+    let k: int = ryu_pow5_bits(i) - RYU_BITS_POW5_F
+    let j: int = q - k
+    let mv: u64 = 4 * en.m2
+    var est = RyuEstado{
+        vr = ryu_mulpow5_div2(mv, i, j),
+        vp = ryu_mulpow5_div2(mv + 2, i, j),
+        vm = ryu_mulpow5_div2(mv - 1 - en.mm_shift, i, j),
+        e10 = q + en.e2,
+    }
+    if q != 0 and ((est.vp - 1) / 10) <= (est.vm / 10) {
+        let j_digito: int = q - 1 - (ryu_pow5_bits(i + 1) - RYU_BITS_POW5_F)
+        est.ultimo = ryu_mulpow5_div2(mv, i + 1, j_digito) % 10
+    }
+    if q <= 1 {
+        est.vr_zeros = true
+        if en.aceita {
+            est.vm_zeros = en.mm_shift == 1
+        } else {
+            est.vp -= 1
+        }
+    } else if q < 31 {
+        est.vr_zeros = ryu_multiplo_2(mv, q - 1)
+    }
+    return est
+}
+
+// ---- remocao de digitos (passo 4): a mesma logica para d2s e f2s ----
+proc ryu_mais_um_se(valor: u64, cond: bool) -> u64 {
+    if cond {
+        return valor + 1
+    }
+    return valor
+}
+
+// Enquanto o intervalo tem mais de um digito: tira um digito de vr, vp e vm
+proc ryu_passo_geral(est: ^RyuEstado) {
+    while (est.vp / 10) > (est.vm / 10) {
+        est.vm_zeros = est.vm_zeros and (est.vm % 10 == 0)
+        est.vr_zeros = est.vr_zeros and (est.ultimo == 0)
+        est.ultimo = est.vr % 10
+        est.vr = est.vr / 10
+        est.vp = est.vp / 10
+        est.vm = est.vm / 10
+        est.removidos += 1
+    }
+}
+
+// vm ainda termina em zero: tira os zeros dele (so no caminho com zeros finais)
+proc ryu_passo_so_vm(est: ^RyuEstado) {
+    while est.vm % 10 == 0 {
+        est.vr_zeros = est.vr_zeros and (est.ultimo == 0)
+        est.ultimo = est.vr % 10
+        est.vr = est.vr / 10
+        est.vp = est.vp / 10
+        est.vm = est.vm / 10
+        est.removidos += 1
+    }
+}
+
+// Caminho comum (sem zeros finais): tira digitos enquanto o intervalo tem mais de um; ultimo guarda o digito tirado por ultimo
+proc ryu_passo_simples(est: ^RyuEstado) {
+    while (est.vp / 10) > (est.vm / 10) {
+        est.ultimo = est.vr % 10
+        est.vr = est.vr / 10
+        est.vp = est.vp / 10
+        est.vm = est.vm / 10
+        est.removidos += 1
+    }
+}
+
+proc ryu_remover_com_zeros(est: ^RyuEstado, aceita: bool) {
+    ryu_passo_geral(est)
+    if est.vm_zeros {
+        ryu_passo_so_vm(est)
+    }
+    if est.vr_zeros and est.ultimo == 5 and est.vr % 2 == 0 {
+        est.ultimo = 4
+    }
+    let empate: bool = (est.vr == est.vm) and ((not aceita) or (not est.vm_zeros))
+    est.saida = ryu_mais_um_se(est.vr, empate or (est.ultimo >= 5))
+}
+
+proc ryu_remover(est: ^RyuEstado, aceita: bool) {
+    if est.vm_zeros or est.vr_zeros {
+        ryu_remover_com_zeros(est, aceita)
+        return
+    }
+    ryu_passo_simples(est)
+    est.saida = ryu_mais_um_se(est.vr, (est.vr == est.vm) or (est.ultimo >= 5))
+}
+
+// ---- d2d e f2d: bits IEEE -> mantissa e expoente decimal mais curtos ----
+proc ryu_escala_d2s(en: RyuEntrada) -> RyuEstado {
+    if en.e2 >= 0 {
+        return ryu_escala_d2s_pos(en)
+    }
+    return ryu_escala_d2s_neg(en)
+}
+
+proc ryu_escala_f2s(en: RyuEntrada) -> RyuEstado {
+    if en.e2 >= 0 {
+        return ryu_escala_f2s_pos(en)
+    }
+    return ryu_escala_f2s_neg(en)
+}
+
+// double com expoente IEEE (11 bits) e mantissa (52 bits) -> digitos mais curtos (d2d do d2s.c)
+proc ryu_d2d(mantissa: u64, expoente_ieee: u64) -> RyuDecimal {
+    var e2: int = 1 - RYU_D_BIAS - RYU_D_MANT - 2
+    var m2: u64 = mantissa
+    if expoente_ieee != 0 {
+        e2 = (expoente_ieee as int) - RYU_D_BIAS - RYU_D_MANT - 2
+        m2 = ((1 as u64) << 52) | mantissa
+    }
+    var mm_shift: u64 = 0
+    if mantissa != 0 or expoente_ieee <= 1 {
+        mm_shift = 1
+    }
+    let en = RyuEntrada{m2 = m2, e2 = e2, mm_shift = mm_shift, aceita = (m2 % 2) == 0}
+    var est: RyuEstado = ryu_escala_d2s(en)
+    ryu_remover(&est, en.aceita)
+    return RyuDecimal{mantissa = est.saida, expoente = est.e10 + est.removidos}
+}
+
+// float com expoente IEEE (8 bits) e mantissa (23 bits) -> digitos mais curtos (f2d do f2s.c)
+proc ryu_f2d(mantissa: u64, expoente_ieee: u64) -> RyuDecimal {
+    var e2: int = 1 - RYU_F_BIAS - RYU_F_MANT - 2
+    var m2: u64 = mantissa
+    if expoente_ieee != 0 {
+        e2 = (expoente_ieee as int) - RYU_F_BIAS - RYU_F_MANT - 2
+        m2 = ((1 as u64) << 23) | mantissa
+    }
+    var mm_shift: u64 = 0
+    if mantissa != 0 or expoente_ieee <= 1 {
+        mm_shift = 1
+    }
+    let en = RyuEntrada{m2 = m2, e2 = e2, mm_shift = mm_shift, aceita = (m2 % 2) == 0}
+    var est: RyuEstado = ryu_escala_f2s(en)
+    ryu_remover(&est, en.aceita)
+    return RyuDecimal{mantissa = est.saida, expoente = est.e10 + est.removidos}
+}
+
+// ---- texto Display do Ryu (rt_real_curto.c): posicional, sem expoente, sem zeros finais ----
+proc ryu_contar_digitos(mantissa: u64) -> int {
+    var n: int = 1
+    var resto: u64 = mantissa / 10
+    while resto > 0 {
+        n += 1
+        resto = resto / 10
+    }
+    return n
+}
+
+// Digito p posicoes a partir da direita (0 = unidade)
+proc ryu_digito_da_direita(mantissa: u64, p: int) -> u64 {
+    var resto: u64 = mantissa
+    var restam: int = p
+    while restam > 0 {
+        resto = resto / 10
+        restam -= 1
+    }
+    return resto % 10
+}
+
+proc ryu_texto_de(d: RyuDecimal) -> RyuTexto {
+    let total: int = ryu_contar_digitos(d.mantissa)
+    var zeros: int = 0
+    while zeros < total - 1 and ryu_digito_da_direita(d.mantissa, zeros) == 0 {
+        zeros += 1
+    }
+    return RyuTexto{mantissa = d.mantissa, total = total, nd = total - zeros, e10 = d.expoente + total - 1}
+}
+
+// ASCII do digito de indice k (0 = o mais significativo); depois do ultimo digito significativo sai '0'
+proc ryu_ascii_do_indice(t: RyuTexto, k: int) -> u8 {
+    if k >= t.nd {
+        return RT_ASCII_ZERO
+    }
+    let digito: u64 = ryu_digito_da_direita(t.mantissa, t.total - 1 - k)
+    return RT_ASCII_ZERO + (digito as u8)
+}
+
+// Parte inteira (e10 >= 0) mais a fracionaria, se houver; devolve o indice depois do ultimo byte escrito
+proc curto_parte_inteira(t: RyuTexto, saida: []u8, inicio: int) -> int {
+    var n: int = inicio
+    var k: int = 0
+    while k <= t.e10 {
+        saida[n] = ryu_ascii_do_indice(t, k)
+        n += 1
+        k += 1
+    }
+    if t.nd > t.e10 + 1 {
+        saida[n] = RT_ASCII_PONTO
+        n += 1
+        var j: int = t.e10 + 1
+        while j < t.nd {
+            saida[n] = ryu_ascii_do_indice(t, j)
+            n += 1
+            j += 1
+        }
+    }
+    return n
+}
+
+// e10 < 0: "0." seguido de zeros e depois os digitos
+proc curto_parte_fracionaria(t: RyuTexto, saida: []u8, inicio: int) -> int {
+    var n: int = inicio
+    saida[n] = RT_ASCII_ZERO
+    saida[n + 1] = RT_ASCII_PONTO
+    n += 2
+    var zeros: int = 0
+    while zeros < -t.e10 - 1 {
+        saida[n] = RT_ASCII_ZERO
+        n += 1
+        zeros += 1
+    }
+    var k: int = 0
+    while k < t.nd {
+        saida[n] = ryu_ascii_do_indice(t, k)
+        n += 1
+        k += 1
+    }
+    return n
+}
+
+// Texto Display de mantissa * 10^expoente com sinal opcional; devolve o tamanho
+proc curto_posicional(d: RyuDecimal, negativo: bool, saida: []u8) -> int {
+    let t: RyuTexto = ryu_texto_de(d)
+    var n: int = 0
+    if negativo {
+        saida[0] = RT_ASCII_MENOS
+        n = 1
+    }
+    if t.e10 >= 0 {
+        return curto_parte_inteira(t, saida, n)
+    }
+    return curto_parte_fracionaria(t, saida, n)
+}
+
+// nan, inf e -inf (o sinal de nan some, como no rt_real_curto.c); devolve o tamanho
+proc curto_nao_finito(mantissa: u64, negativo: bool, saida: []u8) -> int {
+    if mantissa != 0 {
+        saida[0] = RT_ASCII_N
+        saida[1] = RT_ASCII_A
+        saida[2] = RT_ASCII_N
+        return 3
+    }
+    var n: int = 0
+    if negativo {
+        saida[0] = RT_ASCII_MENOS
+        n = 1
+    }
+    saida[n] = RT_ASCII_I
+    saida[n + 1] = RT_ASCII_N
+    saida[n + 2] = RT_ASCII_F
+    return n + 3
+}
+
+// Texto Display do f64 em saida (ate RT_REAL_SAIDA_MAX bytes); devolve o tamanho. Zero sai "0" ou "-0".
+pub proc curto_texto_f64(v: f64, saida: []u8) -> int {
+    let bits: u64 = transmute(v, to = u64)
+    let negativo: bool = (bits >> 63) != 0
+    let expoente: u64 = (bits >> 52) & RYU_D_EXP_MASCARA
+    let mantissa: u64 = bits & RYU_D_MANT_MASCARA
+    if expoente == RYU_D_EXP_MASCARA {
+        return curto_nao_finito(mantissa, negativo, saida)
+    }
+    if expoente == 0 and mantissa == 0 {
+        return curto_posicional(RyuDecimal{mantissa = 0, expoente = 0}, negativo, saida)
+    }
+    return curto_posicional(ryu_d2d(mantissa, expoente), negativo, saida)
+}
+
+// Texto Display do f32 (v arredondado para f32 antes); devolve o tamanho
+pub proc curto_texto_f32(v: f64, saida: []u8) -> int {
+    let f: f32 = v as f32
+    let bits: u32 = transmute(f, to = u32)
+    let expoente: u64 = ((bits >> 23) & 255) as u64
+    let mantissa: u64 = (bits & 8388607) as u64
+    if expoente == RYU_F_EXP_MASCARA or (expoente == 0 and mantissa == 0) {
+        return curto_texto_f64(f as f64, saida)
+    }
+    return curto_posicional(ryu_f2d(mantissa, expoente), (bits >> 31) != 0, saida)
+}
+
+// ---- {x:.N}: porte do fmt_fp do musl (rt_fmt_fixo.c), com blocos base 1e9 em indices de um array local ----
+// Expoente binario e y em [1,2) de v (v != 0); subnormal normalizado pela mantissa
+proc fixo_normalizar(v: f64) -> FixoNormal {
+    let bits: u64 = transmute(v, to = u64)
+    let expoente: u64 = (bits >> 52) & RYU_D_EXP_MASCARA
+    var mantissa: u64 = bits & RYU_D_MANT_MASCARA
+    if expoente == 0 and mantissa == 0 {
+        return FixoNormal{y = 0.0, e2 = 0}
+    }
+    var e2: int = (expoente as int) - RYU_D_BIAS
+    if expoente == 0 {
+        e2 = -1022
+        while (mantissa >> 52) == 0 {
+            mantissa = mantissa << 1
+            e2 -= 1
+        }
+    }
+    let bits_y: u64 = ((RYU_D_BIAS as u64) << 52) | (mantissa & RYU_D_MANT_MASCARA)
+    return FixoNormal{y = transmute(bits_y, to = f64), e2 = e2}
+}
+
+// Passo 1 do musl: y vira blocos base 1e9 (o laco do do-while garante ao menos um bloco)
+proc fixo_expande_blocos(y0: f64, big: []u32, st: ^FixoEstado) {
+    var y: f64 = y0
+    while true {
+        big[st.z] = y as u32
+        y = FIXO_BASE_F64 * (y - (big[st.z] as f64))
+        st.z += 1
+        if y == 0.0 {
+            break
+        }
+    }
+}
+
+// e2 > 0: multiplica os blocos por 2^e2 (de 29 em 29 bits)
+proc fixo_multiplica(big: []u32, st: ^FixoEstado) {
+    while st.e2 > 0 {
+        var sh: int = st.e2
+        if sh > 29 {
+            sh = 29
+        }
+        var carry: u64 = 0
+        var d: int = st.z - 1
+        while d >= st.a {
+            let x: u64 = ((big[d] as u64) << (sh as u64)) + carry
+            big[d] = (x % FIXO_BASE) as u32
+            carry = x / FIXO_BASE
+            d -= 1
+        }
+        if carry != 0 {
+            st.a -= 1
+            big[st.a] = carry as u32
+        }
+        while st.z > st.a and big[st.z - 1] == 0 {
+            st.z -= 1
+        }
+        st.e2 -= sh
+    }
+}
+
+// e2 < 0: divide os blocos por 2^-e2 (de 9 em 9 bits), limitando o numero de blocos ao que a precisao pede
+proc fixo_divide(big: []u32, st: ^FixoEstado) {
+    while st.e2 < 0 {
+        var sh: int = -st.e2
+        if sh > 9 {
+            sh = 9
+        }
+        let precisao_blocos: int = 1 + (st.precisao + FIXO_MANT_LDBL_TERCO + 8) / 9
+        var carry: u64 = 0
+        var d: int = st.a
+        while d < st.z {
+            let resto: u64 = (big[d] as u64) & (((1 as u64) << (sh as u64)) - 1)
+            big[d] = ((((big[d] as u64) >> (sh as u64)) + carry)) as u32
+            carry = (FIXO_BASE >> (sh as u64)) * resto
+            d += 1
+        }
+        if st.a < st.z and big[st.a] == 0 {
+            st.a += 1
+        }
+        if carry != 0 {
+            big[st.z] = carry as u32
+            st.z += 1
+        }
+        if st.z - st.r > precisao_blocos {
+            st.z = st.r + precisao_blocos
+        }
+        st.e2 += sh
+    }
+}
+
+// Passo 1 inteiro (rt_fixo_blocos): ajusta o expoente, posiciona a/r/z e roda os tres laços
+proc fixo_blocos(normal: FixoNormal, big: []u32, st: ^FixoEstado) {
+    var y: f64 = normal.y
+    var e2: int = normal.e2
+    if y != 0.0 {
+        y = y * FIXO_DOIS_28
+        e2 -= 28
+    }
+    st.e2 = e2
+    st.a = FIXO_SLOTS - 6
+    if e2 < 0 {
+        st.a = 0
+    }
+    st.r = st.a
+    st.z = st.a
+    fixo_expande_blocos(y, big, st)
+    fixo_multiplica(big, st)
+    fixo_divide(big, st)
+}
+
+// Empate do arredondamento do musl: devolve o novo d (pode descer ao propagar o vai-um)
+proc fixo_empate(big: []u32, st: ^FixoEstado, d0: int, i: u64) -> int {
+    var d: int = d0
+    let x: u64 = (big[d] as u64) % i
+    let metade: u64 = i / 2
+    var meio: f64 = FIXO_DOIS_53
+    var impar: bool = ((big[d] as u64) / i) % 2 == 1
+    if i == FIXO_BASE and d > st.a {
+        if big[d - 1] % 2 == 1 {
+            impar = true
+        }
+    }
+    if impar {
+        meio = meio + 2.0
+    }
+    var fracao: f64 = 1.5
+    if x < metade {
+        fracao = 0.5
+    } else if x == metade and d + 1 == st.z {
+        fracao = 1.0
+    }
+    big[d] = ((big[d] as u64) - x) as u32
+    if meio + fracao != meio {
+        big[d] = ((big[d] as u64) + i) as u32
+        while (big[d] as u64) > FIXO_NOVE_MAX {
+            big[d] = 0
+            d -= 1
+            if d < st.a {
+                st.a -= 1
+                big[st.a] = 0
+            }
+            big[d] += 1
+        }
+    }
+    return d
+}
+
+// Arredondamento na casa de corte da precisao (rt_fixo_arredondar)
+proc fixo_arredondar(big: []u32, st: ^FixoEstado) {
+    let p: int = st.precisao
+    if p >= 9 * (st.z - st.r - 1) {
+        return
+    }
+    var d: int = st.r + 1 + ((p + 9 * FIXO_MAX_EXP_LDBL) / 9 - FIXO_MAX_EXP_LDBL)
+    var j: int = (p + 9 * FIXO_MAX_EXP_LDBL) % 9
+    var i: u64 = 10
+    j += 1
+    while j < 9 {
+        i = i * 10
+        j += 1
+    }
+    let x: u64 = (big[d] as u64) % i
+    if x != 0 or d + 1 != st.z {
+        d = fixo_empate(big, st, d, i)
+    }
+    if st.z > d + 1 {
+        st.z = d + 1
+    }
+}
+
+// Escreve x com ao menos um digito e sem zeros a esquerda; devolve quantos
+proc fixo_escreve_inteiro(valor: u64, saida: []u8, inicio: int) -> int {
+    var len: int = 1
+    var resto: u64 = valor / 10
+    while resto > 0 {
+        len += 1
+        resto = resto / 10
+    }
+    var x: u64 = valor
+    var k: int = len - 1
+    while k >= 0 {
+        saida[inicio + k] = RT_ASCII_ZERO + ((x % 10) as u8)
+        x = x / 10
+        k -= 1
+    }
+    return len
+}
+
+// Escreve os 9 digitos de x (com zeros a esquerda) a partir de inicio
+proc fixo_escreve_nove(valor: u64, saida: []u8, inicio: int) {
+    var x: u64 = valor
+    var k: int = 8
+    while k >= 0 {
+        saida[inicio + k] = RT_ASCII_ZERO + ((x % 10) as u8)
+        x = x / 10
+        k -= 1
+    }
+}
+
+// Blocos como "inteiro.fracao" com precisao casas (rt_fixo_escrever); devolve o indice depois do ultimo byte
+proc fixo_escrever(big: []u32, st: ^FixoEstado, saida: []u8, inicio: int) -> int {
+    var n: int = inicio
+    var a: int = st.a
+    if a > st.r {
+        a = st.r
+    }
+    var d: int = a
+    while d <= st.r {
+        if d == a {
+            n += fixo_escreve_inteiro(big[d] as u64, saida, n)
+        } else {
+            fixo_escreve_nove(big[d] as u64, saida, n)
+            n += 9
+        }
+        d += 1
+    }
+    var p: int = st.precisao
+    if p > 0 {
+        saida[n] = RT_ASCII_PONTO
+        n += 1
+    }
+    var bloco: [9]u8 = {}
+    while d < st.z and p > 0 {
+        fixo_escreve_nove(big[d] as u64, bloco[..], 0)
+        var k: int = 0
+        while k < 9 and k < p {
+            saida[n] = bloco[k]
+            n += 1
+            k += 1
+        }
+        p -= 9
+        d += 1
+    }
+    while p > 0 {
+        saida[n] = RT_ASCII_ZERO
+        n += 1
+        p -= 1
+    }
+    return n
+}
+
+// rt_fmt_fixo: "%.Nf" exato (N = st.precisao); sem nan/inf (quem chama trata). Devolve o tamanho.
+proc rt_fmt_fixo(v: f64, precisao: int, saida: []u8) -> int {
+    var big: [FIXO_SLOTS]u32 = {}
+    var st = FixoEstado{precisao = precisao}
+    var n: int = 0
+    if (transmute(v, to = u64) >> 63) != 0 {
+        saida[0] = RT_ASCII_MENOS
+        n = 1
+    }
+    fixo_blocos(fixo_normalizar(v), big[..], &st)
+    fixo_arredondar(big[..], &st)
+    while st.z > st.a and big[st.z - 1] == 0 {
+        st.z -= 1
+    }
+    return fixo_escrever(big[..], &st, saida, n)
+}
+
+// Real com precisao: nan/inf saem pelo Display curto (mesmo texto do rt_real_especial)
+proc real_texto_fixo(v: f64, precisao: int, saida: []u8) -> int {
+    if ((transmute(v, to = u64) >> 52) & RYU_D_EXP_MASCARA) == RYU_D_EXP_MASCARA {
+        return curto_texto_f64(v, saida)
+    }
+    return rt_fmt_fixo(v, precisao, saida)
+}
+
+// Precisao de fmt (bits 8..12): N+1 codifica N casas; 0 cairia no padrao 6 (como rt_formata.c)
+proc fmt_precisao_de(fmt: u32) -> int {
+    let codigo: u32 = (fmt >> RT_FMT_PRECISAO_DESLOC) & RT_FMT_PRECISAO_MASCARA
+    if codigo == 0 {
+        return RT_REAL_PRECISAO_PADRAO
+    }
+    return (codigo - 1) as int
+}
+
+// Texto com precisao (f"{x:.N}" e forja_fmt_f32/f64): o fmt traz N; f32 chega como double sem arredondar (como no x64)
+pub proc texto_f64_fixo(v: f64, fmt: u32, saida: []u8) -> int {
+    return real_texto_fixo(v, fmt_precisao_de(fmt), saida)
+}
+
+// ---- simbolos de runtime (forja_fmt_f32/f64 e _curto) ----
+pub proc fmt_f64_curto(v: f64, fmt: u32) {
+    var saida: [RT_REAL_SAIDA_MAX]u8 = {}
+    let n: int = curto_texto_f64(v, saida[..])
+    emite_texto(&saida[0], n, fmt)
+}
+
+pub proc fmt_f32_curto(v: f64, fmt: u32) {
+    var saida: [RT_REAL_SAIDA_MAX]u8 = {}
+    let n: int = curto_texto_f32(v, saida[..])
+    emite_texto(&saida[0], n, fmt)
+}
+
+pub proc fmt_f64(v: f64, fmt: u32) {
+    var saida: [RT_REAL_SAIDA_MAX]u8 = {}
+    let n: int = texto_f64_fixo(v, fmt, saida[..])
+    emite_texto(&saida[0], n, fmt)
+}
+
+pub proc fmt_f32(v: f64, fmt: u32) {
+    fmt_f64(v, fmt)
+}
+
+
+struct Contagem {
+    casos: int = 0
+    diverge: int = 0
+}
+
+proc prec_fmt(casas: int) -> u32 {
+    return ((casas + 1) as u32) << 8
+}
+
+proc iguais(ref: str, buf: []u8, n: int) -> bool {
+    let b = as_bytes(ref)
+    if len(b) != n {
+        return false
+    }
+    var k: int = 0
+    while k < n {
+        if b[k] != buf[k] {
+            return false
+        }
+        k += 1
+    }
+    return true
+}
+
+proc registra(ok: bool, rotulo: str, bits: u64, c: ^Contagem) {
+    c.casos += 1
+    if not ok {
+        c.diverge += 1
+        if c.diverge <= 20 {
+            eprint(f"DIVERGE {rotulo} bits={bits:x}")
+        }
+    }
+}
+
+proc testa_f64(v: f64, bits: u64, c: ^Contagem) {
+    var buf: [352]u8 = {}
+    let n: int = curto_texto_f64(v, buf[..])
+    let r = format(f"{v}", alloc = heap)
+    registra(iguais(r, buf[..], n), "f64 curto", bits, c)
+    delete(r)
+    let n0: int = texto_f64_fixo(v, prec_fmt(0), buf[..])
+    let r0 = format(f"{v:.0}", alloc = heap)
+    registra(iguais(r0, buf[..], n0), "f64 .0", bits, c)
+    delete(r0)
+    let n1: int = texto_f64_fixo(v, prec_fmt(1), buf[..])
+    let r1 = format(f"{v:.1}", alloc = heap)
+    registra(iguais(r1, buf[..], n1), "f64 .1", bits, c)
+    delete(r1)
+    let n2: int = texto_f64_fixo(v, prec_fmt(2), buf[..])
+    let r2 = format(f"{v:.2}", alloc = heap)
+    registra(iguais(r2, buf[..], n2), "f64 .2", bits, c)
+    delete(r2)
+    let n3: int = texto_f64_fixo(v, prec_fmt(3), buf[..])
+    let r3 = format(f"{v:.3}", alloc = heap)
+    registra(iguais(r3, buf[..], n3), "f64 .3", bits, c)
+    delete(r3)
+    let n6: int = texto_f64_fixo(v, prec_fmt(6), buf[..])
+    let r6 = format(f"{v:.6}", alloc = heap)
+    registra(iguais(r6, buf[..], n6), "f64 .6", bits, c)
+    delete(r6)
+    let n17: int = texto_f64_fixo(v, prec_fmt(17), buf[..])
+    let r17 = format(f"{v:.17}", alloc = heap)
+    registra(iguais(r17, buf[..], n17), "f64 .17", bits, c)
+    delete(r17)
+}
+
+proc testa_f32(v: f64, bits: u64, c: ^Contagem) {
+    var buf: [352]u8 = {}
+    let n: int = curto_texto_f32(v, buf[..])
+    let f: f32 = v as f32
+    let r = format(f"{f}", alloc = heap)
+    registra(iguais(r, buf[..], n), "f32 curto", bits, c)
+    delete(r)
+    let n0: int = texto_f64_fixo(v, prec_fmt(0), buf[..])
+    let r0 = format(f"{f:.0}", alloc = heap)
+    registra(iguais(r0, buf[..], n0), "f32 .0", bits, c)
+    delete(r0)
+    let n1: int = texto_f64_fixo(v, prec_fmt(1), buf[..])
+    let r1 = format(f"{f:.1}", alloc = heap)
+    registra(iguais(r1, buf[..], n1), "f32 .1", bits, c)
+    delete(r1)
+    let n2: int = texto_f64_fixo(v, prec_fmt(2), buf[..])
+    let r2 = format(f"{f:.2}", alloc = heap)
+    registra(iguais(r2, buf[..], n2), "f32 .2", bits, c)
+    delete(r2)
+    let n3: int = texto_f64_fixo(v, prec_fmt(3), buf[..])
+    let r3 = format(f"{f:.3}", alloc = heap)
+    registra(iguais(r3, buf[..], n3), "f32 .3", bits, c)
+    delete(r3)
+    let n6: int = texto_f64_fixo(v, prec_fmt(6), buf[..])
+    let r6 = format(f"{f:.6}", alloc = heap)
+    registra(iguais(r6, buf[..], n6), "f32 .6", bits, c)
+    delete(r6)
+    let n17: int = texto_f64_fixo(v, prec_fmt(17), buf[..])
+    let r17 = format(f"{f:.17}", alloc = heap)
+    registra(iguais(r17, buf[..], n17), "f32 .17", bits, c)
+    delete(r17)
+}
+
+proc testa_longa_f64(v: f64, bits: u64, esperado18: str, esperado30: str, c: ^Contagem) {
+    var buf: [352]u8 = {}
+    let n18: int = texto_f64_fixo(v, prec_fmt(18), buf[..])
+    registra(iguais(esperado18, buf[..], n18), "f64 .18 python", bits, c)
+    let n30: int = texto_f64_fixo(v, prec_fmt(30), buf[..])
+    registra(iguais(esperado30, buf[..], n30), "f64 .30 python", bits, c)
+}
+
+proc testa_aleatorios(quantidade: int, c: ^Contagem) {
+    var estado: u64 = 88172645463325252
+    var k: int = 0
+    while k < quantidade {
+        estado = wrapping_add(wrapping_mul(estado, 6364136223846793005), 1442695040888963407)
+        let bits: u64 = estado
+        if ((bits >> 52) & 2047) != 2047 {
+            testa_f64(transmute(bits, to = f64), bits, c)
+        }
+        let meio: u64 = (((bits >> 40) % 60) + 993) << 52
+        let bits_meio: u64 = (bits & 4503599627370495) | meio
+        testa_f64(transmute(bits_meio, to = f64), bits_meio, c)
+        estado = wrapping_add(wrapping_mul(estado, 6364136223846793005), 1442695040888963407)
+        let b32: u32 = (estado >> 32) as u32
+        if ((b32 >> 23) & 255) != 255 {
+            let f32_valor: f32 = transmute(b32, to = f32)
+            testa_f32(f32_valor as f64, b32 as u64, c)
+        }
+        k += 1
+    }
+}
+
+proc main() {
+    var c = Contagem{}
+    testa_bordas_f64(&c)
+    testa_bordas_f32(&c)
+    testa_aleatorios(20000, &c)
+    if c.diverge == 0 {
+        print(f"OK {c.casos} casos, 0 diverge")
+    } else {
+        print(f"{c.diverge} diverge de {c.casos} casos")
+        panic("divergencia do texto de real")
+    }
+}
+
+proc testa_bordas_f64(c: ^Contagem) {
+    testa_f64(transmute(((0x00000000 as u64) << 32) | (0x00000000 as u64), to = f64), ((0x00000000 as u64) << 32) | (0x00000000 as u64), c)
+    testa_longa_f64(transmute(((0x00000000 as u64) << 32) | (0x00000000 as u64), to = f64), ((0x00000000 as u64) << 32) | (0x00000000 as u64), "0.000000000000000000", "0.000000000000000000000000000000", c)
+    testa_f64(transmute(((0x80000000 as u64) << 32) | (0x00000000 as u64), to = f64), ((0x80000000 as u64) << 32) | (0x00000000 as u64), c)
+    testa_longa_f64(transmute(((0x80000000 as u64) << 32) | (0x00000000 as u64), to = f64), ((0x80000000 as u64) << 32) | (0x00000000 as u64), "-0.000000000000000000", "-0.000000000000000000000000000000", c)
+    testa_f64(transmute(((0x00000000 as u64) << 32) | (0x00000001 as u64), to = f64), ((0x00000000 as u64) << 32) | (0x00000001 as u64), c)
+    testa_longa_f64(transmute(((0x00000000 as u64) << 32) | (0x00000001 as u64), to = f64), ((0x00000000 as u64) << 32) | (0x00000001 as u64), "0.000000000000000000", "0.000000000000000000000000000000", c)
+    testa_f64(transmute(((0x7FEFFFFF as u64) << 32) | (0xFFFFFFFF as u64), to = f64), ((0x7FEFFFFF as u64) << 32) | (0xFFFFFFFF as u64), c)
+    testa_longa_f64(transmute(((0x7FEFFFFF as u64) << 32) | (0xFFFFFFFF as u64), to = f64), ((0x7FEFFFFF as u64) << 32) | (0xFFFFFFFF as u64), "179769313486231570814527423731704356798070567525844996598917476803157260780028538760589558632766878171540458953514382464234321326889464182768467546703537516986049910576551282076245490090389328944075868508455133942304583236903222948165808559332123348274797826204144723168738177180919299881250404026184124858368.000000000000000000", "179769313486231570814527423731704356798070567525844996598917476803157260780028538760589558632766878171540458953514382464234321326889464182768467546703537516986049910576551282076245490090389328944075868508455133942304583236903222948165808559332123348274797826204144723168738177180919299881250404026184124858368.000000000000000000000000000000", c)
+    testa_f64(transmute(((0x00100000 as u64) << 32) | (0x00000000 as u64), to = f64), ((0x00100000 as u64) << 32) | (0x00000000 as u64), c)
+    testa_longa_f64(transmute(((0x00100000 as u64) << 32) | (0x00000000 as u64), to = f64), ((0x00100000 as u64) << 32) | (0x00000000 as u64), "0.000000000000000000", "0.000000000000000000000000000000", c)
+    testa_f64(transmute(((0x3FB99999 as u64) << 32) | (0x9999999A as u64), to = f64), ((0x3FB99999 as u64) << 32) | (0x9999999A as u64), c)
+    testa_longa_f64(transmute(((0x3FB99999 as u64) << 32) | (0x9999999A as u64), to = f64), ((0x3FB99999 as u64) << 32) | (0x9999999A as u64), "0.100000000000000006", "0.100000000000000005551115123126", c)
+    testa_f64(transmute(((0x3FD33333 as u64) << 32) | (0x33333333 as u64), to = f64), ((0x3FD33333 as u64) << 32) | (0x33333333 as u64), c)
+    testa_longa_f64(transmute(((0x3FD33333 as u64) << 32) | (0x33333333 as u64), to = f64), ((0x3FD33333 as u64) << 32) | (0x33333333 as u64), "0.299999999999999989", "0.299999999999999988897769753748", c)
+    testa_f64(transmute(((0x3FD55555 as u64) << 32) | (0x55555555 as u64), to = f64), ((0x3FD55555 as u64) << 32) | (0x55555555 as u64), c)
+    testa_longa_f64(transmute(((0x3FD55555 as u64) << 32) | (0x55555555 as u64), to = f64), ((0x3FD55555 as u64) << 32) | (0x55555555 as u64), "0.333333333333333315", "0.333333333333333314829616256247", c)
+    testa_f64(transmute(((0x419D6F34 as u64) << 32) | (0x54800000 as u64), to = f64), ((0x419D6F34 as u64) << 32) | (0x54800000 as u64), c)
+    testa_longa_f64(transmute(((0x419D6F34 as u64) << 32) | (0x54800000 as u64), to = f64), ((0x419D6F34 as u64) << 32) | (0x54800000 as u64), "123456789.125000000000000000", "123456789.125000000000000000000000000000", c)
+    testa_f64(transmute(((0x3FE00000 as u64) << 32) | (0x00000000 as u64), to = f64), ((0x3FE00000 as u64) << 32) | (0x00000000 as u64), c)
+    testa_longa_f64(transmute(((0x3FE00000 as u64) << 32) | (0x00000000 as u64), to = f64), ((0x3FE00000 as u64) << 32) | (0x00000000 as u64), "0.500000000000000000", "0.500000000000000000000000000000", c)
+    testa_f64(transmute(((0x3FF80000 as u64) << 32) | (0x00000000 as u64), to = f64), ((0x3FF80000 as u64) << 32) | (0x00000000 as u64), c)
+    testa_longa_f64(transmute(((0x3FF80000 as u64) << 32) | (0x00000000 as u64), to = f64), ((0x3FF80000 as u64) << 32) | (0x00000000 as u64), "1.500000000000000000", "1.500000000000000000000000000000", c)
+    testa_f64(transmute(((0x40590000 as u64) << 32) | (0x00000000 as u64), to = f64), ((0x40590000 as u64) << 32) | (0x00000000 as u64), c)
+    testa_longa_f64(transmute(((0x40590000 as u64) << 32) | (0x00000000 as u64), to = f64), ((0x40590000 as u64) << 32) | (0x00000000 as u64), "100.000000000000000000", "100.000000000000000000000000000000", c)
+    testa_f64(transmute(((0x43400000 as u64) << 32) | (0x00000000 as u64), to = f64), ((0x43400000 as u64) << 32) | (0x00000000 as u64), c)
+    testa_longa_f64(transmute(((0x43400000 as u64) << 32) | (0x00000000 as u64), to = f64), ((0x43400000 as u64) << 32) | (0x00000000 as u64), "9007199254740992.000000000000000000", "9007199254740992.000000000000000000000000000000", c)
+    testa_f64(transmute(((0x40056666 as u64) << 32) | (0x66666666 as u64), to = f64), ((0x40056666 as u64) << 32) | (0x66666666 as u64), c)
+    testa_longa_f64(transmute(((0x40056666 as u64) << 32) | (0x66666666 as u64), to = f64), ((0x40056666 as u64) << 32) | (0x66666666 as u64), "2.674999999999999822", "2.674999999999999822364316059975", c)
+    testa_f64(transmute(((0x3FF0147A as u64) << 32) | (0xE147AE14 as u64), to = f64), ((0x3FF0147A as u64) << 32) | (0xE147AE14 as u64), c)
+    testa_longa_f64(transmute(((0x3FF0147A as u64) << 32) | (0xE147AE14 as u64), to = f64), ((0x3FF0147A as u64) << 32) | (0xE147AE14 as u64), "1.004999999999999893", "1.004999999999999893418589635985", c)
+    testa_f64(transmute(((0x40116666 as u64) << 32) | (0x66666666 as u64), to = f64), ((0x40116666 as u64) << 32) | (0x66666666 as u64), c)
+    testa_longa_f64(transmute(((0x40116666 as u64) << 32) | (0x66666666 as u64), to = f64), ((0x40116666 as u64) << 32) | (0x66666666 as u64), "4.349999999999999645", "4.349999999999999644728632119950", c)
+    testa_f64(transmute(((0x40210000 as u64) << 32) | (0x00000000 as u64), to = f64), ((0x40210000 as u64) << 32) | (0x00000000 as u64), c)
+    testa_longa_f64(transmute(((0x40210000 as u64) << 32) | (0x00000000 as u64), to = f64), ((0x40210000 as u64) << 32) | (0x00000000 as u64), "8.500000000000000000", "8.500000000000000000000000000000", c)
+    testa_f64(transmute(((0x3EB4B3FD as u64) << 32) | (0x5942CD96 as u64), to = f64), ((0x3EB4B3FD as u64) << 32) | (0x5942CD96 as u64), c)
+    testa_longa_f64(transmute(((0x3EB4B3FD as u64) << 32) | (0x5942CD96 as u64), to = f64), ((0x3EB4B3FD as u64) << 32) | (0x5942CD96 as u64), "0.000001234000000000", "0.000001233999999999999958982247", c)
+    testa_f64(transmute(((0xC0040000 as u64) << 32) | (0x00000000 as u64), to = f64), ((0xC0040000 as u64) << 32) | (0x00000000 as u64), c)
+    testa_longa_f64(transmute(((0xC0040000 as u64) << 32) | (0x00000000 as u64), to = f64), ((0xC0040000 as u64) << 32) | (0x00000000 as u64), "-2.500000000000000000", "-2.500000000000000000000000000000", c)
+    testa_f64(transmute(((0xBF50624D as u64) << 32) | (0xD2F1A9FC as u64), to = f64), ((0xBF50624D as u64) << 32) | (0xD2F1A9FC as u64), c)
+    testa_longa_f64(transmute(((0xBF50624D as u64) << 32) | (0xD2F1A9FC as u64), to = f64), ((0xBF50624D as u64) << 32) | (0xD2F1A9FC as u64), "-0.001000000000000000", "-0.001000000000000000020816681712", c)
+    testa_f64(transmute(((0x3DDB7CDF as u64) << 32) | (0xD9D7BDBB as u64), to = f64), ((0x3DDB7CDF as u64) << 32) | (0xD9D7BDBB as u64), c)
+    testa_longa_f64(transmute(((0x3DDB7CDF as u64) << 32) | (0xD9D7BDBB as u64), to = f64), ((0x3DDB7CDF as u64) << 32) | (0xD9D7BDBB as u64), "0.000000000100000000", "0.000000000100000000000000003643", c)
+    testa_f64(transmute(((0x3E112E0B as u64) << 32) | (0xE826D695 as u64), to = f64), ((0x3E112E0B as u64) << 32) | (0xE826D695 as u64), c)
+    testa_longa_f64(transmute(((0x3E112E0B as u64) << 32) | (0xE826D695 as u64), to = f64), ((0x3E112E0B as u64) << 32) | (0xE826D695 as u64), "0.000000001000000000", "0.000000001000000000000000062282", c)
+    testa_f64(transmute(((0x3E45798E as u64) << 32) | (0xE2308C3A as u64), to = f64), ((0x3E45798E as u64) << 32) | (0xE2308C3A as u64), c)
+    testa_longa_f64(transmute(((0x3E45798E as u64) << 32) | (0xE2308C3A as u64), to = f64), ((0x3E45798E as u64) << 32) | (0xE2308C3A as u64), "0.000000010000000000", "0.000000010000000000000000209226", c)
+    testa_f64(transmute(((0x3E7AD7F2 as u64) << 32) | (0x9ABCAF48 as u64), to = f64), ((0x3E7AD7F2 as u64) << 32) | (0x9ABCAF48 as u64), c)
+    testa_longa_f64(transmute(((0x3E7AD7F2 as u64) << 32) | (0x9ABCAF48 as u64), to = f64), ((0x3E7AD7F2 as u64) << 32) | (0x9ABCAF48 as u64), "0.000000100000000000", "0.000000099999999999999995474811", c)
+    testa_f64(transmute(((0x3EB0C6F7 as u64) << 32) | (0xA0B5ED8D as u64), to = f64), ((0x3EB0C6F7 as u64) << 32) | (0xA0B5ED8D as u64), c)
+    testa_longa_f64(transmute(((0x3EB0C6F7 as u64) << 32) | (0xA0B5ED8D as u64), to = f64), ((0x3EB0C6F7 as u64) << 32) | (0xA0B5ED8D as u64), "0.000001000000000000", "0.000000999999999999999954748112", c)
+    testa_f64(transmute(((0x3EE4F8B5 as u64) << 32) | (0x88E368F1 as u64), to = f64), ((0x3EE4F8B5 as u64) << 32) | (0x88E368F1 as u64), c)
+    testa_longa_f64(transmute(((0x3EE4F8B5 as u64) << 32) | (0x88E368F1 as u64), to = f64), ((0x3EE4F8B5 as u64) << 32) | (0x88E368F1 as u64), "0.000010000000000000", "0.000010000000000000000818030539", c)
+    testa_f64(transmute(((0x3F1A36E2 as u64) << 32) | (0xEB1C432D as u64), to = f64), ((0x3F1A36E2 as u64) << 32) | (0xEB1C432D as u64), c)
+    testa_longa_f64(transmute(((0x3F1A36E2 as u64) << 32) | (0xEB1C432D as u64), to = f64), ((0x3F1A36E2 as u64) << 32) | (0xEB1C432D as u64), "0.000100000000000000", "0.000100000000000000004792173602", c)
+    testa_f64(transmute(((0x3F50624D as u64) << 32) | (0xD2F1A9FC as u64), to = f64), ((0x3F50624D as u64) << 32) | (0xD2F1A9FC as u64), c)
+    testa_longa_f64(transmute(((0x3F50624D as u64) << 32) | (0xD2F1A9FC as u64), to = f64), ((0x3F50624D as u64) << 32) | (0xD2F1A9FC as u64), "0.001000000000000000", "0.001000000000000000020816681712", c)
+    testa_f64(transmute(((0x3F847AE1 as u64) << 32) | (0x47AE147B as u64), to = f64), ((0x3F847AE1 as u64) << 32) | (0x47AE147B as u64), c)
+    testa_longa_f64(transmute(((0x3F847AE1 as u64) << 32) | (0x47AE147B as u64), to = f64), ((0x3F847AE1 as u64) << 32) | (0x47AE147B as u64), "0.010000000000000000", "0.010000000000000000208166817117", c)
+    testa_f64(transmute(((0x3FB99999 as u64) << 32) | (0x9999999A as u64), to = f64), ((0x3FB99999 as u64) << 32) | (0x9999999A as u64), c)
+    testa_longa_f64(transmute(((0x3FB99999 as u64) << 32) | (0x9999999A as u64), to = f64), ((0x3FB99999 as u64) << 32) | (0x9999999A as u64), "0.100000000000000006", "0.100000000000000005551115123126", c)
+    testa_f64(transmute(((0x3FF00000 as u64) << 32) | (0x00000000 as u64), to = f64), ((0x3FF00000 as u64) << 32) | (0x00000000 as u64), c)
+    testa_longa_f64(transmute(((0x3FF00000 as u64) << 32) | (0x00000000 as u64), to = f64), ((0x3FF00000 as u64) << 32) | (0x00000000 as u64), "1.000000000000000000", "1.000000000000000000000000000000", c)
+    testa_f64(transmute(((0x40240000 as u64) << 32) | (0x00000000 as u64), to = f64), ((0x40240000 as u64) << 32) | (0x00000000 as u64), c)
+    testa_longa_f64(transmute(((0x40240000 as u64) << 32) | (0x00000000 as u64), to = f64), ((0x40240000 as u64) << 32) | (0x00000000 as u64), "10.000000000000000000", "10.000000000000000000000000000000", c)
+    testa_f64(transmute(((0x40590000 as u64) << 32) | (0x00000000 as u64), to = f64), ((0x40590000 as u64) << 32) | (0x00000000 as u64), c)
+    testa_longa_f64(transmute(((0x40590000 as u64) << 32) | (0x00000000 as u64), to = f64), ((0x40590000 as u64) << 32) | (0x00000000 as u64), "100.000000000000000000", "100.000000000000000000000000000000", c)
+    testa_f64(transmute(((0x408F4000 as u64) << 32) | (0x00000000 as u64), to = f64), ((0x408F4000 as u64) << 32) | (0x00000000 as u64), c)
+    testa_longa_f64(transmute(((0x408F4000 as u64) << 32) | (0x00000000 as u64), to = f64), ((0x408F4000 as u64) << 32) | (0x00000000 as u64), "1000.000000000000000000", "1000.000000000000000000000000000000", c)
+    testa_f64(transmute(((0x40C38800 as u64) << 32) | (0x00000000 as u64), to = f64), ((0x40C38800 as u64) << 32) | (0x00000000 as u64), c)
+    testa_longa_f64(transmute(((0x40C38800 as u64) << 32) | (0x00000000 as u64), to = f64), ((0x40C38800 as u64) << 32) | (0x00000000 as u64), "10000.000000000000000000", "10000.000000000000000000000000000000", c)
+    testa_f64(transmute(((0x40F86A00 as u64) << 32) | (0x00000000 as u64), to = f64), ((0x40F86A00 as u64) << 32) | (0x00000000 as u64), c)
+    testa_longa_f64(transmute(((0x40F86A00 as u64) << 32) | (0x00000000 as u64), to = f64), ((0x40F86A00 as u64) << 32) | (0x00000000 as u64), "100000.000000000000000000", "100000.000000000000000000000000000000", c)
+    testa_f64(transmute(((0x412E8480 as u64) << 32) | (0x00000000 as u64), to = f64), ((0x412E8480 as u64) << 32) | (0x00000000 as u64), c)
+    testa_longa_f64(transmute(((0x412E8480 as u64) << 32) | (0x00000000 as u64), to = f64), ((0x412E8480 as u64) << 32) | (0x00000000 as u64), "1000000.000000000000000000", "1000000.000000000000000000000000000000", c)
+    testa_f64(transmute(((0x416312D0 as u64) << 32) | (0x00000000 as u64), to = f64), ((0x416312D0 as u64) << 32) | (0x00000000 as u64), c)
+    testa_longa_f64(transmute(((0x416312D0 as u64) << 32) | (0x00000000 as u64), to = f64), ((0x416312D0 as u64) << 32) | (0x00000000 as u64), "10000000.000000000000000000", "10000000.000000000000000000000000000000", c)
+    testa_f64(transmute(((0x4197D784 as u64) << 32) | (0x00000000 as u64), to = f64), ((0x4197D784 as u64) << 32) | (0x00000000 as u64), c)
+    testa_longa_f64(transmute(((0x4197D784 as u64) << 32) | (0x00000000 as u64), to = f64), ((0x4197D784 as u64) << 32) | (0x00000000 as u64), "100000000.000000000000000000", "100000000.000000000000000000000000000000", c)
+    testa_f64(transmute(((0x41CDCD65 as u64) << 32) | (0x00000000 as u64), to = f64), ((0x41CDCD65 as u64) << 32) | (0x00000000 as u64), c)
+    testa_longa_f64(transmute(((0x41CDCD65 as u64) << 32) | (0x00000000 as u64), to = f64), ((0x41CDCD65 as u64) << 32) | (0x00000000 as u64), "1000000000.000000000000000000", "1000000000.000000000000000000000000000000", c)
+    testa_f64(transmute(((0x4202A05F as u64) << 32) | (0x20000000 as u64), to = f64), ((0x4202A05F as u64) << 32) | (0x20000000 as u64), c)
+    testa_longa_f64(transmute(((0x4202A05F as u64) << 32) | (0x20000000 as u64), to = f64), ((0x4202A05F as u64) << 32) | (0x20000000 as u64), "10000000000.000000000000000000", "10000000000.000000000000000000000000000000", c)
+    testa_f64(transmute(((0x42374876 as u64) << 32) | (0xE8000000 as u64), to = f64), ((0x42374876 as u64) << 32) | (0xE8000000 as u64), c)
+    testa_longa_f64(transmute(((0x42374876 as u64) << 32) | (0xE8000000 as u64), to = f64), ((0x42374876 as u64) << 32) | (0xE8000000 as u64), "100000000000.000000000000000000", "100000000000.000000000000000000000000000000", c)
+    testa_f64(transmute(((0x426D1A94 as u64) << 32) | (0xA2000000 as u64), to = f64), ((0x426D1A94 as u64) << 32) | (0xA2000000 as u64), c)
+    testa_longa_f64(transmute(((0x426D1A94 as u64) << 32) | (0xA2000000 as u64), to = f64), ((0x426D1A94 as u64) << 32) | (0xA2000000 as u64), "1000000000000.000000000000000000", "1000000000000.000000000000000000000000000000", c)
+    testa_f64(transmute(((0x42A2309C as u64) << 32) | (0xE5400000 as u64), to = f64), ((0x42A2309C as u64) << 32) | (0xE5400000 as u64), c)
+    testa_longa_f64(transmute(((0x42A2309C as u64) << 32) | (0xE5400000 as u64), to = f64), ((0x42A2309C as u64) << 32) | (0xE5400000 as u64), "10000000000000.000000000000000000", "10000000000000.000000000000000000000000000000", c)
+    testa_f64(transmute(((0x42D6BCC4 as u64) << 32) | (0x1E900000 as u64), to = f64), ((0x42D6BCC4 as u64) << 32) | (0x1E900000 as u64), c)
+    testa_longa_f64(transmute(((0x42D6BCC4 as u64) << 32) | (0x1E900000 as u64), to = f64), ((0x42D6BCC4 as u64) << 32) | (0x1E900000 as u64), "100000000000000.000000000000000000", "100000000000000.000000000000000000000000000000", c)
+    testa_f64(transmute(((0x430C6BF5 as u64) << 32) | (0x26340000 as u64), to = f64), ((0x430C6BF5 as u64) << 32) | (0x26340000 as u64), c)
+    testa_longa_f64(transmute(((0x430C6BF5 as u64) << 32) | (0x26340000 as u64), to = f64), ((0x430C6BF5 as u64) << 32) | (0x26340000 as u64), "1000000000000000.000000000000000000", "1000000000000000.000000000000000000000000000000", c)
+    testa_f64(transmute(((0x4341C379 as u64) << 32) | (0x37E08000 as u64), to = f64), ((0x4341C379 as u64) << 32) | (0x37E08000 as u64), c)
+    testa_longa_f64(transmute(((0x4341C379 as u64) << 32) | (0x37E08000 as u64), to = f64), ((0x4341C379 as u64) << 32) | (0x37E08000 as u64), "10000000000000000.000000000000000000", "10000000000000000.000000000000000000000000000000", c)
+    testa_f64(transmute(((0x43763457 as u64) << 32) | (0x85D8A000 as u64), to = f64), ((0x43763457 as u64) << 32) | (0x85D8A000 as u64), c)
+    testa_longa_f64(transmute(((0x43763457 as u64) << 32) | (0x85D8A000 as u64), to = f64), ((0x43763457 as u64) << 32) | (0x85D8A000 as u64), "100000000000000000.000000000000000000", "100000000000000000.000000000000000000000000000000", c)
+    testa_f64(transmute(((0x43ABC16D as u64) << 32) | (0x674EC800 as u64), to = f64), ((0x43ABC16D as u64) << 32) | (0x674EC800 as u64), c)
+    testa_longa_f64(transmute(((0x43ABC16D as u64) << 32) | (0x674EC800 as u64), to = f64), ((0x43ABC16D as u64) << 32) | (0x674EC800 as u64), "1000000000000000000.000000000000000000", "1000000000000000000.000000000000000000000000000000", c)
+    testa_f64(transmute(((0x43E158E4 as u64) << 32) | (0x60913D00 as u64), to = f64), ((0x43E158E4 as u64) << 32) | (0x60913D00 as u64), c)
+    testa_longa_f64(transmute(((0x43E158E4 as u64) << 32) | (0x60913D00 as u64), to = f64), ((0x43E158E4 as u64) << 32) | (0x60913D00 as u64), "10000000000000000000.000000000000000000", "10000000000000000000.000000000000000000000000000000", c)
+    testa_f64(transmute(((0x4415AF1D as u64) << 32) | (0x78B58C40 as u64), to = f64), ((0x4415AF1D as u64) << 32) | (0x78B58C40 as u64), c)
+    testa_longa_f64(transmute(((0x4415AF1D as u64) << 32) | (0x78B58C40 as u64), to = f64), ((0x4415AF1D as u64) << 32) | (0x78B58C40 as u64), "100000000000000000000.000000000000000000", "100000000000000000000.000000000000000000000000000000", c)
+    testa_f64(transmute(((0x444B1AE4 as u64) << 32) | (0xD6E2EF50 as u64), to = f64), ((0x444B1AE4 as u64) << 32) | (0xD6E2EF50 as u64), c)
+    testa_longa_f64(transmute(((0x444B1AE4 as u64) << 32) | (0xD6E2EF50 as u64), to = f64), ((0x444B1AE4 as u64) << 32) | (0xD6E2EF50 as u64), "1000000000000000000000.000000000000000000", "1000000000000000000000.000000000000000000000000000000", c)
+    testa_f64(transmute(((0x4480F0CF as u64) << 32) | (0x064DD592 as u64), to = f64), ((0x4480F0CF as u64) << 32) | (0x064DD592 as u64), c)
+    testa_longa_f64(transmute(((0x4480F0CF as u64) << 32) | (0x064DD592 as u64), to = f64), ((0x4480F0CF as u64) << 32) | (0x064DD592 as u64), "10000000000000000000000.000000000000000000", "10000000000000000000000.000000000000000000000000000000", c)
+    testa_f64(transmute(0x7FF8000000000000 as u64, to = f64), 0x7FF8000000000000 as u64, c)
+    testa_longa_f64(transmute(0x7FF8000000000000 as u64, to = f64), 0x7FF8000000000000 as u64, "nan", "nan", c)
+    testa_f64(transmute(0x7FF0000000000000 as u64, to = f64), 0x7FF0000000000000 as u64, c)
+    testa_longa_f64(transmute(0x7FF0000000000000 as u64, to = f64), 0x7FF0000000000000 as u64, "inf", "inf", c)
+    testa_f64(transmute(((1 as u64) << 63) | (0x7FF0000000000000 as u64), to = f64), ((1 as u64) << 63) | (0x7FF0000000000000 as u64), c)
+    testa_longa_f64(transmute(((1 as u64) << 63) | (0x7FF0000000000000 as u64), to = f64), ((1 as u64) << 63) | (0x7FF0000000000000 as u64), "-inf", "-inf", c)
+}
+
+proc testa_bordas_f32(c: ^Contagem) {
+    testa_f32(transmute(0x00000000 as u32, to = f32) as f64, 0x00000000 as u64, c)
+    testa_f32(transmute(0x80000000 as u32, to = f32) as f64, 0x80000000 as u64, c)
+    testa_f32(transmute(0x00000001 as u32, to = f32) as f64, 0x00000001 as u64, c)
+    testa_f32(transmute(0x7F7FFFFF as u32, to = f32) as f64, 0x7F7FFFFF as u64, c)
+    testa_f32(transmute(0x00800000 as u32, to = f32) as f64, 0x00800000 as u64, c)
+    testa_f32(transmute(0x3DCCCCCD as u32, to = f32) as f64, 0x3DCCCCCD as u64, c)
+    testa_f32(transmute(0x3EAAAAAB as u32, to = f32) as f64, 0x3EAAAAAB as u64, c)
+    testa_f32(transmute(0x7FC00000 as u32, to = f32) as f64, 0x7FC00000 as u64, c)
+    testa_f32(transmute(0x7F800000 as u32, to = f32) as f64, 0x7F800000 as u64, c)
+    testa_f32(transmute(0xFF800000 as u32, to = f32) as f64, 0xFF800000 as u64, c)
+    testa_f32(transmute(0x4B000000 as u32, to = f32) as f64, 0x4B000000 as u64, c)
+    testa_f32(transmute(0x42C80000 as u32, to = f32) as f64, 0x42C80000 as u64, c)
+}

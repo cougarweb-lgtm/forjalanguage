@@ -1,0 +1,180 @@
+// std:fmt - formatacao e leitura por regiao (locale): numero, inteiro, porcentagem (IA1-S2e); dinheiro e leitura estrita (IA1-S2f); conta de dinheiro exata, compacto e bytes (IA1-S2g); datas, horas e duracao (IA1-S2h). API em ingles (ADR-39); Forja pura, igual nos 2 backends.
+// Versao: 0.5.0. Changelog: 0.5.0 - B01e2: as formas donas de number, money e date (number, integer, percent, compact, bytes, fixed, money, split_even, allocate, format_pattern, format_date, format_time, format_datetime, format_duration) ganham `alloc: Allocator`; nenhum import novo. 0.4.0 - IA1-S2h: import de std:time (tm.DateTime, usado por fmt/date.fj); datas, horas e duracao em fmt/date.fj (DateStyle, DateError, format_date, format_time, format_datetime, format_pattern, parse_date, parse_time, parse_pattern, format_duration e write_*), 6o pedaco. 0.3.0 - IA1-S2g: MoneyError, mul_div_round, split_even e allocate em fmt/money.fj; compact, write_compact, bytes e write_bytes em fmt/number.fj (nenhum import novo, nenhum pedaco novo). 0.2.0 - IA1-S2f: import de std:text (parse_float, usado por fmt/parse.fj); dinheiro em fmt/money.fj (fixed, money, write_fixed, write_money); leitura em fmt/parse.fj (ParseError, parse_number, parse_integer, parse_fixed, parse_money, parse_percent). 0.1.0 - IA1-S2e: Rounding, Locale, as 9 constantes de regiao, LOCALES, find_locale (aqui); number, integer, percent e write_* (fmt/number.fj); motor de digitos (fmt/digitos.fj).
+// Este arquivo e o nucleo do modulo std:fmt: os pedacos std\fmt\*.fj sao concatenados a ele (D-S2-ORG) e so este tem `import`.
+import "std:text" as tx
+import "std:time" as tm
+//
+// Locale e um valor (struct) constante: PT_BR, EN_US, EN_GB, ES_ES, FR_FR, DE_DE, IT_IT, PT_PT e ISO (sem milhar, ponto decimal, data aaaa-mm-dd). Todas as procs de formatacao pedem `loc: Locale` sempre (sem padrao: a regiao e sempre uma escolha explicita).
+// Na SAIDA todo espaco e U+0020, mesmo onde o CLDR usa NBSP (U+00A0) ou U+202F (fr-FR, pt-PT, moeda): assim o texto formatado bate com o texto digitado. O PARSE (S2f) aceita U+0020, U+00A0 e U+202F.
+// Dados das tabelas: CLDR (nomes de mes e de dia, separadores, padroes de data/hora em subconjunto LDML: d dd M MM MMM MMMM yy yyyy E EEEE H HH h hh m mm s ss a 'literal'). Dia da semana: indice 0 = domingo, como em time.weekday.
+// compact_k/m/b/t: sufixo de mil, milhao, bilhao, trilhao (uso em S2g); onde o CLDR nao abrevia o milhar (de-DE, it-IT) a tabela traz a forma usual (" Tsd.", " mila"). dur_*: sufixo de hora, minuto, segundo e milissegundo (S2h poe o espaco).
+// find_locale casa a tag EXATA (nao ignora caixa nem troca '_' por '-'): "pt-BR" acha PT_BR; "pt-br" e "pt_BR" nao acham nada.
+
+// Como o valor e arredondado ao cortar casas. Todos olham so o MODULO do valor (simetricos no sinal): -2,5 e 2,5 dao -3 e 3 em half_up.
+// half_up: meio vai para longe do zero (padrao de exibicao: Excel, calculadora). half_even: meio vai para o par (ABNT NBR 5891, "banqueiro"). half_down: meio vai para perto do zero. up: afasta do zero sempre que sobra algo. down: trunca.
+pub enum Rounding { half_up, half_even, half_down, up, down }
+
+// Tudo o que muda de uma regiao para outra. group_size 0 = sem separador de milhar; min_group_digits = quantos algarismos devem haver ANTES do 1o separador (es-ES e pt-PT: 2, entao "1234" mas "12.345").
+// currency_before: simbolo antes do numero; currency_space: espaco entre simbolo e numero; percent_space: espaco antes do "%".
+pub struct Locale {
+    tag: str
+    decimal_sep: str
+    group_sep: str
+    group_size: int
+    min_group_digits: int
+    currency_symbol: str
+    currency_code: str
+    currency_before: bool
+    currency_space: bool
+    percent_space: bool
+    compact_k: str
+    compact_m: str
+    compact_b: str
+    compact_t: str
+    months_long: [12]str
+    months_short: [12]str
+    weekdays_long: [7]str
+    weekdays_short: [7]str
+    am_text: str
+    pm_text: str
+    date_short: str
+    date_long: str
+    date_full: str
+    time_short: str
+    time_medium: str
+    dur_h: str
+    dur_min: str
+    dur_s: str
+    dur_ms: str
+}
+
+pub const PT_BR: Locale = Locale{
+    tag = "pt-BR", decimal_sep = ",", group_sep = ".", group_size = 3, min_group_digits = 1,
+    currency_symbol = "R$", currency_code = "BRL", currency_before = true, currency_space = true, percent_space = false,
+    compact_k = " mil", compact_m = " mi", compact_b = " bi", compact_t = " tri",
+    months_long = {"janeiro", "fevereiro", "março", "abril", "maio", "junho", "julho", "agosto", "setembro", "outubro", "novembro", "dezembro"},
+    months_short = {"jan.", "fev.", "mar.", "abr.", "mai.", "jun.", "jul.", "ago.", "set.", "out.", "nov.", "dez."},
+    weekdays_long = {"domingo", "segunda-feira", "terça-feira", "quarta-feira", "quinta-feira", "sexta-feira", "sábado"},
+    weekdays_short = {"dom.", "seg.", "ter.", "qua.", "qui.", "sex.", "sáb."},
+    am_text = "AM", pm_text = "PM",
+    date_short = "dd/MM/yyyy", date_long = "d 'de' MMMM 'de' yyyy", date_full = "EEEE, d 'de' MMMM 'de' yyyy",
+    time_short = "HH:mm", time_medium = "HH:mm:ss",
+    dur_h = "h", dur_min = "min", dur_s = "s", dur_ms = "ms"}
+
+pub const EN_US: Locale = Locale{
+    tag = "en-US", decimal_sep = ".", group_sep = ",", group_size = 3, min_group_digits = 1,
+    currency_symbol = "$", currency_code = "USD", currency_before = true, currency_space = false, percent_space = false,
+    compact_k = "K", compact_m = "M", compact_b = "B", compact_t = "T",
+    months_long = {"January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"},
+    months_short = {"Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"},
+    weekdays_long = {"Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"},
+    weekdays_short = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"},
+    am_text = "AM", pm_text = "PM",
+    date_short = "M/d/yyyy", date_long = "MMMM d, yyyy", date_full = "EEEE, MMMM d, yyyy",
+    time_short = "h:mm a", time_medium = "h:mm:ss a",
+    dur_h = "h", dur_min = "min", dur_s = "s", dur_ms = "ms"}
+
+pub const EN_GB: Locale = Locale{
+    tag = "en-GB", decimal_sep = ".", group_sep = ",", group_size = 3, min_group_digits = 1,
+    currency_symbol = "£", currency_code = "GBP", currency_before = true, currency_space = false, percent_space = false,
+    compact_k = "K", compact_m = "M", compact_b = "B", compact_t = "T",
+    months_long = {"January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"},
+    months_short = {"Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sept", "Oct", "Nov", "Dec"},
+    weekdays_long = {"Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"},
+    weekdays_short = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"},
+    am_text = "am", pm_text = "pm",
+    date_short = "dd/MM/yyyy", date_long = "d MMMM yyyy", date_full = "EEEE d MMMM yyyy",
+    time_short = "HH:mm", time_medium = "HH:mm:ss",
+    dur_h = "h", dur_min = "min", dur_s = "s", dur_ms = "ms"}
+
+pub const ES_ES: Locale = Locale{
+    tag = "es-ES", decimal_sep = ",", group_sep = ".", group_size = 3, min_group_digits = 2,
+    currency_symbol = "€", currency_code = "EUR", currency_before = false, currency_space = true, percent_space = true,
+    compact_k = " mil", compact_m = " M", compact_b = " mil M", compact_t = " B",
+    months_long = {"enero", "febrero", "marzo", "abril", "mayo", "junio", "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre"},
+    months_short = {"ene", "feb", "mar", "abr", "may", "jun", "jul", "ago", "sept", "oct", "nov", "dic"},
+    weekdays_long = {"domingo", "lunes", "martes", "miércoles", "jueves", "viernes", "sábado"},
+    weekdays_short = {"dom", "lun", "mar", "mié", "jue", "vie", "sáb"},
+    am_text = "a. m.", pm_text = "p. m.",
+    date_short = "d/M/yyyy", date_long = "d 'de' MMMM 'de' yyyy", date_full = "EEEE, d 'de' MMMM 'de' yyyy",
+    time_short = "H:mm", time_medium = "H:mm:ss",
+    dur_h = "h", dur_min = "min", dur_s = "s", dur_ms = "ms"}
+
+pub const FR_FR: Locale = Locale{
+    tag = "fr-FR", decimal_sep = ",", group_sep = " ", group_size = 3, min_group_digits = 1,
+    currency_symbol = "€", currency_code = "EUR", currency_before = false, currency_space = true, percent_space = true,
+    compact_k = " k", compact_m = " M", compact_b = " Md", compact_t = " Bn",
+    months_long = {"janvier", "février", "mars", "avril", "mai", "juin", "juillet", "août", "septembre", "octobre", "novembre", "décembre"},
+    months_short = {"janv.", "févr.", "mars", "avr.", "mai", "juin", "juil.", "août", "sept.", "oct.", "nov.", "déc."},
+    weekdays_long = {"dimanche", "lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi"},
+    weekdays_short = {"dim.", "lun.", "mar.", "mer.", "jeu.", "ven.", "sam."},
+    am_text = "AM", pm_text = "PM",
+    date_short = "dd/MM/yyyy", date_long = "d MMMM yyyy", date_full = "EEEE d MMMM yyyy",
+    time_short = "HH:mm", time_medium = "HH:mm:ss",
+    dur_h = "h", dur_min = "min", dur_s = "s", dur_ms = "ms"}
+
+pub const DE_DE: Locale = Locale{
+    tag = "de-DE", decimal_sep = ",", group_sep = ".", group_size = 3, min_group_digits = 1,
+    currency_symbol = "€", currency_code = "EUR", currency_before = false, currency_space = true, percent_space = true,
+    compact_k = " Tsd.", compact_m = " Mio.", compact_b = " Mrd.", compact_t = " Bio.",
+    months_long = {"Januar", "Februar", "März", "April", "Mai", "Juni", "Juli", "August", "September", "Oktober", "November", "Dezember"},
+    months_short = {"Jan.", "Feb.", "März", "Apr.", "Mai", "Juni", "Juli", "Aug.", "Sept.", "Okt.", "Nov.", "Dez."},
+    weekdays_long = {"Sonntag", "Montag", "Dienstag", "Mittwoch", "Donnerstag", "Freitag", "Samstag"},
+    weekdays_short = {"So.", "Mo.", "Di.", "Mi.", "Do.", "Fr.", "Sa."},
+    am_text = "AM", pm_text = "PM",
+    date_short = "dd.MM.yyyy", date_long = "d. MMMM yyyy", date_full = "EEEE, d. MMMM yyyy",
+    time_short = "HH:mm", time_medium = "HH:mm:ss",
+    dur_h = "Std.", dur_min = "Min.", dur_s = "Sek.", dur_ms = "ms"}
+
+pub const IT_IT: Locale = Locale{
+    tag = "it-IT", decimal_sep = ",", group_sep = ".", group_size = 3, min_group_digits = 1,
+    currency_symbol = "€", currency_code = "EUR", currency_before = false, currency_space = true, percent_space = false,
+    compact_k = " mila", compact_m = " Mln", compact_b = " Mrd", compact_t = " Bln",
+    months_long = {"gennaio", "febbraio", "marzo", "aprile", "maggio", "giugno", "luglio", "agosto", "settembre", "ottobre", "novembre", "dicembre"},
+    months_short = {"gen", "feb", "mar", "apr", "mag", "giu", "lug", "ago", "set", "ott", "nov", "dic"},
+    weekdays_long = {"domenica", "lunedì", "martedì", "mercoledì", "giovedì", "venerdì", "sabato"},
+    weekdays_short = {"dom", "lun", "mar", "mer", "gio", "ven", "sab"},
+    am_text = "AM", pm_text = "PM",
+    date_short = "dd/MM/yyyy", date_long = "d MMMM yyyy", date_full = "EEEE d MMMM yyyy",
+    time_short = "HH:mm", time_medium = "HH:mm:ss",
+    dur_h = "h", dur_min = "min", dur_s = "s", dur_ms = "ms"}
+
+pub const PT_PT: Locale = Locale{
+    tag = "pt-PT", decimal_sep = ",", group_sep = " ", group_size = 3, min_group_digits = 2,
+    currency_symbol = "€", currency_code = "EUR", currency_before = false, currency_space = true, percent_space = false,
+    compact_k = " mil", compact_m = " M", compact_b = " mM", compact_t = " Bi",
+    months_long = {"janeiro", "fevereiro", "março", "abril", "maio", "junho", "julho", "agosto", "setembro", "outubro", "novembro", "dezembro"},
+    months_short = {"jan.", "fev.", "mar.", "abr.", "mai.", "jun.", "jul.", "ago.", "set.", "out.", "nov.", "dez."},
+    weekdays_long = {"domingo", "segunda-feira", "terça-feira", "quarta-feira", "quinta-feira", "sexta-feira", "sábado"},
+    weekdays_short = {"dom.", "seg.", "ter.", "qua.", "qui.", "sex.", "sáb."},
+    am_text = "AM", pm_text = "PM",
+    date_short = "dd/MM/yyyy", date_long = "d 'de' MMMM 'de' yyyy", date_full = "EEEE, d 'de' MMMM 'de' yyyy",
+    time_short = "HH:mm", time_medium = "HH:mm:ss",
+    dur_h = "h", dur_min = "min", dur_s = "s", dur_ms = "ms"}
+
+// Regiao neutra para arquivo, log e troca de dados: ponto decimal, sem milhar, data aaaa-mm-dd, hora de 24 h, nomes em ingles, moeda pelo codigo (o simbolo e o sinal generico de moeda).
+pub const ISO: Locale = Locale{
+    tag = "ISO", decimal_sep = ".", group_sep = "", group_size = 0, min_group_digits = 1,
+    currency_symbol = "¤", currency_code = "XXX", currency_before = true, currency_space = true, percent_space = false,
+    compact_k = "K", compact_m = "M", compact_b = "B", compact_t = "T",
+    months_long = {"January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"},
+    months_short = {"Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"},
+    weekdays_long = {"Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"},
+    weekdays_short = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"},
+    am_text = "AM", pm_text = "PM",
+    date_short = "yyyy-MM-dd", date_long = "yyyy-MM-dd", date_full = "yyyy-MM-dd",
+    time_short = "HH:mm", time_medium = "HH:mm:ss",
+    dur_h = "h", dur_min = "min", dur_s = "s", dur_ms = "ms"}
+
+// As 9 regioes na ordem PT_BR, EN_US, EN_GB, ES_ES, FR_FR, DE_DE, IT_IT, PT_PT, ISO.
+pub const LOCALES: [9]Locale = {PT_BR, EN_US, EN_GB, ES_ES, FR_FR, DE_DE, IT_IT, PT_PT, ISO}
+
+// A regiao de tag exata ("pt-BR", "en-US", ..., "ISO"), ou none. Nao ignora caixa nem aceita '_'.
+pub proc find_locale(tag: str) -> ?Locale {
+    for i in 0..<9 {
+        if LOCALES[i].tag == tag {
+            return LOCALES[i]
+        }
+    }
+    return none
+}

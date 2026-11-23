@@ -1,0 +1,203 @@
+// nativo/x64/x64_isel_otim_fluxo.fj - porte de compiler/nativo/x64/x64_isel_otim_fluxo.c
+// sha256 de nativo/x64/x64_isel_otim_fluxo.c: 764bac0a6dd3ff99161d321f646c42f09f1d57c459a42993098fa571ce101413
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "common"
+import "nativo/bir"
+
+// C: nativo/x64/x64_isel_otim_fluxo.c:14
+proc classe_de_conta_2(classe: u8) -> bool {
+    return (classe == (bir.BC_I32 as u8)) or (classe == (bir.BC_I64 as u8))
+}
+
+// C: nativo/x64/x64_isel_otim_fluxo.c:20
+proc emitir_cmp_inteiro(c: ^X64Ctx, i: ^bir.BirInstr) -> bool {
+    let larg: u8 = isel_indice_largura(i.a.classe)
+    var bits: u8 = 32
+    var forma_teste: u16 = FX_TEST32_RR as u16
+    if larg == 1 {
+        bits = 64
+        forma_teste = FX_TEST64_RR as u16
+    }
+    let formas: FormasAritmeticas = formas_de_operacao(bir.BIR_CMP as u8)
+    var imm: i64 = 0
+    var ok: bool = false
+    let esq: i32 = isel_otim_fonte(c, &i.a, X64_RAX, &ok)
+    if not ok {
+        return false
+    }
+    if isel_otim_imediato(&i.b, &imm) {
+        // C: cmp com 0 vira test a,a (mesmas flags ZF/SF/PF, CF = OF = 0)
+        if imm == 0 {
+            return x64_emitir(c, mi2(forma_teste, m_reg(esq, bits), m_reg(esq, bits)))
+        }
+        return x64_emitir(c, mi2(formas.ri[larg], m_reg(esq, bits), m_imed(imm)))
+    }
+    let dir: i32 = isel_otim_fonte(c, &i.b, X64_RCX, &ok)
+    if not ok {
+        return false
+    }
+    return x64_emitir(c, mi2(formas.rr[larg], m_reg(esq, bits), m_reg(dir, bits)))
+}
+
+// C: nativo/x64/x64_isel_otim_fluxo.c:42
+proc emitir_salto_condicional(c: ^X64Ctx, desvia: ^bir.BirInstr, cc: i32) -> bool {
+    let proximo: u32 = quadro_proximo_bloco(c)
+    if (desvia.alvo[0] == proximo) and (desvia.alvo[1] != proximo) {
+        return x64_emitir(c, mi_cc(FX_JCC_REL32 as u16, transmute(common.c2f_s2u_32(cc) ~ 1, to = i32), m_bloco(desvia.alvo[1])))
+    }
+    if not x64_emitir(c, mi_cc(FX_JCC_REL32 as u16, cc, m_bloco(desvia.alvo[0]))) {
+        return false
+    }
+    return isel_salto(c, desvia.alvo[1])
+}
+
+// C: nativo/x64/x64_isel_otim_fluxo.c:54
+proc isel_otim_flags_cmp_inteiro(c: ^X64Ctx, i: ^bir.BirInstr, cc: ^i32) -> i32 {
+    if (not classe_de_conta_2(i.a.classe)) or (i.b.classe != i.a.classe) or (i.aux >= 10) {
+        return 0
+    }
+    if not emitir_cmp_inteiro(c, i) {
+        return -1
+    }
+    cc^ = CC_DA_COND_2[i.aux]
+    return 1
+}
+
+// C: nativo/x64/x64_isel_otim_fluxo.c:64
+proc isel_otim_compara_desvia(c: ^X64Ctx, bloco: ^bir.BirBloco, k: u32) -> i32 {
+    let cmp: ^bir.BirInstr = &bloco.instrs[k]
+    let desvia: ^bir.BirInstr = &bloco.instrs[k + 1]
+    var cc: i32 = X64_CC_E
+    var r: i32 = 0
+    if (desvia.op != (bir.BIR_DESVIA as u8)) or (desvia.a.tipo != (bir.BO_VREG as u8)) or (desvia.a.id != cmp.dst) or (not isel_otim_temp_unico(c, cmp.dst)) {
+        return 0
+    }
+    if bir.bir_classe_eh_real(cmp.a.classe as i32) {
+        r = isel_otim_cmp_real(c, cmp, &cc)
+    } else {
+        r = isel_otim_flags_cmp_inteiro(c, cmp, &cc)
+    }
+    if r <= 0 {
+        return r
+    }
+    // C: c->instr = desvia (convencao do main: slice de 1 + indice dentro do bloco)
+    c.instr = slice_from(desvia, len = 1)
+    c.instr_idx = (k + 1) as int
+    if emitir_salto_condicional(c, desvia, cc) {
+        return 2
+    }
+    return -1
+}
+
+// C: nativo/x64/x64_isel_otim_fluxo.c:81
+proc isel_otim_compara(c: ^X64Ctx, i: ^bir.BirInstr) -> i32 {
+    var cc: i32 = 0
+    let r: i32 = isel_otim_flags_cmp_inteiro(c, i, &cc)
+    if r <= 0 {
+        return r
+    }
+    if not x64_emitir(c, mi_cc(FX_SETCC8_R as u16, cc, m_reg(X64_RAX, 8))) {
+        return -1
+    }
+    var tern_1: i32 = -1
+    if common.c2f_b2i32(isel_guardar(c, i.dst, X64_RAX)) != 0 {
+        tern_1 = 1
+    }
+    return tern_1
+}
+
+// C: nativo/x64/x64_isel_otim_fluxo.c:94
+proc isel_otim_desvia(c: ^X64Ctx, i: ^bir.BirInstr) -> i32 {
+    let r: i32 = isel_otim_reg_int(c, &i.a)
+    if r < 0 {
+        return 0
+    }
+    let arg_1: MOperando = m_reg(r, 32)
+    let arg_2: MOperando = m_reg(r, 32)
+    if not x64_emitir(c, mi2(FX_TEST32_RR as u16, arg_2, arg_1)) {
+        return -1
+    }
+    var tern_1: i32 = -1
+    if common.c2f_b2i32(emitir_salto_condicional(c, i, X64_CC_NE)) != 0 {
+        tern_1 = 1
+    }
+    return tern_1
+}
+
+// C: nativo/x64/x64_isel_otim_fluxo.c:108
+proc destino_eh_operando(i: ^bir.BirInstr) -> bool {
+    let args: []bir.BirOperando = i.args or_else {}
+    let ops: [4]bir.BirOperando = {i.a, i.b, args[0], args[1]}
+    for k in (0 as u32)..<4 {
+        if (ops[k].tipo == (bir.BO_VREG as u8)) and (ops[k].id == i.dst) {
+            return true
+        }
+    }
+    return false
+}
+
+// C: nativo/x64/x64_isel_otim_fluxo.c:120
+proc flags_da_selecao(c: ^X64Ctx, i: ^bir.BirInstr, cc: ^i32) -> bool {
+    let args: []bir.BirOperando = i.args or_else {}
+    var cmp: bir.BirInstr = bir.BirInstr{op = bir.BIR_CMP as u8, classe = bir.BC_I8 as u8, aux = i.aux, dst = bir.BIR_SEM_VREG, a = args[0], b = args[1]}
+    let com_sinal: bool = (i.aux >= (bir.BCOND_LT_S as u8)) and (i.aux <= (bir.BCOND_GE_S as u8))
+    let r: i32 = isel_otim_flags_cmp_inteiro(c, &cmp, cc)
+    if r != 0 {
+        return r > 0
+    }
+    // C: aux fora da tabela CC_DA_COND (10 entradas) ou a conta comum sem efeito = falha
+    if (i.aux >= 10) or (not isel_operacao(c, &cmp, bir.BIR_CMP as u8, isel_extensao_da_conta(cmp.a.classe, com_sinal))) {
+        return false
+    }
+    cc^ = CC_DA_COND_2[i.aux]
+    return true
+}
+
+// C: nativo/x64/x64_isel_otim_fluxo.c:135
+proc seleciona_inteiro(c: ^X64Ctx, i: ^bir.BirInstr) -> bool {
+    let bits: u8 = common.c2f_trunc_u8((32 << (common.c2f_s2u_32((isel_indice_largura(i.classe) as i32)) & 31)) as u64)
+    let casa: i32 = isel_otim_reg_destino(c, i.dst)
+    let direto: bool = (casa >= 0) and (not destino_eh_operando(i))
+    var tern_1: u32 = X64_RAX as u32
+    if common.c2f_b2i32(direto) != 0 {
+        tern_1 = common.c2f_s2u_32(casa)
+    }
+    let dst: i32 = transmute(tern_1, to = i32)
+    var origem: i32 = 0
+    var cc: i32 = 0
+    var cmov: MInstr = MInstr{}
+    var ok: bool = false
+    if (not flags_da_selecao(c, i, &cc)) or (not isel_otim_carregar_em(c, dst, &i.b, bir.BE_NENHUMA as u8)) {
+        return false
+    }
+    origem = isel_otim_fonte(c, &i.a, X64_RCX, &ok)
+    if not ok {
+        return false
+    }
+    var tern_2: i32 = FX_CMOV32_RR
+    if bits == 64 {
+        tern_2 = FX_CMOV64_RR
+    }
+    let arg_1: MOperando = m_reg(origem, bits)
+    let arg_2: MOperando = m_reg(dst, bits)
+    let arg_3: u16 = tern_2 as u16
+    cmov = mi2(arg_3, arg_2, arg_1)
+    cmov.cond = cc
+    if not x64_emitir(c, cmov) {
+        return false
+    }
+    return (common.c2f_b2i32(direto) != 0) or (common.c2f_b2i32(isel_guardar(c, i.dst, X64_RAX)) != 0)
+}
+
+// C: nativo/x64/x64_isel_otim_fluxo.c:158
+proc isel_seleciona(c: ^X64Ctx, i: ^bir.BirInstr) -> bool {
+    var tern_1: i32 = 0
+    if common.c2f_b2i32(bir.bir_classe_eh_real(i.classe as i32)) != 0 {
+        tern_1 = common.c2f_b2i32(isel_otim_seleciona_real(c, i))
+    } else {
+        tern_1 = common.c2f_b2i32(seleciona_inteiro(c, i))
+    }
+    return tern_1 != 0
+}

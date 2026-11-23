@@ -1,0 +1,511 @@
+// std:process - testes do modulo (POS-Z A51). Anexados ao texto de std:process SO em forja test std:process (o build normal nao os ve).
+// Versao: 0.5.0. Changelog: 0.5.0 - D-G3-L2b: wait_any, pid, peak_memory, cpu_times, Stdio e recusas no Linux (/bin/sh); last_error depois de spawn tambem no Linux. 0.4.0 - D-G3-L2a blocos C e D: Stdio (file, null, inherit, recusas) e os.last_error depois de spawn (so no Windows). 0.3.0 - D-G3-L2a bloco B: wait_any, pid/pid_alive, peak_memory e cpu_times (so no Windows). 0.2.0 - M5 P28b-2b: mem_limit_bytes (PowerShell aloca 600 MiB: sem limite e com 2 GiB passa, com 300 MiB o catch dele sai 3 e o pai segue). 0.1.0 - A51: run (codigo, stdout, stderr), env que substitui, cwd, saida maior que o pipe, timeout que mata a arvore, erros (not_found, invalid_input), aspas da linha de comando, spawn/kill/close.
+// Roda cmd.exe (existe em todo Windows); sem arquivo auxiliar. Sem import e sem proc main: o pedaco fica dentro do modulo, entao chama as procs dele SEM prefixo.
+
+const TESTE_TIMEOUT_MS: int = 300
+
+// true se os bytes de b sao exatamente o texto s.
+proc bytes_sao(b: []u8, s: str) -> bool {
+    if len(b) != len(s) {
+        return false
+    }
+    for i in 0..<len(s) {
+        if b[i] != s[i] {
+            return false
+        }
+    }
+    return true
+}
+
+// Roda "cmd.exe /c <linha>" com ambiente herdado, na pasta do pai e sem limite de tempo.
+proc rodar_cmd(linha: str, alloc: Allocator) -> Output ! ProcessError {
+    var args: [2]str = {"/c", linha}
+    return run(Command{program = "cmd.exe", args = args[..], env = {}, cwd = "", timeout_ms = 0}, alloc = alloc)
+}
+
+test "run devolve codigo, stdout e stderr separados" {
+    switch r in rodar_cmd("echo ola& echo erro 1>&2& exit 3", alloc = heap) {
+    case Output:
+        expect(r.code == 3)
+        expect(bytes_sao(r.stdout[..], "ola\r\n"))
+        expect(len(r.stderr) > 0)
+        expect(not r.timed_out)
+        delete(r.stdout)
+        delete(r.stderr)
+    case ProcessError:
+        expect(false)
+    }
+}
+
+test "saida maior que o pipe nao trava" {
+    switch r in rodar_cmd("for /l %i in (1,1,30000) do @echo linha%i", alloc = heap) {
+    case Output:
+        expect(r.code == 0)
+        expect(len(r.stdout) > 200000)
+        delete(r.stdout)
+        delete(r.stderr)
+    case ProcessError:
+        expect(false)
+    }
+}
+
+test "env substitui o ambiente e cwd muda a pasta" {
+    var args: [2]str = {"/c", "echo %S4_PROC_X%& cd"}
+    var env: [1]str = {"S4_PROC_X=valor"}
+    let cmd = Command{program = "cmd.exe", args = args[..], env = env[..], cwd = "C:\\Windows", timeout_ms = 0}
+    switch r in run(cmd, alloc = heap) {
+    case Output:
+        expect(bytes_sao(r.stdout[..], "valor\r\nC:\\Windows\r\n"))
+        delete(r.stdout)
+        delete(r.stderr)
+    case ProcessError:
+        expect(false)
+    }
+}
+
+test "timeout mata o filho e a arvore e marca timed_out" {
+    var args: [2]str = {"/c", "ping -n 30 127.0.0.1"}
+    let inicio = os.time_ns()
+    let cmd = Command{program = "cmd.exe", args = args[..], env = {}, cwd = "", timeout_ms = TESTE_TIMEOUT_MS}
+    switch r in run(cmd, alloc = heap) {
+    case Output:
+        expect(r.timed_out)
+        expect((os.time_ns() - inicio) / 1000000 < 5000)
+        delete(r.stdout)
+        delete(r.stderr)
+    case ProcessError:
+        expect(false)
+    }
+}
+
+test "programa que nao existe e not_found" {
+    let cmd = Command{program = "forja_programa_que_nao_existe_s4", args = {}, env = {}, cwd = "", timeout_ms = 0}
+    switch r in run(cmd, alloc = heap) {
+    case Output:
+        expect(false)
+        delete(r.stdout)
+        delete(r.stderr)
+    case ProcessError:
+        expect(r == ProcessError.not_found)
+    }
+}
+
+// true se run recusa o comando com invalid_input (sem rodar nada).
+proc recusado_por_entrada(cmd: Command) -> bool {
+    var recusou = false
+    switch r in run(cmd, alloc = heap) {
+    case Output:
+        delete(r.stdout)
+        delete(r.stderr)
+    case ProcessError:
+        recusou = r == ProcessError.invalid_input
+    }
+    return recusou
+}
+
+test "entrada invalida e recusada: programa vazio, .bat e .cmd, item de env sem igual" {
+    var sem_igual: [1]str = {"SEM_IGUAL"}
+    expect(recusado_por_entrada(Command{program = "", args = {}, env = {}, cwd = "", timeout_ms = 0}))
+    expect(recusado_por_entrada(Command{program = "x.BAT", args = {}, env = {}, cwd = "", timeout_ms = 0}))
+    expect(recusado_por_entrada(Command{program = "dir/y.cmd", args = {}, env = {}, cwd = "", timeout_ms = 0}))
+    expect(recusado_por_entrada(Command{program = "cmd.exe", args = {}, env = sem_igual[..], cwd = "", timeout_ms = 0}))
+}
+
+test "aspas da linha de comando seguem o CommandLineToArgvW" {
+    var args: [4]str = {"a b", "", "x\"y", "c\\"}
+    let cmd = Command{program = "C:\\Program Files\\x.exe", args = args[..], env = {}, cwd = "", timeout_ms = 0}
+    var linha = make([dynamic]u8, alloc = heap)
+    defer delete(linha)
+    expect(montar_linha(cmd, linha = &linha))
+    expect(bytes_sao(linha[..], "\"C:\\Program Files\\x.exe\" \"a b\" \"\" \"x\\\"y\" c\\"))
+}
+
+test "spawn, read_available, kill e close" {
+    var args: [2]str = {"/c", "echo oi& ping -n 30 127.0.0.1"}
+    let cmd = Command{program = "cmd.exe", args = args[..], env = {}, cwd = "", timeout_ms = 0}
+    switch p in spawn(cmd) {
+    case Process:
+        var saida = make([dynamic]u8, alloc = heap)
+        var erro = make([dynamic]u8, alloc = heap)
+        var tentativas = 0
+        while len(saida) < 4 and tentativas < 500 {
+            _ = read_available(p, out = &saida, err = &erro)
+            _ = wait(p, timeout_ms = 20)
+            tentativas += 1
+        }
+        expect(not wait(p, timeout_ms = 0))
+        kill(p)
+        expect(wait(p, timeout_ms = 3000))
+        expect(len(saida) >= 4 and bytes_sao(saida[0..<4], "oi\r\n"))
+        close(p)
+        close(p)
+        delete(saida)
+        delete(erro)
+    case ProcessError:
+        expect(false)
+    }
+}
+
+// Codigo de saida do PowerShell que tenta alocar 600 MiB sob mem_limit_bytes = limite: 0 se alocou, 3 se a alocacao falhou (catch do proprio script); -1 se run falhou ou estourou o tempo.
+proc codigo_da_alocacao_grande(limite: u64) -> int {
+    var args: [4]str = {"-NoProfile", "-NonInteractive", "-Command", "try { $a = New-Object byte[] 629145600; exit 0 } catch { exit 3 }"}
+    let cmd = Command{program = "powershell.exe", args = args[..], env = {}, cwd = "", timeout_ms = 60000, mem_limit_bytes = limite}
+    var codigo = -1
+    switch r in run(cmd, alloc = heap) {
+    case Output:
+        codigo = r.code
+        if r.timed_out {
+            codigo = -1
+        }
+        delete(r.stdout)
+        delete(r.stderr)
+    case ProcessError:
+        codigo = -1
+    }
+    return codigo
+}
+
+test "mem_limit_bytes estoura o limite do filho sem derrubar o pai" {
+    expect(codigo_da_alocacao_grande(2147483648) == 0)
+    expect(codigo_da_alocacao_grande(0) == 0)
+    expect(codigo_da_alocacao_grande(314572800) == 3)
+}
+
+// D-G3-L2a bloco B: wait_any, pid, peak_memory e cpu_times. So no Windows (cmd.exe e PowerShell); no Linux o runtime devolve falha ate o L2b, entao o corpo nao roda.
+const TESTE_WINDOWS: str = "x86_64-windows"
+const TESTE_LINUX: str = "x86_64-linux"
+const BYTES_300_MIB: u64 = 314572800
+const NS_60_S: int = 60000000000
+
+// Inicia "cmd.exe /c <linha>"; Process{id = 0} (fechado) se o spawn falhar, e o expect do teste acusa.
+proc iniciar_cmd(linha: str) -> Process {
+    var args: [2]str = {"/c", linha}
+    return spawn(Command{program = "cmd.exe", args = args[..], env = {}, cwd = "", timeout_ms = 0}) or_else Process{id = 0}
+}
+
+// true se wait_any recusa a lista com invalid_input.
+proc wait_any_recusou(ps: []Process) -> bool {
+    var recusou = false
+    switch r in wait_any(ps, timeout_ms = 0) {
+    case int:
+        recusou = false
+    case ProcessError:
+        recusou = r == ProcessError.invalid_input
+    }
+    return recusou
+}
+
+test "wait_any devolve o indice do 1o a terminar, -1 no prazo e recusa lista vazia e handle fechado" {
+    if os.TARGET == TESTE_WINDOWS {
+        let rapido = iniciar_cmd("exit 7")
+        let lento = iniciar_cmd("ping -n 3 127.0.0.1")
+        var dois: [2]Process = {rapido, lento}
+        let primeiro = wait_any(dois[..], timeout_ms = -1) or_else -9
+        expect(primeiro == 0)
+        expect(exit_code(rapido) == 7)
+        var so_lento: [1]Process = {lento}
+        let no_prazo = wait_any(so_lento[..], timeout_ms = 0) or_else -9
+        expect(no_prazo == -1)
+        expect(not os.pid_alive(pid(rapido)))
+        expect(pid(rapido) > 0)
+        expect(os.pid_alive(pid(lento)))
+        kill(lento)
+        close(rapido)
+        close(lento)
+        expect(wait_any_recusou(dois[0..<0]))
+        expect(wait_any_recusou(dois[..]))
+        expect(pid(rapido) == -1)
+        var muitos: [65]Process = {}
+        expect(wait_any_recusou(muitos[..]))
+    }
+}
+
+// Pico de memoria do PowerShell que aloca e toca 300 MiB; 0 se algo falhou.
+proc pico_da_alocacao_de_300_mib() -> u64 {
+    var args: [4]str = {"-NoProfile", "-NonInteractive", "-Command", "$a = New-Object byte[] 314572800; $a[0] = 1; exit 0"}
+    let p = spawn(Command{program = "powershell.exe", args = args[..], env = {}, cwd = "", timeout_ms = 0}) or_else Process{id = 0}
+    var pico: u64 = 0
+    if wait(p, timeout_ms = 60000) {
+        pico = peak_memory(p) or_else 0
+    }
+    close(p)
+    return pico
+}
+
+test "peak_memory do filho enxerga os 300 MiB que o PowerShell alocou" {
+    if os.TARGET == TESTE_WINDOWS {
+        expect(pico_da_alocacao_de_300_mib() >= BYTES_300_MIB)
+    }
+}
+
+test "cpu_times: inicio perto do relogio, fim zero enquanto roda e fim >= inicio depois" {
+    if os.TARGET == TESTE_WINDOWS {
+        let lento = iniciar_cmd("ping -n 30 127.0.0.1")
+        let rodando = cpu_times(lento) or_else CpuTimes{user_ns = -1, system_ns = -1, start_ns = -1, end_ns = -1}
+        expect(rodando.end_ns == 0)
+        expect(rodando.start_ns > 0)
+        kill(lento)
+        expect(wait(lento, timeout_ms = 3000))
+        let t = cpu_times(lento) or_else CpuTimes{user_ns = -1, system_ns = -1, start_ns = -1, end_ns = -1}
+        expect(t.start_ns > 0)
+        expect(t.end_ns >= t.start_ns)
+        expect(t.user_ns >= 0)
+        expect(t.system_ns >= 0)
+        expect(abs(t.start_ns - os.wall_time_ns()) < NS_60_S)
+        close(lento)
+        switch fechado in cpu_times(lento) {
+        case CpuTimes:
+            expect(false)
+        case ProcessError:
+            expect(fechado == ProcessError.invalid_input)
+        }
+    }
+}
+
+// D-G3-L2a bloco C: Stdio (null, pipe, inherit, file). So no Windows, como o bloco B.
+
+// Inicia "cmd.exe /c <linha>" com o stdout e o stderr escolhidos (e o arquivo do stdout); Process{id = 0} se o spawn falhar.
+proc iniciar_cmd_com_canais(linha: str, saida: Stdio, saida_erro: Stdio, caminho: str) -> Process {
+    var args: [2]str = {"/c", linha}
+    let cmd = Command{program = "cmd.exe", args = args[..], env = {}, cwd = "", timeout_ms = 0, stdout = saida, stderr = saida_erro, stdout_path = caminho}
+    return spawn(cmd) or_else Process{id = 0}
+}
+
+// Arquivo do teste, na pasta de trabalho (o teste o apaga no fim).
+const ARQUIVO_DO_STDIO: str = "forja_stdio_l2a_teste.txt"
+
+// Stdout de "cmd.exe /c type <caminho>" como texto comparavel: true se o conteudo do arquivo e exatamente 'esperado'.
+proc arquivo_contem(caminho: str, esperado: str) -> bool {
+    let linha = format(f"type {caminho}", alloc = heap)
+    defer delete(linha)
+    var igual = false
+    switch r in rodar_cmd(linha, alloc = heap) {
+    case Output:
+        igual = bytes_sao(r.stdout[..], esperado)
+        delete(r.stdout)
+        delete(r.stderr)
+    case ProcessError:
+        igual = false
+    }
+    return igual
+}
+
+// Apaga o arquivo do teste por "cmd.exe /c del" (o modulo nao enxerga std:file).
+proc apagar_arquivo(caminho: str) -> bool {
+    let linha = format(f"del {caminho}", alloc = heap)
+    defer delete(linha)
+    var apagou = false
+    switch r in rodar_cmd(linha, alloc = heap) {
+    case Output:
+        apagou = r.code == 0
+        delete(r.stdout)
+        delete(r.stderr)
+    case ProcessError:
+        apagou = false
+    }
+    return apagou
+}
+
+test "Stdio.file grava a saida do filho no arquivo, exatamente" {
+    if os.TARGET == TESTE_WINDOWS {
+        let caminho = ARQUIVO_DO_STDIO
+        let p = iniciar_cmd_com_canais("echo ola", saida = Stdio.file, saida_erro = Stdio.pipe, caminho = caminho)
+        expect(wait(p, timeout_ms = 10000))
+        expect(exit_code(p) == 0)
+        var fora = make([dynamic]u8, alloc = heap)
+        var dentro = make([dynamic]u8, alloc = heap)
+        expect(read_available(p, out = &fora, err = &dentro) == 0)
+        expect(len(fora) == 0)
+        close(p)
+        expect(arquivo_contem(caminho, "ola\r\n"))
+        let q = iniciar_cmd_com_canais("echo novo", saida = Stdio.file, saida_erro = Stdio.pipe, caminho = caminho)
+        expect(wait(q, timeout_ms = 10000))
+        close(q)
+        expect(arquivo_contem(caminho, "novo\r\n"))
+        expect(apagar_arquivo(caminho))
+        delete(fora)
+        delete(dentro)
+    }
+}
+
+test "Stdio.null e Stdio.inherit tiram o canal do pipe: nada a ler e codigo 0" {
+    if os.TARGET == TESTE_WINDOWS {
+        let nulo = iniciar_cmd_com_canais("echo oi", saida = Stdio.null, saida_erro = Stdio.null, caminho = "")
+        expect(wait(nulo, timeout_ms = 10000))
+        expect(exit_code(nulo) == 0)
+        var fora = make([dynamic]u8, alloc = heap)
+        var dentro = make([dynamic]u8, alloc = heap)
+        expect(read_available(nulo, out = &fora, err = &dentro) == 0)
+        close(nulo)
+        let herda = iniciar_cmd_com_canais("echo x 1>&2", saida = Stdio.pipe, saida_erro = Stdio.inherit, caminho = "")
+        expect(wait(herda, timeout_ms = 10000))
+        expect(exit_code(herda) == 0)
+        expect(read_available(herda, out = &fora, err = &dentro) == 0)
+        expect(len(dentro) == 0)
+        close(herda)
+        delete(fora)
+        delete(dentro)
+    }
+}
+
+test "os.last_error depois de spawn de programa inexistente e 2 (arquivo nao encontrado)" {
+    if os.TARGET == TESTE_WINDOWS or os.TARGET == TESTE_LINUX {
+        var falhou = false
+        switch r in spawn(Command{program = "forja_programa_que_nao_existe_l2a", args = {}, env = {}, cwd = "", timeout_ms = 0}) {
+        case Process:
+            close(r)
+        case ProcessError:
+            falhou = r == ProcessError.not_found
+        }
+        expect(falhou)
+        expect(os.last_error() == 2)
+    }
+}
+
+test "Stdio recusado com invalid_input: stdin pipe ou file e arquivo sem caminho" {
+    if os.TARGET == TESTE_WINDOWS {
+        var args: [2]str = {"/c", "exit 0"}
+        let com_pipe = Command{program = "cmd.exe", args = args[..], env = {}, cwd = "", timeout_ms = 0, stdin = Stdio.pipe}
+        let com_arquivo = Command{program = "cmd.exe", args = args[..], env = {}, cwd = "", timeout_ms = 0, stdin = Stdio.file}
+        let sem_caminho = Command{program = "cmd.exe", args = args[..], env = {}, cwd = "", timeout_ms = 0, stdout = Stdio.file}
+        expect(recusado_por_entrada(com_pipe))
+        expect(recusado_por_entrada(com_arquivo))
+        expect(recusado_por_entrada(sem_caminho))
+    }
+}
+
+// D-G3-L2b: os mesmos comportamentos no Linux, com /bin/sh. Divergencias do Windows: o limite de filhos abertos e 8 (wait_any recusa mais que 8); peak_memory e cpu_times so valem DEPOIS do fim do filho
+// (rusage do wait4: antes do fim peak_memory = 0 e cpu_times = user 0, system 0, start valido, end 0).
+
+const ARQUIVO_DO_STDIO_LINUX: str = "forja_stdio_l2b_teste.txt"
+
+// Inicia "/bin/sh -c <script>" com stdout e stderr escolhidos; Process{id = 0} se o spawn falhar.
+proc iniciar_sh_com_canais(script: str, saida: Stdio, saida_erro: Stdio, caminho: str) -> Process {
+    var args: [2]str = {"-c", script}
+    let cmd = Command{program = "/bin/sh", args = args[..], env = {}, cwd = "", timeout_ms = 0, stdout = saida, stderr = saida_erro, stdout_path = caminho}
+    return spawn(cmd) or_else Process{id = 0}
+}
+
+proc iniciar_sh(script: str) -> Process {
+    return iniciar_sh_com_canais(script, saida = Stdio.pipe, saida_erro = Stdio.pipe, caminho = "")
+}
+
+// true se o stdout de "/bin/sh -c <script>" e exatamente 'esperado'.
+proc sh_imprime(script: str, esperado: str) -> bool {
+    var args: [2]str = {"-c", script}
+    var igual = false
+    switch r in run(Command{program = "/bin/sh", args = args[..], env = {}, cwd = "", timeout_ms = 0}, alloc = heap) {
+    case Output:
+        igual = bytes_sao(r.stdout[..], esperado)
+        delete(r.stdout)
+        delete(r.stderr)
+    case ProcessError:
+        igual = false
+    }
+    return igual
+}
+
+test "Linux wait_any: indice do 1o a terminar, -1 no prazo, pid > 0; recusa vazia, acima de 8 e handle fechado" {
+    if os.TARGET == TESTE_LINUX {
+        let rapido = iniciar_sh("exit 7")
+        let lento = iniciar_sh("sleep 2")
+        var dois: [2]Process = {rapido, lento}
+        let primeiro = wait_any(dois[..], timeout_ms = -1) or_else -9
+        expect(primeiro == 0)
+        expect(exit_code(rapido) == 7)
+        var so_lento: [1]Process = {lento}
+        let no_prazo = wait_any(so_lento[..], timeout_ms = 0) or_else -9
+        expect(no_prazo == -1)
+        expect(pid(rapido) > 0)
+        expect(not os.pid_alive(pid(rapido)))
+        expect(os.pid_alive(pid(lento)))
+        kill(lento)
+        close(rapido)
+        close(lento)
+        expect(wait_any_recusou(dois[0..<0]))
+        expect(wait_any_recusou(dois[..]))
+        expect(pid(rapido) == -1)
+        var muitos: [9]Process = {}
+        expect(wait_any_recusou(muitos[..]))
+    }
+}
+
+test "Linux peak_memory e cpu_times: so valem depois do fim; antes, 0 e fim = 0" {
+    if os.TARGET == TESTE_LINUX {
+        let lento = iniciar_sh("sleep 2")
+        let rodando = cpu_times(lento) or_else CpuTimes{user_ns = -1, system_ns = -1, start_ns = -1, end_ns = -1}
+        expect(rodando.end_ns == 0)
+        expect(rodando.user_ns == 0)
+        expect(rodando.start_ns > 0)
+        expect((peak_memory(lento) or_else 1) == 0)
+        kill(lento)
+        expect(wait(lento, timeout_ms = 3000))
+        let t = cpu_times(lento) or_else CpuTimes{user_ns = -1, system_ns = -1, start_ns = -1, end_ns = -1}
+        expect(t.start_ns > 0)
+        expect(t.end_ns >= t.start_ns)
+        expect(t.user_ns >= 0)
+        expect(t.system_ns >= 0)
+        expect(abs(t.start_ns - os.wall_time_ns()) < NS_60_S)
+        expect((peak_memory(lento) or_else 0) > 0)
+        close(lento)
+        switch fechado in cpu_times(lento) {
+        case CpuTimes:
+            expect(false)
+        case ProcessError:
+            expect(fechado == ProcessError.invalid_input)
+        }
+    }
+}
+
+test "Linux Stdio.file grava a saida do filho no arquivo, exatamente, e zera no spawn seguinte" {
+    if os.TARGET == TESTE_LINUX {
+        let caminho = ARQUIVO_DO_STDIO_LINUX
+        let p = iniciar_sh_com_canais("echo ola", saida = Stdio.file, saida_erro = Stdio.pipe, caminho = caminho)
+        expect(wait(p, timeout_ms = 10000))
+        expect(exit_code(p) == 0)
+        var fora = make([dynamic]u8, alloc = heap)
+        var dentro = make([dynamic]u8, alloc = heap)
+        expect(read_available(p, out = &fora, err = &dentro) == 0)
+        close(p)
+        expect(sh_imprime("cat forja_stdio_l2b_teste.txt", "ola\n"))
+        let q = iniciar_sh_com_canais("echo novo", saida = Stdio.file, saida_erro = Stdio.pipe, caminho = caminho)
+        expect(wait(q, timeout_ms = 10000))
+        close(q)
+        expect(sh_imprime("cat forja_stdio_l2b_teste.txt", "novo\n"))
+        expect(sh_imprime("rm -f forja_stdio_l2b_teste.txt", ""))
+        delete(fora)
+        delete(dentro)
+    }
+}
+
+test "Linux Stdio.null e Stdio.inherit tiram o canal do pipe: nada a ler e codigo 0" {
+    if os.TARGET == TESTE_LINUX {
+        let nulo = iniciar_sh_com_canais("echo oi; echo oi 1>&2", saida = Stdio.null, saida_erro = Stdio.null, caminho = "")
+        expect(wait(nulo, timeout_ms = 10000))
+        expect(exit_code(nulo) == 0)
+        var fora = make([dynamic]u8, alloc = heap)
+        var dentro = make([dynamic]u8, alloc = heap)
+        expect(read_available(nulo, out = &fora, err = &dentro) == 0)
+        close(nulo)
+        let herda = iniciar_sh_com_canais("echo x 1>&2", saida = Stdio.pipe, saida_erro = Stdio.inherit, caminho = "")
+        expect(wait(herda, timeout_ms = 10000))
+        expect(exit_code(herda) == 0)
+        expect(read_available(herda, out = &fora, err = &dentro) == 0)
+        expect(len(dentro) == 0)
+        close(herda)
+        delete(fora)
+        delete(dentro)
+    }
+}
+
+test "Linux Stdio recusado com invalid_input: stdin pipe ou file e arquivo sem caminho" {
+    if os.TARGET == TESTE_LINUX {
+        var args: [2]str = {"-c", "exit 0"}
+        let com_pipe = Command{program = "/bin/sh", args = args[..], env = {}, cwd = "", timeout_ms = 0, stdin = Stdio.pipe}
+        let com_arquivo = Command{program = "/bin/sh", args = args[..], env = {}, cwd = "", timeout_ms = 0, stdin = Stdio.file}
+        let sem_caminho = Command{program = "/bin/sh", args = args[..], env = {}, cwd = "", timeout_ms = 0, stdout = Stdio.file}
+        expect(recusado_por_entrada(com_pipe))
+        expect(recusado_por_entrada(com_arquivo))
+        expect(recusado_por_entrada(sem_caminho))
+    }
+}

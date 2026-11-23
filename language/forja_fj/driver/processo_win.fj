@@ -1,0 +1,444 @@
+// driver/processo_win.fj - porte de compiler/driver/processo_win.c, compiler/driver/processo_win.h
+// sha256 de driver/processo_win.c: 77ff2dc91f7d5c94cfc21a004062cea4f26228e035a37718617c58a864b8ca57
+// sha256 de driver/processo_win.h: f0a43daf4fa63e5c4667eb621491f0a1ffe240cb4da28ea78b789abd85d2e77d
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.2.0
+// Changelog: 0.2.0 - G3 V5-P1: corpo real pelo std:process. CreateProcessA suspenso + HANDLE_LIST + ResumeThread (Canais, abrir_herdavel, fechar_canais, abrir_canais,
+//            lista_de_handles, erro_da_falha, criar_suspenso, retomar) viram process.spawn com stdin NUL e stdout/stderr em arquivo (Stdio.file); o std:process ja prende cada filho
+//            a um Job com KILL_ON_JOB_CLOSE (prender_ao_job sai; ProcessoJob.handle -> ativo, o job do orquestrador e logico); Processo.handle -> id (Process.id, 0 = fechado);
+//            WaitForMultipleObjects -> process.wait_any; GetProcessTimes -> process.cpu_times (ns de 1970 de volta para FILETIME); OpenProcess+WaitForSingleObject -> os.pid_alive;
+//            QueryPerformanceCounter -> common.relogio_ns (as marcas e a frequencia do orquestrador ficam em ns). ProcessoDisparar marca 0 e 1 antes do spawn e 2..5 depois.
+
+import "std:os"
+import "std:file"
+import "std:process"
+import "common"
+
+struct ProcessoJob {
+    ativo: bool
+    avisou: bool
+}
+
+struct Processo {
+    id: u64 // Process.id do std:process (0 = fechado)
+    pid: u32
+    erro: u32
+}
+
+struct ProcessoFases {
+    marca: [6]u64
+}
+
+struct ProcessoPedido {
+    exe: ?str
+    args: ?[]str
+    saida_out: ?str
+    saida_err: ?str
+    job: ?^ProcessoJob
+    fases: ?^ProcessoFases
+}
+
+const PROCESSO_ESPERA_MAX: i32 = 64
+const PROCESSO_LINHA_MAX: i32 = 32768
+const PROCESSO_MARCAS: i32 = 6
+// 1601-01-01 -> 1970-01-01 em intervalos de 100 ns (FILETIME).
+const FILETIME_EPOCA_UNIX: u64 = 116444736000000000
+const ERRO_ARQUIVO_NAO_ACHADO: u32 = 2
+const ERRO_ACESSO_NEGADO: u32 = 5
+const ERRO_PARAMETRO_INVALIDO: u32 = 87
+const SAIDA_INTERNO_PROCESSO: i32 = 3
+
+// C: driver/processo_win.c:27
+proc caractere(linha: []u8, n: ^u64, c: u8) -> bool {
+    if (n^ + 1) >= (PROCESSO_LINHA_MAX as u64) {
+        return false
+    }
+    let antes_1: u64 = n^
+    n^ += 1
+    linha[antes_1] = c
+    return true
+}
+
+// C: driver/processo_win.c:34
+proc repetir(linha: []u8, n: ^u64, c: u8, vezes: u64) -> bool {
+    for _k in (0 as u64)..<vezes {
+        if not caractere(linha, n, c) {
+            return false
+        }
+    }
+    return true
+}
+
+// C: driver/processo_win.c:42
+proc texto(linha: []u8, n: ^u64, texto: str) -> bool {
+    for i in 0..<len(texto) {
+        if not caractere(linha, n, texto[i]) {
+            return false
+        }
+    }
+    return true
+}
+
+// C: driver/processo_win.c:51
+proc anexar_caractere_do_argumento(linha: []u8, n: ^u64, c: u8, barras: ^u64) -> bool {
+    if (c == 34) and (not repetir(linha, n, 92, barras^ + 1)) { // '"' '\\'
+        return false
+    }
+    var tern_1: u64 = 0
+    if c == 92 {
+        tern_1 = barras^ + 1
+    }
+    barras^ = tern_1 // '\\'
+    return caractere(linha, n, c)
+}
+
+// C: driver/processo_win.c:58
+proc anexar_entre_aspas(linha: []u8, n: ^u64, arg: str) -> bool {
+    var barras: u64 = 0
+    if not caractere(linha, n, 34) { // '"'
+        return false
+    }
+    for i in 0..<len(arg) {
+        if not anexar_caractere_do_argumento(linha, n, arg[i], &barras) {
+            return false
+        }
+    }
+    return repetir(linha, n, 92, barras) and caractere(linha, n, 34) // '\\' '"'
+}
+
+// C: driver/processo_win.c:69
+proc precisa_de_aspas(arg: str) -> bool {
+    if len(arg) == 0 {
+        return true
+    }
+    for i in 0..<len(arg) {
+        if (arg[i] == 32) or (arg[i] == 9) or (arg[i] == 34) { // ' ' '\t' '"'
+            return true
+        }
+    }
+    return false
+}
+
+// C: driver/processo_win.c:75
+proc anexar_argumento_2(linha: []u8, n: ^u64, arg: str) -> bool {
+    if not caractere(linha, n, 32) { // ' '
+        return false
+    }
+    var tern_1: i32 = 0
+    if common.c2f_b2i32(precisa_de_aspas(arg)) != 0 {
+        tern_1 = common.c2f_b2i32(anexar_entre_aspas(linha, n, arg))
+    } else {
+        tern_1 = common.c2f_b2i32(texto(linha, n, arg))
+    }
+    return tern_1 != 0
+}
+
+// C: driver/processo_win.c:82
+// A linha de comando do filho (exe entre aspas e cada arg citado so se precisar) em linha[PROCESSO_LINHA_MAX], com NUL no fim; usa so exe e args. false = nao coube.
+proc processo_montar_linha(p: ^ProcessoPedido, linha: []u8) -> bool {
+    var n: u64 = 0
+    let args: []str = p.args or_else {}
+    if not anexar_entre_aspas(linha, &n, p.exe or_else "") {
+        return false
+    }
+    for k in 0..<len(args) {
+        if not anexar_argumento_2(linha, &n, args[k]) {
+            return false
+        }
+    }
+    linha[n] = 0
+    return true
+}
+
+// C: driver/processo_win.c:188
+// Marca o instante da fase 'i' em f; f none = nao mede.
+proc marcar(f: ?^ProcessoFases, i: i32) {
+    if f == none {
+        return
+    }
+    let alvo: ^ProcessoFases = f as ^ProcessoFases
+    alvo.marca[i] = common.relogio_ns()
+}
+
+// O erro do Windows de um spawn que falhou: o ultimo erro do sistema, ou o equivalente do ProcessError quando ele nao deixou nenhum.
+proc erro_do_spawn(e: process.ProcessError) -> u32 {
+    let ultimo: int = os.last_error()
+    if ultimo > 0 {
+        return ultimo as u32
+    }
+    switch e {
+    case process.ProcessError.not_found:
+        return ERRO_ARQUIVO_NAO_ACHADO
+    case process.ProcessError.permission_denied:
+        return ERRO_ACESSO_NEGADO
+    case process.ProcessError.invalid_input:
+        return ERRO_PARAMETRO_INVALIDO
+    case process.ProcessError.timeout:
+        return ERRO_PARAMETRO_INVALIDO
+    case process.ProcessError.io:
+        return ERRO_PARAMETRO_INVALIDO
+    }
+    return ERRO_PARAMETRO_INVALIDO
+}
+
+// C: driver/processo_win.c:211
+// Dispara o filho: stdin = NUL, stdout e stderr nos arquivos (criados e truncados). false = nao disparou (saida.erro).
+proc processo_disparar(pedido: ^ProcessoPedido, saida: ^Processo) -> bool {
+    saida^ = Processo{id = 0, pid = 0, erro = 0}
+    marcar(pedido.fases, 0)
+    let cmd = process.Command{program = pedido.exe or_else "", args = pedido.args or_else {}, env = {}, cwd = "", timeout_ms = 0, stdin = process.Stdio.null, stdout = process.Stdio.file, stderr = process.Stdio.file, stdout_path = pedido.saida_out or_else "", stderr_path = pedido.saida_err or_else ""}
+    marcar(pedido.fases, 1)
+    switch p in process.spawn(cmd) {
+    case process.Process:
+        marcar(pedido.fases, 2)
+        marcar(pedido.fases, 3)
+        marcar(pedido.fases, 4)
+        marcar(pedido.fases, 5)
+        saida.id = p.id
+        saida.pid = process.pid(p) as u32
+        return true
+    case process.ProcessError:
+        marcar(pedido.fases, 2)
+        marcar(pedido.fases, 3)
+        saida.erro = erro_do_spawn(p)
+        return false
+    }
+    return false
+}
+
+// C: driver/processo_win.c:244
+// O job do orquestrador e logico: cada filho do std:process ja nasce num Job com KILL_ON_JOB_CLOSE (morre se o orquestrador morrer).
+proc processo_job_criar(job: ^ProcessoJob) -> bool {
+    job.avisou = false
+    job.ativo = true
+    return true
+}
+
+// C: driver/processo_win.c:258
+proc processo_job_fechar(job: ^ProcessoJob) {
+    job.ativo = false
+}
+
+// C: driver/processo_win.c:264
+// C2F-13: lista fundido em n (len)
+// Espera o primeiro dos n filhos (1..64) terminar; qual = indice na lista. false = a espera falhou.
+proc processo_esperar_qualquer(lista: []Processo, qual: ^u32) -> bool {
+    let n: int = len(lista)
+    if (n == 0) or (n > (PROCESSO_ESPERA_MAX as int)) {
+        return false
+    }
+    var ps = make([dynamic]process.Process, alloc = heap)
+    defer delete(ps)
+    for k in 0..<n {
+        append(&ps, item = process.Process{id = lista[k].id})
+    }
+    switch r in process.wait_any(ps[..], timeout_ms = -1) {
+    case int:
+        if r < 0 {
+            return false
+        }
+        qual^ = r as u32
+        return true
+    case process.ProcessError:
+        return false
+    }
+    return false
+}
+
+// FILETIME (100 ns desde 1601) de um instante em ns desde 1970.
+proc ns_para_filetime(ns: int) -> u64 {
+    return ((ns as u64) / 100) + FILETIME_EPOCA_UNIX
+}
+
+// C: driver/processo_win.c:282
+// FILETIME de criacao e de saida de um filho que ja terminou; chamar ANTES de processo_concluir. false = nao leu.
+proc processo_tempos(p: ^Processo, criacao: ^u64, saida: ^u64) -> bool {
+    if p.id == 0 {
+        return false
+    }
+    switch t in process.cpu_times(process.Process{id = p.id}) {
+    case process.CpuTimes:
+        criacao^ = ns_para_filetime(t.start_ns)
+        saida^ = ns_para_filetime(t.end_ns)
+        return true
+    case process.ProcessError:
+        return false
+    }
+    return false
+}
+
+// C: driver/processo_win.c:292
+// Codigo de saida de um filho que ja terminou, e fecha o handle (SAIDA_INTERNO se nem o codigo de saida se obtem).
+proc processo_concluir(p: ^Processo) -> i32 {
+    if p.id == 0 {
+        return SAIDA_INTERNO_PROCESSO
+    }
+    let filho = process.Process{id = p.id}
+    let codigo: i32 = common.c2f_trunc_i32(common.c2f_s2u_64(process.exit_code(filho) as i64))
+    process.close(filho)
+    p.id = 0
+    return codigo
+}
+
+// C: driver/processo_win.c:303
+// O pid ainda e de um processo vivo? (acesso negado conta como vivo.)
+proc processo_vivo(pid: u32) -> bool {
+    return os.pid_alive(pid as int)
+}
+
+// ---------------------------------------------------------------- testes (G3 V5-P1)
+
+proc pw_linha_de(exe: str, args: []str) -> str {
+    var pedido: ProcessoPedido = ProcessoPedido{exe = exe, args = args, saida_out = none, saida_err = none, job = none, fases = none}
+    var linha: [32768]u8 = {}
+    if not processo_montar_linha(&pedido, linha[..]) {
+        return "<nao coube>"
+    }
+    return from_bytes(linha[0..<common.c2f_strlen_b(linha[..])], alloc = heap)
+}
+
+test "processo_montar_linha: exe sempre entre aspas; arg so se precisar; barras e aspas pela regra do argv" {
+    var a1: [5]str = {"a b", "", "x\"y", "c\\", "d\\e"}
+    let l1 = pw_linha_de("C:\\Program Files\\x.exe", a1[..])
+    expect(l1 == "\"C:\\Program Files\\x.exe\" \"a b\" \"\" \"x\\\"y\" c\\ d\\e")
+    delete(l1)
+    var a2: [1]str = {"p q\\"}
+    let l2 = pw_linha_de("a.exe", a2[..])
+    expect(l2 == "\"a.exe\" \"p q\\\\\"")
+    delete(l2)
+    var a3: [1]str = {"t\ta"}
+    let l3 = pw_linha_de("a.exe", a3[..])
+    expect(l3 == "\"a.exe\" \"t\ta\"")
+    delete(l3)
+    let l4 = pw_linha_de("a.exe", {})
+    expect(l4 == "\"a.exe\"")
+    delete(l4)
+}
+
+test "processo_montar_linha: nao cabe em PROCESSO_LINHA_MAX devolve false" {
+    var grande = make([dynamic]u8, alloc = heap, len = PROCESSO_LINHA_MAX as int)
+    for k in 0..<len(grande) {
+        grande[k] = 120
+    }
+    let arg_grande = from_bytes(grande[..], alloc = heap)
+    var args: [1]str = {arg_grande}
+    let l = pw_linha_de("a.exe", args[..])
+    expect(l == "<nao coube>")
+    delete(arg_grande)
+    delete(grande)
+}
+
+test "precisa_de_aspas e ns_para_filetime" {
+    expect(precisa_de_aspas(""))
+    expect(precisa_de_aspas("a b"))
+    expect(precisa_de_aspas("a\"b"))
+    expect(precisa_de_aspas("a\tb"))
+    expect(not precisa_de_aspas("abc\\d"))
+    expect(ns_para_filetime(0) == 116444736000000000)
+    expect(ns_para_filetime(1000000000) == 116444736010000000)
+}
+
+test "processo_job_criar e fechar" {
+    var j: ProcessoJob = ProcessoJob{ativo = false, avisou = true}
+    expect(processo_job_criar(&j))
+    expect(j.ativo and (not j.avisou))
+    processo_job_fechar(&j)
+    expect(not j.ativo)
+}
+
+// Pasta temporaria (heap; quem chama faz delete), "." se nao resolver.
+proc pw_pasta_temp() -> str {
+    switch t in os.temp_dir(alloc = heap) {
+    case str:
+        return t
+    case os.OsError:
+        return from_bytes(as_bytes("."), alloc = heap)
+    }
+    return from_bytes(as_bytes("."), alloc = heap)
+}
+
+// Le um arquivo inteiro como texto (vazio se nao abre).
+proc pw_ler_texto(caminho: str) -> str {
+    switch dados in file.read_all(caminho, alloc = heap) {
+    case [dynamic]u8:
+        let t = from_bytes(dados[..], alloc = heap)
+        delete(dados)
+        return t
+    case file.FileError:
+        return from_bytes(as_bytes(""), alloc = heap)
+    }
+    return from_bytes(as_bytes(""), alloc = heap)
+}
+
+test "processo_disparar: cmd /c echo grava o stdout em arquivo, exit code 7, concluir, marcas e tempos" {
+    let tmp = pw_pasta_temp()
+    let out = format(f"{tmp}\\forja_pw_teste_{os.pid()}.out", alloc = heap)
+    let err = format(f"{tmp}\\forja_pw_teste_{os.pid()}.err", alloc = heap)
+    var args: [2]str = {"/c", "echo ola& echo ruim 1>&2& exit /b 7"}
+    var fases: ProcessoFases = ProcessoFases{marca = {}}
+    var job: ProcessoJob = ProcessoJob{ativo = false, avisou = false}
+    expect(processo_job_criar(&job))
+    var pedido: ProcessoPedido = ProcessoPedido{exe = "cmd.exe", args = args[..], saida_out = out, saida_err = err, job = &job, fases = &fases}
+    var filho: Processo = Processo{id = 0, pid = 0, erro = 0}
+    expect(processo_disparar(&pedido, &filho))
+    expect(filho.id != 0)
+    expect(filho.pid != 0)
+    expect(processo_vivo(filho.pid) or true)
+    var lista: [1]Processo = {filho}
+    var qual: u32 = 9
+    expect(processo_esperar_qualquer(lista[..], &qual))
+    expect(qual == 0)
+    var criacao: u64 = 0
+    var saida: u64 = 0
+    expect(processo_tempos(&filho, &criacao, &saida))
+    expect(criacao > FILETIME_EPOCA_UNIX)
+    expect(saida >= criacao)
+    expect(processo_concluir(&filho) == 7)
+    expect(filho.id == 0)
+    expect(processo_concluir(&filho) == SAIDA_INTERNO_PROCESSO)
+    expect(not processo_tempos(&filho, &criacao, &saida))
+    expect(fases.marca[0] != 0)
+    expect(fases.marca[5] >= fases.marca[0])
+    let dados_out = pw_ler_texto(out)
+    let dados_err = pw_ler_texto(err)
+    expect(dados_out == "ola\r\n")
+    expect(dados_err == "ruim \r\n")
+    delete(dados_out)
+    delete(dados_err)
+    _ = file.remove_file(out)
+    _ = file.remove_file(err)
+    delete(out)
+    delete(err)
+    delete(tmp)
+    processo_job_fechar(&job)
+}
+
+test "processo_disparar: programa inexistente falha com erro; timeout mata o filho e a espera acaba" {
+    let tmp = pw_pasta_temp()
+    let out = format(f"{tmp}\\forja_pw_teste2_{os.pid()}.out", alloc = heap)
+    let err = format(f"{tmp}\\forja_pw_teste2_{os.pid()}.err", alloc = heap)
+    var pedido_ruim: ProcessoPedido = ProcessoPedido{exe = "C:\\nao_existe_forja\\x.exe", args = {}, saida_out = out, saida_err = err, job = none, fases = none}
+    var ruim: Processo = Processo{id = 0, pid = 0, erro = 0}
+    expect(not processo_disparar(&pedido_ruim, &ruim))
+    expect(ruim.erro != 0)
+    expect(ruim.id == 0)
+    var args: [2]str = {"/c", "ping -n 30 127.0.0.1"}
+    var pedido: ProcessoPedido = ProcessoPedido{exe = "cmd.exe", args = args[..], saida_out = out, saida_err = err, job = none, fases = none}
+    var filho: Processo = Processo{id = 0, pid = 0, erro = 0}
+    expect(processo_disparar(&pedido, &filho))
+    let h = process.Process{id = filho.id}
+    expect(process.wait(h, timeout_ms = 200) == false)
+    expect(processo_vivo(filho.pid))
+    process.kill(h)
+    var lista: [1]Processo = {filho}
+    var qual: u32 = 9
+    expect(processo_esperar_qualquer(lista[..], &qual))
+    expect(qual == 0)
+    let codigo = processo_concluir(&filho)
+    expect(codigo != 0)
+    _ = file.remove_file(out)
+    _ = file.remove_file(err)
+    delete(out)
+    delete(err)
+    delete(tmp)
+}

@@ -1,0 +1,626 @@
+// nativo/nativo_biblioteca.fj - porte de compiler/nativo/nativo_biblioteca.c, compiler/nativo/nativo_biblioteca.h
+// sha256 de nativo/nativo_biblioteca.c: 108065322d7f42c25794dda4d5a3cfbe0f6622d4bd0fddcc91e3807a724e66a6
+// sha256 de nativo/nativo_biblioteca.h: 2c051346219a2286f17499a5f776cc271051ce3410af5194fbdb7f1608fa6ac3
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "common"
+import "ir"
+import "nativo/bir"
+import "nativo/fmt" as pefmt
+import "nativo/obj"
+import "nativo/x64"
+import "std:file"
+import "std:os"
+
+struct BibliotecaFalha {
+    diag: common.Diag
+    campos: [dynamic]u8
+}
+
+struct NativoBibliotecasEntrada {
+    pedido: ?^NativoPedido
+    bir: ?^bir.BirPrograma
+    provedores: ?[]obj.BibliotecasProvedor
+    qtd_provedores: u32
+    libmem: bool
+}
+
+struct Coleta {
+    arena: common.Arena
+    pedido: ?^NativoPedido
+    links: ?[]str
+    pastas: ?[]str
+    simbolos: ?[]str
+    proc_do_simbolo: ?[]u32
+    busca: obj.BibliotecaBusca
+    ped: obj.BibliotecasPedido
+}
+
+const NB_TAM_PREFIXO_IMP: u32 = 6
+const SEMENTE_SUBPASTA: str = "\\..\\third\\musl\\x86_64"
+const SEMENTE_CRT1: str = "\\crt1.o"
+const SEMENTE_RCRT1: str = "\\rcrt1.o"
+const SEMENTE_LIBC: str = "\\libc.a"
+// C2F-82 macro NB_QTD_IMPORTS_CRT = ( sizeof NB_IMPORTS_CRT / sizeof NB_IMPORTS_CRT [ 0 ] )  (expandida no uso)
+// C2F-82 macro NB_QTD_RAIZES_SEMENTE = ( sizeof NB_RAIZES_SEMENTE / sizeof NB_RAIZES_SEMENTE [ 0 ] )  (expandida no uso)
+const NB_LIBS_SO_WINDOWS: [6]str = {"ws2_32", "crypt32", "bcrypt", "advapi32", "secur32", "iphlpapi"}
+const NB_IMPORTS_CRT: [3]str = {"__acrt_iob_func", "fwrite", "fflush"}
+const PREFIXO: [14]u8 = {102, 111, 114, 106, 97, 95, 116, 104, 114, 101, 97, 100, 95, 0}
+const NB_PREFIXO_THREAD: str = "forja_thread_"
+const NB_RAIZES_SEMENTE: [13]str = {"__libc_start_main", "exit", "fwrite", "fflush", "stdout", "pthread_key_create", "pthread_getspecific", "pthread_setspecific", "pthread_create", "pthread_join", "pthread_attr_init", "pthread_attr_setstacksize", "pthread_attr_destroy"}
+
+// C: nativo/nativo_biblioteca.c:56
+proc nb_texto(p: ^NativoPedido, id: i32) -> str {
+    return common.interner_texto(p.nomes as ^common.Interner, id)
+}
+
+// C: nativo/nativo_biblioteca.c:62
+proc nb_caminho_absoluto(c: ^Coleta, pasta: ?str) -> ?str {
+    switch absoluto in os.abs_path(pasta or_else "", alloc = heap) {
+    case str:
+        defer delete(absoluto)
+        // _fullpath com buffer de BIBLIOTECA_TAM_CAMINHO: caminho que nao cabe devolve a pasta como veio
+        if len(absoluto) >= (obj.BIBLIOTECA_TAM_CAMINHO as int) {
+            return pasta
+        }
+        return nb_copiar_na_arena(c, absoluto)
+    case os.OsError:
+        return pasta
+    }
+    return pasta
+}
+
+// ArenaCopiarTexto do C: o texto vai para a arena da coleta (quem chama nao e dono dela)
+proc nb_copiar_na_arena(c: ^Coleta, texto: str) -> str {
+    return from_bytes(as_bytes(texto), alloc = common.arena_mem(&c.arena))
+}
+
+// C: nativo/nativo_biblioteca.c:72
+proc nb_alvo_eh_elf(p: ^NativoPedido) -> bool {
+    let nome: str = p.alvo or_else NATIVO_ALVO_PADRAO
+    let alvo = alvo_por_nome(nome)
+    if alvo == none {
+        return false
+    }
+    return common.c2f_s2u_32((alvo as ^x64.Alvo).formato) == (pefmt.IMAGEM_ELF as u32)
+}
+
+// C: nativo/nativo_biblioteca.c:83
+proc nb_eh_lib_so_windows(link: str) -> bool {
+    for k in (0 as u64)..<(48 / 8) { // C2F: sizeof NB_LIBS_SO_WINDOWS C2F: sizeof NB_LIBS_SO_WINDOWS [ 0 ]
+        if link == NB_LIBS_SO_WINDOWS[k] {
+            return true
+        }
+    }
+    return false
+}
+
+// C: nativo/nativo_biblioteca.c:92
+proc nb_coletar_links(c: ^Coleta) {
+    let ir_c: ?^ir.IrPrograma = (c.pedido as ^NativoPedido).ir
+    let elf: bool = nb_alvo_eh_elf(c.pedido as ^NativoPedido)
+    let total: u32 = (ir_c as ^ir.IrPrograma).nbibliotecas
+    let bibliotecas: []i32 = (ir_c as ^ir.IrPrograma).bibliotecas or_else {}
+    var links: []str = common.arena_fatia_str(&c.arena, (total + 1) as int)
+    var n: u32 = 0
+    for k in (0 as u32)..<total {
+        let link: str = nb_texto(c.pedido as ^NativoPedido, bibliotecas[k])
+        // 0.16.0 (R10a): no alvo ELF as libs de sistema do Windows nao entram no 'link'
+        if (not elf) or (not nb_eh_lib_so_windows(link)) {
+            links[n] = link
+            n += 1
+        }
+    }
+    c.links = links
+    c.ped.links = links
+    c.ped.qtd_links = n
+}
+
+// C: nativo/nativo_biblioteca.c:116
+proc semente_musl_pasta(saida: []u8, tam: u64) -> bool {
+    switch exe in os.exe_path(alloc = heap) {
+    case str:
+        defer delete(exe)
+        return semente_pasta_do_exe(exe, saida, tam)
+    case os.OsError:
+        return false
+    }
+    return false
+}
+
+// pasta do forja.exe + SEMENTE_SUBPASTA, com NUL, em saida; false se nao couber (como SementeMuslPasta do C)
+proc semente_pasta_do_exe(exe: str, saida: []u8, tam: u64) -> bool {
+    if len(exe) >= (SEMENTE_TAM_PASTA as int) {
+        return false
+    }
+    let barra: int = semente_ultima_barra(exe)
+    if barra < 0 {
+        return false
+    }
+    let pasta: str = exe[0..<barra]
+    if (len(pasta) + len(SEMENTE_SUBPASTA) + 1) > (tam as int) {
+        return false
+    }
+    semente_gravar_texto(saida, format(f"{pasta}{SEMENTE_SUBPASTA}", alloc = frame))
+    return true
+}
+
+// posicao da ultima '\\' (strrchr do C); -1 se nao ha
+proc semente_ultima_barra(exe: str) -> int {
+    let bytes_exe: []u8 = as_bytes(exe)
+    var k: int = len(bytes_exe) - 1
+    while k >= 0 {
+        if bytes_exe[k] == 92 {
+            return k
+        }
+        k = k - 1
+    }
+    return -1
+}
+
+// copia o texto para saida e fecha com NUL (o chamador garante o espaco)
+proc semente_gravar_texto(saida: []u8, texto: str) {
+    let bytes_texto: []u8 = as_bytes(texto)
+    for k in 0..<len(bytes_texto) {
+        saida[k] = bytes_texto[k]
+    }
+    saida[len(bytes_texto)] = 0
+}
+
+// tamanho ate o primeiro NUL (strlen do C sobre o buffer de semente_musl_pasta)
+proc semente_ate_nul(b: []u8) -> int {
+    var k: int = 0
+    while (k < len(b)) and (b[k] != 0) {
+        k += 1
+    }
+    return k
+}
+
+// C: nativo/nativo_biblioteca.c:135
+// Um arquivo da semente existe e abre para leitura (fopen; nada de stat).
+proc semente_arquivo_existe(pasta: str, sufixo: str) -> bool {
+    let caminho: str = format(f"{pasta}{sufixo}", alloc = frame)
+    if len(caminho) >= ((SEMENTE_TAM_PASTA as int) + 16) {
+        return false
+    }
+    switch r in file.open(caminho, file.OpenMode.read) {
+    case file.File:
+        var arq: file.File = r
+        file.close(&arq)
+        return true
+    case file.FileError:
+        return false
+    }
+    return false
+}
+
+// C: nativo/nativo_biblioteca.c:149
+proc semente_musl_completa(pasta: str) -> bool {
+    return (common.c2f_b2i32(semente_arquivo_existe(pasta, SEMENTE_CRT1)) != 0) and (common.c2f_b2i32(semente_arquivo_existe(pasta, SEMENTE_LIBC)) != 0)
+}
+
+// C: nativo/nativo_biblioteca.c:155
+// C2F: o malloc do C vira [dynamic]u8 no heap, devolvido ao chamador (que faz delete); o ponteiro do C nao sobrevive ao dono.
+// Vazio = o NULL do C (fopen falhou ou arquivo vazio).
+proc semente_ler_tudo(caminho: str) -> [dynamic]u8 {
+    switch r in file.read_all(caminho, alloc = heap) {
+    case [dynamic]u8:
+        return r
+    case file.FileError:
+        return make([dynamic]u8, alloc = heap)
+    }
+    return make([dynamic]u8, alloc = heap)
+}
+
+// C: nativo/nativo_biblioteca.c:181
+proc semente_ajustar_pc(o: ^obj.Objeto) {
+    var r: u64 = 0
+    while r < (len(o.relocs) as u64) {
+        let rel: ^obj.ObjReloc = &o.relocs[r]
+        if ((common.c2f_s2u_32(rel.correcao.tipo) == (obj.OR_REL32 as u32)) or (common.c2f_s2u_32(rel.correcao.tipo) == (obj.OR_GOTPCREL as u32))) or (common.c2f_s2u_32(rel.correcao.tipo) == (obj.OR_GOTPCRELX as u32)) {
+            rel.correcao.adendo += 4
+        }
+        r += 1
+    }
+}
+
+// C: nativo/nativo_biblioteca.c:191
+proc semente_musl_crt1(pasta: str, pie: bool, o: ^obj.Objeto) -> bool {
+    var sufixo: str = SEMENTE_CRT1
+    if pie {
+        sufixo = SEMENTE_RCRT1
+    }
+    let caminho: str = format(f"{pasta}{sufixo}", alloc = frame)
+    if len(caminho) >= ((SEMENTE_TAM_PASTA as int) + 16) {
+        return false
+    }
+    var dados: [dynamic]u8 = semente_ler_tudo(caminho)
+    defer delete(dados)
+    if len(dados) == 0 {
+        return false
+    }
+    var erro = obj.ElfLErro{codigo = 0}
+    let ok: bool = obj.elf_ler_objeto(&dados[0], len(dados) as u64, o, &erro) == obj.ELFL_OK
+    if ok {
+        semente_ajustar_pc(o)
+    }
+    return ok
+}
+
+// M5b P39-B2: no alvo linux, a pasta da semente musl; none fora dele ou sem o caminho do forja.exe.
+// C: nativo/nativo_biblioteca.c:212
+proc nb_semente(c: ^Coleta) -> ?str {
+    let pedido = c.pedido as ^NativoPedido
+    if not nb_alvo_eh_elf(pedido) {
+        return none
+    }
+    var pasta: [SEMENTE_TAM_PASTA]u8 = {}
+    if not semente_musl_pasta(pasta[..], SEMENTE_TAM_PASTA as u64) {
+        return none
+    }
+    let n: int = semente_ate_nul(pasta[..])
+    return from_bytes(pasta[0..<n], alloc = common.arena_mem(&c.arena))
+}
+
+// C: nativo/nativo_biblioteca.c:221
+proc nb_coletar_pastas(c: ^Coleta) {
+    let pedido = c.pedido as ^NativoPedido
+    var n: u32 = 0
+    var pastas: []str = common.arena_fatia_str(&c.arena, (pedido.npastas_extra + 2) as int)
+    c.pastas = pastas
+    if pedido.pasta_libs != none {
+        pastas[n] = pedido.pasta_libs or_else ""
+        n += 1
+    }
+    let extras: []str = pedido.pastas_extra or_else {}
+    for k in (0 as u32)..<pedido.npastas_extra {
+        pastas[n] = extras[k]
+        n += 1
+    }
+    if pedido.lib_pasta != none {
+        pastas[n] = nb_caminho_absoluto(c, pedido.lib_pasta) or_else ""
+        n += 1
+    }
+    c.busca = obj.BibliotecaBusca{pastas = c.pastas, qtd_pastas = n, elf = nb_alvo_eh_elf(pedido), semente = nb_semente(c)}
+    c.ped.busca = &c.busca
+}
+
+// C: nativo/nativo_biblioteca.c:238
+proc nb_proc_do_simbolo(c: ^Coleta, simbolo: str) -> u32 {
+    let ir_c: ?^ir.IrPrograma = (c.pedido as ^NativoPedido).ir
+    var k: u32 = 0
+    while k < (ir_c as ^ir.IrPrograma).nexternos {
+        if (not ((ir_c as ^ir.IrPrograma).externos or_else {})[k].interno) and (nb_texto(c.pedido as ^NativoPedido, ((ir_c as ^ir.IrPrograma).externos or_else {})[k].simbolo) == simbolo) {
+            return k
+        }
+        k += 1
+    }
+    return 4294967295
+}
+
+// C: nativo/nativo_biblioteca.c:256
+proc nativo_usa_runtime_crt(pedido: ^NativoPedido, bir_c: ^bir.BirPrograma) -> bool {
+    if pedido.dll {
+        return true
+    }
+    for k in (0 as u32)..<bir_c.nsimbolos {
+        if bir_c.simbolos[k].tipo == (bir.BS_IMPORT as u8) {
+            return true
+        }
+    }
+    return false
+}
+
+// C: nativo/nativo_biblioteca.c:269
+proc nativo_usa_threads_no_elf(bir_c: ^bir.BirPrograma) -> bool {
+    for k in (0 as u32)..<bir_c.nsimbolos {
+        let nome: str = bir_c.simbolos[k].nome or_else ""
+        if (bir_c.simbolos[k].tipo == (bir.BS_RUNTIME as u8)) and (len(nome) >= len(NB_PREFIXO_THREAD)) and (nome[0..<len(NB_PREFIXO_THREAD)] == NB_PREFIXO_THREAD) {
+            return true
+        }
+    }
+    return false
+}
+
+// C: nativo/nativo_biblioteca.c:280
+// Os imports do CRT entram no fim, sem repetir o que o programa ja importa (a checagem usa so a lista de antes: base).
+proc nb_acrescentar_imports_crt(c: ^Coleta, n: u32, usa_crt: bool) -> u32 {
+    if not usa_crt {
+        return n
+    }
+    var simbolos: []str = c.simbolos or_else {}
+    var procs: []u32 = c.proc_do_simbolo or_else {}
+    var m: u32 = n
+    for k in 0..<len(NB_IMPORTS_CRT) {
+        if not nb_ja_na_coleta(c, n, NB_IMPORTS_CRT[k]) {
+            simbolos[m] = NB_IMPORTS_CRT[k]
+            procs[m] = 4294967295
+            m += 1
+        }
+    }
+    return m
+}
+
+// C: nativo/nativo_biblioteca.c:304
+proc nb_ja_na_coleta(c: ^Coleta, n: u32, nome: str) -> bool {
+    for i in (0 as u32)..<n {
+        if (c.simbolos or_else {})[i] == nome {
+            return true
+        }
+    }
+    return false
+}
+
+// C: nativo/nativo_biblioteca.c:313
+proc nb_acrescentar_raizes_semente(c: ^Coleta, n: u32) -> u32 {
+    if c.busca.semente == none {
+        return n
+    }
+    var simbolos: []str = c.simbolos or_else {}
+    var procs: []u32 = c.proc_do_simbolo or_else {}
+    var m: u32 = n
+    for k in 0..<len(NB_RAIZES_SEMENTE) {
+        if not nb_ja_na_coleta(c, m, NB_RAIZES_SEMENTE[k]) {
+            simbolos[m] = NB_RAIZES_SEMENTE[k]
+            procs[m] = 4294967295
+            m += 1
+        }
+    }
+    return m
+}
+
+// C: nativo/nativo_biblioteca.c:326
+proc nb_coletar_simbolos(c: ^Coleta, bir_c: ^bir.BirPrograma) {
+    let pedido = c.pedido as ^NativoPedido
+    var n: u32 = 0
+    let teto: int = (bir_c.nsimbolos as int) + len(NB_IMPORTS_CRT) + len(NB_RAIZES_SEMENTE) + 1
+    c.simbolos = common.arena_fatia_str(&c.arena, teto)
+    c.proc_do_simbolo = common.arena_fatia_u32(&c.arena, teto)
+    var simbolos: []str = c.simbolos or_else {}
+    var procs: []u32 = c.proc_do_simbolo or_else {}
+    for k in (0 as u32)..<bir_c.nsimbolos {
+        if bir_c.simbolos[k].tipo != (bir.BS_IMPORT as u8) {
+            continue
+        }
+        let nome: str = bir_c.simbolos[k].nome or_else ""
+        simbolos[n] = nome[(NB_TAM_PREFIXO_IMP as int)..<len(nome)]
+        procs[n] = nb_proc_do_simbolo(c, simbolos[n])
+        n += 1
+    }
+    // sem foreign nem threads o alvo linux nao usa a libc: a semente sai da busca e o programa segue o ELF cru
+    if (n == 0) and (not nativo_usa_threads_no_elf(bir_c)) {
+        c.busca.semente = none
+    }
+    let usa_crt: bool = nativo_usa_runtime_crt(pedido, bir_c) and (not nb_alvo_eh_elf(pedido))
+    n = nb_acrescentar_imports_crt(c, n, usa_crt)
+    n = nb_acrescentar_raizes_semente(c, n)
+    c.ped.simbolos = c.simbolos
+    c.ped.qtd_simbolos = n
+}
+
+// C: nativo/nativo_biblioteca.c:351
+proc nb_pos_do_externo(f: ^common.Fonte, e: ?^ir.IrExterno) -> u32 {
+    var tern_1: u32 = 0
+    if f.ntrechos > 1 {
+        tern_1 = (f.trechos or_else {})[(e as ^ir.IrExterno).arquivo].linha_base
+    }
+    let base: u32 = tern_1
+    let linha: u32 = base + (e as ^ir.IrExterno).linha
+    if ((f.inicio_linha == none) or (linha == 0)) or (linha > f.ninicios) {
+        return 0
+    }
+    return (f.inicio_linha or_else {})[linha - 1]
+}
+
+// C: nativo/nativo_biblioteca.c:361
+proc nb_primeiro_de_fora(ir_c: ^ir.IrPrograma) -> ?^ir.IrExterno {
+    for k in (0 as u32)..<ir_c.nexternos {
+        if not (ir_c.externos or_else {})[k].interno {
+            return &(ir_c.externos or_else {})[k]
+        }
+    }
+    return none
+}
+
+// C: nativo/nativo_biblioteca.c:371
+proc nb_campo_procurei_em(campos: ^[dynamic]u8, linhas: ^[dynamic]u8) {
+    append(campos, item = "\"procurei_em\": [")
+    let total: int = len(linhas^)
+    let limite: int = (obj.BIBLIOTECA_TAM_CAMINHO as int) - 1
+    var inicio: int = 0
+    var primeira: bool = true
+    // um caminho por linha; a ultima quebra nao abre linha nova (o while do C para no NUL)
+    while inicio < total {
+        var fim: int = inicio
+        while (fim < total) and (linhas^[fim] != 10) {
+            fim += 1
+        }
+        var corte: int = fim
+        if (corte - inicio) > limite {
+            corte = inicio + limite
+        }
+        let caminho: str = from_bytes(linhas^[inicio..<corte], alloc = frame)
+        if not primeira {
+            append(campos, item = ", ")
+        }
+        json_caminho(campos, caminho)
+        primeira = false
+        inicio = fim + 1
+    }
+    append(campos, item = "]")
+}
+
+// C: nativo/nativo_biblioteca.c:390
+proc nb_campo_texto(campos: ^[dynamic]u8, chave: str, texto: str) {
+    format(f"\"{chave}\": ", into = campos)
+    json_texto(campos, texto, len(texto) as u64)
+}
+
+// C: nativo/nativo_biblioteca.c:397
+proc nb_externo_do_faltante(c: ^Coleta, r: ^obj.BibliotecasResolvidas) -> ?^ir.IrExterno {
+    let j: u32 = common.c2f_s2u_32(r.simbolo_faltando)
+    if (r.simbolo_faltando < 0) or ((c.proc_do_simbolo or_else {})[j] == 4294967295) {
+        return none
+    }
+    return &(((c.pedido as ^NativoPedido).ir as ^ir.IrPrograma).externos or_else {})[(c.proc_do_simbolo or_else {})[j]]
+}
+
+// C: nativo/nativo_biblioteca.c:406
+proc nb_falha_simbolo(c: ^Coleta, r: ^obj.BibliotecasResolvidas, falha: ^BibliotecaFalha) {
+    // simbolo_faltando < 0: quem pediu foi um membro de estatica, so ha o nome do simbolo
+    var simbolo: str = ""
+    if r.simbolo_faltando >= 0 {
+        simbolo = (c.simbolos or_else {})[common.c2f_s2u_32(r.simbolo_faltando)]
+    } else {
+        simbolo = r.simbolo_faltando_nome or_else ""
+    }
+    let e: ?^ir.IrExterno = nb_externo_do_faltante(c, r)
+    var proc_nome: str = simbolo
+    var posicao: u32 = 0
+    if e != none {
+        proc_nome = nb_texto(c.pedido as ^NativoPedido, (e as ^ir.IrExterno).nome)
+        posicao = nb_pos_do_externo((c.pedido as ^NativoPedido).fonte as ^common.Fonte, e)
+    }
+    let msg: str = format(f"simbolo '{simbolo}' do proc foreign '{proc_nome}' nao encontrado nas bibliotecas do 'link'", alloc = frame)
+    _ = common.diag_relatar(&falha.diag, common.X0101, posicao, msg)
+    nb_campo_texto(&falha.campos, "proc", proc_nome)
+    append(&falha.campos, item = ", ")
+    nb_campo_texto(&falha.campos, "simbolo", simbolo)
+    append(&falha.campos, item = ", ")
+    nb_campo_procurei_em(&falha.campos, &r.procurei_em)
+}
+
+// C: nativo/nativo_biblioteca.c:423
+proc nb_falha_link(c: ^Coleta, r: ^obj.BibliotecasResolvidas, falha: ^BibliotecaFalha) {
+    let e: ?^ir.IrExterno = nb_primeiro_de_fora((c.pedido as ^NativoPedido).ir as ^ir.IrPrograma)
+    var tern_1: u32 = 0
+    if e != none {
+        tern_1 = nb_pos_do_externo((c.pedido as ^NativoPedido).fonte as ^common.Fonte, e)
+    }
+    falha.diag.off = tern_1
+    nb_campo_texto(&falha.campos, "biblioteca", (r.link_falho or_else ""))
+    if common.c2f_s2u_32(falha.diag.codigo) == (common.X0102 as u32) {
+        append(&falha.campos, item = ", ")
+        nb_campo_procurei_em(&falha.campos, &r.procurei_em)
+    }
+}
+
+// C: nativo/nativo_biblioteca.c:435
+proc nb_montar_falha(c: ^Coleta, r: ^obj.BibliotecasResolvidas, falha: ^BibliotecaFalha) {
+    if common.c2f_s2u_32(falha.diag.codigo) == (common.X0101 as u32) {
+        nb_falha_simbolo(c, r, falha)
+    } else {
+        nb_falha_link(c, r, falha)
+    }
+}
+
+// C: nativo/nativo_biblioteca.c:444
+proc nb_montar_libmem(c: ^Coleta, saida: ^obj.BibliotecasResolvidas) {
+    let pedido = c.pedido as ^NativoPedido
+    let ir_c: ?^ir.IrPrograma = pedido.ir
+    let nfins: u32 = (ir_c as ^ir.IrPrograma).nfins
+    let ids: []i32 = (ir_c as ^ir.IrPrograma).fins or_else {}
+    var fins: []str = common.arena_fatia_str(&c.arena, (nfins + 1) as int)
+    for k in (0 as u32)..<nfins {
+        fins[k] = nb_texto(pedido, ids[k])
+    }
+    var entrada = obj.LibmemEntrada{estaticas = &saida.estaticas, fins = fins, qtd_fins = nfins}
+    obj.libmem_montar(&entrada, &saida.memoria, &saida.libmem)
+}
+
+// C: nativo/nativo_biblioteca.c:455
+proc nativo_bibliotecas(entrada: ^NativoBibliotecasEntrada, saida: ^obj.BibliotecasResolvidas, falha: ^BibliotecaFalha) -> bool {
+    // Coleta em heap (V4, decisao do main): bibliotecas_resolver guarda o pedido em saida, e o endereco de local nao sai do proc (E0706).
+    let c = new(Coleta, alloc = heap)
+    defer delete(c)
+    c.arena = common.Arena{}
+    c.pedido = entrada.pedido
+    falha.diag = common.Diag{}
+    falha.campos = make([dynamic]u8, alloc = heap)
+    nb_coletar_links(c)
+    nb_coletar_pastas(c)
+    nb_coletar_simbolos(c, entrada.bir as ^bir.BirPrograma)
+    c.ped.provedores = entrada.provedores
+    c.ped.qtd_provedores = entrada.qtd_provedores
+    let ok: bool = obj.bibliotecas_resolver(&c.ped, saida, &falha.diag)
+    if not ok {
+        nb_montar_falha(c, saida, falha)
+    } else if entrada.libmem {
+        nb_montar_libmem(c, saida)
+    }
+    common.arena_liberar(&c.arena)
+    return ok
+}
+
+// C: nativo/nativo_biblioteca.c:475
+proc biblioteca_falha_liberar(falha: ^BibliotecaFalha) {
+    delete(falha.campos)
+}
+
+test "nb_ultima_barra_nul_e_gravacao" {
+    expect(semente_ultima_barra("C:\\x\\forja.exe") == 4)
+    expect(semente_ultima_barra("sem_barra") == -1)
+    var b: [8]u8 = {65, 66, 0, 67, 0, 0, 0, 0}
+    expect(semente_ate_nul(b[..]) == 2)
+    var saida: [16]u8 = {}
+    semente_gravar_texto(saida[..], "ab")
+    expect(saida[0] == 97)
+    expect(saida[1] == 98)
+    expect(saida[2] == 0)
+}
+
+test "nb_pasta_do_exe_monta_semente_ou_recusa" {
+    var saida: [SEMENTE_TAM_PASTA]u8 = {}
+    expect(semente_pasta_do_exe("C:\\forja\\forja.exe", saida[..], 512))
+    let esperado: str = "C:\\forja\\..\\third\\musl\\x86_64"
+    expect(semente_ate_nul(saida[..]) == len(esperado))
+    expect(from_bytes(saida[0..<len(esperado)], alloc = frame) == esperado)
+    var pequena: [8]u8 = {}
+    expect(not semente_pasta_do_exe("C:\\forja\\forja.exe", pequena[..], 8))
+    expect(not semente_pasta_do_exe("sem_barra.exe", saida[..], 512))
+}
+
+test "nb_alvo_eh_elf_pelo_nome_do_alvo" {
+    var linux = NativoPedido{alvo = "x86_64-linux"}
+    var padrao = NativoPedido{}
+    expect(nb_alvo_eh_elf(&linux))
+    expect(not nb_alvo_eh_elf(&padrao))
+}
+
+test "nb_semente_ausente_e_leitura_falha" {
+    expect(not semente_arquivo_existe("Z:\\nao_existe_forja", "\\crt1.o"))
+    var vazio: [dynamic]u8 = semente_ler_tudo("Z:\\nao_existe_forja\\x.o")
+    expect(len(vazio) == 0)
+    delete(vazio)
+}
+
+test "nb_imports_crt_e_raizes_sem_repetir" {
+    var c = Coleta{arena = common.Arena{}}
+    c.simbolos = common.arena_fatia_str(&c.arena, 32)
+    c.proc_do_simbolo = common.arena_fatia_u32(&c.arena, 32)
+    var sim: []str = c.simbolos or_else {}
+    sim[0] = "fwrite"
+    sim[1] = "exit"
+    c.busca.semente = "pasta_semente"
+    var n: u32 = nb_acrescentar_imports_crt(&c, 2, true)
+    expect(n == 4)
+    expect(sim[2] == "__acrt_iob_func")
+    expect(sim[3] == "fflush")
+    n = nb_acrescentar_raizes_semente(&c, n)
+    expect(n == 14)
+    expect(sim[4] == "__libc_start_main")
+    let mudo: u32 = nb_acrescentar_imports_crt(&c, 2, false)
+    expect(mudo == 2)
+    common.arena_liberar(&c.arena)
+}
+
+test "nb_threads_no_elf_pelo_prefixo" {
+    var bir_p = bir.BirPrograma{}
+    bir_p.simbolos = make([dynamic]bir.BirSimbolo, alloc = frame)
+    append(&bir_p.simbolos, item = bir.BirSimbolo{nome = "forja_thread_criar", tipo = bir.BS_RUNTIME as u8})
+    bir_p.nsimbolos = 1
+    expect(nativo_usa_threads_no_elf(&bir_p))
+    bir_p.simbolos[0].nome = "forja_outra"
+    expect(not nativo_usa_threads_no_elf(&bir_p))
+}

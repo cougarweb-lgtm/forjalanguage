@@ -1,0 +1,132 @@
+// nativo/optimizer/cfg_ordem.fj - porte de compiler/nativo/optimizer/cfg_ordem.c
+// sha256 de nativo/optimizer/cfg_ordem.c: 32e10835bae1b9fad20b5f0558b09daa24808bc72383dd6b500853cea90946cb
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "common"
+import "nativo/bir"
+
+// C: nativo/optimizer/cfg_ordem.c:12
+proc cfg_elegivel(programa: ^bir.BirPrograma, funcao: ^bir.BirFuncao) -> bool {
+    if (common.c2f_b2i32(programa.simbolos_dbg) != 0) or (funcao.nblocos < 2) {
+        return false
+    }
+    for b in (0 as u32)..<funcao.nblocos {
+        if funcao.blocos[b].n == 0 {
+            return false
+        }
+    }
+    return true
+}
+
+// C: nativo/optimizer/cfg_ordem.c:23
+proc eh_conta_ov_2(op: u8) -> bool {
+    return (((op == (bir.BIR_ADD_OV as u8)) or (op == (bir.BIR_SUB_OV as u8))) or (op == (bir.BIR_MUL_OV as u8))) or (op == (bir.BIR_NEG_OV as u8))
+}
+
+// C: nativo/optimizer/cfg_ordem.c:29
+// C2F-INDECIDIVEL: novo_id
+proc reescrever_alvos(i: ^bir.BirInstr, novo_id: []u32) {
+    if ((i.op == (bir.BIR_SALTA as u8)) or (i.op == (bir.BIR_DESVIA as u8))) or (common.c2f_b2i32(eh_conta_ov_2(i.op)) != 0) {
+        i.alvo[0] = novo_id[i.alvo[0]]
+    }
+    if i.op == (bir.BIR_DESVIA as u8) {
+        i.alvo[1] = novo_id[i.alvo[1]]
+    }
+}
+
+// C: nativo/optimizer/cfg_ordem.c:37
+// C2F-13: ordem fundido em n (len)
+// Forja nao move [dynamic] de struct (E0311): os blocos novos recebem copia das instrucoes, feita por um buffer plano antes de liberar as listas antigas.
+// Decisao: o campo cap do bloco vira cap(instrs) (convencao da BIR da Forja); o C deixava cap == n.
+proc cfg_aplicar_ordem(funcao: ^bir.BirFuncao, ordem: ?[]u32) {
+    let ord: []u32 = ordem or_else {}
+    let n: u32 = len(ord) as u32
+    let velho: u32 = funcao.nblocos
+    var novo_id = make([dynamic]u32, alloc = heap, cap = (velho as int) + 1)
+    defer delete(novo_id)
+    var b: u32 = 0
+    while b < velho {
+        append(&novo_id, item = bir.BIR_SEM_BLOCO)
+        b += 1
+    }
+    var total: int = 0
+    var k: u32 = 0
+    while k < n {
+        novo_id[ord[k]] = k
+        total += (funcao.blocos[ord[k]].n as int)
+        k += 1
+    }
+    var plano = make([dynamic]bir.BirInstr, alloc = heap, cap = total + 1)
+    defer delete(plano)
+    var inicio = make([dynamic]u32, alloc = heap, cap = (n as int) + 1)
+    defer delete(inicio)
+    var frios = make([dynamic]bool, alloc = heap, cap = (n as int) + 1)
+    defer delete(frios)
+    k = 0
+    while k < n {
+        let antigo: ^bir.BirBloco = &funcao.blocos[ord[k]]
+        append(&inicio, item = (len(plano) as u32))
+        append(&frios, item = antigo.frio)
+        var j: u32 = 0
+        while j < antigo.n {
+            append(&plano, item = antigo.instrs[j])
+            j += 1
+        }
+        k += 1
+    }
+    append(&inicio, item = (len(plano) as u32))
+    b = 0
+    while b < velho {
+        let descartado: ^bir.BirBloco = &funcao.blocos[b]
+        if cap(descartado.instrs) > 0 {
+            delete(descartado.instrs)
+        }
+        b += 1
+    }
+    // A lista de blocos e refeita so com os que sobrevivem (truncate e copia de lista de dono sao E0311): delete + make no proprio campo.
+    delete(funcao.blocos)
+    funcao.blocos = make([dynamic]bir.BirBloco, alloc = heap, cap = (n as int) + 1)
+    k = 0
+    while k < n {
+        append(&funcao.blocos, item = bir.BirBloco{frio = frios[k]})
+        let dst: ^bir.BirBloco = &funcao.blocos[k]
+        let ini: u32 = inicio[k]
+        let fim: u32 = inicio[k + 1]
+        dst.instrs = make([dynamic]bir.BirInstr, alloc = heap, cap = ((fim - ini) as int) + 1)
+        var j: u32 = ini
+        while j < fim {
+            append(&dst.instrs, item = plano[j])
+            j += 1
+        }
+        dst.n = fim - ini
+        dst.cap = (cap(dst.instrs) as u64) as u32
+        k += 1
+    }
+    funcao.nblocos = n
+    funcao.cap_blocos = (cap(funcao.blocos) as u64) as u32
+    k = 0
+    while k < n {
+        let bloco: ^bir.BirBloco = &funcao.blocos[k]
+        var j: u32 = 0
+        while j < bloco.n {
+            reescrever_alvos(&bloco.instrs[j], novo_id[..])
+            j += 1
+        }
+        k += 1
+    }
+}
+
+test "cfg_ordem_reordena_e_descarta_bloco" {
+    var f = bir.BirFuncao{}
+    f.blocos = make([dynamic]bir.BirBloco, alloc = heap, cap = 4)
+    cfgt_novo_bloco(&f, bir.BIR_SALTA, 2)
+    cfgt_novo_bloco(&f, bir.BIR_RETORNA, bir.BIR_SEM_BLOCO)
+    cfgt_novo_bloco(&f, bir.BIR_RETORNA, bir.BIR_SEM_BLOCO)
+    var ordem: [2]u32 = {0, 2}
+    cfg_aplicar_ordem(&f, ordem[..])
+    expect(f.nblocos == 2)
+    expect(f.blocos[0].instrs[0].alvo[0] == 1)
+    expect(f.blocos[1].instrs[0].op == (bir.BIR_RETORNA as u8))
+    cfgt_libera(&f)
+}

@@ -1,0 +1,668 @@
+// nativo/x64/x64_quadro.fj - porte de compiler/nativo/x64/x64_quadro.c
+// sha256 de nativo/x64/x64_quadro.c: 3a855f902973c0490de18be80f13f26d9d95bdfda035b851e004446dd6ec0834
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "common"
+import "nativo/bir"
+import "nativo/dbg"
+
+struct VarreduraSysv {
+    chama: bool
+    pilha: u32
+}
+
+struct MovParametro {
+    origem: i32
+    destino: i32
+    classe: u8
+    feito: bool
+}
+
+const QUADRO_ALINHAMENTO: u32 = 16
+const QUADRO_SALVOS_BYTES: u32 = 176
+const QUADRO_SALVOS_XMM: u32 = 10
+const QUADRO_XMM_BYTES: u32 = 16
+const QUADRO_XMM_PRIMEIRO: u32 = 6
+const QUADRO_XMM_QTD: u32 = 16
+const REGS_HOME: [4]i32 = {1, 2, 8, 9}
+const REGS_SALVOS_GP: [2]i32 = {6, 7}
+
+// C: nativo/x64/x64_quadro.c:50
+proc max_args_do_bloco(b: ^bir.BirBloco) -> u32 {
+    var maximo: u32 = 0
+    var k: u32 = 0
+    while k < b.n {
+        let i: ^bir.BirInstr = &b.instrs[k]
+        if (((i.op == (bir.BIR_CHAMA as u8)) or (i.op == (bir.BIR_CHAMA_IND as u8))) or (i.op == (bir.BIR_ARMADILHA as u8))) and ((i.nargs + abi_win_oculto_da_chamada(i)) > maximo) {
+            maximo = i.nargs + abi_win_oculto_da_chamada(i)
+        }
+        k += 1
+    }
+    return maximo
+}
+
+// C: nativo/x64/x64_quadro.c:62
+// C2F-INDECIDIVEL: saida
+proc quadro_posicionar_slots(f: ^bir.BirFuncao, saida: []u32) -> u32 {
+    var fim: u32 = aloc_bytes_slots(f)
+    var k: u32 = 0
+    while k < f.nslots {
+        let ali: u32 = f.slots[k].alinhamento
+        fim = (fim + f.slots[k].tam + ali - 1) / ali * ali
+        if len(saida) > 0 {
+            saida[k] = fim
+        }
+        k += 1
+    }
+    return fim
+}
+
+// C: nativo/x64/x64_quadro.c:77
+proc variavel_da_casa(c: ^X64Ctx, k: ^bir.BirLocalCasa) -> dbg.DbgVar {
+    var v: dbg.DbgVar = dbg.DbgVar{nome = k.nome, tipo_nome = k.tipo_nome, tipo = k.tipo, local_id = k.local_id, parametro = k.local_id < (c.f as ^bir.BirFuncao).nparams}
+    v.loc.tipo = dbg.DBG_LOC_RBP as u8
+    if k.slot >= 0 {
+        v.loc.rbp_off = -transmute(c.slot_off[k.slot as int], to = i32)
+    } else {
+        v.loc.rbp_off = aloc_operando_de(c.f, k.vreg as u32, 64).desloc
+        v.loc.indireto = k.indireto
+    }
+    return v
+}
+
+// C: nativo/x64/x64_quadro.c:91
+proc x64_dbg_locais(c: ^X64Ctx) {
+    var j: u32 = 0
+    while j < (c.f as ^bir.BirFuncao).ncasas {
+        var v: dbg.DbgVar = variavel_da_casa(c, &((c.f as ^bir.BirFuncao).casas or_else {})[j])
+        dbg.dbg_variavel(c.dbg, &v)
+        j += 1
+    }
+}
+
+// C: nativo/x64/x64_quadro.c:103
+proc varrer_bloco_sysv(p: ^bir.BirPrograma, b: ^bir.BirBloco, v: ^VarreduraSysv) {
+    var k: u32 = 0
+    while k < b.n {
+        let i: ^bir.BirInstr = &b.instrs[k]
+        var pilha: u32 = 0
+        if not sysv_eh_chamada_do_programa(p, i) {
+            k += 1
+            continue
+        }
+        pilha = sysv_bytes_de_pilha(i)
+        v.chama = true
+        if pilha > v.pilha {
+            v.pilha = pilha
+        }
+        k += 1
+    }
+}
+
+// C: nativo/x64/x64_quadro.c:118
+proc varrer_sysv(p: ^bir.BirPrograma, f: ^bir.BirFuncao) -> VarreduraSysv {
+    var v: VarreduraSysv = VarreduraSysv{chama = false}
+    for b in (0 as u32)..<f.nblocos {
+        varrer_bloco_sysv(p, &f.blocos[b], &v)
+    }
+    return v
+}
+
+// C: nativo/x64/x64_quadro.c:128
+proc pilha_de_saida(q: ^Quadro, sysv: ^VarreduraSysv) -> u32 {
+    var tern_1: u32 = 0
+    if q.maxargs > ABI_WIN_REGS_ARG {
+        tern_1 = ABI_WIN_BYTES_ARG * (q.maxargs - ABI_WIN_REGS_ARG)
+    }
+    var pilha: u32 = tern_1
+    if (sysv.pilha > ABI_WIN_SOMBRA) and ((sysv.pilha - ABI_WIN_SOMBRA) > pilha) {
+        pilha = sysv.pilha - ABI_WIN_SOMBRA
+    }
+    return pilha
+}
+
+// C: nativo/x64/x64_quadro.c:137
+proc quadro_calcular(p: ^bir.BirPrograma, f: ^bir.BirFuncao) -> Quadro {
+    var q: Quadro = Quadro{slots = aloc_bytes_slots(f)}
+    var sysv: VarreduraSysv = varrer_sysv(p, f)
+    var sem_saida: [1]u32 = {0}
+    q.agregados = quadro_posicionar_slots(f, sem_saida[0..<0]) - q.slots
+    var b: u32 = 0
+    while b < f.nblocos {
+        let n: u32 = max_args_do_bloco(&f.blocos[b])
+        if n > q.maxargs {
+            q.maxargs = n
+        }
+        b += 1
+    }
+    let pilha: u32 = pilha_de_saida(&q, &sysv)
+    q.salva = sysv.chama
+    q.regs_salvos = aloc_regs_salvos(f)
+    q.empurrados = aloc_bytes_empurrados(f)
+    q.salvos = 0
+    if q.salva {
+        q.salvos = QUADRO_SALVOS_BYTES
+    }
+    q.regs_salvos_xmm = aloc_regs_salvos_xmm(f)
+    var bits_xmm: u32 = 0
+    var mascara_xmm: u32 = q.regs_salvos_xmm
+    while mascara_xmm != 0 {
+        bits_xmm += mascara_xmm & 1
+        mascara_xmm = mascara_xmm >> 1
+    }
+    q.salvos_xmm = QUADRO_XMM_BYTES * bits_xmm
+    q.tam = (q.slots + q.agregados + q.salvos + q.salvos_xmm + ABI_WIN_SOMBRA + pilha + QUADRO_ALINHAMENTO - 1) / QUADRO_ALINHAMENTO * QUADRO_ALINHAMENTO
+    q.sondar = quadro_alocacao(&q) >= X64_PAGINA
+    return q
+}
+
+// C: nativo/x64/x64_quadro.c:161
+proc quadro_alocacao(q: ^Quadro) -> u32 {
+    return q.tam - q.empurrados
+}
+
+// C: nativo/x64/x64_quadro.c:166
+// C2F-INDECIDIVEL: ordem
+proc quadro_ordenar(f: ^bir.BirFuncao, ordem: []u32) {
+    var n: u32 = 0
+    var b: u32 = 0
+    while b < f.nblocos {
+        if not f.blocos[b].frio {
+            let antes_1: u32 = n
+            n += 1
+            ordem[antes_1] = b
+        }
+        b += 1
+    }
+    let antes_2: u32 = n
+    n += 1
+    ordem[antes_2] = f.nblocos
+    var b_2: u32 = 0
+    while b_2 < f.nblocos {
+        if f.blocos[b_2].frio {
+            let antes_3: u32 = n
+            n += 1
+            ordem[antes_3] = b_2
+        }
+        b_2 += 1
+    }
+}
+
+// C: nativo/x64/x64_quadro.c:181
+proc quadro_proximo_bloco(c: ^X64Ctx) -> u32 {
+    var tern_1: u32 = bir.BIR_SEM_BLOCO
+    if (c.pos_ordem + 1) < c.nordem {
+        tern_1 = (c.ordem or_else {})[c.pos_ordem + 1]
+    }
+    return tern_1
+}
+
+// C: nativo/x64/x64_quadro.c:186
+// C2F-13: lista fundido em n (len)
+proc emitir_lista(c: ^X64Ctx, lista: []MInstr) -> bool {
+    for k in (0 as u32)..<(len(lista) as u32) {
+        if not x64_emitir(c, lista[k]) {
+            return false
+        }
+    }
+    return true
+}
+
+// C: nativo/x64/x64_quadro.c:197
+proc sondar_laco(c: ^X64Ctx) -> bool {
+    let laco: u32 = (c.f as ^bir.BirFuncao).nblocos + 1
+    var inicio: [2]MInstr = {mi2(FX_MOV64_RR as u16, m_reg(X64_R10, 64), m_reg(X64_RSP, 64)), mi2(FX_MOV32_RI as u16, m_reg(X64_R11, 32), m_imed((quadro_alocacao(&c.quadro) / X64_PAGINA) as i64))}
+    var volta: [4]MInstr = {mi2(FX_SUB64_RI as u16, m_reg(X64_R10, 64), m_imed(X64_PAGINA as i64)), mi2(FX_TEST64_MR as u16, m_mem(X64_R10, 0, 64), m_reg(X64_R10, 64)), mi2(FX_SUB32_RI as u16, m_reg(X64_R11, 32), m_imed(1)), mi_cc(FX_JCC_REL32 as u16, X64_CC_NE, m_bloco(laco))}
+    if not emitir_lista(c, inicio[..]) {
+        return false
+    }
+    var bloco_off: []u32 = c.bloco_off or_else {}
+    bloco_off[laco] = x64_offset(c)
+    return emitir_lista(c, volta[..])
+}
+
+// C: nativo/x64/x64_quadro.c:219
+proc sondar(c: ^X64Ctx) -> bool {
+    let arg_1: MOperando = m_reg(X64_RAX, 64)
+    let arg_2: MOperando = m_mem(X64_RSP, -transmute(quadro_alocacao(&c.quadro), to = i32), 64)
+    let ultima: MInstr = mi2(FX_TEST64_MR as u16, arg_2, arg_1)
+    var ok: bool = false
+    c.origem = ORIGEM_SONDAGEM as u8
+    ok = (common.c2f_b2i32(sondar_laco(c)) != 0) and (common.c2f_b2i32(x64_emitir(c, ultima)) != 0)
+    c.origem = ORIGEM_PROLOGO as u8
+    return ok
+}
+
+// C: nativo/x64/x64_quadro.c:231
+proc guardar_posicao_na_home(c: ^X64Ctx, k: u32, oculto: u32) -> bool {
+    // C2F: o ternario do C avalia so o ramo escolhido; classe_vreg[k - oculto] com k < oculto indexaria fora
+    var tern_1: i32 = 4
+    if k >= oculto {
+        tern_1 = ((c.f as ^bir.BirFuncao).classe_vreg or_else {})[k - oculto] as i32
+    }
+    let classe: u8 = tern_1 as u8
+    let arg_1: MOperando = m_reg(REGS_HOME[k], 64)
+    let arg_2: MOperando = m_mem(X64_RBP, abi_win_param_rbp(k), 64)
+    let guarda: MInstr = mi2(FX_MOV64_MR as u16, arg_2, arg_1)
+    if bir.bir_classe_eh_real(classe as i32) {
+        let arg_3: u8 = aloc_bits(classe)
+        let arg_4: i32 = abi_win_param_rbp(k)
+        return isel_guardar_xmm(c, classe, m_mem(X64_RBP, arg_4, arg_3), k as u8)
+    }
+    return x64_emitir(c, guarda)
+}
+
+// C: nativo/x64/x64_quadro.c:243
+proc parametro_direto_em_registrador(c: ^X64Ctx, k: u32) -> bool {
+    let f: ?^bir.BirFuncao = c.f
+    let oculto: u32 = abi_win_oculto(f)
+    if (((common.c2f_b2i32((c.p as ^bir.BirPrograma).sysv) != 0) or (k >= (f as ^bir.BirFuncao).nparams)) or ((k + oculto) >= ABI_WIN_REGS_ARG)) or (common.c2f_b2i32(bir.bir_classe_eh_real(((f as ^bir.BirFuncao).classe_vreg or_else {})[k] as i32)) != 0) {
+        return false
+    }
+    return aloc_operando_de(f, k, 64).em_reg
+}
+
+// C: nativo/x64/x64_quadro.c:254
+proc posicao_vai_para_home(c: ^X64Ctx, k: u32, oculto: u32) -> bool {
+    return (k < oculto) or (not parametro_direto_em_registrador(c, k - oculto))
+}
+
+// C: nativo/x64/x64_quadro.c:260
+proc guardar_home(c: ^X64Ctx) -> bool {
+    let oculto: u32 = abi_win_oculto(c.f)
+    let n: u32 = min((c.f as ^bir.BirFuncao).nparams + oculto, ABI_WIN_REGS_ARG)
+    for k in (0 as u32)..<n {
+        if (common.c2f_b2i32(posicao_vai_para_home(c, k, oculto)) != 0) and (not guardar_posicao_na_home(c, k, oculto)) {
+            return false
+        }
+    }
+    return true
+}
+
+// C: nativo/x64/x64_quadro.c:273
+proc ponteiros_dos_bytes(c: ^X64Ctx) -> bool {
+    let oculto: u32 = abi_win_oculto(c.f)
+    var k: u32 = 0
+    while k < (c.f as ^bir.BirFuncao).nparams {
+        if not abi_win_param_em_bytes(c.f, k) {
+            k += 1
+            continue
+        }
+        let arg_1: MOperando = m_mem(X64_RBP, abi_win_param_rbp(k + oculto), 64)
+        let arg_2: MOperando = m_reg(X64_RAX, 64)
+        if (not x64_emitir(c, mi2(FX_LEA64_RM as u16, arg_2, arg_1))) or (not isel_guardar(c, k, X64_RAX)) {
+            return false
+        }
+        k += 1
+    }
+    return true
+}
+
+// C: nativo/x64/x64_quadro.c:287
+proc fim_da_instrucao(c: ^X64Ctx) -> u32 {
+    return x64_offset(c) - c.inicio
+}
+
+// C: nativo/x64/x64_quadro.c:293
+proc salvar_rbp(c: ^X64Ctx) -> bool {
+    if not x64_emitir(c, mi1(FX_PUSH64_R as u16, m_reg(X64_RBP, 64))) {
+        return false
+    }
+    c.prologo.push = fim_da_instrucao(c)
+    let arg_1: MOperando = m_reg(X64_RSP, 64)
+    let arg_2: MOperando = m_reg(X64_RBP, 64)
+    if not x64_emitir(c, mi2(FX_MOV64_RR as u16, arg_2, arg_1)) {
+        return false
+    }
+    c.prologo.fpreg = fim_da_instrucao(c)
+    return true
+}
+
+// C: nativo/x64/x64_quadro.c:306
+proc desloc_salvo_gp(q: ^Quadro, k: u32) -> i32 {
+    return -transmute((q.slots + q.agregados) + (X64_SLOT_BYTES * (k + 1)), to = i32)
+}
+
+// C: nativo/x64/x64_quadro.c:311
+proc desloc_salvo_xmm(q: ^Quadro, j: u32) -> i32 {
+    return -transmute(((q.slots + q.agregados) + (2 * X64_SLOT_BYTES)) + (16 * (j + 1)), to = i32)
+}
+
+// C: nativo/x64/x64_quadro.c:316
+proc salvar_registradores_sysv(c: ^X64Ctx) -> bool {
+    for k in (0 as u32)..<2 {
+        let arg_1: MOperando = m_reg(REGS_SALVOS_GP[k], 64)
+        let arg_2: MOperando = m_mem(X64_RBP, desloc_salvo_gp(&c.quadro, k), 64)
+        if not x64_emitir(c, mi2(FX_MOV64_MR as u16, arg_2, arg_1)) {
+            return false
+        }
+    }
+    for j in (0 as u32)..<QUADRO_SALVOS_XMM {
+        let arg_3: MOperando = m_xmm((6 + j) as u8)
+        let arg_4: MOperando = m_mem(X64_RBP, desloc_salvo_xmm(&c.quadro, j), 128)
+        if not x64_emitir(c, mi2(FX_MOVUPS_MX as u16, arg_4, arg_3)) {
+            return false
+        }
+    }
+    return true
+}
+
+// C: nativo/x64/x64_quadro.c:329
+proc restaurar_registradores_sysv(c: ^X64Ctx) -> bool {
+    for k in (0 as u32)..<2 {
+        let arg_1: MOperando = m_mem(X64_RBP, desloc_salvo_gp(&c.quadro, k), 64)
+        let arg_2: MOperando = m_reg(REGS_SALVOS_GP[k], 64)
+        if not x64_emitir(c, mi2(FX_MOV64_RM as u16, arg_2, arg_1)) {
+            return false
+        }
+    }
+    for j in (0 as u32)..<QUADRO_SALVOS_XMM {
+        let arg_3: MOperando = m_mem(X64_RBP, desloc_salvo_xmm(&c.quadro, j), 128)
+        let arg_4: MOperando = m_xmm((6 + j) as u8)
+        if not x64_emitir(c, mi2(FX_MOVUPS_XM as u16, arg_4, arg_3)) {
+            return false
+        }
+    }
+    return true
+}
+
+// C: nativo/x64/x64_quadro.c:344
+proc empurrar_salvos(c: ^X64Ctx) -> bool {
+    var k: u32 = 0
+    for reg in (0 as u32)..<16 {
+        if ((c.quadro.regs_salvos >> (reg & 31)) & 1) == 0 {
+            continue
+        }
+        if not x64_emitir(c, mi1(FX_PUSH64_R as u16, m_reg(transmute(reg, to = i32), 64))) {
+            return false
+        }
+        let antes_1: u32 = k
+        k += 1
+        c.prologo.salvo[antes_1] = fim_da_instrucao(c)
+    }
+    return true
+}
+
+// C: nativo/x64/x64_quadro.c:361
+proc desloc_salvo_xmm_alocador(q: ^Quadro, k: u32) -> i32 {
+    return -transmute(((q.slots + q.agregados) + q.salvos) + (QUADRO_XMM_BYTES * (k + 1)), to = i32)
+}
+
+// C: nativo/x64/x64_quadro.c:366
+proc mover_xmm_do_alocador(c: ^X64Ctx, salvar: bool) -> bool {
+    var k: u32 = 0
+    for reg in (QUADRO_XMM_PRIMEIRO as u32)..<QUADRO_XMM_QTD {
+        let memoria: MOperando = m_mem(X64_RBP, desloc_salvo_xmm_alocador(&c.quadro, k), 128)
+        var tern_1: MInstr = MInstr{}
+        if common.c2f_b2i32(salvar) != 0 {
+            tern_1 = mi2(FX_MOVUPS_MX as u16, memoria, m_xmm(reg as u8))
+        } else {
+            tern_1 = mi2(FX_MOVUPS_XM as u16, m_xmm(reg as u8), memoria)
+        }
+        let mover: MInstr = tern_1
+        if ((c.quadro.regs_salvos_xmm >> (reg & 31)) & 1) == 0 {
+            continue
+        }
+        if not x64_emitir(c, mover) {
+            return false
+        }
+        k += 1
+    }
+    return true
+}
+
+// C: nativo/x64/x64_quadro.c:384
+proc desempilhar_salvos(c: ^X64Ctx) -> bool {
+    var reg: u32 = 16
+    while reg > 0 {
+        reg -= 1
+        if ((c.quadro.regs_salvos >> reg) & 1) != 0 {
+            if not x64_emitir(c, mi1(FX_POP64_R as u16, m_reg(reg as i32, 64))) {
+                return false
+            }
+        }
+    }
+    return true
+}
+
+// C: nativo/x64/x64_quadro.c:394
+proc carregar_parametro_em_registrador(c: ^X64Ctx, k: u32, reg: i32) -> bool {
+    let f = c.f as ^bir.BirFuncao
+    let classe: u8 = (f.classe_vreg or_else {})[k]
+    if bir.bir_classe_eh_real(classe as i32) {
+        var forma: i32 = FX_MOVSS_XM
+        if (classe as i32) == bir.BC_F64 {
+            forma = FX_MOVSD_XM
+        }
+        return x64_emitir(c, mi2(forma as u16, m_xmm(reg as u8), aloc_home_do_parametro(c.f, k, aloc_bits(classe))))
+    }
+    let bits: u8 = aloc_bits(classe)
+    if bits == 64 {
+        return x64_emitir(c, mi2(FX_MOV64_RM as u16, m_reg(reg, 64), aloc_home_do_parametro(c.f, k, 64)))
+    }
+    if bits == 32 {
+        return x64_emitir(c, mi2(FX_MOV32_RM as u16, m_reg(reg, 32), aloc_home_do_parametro(c.f, k, 32)))
+    }
+    if bits == 16 {
+        return x64_emitir(c, mi2(FX_MOVZX32_RM16 as u16, m_reg(reg, 32), aloc_home_do_parametro(c.f, k, 16)))
+    }
+    return x64_emitir(c, mi2(FX_MOVZX32_RM8 as u16, m_reg(reg, 32), aloc_home_do_parametro(c.f, k, 8)))
+}
+
+// C: nativo/x64/x64_quadro.c:413
+proc carregar_parametros_em_registrador(c: ^X64Ctx) -> bool {
+    var k: u32 = 0
+    while k < (c.f as ^bir.BirFuncao).nparams {
+        let vreg: AlocOperando = aloc_operando_de(c.f, k, 64)
+        if ((common.c2f_b2i32(vreg.em_reg) != 0) and (not parametro_direto_em_registrador(c, k))) and (not carregar_parametro_em_registrador(c, k, vreg.reg)) {
+            return false
+        }
+        k += 1
+    }
+    return true
+}
+
+// C: nativo/x64/x64_quadro.c:431
+// C2F-INDECIDIVEL: mov
+proc listar_movimentos_de_parametros(c: ^X64Ctx, mov: []MovParametro) -> u32 {
+    let oculto: u32 = abi_win_oculto(c.f)
+    var n: u32 = 0
+    var k: u32 = 0
+    while k < (c.f as ^bir.BirFuncao).nparams {
+        if not parametro_direto_em_registrador(c, k) {
+            k += 1
+            continue
+        }
+        let antes_1: u32 = n
+        n += 1
+        mov[antes_1] = MovParametro{origem = REGS_HOME[k + oculto], destino = aloc_operando_de(c.f, k, 64).reg, classe = ((c.f as ^bir.BirFuncao).classe_vreg or_else {})[k]}
+        k += 1
+    }
+    return n
+}
+
+// C: nativo/x64/x64_quadro.c:445
+proc emitir_mov_parametro(c: ^X64Ctx, m: ^MovParametro) -> bool {
+    let sw_1 = aloc_bits(m.classe) as i32
+    if sw_1 == 64 {
+        let arg_1: MOperando = m_reg(m.origem, 64)
+        let arg_2: MOperando = m_reg(m.destino, 64)
+        return x64_emitir(c, mi2(FX_MOV64_RR as u16, arg_2, arg_1))
+    } else if sw_1 == 32 {
+        let arg_3: MOperando = m_reg(m.origem, 32)
+        let arg_4: MOperando = m_reg(m.destino, 32)
+        return x64_emitir(c, mi2(FX_MOV32_RR as u16, arg_4, arg_3))
+    } else if sw_1 == 16 {
+        let arg_5: MOperando = m_reg(m.origem, 16)
+        let arg_6: MOperando = m_reg(m.destino, 32)
+        return x64_emitir(c, mi2(FX_MOVZX32_RR16 as u16, arg_6, arg_5))
+    } else {
+        let arg_7: MOperando = m_reg(m.origem, 8)
+        let arg_8: MOperando = m_reg(m.destino, 32)
+        return x64_emitir(c, mi2(FX_MOVZX32_RR8 as u16, arg_8, arg_7))
+    }
+    return false
+}
+
+// C: nativo/x64/x64_quadro.c:460
+// C2F-13: mov fundido em n (len)
+proc destino_ainda_lido(mov: []MovParametro, j: u32) -> bool {
+    for k in (0 as u32)..<(len(mov) as u32) {
+        if ((k != j) and (not mov[k].feito)) and (common.c2f_s2u_32(mov[k].origem) == common.c2f_s2u_32(mov[j].destino)) {
+            return true
+        }
+    }
+    return false
+}
+
+// C: nativo/x64/x64_quadro.c:470
+// C2F-13: mov fundido em n (len)
+proc salvar_origem_em_r11(c: ^X64Ctx, mov: []MovParametro) -> bool {
+    var presa: i32 = X64_R11
+    for k in (0 as u32)..<(len(mov) as u32) {
+        if not mov[k].feito {
+            presa = mov[k].destino
+            break
+        }
+    }
+    let arg_1: MOperando = m_reg(presa, 64)
+    let arg_2: MOperando = m_reg(X64_R11, 64)
+    if not x64_emitir(c, mi2(FX_MOV64_RR as u16, arg_2, arg_1)) {
+        return false
+    }
+    for k in (0 as u32)..<(len(mov) as u32) {
+        if (not mov[k].feito) and (common.c2f_s2u_32(mov[k].origem) == common.c2f_s2u_32(presa)) {
+            mov[k].origem = X64_R11
+        }
+    }
+    return true
+}
+
+// C: nativo/x64/x64_quadro.c:490
+// C2F-13: mov fundido em n (len)
+proc emitir_movimentos_prontos(c: ^X64Ctx, mov: []MovParametro, emitidos: ^u32) -> bool {
+    emitidos^ = 0
+    for j in (0 as u32)..<(len(mov) as u32) {
+        if (common.c2f_b2i32(mov[j].feito) != 0) or (common.c2f_b2i32(destino_ainda_lido(mov, j)) != 0) {
+            continue
+        }
+        if not emitir_mov_parametro(c, &mov[j]) {
+            return false
+        }
+        mov[j].feito = true
+        emitidos^ += 1
+    }
+    return true
+}
+
+// C: nativo/x64/x64_quadro.c:505
+proc mover_parametros_inteiros(c: ^X64Ctx) -> bool {
+    var mov: [4]MovParametro = {}
+    let n: u32 = listar_movimentos_de_parametros(c, mov[..])
+    let movs = mov[0..<(n as int)]
+    var pendentes: u32 = n
+    var r11_usado: bool = false
+    while pendentes > 0 {
+        var emitidos: u32 = 0
+        if not emitir_movimentos_prontos(c, movs, &emitidos) {
+            return false
+        }
+        pendentes -= emitidos
+        if emitidos > 0 {
+            continue
+        }
+        if r11_usado {
+            return x64_sem_regra(c, "prologo", "dois ciclos de parametros em registrador (fora do degrau do alocador)")
+        }
+        if not salvar_origem_em_r11(c, movs) {
+            return false
+        }
+        r11_usado = true
+    }
+    return true
+}
+
+// C: nativo/x64/x64_quadro.c:529
+proc quadro_prologo(c: ^X64Ctx) -> bool {
+    if (not salvar_rbp(c)) or (not empurrar_salvos(c)) {
+        return false
+    }
+    if (common.c2f_b2i32(c.quadro.sondar) != 0) and (not sondar(c)) {
+        return false
+    }
+    let arg_1: MOperando = m_imed(quadro_alocacao(&c.quadro) as i64)
+    let arg_2: MOperando = m_reg(X64_RSP, 64)
+    if not x64_emitir(c, mi2(FX_SUB64_RI as u16, arg_2, arg_1)) {
+        return false
+    }
+    c.prologo.alocacao = fim_da_instrucao(c)
+    return (((((common.c2f_b2i32(guardar_home(c)) != 0) and (common.c2f_b2i32(ponteiros_dos_bytes(c)) != 0)) and (common.c2f_b2i32(mover_xmm_do_alocador(c, true)) != 0)) and (common.c2f_b2i32(mover_parametros_inteiros(c)) != 0)) and (common.c2f_b2i32(carregar_parametros_em_registrador(c)) != 0)) and ((not c.quadro.salva) or (common.c2f_b2i32(salvar_registradores_sysv(c)) != 0))
+}
+
+// C: nativo/x64/x64_quadro.c:541
+proc quadro_epilogo(c: ^X64Ctx) -> bool {
+    if (common.c2f_b2i32(c.quadro.salva) != 0) and (not restaurar_registradores_sysv(c)) {
+        return false
+    }
+    if not mover_xmm_do_alocador(c, false) {
+        return false
+    }
+    let arg_1: MOperando = m_mem(X64_RBP, -transmute(c.quadro.empurrados, to = i32), 64)
+    let arg_2: MOperando = m_reg(X64_RSP, 64)
+    if not x64_emitir(c, mi2(FX_LEA64_RM as u16, arg_2, arg_1)) {
+        return false
+    }
+    if (not desempilhar_salvos(c)) or (not x64_emitir(c, mi1(FX_POP64_R as u16, m_reg(X64_RBP, 64)))) {
+        return false
+    }
+    return x64_emitir(c, mi0(FX_RET as u16))
+}
+
+// Teste dirigido: alinhamento dos slots (cada um no seu alinhamento, o fim cresce na ordem); saida recebe o deslocamento de cada slot.
+test "x64_quadro_posicionar_slots_alinha" {
+    var f: bir.BirFuncao = bir.BirFuncao{}
+    f.slots = make([dynamic]bir.BirSlot, alloc = heap, cap = 2)
+    defer delete(f.slots)
+    append(&f.slots, item = bir.BirSlot{tam = 4, alinhamento = 4})
+    append(&f.slots, item = bir.BirSlot{tam = 8, alinhamento = 8})
+    f.nslots = 2
+    var saida: [2]u32 = {0, 0}
+    let fim = quadro_posicionar_slots(&f, saida[..])
+    expect(saida[0] == 4)
+    expect(saida[1] == 16)
+    expect(fim == 16)
+}
+
+// Teste dirigido: quadro de funcao vazia = so a area de sombra (32 B) arredondada a 16.
+test "x64_quadro_calcular_vazio" {
+    var p: bir.BirPrograma = bir.BirPrograma{}
+    var f: bir.BirFuncao = bir.BirFuncao{}
+    let q = quadro_calcular(&p, &f)
+    expect(q.tam == 32)
+    expect(q.salvos_xmm == 0)
+    expect(q.sondar == false)
+}
+
+// Teste dirigido: popcount da mascara de xmm salvos (bits 6, 7 e 8 = 3 xmm = 48 B) entra no quadro (32 + 48 = 80).
+test "x64_quadro_calcular_popcount_xmm" {
+    var p: bir.BirPrograma = bir.BirPrograma{}
+    var f: bir.BirFuncao = bir.BirFuncao{}
+    f.regs_salvos_xmm = 448
+    let q = quadro_calcular(&p, &f)
+    expect(q.salvos_xmm == 48)
+    expect(q.tam == 80)
+}
+
+// Teste dirigido: slot de 4 bytes sem vreg vira agregado de 4 B e o quadro arredonda para 48.
+test "x64_quadro_calcular_agregado_de_slot" {
+    var p: bir.BirPrograma = bir.BirPrograma{}
+    var f: bir.BirFuncao = bir.BirFuncao{}
+    f.slots = make([dynamic]bir.BirSlot, alloc = heap, cap = 1)
+    defer delete(f.slots)
+    append(&f.slots, item = bir.BirSlot{tam = 4, alinhamento = 4})
+    f.nslots = 1
+    let q = quadro_calcular(&p, &f)
+    expect(q.agregados == 4)
+    expect(q.tam == 48)
+}

@@ -1,0 +1,596 @@
+// nativo/obj/terceiros.fj - porte de compiler/nativo/obj/terceiros.c, compiler/nativo/obj/terceiros.h
+// sha256 de nativo/obj/terceiros.c: 44652b02a34b3699785f42599d888766cf615f17fa5c8bd429cdfb7c9732b1e5
+// sha256 de nativo/obj/terceiros.h: 3e5f9493bbdc871466cf36dbc98b9c0a6119ff8c7bfe5d3046994a1947b24d86
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "common"
+import "nativo/fmt" as pefmt
+
+pub struct TerceirosPedido {
+    membros: ?^[dynamic]EstaticaMembro
+    celulas: ?[]str
+    qtd_celulas: u32
+    tabelas: ?[]ImportTabela
+    qtd_tabelas: u32
+    outros: ?[]?^Objeto
+    qtd_outros: u32
+    formato: i32
+    libmem: ?^TerceirosLibmem
+}
+
+pub struct TerceirosRelato {
+    ignoradas: u32
+    primeira_ignorada: ?str
+    exportados: ?^[dynamic]str
+    tem_ctors: bool
+}
+
+struct TrUniaoElf {
+    saida: ?^Objeto
+    ele: ?^Objeto
+    mapa_sec: [dynamic]u32
+    mapa_sim: [dynamic]u32
+    indice: u32
+    erro: ?^common.Diag
+}
+
+struct TrChave {
+    nome: ?str
+    antigo: u32
+}
+
+const TR_PREFIXO_IMP: str = "__imp_"
+const TR_TAM_PREFIXO_IMP: u32 = 6
+const TR_ALINHA_MAX_COMUM: u32 = 16
+const TR_ALINHA_CELULA: u32 = 8
+const TR_ALINHA_THUNK: u32 = 16
+const TR_TAM_CELULA: u32 = 8
+const TR_LOG2_MAX: u32 = 12
+const TR_SECAO_COMUM: str = ".bss$comum"
+const TR_SECAO_CELULA: str = ".rdata$imp"
+const TR_SECAO_THUNK: str = ".text$thunk"
+const TR_PREFIXO_LOCAL: str = ".m%u"
+const TR_FIM_CAMPO_PC: i32 = 4
+const TR_OFF_DISP_THUNK: u32 = 2
+// C2F: TR_JMP_IMPORT (char[6] com NUL) vira [6]u8 com os bytes FF 25 00 00 00 00 (jmp qword ptr [rip+disp32])
+const TR_JMP_IMPORT: [6]u8 = {255, 37, 0, 0, 0, 0}
+const ZEROS_2: [8]u8 = {0, 0, 0, 0, 0, 0, 0, 0}
+
+// C: nativo/obj/terceiros.c:46
+proc tr_simbolo(o: ^Objeto, i: u32) -> ^ObjSimbolo {
+    return &o.simbolos[i as u64]
+}
+
+// C: nativo/obj/terceiros.c:56
+proc tr_copiar_secoes(saida: ^Objeto, ele: ^Objeto, mapa: ^[dynamic]u32) {
+    for s in (0 as u64)..<(len(ele.secoes) as u64) {
+        let orig: ^ObjSecao = &ele.secoes[s]
+        let nova: u32 = obj_secao_abrir(saida, orig.nome, orig.tipo, orig.alinhamento)
+        let dest: ^ObjSecao = &saida.secoes[nova as u64]
+        if len(orig.bytes) > 0 {
+            append(&dest.bytes, items = orig.bytes[0..<len(orig.bytes)])
+        }
+        dest.tam_bss = orig.tam_bss
+        append(mapa, item = nova)
+    }
+}
+
+// C: nativo/obj/terceiros.c:81
+proc tr_definir_elf(u: ^TrUniaoElf, s: ^ObjSimbolo, nome: ?str, secao: i32) -> bool {
+    let prev: i64 = obj_achar_simbolo(u.saida as ^Objeto, nome)
+    var tern_1: ?^ObjSimbolo = none
+    if prev >= 0 {
+        tern_1 = &(u.saida as ^Objeto).simbolos[common.c2f_s2u_64(prev)]
+    }
+    let p: ?^ObjSimbolo = tern_1
+    if (p == none) or ((p as ^ObjSimbolo).secao == OBJ_SECAO_INDEFINIDA) {
+        let idx: u32 = obj_simbolo_definir(u.saida as ^Objeto, nome, secao, s.off)
+        let ptr_1: ^Objeto = u.saida as ^Objeto
+        ptr_1.simbolos[idx as u64].fraco = s.fraco
+        return true
+    }
+    if s.fraco {
+        return true
+    }
+    if not (p as ^ObjSimbolo).fraco {
+        let txt_1 = nome or_else "(null)"
+        let msg_1 = format(f"ELF: simbolo '{txt_1}' definido em dois membros de biblioteca estatica", alloc = heap)
+        defer delete(msg_1)
+        return common.diag_relatar(u.erro as ^common.Diag, common.X0903, 0, msg_1)
+    }
+    let ptr_2: ^ObjSimbolo = p as ^ObjSimbolo
+    ptr_2.secao = secao
+    let ptr_3: ^ObjSimbolo = p as ^ObjSimbolo
+    ptr_3.off = s.off
+    let ptr_4: ^ObjSimbolo = p as ^ObjSimbolo
+    ptr_4.fraco = false
+    return true
+}
+
+// C: nativo/obj/terceiros.c:102
+// C2F: nome do simbolo no objeto de saida: local ganha o prefixo .m<indice>; global e copiado como esta (texto de heap, dono quem chama)
+proc tr_nome_do_simbolo(indice: u32, s: ^ObjSimbolo) -> str {
+    let txt_nome: str = s.nome or_else "(null)"
+    if s.global {
+        return format(f"{txt_nome}", alloc = heap)
+    }
+    return format(f".m{indice}{txt_nome}", alloc = heap)
+}
+
+proc tr_copiar_simbolos(u: ^TrUniaoElf) -> bool {
+    let ele: ^Objeto = u.ele as ^Objeto
+    for j in (0 as u64)..<(len(ele.simbolos) as u64) {
+        let s: ^ObjSimbolo = &ele.simbolos[j]
+        let nome_txt: str = tr_nome_do_simbolo(u.indice, s)
+        defer delete(nome_txt)
+        var ok: bool = true
+        if s.secao != OBJ_SECAO_INDEFINIDA {
+            let secao_saida: i32 = transmute(u.mapa_sec[common.c2f_s2u_64(s.secao as i64)], to = i32)
+            ok = tr_definir_elf(u, s, nome_txt, secao_saida)
+        }
+        if ok {
+            let idx: u32 = obj_simbolo_referir(u.saida as ^Objeto, nome_txt)
+            if s.fraco {
+                let alvo: ^ObjSimbolo = &(u.saida as ^Objeto).simbolos[idx as u64]
+                alvo.fraco = true
+            }
+            append(&u.mapa_sim, item = idx)
+        }
+        if not ok {
+            return false
+        }
+    }
+    return true
+}
+
+// C: nativo/obj/terceiros.c:130
+proc tr_relativo_ao_pc(tipo: i32) -> bool {
+    return ((common.c2f_s2u_32(tipo) == (OR_REL32 as u32)) or (common.c2f_s2u_32(tipo) == (OR_GOTPCREL as u32))) or (common.c2f_s2u_32(tipo) == (OR_GOTPCRELX as u32))
+}
+
+// C: nativo/obj/terceiros.c:135
+proc tr_copiar_relocs(u: ^TrUniaoElf) {
+    var r: u64 = 0
+    while r < (len((u.ele as ^Objeto).relocs) as u64) {
+        let rel: ^ObjReloc = &(u.ele as ^Objeto).relocs[r]
+        var c: ObjCorrecao = rel.correcao
+        c.simbolo = u.mapa_sim[c.simbolo as u64]
+        if tr_relativo_ao_pc(c.tipo) {
+            c.adendo += TR_FIM_CAMPO_PC as i64
+        }
+        let arg_1: ObjCorrecao = c
+        let arg_2: ObjAlvoReloc = ObjAlvoReloc{secao = u.mapa_sec[rel.alvo.secao as u64], off = rel.alvo.off}
+        let arg_3: ^Objeto = u.saida as ^Objeto
+        obj_relocar(arg_3, arg_2, arg_1)
+        r += 1
+    }
+}
+
+// C: nativo/obj/terceiros.c:149
+proc tr_unir_elf(saida: ^Objeto, m: ^EstaticaMembro, indice: u32, erro: ^common.Diag) -> bool {
+    var ele: Objeto = Objeto{}
+    var e: ElfLErro = ElfLErro{codigo = 0}
+    var u: TrUniaoElf = TrUniaoElf{saida = saida, ele = &ele, indice = indice, erro = erro}
+    var ok: bool = true
+    obj_iniciar(&ele)
+    u.mapa_sec = make([dynamic]u32, alloc = heap)
+    u.mapa_sim = make([dynamic]u32, alloc = heap)
+    if common.c2f_s2u_32(elf_ler_objeto(m.dados, m.tam, &ele, &e)) != (ELFL_OK as u32) {
+        ok = ar_relatar_membro_elf(erro, (m.nome or_else ""), &e)
+    } else {
+        tr_copiar_secoes(saida, &ele, &u.mapa_sec)
+        ok = tr_copiar_simbolos(&u)
+        if ok {
+            tr_copiar_relocs(&u)
+        }
+    }
+    delete(u.mapa_sec)
+    delete(u.mapa_sim)
+    obj_liberar(&ele)
+    return ok
+}
+
+// C: nativo/obj/terceiros.c:174
+proc tr_ler_membros(p: ^TerceirosPedido, u: ^CoffUniao, inicios: ^[dynamic]u32, erro: ^common.Diag) -> bool {
+    let membros: ^[dynamic]EstaticaMembro = p.membros as ^[dynamic]EstaticaMembro
+    for k in (0 as u64)..<(len(membros^) as u64) {
+        let m: ^EstaticaMembro = &membros[k]
+        var entrada: CoffMembroEntrada = CoffMembroEntrada{dados = m.dados, tam = m.tam, nome = m.nome}
+        append(inicios, item = (len((u.o as ^Objeto).secoes) as u32))
+        if ar_eh_elf(m.dados as ^u8, m.tam) {
+            if p.formato != pefmt.IMAGEM_ELF {
+                let nome_txt: str = m.nome or_else "(null)"
+                let msg_1 = format(f"biblioteca estatica, membro '{nome_txt}': formato ELF no alvo Windows (so o alvo Linux liga ELF)", alloc = heap)
+                defer delete(msg_1)
+                return common.diag_relatar(erro, common.X0105, 0, msg_1)
+            }
+            if not tr_unir_elf((u.o as ^Objeto), m, (k as u32), erro) {
+                return false
+            }
+            continue
+        }
+        if p.formato == pefmt.IMAGEM_ELF {
+            let nome_txt: str = m.nome or_else "(null)"
+            let msg_2 = format(f"biblioteca estatica, membro '{nome_txt}': formato COFF no alvo Linux (o alvo Linux liga so ELF)", alloc = heap)
+            defer delete(msg_2)
+            return common.diag_relatar(erro, common.X0105, 0, msg_2)
+        }
+        if not coff_uniao_ler_membro(u, &entrada, erro) {
+            return false
+        }
+    }
+    return true
+}
+
+// C: nativo/obj/terceiros.c:200
+proc tr_fechar_fraco(o: ^Objeto, f: ^CoffFraco) {
+    let fraco: ^ObjSimbolo = tr_simbolo(o, f.simbolo)
+    var padrao: ?^ObjSimbolo = none
+    let nome: ?str = fraco.nome
+    if (fraco.secao != OBJ_SECAO_INDEFINIDA) or (f.padrao == COFF_SIMBOLO_NAO_MAPEADO) {
+        return
+    }
+    padrao = tr_simbolo(o, f.padrao)
+    if (padrao as ^ObjSimbolo).secao >= 0 {
+        _ = obj_simbolo_definir(o, nome, (padrao as ^ObjSimbolo).secao, (padrao as ^ObjSimbolo).off)
+    }
+}
+
+// C: nativo/obj/terceiros.c:213
+proc tr_fechar_fracos(u: ^CoffUniao) {
+    for k in (0 as u64)..<(len(u.fracos) as u64) {
+        let arg_1: ^CoffFraco = &u.fracos[k]
+        let arg_2: ^Objeto = u.o as ^Objeto
+        tr_fechar_fraco(arg_2, arg_1)
+    }
+}
+
+// C: nativo/obj/terceiros.c:221
+proc tr_alinhamento_do_comum(u: ^CoffUniao, nome: str, tam: u32) -> u32 {
+    var alinha: u32 = 1
+    for k in (0 as u64)..<(len(u.alinhamentos) as u64) {
+        let d: ^CoffDiretiva = &u.alinhamentos[k]
+        if ((d.nome or_else "") == nome) and (d.valor <= TR_LOG2_MAX) {
+            return 1 << (d.valor & 31)
+        }
+    }
+    while (alinha < tam) and (alinha < TR_ALINHA_MAX_COMUM) {
+        alinha = alinha << 1
+    }
+    return alinha
+}
+
+// C: nativo/obj/terceiros.c:236
+proc tr_fechar_comum(u: ^CoffUniao, c: ^CoffComum) {
+    let sim: ^ObjSimbolo = tr_simbolo(u.o as ^Objeto, c.simbolo)
+    let nome: ?str = sim.nome
+    var secao: u32 = 0
+    if sim.secao != OBJ_SECAO_INDEFINIDA {
+        return
+    }
+    let arg_1: u32 = tr_alinhamento_do_comum(u, (nome or_else ""), c.tam)
+    let arg_2: ^Objeto = u.o as ^Objeto
+    secao = obj_secao_abrir(arg_2, TR_SECAO_COMUM, OS_BSS, arg_1)
+    let ptr_1: ^Objeto = u.o as ^Objeto
+    ptr_1.secoes[secao as u64].tam_bss = c.tam
+    _ = obj_simbolo_definir(u.o as ^Objeto, nome, transmute(secao, to = i32), 0)
+}
+
+// C: nativo/obj/terceiros.c:249
+proc tr_fechar_comuns(u: ^CoffUniao) {
+    for k in (0 as u64)..<(len(u.comuns) as u64) {
+        tr_fechar_comum(u, &u.comuns[k])
+    }
+}
+
+// C: nativo/obj/terceiros.c:257
+proc terceiros_criar_celula(o: ^Objeto, nome: str) {
+    let secao: u32 = obj_secao_abrir(o, TR_SECAO_CELULA, OS_RDATA, TR_ALINHA_CELULA)
+    var zeros: [8]u8 = ZEROS_2
+    append(&o.secoes[secao as u64].bytes, items = zeros[0..<len(zeros)])
+    let imp: str = format(f"{TR_PREFIXO_IMP}{nome}", alloc = heap)
+    defer delete(imp)
+    _ = obj_simbolo_definir(o, imp, transmute(secao, to = i32), 0)
+    obj_relocar(o, ObjAlvoReloc{secao = secao, off = 0}, ObjCorrecao{tipo = OR_ADDR64, simbolo = obj_simbolo_referir(o, nome), adendo = 0})
+}
+
+// C: nativo/obj/terceiros.c:270
+proc tr_criar_celulas(p: ^TerceirosPedido, o: ^Objeto) {
+    for k in (0 as u32)..<p.qtd_celulas {
+        terceiros_criar_celula(o, (p.celulas or_else {})[k])
+    }
+}
+
+// C: nativo/obj/terceiros.c:276
+proc tr_na_tabela(p: ^TerceirosPedido, nome: str) -> bool {
+    for t in (0 as u32)..<p.qtd_tabelas {
+        for s in (0 as u32)..<(p.tabelas or_else {})[t].qtd {
+            if ((p.tabelas or_else {})[t].simbolos or_else {})[s] == nome {
+                return true
+            }
+        }
+    }
+    return false
+}
+
+// C: nativo/obj/terceiros.c:288
+proc tr_definido_fora(p: ^TerceirosPedido, nome: str) -> bool {
+    for k in (0 as u32)..<p.qtd_outros {
+        let simbolos: ^[dynamic]ObjSimbolo = &((p.outros or_else {})[k] as ^Objeto).simbolos
+        for i in (0 as u64)..<(len(simbolos^) as u64) {
+            let s: ^ObjSimbolo = &simbolos[i]
+            if ((common.c2f_b2i32(s.global) != 0) and (s.secao >= 0)) and ((s.nome or_else "") == nome) {
+                return true
+            }
+        }
+    }
+    return false
+}
+
+// C: nativo/obj/terceiros.c:303
+proc tr_precisa_thunk(p: ^TerceirosPedido, s: ^ObjSimbolo) -> bool {
+    return ((((common.c2f_b2i32(s.global) != 0) and (s.secao == OBJ_SECAO_INDEFINIDA)) and (not common.c2f_prefixo_igual((s.nome or_else ""), TR_PREFIXO_IMP, 6))) and (common.c2f_b2i32(tr_na_tabela(p, (s.nome or_else ""))) != 0)) and (not tr_definido_fora(p, (s.nome or_else "")))
+}
+
+// C: nativo/obj/terceiros.c:308
+proc tr_criar_thunk(o: ^Objeto, nome: str) {
+    let secao: u32 = obj_secao_abrir(o, TR_SECAO_THUNK, OS_TEXTO, TR_ALINHA_THUNK)
+    var jmp: [6]u8 = TR_JMP_IMPORT
+    append(&o.secoes[secao as u64].bytes, items = jmp[0..<len(jmp)])
+    let imp: str = format(f"{TR_PREFIXO_IMP}{nome}", alloc = heap)
+    defer delete(imp)
+    _ = obj_simbolo_definir(o, nome, transmute(secao, to = i32), 0)
+    obj_relocar(o, ObjAlvoReloc{secao = secao, off = TR_OFF_DISP_THUNK}, ObjCorrecao{tipo = OR_REL32, simbolo = obj_simbolo_referir(o, imp), adendo = 0})
+}
+
+// C: nativo/obj/terceiros.c:321
+proc tr_criar_thunks(p: ^TerceirosPedido, o: ^Objeto) {
+    let antes: u64 = len(o.simbolos) as u64
+    for i in (0 as u64)..<antes {
+        let s: ^ObjSimbolo = tr_simbolo(o, i as u32)
+        let nome: ?str = s.nome
+        if tr_precisa_thunk(p, s) {
+            tr_criar_thunk(o, (nome or_else ""))
+        }
+    }
+}
+
+// C: nativo/obj/terceiros.c:336
+proc tr_esvaziar_secao(s: ^ObjSecao) {
+    delete(s.bytes)
+    s.bytes = make([dynamic]u8, alloc = heap)
+    s.tam_bss = 0
+}
+
+// C: nativo/obj/terceiros.c:343
+proc tr_esta_anulada(marcas: ^[dynamic]u8, secao: u32) -> bool {
+    return marcas[secao as u64] != 0
+}
+
+// C: nativo/obj/terceiros.c:348
+// C2F: o C compacta no lugar e corta o tamanho; aqui as vivas vao para uma lista de passagem e a lista volta por clear + append (E0311)
+proc tr_descartar_relocs(o: ^Objeto, marcas: ^[dynamic]u8) {
+    var vivas: [dynamic]ObjReloc = make([dynamic]ObjReloc, alloc = heap)
+    for r in (0 as u64)..<(len(o.relocs) as u64) {
+        let rel: ObjReloc = o.relocs[r]
+        if not tr_esta_anulada(marcas, rel.alvo.secao) {
+            append(&vivas, item = rel)
+        }
+    }
+    clear(&o.relocs)
+    for v in (0 as u64)..<(len(vivas) as u64) {
+        append(&o.relocs, item = vivas[v])
+    }
+    delete(vivas)
+}
+
+// C: nativo/obj/terceiros.c:362
+proc tr_anular(u: ^CoffUniao) {
+    let o: ^Objeto = u.o as ^Objeto
+    var marcas: [dynamic]u8 = make([dynamic]u8, alloc = heap)
+    for k in (0 as u64)..<(len(o.secoes) as u64) {
+        append(&marcas, item = 0 as u8)
+    }
+    for k in (0 as u64)..<(len(u.anuladas) as u64) {
+        let secao: u32 = u.anuladas[k]
+        marcas[secao as u64] = 1 as u8
+        tr_esvaziar_secao(&o.secoes[secao as u64])
+    }
+    tr_descartar_relocs(o, &marcas)
+    delete(marcas)
+}
+
+// C: nativo/obj/terceiros.c:385
+// C2F-B0: less do sort_by. Ordem total sem desempate extra: o antigo e unico por secao, entao dois elementos nunca empatam.
+proc tr_comparar(a: ^TrChave, b: ^TrChave) -> bool {
+    let c: i32 = common.c2f_strcmp(a.nome or_else "", b.nome or_else "")
+    if c != 0 {
+        return c < 0
+    }
+    return a.antigo < b.antigo
+}
+
+// C: nativo/obj/terceiros.c:396
+proc tr_renumerar(o: ^Objeto, posicao: ^[dynamic]u32) {
+    var i: u64 = 0
+    while i < (len(o.simbolos) as u64) {
+        let s: ^ObjSimbolo = &o.simbolos[i]
+        if s.secao >= 0 {
+            s.secao = transmute(posicao[common.c2f_s2u_64(s.secao as i64)], to = i32)
+        }
+        i += 1
+    }
+    var r: u64 = 0
+    while r < (len(o.relocs) as u64) {
+        let rel: ^ObjReloc = &o.relocs[r]
+        rel.alvo.secao = posicao[rel.alvo.secao as u64]
+        r += 1
+    }
+}
+
+// C: nativo/obj/terceiros.c:412
+// C2F: a lista de secoes nao muda de dono (E0311): cada secao e copiada com bytes novos, um elemento de cada vez
+proc tr_copiar_secao(destino: ^[dynamic]ObjSecao, origem: ^ObjSecao) {
+    append(destino, item = ObjSecao{nome = origem.nome, tipo = origem.tipo, alinhamento = origem.alinhamento, bytes = make([dynamic]u8, alloc = heap), tam_bss = origem.tam_bss})
+    let nova: ^ObjSecao = &destino[len(destino^) - 1]
+    if len(origem.bytes) > 0 {
+        append(&nova.bytes, items = origem.bytes[0..<len(origem.bytes)])
+    }
+}
+
+// C2F: o malloc das chaves some (heap); o qsort vira sort_by(less = tr_comparar); a velha e liberada depois da copia na ordem nova
+proc tr_ordenar(o: ^Objeto) {
+    let n: u64 = len(o.secoes) as u64
+    var chaves: [dynamic]TrChave = make([dynamic]TrChave, alloc = heap)
+    var posicao: [dynamic]u32 = make([dynamic]u32, alloc = heap)
+    var velhas: [dynamic]ObjSecao = make([dynamic]ObjSecao, alloc = heap)
+    for k in (0 as u64)..<n {
+        append(&chaves, item = TrChave{nome = o.secoes[k].nome, antigo = k as u32})
+        append(&posicao, item = 0 as u32)
+        tr_copiar_secao(&velhas, &o.secoes[k])
+    }
+    sort_by(chaves[..], less = tr_comparar)
+    for k in (0 as u64)..<n {
+        posicao[chaves[k].antigo as u64] = k as u32
+    }
+    for k in (0 as u64)..<n {
+        delete(o.secoes[k].bytes)
+    }
+    delete(o.secoes)
+    o.secoes = make([dynamic]ObjSecao, alloc = heap)
+    for k in (0 as u64)..<n {
+        tr_copiar_secao(&o.secoes, &velhas[chaves[k].antigo as u64])
+    }
+    tr_renumerar(o, &posicao)
+    for k in (0 as u64)..<n {
+        delete(velhas[k].bytes)
+    }
+    delete(velhas)
+    delete(chaves)
+    delete(posicao)
+}
+
+// C: nativo/obj/terceiros.c:440
+proc tr_relatar(u: ^CoffUniao, relato: ^TerceirosRelato) {
+    relato.ignoradas = u.ignoradas
+    relato.primeira_ignorada = u.primeira_ignorada
+    if relato.exportados == none {
+        return
+    }
+    let exportados: ^[dynamic]str = relato.exportados as ^[dynamic]str
+    for k in (0 as u64)..<(len(u.exportados) as u64) {
+        append(exportados, item = u.exportados[k])
+    }
+}
+
+// C: nativo/obj/terceiros.c:448
+pub proc terceiros_montar(pedido: ^TerceirosPedido, saida: ^Objeto, relato: ^TerceirosRelato, erro: ^common.Diag) -> bool {
+    var u: CoffUniao = CoffUniao{}
+    var inicios: [dynamic]u32 = make([dynamic]u32, alloc = heap)
+    coff_uniao_iniciar(&u, saida)
+    let ok: bool = tr_ler_membros(pedido, &u, &inicios, erro)
+    if ok and (pedido.libmem != none) {
+        let lm: ^TerceirosLibmem = pedido.libmem as ^TerceirosLibmem
+        if lm.qtd_slots > 0 {
+            libmem_redirecionar(saida, pedido.membros as ^[dynamic]EstaticaMembro, &inicios, pedido.libmem)
+            libmem_tabela(saida, pedido.libmem)
+        }
+    }
+    delete(inicios)
+    if ok {
+        tr_fechar_fracos(&u)
+        tr_fechar_comuns(&u)
+        tr_criar_celulas(pedido, saida)
+        tr_criar_thunks(pedido, saida)
+        tr_anular(&u)
+        tr_ordenar(saida)
+        relato.tem_ctors = terceiros_construtores(saida)
+        tr_relatar(&u, relato)
+    }
+    coff_uniao_liberar(&u)
+    return ok
+}
+
+test "terceiros_tr_comparar_ordem" {
+    var ab: TrChave = TrChave{nome = "b", antigo = 0}
+    var a1: TrChave = TrChave{nome = "a", antigo = 1}
+    var a2: TrChave = TrChave{nome = "a", antigo = 2}
+    expect(tr_comparar(&a1, &ab))
+    expect(not tr_comparar(&ab, &a1))
+    expect(tr_comparar(&a1, &a2))
+    expect(not tr_comparar(&a2, &a1))
+}
+
+test "terceiros_tr_ordenar_por_nome" {
+    var o: Objeto = Objeto{}
+    obj_iniciar(&o)
+    _ = obj_secao_abrir(&o, ".text$b", OS_TEXTO, 1)
+    _ = obj_secao_abrir(&o, ".text", OS_TEXTO, 1)
+    _ = obj_secao_abrir(&o, ".text$a", OS_TEXTO, 1)
+    tr_ordenar(&o)
+    expect((o.secoes[0].nome or_else "") == ".text")
+    expect((o.secoes[1].nome or_else "") == ".text$a")
+    expect((o.secoes[2].nome or_else "") == ".text$b")
+    obj_liberar(&o)
+}
+
+test "terceiros_tr_copiar_secoes" {
+    var ele: Objeto = Objeto{}
+    obj_iniciar(&ele)
+    let sec: u32 = obj_secao_abrir(&ele, ".data", OS_DATA, 4)
+    append(&ele.secoes[sec as u64].bytes, item = 9 as u8)
+    var saida: Objeto = Objeto{}
+    obj_iniciar(&saida)
+    var mapa: [dynamic]u32 = make([dynamic]u32, alloc = heap)
+    tr_copiar_secoes(&saida, &ele, &mapa)
+    expect(len(mapa) == 1)
+    expect(mapa[0] == 0)
+    expect(len(saida.secoes[0].bytes) == 1)
+    expect(saida.secoes[0].bytes[0] == 9)
+    delete(mapa)
+    obj_liberar(&ele)
+    obj_liberar(&saida)
+}
+
+test "terceiros_celula_e_thunk" {
+    var o: Objeto = Objeto{}
+    obj_iniciar(&o)
+    terceiros_criar_celula(&o, "memcpy")
+    expect(len(o.secoes) == 1)
+    expect((o.secoes[0].nome or_else "") == ".rdata$imp")
+    expect(len(o.secoes[0].bytes) == 8)
+    expect(obj_achar_simbolo(&o, "__imp_memcpy") >= 0)
+    expect(len(o.relocs) == 1)
+    expect(o.relocs[0].correcao.tipo == OR_ADDR64)
+    tr_criar_thunk(&o, "free")
+    expect(len(o.secoes) == 2)
+    expect((o.secoes[1].nome or_else "") == ".text$thunk")
+    expect(len(o.secoes[1].bytes) == 6)
+    expect(o.secoes[1].bytes[0] == 255)
+    expect(o.secoes[1].bytes[1] == 37)
+    expect(o.relocs[1].alvo.off == 2)
+    expect(o.relocs[1].correcao.tipo == OR_REL32)
+    obj_liberar(&o)
+}
+
+test "terceiros_tr_anular_descarta_relocs" {
+    var o: Objeto = Objeto{}
+    obj_iniciar(&o)
+    let s0: u32 = obj_secao_abrir(&o, ".text", OS_TEXTO, 1)
+    let s1: u32 = obj_secao_abrir(&o, ".pdata", OS_PDATA, 4)
+    append(&o.secoes[s1 as u64].bytes, item = 7 as u8)
+    let alvo: u32 = obj_simbolo_referir(&o, "f")
+    obj_relocar(&o, ObjAlvoReloc{secao = s0, off = 0}, ObjCorrecao{tipo = OR_REL32, simbolo = alvo, adendo = 0})
+    obj_relocar(&o, ObjAlvoReloc{secao = s1, off = 0}, ObjCorrecao{tipo = OR_ADDR64, simbolo = alvo, adendo = 0})
+    var u: CoffUniao = CoffUniao{}
+    u.o = &o
+    u.anuladas = make([dynamic]u32, alloc = heap)
+    append(&u.anuladas, item = s1)
+    tr_anular(&u)
+    expect(len(o.relocs) == 1)
+    expect(o.relocs[0].alvo.secao == s0)
+    expect(len(o.secoes[1].bytes) == 0)
+    delete(u.anuladas)
+    obj_liberar(&o)
+}

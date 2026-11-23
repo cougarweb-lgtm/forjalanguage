@@ -1,0 +1,244 @@
+// nativo/wasm/wasm_real.fj - emissao das operacoes reais (f32/f64) da BIR no alvo wasm32-wasip1
+// Versao: 0.1.0 (W2-M1: CONST, add/sub/mul/div, NEG, RAIZ, CMP real, i_para_f com e sem sinal, f_para_f; real->int fica X0001)
+// Contrato: wasm_emitir_real(ins, corpo, erro) acrescenta em `corpo` a sequencia wasm da op real e devolve true; operando ou op sem
+// equivalente devolve false e registra X0001 em `erro`. wasm_real_aplica(ins) diz se wasm_emitir_op deve desviar para ca.
+// Convencao: imediato real = bits da BIR (bir_construir_real.fj: f32 nos 32 bits baixos de imed, f64 nos 64) em bytes little-endian.
+// CMP real devolve i32 0/1 (como a inteira). NEG real usa f32.neg/f64.neg sobre a: o operando b (mascara de sinal) e ignorado.
+
+import "common"
+import "nativo/bir"
+
+const OP_F32_CONST: u8 = 0x43
+const OP_F64_CONST: u8 = 0x44
+const OP_F32_NEG: u8 = 0x8C
+const OP_F32_SQRT: u8 = 0x91
+const OP_F64_NEG: u8 = 0x9A
+const OP_F64_SQRT: u8 = 0x9F
+const OP_F32_DEMOTE_F64: u8 = 0xB6
+const OP_F64_PROMOTE_F32: u8 = 0xBB
+
+// add sub mul div (indice = op BIR - BIR_ADD; BIR_DIV = 23 usa o indice 3)
+const WREAL_F32_ARIT: [4]u8 = {0x92, 0x93, 0x94, 0x95}
+const WREAL_F64_ARIT: [4]u8 = {0xA0, 0xA1, 0xA2, 0xA3}
+// eq ne lt le gt ge (indice = cond BIR - BCOND_FEQ)
+const WREAL_F32_CMP: [6]u8 = {0x5B, 0x5C, 0x5D, 0x5F, 0x5E, 0x60}
+const WREAL_F64_CMP: [6]u8 = {0x61, 0x62, 0x63, 0x65, 0x64, 0x66}
+// convert_i32_s, convert_i32_u, convert_i64_s, convert_i64_u (indice = 0..3)
+const WREAL_F32_DE_INT: [4]u8 = {0xB2, 0xB3, 0xB4, 0xB5}
+const WREAL_F64_DE_INT: [4]u8 = {0xB7, 0xB8, 0xB9, 0xBA}
+
+proc wasm_classe_real(classe: u8) -> bool {
+    let c = classe as i32
+    return (c == bir.BC_F32) or (c == bir.BC_F64)
+}
+
+proc wasm_classe_f64(classe: u8) -> bool {
+    return (classe as i32) == bir.BC_F64
+}
+
+// Ops da BIR que este modulo emite (o resto, como SELECIONA real, segue X0001 em wasm_ops.fj)
+proc wasm_real_op_tratada(op: i32) -> bool {
+    if (op == bir.BIR_CONST) or (op == bir.BIR_NEG) or (op == bir.BIR_RAIZ) or (op == bir.BIR_CMP) {
+        return true
+    }
+    if (op == bir.BIR_I_PARA_F) or (op == bir.BIR_F_PARA_F) or (op == bir.BIR_DIV) {
+        return true
+    }
+    return (op >= bir.BIR_ADD) and (op <= bir.BIR_MUL)
+}
+
+// Desvio de wasm_emitir_op: op tratada e (CMP com operando real, ou destino real)
+proc wasm_real_aplica(ins: ^bir.BirInstr) -> bool {
+    let op = ins.op as i32
+    if not wasm_real_op_tratada(op) {
+        return false
+    }
+    if op == bir.BIR_CMP {
+        return wasm_classe_real(ins.a.classe) or wasm_classe_real(ins.b.classe)
+    }
+    return wasm_classe_real(ins.classe)
+}
+
+// Escreve os `n` bytes baixos de `bits` em little-endian (corpo do f32.const / f64.const)
+proc wasm_real_bytes(corpo: ^[dynamic]u8, bits: u64, n: u32) {
+    var k: u32 = 0
+    while k < n {
+        let deslocamento: u64 = (k as u64) * 8
+        let byte: u64 = (bits >> deslocamento) & 255
+        append(corpo, item = byte as u8)
+        k += 1
+    }
+}
+
+// Empilha operando real: imediato = f32.const / f64.const; vreg e o resto seguem wasm_empilhar
+proc wasm_real_empilhar(op: bir.BirOperando, corpo: ^[dynamic]u8) -> bool {
+    if ((op.tipo as i32) == bir.BO_IMED) and wasm_classe_real(op.classe) {
+        if wasm_classe_f64(op.classe) {
+            append(corpo, item = OP_F64_CONST)
+            wasm_real_bytes(corpo, op.imed as u64, 8)
+        } else {
+            append(corpo, item = OP_F32_CONST)
+            wasm_real_bytes(corpo, op.imed as u64, 4)
+        }
+        return true
+    }
+    return wasm_empilhar(op, corpo)
+}
+
+// a OP b com add/sub/mul/div reais
+proc wasm_real_emitir_aritmetica(ins: ^bir.BirInstr, corpo: ^[dynamic]u8, erro: ^common.Diag) -> bool {
+    if not (wasm_real_empilhar(ins.a, corpo) and wasm_real_empilhar(ins.b, corpo)) {
+        return wasm_nao_suportado(erro, ins.pos, "operando real que nao e vreg nem imediato")
+    }
+    var indice: u32 = 3
+    if (ins.op as i32) != bir.BIR_DIV {
+        indice = ((ins.op as i32) - bir.BIR_ADD) as u32
+    }
+    if wasm_classe_f64(ins.classe) {
+        append(corpo, item = WREAL_F64_ARIT[indice])
+    } else {
+        append(corpo, item = WREAL_F32_ARIT[indice])
+    }
+    wasm_gravar_destino(ins, corpo)
+    return true
+}
+
+// NEG (sinal) e RAIZ (sqrt) de 1 operando real
+proc wasm_real_emitir_unaria(ins: ^bir.BirInstr, corpo: ^[dynamic]u8, erro: ^common.Diag) -> bool {
+    if not wasm_real_empilhar(ins.a, corpo) {
+        return wasm_nao_suportado(erro, ins.pos, "operando real que nao e vreg nem imediato")
+    }
+    var op: u8 = OP_F32_SQRT
+    if (ins.op as i32) == bir.BIR_NEG {
+        op = OP_F32_NEG
+        if wasm_classe_f64(ins.classe) {
+            op = OP_F64_NEG
+        }
+    } else if wasm_classe_f64(ins.classe) {
+        op = OP_F64_SQRT
+    }
+    append(corpo, item = op)
+    wasm_gravar_destino(ins, corpo)
+    return true
+}
+
+// Empilha a, b e o opcode de comparacao real (cond em BCOND_FEQ..BCOND_FGE): deixa um i32 0/1 na pilha (usado por CMP e por SELECIONA)
+proc wasm_real_empilhar_comparacao(a: bir.BirOperando, b: bir.BirOperando, cond: i32, corpo: ^[dynamic]u8) -> bool {
+    let indice: i32 = cond - bir.BCOND_FEQ
+    if (indice < 0) or (indice > 5) {
+        return false
+    }
+    if not (wasm_real_empilhar(a, corpo) and wasm_real_empilhar(b, corpo)) {
+        return false
+    }
+    let idx: u32 = indice as u32
+    if wasm_classe_f64(a.classe) {
+        append(corpo, item = WREAL_F64_CMP[idx])
+    } else {
+        append(corpo, item = WREAL_F32_CMP[idx])
+    }
+    return true
+}
+
+// a COND b com COND em BCOND_FEQ..BCOND_FGE; resultado i32 0/1
+proc wasm_real_emitir_cmp(ins: ^bir.BirInstr, corpo: ^[dynamic]u8, erro: ^common.Diag) -> bool {
+    let indice: i32 = (ins.aux as i32) - bir.BCOND_FEQ
+    if (indice < 0) or (indice > 5) {
+        return wasm_nao_suportado(erro, ins.pos, "comparacao real com condicao invalida")
+    }
+    if not (wasm_real_empilhar(ins.a, corpo) and wasm_real_empilhar(ins.b, corpo)) {
+        return wasm_nao_suportado(erro, ins.pos, "comparacao real com operando invalido")
+    }
+    let idx: u32 = indice as u32
+    if wasm_classe_f64(ins.a.classe) {
+        append(corpo, item = WREAL_F64_CMP[idx])
+    } else {
+        append(corpo, item = WREAL_F32_CMP[idx])
+    }
+    wasm_gravar_destino(ins, corpo)
+    return true
+}
+
+// int -> real: estende i8/i16 pelo sinal da op (BIR_SINAL = com sinal) e converte pela largura do fonte
+proc wasm_real_emitir_int_para_real(ins: ^bir.BirInstr, corpo: ^[dynamic]u8, erro: ^common.Diag) -> bool {
+    let com_sinal: bool = (ins.aux as i32) == bir.BIR_SINAL
+    if not wasm_empilhar_ext(ins.a, corpo, com_sinal) {
+        return wasm_nao_suportado(erro, ins.pos, "conversao int para real de operando invalido")
+    }
+    var indice: u32 = 0
+    if not com_sinal {
+        indice = 1
+    }
+    if wasm_classe_i64(ins.a.classe) {
+        indice += 2
+    }
+    if wasm_classe_f64(ins.classe) {
+        append(corpo, item = WREAL_F64_DE_INT[indice])
+    } else {
+        append(corpo, item = WREAL_F32_DE_INT[indice])
+    }
+    wasm_gravar_destino(ins, corpo)
+    return true
+}
+
+// real -> real: f32 -> f64 e promote, f64 -> f32 e demote; mesma classe so copia
+proc wasm_real_emitir_real_para_real(ins: ^bir.BirInstr, corpo: ^[dynamic]u8, erro: ^common.Diag) -> bool {
+    if not wasm_real_empilhar(ins.a, corpo) {
+        return wasm_nao_suportado(erro, ins.pos, "conversao real para real de operando invalido")
+    }
+    let de_f64: bool = wasm_classe_f64(ins.a.classe)
+    let para_f64: bool = wasm_classe_f64(ins.classe)
+    if de_f64 and (not para_f64) {
+        append(corpo, item = OP_F32_DEMOTE_F64)
+    }
+    if (not de_f64) and para_f64 {
+        append(corpo, item = OP_F64_PROMOTE_F32)
+    }
+    wasm_gravar_destino(ins, corpo)
+    return true
+}
+
+// Despacho das ops reais; chamado por wasm_emitir_op so quando wasm_real_aplica(ins) e verdadeiro
+proc wasm_emitir_real(ins: ^bir.BirInstr, corpo: ^[dynamic]u8, erro: ^common.Diag) -> bool {
+    let op = ins.op as i32
+    if op == bir.BIR_CONST {
+        if not wasm_real_empilhar(ins.a, corpo) {
+            return wasm_nao_suportado(erro, ins.pos, "const real sem imediato")
+        }
+        wasm_gravar_destino(ins, corpo)
+        return true
+    }
+    if op == bir.BIR_CMP {
+        return wasm_real_emitir_cmp(ins, corpo, erro)
+    }
+    if op == bir.BIR_I_PARA_F {
+        return wasm_real_emitir_int_para_real(ins, corpo, erro)
+    }
+    if op == bir.BIR_F_PARA_F {
+        return wasm_real_emitir_real_para_real(ins, corpo, erro)
+    }
+    if (op == bir.BIR_NEG) or (op == bir.BIR_RAIZ) {
+        return wasm_real_emitir_unaria(ins, corpo, erro)
+    }
+    if ((op >= bir.BIR_ADD) and (op <= bir.BIR_MUL)) or (op == bir.BIR_DIV) {
+        return wasm_real_emitir_aritmetica(ins, corpo, erro)
+    }
+    return wasm_nao_suportado(erro, ins.pos, wasm_nome_do_op(ins.op))
+}
+
+test "wasm_real_bytes_le" {
+    var b = make([dynamic]u8, alloc = heap)
+    defer delete(b)
+    wasm_real_bytes(&b, 4607182418800017408 as u64, 8)
+    expect(len(b) == 8)
+    expect(b[0] == 0 as u8)
+    expect(b[6] == 240 as u8)
+    expect(b[7] == 63 as u8)
+}
+
+test "wasm_real_tabelas" {
+    expect(WREAL_F32_CMP[4] == 0x5E)
+    expect(WREAL_F64_CMP[5] == 0x66)
+    expect(WREAL_F64_ARIT[3] == 0xA3)
+    expect(WREAL_F32_DE_INT[3] == 0xB5)
+}

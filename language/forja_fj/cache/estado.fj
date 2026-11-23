@@ -1,0 +1,401 @@
+// cache/estado.fj - porte de compiler/cache/estado.c, compiler/cache/estado.h
+// sha256 de cache/estado.c: ab217999bdc858de870bf0de35fd5ff6bae86542b115eeb2379aa3fdf7727517
+// sha256 de cache/estado.h: ed05bcae5d53fc98e2f60d11598c3191cac18f5c3488db00ec5edb75cfe98bdc
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.2.0
+// Changelog: 0.2.0 - G3 V4-W9: corpo real. Campos de tamanho fixo do C viram checagem de comprimento (cabe_no_campo) e copia para alloc = frame; numero_2 e dividir_colunas viram numero e contar_tabs do entradas_ler (mesmo pacote); copiar sai.
+
+import "common"
+
+pub struct EstadoLinha {
+    nome: ?str
+    chave: u64
+    tem_interface: bool
+    hash_interface: u64
+    saida: ?str
+    tamanho: u64
+    mtime: u64
+    ambiente: u64
+    deps: ?str
+}
+
+pub struct Estado {
+    linhas: [dynamic]EstadoLinha
+}
+
+pub struct EstadoDep {
+    nome: ?str
+    tem: bool
+    hash: u64
+}
+
+pub struct EstadoArquivo {
+    caminho: ?str
+    hash: u64
+}
+
+pub struct ChavePedido {
+    forja: u64
+    alvo: ?str
+    modo: ?str
+    tipo: ?str
+    entrada: ?str
+    lib_pasta: ?str
+    nivel: u32
+    deps: ?[]EstadoDep
+    ndeps: u64
+    arquivos: ?[]EstadoArquivo
+    narquivos: u64
+}
+
+pub struct MotivoPedido {
+    forcado: bool
+    primeira_vez: bool
+    chave_igual: bool
+    ambiente_igual: bool
+    saida_ok: bool
+    dep_mudou: ?str
+    arquivo_mudou: ?str
+    arquivo_e_lib: bool
+}
+
+pub const ESTADO_DEPS_MAX: i32 = 2656
+const ESTADO_CABECALHO: str = "# forja-estado 1\n"
+const ESTADO_COLUNAS: i32 = 8
+
+// C: DividirColunas (valida; os campos saem de campo_de_tab). 8 colunas = 7 TABs.
+proc dividir_colunas(linha: str) -> bool {
+    return contar_tabs(linha) == ((ESTADO_COLUNAS as int) - 1)
+}
+
+// C: Copiar. Cabe no campo do C com o NUL? strlen < limite (o Copiar recusa strlen >= tam).
+proc cabe_no_campo(texto: str, limite: i32) -> bool {
+    return len(texto) < (limite as int)
+}
+
+// C: LerInterface (ja portado; numero_2 virou numero do entradas_ler).
+proc ler_interface(texto: str, l: ^EstadoLinha) -> bool {
+    l.tem_interface = texto != "-"
+    l.hash_interface = 0
+    return (not l.tem_interface) or (common.c2f_b2i32(numero(texto, 16, &l.hash_interface)) != 0)
+}
+
+// C: LerTextos. nome, saida e deps (o "-" vira vazio) precisam caber no campo do C; senao a linha e torta.
+proc ler_textos(campo: []str, l: ^EstadoLinha) -> bool {
+    let nome_lido = campo[0]
+    let saida_lida = campo[3]
+    var deps_lido: str = campo[7]
+    if campo[7] == "-" {
+        deps_lido = ""
+    }
+    if not cabe_no_campo(nome_lido, PROJETO_NOME_MAX) {
+        return false
+    }
+    if not cabe_no_campo(saida_lida, PROJETO_CAMINHO_MAX) {
+        return false
+    }
+    if not cabe_no_campo(deps_lido, ESTADO_DEPS_MAX) {
+        return false
+    }
+    l.nome = format(f"{nome_lido}", alloc = frame)
+    l.saida = format(f"{saida_lida}", alloc = frame)
+    l.deps = format(f"{deps_lido}", alloc = frame)
+    return true
+}
+
+// C: LerNumeros (ja portado; numero_2 virou numero do entradas_ler).
+proc ler_numeros(campo: []str, l: ^EstadoLinha) -> bool {
+    return ((((common.c2f_b2i32(numero(campo[1], 16, &l.chave)) != 0) and (common.c2f_b2i32(ler_interface(campo[2], l)) != 0)) and (common.c2f_b2i32(numero(campo[4], 10, &l.tamanho)) != 0)) and (common.c2f_b2i32(numero(campo[5], 10, &l.mtime)) != 0)) and (common.c2f_b2i32(numero(campo[6], 16, &l.ambiente)) != 0)
+}
+
+// C: LerLinha. 8 colunas; false = linha torta (quem chama nao empurra).
+proc ler_linha_2(linha: str, l: ^EstadoLinha) -> bool {
+    if not dividir_colunas(linha) {
+        return false
+    }
+    var campo: [8]str = {}
+    for k in (0 as u64)..<(ESTADO_COLUNAS as u64) {
+        campo[k] = campo_de_tab(linha, k as int)
+    }
+    return ler_textos(campo[..], l) and ler_numeros(campo[..], l)
+}
+
+// C: LerLinhasDoTexto. A ultima linha sem '\n' conta; linha torta sai do estado (o pior caso e recompilar).
+proc ler_linhas_do_texto_2(p: str, e: ^Estado) {
+    var inicio: int = 0
+    while inicio < len(p) {
+        var fim = fim_da_linha(p, inicio)
+        var proximo = len(p)
+        if fim < 0 {
+            fim = len(p)
+        } else {
+            proximo = fim + 1
+        }
+        var l = EstadoLinha{}
+        if ler_linha_2(p[inicio..<fim], &l) {
+            append(&e.linhas, item = l)
+        }
+        inicio = proximo
+    }
+}
+
+// C: EstadoLer. Arquivo ausente = estado vazio; cabecalho desconhecido = vazio; false so se o arquivo existe e nao le.
+pub proc estado_ler(caminho: str, e: ^Estado) -> bool {
+    if cap(e.linhas) == 0 {
+        e.linhas = make([dynamic]EstadoLinha, alloc = heap)
+    }
+    clear(&e.linhas)
+    var tam: u64 = 0
+    var mtime: u64 = 0
+    if not arquivo_medir(caminho, &tam, &mtime) {
+        return true
+    }
+    var texto = make([dynamic]u8, alloc = heap)
+    defer delete(texto)
+    if not arquivo_ler_inteiro(caminho, &texto) {
+        return false
+    }
+    let todo = texto_c_de_bytes(texto[..])
+    if common.c2f_prefixo_igual(todo, ESTADO_CABECALHO, len(ESTADO_CABECALHO)) {
+        ler_linhas_do_texto_2(todo[len(ESTADO_CABECALHO)..<len(todo)], e)
+    }
+    return true
+}
+
+// C: AnexarLinha. Uma linha do estado, com os 8 campos separados por TAB e o "-" de quem nao tem.
+proc anexar_linha(texto: ^[dynamic]u8, l: ^EstadoLinha) {
+    let nome_txt = l.nome or_else ""
+    let saida_txt = l.saida or_else ""
+    var deps_txt: str = "-"
+    if len(l.deps or_else "") > 0 {
+        deps_txt = l.deps or_else ""
+    }
+    if l.tem_interface {
+        format(f"{nome_txt}\t{l.chave:016x}\t{l.hash_interface:016x}\t{saida_txt}\t{l.tamanho}\t{l.mtime}\t{l.ambiente:016x}\t{deps_txt}\n", into = texto)
+    } else {
+        format(f"{nome_txt}\t{l.chave:016x}\t-\t{saida_txt}\t{l.tamanho}\t{l.mtime}\t{l.ambiente:016x}\t{deps_txt}\n", into = texto)
+    }
+}
+
+// C: EstadoGravarAtomico. Texto do estado inteiro, gravado sem descarga em disco (ArquivoGravarAtomicoSemDescarga).
+pub proc estado_gravar_atomico(caminho: str, e: ^Estado, errno_saida: ^i32) -> bool {
+    var texto = make([dynamic]u8, alloc = heap)
+    defer delete(texto)
+    append(&texto, items = as_bytes(ESTADO_CABECALHO))
+    for k in (0 as u64)..<(len(e.linhas) as u64) {
+        anexar_linha(&texto, &e.linhas[k])
+    }
+    append(&texto, item = 0)
+    let tam = (len(texto) - 1) as u64
+    return common.arquivo_gravar_atomico_sem_descarga(caminho, texto_c_de_bytes(texto[..]), tam, errno_saida)
+}
+
+// C: EstadoAchar (ja portado).
+pub proc estado_achar(e: ^Estado, nome: str) -> ?^EstadoLinha {
+    for k in (0 as u64)..<(len(e.linhas) as u64) {
+        let l: ^EstadoLinha = &e.linhas[k]
+        if (l.nome or_else "") == nome {
+            return l
+        }
+    }
+    return none
+}
+
+// C: EstadoLiberar (ja portado).
+pub proc estado_liberar(e: ^Estado) {
+    delete(e.linhas)
+}
+
+// C: TextoDoCabecalho (ja portado).
+proc texto_do_cabecalho(p: ^ChavePedido, texto: ^[dynamic]u8) {
+    let txt_1 = p.alvo or_else "(null)"
+    let txt_2 = p.modo or_else "(null)"
+    let txt_3 = p.tipo or_else "(null)"
+    let txt_4 = p.entrada or_else "(null)"
+    let txt_5 = p.lib_pasta or_else "(null)"
+    format(f"forja={p.forja:016x}\nalvo={txt_1}\nmodo={txt_2}\nnivel={p.nivel}\ntipo={txt_3}\nentrada={txt_4}\nlib-pasta={txt_5}\n", into = texto)
+}
+
+// C: EstadoTextoCanonico (ja portado).
+proc estado_texto_canonico(p: ^ChavePedido, texto: ^[dynamic]u8) {
+    texto_do_cabecalho(p, texto)
+    var k: u64 = 0
+    while k < p.ndeps {
+        if (p.deps or_else {})[k].tem {
+            let fmt_1: ?str = (p.deps or_else {})[k].nome
+            let txt_1 = fmt_1 or_else "(null)"
+            let fmt_2: u64 = (p.deps or_else {})[k].hash
+            format(f"dep:{txt_1}={fmt_2:016x}\n", into = texto)
+        } else {
+            let fmt_3: ?str = (p.deps or_else {})[k].nome
+            let txt_2 = fmt_3 or_else "(null)"
+            format(f"dep:{txt_2}=-\n", into = texto)
+        }
+        k += 1
+    }
+    for k_2 in (0 as u64)..<p.narquivos {
+        let fmt_4: ?str = (p.arquivos or_else {})[k_2].caminho
+        let txt_3 = fmt_4 or_else "(null)"
+        let fmt_5: u64 = (p.arquivos or_else {})[k_2].hash
+        format(f"{txt_3}={fmt_5:016x}\n", into = texto)
+    }
+}
+
+// C: EstadoChave. Hash64 do texto canonico inteiro.
+pub proc estado_chave(p: ^ChavePedido) -> u64 {
+    var texto = make([dynamic]u8, alloc = heap)
+    defer delete(texto)
+    estado_texto_canonico(p, &texto)
+    return common.hash64(texto[..], len(texto) as u64, common.HASH64_SEMENTE)
+}
+
+// C: EstadoAmbiente. Hash64 so do cabecalho (forja, alvo, modo, nivel, tipo, entrada, lib-pasta).
+pub proc estado_ambiente(p: ^ChavePedido) -> u64 {
+    var texto = make([dynamic]u8, alloc = heap)
+    defer delete(texto)
+    texto_do_cabecalho(p, &texto)
+    return common.hash64(texto[..], len(texto) as u64, common.HASH64_SEMENTE)
+}
+
+// C: EstadoDepsTexto. "nome=<hash>,nome=-" (uma por dependencia) ou "-"; copiado para destino com o NUL do fim (snprintf "%s").
+pub proc estado_deps_texto(p: ^ChavePedido, destino: []u8, tam: u64) {
+    let limite = min(tam as int, len(destino))
+    if p.ndeps == 0 {
+        _ = common.c2f_snprintf(destino[0..<limite], "-")
+        return
+    }
+    var texto = make([dynamic]u8, alloc = heap)
+    defer delete(texto)
+    var k: u64 = 0
+    while k < p.ndeps {
+        var sep: str = ""
+        if k > 0 {
+            sep = ","
+        }
+        let dep = (p.deps or_else {})[k]
+        let nome_dep = dep.nome or_else "(null)"
+        if dep.tem {
+            format(f"{sep}{nome_dep}={dep.hash:016x}", into = &texto)
+        } else {
+            format(f"{sep}{nome_dep}=-", into = &texto)
+        }
+        k += 1
+    }
+    append(&texto, item = 0)
+    _ = common.c2f_snprintf(destino[0..<limite], texto_c_de_bytes(texto[..]))
+}
+
+// Janela de n bytes de texto (o snprintf do C grava no maximo n bytes, com o NUL do fim).
+proc janela_de(texto: []u8, n: u64) -> []u8 {
+    return texto[0..<min(n as int, len(texto))]
+}
+
+// C: Escrever. Copia o texto fixo para a janela de n bytes e devolve true.
+proc escrever(texto: []u8, n: u64, fixo: ?str) -> bool {
+    _ = common.c2f_snprintf(janela_de(texto, n), fixo or_else "")
+    return true
+}
+
+// C: MotivoFixo (ja portado).
+proc motivo_fixo(p: ^MotivoPedido) -> ?str {
+    if p.forcado {
+        return "forcado (--tudo)"
+    }
+    if p.primeira_vez {
+        return "primeira vez"
+    }
+    if p.chave_igual {
+        var tern_1: str = "saida ausente ou alterada"
+        if common.c2f_b2i32(p.saida_ok) != 0 {
+            tern_1 = ""
+        }
+        return tern_1
+    }
+    if not p.ambiente_igual {
+        return "forja.exe, modo ou opcoes mudaram"
+    }
+    return none
+}
+
+// C: EstadoMotivo. Motivo de texto fixo na ordem de prioridade; "" = nao recompila; senao dep, arquivo, ou o motivo de ambiente.
+pub proc estado_motivo(p: ^MotivoPedido, texto: []u8, n: u64) -> bool {
+    let fixo = motivo_fixo(p)
+    if fixo != none {
+        return (fixo or_else "") != "" and escrever(texto, n, fixo)
+    }
+    let dep = p.dep_mudou or_else ""
+    if dep != "" {
+        let msg_dep = format(f"interface de {dep} mudou", alloc = heap)
+        defer delete(msg_dep)
+        return escrever(texto, n, msg_dep)
+    }
+    let arquivo = p.arquivo_mudou or_else ""
+    if arquivo != "" {
+        var tipo_txt: str = "fonte"
+        if p.arquivo_e_lib {
+            tipo_txt = "biblioteca"
+        }
+        let msg_arq = format(f"{tipo_txt} mudou: {arquivo}", alloc = heap)
+        defer delete(msg_arq)
+        return escrever(texto, n, msg_arq)
+    }
+    return escrever(texto, n, "forja.exe, modo ou opcoes mudaram")
+}
+
+// Testes dirigidos (C: EstadoMotivo, AnexarLinha, EstadoDepsTexto); textos conferidos a mao contra o snprintf/format do C.
+test "estado: motivo fixo e corte no tamanho da janela" {
+    var mp = MotivoPedido{}
+    mp.primeira_vez = true
+    var buf: [64]u8 = {}
+    expect(estado_motivo(&mp, buf[..], 64))
+    expect(texto_c_de_bytes(buf[..]) == "primeira vez")
+    var corte: [64]u8 = {}
+    expect(estado_motivo(&mp, corte[..], 5))
+    expect(texto_c_de_bytes(corte[..]) == "prim")
+}
+
+test "estado: chave igual e saida ok nao recompila" {
+    var mp = MotivoPedido{}
+    mp.chave_igual = true
+    mp.saida_ok = true
+    var buf: [64]u8 = {}
+    expect(not estado_motivo(&mp, buf[..], 64))
+}
+
+test "estado: motivo de dependencia e de arquivo" {
+    var mp = MotivoPedido{}
+    mp.ambiente_igual = true
+    mp.dep_mudou = "libx"
+    var buf: [64]u8 = {}
+    expect(estado_motivo(&mp, buf[..], 64))
+    expect(texto_c_de_bytes(buf[..]) == "interface de libx mudou")
+    var mq = MotivoPedido{}
+    mq.ambiente_igual = true
+    mq.arquivo_mudou = "a.fj"
+    mq.arquivo_e_lib = true
+    var buf2: [64]u8 = {}
+    expect(estado_motivo(&mq, buf2[..], 64))
+    expect(texto_c_de_bytes(buf2[..]) == "biblioteca mudou: a.fj")
+}
+
+test "estado: linha gravada no formato do C" {
+    var l = EstadoLinha{}
+    l.nome = "a"
+    l.chave = 1
+    l.saida = "s"
+    l.tamanho = 2
+    l.mtime = 3
+    l.ambiente = 4
+    var texto = make([dynamic]u8, alloc = heap)
+    defer delete(texto)
+    anexar_linha(&texto, &l)
+    append(&texto, item = 0)
+    expect(texto_c_de_bytes(texto[..]) == "a\t0000000000000001\t-\ts\t2\t3\t0000000000000004\t-\n")
+}
+
+test "estado: dependencias vazias viram '-'" {
+    var p = ChavePedido{}
+    var destino: [8]u8 = {}
+    estado_deps_texto(&p, destino[..], 8)
+    expect(texto_c_de_bytes(destino[..]) == "-")
+}

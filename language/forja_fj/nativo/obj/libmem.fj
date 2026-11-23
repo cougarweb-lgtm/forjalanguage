@@ -1,0 +1,474 @@
+// nativo/obj/libmem.fj - porte de compiler/nativo/obj/libmem.c, compiler/nativo/obj/libmem.h
+// sha256 de nativo/obj/libmem.c: f5da9aee61591d6ad3ca7d95535c78ae056382ec1f7cb8f48f6ec13b75ed80ae
+// sha256 de nativo/obj/libmem.h: 11e4b9b69f67bee45c3a331d0a7f963eab9201dc50726bcb03a2bbf089728e34
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "common"
+
+struct TerceirosLibmem {
+    qtd_slots: u32
+    qtd_arquivos: u32
+    slot_do_arquivo: []i32 // C2F-B3: era []i8 (int8_t* da arena); a arena da Forja nao tem fatia i8, e o slot cabe em i32 (-1 = nao conta)
+    nome: [16]str // C2F-B3: era ?[16]str; sem o opcional para gravar nome[k]
+    arquivo: [16]str // idem
+    fins: [16]?str // C2F-B3: um texto "a\0b\0\0" por slot, ou none (o NULL do C)
+    excedentes: u32
+    primeiro_excedente: ?str
+}
+
+pub struct LibmemEntrada {
+    estaticas: ?^[dynamic]EstaticaArquivo
+    fins: ?[]str
+    qtd_fins: u32
+}
+
+const FORJA_LIBMEM_SLOTS: u32 = 16
+const LM_PREFIXO_IMP: str = "__imp_"
+const LM_TAM_PREFIXO_IMP: u32 = 6
+const LM_MAGIA: u32 = 827149382
+const LM_SECAO_TABELA: str = ".rdata$libmem"
+const LM_ALINHA_TABELA: u32 = 4
+const LM_TAM_NOME: u32 = 96
+// C2F-82 macro LM_QTD_FAMILIA = ( sizeof LM_FAMILIA / sizeof LM_FAMILIA [ 0 ] )  (expandida no uso)
+const LM_FAMILIA: [6]str = {"malloc", "calloc", "realloc", "free", "strdup", "_strdup"}
+
+// C: nativo/obj/libmem.c:35
+proc lm_nome_do_arquivo(caminho: str) -> str {
+    // C: o maior indice entre a ultima '/' e a ultima '\\'; sem nenhuma, o caminho inteiro
+    var i: u64 = len(caminho) as u64
+    while i > 0 {
+        if (caminho[i - 1] == 47) or (caminho[i - 1] == 92) { // '/' '\\'
+            return caminho[i..<(len(caminho) as u64)]
+        }
+        i -= 1
+    }
+    return caminho
+}
+
+// C: nativo/obj/libmem.c:46
+// C2F-B3: slots vira []i32 (ver TerceirosLibmem)
+proc lm_slot_do_arquivo(estaticas: ^[dynamic]EstaticaArquivo, k: u64, slots: []i32, lm: ^TerceirosLibmem) -> i32 {
+    let a: ^EstaticaArquivo = &estaticas[k]
+    if (a.link == none) or bibs_coberta(a.link) {
+        return -1
+    }
+    var j: u64 = 0
+    while j < k {
+        if (slots[j] >= 0) and (estaticas[j].bytes == a.bytes) {
+            return slots[j]
+        }
+        j += 1
+    }
+    if lm.qtd_slots >= FORJA_LIBMEM_SLOTS {
+        if lm.excedentes == 0 {
+            lm.primeiro_excedente = a.link
+        }
+        lm.excedentes += 1
+        return -1
+    }
+    lm.nome[lm.qtd_slots] = a.link or_else ""
+    lm.arquivo[lm.qtd_slots] = lm_nome_do_arquivo((a.nome or_else ""))
+    let slot: i32 = lm.qtd_slots as i32
+    lm.qtd_slots += 1
+    return slot
+}
+
+// C: nativo/obj/libmem.c:67
+proc lm_arquivo_define(a: ^EstaticaArquivo, simbolo: str) -> bool {
+    // C2F-B4: ar_ler_indice inicia o vetor no C; aqui ele nasce antes (lista Forja precisa de alocador)
+    var indice: [dynamic]ArSimbolo = make([dynamic]ArSimbolo, alloc = heap)
+    var erro: common.Diag = common.Diag{tem = false}
+    var achou: bool = false
+    if ar_ler_indice(slice_from(a.bytes as ^u8, len = a.n as int), &indice, &erro) {
+        var s: u64 = 0
+        while (s < (len(indice) as u64)) and (not achou) {
+            let e: ^ArSimbolo = &indice[s]
+            achou = ((len(simbolo) as u64) == e.nome_tam) and (est_texto_do_nome(e.nome)[0..<e.nome_tam] == simbolo)
+            s += 1
+        }
+    }
+    delete(indice)
+    return achou
+}
+
+// C: nativo/obj/libmem.c:85
+// C2F-13: fins fundido em qtd_fins (len)
+proc lm_fins_do_slot(a: ^EstaticaArquivo, fins: []str, arena: ^common.Arena) -> ?str {
+    var total: u64 = 1
+    for f in (0 as u64)..<(len(fins) as u64) {
+        if lm_arquivo_define(a, fins[f]) {
+            total += (len(fins[f]) as u64) + 1
+        }
+    }
+    if total == 1 {
+        return none
+    }
+    // C: texto "a\0b\0\0" na arena; montado numa lista e copiado para a arena (o str leva os NUL dentro)
+    var texto: [dynamic]u8 = make([dynamic]u8, alloc = heap)
+    for f in (0 as u64)..<(len(fins) as u64) {
+        if lm_arquivo_define(a, fins[f]) {
+            append(&texto, item = fins[f])
+            append(&texto, item = 0)
+        }
+    }
+    append(&texto, item = 0)
+    let res: str = from_bytes(texto[..], alloc = common.arena_mem(arena))
+    delete(texto)
+    return res
+}
+
+// C: nativo/obj/libmem.c:109
+pub proc libmem_montar(entrada: ^LibmemEntrada, arena: ^common.Arena, saida: ^TerceirosLibmem) {
+    let estaticas: ^[dynamic]EstaticaArquivo = entrada.estaticas as ^[dynamic]EstaticaArquivo
+    let n: u64 = len(estaticas^) as u64
+    let slots: []i32 = common.arena_fatia_i32(arena, (n + 1) as int)
+    saida^ = TerceirosLibmem{qtd_arquivos = n as u32, slot_do_arquivo = slots}
+    var k: u64 = 0
+    while k < n {
+        slots[k] = lm_slot_do_arquivo(estaticas, k, slots, saida)
+        k += 1
+    }
+    k = 0
+    while (k < n) and (entrada.qtd_fins > 0) {
+        if (slots[k] >= 0) and (saida.fins[slots[k] as u64] == none) {
+            saida.fins[slots[k] as u64] = lm_fins_do_slot(&estaticas[k], (entrada.fins or_else {})[0..<(entrada.qtd_fins as u64)], arena)
+        }
+        k += 1
+    }
+    if saida.excedentes > 0 {
+        let txt_1 = saida.primeiro_excedente or_else "(null)"
+        let msg_1 = format(f"aviso: so as {FORJA_LIBMEM_SLOTS} primeiras bibliotecas estaticas tem a memoria contada em dev; {txt_1} fica de fora\n", alloc = heap)
+        defer delete(msg_1)
+        common.c2f_saida_formatar(common.c2f_saida_stderr(), msg_1)
+    }
+}
+
+// C: nativo/obj/libmem.c:128
+proc lm_familia(nome: str, imp: ^bool) -> i32 {
+    imp^ = common.c2f_prefixo_igual(nome, LM_PREFIXO_IMP, 6)
+    var base: str = nome
+    if imp^ {
+        base = nome[(LM_TAM_PREFIXO_IMP as u64)..<(len(nome) as u64)]
+    }
+    for f in (0 as i32)..<6 {
+        if LM_FAMILIA[f] == base {
+            return f
+        }
+    }
+    return -1
+}
+
+// C: nativo/obj/libmem.c:141
+// C2F-B3: o malloc(secoes+1) do C vira lista heap [dynamic]i32 (quem chama da delete)
+proc lm_slots_das_secoes(o: ^Objeto, membros: ^[dynamic]EstaticaMembro, inicios: ^[dynamic]u32, lm: ?^TerceirosLibmem) -> [dynamic]i32 {
+    let nsec: u64 = len(o.secoes) as u64
+    var slots: [dynamic]i32 = make([dynamic]i32, alloc = heap)
+    var i: u64 = 0
+    while i < (nsec + 1) {
+        append(&slots, item = -1)
+        i += 1
+    }
+    let lmp: ^TerceirosLibmem = lm as ^TerceirosLibmem
+    var m: u64 = 0
+    while m < (len(membros^) as u64) {
+        let membro: ^EstaticaMembro = &membros[m]
+        let de: u64 = inicios[m] as u64
+        var ate: u64 = nsec
+        if (m + 1) < (len(inicios^) as u64) {
+            ate = inicios[m + 1] as u64
+        }
+        var slot: i32 = -1
+        if membro.arquivo < lmp.qtd_arquivos {
+            slot = lmp.slot_do_arquivo[membro.arquivo as u64]
+        }
+        var s: u64 = de
+        while s < ate {
+            slots[s] = slot
+            s += 1
+        }
+        m += 1
+    }
+    return slots
+}
+
+// C: nativo/obj/libmem.c:162
+// C2F-B3: slots vira []i32
+proc lm_alvo_do_simbolo(o: ^Objeto, simbolo: u32, slot: i32, slots: []i32) -> u32 {
+    let s: ^ObjSimbolo = &o.simbolos[simbolo as u64]
+    if (s.secao != OBJ_SECAO_INDEFINIDA) and (slots[s.secao as u64] >= 0) {
+        return simbolo
+    }
+    var imp: bool = false
+    let f: i32 = lm_familia((s.nome or_else ""), &imp)
+    if f < 0 {
+        return simbolo
+    }
+    var prefixo: str = ""
+    if imp {
+        prefixo = LM_PREFIXO_IMP
+    }
+    let familia: str = LM_FAMILIA[f]
+    let novo = format(f"{prefixo}forja_libmem_{familia}_{slot}", alloc = heap)
+    defer delete(novo)
+    let novo_simbolo: u32 = obj_simbolo_referir(o, novo)
+    if imp and (o.simbolos[novo_simbolo as u64].secao == OBJ_SECAO_INDEFINIDA) {
+        terceiros_criar_celula(o, novo[(LM_TAM_PREFIXO_IMP as u64)..<(len(novo) as u64)])
+    }
+    return novo_simbolo
+}
+
+// C: nativo/obj/libmem.c:180
+proc libmem_redirecionar(o: ^Objeto, membros: ^[dynamic]EstaticaMembro, inicios: ^[dynamic]u32, lm: ?^TerceirosLibmem) {
+    var slots: [dynamic]i32 = lm_slots_das_secoes(o, membros, inicios, lm)
+    let relocs: u64 = len(o.relocs) as u64
+    var r: u64 = 0
+    while r < relocs {
+        let secao: u32 = o.relocs[r].alvo.secao
+        if ((secao as u64) < (len(o.secoes) as u64)) and (slots[secao as u64] >= 0) {
+            let simbolo: u32 = o.relocs[r].correcao.simbolo
+            // C: lm_alvo_do_simbolo pode anexar a o.relocs (terceiros_criar_celula); o destino so e calculado depois
+            let novo: u32 = lm_alvo_do_simbolo(o, simbolo, slots[secao as u64], slots[..])
+            o.relocs[r].correcao.simbolo = novo
+        }
+        r += 1
+    }
+    delete(slots)
+}
+
+// C: nativo/obj/libmem.c:202
+proc lm_anexar32(b: ^[dynamic]u8, v: u32) {
+    // C: BufAnexarN do uint32_t no host x86: little-endian
+    for k in (0 as u32)..<4 {
+        append(b, item = ((v >> (k * 8)) & 255) as u8)
+    }
+}
+
+// C: nativo/obj/libmem.c:207
+proc lm_anexar_texto(b: ^[dynamic]u8, texto: str) {
+    // C2F-B4: o gerado fatiava texto[0..<len+1] (R0006 em dev: o str nao expoe o NUL); o C grava strlen+1 bytes: o texto e o NUL
+    append(b, item = texto)
+    append(b, item = 0)
+}
+
+// C: nativo/obj/libmem.c:213
+proc lm_tamanho_fins(fins: str) -> u64 {
+    // C: o str leva os NUL de dentro ("a\0b\0\0"); n += strlen(fins + n) + 1 ate o NUL duplo, mais 1
+    let total: u64 = len(fins) as u64
+    var n: u64 = 0
+    while (n < total) and (fins[n] != 0) {
+        var t: u64 = n
+        while (t < total) and (fins[t] != 0) {
+            t += 1
+        }
+        n += (t - n) + 1
+    }
+    return n + 1
+}
+
+// C: nativo/obj/libmem.c:222
+proc libmem_tabela(o: ^Objeto, lm: ?^TerceirosLibmem) {
+    let l: ^TerceirosLibmem = lm as ^TerceirosLibmem
+    var b: [dynamic]u8 = make([dynamic]u8, alloc = heap)
+    let secao: u32 = obj_secao_abrir(o, LM_SECAO_TABELA, OS_RDATA, LM_ALINHA_TABELA)
+    var pos: u32 = 8 + (12 * l.qtd_slots)
+    var pos_fins: u32 = pos
+    for k in (0 as u32)..<l.qtd_slots { // os textos dos fins vem depois de todos os nomes
+        pos_fins += (((len(l.nome[k]) as u64) + (len(l.arquivo[k]) as u64)) as u32) + 2
+    }
+    lm_anexar32(&b, LM_MAGIA)
+    lm_anexar32(&b, l.qtd_slots)
+    for k in (0 as u32)..<l.qtd_slots {
+        lm_anexar32(&b, pos)
+        pos += ((len(l.nome[k]) as u64) as u32) + 1
+        lm_anexar32(&b, pos)
+        pos += ((len(l.arquivo[k]) as u64) as u32) + 1
+        if l.fins[k] != none {
+            lm_anexar32(&b, pos_fins) // 0 = a lib nao declara `ends`
+            pos_fins += lm_tamanho_fins((l.fins[k] or_else "")) as u32
+        } else {
+            lm_anexar32(&b, 0)
+        }
+    }
+    for k in (0 as u32)..<l.qtd_slots {
+        lm_anexar_texto(&b, l.nome[k])
+        lm_anexar_texto(&b, l.arquivo[k])
+    }
+    for k in (0 as u32)..<l.qtd_slots {
+        if l.fins[k] != none {
+            let fins: str = l.fins[k] or_else ""
+            append(&b, item = fins[0..<lm_tamanho_fins(fins)])
+        }
+    }
+    let sec: ^ObjSecao = &o.secoes[secao as u64]
+    var i: u64 = 0
+    while i < (len(b) as u64) {
+        append(&sec.bytes, item = b[i])
+        i += 1
+    }
+    _ = obj_simbolo_definir(o, "forja_libmem_tabela", secao as i32, 0)
+    delete(b)
+}
+
+test "libmem: lm_nome_do_arquivo, lm_familia, lm_anexar32 e lm_tamanho_fins" {
+    expect(lm_nome_do_arquivo("a/b/c.a") == "c.a")
+    expect(lm_nome_do_arquivo("a\\b.lib") == "b.lib")
+    expect(lm_nome_do_arquivo("x/y\\z.a") == "z.a")
+    expect(lm_nome_do_arquivo("x\\y/z.a") == "z.a")
+    expect(lm_nome_do_arquivo("sem") == "sem")
+    expect(lm_nome_do_arquivo("dir/") == "")
+    var imp: bool = true
+    expect(lm_familia("malloc", &imp) == 0)
+    expect(not imp)
+    expect(lm_familia("calloc", &imp) == 1)
+    expect(lm_familia("realloc", &imp) == 2)
+    expect(lm_familia("__imp_free", &imp) == 3)
+    expect(imp)
+    expect(lm_familia("strdup", &imp) == 4)
+    expect(lm_familia("_strdup", &imp) == 5)
+    expect(lm_familia("__imp__strdup", &imp) == 5)
+    expect(imp)
+    expect(lm_familia("mallocx", &imp) == -1)
+    expect(lm_familia("__imp_", &imp) == -1)
+    expect(imp)
+    expect(lm_familia("__im", &imp) == -1)
+    expect(not imp)
+    var b: [dynamic]u8 = make([dynamic]u8, alloc = heap)
+    defer delete(b)
+    lm_anexar32(&b, LM_MAGIA)
+    expect(len(b) == 4)
+    expect(b[0] == 70) // "FLM1" em little-endian
+    expect(b[1] == 76)
+    expect(b[2] == 77)
+    expect(b[3] == 49)
+    lm_anexar32(&b, 258)
+    expect(b[4] == 2)
+    expect(b[5] == 1)
+    expect(b[7] == 0)
+    var dois: [5]u8 = {97, 0, 98, 0, 0}
+    let fins2: str = from_bytes(dois[..], alloc = heap)
+    defer delete(fins2)
+    expect(lm_tamanho_fins(fins2) == 5)
+    var um: [4]u8 = {97, 98, 0, 0}
+    let fins1: str = from_bytes(um[..], alloc = heap)
+    defer delete(fins1)
+    expect(lm_tamanho_fins(fins1) == 4)
+    var vazio: [1]u8 = {0}
+    let fins0: str = from_bytes(vazio[..], alloc = heap)
+    defer delete(fins0)
+    expect(lm_tamanho_fins(fins0) == 1)
+}
+
+test "libmem: lm_slot_do_arquivo ignora arquivo sem link e libmem_montar sem libs contadas" {
+    var arqs: [dynamic]EstaticaArquivo = make([dynamic]EstaticaArquivo, alloc = heap)
+    defer delete(arqs)
+    var b1: [4]u8 = {1, 2, 3, 4}
+    append(&arqs, item = EstaticaArquivo{nome = "x/a.lib", bytes = &b1[0], n = 4})
+    append(&arqs, item = EstaticaArquivo{nome = "y/b.lib", bytes = &b1[0], n = 4})
+    var arena: common.Arena = common.Arena{}
+    defer common.arena_liberar(&arena)
+    var entrada: LibmemEntrada = LibmemEntrada{estaticas = &arqs, qtd_fins = 0}
+    var saida: TerceirosLibmem = TerceirosLibmem{}
+    libmem_montar(&entrada, &arena, &saida)
+    expect(saida.qtd_arquivos == 2)
+    expect(saida.qtd_slots == 0)
+    expect(saida.excedentes == 0)
+    expect(len(saida.slot_do_arquivo) == 3)
+    expect(saida.slot_do_arquivo[0] == -1)
+    expect(saida.slot_do_arquivo[1] == -1)
+    expect(saida.fins[0] == none)
+}
+
+test "libmem: lm_slots_das_secoes e libmem_redirecionar" {
+    var o: Objeto = Objeto{}
+    obj_iniciar(&o)
+    defer obj_liberar(&o)
+    let s0: u32 = obj_secao_abrir(&o, ".text$a", OS_TEXTO, 1) // membro 0 (arquivo 0, slot 2)
+    let s1: u32 = obj_secao_abrir(&o, ".text$b", OS_TEXTO, 1) // membro 1 (arquivo 1, slot -1)
+    let s2: u32 = obj_secao_abrir(&o, ".text$c", OS_TEXTO, 1) // membro 2 (arquivo 9, fora de qtd_arquivos: -1)
+    let y_malloc: u32 = obj_simbolo_referir(&o, "malloc")
+    let y_foo: u32 = obj_simbolo_definir(&o, "foo", s0 as i32, 0)
+    let y_free: u32 = obj_simbolo_definir(&o, "free", s1 as i32, 0) // definido por arquivo NAO contado: tambem e redirecionado
+    let y_imp: u32 = obj_simbolo_referir(&o, "somente_ref")
+    obj_relocar(&o, ObjAlvoReloc{secao = s0, off = 0}, ObjCorrecao{tipo = OR_REL32, simbolo = y_malloc, adendo = 0})
+    obj_relocar(&o, ObjAlvoReloc{secao = s0, off = 4}, ObjCorrecao{tipo = OR_REL32, simbolo = y_foo, adendo = 0})
+    obj_relocar(&o, ObjAlvoReloc{secao = s1, off = 0}, ObjCorrecao{tipo = OR_REL32, simbolo = y_malloc, adendo = 0})
+    obj_relocar(&o, ObjAlvoReloc{secao = s0, off = 8}, ObjCorrecao{tipo = OR_REL32, simbolo = y_free, adendo = 0})
+    obj_relocar(&o, ObjAlvoReloc{secao = s0, off = 12}, ObjCorrecao{tipo = OR_REL32, simbolo = y_malloc, adendo = 0})
+    obj_relocar(&o, ObjAlvoReloc{secao = s2, off = 0}, ObjCorrecao{tipo = OR_REL32, simbolo = y_malloc, adendo = 0})
+    obj_relocar(&o, ObjAlvoReloc{secao = s0, off = 16}, ObjCorrecao{tipo = OR_REL32, simbolo = y_imp, adendo = 0})
+    var membros: [dynamic]EstaticaMembro = make([dynamic]EstaticaMembro, alloc = heap)
+    defer delete(membros)
+    append(&membros, item = EstaticaMembro{arquivo = 0})
+    append(&membros, item = EstaticaMembro{arquivo = 1})
+    append(&membros, item = EstaticaMembro{arquivo = 9})
+    var inicios: [dynamic]u32 = make([dynamic]u32, alloc = heap)
+    defer delete(inicios)
+    append(&inicios, item = 0)
+    append(&inicios, item = 1)
+    append(&inicios, item = 2)
+    var lm_slots: [2]i32 = {2, -1}
+    var lm: TerceirosLibmem = TerceirosLibmem{qtd_arquivos = 2, slot_do_arquivo = lm_slots[..]}
+    var slots: [dynamic]i32 = lm_slots_das_secoes(&o, &membros, &inicios, &lm)
+    defer delete(slots)
+    expect(len(slots) == 4)
+    expect(slots[0] == 2)
+    expect(slots[1] == -1)
+    expect(slots[2] == -1)
+    expect(slots[3] == -1)
+    libmem_redirecionar(&o, &membros, &inicios, &lm)
+    expect(len(o.simbolos) == 6) // + forja_libmem_malloc_2 e forja_libmem_free_2
+    // r0 (malloc indefinido, secao viva): novo; r1 (foo): intacto; r2 (secao sem slot): intacto; r3 (free de arquivo nao contado): novo
+    expect((o.simbolos[o.relocs[0].correcao.simbolo as u64].nome or_else "") == "forja_libmem_malloc_2")
+    expect(o.relocs[1].correcao.simbolo == y_foo)
+    expect(o.relocs[2].correcao.simbolo == y_malloc)
+    expect((o.simbolos[o.relocs[3].correcao.simbolo as u64].nome or_else "") == "forja_libmem_free_2")
+    expect(o.relocs[4].correcao.simbolo == o.relocs[0].correcao.simbolo) // o mesmo simbolo novo (referir acha)
+    expect(o.relocs[5].correcao.simbolo == y_malloc) // secao s2 sem slot
+    expect(o.relocs[6].correcao.simbolo == y_imp) // fora da familia
+    expect(o.simbolos[o.relocs[0].correcao.simbolo as u64].secao == OBJ_SECAO_INDEFINIDA)
+}
+
+test "libmem: libmem_tabela monta a FLM1" {
+    var o: Objeto = Objeto{}
+    obj_iniciar(&o)
+    defer obj_liberar(&o)
+    var lm: TerceirosLibmem = TerceirosLibmem{qtd_slots = 2}
+    lm.nome[0] = "lib_a"
+    lm.nome[1] = "lib_b"
+    lm.arquivo[0] = "a.lib"
+    lm.arquivo[1] = "b.a"
+    var xy: [5]u8 = {120, 0, 121, 0, 0}
+    let fins: str = from_bytes(xy[..], alloc = heap)
+    defer delete(fins)
+    lm.fins[0] = fins
+    libmem_tabela(&o, &lm)
+    expect(len(o.secoes) == 1)
+    expect((o.secoes[0].nome or_else "") == ".rdata$libmem")
+    expect(o.secoes[0].tipo == OS_RDATA)
+    expect(o.secoes[0].alinhamento == 4)
+    let b: ^[dynamic]u8 = &o.secoes[0].bytes
+    expect(len(b^) == 59)
+    expect(b[0] == 70)
+    expect(b[3] == 49)
+    expect(b[4] == 2) // qtd_slots
+    expect(b[8] == 32) // slot 0: nome
+    expect(b[12] == 38) // arquivo
+    expect(b[16] == 54) // fins
+    expect(b[20] == 44) // slot 1: nome
+    expect(b[24] == 50) // arquivo
+    expect(b[28] == 0) // sem fins
+    expect(b[32] == 108) // "lib_a\0"
+    expect(b[37] == 0)
+    expect(b[38] == 97) // "a.lib\0"
+    expect(b[44] == 108) // "lib_b\0"
+    expect(b[50] == 98) // "b.a\0"
+    expect(b[53] == 0)
+    expect(b[54] == 120) // "x\0y\0\0"
+    expect(b[55] == 0)
+    expect(b[56] == 121)
+    expect(b[57] == 0)
+    expect(b[58] == 0)
+    expect(obj_achar_simbolo(&o, "forja_libmem_tabela") == 0)
+    expect(o.simbolos[0].secao == 0)
+}

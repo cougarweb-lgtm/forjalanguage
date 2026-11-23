@@ -1,0 +1,97 @@
+// semantic/sem_resultado.fj - porte de compiler/semantic/sem_resultado.c
+// sha256 de semantic/sem_resultado.c: 62a7991e13ae32ffb590a5450671f77dba4736b7d15a627f20b56d4f96f3f1e7
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "common"
+import "frontend"
+
+// C: semantic/sem_resultado.c:10
+proc sem_try(s: ^Semantica, e: ^frontend.Expr) -> bool {
+    if s.erro_do_proc == 0 {
+        let msg_1 = format(f"try so vale dentro de proc com retorno '! E' ou 'T ! E'", alloc = heap)
+        defer delete(msg_1)
+        return sem_erro(s, common.E0602, e.pos, msg_1)
+    }
+    if not sem_checar(s, e.a, TIPO_VAZIO as u32) {
+        return false
+    }
+    let texto = texto_do_tipo(s, (e.a as ^frontend.Expr).tipo, 96)
+    defer delete(texto)
+    let classe: i32 = tipo_classe_de(&s.tipos, (e.a as ^frontend.Expr).tipo)
+    if (classe == TC_OPCIONAL) or (classe == TC_ANULAVEL) {
+        let msg_2 = format(f"try nao se aplica a {texto}: use or_else ou switch (try so repassa o erro de 'T ! E')", alloc = heap)
+        defer delete(msg_2)
+        return sem_erro(s, common.E0606, (e.a as ^frontend.Expr).pos, msg_2)
+    }
+    if classe != TC_RESULTADO {
+        let msg_3 = format(f"try exige um valor resultado ('T ! E'), recebeu {texto}", alloc = heap)
+        defer delete(msg_3)
+        return sem_erro(s, common.E0606, (e.a as ^frontend.Expr).pos, msg_3)
+    }
+    let resultado: TipoInfo = tipo_de(&s.tipos, (e.a as ^frontend.Expr).tipo)^
+    if not sem_conferir_movimento(s, e.a) { // L-01: o dono sai do resultado; de um lvalor seria copia (E0311)
+        return false
+    }
+    if resultado.b != s.erro_do_proc {
+        let texto_erro = texto_do_tipo(s, resultado.b, 96)
+        defer delete(texto_erro)
+        let texto_proc = texto_do_tipo(s, s.erro_do_proc, 96)
+        defer delete(texto_proc)
+        let msg_4 = format(f"o erro {texto_erro} do try e diferente do erro {texto_proc} do retorno do proc", alloc = heap)
+        defer delete(msg_4)
+        return sem_erro(s, common.E0603, e.pos, msg_4)
+    }
+    e.tipo = resultado.a
+    return true
+}
+
+// C: semantic/sem_resultado.c:37
+// Tipo do valor que o or_else devolve: o de ?T, o ^T de ?^T ou o T de 'T ! E'. Erros em e->a->pos.
+proc valor_do_or_else(s: ^Semantica, esquerda: ?^frontend.Expr, valor: ^u32) -> bool {
+    let k: TipoInfo = tipo_de(&s.tipos, (esquerda as ^frontend.Expr).tipo)^ // copia: tipo_ponteiro pode crescer a tabela
+    let texto = texto_do_tipo(s, (esquerda as ^frontend.Expr).tipo, 96)
+    defer delete(texto)
+    if k.classe == (TC_OPCIONAL as u8) {
+        valor^ = k.a
+    } else if k.classe == (TC_ANULAVEL as u8) {
+        valor^ = tipo_ponteiro(&s.tipos, k.a)
+    } else if k.classe != (TC_RESULTADO as u8) {
+        let msg_1 = format(f"or_else exige ?T, ?^T ou resultado ('T ! E') a esquerda, recebeu {texto}", alloc = heap)
+        defer delete(msg_1)
+        return sem_erro(s, common.E0606, (esquerda as ^frontend.Expr).pos, msg_1)
+    } else if k.a == (TIPO_VAZIO as u32) {
+        let msg_2 = format(f"or_else precisa de um resultado com valor, mas {texto} so tem erro", alloc = heap)
+        defer delete(msg_2)
+        return sem_erro(s, common.E0604, (esquerda as ^frontend.Expr).pos, msg_2)
+    } else if sem_tipo_eh_dono(s, k.a) {
+        let msg_3 = format(f"or_else sobre {texto} alocaria o padrao a toa: o valor e dono; use try ou 'switch r in f()'", alloc = heap)
+        defer delete(msg_3)
+        return sem_erro(s, common.E0604, (esquerda as ^frontend.Expr).pos, msg_3)
+    } else {
+        valor^ = k.a
+    }
+    return true
+}
+
+// C: semantic/sem_resultado.c:54
+proc sem_or_else(s: ^Semantica, e: ^frontend.Expr) -> bool {
+    var valor: u32 = TIPO_VAZIO as u32
+    if (not sem_checar(s, e.a, TIPO_VAZIO as u32)) or (not valor_do_or_else(s, e.a, &valor)) {
+        return false
+    }
+    if not sem_checar(s, e.b, valor) {
+        return false
+    }
+    if (e.b as ^frontend.Expr).tipo != valor {
+        let texto_valor = texto_do_tipo(s, valor, 96)
+        defer delete(texto_valor)
+        let texto = texto_do_tipo(s, (e.b as ^frontend.Expr).tipo, 96)
+        defer delete(texto)
+        let msg_1 = format(f"o padrao do or_else deve ser {texto_valor}, recebeu {texto}", alloc = heap)
+        defer delete(msg_1)
+        return sem_erro(s, common.E0604, (e.b as ^frontend.Expr).pos, msg_1)
+    }
+    e.tipo = valor
+    return true
+}

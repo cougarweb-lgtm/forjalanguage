@@ -1,0 +1,188 @@
+// semantic/sem_lista_fixa.fj - porte de compiler/semantic/sem_lista_fixa.c
+// sha256 de semantic/sem_lista_fixa.c: bc902a6b1b658d49e10688f58fe50ea8f269ee9da7a93884628e62193b6a33db
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "common"
+import "frontend"
+
+const LISTA_FIXA_CAMPOS: i32 = 2
+
+// C: semantic/sem_lista_fixa.c:22
+proc sem_listas_fixas_iniciar(s: ^Semantica) {
+    let nomes: ^common.Interner = nomes_da_sem(s)
+    s.nome_itens = common.internar(nomes, "itens", 5)
+    s.nome_n = common.internar(nomes, "n", 1)
+    for k in (0 as u32)..<(LISTAS_FIXAS_MAX as u32) {
+        let texto = format(f"0lista_fixa_{k}", alloc = heap)
+        defer delete(texto)
+        s.nomes_listas_fixas[k] = common.internar(nomes, texto, len(texto) as u32)
+    }
+}
+
+// C: semantic/sem_lista_fixa.c:34
+// C2F-13: o retorno `Campo *` (FATIA de LISTA_FIXA_CAMPOS) vira []frontend.Campo (assinatura alterada dentro do lote)
+proc campos_da_lista(s: ^Semantica, array: u32) -> []frontend.Campo {
+    let nomes: [2]i32 = {s.nome_itens, s.nome_n}
+    let tipos: [2]u32 = {array, TIPO_INT as u32}
+    let campos = s4_arena_fatia_campo(s, LISTA_FIXA_CAMPOS as int)
+    for k in 0..<(LISTA_FIXA_CAMPOS as int) {
+        campos[k].nome = nomes[k]
+        campos[k].tipo.forma = frontend.TR_NOME as u8
+        campos[k].tipo.nome = -1
+        campos[k].tipo.erro = -1
+        campos[k].tipo.tipo = tipos[k]
+    }
+    return campos
+}
+
+// C: semantic/sem_lista_fixa.c:51
+proc nova_lista_fixa(s: ^Semantica, array: u32) -> u32 {
+    let k: u32 = s.qtd_listas_fixas
+    s.qtd_listas_fixas += 1
+    let d: ^frontend.Decl = s4_novo_decl(s)
+    d.tipo_no = frontend.D_STRUCT as u8
+    d.nome = s.nomes_listas_fixas[k]
+    d.chave = d.nome
+    d.simbolo = -1
+    d.publico = true
+    d.campos = campos_da_lista(s, array)
+    d.ncampos = LISTA_FIXA_CAMPOS as u32
+    d.indice = s.qtd_struct as i32
+    s.qtd_struct += 1
+    let tipo: u32 = tipo_lista_fixa(&s.tipos, d.nome, array)
+    let globais = s.globais or_else {}
+    globais[d.nome] = Simbolo{categoria = SIM_STRUCT as u8, indice = d.indice, decl = d, tipo = tipo, envenenado = 0}
+    s.decls_listas_fixas[k] = d
+    s.tipos_listas_fixas[k] = tipo
+    return tipo
+}
+
+// C: semantic/sem_lista_fixa.c:72
+proc lista_fixa_do_array(s: ^Semantica, array: u32, pos: u32) -> u32 {
+    var k: u32 = 0
+    while k < s.qtd_listas_fixas {
+        if tipo_lista_fixa_array(&s.tipos, s.tipos_listas_fixas[k]) == array {
+            return s.tipos_listas_fixas[k]
+        }
+        k += 1
+    }
+    if s.qtd_listas_fixas == (LISTAS_FIXAS_MAX as u32) {
+        let msg_1 = format(f"o programa usa mais de {LISTAS_FIXAS_MAX} tipos [dynamic, N]T diferentes", alloc = heap)
+        defer delete(msg_1)
+        _ = sem_erro(s, common.E0335, pos, msg_1)
+        return 0
+    }
+    return nova_lista_fixa(s, array)
+}
+
+// C: semantic/sem_lista_fixa.c:85
+proc conferir_elemento(s: ^Semantica, alvo: ?^frontend.TipoRef) -> bool {
+    let a: ^frontend.TipoRef = alvo as ^frontend.TipoRef
+    if tipo_classe_de(&s.tipos, a.tipo) == TC_RESULTADO {
+        let msg_1 = format(f"lista de 'T ! E' nao existe: guarde o valor ou o erro", alloc = heap)
+        defer delete(msg_1)
+        return sem_erro(s, common.E0308, a.pos, msg_1)
+    }
+    if not sem_tipo_eh_dono(s, a.tipo) {
+        return true
+    }
+    let texto = s4_descrever(s, a.tipo)
+    defer delete(texto)
+    let msg_2 = format(f"[dynamic, N]{texto} nao existe: a lista fixa e valor e copiaria o dono; use [dynamic]T com make", alloc = heap)
+    defer delete(msg_2)
+    return sem_erro(s, common.E0335, a.pos, msg_2)
+}
+
+// C: semantic/sem_lista_fixa.c:97
+proc sem_resolver_lista_fixa(s: ^Semantica, t: ?^frontend.TipoRef, base: ^u32) -> bool {
+    var n: u32 = 0
+    let tr: ^frontend.TipoRef = t as ^frontend.TipoRef
+    // TipoRef.alvo (TipoRef * no C) chega como fatia de 1 elemento: o objeto e o [0]
+    let alvo: ^frontend.TipoRef = &(tr.alvo or_else {})[0]
+    if (not sem_resolver_tipo_ref(s, alvo)) or (not conferir_elemento(s, alvo)) {
+        return false
+    }
+    if not sem_resolver_capacidade(s, t, &n) {
+        return false
+    }
+    let array: u32 = tipo_array(&s.tipos, alvo.tipo, n)
+    base^ = lista_fixa_do_array(s, array, tr.pos)
+    return base^ != 0
+}
+
+// C: semantic/sem_lista_fixa.c:107
+proc sem_literal_lista_fixa(s: ^Semantica, e: ^frontend.Expr, ctx: u32) -> bool {
+    if e.nargs != 0 {
+        let msg_1 = format(f"[dynamic, N]T nao tem literal com elementos: comece com {{}} e use append(&l, item = x)", alloc = heap)
+        defer delete(msg_1)
+        return sem_erro(s, common.E0335, e.pos, msg_1)
+    }
+    e.tipo = ctx
+    return true
+}
+
+// C: semantic/sem_lista_fixa.c:117
+proc sem_eh_lista_fixa_ou_ponteiro(s: ^Semantica, t: u32) -> bool {
+    var por_ponteiro: bool = false
+    return tipo_lista_fixa_de(&s.tipos, t, &por_ponteiro) != 0
+}
+
+// C: semantic/sem_lista_fixa.c:124
+proc sem_erro_de_lista_fixa(s: ^Semantica, pos: u32, causa: str) -> bool {
+    let msg_1 = format(f"{causa}", alloc = heap)
+    defer delete(msg_1)
+    return sem_erro(s, common.E0335, pos, msg_1)
+}
+
+// G3 S4: nomes `0lista_fixa_k`, a struct sintetica [dynamic, N]T (2 campos itens/n), reuso por array igual e a tabela de tipos montada a mao (tipos_iniciar e stub do S1)
+test "sem_lista_fixa: nomes, struct sintetica e reuso" {
+    var arenas = make([dynamic]common.Arena, alloc = heap)
+    append(&arenas, item = common.Arena{})
+    let arena: ^common.Arena = &arenas[0]
+    var sv: Semantica = Semantica{}
+    sv.arena = arena
+    var ins = make([dynamic]common.Interner, alloc = heap)
+    append(&ins, item = common.Interner{})
+    common.interner_iniciar(&ins[0], arena)
+    sv.nomes = ins[0..<1]
+    sv.tipos.itens = make([dynamic]TipoInfo, alloc = heap)
+    append(&sv.tipos.itens, item = TipoInfo{})
+    sv.tipos.tabela = make([dynamic]u32, alloc = heap)
+    for _k in 0..<64 {
+        append(&sv.tipos.tabela, item = 0 as u32)
+    }
+    sv.tipos.cap = 64
+    var gl = make([dynamic]Simbolo, alloc = heap)
+    for _k in 0..<80 {
+        append(&gl, item = Simbolo{})
+    }
+    sv.globais = gl[0..<len(gl)]
+    sem_listas_fixas_iniciar(&sv)
+    expect(common.interner_texto(&ins[0], sv.nome_itens) == "itens" and common.interner_texto(&ins[0], sv.nome_n) == "n")
+    expect(common.interner_texto(&ins[0], sv.nomes_listas_fixas[0]) == "0lista_fixa_0" and common.interner_texto(&ins[0], sv.nomes_listas_fixas[63]) == "0lista_fixa_63")
+    let arr1: u32 = tipo_array(&sv.tipos, TIPO_INT as u32, 4)
+    let arr2: u32 = tipo_array(&sv.tipos, TIPO_INT as u32, 8)
+    let l1: u32 = lista_fixa_do_array(&sv, arr1, 0)
+    expect(l1 != 0 and sv.qtd_listas_fixas == 1 and tipo_lista_fixa_array(&sv.tipos, l1) == arr1 and sv.tipos_listas_fixas[0] == l1)
+    expect(lista_fixa_do_array(&sv, arr1, 0) == l1 and sv.qtd_listas_fixas == 1)
+    let l2: u32 = lista_fixa_do_array(&sv, arr2, 0)
+    expect(l2 != l1 and sv.qtd_listas_fixas == 2 and sv.tipos_listas_fixas[1] == l2)
+    let d: ^frontend.Decl = sv.decls_listas_fixas[0] as ^frontend.Decl
+    expect(d.tipo_no == (frontend.D_STRUCT as u8) and d.nome == sv.nomes_listas_fixas[0] and d.chave == d.nome and d.publico and d.ncampos == 2 and len(d.campos or_else {}) == 2)
+    let campos = d.campos or_else {}
+    expect(campos[0].nome == sv.nome_itens and campos[0].tipo.tipo == arr1 and campos[1].nome == sv.nome_n and campos[1].tipo.tipo == (TIPO_INT as u32))
+    expect(d.indice == 0 and sv.qtd_struct == 2 and (sv.decls_listas_fixas[1] as ^frontend.Decl).indice == 1)
+    let g: Simbolo = gl[d.nome]
+    expect(g.categoria == (SIM_STRUCT as u8) and g.indice == d.indice and g.tipo == l1)
+    expect(sem_eh_lista_fixa_ou_ponteiro(&sv, l1) and not sem_eh_lista_fixa_ou_ponteiro(&sv, arr1))
+    var lit: frontend.Expr = frontend.Expr{}
+    expect(sem_literal_lista_fixa(&sv, &lit, l1) and lit.tipo == l1)
+    delete(gl)
+    delete(sv.tipos.itens)
+    delete(sv.tipos.tabela)
+    common.interner_liberar(&ins[0])
+    delete(ins)
+    common.arena_liberar(arena)
+    delete(arenas)
+}

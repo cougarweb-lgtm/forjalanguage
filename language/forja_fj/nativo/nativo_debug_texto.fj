@@ -1,0 +1,314 @@
+// nativo/nativo_debug_texto.fj - porte de compiler/nativo/nativo_debug_texto.c
+// sha256 de nativo/nativo_debug_texto.c: 354aeef902dad12411bb4aeaa9c2198b7e30d561740181755b032ef15c9daa13
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "common"
+import "nativo/dbg"
+import "nativo/x64"
+
+struct TextoEstado {
+    mascara: u32
+    secoes: [12][dynamic]u8
+    tem_pdata: bool
+    elf: bool
+    pdata_rva: u32
+    pdata_tam: u32
+}
+
+const SEC_BIR: i32 = 0
+const SEC_ASM: i32 = 1
+const SEC_QUADROS: i32 = 2
+const SEC_RELOC: i32 = 3
+const SEC_FORMATO: i32 = 4
+const SEC_TEMPOS: i32 = 5
+const SEC_LOCAIS: i32 = 6
+const SEC_LINHAS: i32 = 7
+const SEC_OTIM: i32 = 8
+const SEC_INTERFACE: i32 = 9
+const SEC_PERFIL: i32 = 10
+const SEC_PASSES: i32 = 11
+const SEC_QTD: i32 = 12
+const TEXTO_LARGURA_BYTES: i32 = 44
+const TEXTO_TAM_ENTRADA_PDATA: u32 = 12
+const TEXTO_TAM_MAX_INSTR: u32 = 15
+const NOMES_SECAO: [12]str = {"bir", "asm", "quadros", "reloc", "formato", "tempos", "locais", "linhas", "otim", "interface", "perfil", "passes"}
+const BITS_SECAO: [12]u32 = {1, 2, 4, 8, 16, 32, 128, 256, 512, 1024, 2048, 4096}
+
+// C: nativo/nativo_debug_texto.c:44
+// C2F-13: bytes fundido em tam (len)
+proc bytes_em_hex(bytes: []u8, hex: []u8) {
+    var k: u64 = 0
+    while k < (len(bytes) as u64) {
+        hex[3 * k] = digito_hex(bytes[k] >> 4)
+        hex[3 * k + 1] = digito_hex(bytes[k] & 15)
+        if k + 1 < (len(bytes) as u64) {
+            hex[3 * k + 2] = 32
+        }
+        k += 1
+    }
+}
+
+// digito hexadecimal minusculo (0-9, a-f) de um nibble; o C usa %02x
+proc digito_hex(nibble: u8) -> u8 {
+    if nibble < 10 {
+        return 48 + nibble
+    }
+    return 87 + nibble
+}
+
+// anexa o texto e completa com espacos ate a largura (o %-Ns do C)
+proc anexar_com_largura(saida: ^[dynamic]u8, texto: str, largura: u64) {
+    append(saida, item = texto)
+    var faltam: u64 = 0
+    if (len(texto) as u64) < largura {
+        faltam = largura - (len(texto) as u64)
+    }
+    while faltam > 0 {
+        append(saida, item = " ")
+        faltam -= 1
+    }
+}
+
+// anexa o texto de um bloco (BIR, locais, otim, interface, perfil, passes): bytes ate tam
+proc anexar_bloco(saida: ^[dynamic]u8, bloco: ^RegBir) {
+    append(saida, items = (bloco.texto or_else "")[0..<bloco.tam])
+}
+
+// C: nativo/nativo_debug_texto.c:51
+proc texto_funcao(t: ^TextoEstado, f: ^RegFuncao) {
+    let q: ?^x64.ListaFuncao = f.quadro
+    if (t.mascara & DEBUG_ASM) != 0 {
+        let txt_1 = f.nome or_else "(null)"
+        format(f"funcao {txt_1} texto+0x{f.inicio:x}\n", into = &t.secoes[SEC_ASM])
+    }
+    if (t.mascara & DEBUG_QUADROS) == 0 {
+        return
+    }
+    let txt_2 = f.nome or_else "(null)"
+    var tern_1: str = "nao"
+    if ((q as ^x64.ListaFuncao).sondagem as i32) != 0 {
+        tern_1 = "sim"
+    }
+    format(f"funcao {txt_2} texto+0x{f.inicio:x} tam=0x{f.tamanho:x} quadro={(q as ^x64.ListaFuncao).quadro} slots={(q as ^x64.ListaFuncao).slots} maxargs={(q as ^x64.ListaFuncao).maxargs} sondagem={tern_1} push={(q as ^x64.ListaFuncao).push} fpreg={(q as ^x64.ListaFuncao).fpreg} alocacao={(q as ^x64.ListaFuncao).alocacao} unwind=", into = &t.secoes[SEC_QUADROS])
+    for k in (0 as u32)..<((q as ^x64.ListaFuncao).tam_unwind as u32) {
+        let fmt_1: u32 = ((q as ^x64.ListaFuncao).unwind or_else {})[k] as u32
+        format(f"{fmt_1:02x}", into = &t.secoes[SEC_QUADROS])
+    }
+    append(&t.secoes[SEC_QUADROS], item = "\n")
+}
+
+// C: nativo/nativo_debug_texto.c:67
+proc texto_instr(t: ^TextoEstado, i: ^RegInstr) {
+    let saida: ^[dynamic]u8 = &t.secoes[SEC_ASM]
+    var hex: [46]u8 = {}
+    var sem_bytes: [1]u8 = {}
+    if i.tam == 0 or i.bytes == none {
+        bytes_em_hex(sem_bytes[0..<0], hex[..])
+    } else {
+        bytes_em_hex(slice_from(i.bytes as ^u8, len = i.tam as int), hex[..])
+    }
+    let tam_hex: u64 = common.c2f_strlen_b(hex[..]) as u64
+    format(f"  +{i.deslocamento:04x}  ", into = saida)
+    anexar_com_largura(saida, from_bytes(hex[0..<tam_hex], alloc = frame), TEXTO_LARGURA_BYTES as u64)
+    let asm_txt: str = i.texto_asm or_else "(null)"
+    format(f"  {asm_txt}", into = saida)
+    if i.simbolo != none {
+        let simbolo_txt: str = i.simbolo or_else "(null)"
+        format(f"  ; @{simbolo_txt}", into = saida)
+    }
+    if i.linha != 0 {
+        format(f"  ; {i.linha}:{i.coluna}", into = saida)
+    }
+    append(saida, item = "\n")
+}
+
+// C: nativo/nativo_debug_texto.c:81
+proc texto_reloc(t: ^TextoEstado, r: ^RegReloc) {
+    let saida: ^[dynamic]u8 = &t.secoes[SEC_RELOC]
+    let secao_txt: str = r.secao or_else "(null)"
+    let kind_txt: str = r.kind or_else "(null)"
+    let simbolo_txt: str = r.simbolo or_else "(null)"
+    format(f"  {secao_txt}+0x{r.offset:04x}  ", into = saida)
+    anexar_com_largura(saida, kind_txt, 8)
+    format(f" {simbolo_txt}{common.c2f_com_sinal(r.adendo)}\n", into = saida)
+}
+
+// C: nativo/nativo_debug_texto.c:86
+proc texto_formato(t: ^TextoEstado, f: ^RegFormato) {
+    let saida: ^[dynamic]u8 = &t.secoes[SEC_FORMATO]
+    t.elf = f.elf
+    if f.elf {
+        let txt_1 = f.forja or_else "(null)"
+        format(f"exe: {f.tam_arquivo} bytes | gerado por Forja Native {txt_1} | ELF64 x86-64 ET_EXEC estatico\n", into = saida)
+    } else {
+        let txt_2 = f.forja or_else "(null)"
+        format(f"exe: {f.tam_arquivo} bytes | gerado por Forja Native {txt_2} | linker {f.linker_maior as u32}.{f.linker_menor as u32}\n", into = saida)
+    }
+    format(f"image_base: 0x{f.imagem_base:x} | entrada: rva=0x{f.entrada_rva:x}\n", into = saida)
+}
+
+// C: nativo/nativo_debug_texto.c:99
+proc texto_segmento(t: ^TextoEstado, s: ^RegSegmento) {
+    let saida: ^[dynamic]u8 = &t.secoes[SEC_FORMATO]
+    let tipo_txt: str = s.tipo or_else "(null)"
+    let flags_txt: str = s.flags or_else "(null)"
+    append(saida, item = "segmento ")
+    anexar_com_largura(saida, tipo_txt, 9)
+    append(saida, item = " ")
+    anexar_com_largura(saida, flags_txt, 2)
+    format(f" offset=0x{s.offset:x} vaddr=0x{s.vaddr:x} filesz=0x{s.filesz:x} memsz=0x{s.memsz:x} align=0x{s.alinhamento:x}\n", into = saida)
+}
+
+// C: nativo/nativo_debug_texto.c:106
+proc texto_secao(t: ^TextoEstado, s: ^RegSecao) {
+    let saida: ^[dynamic]u8 = &t.secoes[SEC_FORMATO]
+    let nome_txt: str = s.nome or_else "(null)"
+    var nome_corte: str = nome_txt
+    if len(nome_txt) > 8 {
+        nome_corte = nome_txt[0..<8]
+    }
+    append(saida, item = "secao ")
+    anexar_com_largura(saida, nome_corte, 8)
+    format(f" rva=0x{s.rva:x} virt=0x{s.tam_virtual:x} arq=0x{s.tam_bruto:x} carac=0x{s.caracteristicas:08x}\n", into = saida)
+    if nome_txt == ".pdata" {
+        t.tem_pdata = true
+        t.pdata_rva = s.rva
+        t.pdata_tam = s.tam_virtual
+    }
+}
+
+// C: nativo/nativo_debug_texto.c:117
+proc texto_tempos(t: ^TextoEstado, n: ^NativoTempos) {
+    let saida: ^[dynamic]u8 = &t.secoes[SEC_TEMPOS]
+    var k: u64 = 0
+    while k < (NATIVO_TEMPOS_QTD as u64) {
+        var sep: str = " "
+        if k == 0 {
+            sep = ""
+        }
+        let nome: str = nativo_tempos_nome(k)
+        let valor: u64 = nativo_tempos_valor(n, k)
+        format(f"{sep}{nome}={valor}", into = saida)
+        k += 1
+    }
+    append(saida, item = " (ns; linhas = do programa inteiro; outros = total - soma das etapas)\n")
+}
+
+// C: nativo/nativo_debug_texto.c:127
+proc texto_linhas(t: ^TextoEstado, r: ^RegLinhas) {
+    let saida: ^[dynamic]u8 = &t.secoes[SEC_LINHAS]
+    let txt_1 = (r.proc_c as ^dbg.DbgProc).nome or_else "(null)"
+    format(f"proc {txt_1} [0x{(r.proc_c as ^dbg.DbgProc).inicio:x},0x{(r.proc_c as ^dbg.DbgProc).fim:x})\n", into = saida)
+    var k: u32 = 0
+    while k < (r.proc_c as ^dbg.DbgProc).nlinhas {
+        let l: ^dbg.DbgLinha = &(r.dbg as ^dbg.DbgPrograma).linhas[((r.proc_c as ^dbg.DbgProc).linha_ini + k) as u64]
+        let p: common.FontePosicao = common.fonte_localizar_no_arquivo(r.fonte, l.pos)
+        let txt_2 = p.caminho or_else "(null)"
+        format(f"  linha +0x{l.off - (r.proc_c as ^dbg.DbgProc).inicio:x} {txt_2}:{p.linha}:{p.coluna}\n", into = saida)
+        k += 1
+    }
+    var k_2: u32 = 0
+    while k_2 < (r.proc_c as ^dbg.DbgProc).nvars {
+        let v: ^dbg.DbgVar = &(r.dbg as ^dbg.DbgPrograma).vars[((r.proc_c as ^dbg.DbgProc).var_ini + k_2) as u64]
+        var tern_1: str = "local"
+        if common.c2f_b2i32(v.parametro) != 0 {
+            tern_1 = "param"
+        }
+        let txt_3 = v.nome or_else "(null)"
+        let txt_4 = v.tipo_nome or_else "(null)"
+        var tern_2: str = ""
+        if common.c2f_b2i32(v.loc.indireto) != 0 {
+            tern_2 = " indireto"
+        }
+        format(f"  {tern_1} {txt_3} tipo={txt_4} rbp{common.c2f_com_sinal(v.loc.rbp_off as i64)}{tern_2}\n", into = saida)
+        k_2 += 1
+    }
+}
+
+// C: nativo/nativo_debug_texto.c:146
+// C2F-VOID: estado
+proc escrever_texto(estado: rawptr, reg: ^DebugReg) {
+    let t: ^TextoEstado = estado as ^TextoEstado
+    let tipo: i32 = reg.tipo as i32
+    // LIMITE: cognitiva 17 despacho plano por tipo de registro (um if por REG_, sem logica propria)
+    if tipo == REG_FUNCAO {
+        texto_funcao(t, &reg.funcao)
+    } else if tipo == REG_INSTR {
+        texto_instr(t, &reg.instr)
+    } else if tipo == REG_BIR {
+        anexar_bloco(&t.secoes[SEC_BIR], &reg.bir)
+    } else if tipo == REG_LOCAIS {
+        anexar_bloco(&t.secoes[SEC_LOCAIS], &reg.bir)
+    } else if tipo == REG_LINHAS {
+        texto_linhas(t, &reg.linhas)
+    } else if tipo == REG_OTIM {
+        anexar_bloco(&t.secoes[SEC_OTIM], &reg.otim)
+    } else if tipo == REG_INTERFACE {
+        anexar_bloco(&t.secoes[SEC_INTERFACE], &reg.texto_interface)
+    } else if tipo == REG_PERFIL {
+        anexar_bloco(&t.secoes[SEC_PERFIL], &reg.texto_perfil)
+    } else if tipo == REG_PASSES {
+        anexar_bloco(&t.secoes[SEC_PASSES], &reg.texto_passes)
+    } else if tipo == REG_RELOC {
+        texto_reloc(t, &reg.reloc)
+    } else if tipo == REG_FORMATO {
+        texto_formato(t, &reg.formato)
+    } else if tipo == REG_SECAO {
+        texto_secao(t, &reg.secao)
+    } else if tipo == REG_SEGMENTO {
+        texto_segmento(t, &reg.segmento)
+    } else if tipo == REG_TEMPOS {
+        texto_tempos(t, reg.tempos.tempos as ^NativoTempos)
+    }
+}
+
+// C: nativo/nativo_debug_texto.c:170
+proc texto_fechar_formato(t: ^TextoEstado) {
+    let saida: ^[dynamic]u8 = &t.secoes[SEC_FORMATO]
+    if t.tem_pdata {
+        format(f"excecoes: rva=0x{t.pdata_rva:x} tam=0x{t.pdata_tam:x} entradas={t.pdata_tam / TEXTO_TAM_ENTRADA_PDATA} (programa e runtime)\n", into = saida)
+    }
+    if not t.elf {
+        append(saida, item = "reloc: tabela DIR64 gerada na escrita do PE\n")
+    }
+}
+
+// C: nativo/nativo_debug_texto.c:181
+proc debug_montar(e: ^DebugEntrada, saida: ^[dynamic]u8) {
+    var t: TextoEstado = TextoEstado{mascara = e.mascara, secoes = {}, tem_pdata = false, elf = false, pdata_rva = 0, pdata_tam = 0}
+    var k: u64 = 0
+    while k < (SEC_QTD as u64) {
+        t.secoes[k] = make([dynamic]u8, alloc = heap)
+        k += 1
+    }
+    debug_percorrer(e, DEBUG_ESCRITOR_ESCREVER_TEXTO, &t as rawptr)
+    if (e.mascara & DEBUG_FORMATO) != 0 {
+        texto_fechar_formato(&t)
+    }
+    let versao: str = e.versao or_else "(null)"
+    format(f"# Forja Native {versao} --debug-code\n", into = saida)
+    k = 0
+    while k < (SEC_QTD as u64) {
+        if (e.mascara & BITS_SECAO[k]) != 0 {
+            format(f"## {NOMES_SECAO[k]}\n", into = saida)
+            let sec: ^[dynamic]u8 = &t.secoes[k]
+            append(saida, items = (sec^)[..])
+        }
+        k += 1
+    }
+    k = 0
+    while k < (SEC_QTD as u64) {
+        delete(t.secoes[k])
+        k += 1
+    }
+}
+
+// testes: texto conferido a mao contra bytes_em_hex do C (%02x com espaco entre bytes, sem espaco no fim)
+test "bytes_em_hex escreve os bytes em hex com espaco entre eles" {
+    var dados: [2]u8 = {10, 255}
+    var hex: [46]u8 = {}
+    bytes_em_hex(dados[..], hex[..])
+    let s: str = from_bytes(hex[0..<common.c2f_strlen_b(hex[..])], alloc = frame)
+    expect(s == "0a ff")
+}

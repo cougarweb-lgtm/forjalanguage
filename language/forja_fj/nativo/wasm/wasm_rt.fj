@@ -1,0 +1,760 @@
+// nativo/wasm/wasm_rt.fj - runtime minimo do alvo wasm32-wasip1 escrito em bytecode WebAssembly
+// Versao: 0.1.0
+// Contrato: wasm_rt_definir acrescenta as 16 funcoes do runtime na ordem k = 0..15; o indice wasm da funcao k e base + k.
+// k = 0..5 saem pelo fd_write da WASI (stdout); k = 6..15 saem em fd 2 (stderr) e as de falha terminam com proc_exit(101).
+// Memoria reservada ao runtime: [0,16) nunca escrever; [16,24) iovec; [24,28) nwritten; 28 = LF; [29,31) escape de erro;
+// [32,56) buffer de digitos/bool; [64,344) textos constantes das falhas. Ninguem mais usa essa regiao.
+
+import "nativo/fmt" as pefmt
+
+pub const WASM_RT_QTD: u32 = 18
+
+const RT_IDX_ESCREVER: u32 = 0
+const RT_IDX_PRINT_I64: u32 = 3
+const RT_IOVEC: u32 = 16
+const RT_IOV_LEN: u32 = 20
+const RT_NWRITTEN: u32 = 24
+const RT_LF: u32 = 28
+const RT_BUF_INI: u32 = 32
+const RT_BUF_FIM: u32 = 56
+const RT_BUF_LF: u32 = 55
+const RT_ASCII_ZERO: u32 = 48
+const RT_ASCII_MENOS: u32 = 45
+const RT_ASCII_LF: u32 = 10
+const RT_ASCII_ASPAS: u32 = 34
+const RT_ASCII_BARRA: u32 = 92
+
+const RT_IDX_ERR_ESCREVER: u32 = 6
+const RT_IDX_ERR_TEXTO: u32 = 7
+const RT_IDX_ERR_I64: u32 = 8
+const RT_IDX_ERR_U64: u32 = 9
+const RT_FD_SAIDA: u32 = 1
+const RT_FD_ERRO: u32 = 2
+const RT_ERR_BYTE: u32 = 29
+const RT_ERR_BARRA: u32 = 30
+const RT_PROC_EXIT: u32 = 0
+const RT_SAIDA_FALHA: u32 = 101
+
+// Textos constantes das falhas: enderecos e tamanhos (a ordem bate com rt_textos_erro)
+const RT_TXT_PREF: u32 = 64
+const RT_TAM_PREF: u32 = 51
+const RT_TXT_LINHA: u32 = 115
+const RT_TAM_LINHA: u32 = 12
+const RT_TXT_CAUSA: u32 = 127
+const RT_TAM_CAUSA: u32 = 12
+const RT_TXT_EST: u32 = 139
+const RT_TAM_EST: u32 = 22
+const RT_TXT_DOIS: u32 = 161
+const RT_TAM_DOIS: u32 = 2
+const RT_TXT_E: u32 = 163
+const RT_TAM_E: u32 = 3
+const RT_TXT_CONV: u32 = 166
+const RT_TAM_CONV: u32 = 18
+const RT_TXT_PARA: u32 = 184
+const RT_TAM_PARA: u32 = 6
+const RT_TXT_FORA: u32 = 190
+const RT_TAM_FORA: u32 = 14
+const RT_TXT_FIM: u32 = 204
+const RT_TAM_FIM: u32 = 3
+// Textos novos das falhas 14 e 15: prefixos com R0006 e R0005 (mesma forma do R0002), indice e nulo
+const RT_TXT_PREF6: u32 = 207
+const RT_TAM_PREF6: u32 = 51
+const RT_TXT_PREF5: u32 = 258
+const RT_TAM_PREF5: u32 = 51
+const RT_TXT_INDICE: u32 = 309
+const RT_TAM_INDICE: u32 = 7
+const RT_TXT_FORA_DE: u32 = 316
+const RT_TAM_FORA_DE: u32 = 13
+const RT_TXT_PONTEIRO: u32 = 329
+const RT_TAM_PONTEIRO: u32 = 15
+// Textos da falha 16 (fatia fora): "fatia ", "..<", "..=", " fora de 0..="
+const RT_TXT_FATIA: u32 = 344
+const RT_TAM_FATIA: u32 = 6
+const RT_TXT_EXCL: u32 = 350
+const RT_TXT_INCL: u32 = 353
+const RT_TAM_FAIXA: u32 = 3
+const RT_TXT_FATIA_FORA: u32 = 356
+const RT_TAM_FATIA_FORA: u32 = 13
+
+const RT_BLOCO_VAZIO: u8 = 0x40
+const RT_OP_UNREACHABLE: u8 = 0x00
+const RT_OP_BLOCK: u8 = 0x02
+const RT_OP_LOOP: u8 = 0x03
+const RT_OP_IF: u8 = 0x04
+const RT_OP_ELSE: u8 = 0x05
+const RT_OP_END: u8 = 0x0B
+const RT_OP_BR: u8 = 0x0C
+const RT_OP_BR_IF: u8 = 0x0D
+const RT_OP_CALL: u8 = 0x10
+const RT_OP_DROP: u8 = 0x1A
+const RT_OP_LOCAL_GET: u8 = 0x20
+const RT_OP_LOCAL_SET: u8 = 0x21
+const RT_OP_I32_LOAD8_U: u8 = 0x2D
+const RT_OP_I32_STORE: u8 = 0x36
+const RT_OP_I32_STORE8: u8 = 0x3A
+const RT_OP_I32_CONST: u8 = 0x41
+const RT_OP_I64_CONST: u8 = 0x42
+const RT_OP_I32_EQZ: u8 = 0x45
+const RT_OP_I32_EQ: u8 = 0x46
+const RT_OP_I64_NE: u8 = 0x52
+const RT_OP_I64_LT_S: u8 = 0x53
+const RT_OP_I32_ADD: u8 = 0x6A
+const RT_OP_I32_SUB: u8 = 0x6B
+const RT_OP_I32_AND: u8 = 0x71
+const RT_OP_I32_OR: u8 = 0x72
+const RT_OP_I64_SUB: u8 = 0x7D
+const RT_OP_I64_DIV_U: u8 = 0x80
+const RT_OP_I64_REM_U: u8 = 0x82
+const RT_OP_I32_WRAP_I64: u8 = 0xA7
+const RT_OP_I64_EXTEND_I32_S: u8 = 0xAC
+
+// Nome da funcao k (k = 0 e "" = interna, sem entrada na secao name)
+pub proc wasm_rt_nome(k: u32) -> str {
+    if k == 1 {
+        return "forja_print_texto"
+    } else if k == 2 {
+        return "forja_print_i32"
+    } else if k == 3 {
+        return "forja_print_i64"
+    } else if k == 4 {
+        return "forja_print_u64"
+    } else if k == 5 {
+        return "forja_print_bool"
+    } else if k == 6 {
+        return "forja_err_escrever"
+    } else if k == 7 {
+        return "forja_err_texto_json"
+    } else if k == 8 {
+        return "forja_err_i64"
+    } else if k == 9 {
+        return "forja_err_u64"
+    } else if k == 10 {
+        return "forja_falha_estouro"
+    } else if k == 11 {
+        return "forja_falha_estouro_u"
+    } else if k == 12 {
+        return "forja_falha_conversao_i"
+    } else if k == 13 {
+        return "forja_falha_conversao_u"
+    } else if k == 14 {
+        return "forja_falha_indice"
+    } else if k == 15 {
+        return "forja_falha_nulo"
+    } else if k == 16 {
+        return "forja_falha_fatia"
+    } else if k == 17 {
+        return "forja_os_write_stdout"
+    }
+    return ""
+}
+
+// Verdadeiro se o unico parametro da funcao k e i64 (print_texto, print_i64, print_u64)
+pub proc wasm_rt_param_i64(k: u32) -> bool {
+    return (k == 1) or (k == 3) or (k == 4)
+}
+
+// Locais: entrada 0 = nenhum local
+proc rt_sem_locais(c: ^[dynamic]u8) {
+    append(c, item = 0)
+}
+
+// Locais: uma entrada com qtd locais do mesmo tipo
+proc rt_locais_um(c: ^[dynamic]u8, qtd: u32, tipo: u8) {
+    append(c, item = 1)
+    pefmt.wasm_leb_u32(c, qtd)
+    append(c, item = tipo)
+}
+
+// Locais dos digitos: 1 = u (i64), 2 = pos (i32), 3 = neg (i32)
+proc rt_locais_digitos(c: ^[dynamic]u8) {
+    append(c, item = 2)
+    pefmt.wasm_leb_u32(c, 1)
+    append(c, item = pefmt.WASM_I64)
+    pefmt.wasm_leb_u32(c, 2)
+    append(c, item = pefmt.WASM_I32)
+}
+
+proc rt_i32c(c: ^[dynamic]u8, v: u32) {
+    append(c, item = RT_OP_I32_CONST)
+    pefmt.wasm_leb_s32(c, v as i32)
+}
+
+proc rt_i64c(c: ^[dynamic]u8, v: i64) {
+    append(c, item = RT_OP_I64_CONST)
+    pefmt.wasm_leb_s64(c, v)
+}
+
+proc rt_local_get(c: ^[dynamic]u8, idx: u32) {
+    append(c, item = RT_OP_LOCAL_GET)
+    pefmt.wasm_leb_u32(c, idx)
+}
+
+proc rt_local_set(c: ^[dynamic]u8, idx: u32) {
+    append(c, item = RT_OP_LOCAL_SET)
+    pefmt.wasm_leb_u32(c, idx)
+}
+
+// Desvio (br ou br_if) para o rotulo de profundidade prof
+proc rt_salto(c: ^[dynamic]u8, op: u8, prof: u32) {
+    append(c, item = op)
+    pefmt.wasm_leb_u32(c, prof)
+}
+
+// Chamada direta pelo indice de funcao
+proc rt_chamar(c: ^[dynamic]u8, indice: u32) {
+    append(c, item = RT_OP_CALL)
+    pefmt.wasm_leb_u32(c, indice)
+}
+
+// memarg de i32.load8_u/i32.store8: align 0, offset 0
+proc rt_load8(c: ^[dynamic]u8) {
+    append(c, item = RT_OP_I32_LOAD8_U)
+    pefmt.wasm_leb_u32(c, 0)
+    pefmt.wasm_leb_u32(c, 0)
+}
+
+proc rt_store8(c: ^[dynamic]u8) {
+    append(c, item = RT_OP_I32_STORE8)
+    pefmt.wasm_leb_u32(c, 0)
+    pefmt.wasm_leb_u32(c, 0)
+}
+
+// memarg de i32.store: align 2 (4 bytes), offset 0
+proc rt_store32(c: ^[dynamic]u8) {
+    append(c, item = RT_OP_I32_STORE)
+    pefmt.wasm_leb_u32(c, 2)
+    pefmt.wasm_leb_u32(c, 0)
+}
+
+// Grava um byte em endereco fixo: i32.const endereco; i32.const valor; i32.store8
+proc rt_gravar_byte(c: ^[dynamic]u8, endereco: u32, valor: u32) {
+    rt_i32c(c, endereco)
+    rt_i32c(c, valor)
+    rt_store8(c)
+}
+
+// Grava os bytes de texto a partir de inicio, um i32.store8 por byte
+proc rt_gravar_texto(c: ^[dynamic]u8, inicio: u32, texto: []u8) {
+    let n = len(texto) as u32
+    for i in (0 as u32)..<n {
+        rt_gravar_byte(c, inicio + i, texto[i] as u32)
+    }
+}
+
+// rt_escrever(ptr, len): iovec em [16,24), fd_write(fd, 16, 1, 24), errno descartado
+proc rt_corpo_escrever(c: ^[dynamic]u8, fd_write: u32, fd: u32) {
+    rt_sem_locais(c)
+    rt_i32c(c, RT_IOVEC)
+    rt_local_get(c, 0)
+    rt_store32(c)
+    rt_i32c(c, RT_IOV_LEN)
+    rt_local_get(c, 1)
+    rt_store32(c)
+    rt_i32c(c, fd)
+    rt_i32c(c, RT_IOVEC)
+    rt_i32c(c, 1)
+    rt_i32c(c, RT_NWRITTEN)
+    rt_chamar(c, fd_write)
+    append(c, item = RT_OP_DROP)
+}
+
+// print_texto(p: i64): conta bytes ate o NUL (local 2 = len), escreve e depois um LF
+proc rt_corpo_print_texto(c: ^[dynamic]u8, base: u32) {
+    rt_locais_um(c, 2, pefmt.WASM_I32)
+    rt_local_get(c, 0)
+    append(c, item = RT_OP_I32_WRAP_I64)
+    rt_local_set(c, 1)
+    rt_i32c(c, 0)
+    rt_local_set(c, 2)
+    append(c, item = RT_OP_BLOCK)
+    append(c, item = RT_BLOCO_VAZIO)
+    append(c, item = RT_OP_LOOP)
+    append(c, item = RT_BLOCO_VAZIO)
+    rt_local_get(c, 1)
+    rt_local_get(c, 2)
+    append(c, item = RT_OP_I32_ADD)
+    rt_load8(c)
+    append(c, item = RT_OP_I32_EQZ)
+    rt_salto(c, RT_OP_BR_IF, 1)
+    rt_local_get(c, 2)
+    rt_i32c(c, 1)
+    append(c, item = RT_OP_I32_ADD)
+    rt_local_set(c, 2)
+    rt_salto(c, RT_OP_BR, 0)
+    append(c, item = RT_OP_END)
+    append(c, item = RT_OP_END)
+    rt_local_get(c, 1)
+    rt_local_get(c, 2)
+    rt_chamar(c, base + RT_IDX_ESCREVER)
+    rt_gravar_byte(c, RT_LF, RT_ASCII_LF)
+    rt_i32c(c, RT_LF)
+    rt_i32c(c, 1)
+    rt_chamar(c, base + RT_IDX_ESCREVER)
+}
+
+// print_i32(v: i32): estende para i64 e segue como print_i64
+proc rt_corpo_print_i32(c: ^[dynamic]u8, base: u32) {
+    rt_sem_locais(c)
+    rt_local_get(c, 0)
+    append(c, item = RT_OP_I64_EXTEND_I32_S)
+    rt_chamar(c, base + RT_IDX_PRINT_I64)
+}
+
+// u = |v| em u64 (local 1). Com sinal: neg = v < 0 (local 3) e u = 0 - v (INT64_MIN da 2^63 certo)
+proc rt_magnitude(c: ^[dynamic]u8, com_sinal: bool) {
+    if com_sinal {
+        rt_local_get(c, 0)
+        rt_i64c(c, 0)
+        append(c, item = RT_OP_I64_LT_S)
+        rt_local_set(c, 3)
+    }
+    rt_local_get(c, 0)
+    rt_local_set(c, 1)
+    if com_sinal {
+        rt_local_get(c, 3)
+        append(c, item = RT_OP_IF)
+        append(c, item = RT_BLOCO_VAZIO)
+        rt_i64c(c, 0)
+        rt_local_get(c, 0)
+        append(c, item = RT_OP_I64_SUB)
+        rt_local_set(c, 1)
+        append(c, item = RT_OP_END)
+    }
+}
+
+// pos (local 2) recua um byte
+proc rt_recuar_pos(c: ^[dynamic]u8) {
+    rt_local_get(c, 2)
+    rt_i32c(c, 1)
+    append(c, item = RT_OP_I32_SUB)
+    rt_local_set(c, 2)
+}
+
+// Digitos de tras para frente a partir de RT_BUF_LF (que recebe o LF); pos = ultimo byte escrito
+proc rt_loop_digitos(c: ^[dynamic]u8) {
+    rt_i32c(c, RT_BUF_LF)
+    rt_local_set(c, 2)
+    rt_gravar_byte(c, RT_BUF_LF, RT_ASCII_LF)
+    append(c, item = RT_OP_LOOP)
+    append(c, item = RT_BLOCO_VAZIO)
+    rt_recuar_pos(c)
+    rt_local_get(c, 2)
+    rt_local_get(c, 1)
+    rt_i64c(c, 10)
+    append(c, item = RT_OP_I64_REM_U)
+    append(c, item = RT_OP_I32_WRAP_I64)
+    rt_i32c(c, RT_ASCII_ZERO)
+    append(c, item = RT_OP_I32_ADD)
+    rt_store8(c)
+    rt_local_get(c, 1)
+    rt_i64c(c, 10)
+    append(c, item = RT_OP_I64_DIV_U)
+    rt_local_set(c, 1)
+    rt_local_get(c, 1)
+    rt_i64c(c, 0)
+    append(c, item = RT_OP_I64_NE)
+    rt_salto(c, RT_OP_BR_IF, 0)
+    append(c, item = RT_OP_END)
+}
+
+// Negativo: '-' antes do primeiro digito
+proc rt_menos(c: ^[dynamic]u8) {
+    rt_local_get(c, 3)
+    append(c, item = RT_OP_IF)
+    append(c, item = RT_BLOCO_VAZIO)
+    rt_recuar_pos(c)
+    rt_local_get(c, 2)
+    rt_i32c(c, RT_ASCII_MENOS)
+    rt_store8(c)
+    append(c, item = RT_OP_END)
+}
+
+// rt_escrever(pos, 56 - pos): do primeiro digito ate o LF
+proc rt_saida_digitos(c: ^[dynamic]u8, base: u32) {
+    rt_local_get(c, 2)
+    rt_i32c(c, RT_BUF_FIM)
+    rt_local_get(c, 2)
+    append(c, item = RT_OP_I32_SUB)
+    rt_chamar(c, base + RT_IDX_ESCREVER)
+}
+
+// print_i64 (com_sinal = true) e print_u64 (false): decimal + LF; zero imprime "0\n"
+proc rt_corpo_digitos(c: ^[dynamic]u8, base: u32, com_sinal: bool) {
+    rt_locais_digitos(c)
+    rt_magnitude(c, com_sinal)
+    rt_loop_digitos(c)
+    if com_sinal {
+        rt_menos(c)
+    }
+    rt_saida_digitos(c, base)
+}
+
+// print_bool(v: i32): "true\n" se v & 255 != 0, senao "false\n"
+proc rt_corpo_print_bool(c: ^[dynamic]u8, base: u32) {
+    var verdadeiro: [5]u8 = {0x74, 0x72, 0x75, 0x65, 0x0A}
+    var falso: [6]u8 = {0x66, 0x61, 0x6C, 0x73, 0x65, 0x0A}
+    rt_sem_locais(c)
+    rt_local_get(c, 0)
+    rt_i32c(c, 255)
+    append(c, item = RT_OP_I32_AND)
+    append(c, item = RT_OP_IF)
+    append(c, item = RT_BLOCO_VAZIO)
+    rt_gravar_texto(c, RT_BUF_INI, verdadeiro[..])
+    rt_i32c(c, RT_BUF_INI)
+    rt_i32c(c, 5)
+    rt_chamar(c, base + RT_IDX_ESCREVER)
+    append(c, item = RT_OP_ELSE)
+    rt_gravar_texto(c, RT_BUF_INI, falso[..])
+    rt_i32c(c, RT_BUF_INI)
+    rt_i32c(c, 6)
+    rt_chamar(c, base + RT_IDX_ESCREVER)
+    append(c, item = RT_OP_END)
+}
+
+// Escreve em fd 2 o trecho constante [inicio, inicio + tamanho) do segmento de textos
+proc rt_err_trecho(c: ^[dynamic]u8, base: u32, inicio: u32, tamanho: u32) {
+    rt_i32c(c, inicio)
+    rt_i32c(c, tamanho)
+    rt_chamar(c, base + RT_IDX_ERR_ESCREVER)
+}
+
+// Escreve em fd 2 o byte guardado no local byte_local (posicao RT_ERR_BYTE, tamanho 1)
+proc rt_byte_erro(c: ^[dynamic]u8, base: u32, byte_local: u32) {
+    rt_i32c(c, RT_ERR_BYTE)
+    rt_local_get(c, byte_local)
+    rt_store8(c)
+    rt_i32c(c, RT_ERR_BYTE)
+    rt_i32c(c, 1)
+    rt_chamar(c, base + RT_IDX_ERR_ESCREVER)
+}
+
+// Se o byte (local 2) e '"' ou '\', escreve antes uma barra (posicao RT_ERR_BARRA)
+proc rt_barra_escape(c: ^[dynamic]u8, base: u32) {
+    rt_local_get(c, 2)
+    rt_i32c(c, RT_ASCII_ASPAS)
+    append(c, item = RT_OP_I32_EQ)
+    rt_local_get(c, 2)
+    rt_i32c(c, RT_ASCII_BARRA)
+    append(c, item = RT_OP_I32_EQ)
+    append(c, item = RT_OP_I32_OR)
+    append(c, item = RT_OP_IF)
+    append(c, item = RT_BLOCO_VAZIO)
+    rt_gravar_byte(c, RT_ERR_BARRA, RT_ASCII_BARRA)
+    rt_i32c(c, RT_ERR_BARRA)
+    rt_i32c(c, 1)
+    rt_chamar(c, base + RT_IDX_ERR_ESCREVER)
+    append(c, item = RT_OP_END)
+}
+
+// rt_err_texto_json(p: i64): bytes ate o NUL em fd 2 (local 1 = ptr, local 2 = byte); '"' e '\' saem com barra antes
+proc rt_corpo_texto_json(c: ^[dynamic]u8, base: u32) {
+    rt_locais_um(c, 2, pefmt.WASM_I32)
+    rt_local_get(c, 0)
+    append(c, item = RT_OP_I32_WRAP_I64)
+    rt_local_set(c, 1)
+    append(c, item = RT_OP_BLOCK)
+    append(c, item = RT_BLOCO_VAZIO)
+    append(c, item = RT_OP_LOOP)
+    append(c, item = RT_BLOCO_VAZIO)
+    rt_local_get(c, 1)
+    rt_load8(c)
+    rt_local_set(c, 2)
+    rt_local_get(c, 2)
+    append(c, item = RT_OP_I32_EQZ)
+    rt_salto(c, RT_OP_BR_IF, 1)
+    rt_barra_escape(c, base)
+    rt_byte_erro(c, base, 2)
+    rt_local_get(c, 1)
+    rt_i32c(c, 1)
+    append(c, item = RT_OP_I32_ADD)
+    rt_local_set(c, 1)
+    rt_salto(c, RT_OP_BR, 0)
+    append(c, item = RT_OP_END)
+    append(c, item = RT_OP_END)
+}
+
+// Texto NUL-terminado do local i64 p, em fd 2 e sem escape (ptr = local i32, byte = local ptr + 1)
+proc rt_texto_bruto(c: ^[dynamic]u8, base: u32, p: u32, ptr: u32) {
+    rt_local_get(c, p)
+    append(c, item = RT_OP_I32_WRAP_I64)
+    rt_local_set(c, ptr)
+    append(c, item = RT_OP_BLOCK)
+    append(c, item = RT_BLOCO_VAZIO)
+    append(c, item = RT_OP_LOOP)
+    append(c, item = RT_BLOCO_VAZIO)
+    rt_local_get(c, ptr)
+    rt_load8(c)
+    rt_local_set(c, ptr + 1)
+    rt_local_get(c, ptr + 1)
+    append(c, item = RT_OP_I32_EQZ)
+    rt_salto(c, RT_OP_BR_IF, 1)
+    rt_byte_erro(c, base, ptr + 1)
+    rt_local_get(c, ptr)
+    rt_i32c(c, 1)
+    append(c, item = RT_OP_I32_ADD)
+    rt_local_set(c, ptr)
+    rt_salto(c, RT_OP_BR, 0)
+    append(c, item = RT_OP_END)
+    append(c, item = RT_OP_END)
+}
+
+// Digitos de pos (local 2) ate RT_BUF_LF, sem o LF, em fd 2
+proc rt_saida_erro_digitos(c: ^[dynamic]u8, base: u32) {
+    rt_local_get(c, 2)
+    rt_i32c(c, RT_BUF_LF)
+    rt_local_get(c, 2)
+    append(c, item = RT_OP_I32_SUB)
+    rt_chamar(c, base + RT_IDX_ERR_ESCREVER)
+}
+
+// rt_err_i64 (com_sinal = true) e rt_err_u64 (false): decimal em fd 2, sem LF
+proc rt_corpo_err_digitos(c: ^[dynamic]u8, base: u32, com_sinal: bool) {
+    rt_locais_digitos(c)
+    rt_magnitude(c, com_sinal)
+    rt_loop_digitos(c)
+    if com_sinal {
+        rt_menos(c)
+    }
+    rt_saida_erro_digitos(c, base)
+}
+
+// Imprime o local v_local em fd 2: com sinal chama rt_err_i64, senao rt_err_u64
+proc rt_err_numero(c: ^[dynamic]u8, base: u32, v_local: u32, com_sinal: bool) {
+    rt_local_get(c, v_local)
+    if com_sinal {
+        rt_chamar(c, base + RT_IDX_ERR_I64)
+    } else {
+        rt_chamar(c, base + RT_IDX_ERR_U64)
+    }
+}
+
+// Cabeca do JSON de falha com prefixo R0002: prefixo, arquivo escapado (local arq i64) e linha (local linha i32 estendido)
+proc rt_falha_cabeca(c: ^[dynamic]u8, base: u32, arq: u32, linha: u32) {
+    rt_err_trecho(c, base, RT_TXT_PREF, RT_TAM_PREF)
+    rt_falha_cabeca_resto(c, base, arq, linha)
+}
+
+// Parte da cabeca depois do prefixo (quem chama ja escreveu o prefixo com o codigo da falha)
+proc rt_falha_cabeca_resto(c: ^[dynamic]u8, base: u32, arq: u32, linha: u32) {
+    rt_local_get(c, arq)
+    rt_chamar(c, base + RT_IDX_ERR_TEXTO)
+    rt_err_trecho(c, base, RT_TXT_LINHA, RT_TAM_LINHA)
+    rt_local_get(c, linha)
+    append(c, item = RT_OP_I64_EXTEND_I32_S)
+    rt_chamar(c, base + RT_IDX_ERR_I64)
+}
+
+// Fim da falha: "}\n em fd 2, depois proc_exit(101) e unreachable
+proc rt_falha_fim(c: ^[dynamic]u8, base: u32) {
+    rt_err_trecho(c, base, RT_TXT_FIM, RT_TAM_FIM)
+    rt_i32c(c, RT_SAIDA_FALHA)
+    rt_chamar(c, RT_PROC_EXIT)
+    append(c, item = RT_OP_UNREACHABLE)
+}
+
+// forja_falha_estouro / _u (op, a, b, arq, linha): locais 5 e 6 = ptr e byte do texto de op
+proc rt_corpo_estouro(c: ^[dynamic]u8, base: u32, com_sinal: bool) {
+    rt_locais_um(c, 2, pefmt.WASM_I32)
+    rt_falha_cabeca(c, base, 3, 4)
+    rt_err_trecho(c, base, RT_TXT_CAUSA, RT_TAM_CAUSA)
+    rt_err_trecho(c, base, RT_TXT_EST, RT_TAM_EST)
+    rt_texto_bruto(c, base, 0, 5)
+    rt_err_trecho(c, base, RT_TXT_DOIS, RT_TAM_DOIS)
+    rt_err_numero(c, base, 1, com_sinal)
+    rt_err_trecho(c, base, RT_TXT_E, RT_TAM_E)
+    rt_err_numero(c, base, 2, com_sinal)
+    rt_falha_fim(c, base)
+}
+
+// forja_falha_conversao_i / _u (v, alvo, arq, linha): locais 4 e 5 = ptr e byte do texto de alvo
+proc rt_corpo_conversao(c: ^[dynamic]u8, base: u32, com_sinal: bool) {
+    rt_locais_um(c, 2, pefmt.WASM_I32)
+    rt_falha_cabeca(c, base, 2, 3)
+    rt_err_trecho(c, base, RT_TXT_CAUSA, RT_TAM_CAUSA)
+    rt_err_trecho(c, base, RT_TXT_CONV, RT_TAM_CONV)
+    rt_err_numero(c, base, 0, com_sinal)
+    rt_err_trecho(c, base, RT_TXT_PARA, RT_TAM_PARA)
+    rt_texto_bruto(c, base, 1, 4)
+    rt_err_trecho(c, base, RT_TXT_FORA, RT_TAM_FORA)
+    rt_falha_fim(c, base)
+}
+
+// forja_falha_indice (i, n, arq, linha): R0006, causa "indice i fora de 0..<n" (i e n i64 com sinal, sem locais extras)
+proc rt_corpo_indice(c: ^[dynamic]u8, base: u32) {
+    rt_sem_locais(c)
+    rt_err_trecho(c, base, RT_TXT_PREF6, RT_TAM_PREF6)
+    rt_falha_cabeca_resto(c, base, 2, 3)
+    rt_err_trecho(c, base, RT_TXT_CAUSA, RT_TAM_CAUSA)
+    rt_err_trecho(c, base, RT_TXT_INDICE, RT_TAM_INDICE)
+    rt_err_numero(c, base, 0, true)
+    rt_err_trecho(c, base, RT_TXT_FORA_DE, RT_TAM_FORA_DE)
+    rt_err_numero(c, base, 1, true)
+    rt_falha_fim(c, base)
+}
+
+// forja_falha_nulo (oque, arq, linha): R0005, causa "<oque>: ponteiro nulo" (locais 3 e 4 = ptr e byte de oque)
+proc rt_corpo_nulo(c: ^[dynamic]u8, base: u32) {
+    rt_locais_um(c, 2, pefmt.WASM_I32)
+    rt_err_trecho(c, base, RT_TXT_PREF5, RT_TAM_PREF5)
+    rt_falha_cabeca_resto(c, base, 1, 2)
+    rt_err_trecho(c, base, RT_TXT_CAUSA, RT_TAM_CAUSA)
+    rt_texto_bruto(c, base, 0, 3)
+    rt_err_trecho(c, base, RT_TXT_PONTEIRO, RT_TAM_PONTEIRO)
+    rt_falha_fim(c, base)
+}
+
+// forja_falha_fatia (lo, hi, excl, n, arq, linha): R0006, causa "fatia lo..<hi fora de 0..=n" (ou ..= com excl 0); lo, hi, n com sinal
+proc rt_corpo_fatia(c: ^[dynamic]u8, base: u32) {
+    rt_sem_locais(c)
+    rt_err_trecho(c, base, RT_TXT_PREF6, RT_TAM_PREF6)
+    rt_falha_cabeca_resto(c, base, 4, 5)
+    rt_err_trecho(c, base, RT_TXT_CAUSA, RT_TAM_CAUSA)
+    rt_err_trecho(c, base, RT_TXT_FATIA, RT_TAM_FATIA)
+    rt_err_numero(c, base, 0, true)
+    rt_local_get(c, 2)
+    append(c, item = RT_OP_I32_WRAP_I64)
+    append(c, item = RT_OP_IF)
+    append(c, item = RT_BLOCO_VAZIO)
+    rt_err_trecho(c, base, RT_TXT_EXCL, RT_TAM_FAIXA)
+    append(c, item = RT_OP_ELSE)
+    rt_err_trecho(c, base, RT_TXT_INCL, RT_TAM_FAIXA)
+    append(c, item = RT_OP_END)
+    rt_err_numero(c, base, 1, true)
+    rt_err_trecho(c, base, RT_TXT_FATIA_FORA, RT_TAM_FATIA_FORA)
+    rt_err_numero(c, base, 3, true)
+    rt_falha_fim(c, base)
+}
+
+// forja_os_write_stdout (ptr, n): os.write_stdout(bytes) da std; escreve o bloco em fd 1 pelo rt_escrever (k = 0)
+proc rt_corpo_write_stdout(c: ^[dynamic]u8, base: u32) {
+    rt_sem_locais(c)
+    rt_local_get(c, 0)
+    append(c, item = RT_OP_I32_WRAP_I64)
+    rt_local_get(c, 1)
+    append(c, item = RT_OP_I32_WRAP_I64)
+    rt_chamar(c, base + RT_IDX_ESCREVER)
+}
+
+// Locais e instrucoes da funcao k (sem o 0x0B final)
+proc rt_corpo_funcao(c: ^[dynamic]u8, k: u32, fd_write: u32, base: u32) {
+    if k == 0 {
+        rt_corpo_escrever(c, fd_write, RT_FD_SAIDA)
+    } else if k == 1 {
+        rt_corpo_print_texto(c, base)
+    } else if k == 2 {
+        rt_corpo_print_i32(c, base)
+    } else if k == 3 {
+        rt_corpo_digitos(c, base, true)
+    } else if k == 4 {
+        rt_corpo_digitos(c, base, false)
+    } else if k == 5 {
+        rt_corpo_print_bool(c, base)
+    } else if k == 6 {
+        rt_corpo_escrever(c, fd_write, RT_FD_ERRO)
+    } else if k == 7 {
+        rt_corpo_texto_json(c, base)
+    } else if k == 8 {
+        rt_corpo_err_digitos(c, base, true)
+    } else if k == 9 {
+        rt_corpo_err_digitos(c, base, false)
+    } else if k == 10 {
+        rt_corpo_estouro(c, base, true)
+    } else if k == 11 {
+        rt_corpo_estouro(c, base, false)
+    } else if k == 12 {
+        rt_corpo_conversao(c, base, true)
+    } else if k == 13 {
+        rt_corpo_conversao(c, base, false)
+    } else if k == 14 {
+        rt_corpo_indice(c, base)
+    } else if k == 15 {
+        rt_corpo_nulo(c, base)
+    } else if k == 16 {
+        rt_corpo_fatia(c, base)
+    } else if k == 17 {
+        rt_corpo_write_stdout(c, base)
+    } else {
+        panic("wasm_rt: funcao fora do contrato (k >= WASM_RT_QTD)")
+    }
+}
+
+// Tipo da funcao k: (i32, i32) em k = 0, 6; (i64, i64, i64, i64, i32) em 10, 11; (i64, i64, i64, i32) em 12, 13, 14;
+// (i64, i64, i32) em 15; i64 em k = 1, 3, 4, 7, 8, 9; i32 em 2, 5; sem retorno
+proc rt_tipo_funcao(m: ^pefmt.WasmModulo, k: u32) -> u32 {
+    var sem_valor: [1]u8 = {0x00}
+    var i32_dois: [2]u8 = {pefmt.WASM_I32, pefmt.WASM_I32}
+    var i32_um: [1]u8 = {pefmt.WASM_I32}
+    var i64_um: [1]u8 = {pefmt.WASM_I64}
+    var i64_dois: [2]u8 = {pefmt.WASM_I64, pefmt.WASM_I64}
+    var i64_dois_i32: [3]u8 = {pefmt.WASM_I64, pefmt.WASM_I64, pefmt.WASM_I32}
+    var i64_tres_i32: [4]u8 = {pefmt.WASM_I64, pefmt.WASM_I64, pefmt.WASM_I64, pefmt.WASM_I32}
+    var i64_quatro_i32: [5]u8 = {pefmt.WASM_I64, pefmt.WASM_I64, pefmt.WASM_I64, pefmt.WASM_I64, pefmt.WASM_I32}
+    var i64_cinco_i32: [6]u8 = {pefmt.WASM_I64, pefmt.WASM_I64, pefmt.WASM_I64, pefmt.WASM_I64, pefmt.WASM_I64, pefmt.WASM_I32}
+    if k == 0 or k == 6 {
+        return pefmt.wasm_tipo(m, i32_dois[..], sem_valor[0..<0])
+    }
+    if k == 10 or k == 11 {
+        return pefmt.wasm_tipo(m, i64_quatro_i32[..], sem_valor[0..<0])
+    }
+    if k == 12 or k == 13 or k == 14 {
+        return pefmt.wasm_tipo(m, i64_tres_i32[..], sem_valor[0..<0])
+    }
+    if k == 16 {
+        return pefmt.wasm_tipo(m, i64_cinco_i32[..], sem_valor[0..<0])
+    }
+    if k == 17 {
+        return pefmt.wasm_tipo(m, i64_dois[..], sem_valor[0..<0])
+    }
+    if k == 15 {
+        return pefmt.wasm_tipo(m, i64_dois_i32[..], sem_valor[0..<0])
+    }
+    if wasm_rt_param_i64(k) or k == 7 or k == 8 or k == 9 {
+        return pefmt.wasm_tipo(m, i64_um[..], sem_valor[0..<0])
+    }
+    return pefmt.wasm_tipo(m, i32_um[..], sem_valor[0..<0])
+}
+
+// Textos constantes das falhas, na ordem dos RT_TXT_* (o segmento comeca em RT_TXT_PREF; os de 207 em diante sao das falhas 14 e 15)
+proc rt_textos_erro(b: ^[dynamic]u8) {
+    append(b, item = "{\"codigo\": \"R0002\", \"tipo\": \"runtime\", \"arquivo\": \"")
+    append(b, item = "\", \"linha\": ")
+    append(b, item = ", \"causa\": \"")
+    append(b, item = "estouro de inteiro em ")
+    append(b, item = ": ")
+    append(b, item = " e ")
+    append(b, item = "conversao 'as' de ")
+    append(b, item = " para ")
+    append(b, item = " fora da faixa")
+    append(b, item = "\"}\n")
+    append(b, item = "{\"codigo\": \"R0006\", \"tipo\": \"runtime\", \"arquivo\": \"")
+    append(b, item = "{\"codigo\": \"R0005\", \"tipo\": \"runtime\", \"arquivo\": \"")
+    append(b, item = "indice ")
+    append(b, item = " fora de 0..<")
+    append(b, item = ": ponteiro nulo")
+    append(b, item = "fatia ")
+    append(b, item = "..<")
+    append(b, item = "..=")
+    append(b, item = " fora de 0..=")
+}
+
+// Monta e registra a funcao k; corpo = locais + instrucoes + 0x0B
+proc rt_definir_funcao(m: ^pefmt.WasmModulo, k: u32, fd_write: u32, base: u32) {
+    var corpo = make([dynamic]u8, alloc = heap)
+    defer delete(corpo)
+    rt_corpo_funcao(&corpo, k, fd_write, base)
+    append(&corpo, item = RT_OP_END)
+    let tipo = rt_tipo_funcao(m, k)
+    _ = pefmt.wasm_funcao(m, tipo, wasm_rt_nome(k), corpo[..])
+}
+
+// Define as 16 funcoes do runtime, nesta ordem, e grava os textos das falhas no segmento de dados.
+// fd_write = indice do import wasi fd_write; base = indice wasm da funcao k = 0 (rt_escrever), que vem depois dos imports.
+pub proc wasm_rt_definir(m: ^pefmt.WasmModulo, fd_write: u32, base: u32) {
+    var textos = make([dynamic]u8, alloc = heap)
+    defer delete(textos)
+    rt_textos_erro(&textos)
+    pefmt.wasm_dados(m, RT_TXT_PREF, textos[..])
+    for k in (0 as u32)..<WASM_RT_QTD {
+        rt_definir_funcao(m, k, fd_write, base)
+    }
+}

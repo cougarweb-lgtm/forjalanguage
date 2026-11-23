@@ -1,0 +1,255 @@
+// semantic/dimensao.fj - porte de compiler/semantic/dimensao.c, compiler/semantic/dimensao.h
+// sha256 de semantic/dimensao.c: a89df30848b9a02a9ca2e94e1a4d7c2d0a22c7b3aba86c38556f5a1cee828ea7
+// sha256 de semantic/dimensao.h: 6ca46edc26300aa47c050f2c934aca257e8c15206153886e81259ca0fec7d17a
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "common"
+
+struct DimTermo {
+    base: u16
+    expoente: i16
+}
+
+struct DimItem {
+    inicio: u32
+    qtd: u32
+    nome: i32
+}
+
+struct DimTabela {
+    itens: [dynamic]DimItem
+    termos: [dynamic]DimTermo
+    rascunho: [dynamic]DimTermo
+    tabela: [dynamic]u32
+    cap: u32
+    qtd_bases: u32
+}
+
+struct Mescla {
+    a: ?[]DimTermo
+    b: ?[]DimTermo
+    na: u32
+    nb: u32
+    i: u32
+    j: u32
+    sinal: i32
+}
+
+const CAP_INICIAL: i32 = 64
+const DIM_ADIMENSIONAL: i32 = 0
+
+// C: semantic/dimensao.c:12
+// C2F-13: x fundido em n (len)
+proc hash_termos(x: ?[]DimTermo) -> u32 {
+    var h: u32 = 2166136261
+    for i in (0 as u32)..<(len((x or_else {})) as u32) {
+        h = wrapping_mul(h ~ ((x or_else {})[i].base as u32), 16777619)
+        h = wrapping_mul(h ~ (common.c2f_s2u_16((x or_else {})[i].expoente) as u32), 16777619)
+    }
+    return h
+}
+
+// C: semantic/dimensao.c:22
+// C2F-13: x fundido em n (len); o memcmp do C compara os 4 bytes de cada termo = os 2 campos
+proc termos_iguais(t: ^DimTabela, id: u32, x: ?[]DimTermo) -> bool {
+    let it: ^DimItem = &t.itens[id as u64]
+    let xs = x or_else {}
+    let n: u32 = len(xs) as u32
+    if it.qtd != n {
+        return false
+    }
+    for i in (0 as u32)..<n {
+        let guardado = t.termos[(it.inicio + i) as u64]
+        let novo = xs[i]
+        if (guardado.base != novo.base) or (guardado.expoente != novo.expoente) {
+            return false
+        }
+    }
+    return true
+}
+
+// C: semantic/dimensao.c:28
+// C2F-13: x fundido em n (len)
+proc acrescentar(t: ^DimTabela, x: ?[]DimTermo) -> u32 {
+    append(&t.itens, item = DimItem{})
+    let it: ^DimItem = &t.itens[len(t.itens) - 1]
+    it.inicio = (len(t.termos) as u64) as u32
+    it.qtd = len((x or_else {})) as u32
+    it.nome = -1
+    for i in (0 as u32)..<(len((x or_else {})) as u32) {
+        append(&t.termos, item = DimTermo{})
+        t.termos[len(t.termos) - 1] = (x or_else {})[i]
+    }
+    return ((len(t.itens) as u64) - 1) as u32
+}
+
+// C: semantic/dimensao.c:38
+// C2F-14/21: tabela de uint32_t calloc -> [dynamic]u32 de heap com cap zeros (o chamador e o dono)
+proc alocar_tabela(cap: u32) -> [dynamic]u32 {
+    return make([dynamic]u32, alloc = heap, len = cap as int)
+}
+
+// C: semantic/dimensao.c:45
+// C2F-14: em vez de alocar uma tabela nova e trocar, zera a mesma lista e a estende para o dobro (mesmo resultado: tabela de cap*2 zeros reinserida na mesma ordem)
+proc crescer(t: ^DimTabela) {
+    let cap: u32 = t.cap * 2
+    clear(&t.tabela)
+    resize(&t.tabela, cap as int)
+    for id in 0..<len(t.itens) {
+        let it: ^DimItem = &t.itens[id]
+        let ini: u32 = it.inicio
+        let fim: u32 = it.inicio + it.qtd
+        var i: u32 = hash_termos(t.termos[ini..<fim]) & (cap - 1)
+        while t.tabela[i] != 0 {
+            i = (i + 1) & (cap - 1)
+        }
+        t.tabela[i] = (id as u32) + 1
+    }
+    t.cap = cap
+}
+
+// C: semantic/dimensao.c:61
+// C2F-13: x fundido em n (len); x nao pode apontar para t.termos
+proc internar_termos(t: ^DimTabela, x: ?[]DimTermo) -> u32 {
+    let mascara: u32 = t.cap - 1
+    var i: u32 = hash_termos(x) & mascara
+    while t.tabela[i] != 0 {
+        if termos_iguais(t, t.tabela[i] - 1, x) {
+            return t.tabela[i] - 1
+        }
+        i = (i + 1) & mascara
+    }
+    let novo: u32 = acrescentar(t, x)
+    t.tabela[i] = novo + 1
+    if ((len(t.itens) as u64) * 2) > (t.cap as u64) {
+        crescer(t)
+    }
+    return novo
+}
+
+// C: semantic/dimensao.c:74
+proc dim_iniciar(t: ^DimTabela) {
+    t.itens = make([dynamic]DimItem, alloc = heap)
+    t.termos = make([dynamic]DimTermo, alloc = heap)
+    t.rascunho = make([dynamic]DimTermo, alloc = heap)
+    t.cap = CAP_INICIAL as u32
+    t.tabela = alocar_tabela(t.cap)
+    t.qtd_bases = 0
+    _ = internar_termos(t, none)
+}
+
+// C: semantic/dimensao.c:85
+proc dim_nova_base(t: ^DimTabela, nome: i32) -> u32 {
+    let antes_1: u32 = t.qtd_bases
+    t.qtd_bases += 1
+    var termo: [1]DimTermo = {DimTermo{base = antes_1 as u16, expoente = 1}}
+    let d: u32 = internar_termos(t, termo[..])
+    dim_nomear(t, d, nome)
+    return d
+}
+
+// C: semantic/dimensao.c:96
+proc mesclar_proximo(t: ^DimTabela, m: ^Mescla) {
+    var r: DimTermo = DimTermo{}
+    let tem_a: bool = m.i < m.na
+    let tem_b: bool = m.j < m.nb
+    if (common.c2f_b2i32(tem_a) != 0) and ((not tem_b) or (((m.a or_else {})[m.i].base as i32) < ((m.b or_else {})[m.j].base as i32))) {
+        let antes_1: u32 = m.i
+        m.i += 1
+        r = (m.a or_else {})[antes_1]
+    } else if (common.c2f_b2i32(tem_b) != 0) and ((not tem_a) or (((m.b or_else {})[m.j].base as i32) < ((m.a or_else {})[m.i].base as i32))) {
+        let antes_2: u32 = m.j
+        m.j += 1
+        r = (m.b or_else {})[antes_2]
+        r.expoente = common.c2f_trunc_i16(common.c2f_s2u_64(((r.expoente as i32) * m.sinal) as i64))
+    } else {
+        let antes_3: u32 = m.i
+        m.i += 1
+        r = (m.a or_else {})[antes_3]
+        let antes_4: u32 = m.j
+        m.j += 1
+        r.expoente = ((r.expoente as i32) + (m.sinal * ((m.b or_else {})[antes_4].expoente as i32))) as i16
+    }
+    if r.expoente != 0 {
+        append(&t.rascunho, item = DimTermo{})
+        t.rascunho[len(t.rascunho) - 1] = r
+    }
+}
+
+// C: semantic/dimensao.c:112
+proc dim_combinar(t: ^DimTabela, a: u32, b: u32, sinal: i32) -> u32 {
+    let ia: ^DimItem = &t.itens[a as u64]
+    let ib: ^DimItem = &t.itens[b as u64]
+    let a_ini: u32 = ia.inicio
+    let a_fim: u32 = ia.inicio + ia.qtd
+    let b_ini: u32 = ib.inicio
+    let b_fim: u32 = ib.inicio + ib.qtd
+    var m: Mescla = Mescla{a = t.termos[a_ini..<a_fim], b = t.termos[b_ini..<b_fim], na = ia.qtd, nb = ib.qtd, i = 0, j = 0, sinal = sinal}
+    clear(&t.rascunho)
+    while (m.i < m.na) or (m.j < m.nb) {
+        mesclar_proximo(t, &m)
+    }
+    return internar_termos(t, t.rascunho[..])
+}
+
+// C: semantic/dimensao.c:121
+proc dim_nomear(t: ^DimTabela, d: u32, nome: i32) {
+    let it: ^DimItem = &t.itens[d as u64]
+    if (it.nome < 0) and (d != (DIM_ADIMENSIONAL as u32)) {
+        it.nome = nome
+    }
+}
+
+// C: semantic/dimensao.c:127
+proc dim_nome(t: ^DimTabela, d: u32) -> i32 {
+    return t.itens[d as u64].nome
+}
+
+// C: semantic/dimensao.c:132
+proc dim_declarada(t: ^DimTabela, d: u32) -> bool {
+    return (d == (DIM_ADIMENSIONAL as u32)) or (dim_nome(t, d) >= 0)
+}
+
+// C: semantic/dimensao.c:137
+proc dim_liberar(t: ^DimTabela) {
+    delete(t.tabela)
+    delete(t.itens)
+    delete(t.termos)
+    delete(t.rascunho)
+}
+
+// Do TestaDimensao do teste_common.c (os 200 dim_nova_base forcam o crescer)
+test "dimensao" {
+    var t: DimTabela = DimTabela{}
+    dim_iniciar(&t)
+    let metros: u32 = dim_nova_base(&t, 10)
+    let segundos: u32 = dim_nova_base(&t, 11)
+    let velocidade: u32 = dim_combinar(&t, metros, segundos, -1)
+    expect(metros != segundos and metros != (DIM_ADIMENSIONAL as u32) and not dim_declarada(&t, velocidade))
+    dim_nomear(&t, velocidade, 12)
+    expect(dim_declarada(&t, velocidade) and dim_nome(&t, velocidade) == 12)
+    expect(dim_combinar(&t, velocidade, segundos, 1) == metros)
+    expect(dim_combinar(&t, metros, metros, -1) == (DIM_ADIMENSIONAL as u32))
+    expect(dim_combinar(&t, metros, segundos, -1) == velocidade)
+    for i in 0..<200 {
+        _ = dim_nova_base(&t, 20)
+    }
+    expect(t.cap == 512 and len(t.itens) == 204)
+    expect(dim_combinar(&t, velocidade, segundos, 1) == metros and dim_declarada(&t, DIM_ADIMENSIONAL as u32))
+    dim_liberar(&t)
+}
+
+// Valores do hash FNV de dimensao calculados a partir do C (HashTermos)
+test "dimensao: hash de 5 chaves igual ao C" {
+    var vazio_1: [1]DimTermo = {DimTermo{base = 0, expoente = 0}}
+    var um: [1]DimTermo = {DimTermo{base = 10, expoente = 1}}
+    var dois: [2]DimTermo = {DimTermo{base = 10, expoente = 1}, DimTermo{base = 11, expoente = -1}}
+    var tres: [1]DimTermo = {DimTermo{base = 3, expoente = 2}}
+    var quatro: [3]DimTermo = {DimTermo{base = 1, expoente = -32768}, DimTermo{base = 2, expoente = 5}, DimTermo{base = 9, expoente = 0}}
+    expect(hash_termos(vazio_1[0..<0]) == 2166136261)
+    expect(hash_termos(um[..]) == 2358206036)
+    expect(hash_termos(dois[..]) == 3042182006)
+    expect(hash_termos(tres[..]) == 897126160)
+    expect(hash_termos(quatro[..]) == 200173340)
+}

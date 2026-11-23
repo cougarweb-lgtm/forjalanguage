@@ -1,0 +1,67 @@
+// nativo/a64/a64_isel_mem.fj - END_SLOT, CARREGA e GRAVA escalares inteiros (so-slots, contrato_a64 §4)
+// Versao: 0.2.0
+// Changelog: 0.2.0 - A1.3(iii): CARREGA/GRAVA de real por bits (F32 = ldr/str w, F64 = ldr/str x; a64_classe_de_mem).
+//            0.1.0 - A1.3(i): END_SLOT = add dst,x29,#off (off grande: mov em x16); CARREGA/GRAVA por classe (ldrb/ldrh/ldr w/ldr x e os str)
+//                    com a64_acesso (imm12 escalado, LDUR ou x16). Valor imediato gravado passa por x10 (sem otimizar o zero).
+
+import "nativo/bir"
+
+// LDR por classe: I8 ldrb | I16 ldrh | I32 ldr w | I64 ldr x
+const A64_FORMA_CARREGA: [4]u32 = {55, 59, 63, 66}
+// STR por classe: I8 strb | I16 strh | I32 str w | I64 str x
+const A64_FORMA_GRAVA: [4]u32 = {54, 58, 62, 65}
+
+// dst = x29 + offset do slot agregado
+proc a64_isel_end_slot(c: ^A64Ctx, ins: ^bir.BirInstr) -> bool {
+    let off = c.slot_off[ins.a.imed as u32]
+    if off <= A64_MAX_IMM12 {
+        a64_op(c, A64F_ADD_IMM, true, A64Ops{rd = R_T0, rn = R_FP, imm = off})
+    } else {
+        a64_const(c, R_T0, off as u64, true)
+        a64_op(c, A64F_ADD_REG, true, A64Ops{rd = R_T0, rn = R_FP, rm = R_T0})
+    }
+    a64_resultado(c, ins, R_T0)
+    return true
+}
+
+// classe de memoria de um real: f32 move 32 bits (ldr w) e f64 move 64 (ldr x); os bits sao os mesmos do S/D
+proc a64_classe_de_mem(classe: u8) -> i32 {
+    let k = classe as i32
+    if k == bir.BC_F32 {
+        return bir.BC_I32
+    }
+    if k == bir.BC_F64 {
+        return bir.BC_I64
+    }
+    return k
+}
+
+// dst = *(base + desloc), pela classe
+proc a64_isel_carrega(c: ^A64Ctx, ins: ^bir.BirInstr) -> bool {
+    if not a64_operando(c, R_T0, &ins.a) {
+        return false
+    }
+    a64_acesso(c, A64_FORMA_CARREGA[a64_classe_de_mem(ins.classe) - bir.BC_I8], R_T1, R_T0, ins.desloc as i64)
+    a64_resultado(c, ins, R_T1)
+    return true
+}
+
+// *(base + desloc) = b, pela classe de b
+proc a64_isel_grava(c: ^A64Ctx, ins: ^bir.BirInstr) -> bool {
+    if (not a64_operando(c, R_T0, &ins.a)) or (not a64_operando(c, R_T1, &ins.b)) {
+        return false
+    }
+    a64_acesso(c, A64_FORMA_GRAVA[a64_classe_de_mem(ins.classe) - bir.BC_I8], R_T1, R_T0, ins.desloc as i64)
+    return true
+}
+
+proc a64_selecionar_memoria(c: ^A64Ctx, ins: ^bir.BirInstr) -> bool {
+    let op = ins.op as i32
+    if op == bir.BIR_END_SLOT {
+        return a64_isel_end_slot(c, ins)
+    }
+    if op == bir.BIR_CARREGA {
+        return a64_isel_carrega(c, ins)
+    }
+    return a64_isel_grava(c, ins)
+}

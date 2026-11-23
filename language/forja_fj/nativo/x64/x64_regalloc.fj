@@ -1,0 +1,422 @@
+// nativo/x64/x64_regalloc.fj - porte de compiler/nativo/x64/x64_regalloc.c, compiler/nativo/x64/x64_regalloc.h
+// sha256 de nativo/x64/x64_regalloc.c: 7e44bbdd5ebae052697707c75cf20b71d3e4b50e7c55b687b6180058299a1852
+// sha256 de nativo/x64/x64_regalloc.h: 363453438dc6095f5ba24cb1db412657e39c3362b27b76daf73b1e982dceb13e
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.2.0
+// Changelog: 0.2.0 - G3 V3 L5: corpo real dos 9 stubs (alocador por intervalos; reg_vreg vive na arena do programa; rastro lê FORJA_ALOC_RASTRO a cada despejo).
+
+import "common"
+import "nativo/bir"
+import "std:os"
+
+struct Banco {
+    todos: ?[]u8
+    volateis: ?[]u8
+    salvos: ?[]u8
+    n_todos: u32
+    n_volateis: u32
+    n_salvos: u32
+    mascara_volatil: u32
+    proibidos_sysv: u32
+    real: bool
+}
+
+struct EntradaScan {
+    inicio: u32
+    vreg: u32
+}
+
+struct Scan {
+    intervalos: ?^Intervalos
+    banco: ?^Banco
+    proibidos: u32
+    dono: [16]u32
+    mascara: u32
+    reg_vreg: []u8 // C2F-INDECIDIVEL
+    nome_funcao: str // C: gRastroFuncao (global do C) vira campo do scan
+}
+
+struct Candidatos {
+    regs: ?[]u8
+    n: u32
+    so_salvos_usados: bool
+}
+
+const MIN_PESO_SALVO: u32 = 4
+const SEM_DONO: u32 = 4294967295
+const MAX_REGS_BANCO: u32 = 16
+const ORC_DESPEJO_K: u32 = 16
+const ORC_DESPEJO_NPOS_MAX: u32 = 262144
+const MASCARA_GPR_VOLATIL: u32 = 1792
+const MASCARA_GPR_SYSV: u32 = 192
+const MASCARA_XMM_VOLATIL: u32 = 60
+const MASCARA_XMM_SYSV: u32 = 65472
+const REGS_VOLATEIS: [3]u8 = {8, 9, 10}
+const REGS_SALVOS: [7]u8 = {3, 12, 13, 14, 15, 6, 7}
+const REGS_TODOS: [10]u8 = {8, 9, 10, 3, 12, 13, 14, 15, 6, 7}
+const XMM_VOLATEIS: [4]u8 = {2, 3, 4, 5}
+const XMM_SALVOS: [10]u8 = {6, 7, 8, 9, 10, 11, 12, 13, 14, 15}
+const XMM_TODOS: [14]u8 = {2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15}
+// C2F-70 global mutavel ligado (int) -> parametro/struct de estado (plano C2F-70)
+
+// C: nativo/x64/x64_regalloc.c:75
+proc eh_volatil(s: ^Scan, reg: u8) -> bool {
+    return (((s.banco as ^Banco).mascara_volatil >> (common.c2f_s2u_32((reg as i32)) & 31)) & 1) != 0
+}
+
+// C: nativo/x64/x64_regalloc.c:80
+proc registrador_serve(s: ^Scan, iv: ^IntervaloVreg, reg: u8) -> bool {
+    if eh_volatil(s, reg) {
+        return not iv.cruza_chamada
+    }
+    if ((s.proibidos >> (common.c2f_s2u_32((reg as i32)) & 31)) & 1) != 0 {
+        return false
+    }
+    return (((s.mascara >> (common.c2f_s2u_32((reg as i32)) & 31)) & 1) != 0) or (iv.peso >= (MIN_PESO_SALVO as u64))
+}
+
+// C: nativo/x64/x64_regalloc.c:93
+proc procurar_livre(s: ^Scan, iv: ^IntervaloVreg, c: Candidatos) -> i32 {
+    var k: u32 = 0
+    while k < c.n {
+        let reg: u8 = (c.regs or_else {})[k]
+        if (s.dono[reg] != SEM_DONO) or (not registrador_serve(s, iv, reg)) {
+            k += 1
+            continue
+        }
+        if (not c.so_salvos_usados) or (((s.mascara >> (common.c2f_s2u_32((reg as i32)) & 31)) & 1) != 0) {
+            return reg as i32
+        }
+        k += 1
+    }
+    return -1
+}
+
+// C: nativo/x64/x64_regalloc.c:106
+proc escolher_livre(s: ^Scan, iv: ^IntervaloVreg) -> i32 {
+    let b: ^Banco = s.banco as ^Banco
+    var reg = procurar_livre(s, iv, Candidatos{regs = b.volateis, n = b.n_volateis, so_salvos_usados = false})
+    if reg < 0 {
+        reg = procurar_livre(s, iv, Candidatos{regs = b.salvos, n = b.n_salvos, so_salvos_usados = true})
+    }
+    if reg < 0 {
+        reg = procurar_livre(s, iv, Candidatos{regs = b.salvos, n = b.n_salvos, so_salvos_usados = false})
+    }
+    return reg
+}
+
+// C: nativo/x64/x64_regalloc.c:119
+proc escolher_vitima(s: ^Scan, atual: ^IntervaloVreg) -> i32 {
+    var escolhido: i32 = -1
+    var menor: u64 = atual.peso
+    var k: u32 = 0
+    while k < (s.banco as ^Banco).n_todos {
+        let reg: u8 = ((s.banco as ^Banco).todos or_else {})[k]
+        let dono: u32 = s.dono[reg]
+        if ((dono == SEM_DONO) or (not registrador_serve(s, atual, reg))) or (((s.intervalos as ^Intervalos).iv or_else {})[dono].peso >= menor) {
+            k += 1
+            continue
+        }
+        menor = ((s.intervalos as ^Intervalos).iv or_else {})[dono].peso
+        escolhido = reg as i32
+        k += 1
+    }
+    return escolhido
+}
+
+// C: nativo/x64/x64_regalloc.c:138
+proc escolher_por_densidade(s: ^Scan, atual: ^IntervaloVreg) -> i32 {
+    let ivs: ?[]IntervaloVreg = (s.intervalos as ^Intervalos).iv
+    let comp_atual: u64 = ((atual.fim as u64) - (atual.inicio as u64)) + 1
+    var peso_vitima: u64 = 0
+    var comp_vitima: u64 = 1
+    var escolhido: i32 = -1
+    if (s.intervalos as ^Intervalos).npos > ORC_DESPEJO_NPOS_MAX {
+        return -1
+    }
+    var k: u32 = 0
+    while k < (s.banco as ^Banco).n_todos {
+        let reg: u8 = ((s.banco as ^Banco).todos or_else {})[k]
+        let dono: u32 = s.dono[reg]
+        var comp: u64 = 0
+        if (dono == SEM_DONO) or (not registrador_serve(s, atual, reg)) {
+            k += 1
+            continue
+        }
+        comp = (((ivs or_else {})[dono].fim as u64) - ((ivs or_else {})[dono].inicio as u64)) + 1
+        if (escolhido < 0) or (((ivs or_else {})[dono].peso * comp_vitima) < (peso_vitima * comp)) {
+            escolhido = reg as i32
+            peso_vitima = (ivs or_else {})[dono].peso
+            comp_vitima = comp
+        }
+        k += 1
+    }
+    if (escolhido < 0) or (((peso_vitima * (ORC_DESPEJO_K as u64)) * comp_atual) >= (atual.peso * comp_vitima)) {
+        return -1
+    }
+    return escolhido
+}
+
+// C: nativo/x64/x64_regalloc.c:166
+proc liberar_expirados(s: ^Scan, inicio: u32) {
+    var k: u32 = 0
+    while k < (s.banco as ^Banco).n_todos {
+        let reg: u8 = ((s.banco as ^Banco).todos or_else {})[k]
+        let dono: u32 = s.dono[reg]
+        if (dono != SEM_DONO) and (((s.intervalos as ^Intervalos).iv or_else {})[dono].fim < inicio) {
+            s.dono[reg] = SEM_DONO
+        }
+        k += 1
+    }
+}
+
+// C: nativo/x64/x64_regalloc.c:177
+proc entregar(s: ^Scan, vreg: u32, reg: u8) {
+    s.dono[reg] = vreg
+    s.reg_vreg[vreg] = reg
+    if not eh_volatil(s, reg) {
+        s.mascara = s.mascara | (1 << (common.c2f_s2u_32(reg as i32) & 31))
+    }
+}
+
+// C: nativo/x64/x64_regalloc.c:188
+// C2F-70: o cache estatico do getenv sai; o despejo le FORJA_ALOC_RASTRO quando chega aqui (so no caminho de despejo, valor do ambiente constante no processo)
+proc rastro_ligado() -> bool {
+    let valor: str = os.env("FORJA_ALOC_RASTRO") or_else ""
+    return valor == "1"
+}
+
+// C: nativo/x64/x64_regalloc.c:200
+proc rastrear_despejo(s: ^Scan, atual: u32, vitima: u32) {
+    let ivs: []IntervaloVreg = (s.intervalos as ^Intervalos).iv or_else {}
+    let vitima_iv: IntervaloVreg = ivs[vitima]
+    let atual_iv: IntervaloVreg = ivs[atual]
+    let comp_vitima: u32 = (vitima_iv.fim - vitima_iv.inicio) + 1
+    let comp_atual: u32 = (atual_iv.fim - atual_iv.inicio) + 1
+    let linha: str = format(f"aloc-rastro {s.nome_funcao} despejo: vitima=v{vitima} peso={vitima_iv.peso} comp={comp_vitima} def_laco={common.c2f_b2i32(vitima_iv.def_em_laco)} carregada={common.c2f_b2i32(vitima_iv.carregada)} | atual=v{atual} peso={atual_iv.peso} comp={comp_atual}\n", alloc = heap)
+    defer delete(linha)
+    let e = common.c2f_saida_stderr()
+    common.c2f_saida_formatar(e, linha)
+    _ = common.c2f_saida_fechar(e)
+}
+
+// C: nativo/x64/x64_regalloc.c:209
+proc alocar_um(s: ^Scan, vreg: u32) {
+    let iv: ^IntervaloVreg = &((s.intervalos as ^Intervalos).iv or_else {})[vreg]
+    var reg = escolher_livre(s, iv)
+    if reg < 0 {
+        reg = escolher_vitima(s, iv)
+        if reg < 0 {
+            reg = escolher_por_densidade(s, iv)
+            if (reg >= 0) and rastro_ligado() {
+                rastrear_despejo(s, vreg, s.dono[reg as u8])
+            }
+        }
+        if reg < 0 {
+            return
+        }
+        s.reg_vreg[s.dono[reg as u8]] = (bir.BIR_SEM_REG as u8)
+    }
+    entregar(s, vreg, reg as u8)
+}
+
+// Fatia de EntradaScan na arena (mesmo molde de arena_fatia_intervalo_vreg): a lista vive ate o fim do alocador.
+proc arena_fatia_entrada_scan(a: ^common.Arena, n: int) -> []EntradaScan {
+    var l = make([dynamic]EntradaScan, alloc = common.arena_mem(a), cap = n)
+    for i in 0..<n {
+        append(&l, item = EntradaScan{})
+    }
+    return l[..]
+}
+
+// C: nativo/x64/x64_regalloc.c:230
+// Ordem (inicio, id) por contagem sobre o inicio: estavel. Listas e contadores na arena do intervalo (liberada pelo chamador).
+proc ordenar_elegiveis(intervalos: ^Intervalos, real: bool, quantos: ^u32) -> []EntradaScan {
+    let arena: ^common.Arena = intervalos.arena as ^common.Arena
+    let ivs: []IntervaloVreg = intervalos.iv or_else {}
+    let posicao: []u32 = common.arena_fatia_u32(arena, (intervalos.npos + 2) as int)
+    var n: u32 = 0
+    for v in (0 as u32)..<intervalos.nvregs {
+        if ivs[v].elegivel and (ivs[v].real == real) {
+            posicao[ivs[v].inicio + 1] += 1
+            n += 1
+        }
+    }
+    for p in (1 as u32)..=(intervalos.npos + 1) {
+        posicao[p] += posicao[p - 1]
+    }
+    let lista: []EntradaScan = arena_fatia_entrada_scan(arena, n as int)
+    for v in (0 as u32)..<intervalos.nvregs {
+        if ivs[v].elegivel and (ivs[v].real == real) {
+            lista[posicao[ivs[v].inicio]] = EntradaScan{inicio = ivs[v].inicio, vreg = v}
+            posicao[ivs[v].inicio] += 1
+        }
+    }
+    quantos^ = n
+    return lista
+}
+
+// C: nativo/x64/x64_regalloc.c:256
+// C2F-70: o nome da funcao (para o rastro) entra como parametro; reg_vreg e a fatia da arena do programa.
+proc executar_banco(banco: ^Banco, intervalos: ^Intervalos, reg_vreg: []u8, nome_funcao: str) {
+    var s = Scan{intervalos = intervalos, banco = banco, reg_vreg = reg_vreg, nome_funcao = nome_funcao}
+    var n: u32 = 0
+    let ordem: []EntradaScan = ordenar_elegiveis(intervalos, banco.real, &n)
+    if intervalos.tem_sysv {
+        s.proibidos = banco.proibidos_sysv
+    }
+    var k: u32 = 0
+    while k < MAX_REGS_BANCO {
+        s.dono[k] = SEM_DONO
+        k += 1
+    }
+    k = 0
+    while k < n {
+        liberar_expirados(&s, ordem[k].inicio)
+        alocar_um(&s, ordem[k].vreg)
+        k += 1
+    }
+}
+
+// C: nativo/x64/x64_regalloc.c:274
+proc mascaras_dos_salvos(f: ^bir.BirFuncao) {
+    f.regs_salvos = 0
+    f.regs_salvos_xmm = 0
+    var v: u32 = 0
+    while v < f.nvregs {
+        let reg: u8 = (f.reg_vreg or_else {})[v]
+        let real: bool = bir.bir_classe_eh_xmm((f.classe_vreg or_else {})[v] as i32)
+        if reg == (bir.BIR_SEM_REG as u8) {
+            v += 1
+            continue
+        }
+        if (common.c2f_b2i32(real) != 0) and (((MASCARA_XMM_VOLATIL >> (common.c2f_s2u_32((reg as i32)) & 31)) & 1) == 0) {
+            f.regs_salvos_xmm = f.regs_salvos_xmm | (1 << (common.c2f_s2u_32((reg as i32)) & 31))
+        } else if (not real) and (((MASCARA_GPR_VOLATIL >> (common.c2f_s2u_32((reg as i32)) & 31)) & 1) == 0) {
+            f.regs_salvos = f.regs_salvos | (1 << (common.c2f_s2u_32((reg as i32)) & 31))
+        }
+        v += 1
+    }
+}
+
+// C: nativo/x64/x64_regalloc.c:291
+// C2F-INDECIDIVEL: reg_vreg
+proc algum_em_registrador(f: ^bir.BirFuncao, reg_vreg: []u8) -> bool {
+    for v in (0 as u32)..<f.nvregs {
+        if reg_vreg[v] != (bir.BIR_SEM_REG as u8) {
+            return true
+        }
+    }
+    return false
+}
+
+// C: nativo/x64/x64_regalloc.c:301
+proc executar_scan(programa: ^bir.BirPrograma, f: ^bir.BirFuncao, intervalos: ^Intervalos) -> ?[]u8 {
+    let nome: str = programa.simbolos[f.simbolo].nome or_else ""
+    let nregs: int = (f.nvregs + 1) as int
+    let reg_vreg: []u8 = common.arena_fatia_u8(&programa.arena, nregs)
+    var k: u32 = 0
+    while k <= f.nvregs {
+        reg_vreg[k] = (bir.BIR_SEM_REG as u8)
+        k += 1
+    }
+    // Bancos: tabelas C de x64_regalloc.c (BANCO_INTEIRO e BANCO_XMM), contagens = sizeof dos vetores.
+    // Slice de const nao e permitido (E0301): copia para var local, que vive so nesta funcao.
+    var todos_inteiro: [10]u8 = REGS_TODOS
+    var volateis_inteiro: [3]u8 = REGS_VOLATEIS
+    var salvos_inteiro: [7]u8 = REGS_SALVOS
+    var banco_inteiro = Banco{todos = todos_inteiro[..], volateis = volateis_inteiro[..], salvos = salvos_inteiro[..], n_todos = 10, n_volateis = 3, n_salvos = 7, mascara_volatil = MASCARA_GPR_VOLATIL, proibidos_sysv = MASCARA_GPR_SYSV, real = false}
+    executar_banco(&banco_inteiro, intervalos, reg_vreg, nome)
+    var todos_xmm: [14]u8 = XMM_TODOS
+    var volateis_xmm: [4]u8 = XMM_VOLATEIS
+    var salvos_xmm: [10]u8 = XMM_SALVOS
+    var banco_xmm = Banco{todos = todos_xmm[..], volateis = volateis_xmm[..], salvos = salvos_xmm[..], n_todos = 14, n_volateis = 4, n_salvos = 10, mascara_volatil = MASCARA_XMM_VOLATIL, proibidos_sysv = MASCARA_XMM_SYSV, real = true}
+    executar_banco(&banco_xmm, intervalos, reg_vreg, nome)
+    if not algum_em_registrador(f, reg_vreg) {
+        return none
+    }
+    return reg_vreg
+}
+
+// C: nativo/x64/x64_regalloc.c:317
+// A fatia reg_vreg sai da arena do programa (nao da arena do intervalo, liberada ao fim): BirLiberar solta a arena inteira.
+pub proc x64_alocador_aplicar(programa: ^bir.BirPrograma, funcao: ^bir.BirFuncao) {
+    funcao.reg_vreg = none
+    funcao.regs_salvos = 0
+    funcao.regs_salvos_xmm = 0
+    if (funcao.nblocos == 0) or (funcao.nvregs == 0) {
+        return
+    }
+    var analises = bir.AnalisesBir{}
+    var arena = common.Arena{}
+    var intervalos = Intervalos{arena = &arena}
+    bir.analises_calcular(funcao, &analises)
+    regalloc_intervalos(programa, funcao, &analises, &intervalos)
+    funcao.reg_vreg = executar_scan(programa, funcao, &intervalos)
+    if funcao.reg_vreg != none {
+        mascaras_dos_salvos(funcao)
+    }
+    bir.analises_liberar(&analises)
+    common.arena_liberar(&arena)
+}
+
+test "x64_regalloc_ordenar_elegiveis_inicio_depois_id" {
+    var arena = common.Arena{}
+    let iv_src = arena_fatia_intervalo_vreg(&arena, 4)
+    iv_src[0] = IntervaloVreg{inicio = 2, fim = 2, elegivel = true, real = false}
+    iv_src[1] = IntervaloVreg{inicio = 1, fim = 1, elegivel = true, real = false}
+    iv_src[2] = IntervaloVreg{inicio = 1, fim = 1, elegivel = true, real = false}
+    iv_src[3] = IntervaloVreg{inicio = 0, fim = 0, elegivel = true, real = true}
+    var intervalos = Intervalos{arena = &arena, nvregs = 4, npos = 3, iv = iv_src}
+    var n: u32 = 0
+    let ord = ordenar_elegiveis(&intervalos, false, &n)
+    expect(n == 3)
+    expect(ord[0].vreg == 1)
+    expect(ord[1].vreg == 2)
+    expect(ord[2].vreg == 0)
+    var nx: u32 = 0
+    let ordx = ordenar_elegiveis(&intervalos, true, &nx)
+    expect(nx == 1)
+    expect(ordx[0].vreg == 3)
+    common.arena_liberar(&arena)
+}
+
+test "x64_regalloc_escolher_livre_volateis_e_salvos" {
+    var arena = common.Arena{}
+    let iv_src = arena_fatia_intervalo_vreg(&arena, 1)
+    iv_src[0] = IntervaloVreg{inicio = 0, fim = 5, peso = 10, elegivel = true}
+    var intervalos = Intervalos{arena = &arena, nvregs = 1, npos = 5, iv = iv_src}
+    var todos: [10]u8 = REGS_TODOS
+    var volateis: [3]u8 = REGS_VOLATEIS
+    var salvos: [7]u8 = REGS_SALVOS
+    var banco = Banco{todos = todos[..], volateis = volateis[..], salvos = salvos[..], n_todos = 10, n_volateis = 3, n_salvos = 7, mascara_volatil = MASCARA_GPR_VOLATIL, proibidos_sysv = MASCARA_GPR_SYSV, real = false}
+    var reg_vreg: [1]u8 = {255}
+    var s = Scan{intervalos = &intervalos, banco = &banco, reg_vreg = reg_vreg[..]}
+    for k in (0 as u32)..<MAX_REGS_BANCO {
+        s.dono[k] = SEM_DONO
+    }
+    let iv_0: ^IntervaloVreg = &iv_src[0]
+    expect(escolher_livre(&s, iv_0) == 8)
+    iv_src[0].cruza_chamada = true
+    expect(escolher_livre(&s, iv_0) == 3)
+    iv_src[0].peso = 1
+    expect(escolher_livre(&s, iv_0) == -1)
+    iv_src[0].peso = 10
+    entregar(&s, 0, 3)
+    expect(s.mascara == 8)
+    expect(s.reg_vreg[0] == 3)
+    expect(s.dono[3] == 0)
+    common.arena_liberar(&arena)
+}
+
+test "x64_regalloc_mascaras_dos_salvos" {
+    var f = bir.BirFuncao{}
+    f.nvregs = 2
+    var classes: [2]u8 = {bir.BC_I64 as u8, bir.BC_F64 as u8}
+    var regs: [2]u8 = {3, 6}
+    f.classe_vreg = classes[..]
+    f.reg_vreg = regs[..]
+    mascaras_dos_salvos(&f)
+    expect(f.regs_salvos == 8)
+    expect(f.regs_salvos_xmm == 64)
+}

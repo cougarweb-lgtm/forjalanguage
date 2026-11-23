@@ -1,0 +1,228 @@
+// nativo/bir/analises.fj - porte de compiler/nativo/bir/analises.c, compiler/nativo/bir/analises.h
+// sha256 de nativo/bir/analises.c: 850dc05bd67740656a0ee6dfbfbf625db80caa37b055c5a9592040bd4a9e9330
+// sha256 de nativo/bir/analises.h: 185c3615d30d81a57aa8a266493e182062f0221dbadcde95d5fd8141e313e4be
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "common"
+
+pub struct LacoBir {
+    cabecalho: u32
+    ncorpo: u32
+    corpo: ?[]u32
+}
+
+pub struct ConjuntoVivo {
+    n: u32
+    v: ?[]u32
+}
+
+pub struct AnalisesBir {
+    arena: common.Arena
+    nblocos: u32
+    nvregs: u32
+    suc_ini: ?[]u32
+    suc: ?[]u32
+    pred_ini: ?[]u32
+    pred: ?[]u32
+    rpo: ?[]u32
+    nrpo: u32
+    pos_rpo: ?[]u32
+    idom: ?[]u32
+    dom_pre: ?[]u32
+    dom_tam: ?[]u32
+    lacos: ?[]LacoBir
+    nlacos: u32
+    prof_laco: ?[]u32
+    vivo_entra: ?[]ConjuntoVivo
+    vivo_sai: ?[]ConjuntoVivo
+}
+
+// C2F-82 macro de funcao FALHA_ANALISE ( causa , n , ... ) ( snprintf ( ( causa ) , ( n ) , __VA_ARGS__ ) , false )
+
+pub proc arena_fatia_conjunto_vivo(a: ^common.Arena, n: int) -> []ConjuntoVivo {
+    var l = make([dynamic]ConjuntoVivo, alloc = common.arena_mem(a), cap = n)
+    for i in 0..<n {
+        append(&l, item = ConjuntoVivo{})
+    }
+    return l[..]
+}
+
+pub proc arena_fatia_laco_bir(a: ^common.Arena, n: int) -> []LacoBir {
+    var l = make([dynamic]LacoBir, alloc = common.arena_mem(a), cap = n)
+    for i in 0..<n {
+        append(&l, item = LacoBir{})
+    }
+    return l[..]
+}
+
+// C: nativo/bir/analises.c:13
+// C2F-13: ponteiro de ArenaAlocar vira fatia; o C aloca n+1 zerados
+proc analises_vetor32(a: ^AnalisesBir, n: u64) -> []u32 {
+    return common.arena_fatia_u32(&a.arena, (n + 1) as int)
+}
+
+// C: nativo/bir/analises.c:18
+proc analises_vetor64(a: ^AnalisesBir, n: u64) -> []u64 {
+    return common.arena_fatia_u64(&a.arena, (n + 1) as int)
+}
+
+// C: nativo/bir/analises.c:23
+pub proc analises_calcular_lacos_apenas(funcao: ^BirFuncao, saida: ^AnalisesBir) {
+    saida^ = AnalisesBir{}
+    saida.nblocos = funcao.nblocos
+    saida.nvregs = funcao.nvregs
+    analises_montar_arestas(saida, funcao)
+    analises_calcular_rpo(saida)
+    analises_calcular_idom(saida)
+    analises_calcular_lacos(saida)
+}
+
+// C: nativo/bir/analises.c:34
+pub proc analises_completar_vivo(funcao: ^BirFuncao, saida: ^AnalisesBir) {
+    analises_calcular_vivo(saida, funcao)
+}
+
+// C: nativo/bir/analises.c:39
+pub proc analises_calcular(funcao: ^BirFuncao, saida: ^AnalisesBir) {
+    analises_calcular_lacos_apenas(funcao, saida)
+    analises_completar_vivo(funcao, saida)
+}
+
+// C: nativo/bir/analises.c:45
+pub proc analises_liberar(a: ^AnalisesBir) {
+    common.arena_liberar(&a.arena)
+    a^ = AnalisesBir{}
+}
+
+// FALHA_ANALISE do C: snprintf(causa, n, msg) (copia truncada em len(causa)-1 e NUL no fim) e devolve false.
+proc falha_analise(causa: []u8, msg: []u8) -> bool {
+    if len(causa) == 0 {
+        return false
+    }
+    var k: u32 = 0
+    while (k < (len(msg) as u32)) and (k + 1 < (len(causa) as u32)) {
+        causa[k] = msg[k]
+        k += 1
+    }
+    causa[k] = 0
+    return false
+}
+
+// C: nativo/bir/analises.c:54
+proc conferir_rpo(a: ^AnalisesBir, causa: []u8, n: u64) -> bool {
+    let fila: []u32 = analises_vetor32(a, a.nblocos as u64)
+    let visto: []u8 = common.arena_fatia_u8(&a.arena, (a.nblocos + 1) as int)
+    var inicio: u32 = 0
+    var fim: u32 = 0
+    if a.nblocos == 0 {
+        return true
+    }
+    visto[0] = 1
+    fila[fim] = 0
+    fim += 1
+    while inicio < fim {
+        let b: u32 = fila[inicio]
+        inicio += 1
+        var k: u32 = (a.suc_ini or_else {})[b]
+        while k < (a.suc_ini or_else {})[b + 1] {
+            let s: u32 = (a.suc or_else {})[k]
+            if visto[s] == 0 {
+                visto[s] = 1
+                fila[fim] = s
+                fim += 1
+            }
+            k += 1
+        }
+    }
+    let rpo: []u32 = a.rpo or_else {}
+    if (a.nrpo != fim) or (rpo[0] != 0) {
+        var msg = make([dynamic]u8, alloc = heap, cap = 96)
+        defer delete(msg)
+        format(f"RPO tem {a.nrpo} blocos, alcancaveis {fim}", into = &msg)
+        return falha_analise(causa, msg[..])
+    }
+    for i in (0 as u32)..<a.nrpo {
+        if (visto[rpo[i]] == 0) or ((a.pos_rpo or_else {})[rpo[i]] != i) {
+            var msg = make([dynamic]u8, alloc = heap, cap = 96)
+            defer delete(msg)
+            format(f"RPO[{i}]={rpo[i]} incoerente", into = &msg)
+            return falha_analise(causa, msg[..])
+        }
+    }
+    return true
+}
+
+// C: nativo/bir/analises.c:84
+proc conferir_idom(a: ^AnalisesBir, causa: []u8, n: u64) -> bool {
+    var i: u32 = 1
+    while i < a.nrpo {
+        let b: u32 = (a.rpo or_else {})[i]
+        let d: u32 = (a.idom or_else {})[b]
+        if (d >= a.nblocos) or (d == b) or ((a.pos_rpo or_else {})[d] >= i) {
+            var msg = make([dynamic]u8, alloc = heap, cap = 96)
+            defer delete(msg)
+            format(f"idom do bloco {b} invalido ({d})", into = &msg)
+            return falha_analise(causa, msg[..])
+        }
+        var k: u32 = (a.pred_ini or_else {})[b]
+        while k < (a.pred_ini or_else {})[b + 1] {
+            let p: u32 = (a.pred or_else {})[k]
+            if ((a.pos_rpo or_else {})[p] != BIR_SEM_BLOCO) and (not analises_domina(a, d, p)) {
+                var msg = make([dynamic]u8, alloc = heap, cap = 96)
+                defer delete(msg)
+                format(f"idom {d} do bloco {b} nao domina o predecessor {p}", into = &msg)
+                return falha_analise(causa, msg[..])
+            }
+            k += 1
+        }
+        i += 1
+    }
+    return true
+}
+
+// C: nativo/bir/analises.c:100
+proc conferir_lacos(a: ^AnalisesBir, causa: []u8, n: u64) -> bool {
+    for l in (0 as u32)..<a.nlacos {
+        let laco: LacoBir = (a.lacos or_else {})[l]
+        for k in (0 as u32)..<laco.ncorpo {
+            let bloco: u32 = (laco.corpo or_else {})[k]
+            if (not analises_domina(a, laco.cabecalho, bloco)) or ((a.prof_laco or_else {})[bloco] == 0) {
+                var msg = make([dynamic]u8, alloc = heap, cap = 96)
+                defer delete(msg)
+                format(f"laco {laco.cabecalho}: bloco {bloco} fora da regra", into = &msg)
+                return falha_analise(causa, msg[..])
+            }
+        }
+    }
+    return true
+}
+
+// C: nativo/bir/analises.c:114
+proc conferir_vivo(f: ^BirFuncao, a: ^AnalisesBir, causa: []u8, n: u64) -> bool {
+    for i in (0 as u32)..<a.nrpo {
+        let bloco: u32 = (a.rpo or_else {})[i]
+        if not analises_vivo_confere(a, f, bloco) {
+            var msg = make([dynamic]u8, alloc = heap, cap = 96)
+            defer delete(msg)
+            format(f"vivacidade do bloco {bloco} nao e ponto fixo", into = &msg)
+            return falha_analise(causa, msg[..])
+        }
+    }
+    var v: u32 = f.nparams
+    while (v < a.nvregs) and (a.nblocos > 0) {
+        if analises_vivo_entra(a, 0, v) {
+            var msg = make([dynamic]u8, alloc = heap, cap = 96)
+            defer delete(msg)
+            format(f"vreg {v} vivo na entrada sem ser parametro", into = &msg)
+            return falha_analise(causa, msg[..])
+        }
+        v += 1
+    }
+    return true
+}
+
+// C: nativo/bir/analises.c:127
+pub proc analises_conferir(funcao: ^BirFuncao, a: ^AnalisesBir, causa: []u8, n: u64) -> bool {
+    return (((common.c2f_b2i32(conferir_rpo(a, causa, n)) != 0) and (common.c2f_b2i32(conferir_idom(a, causa, n)) != 0)) and (common.c2f_b2i32(conferir_lacos(a, causa, n)) != 0)) and (common.c2f_b2i32(conferir_vivo(funcao, a, causa, n)) != 0)
+}

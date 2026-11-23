@@ -1,0 +1,240 @@
+// semantic/sem_quat.fj - porte de compiler/semantic/sem_quat.c
+// sha256 de semantic/sem_quat.c: 9ccc675a9635f6eeb46362d2405dce9252415811b6c519c590f97e6109881ec6
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "common"
+import "frontend"
+
+const QUAT_CAMPOS: i32 = 4
+const VETOR_GIRO_N: i32 = 3
+
+// C: semantic/sem_quat.c:19
+// C2F-13: o retorno `Campo *` (FATIA de QUAT_CAMPOS) vira []frontend.Campo (assinatura alterada dentro do lote); o memset zero e o do s4_arena_fatia_campo
+proc campos_do_quat(s: ^Semantica) -> []frontend.Campo {
+    let nomes: [4]i32 = {s.nome_x, s.nome_y, s.nome_z, s.nome_w}
+    let campos = s4_arena_fatia_campo(s, QUAT_CAMPOS as int)
+    for k in 0..<(QUAT_CAMPOS as int) {
+        campos[k].nome = nomes[k]
+        campos[k].tipo.forma = frontend.TR_NOME as u8
+        campos[k].tipo.nome = frontend.SYM_F32
+        campos[k].tipo.erro = -1
+        campos[k].tipo.tipo = TIPO_F32 as u32
+    }
+    return campos
+}
+
+// C: semantic/sem_quat.c:34
+proc sem_quat_garantir(s: ^Semantica) {
+    let y: ^Simbolo = &(s.globais or_else {})[frontend.SYM_QUAT]
+    if (s.tipo_quat != 0) or (y.categoria != (SIM_NENHUM as u8)) {
+        return
+    }
+    let d: ^frontend.Decl = s4_novo_decl(s)
+    d.tipo_no = frontend.D_STRUCT as u8
+    d.nome = frontend.SYM_QUAT
+    d.chave = d.nome
+    d.simbolo = -1
+    d.publico = true
+    d.campos = campos_do_quat(s)
+    d.ncampos = QUAT_CAMPOS as u32
+    d.indice = s.qtd_struct as i32
+    s.qtd_struct += 1
+    s.decl_quat = d
+    s.tipo_quat = tipo_struct(&s.tipos, frontend.SYM_QUAT)
+    y^ = Simbolo{categoria = SIM_STRUCT as u8, indice = d.indice, decl = d, tipo = s.tipo_quat, envenenado = 0}
+}
+
+// C: semantic/sem_quat.c:53
+proc erro_quat(s: ^Semantica, pos: u32, causa: str) -> bool {
+    let msg_1 = format(f"{causa}", alloc = heap)
+    defer delete(msg_1)
+    return sem_erro(s, common.E0333, pos, msg_1)
+}
+
+// C: semantic/sem_quat.c:59
+proc eh_vetor3_f32(s: ^Semantica, tipo: u32) -> bool {
+    let k: ^TipoInfo = tipo_de(&s.tipos, tipo)
+    return ((k.classe == (TC_ARRAY as u8)) and (k.a == (TIPO_F32 as u32))) and (k.b == (VETOR_GIRO_N as u32))
+}
+
+// C: semantic/sem_quat.c:66
+proc produto_com_vetor(s: ^Semantica, e: ^frontend.Expr, a_quat: bool) -> bool {
+    if not a_quat {
+        return erro_quat(s, e.pos_op, "v * q nao existe: o quat gira o vetor, escreva q * v")
+    }
+    if eh_vetor3_f32(s, (e.b as ^frontend.Expr).tipo) {
+        e.tipo = (e.b as ^frontend.Expr).tipo
+        return true
+    }
+    let texto = sem_descrever_str(s, (e.b as ^frontend.Expr).tipo)
+    defer delete(texto)
+    let msg_1 = format(f"q * v pede v: [3]f32 sem unidade, nao {texto}", alloc = heap)
+    defer delete(msg_1)
+    return sem_erro(s, common.E0333, e.pos_op, msg_1)
+}
+
+// C: semantic/sem_quat.c:79
+proc produto_quat(s: ^Semantica, e: ^frontend.Expr, a_quat: bool, b_quat: bool) -> bool {
+    if a_quat and b_quat {
+        e.tipo = s.tipo_quat
+        return true
+    }
+    var outro: ^frontend.Expr = e.a as ^frontend.Expr
+    if a_quat {
+        outro = e.b as ^frontend.Expr
+    }
+    if outro.tipo == (TIPO_F32 as u32) {
+        e.tipo = s.tipo_quat
+        return true
+    }
+    if tipo_classe_de(&s.tipos, outro.tipo) == TC_ARRAY {
+        return produto_com_vetor(s, e, a_quat)
+    }
+    let texto = sem_descrever_str(s, outro.tipo)
+    defer delete(texto)
+    let msg_1 = format(f"q * k pede k: f32 sem unidade, nao {texto}", alloc = heap)
+    defer delete(msg_1)
+    return sem_erro(s, common.E0333, e.pos_op, msg_1)
+}
+
+// C: semantic/sem_quat.c:96
+proc sem_conta_quat(s: ^Semantica, e: ^frontend.Expr) -> bool {
+    let a_quat: bool = sem_eh_quat(s, (e.a as ^frontend.Expr).tipo)
+    let b_quat: bool = sem_eh_quat(s, (e.b as ^frontend.Expr).tipo)
+    if (e.op == (frontend.OP_SOMA as u8)) or (e.op == (frontend.OP_SUB as u8)) {
+        if (not a_quat) or (not b_quat) {
+            return erro_quat(s, e.pos_op, "q + r e q - r pedem dois quat (quat com escalar so existe em *)")
+        }
+        e.tipo = s.tipo_quat
+        return true
+    }
+    if e.op == (frontend.OP_MUL as u8) {
+        return produto_quat(s, e, a_quat, b_quat)
+    }
+    return erro_quat(s, e.pos_op, "quat nao tem '/' nem '%': so + - * (q * k e k * q com k: f32)")
+}
+
+// C: semantic/sem_quat.c:108
+proc sem_comparacao_quat(s: ^Semantica, e: ^frontend.Expr) -> bool {
+    return erro_quat(s, e.pos_op, "quat nao tem ==, != nem ordem: compare os campos x, y, z e w um a um")
+}
+
+// C: semantic/sem_quat.c:114
+proc sem_chamar_conj(s: ^Semantica, e: ^frontend.Expr) -> bool {
+    if (not sem_ligar_embutido(s, e, s.params_um[..])) or (not sem_checar(s, (e.args or_else {})[0].valor, TIPO_VAZIO as u32)) {
+        return false
+    }
+    let arg: ^frontend.Expr = (e.args or_else {})[0].valor as ^frontend.Expr
+    if not sem_eh_quat(s, arg.tipo) {
+        let texto = sem_descrever_str(s, arg.tipo)
+        defer delete(texto)
+        let msg_1 = format(f"conj pede quat, nao {texto}", alloc = heap)
+        defer delete(msg_1)
+        return sem_erro(s, common.E0333, arg.pos, msg_1)
+    }
+    e.tipo = s.tipo_quat
+    return true
+}
+
+// C: semantic/sem_quat.c:128
+proc sem_abs_de_quat(s: ^Semantica, e: ^frontend.Expr) -> bool {
+    e.tipo = TIPO_F32 as u32
+    return true
+}
+
+// G3 S5: testes dirigidos (so existem em `forja test`)
+test "sem_quat: sem_quat_garantir e campos_do_quat" {
+    var c = S5Cena{}
+    s5_cena_montar(&c, {})
+    expect(c.sv.tipo_quat == 0 and (c.sv.globais or_else {})[frontend.SYM_QUAT].categoria == (SIM_NENHUM as u8))
+    let antes: u32 = c.sv.qtd_struct
+    sem_quat_garantir(&c.sv)
+    expect(c.sv.tipo_quat != 0 and c.sv.qtd_struct == antes + 1 and c.sv.tipo_quat == tipo_struct(&c.sv.tipos, frontend.SYM_QUAT))
+    let y: ^Simbolo = &(c.sv.globais or_else {})[frontend.SYM_QUAT]
+    expect(y.categoria == (SIM_STRUCT as u8) and y.tipo == c.sv.tipo_quat and y.indice == (antes as i32) and y.envenenado == 0 and y.decl == c.sv.decl_quat)
+    let d: ^frontend.Decl = c.sv.decl_quat as ^frontend.Decl
+    expect(d.tipo_no == (frontend.D_STRUCT as u8) and d.nome == frontend.SYM_QUAT and d.chave == frontend.SYM_QUAT and d.simbolo == -1 and d.publico and d.ncampos == 4 and d.indice == (antes as i32))
+    let campos = d.campos or_else {}
+    expect(len(campos) == 4)
+    expect(campos[0].nome == c.sv.nome_x and campos[1].nome == c.sv.nome_y and campos[2].nome == c.sv.nome_z and campos[3].nome == c.sv.nome_w)
+    for k in 0..<4 {
+        expect(campos[k].tipo.forma == (frontend.TR_NOME as u8) and campos[k].tipo.nome == frontend.SYM_F32 and campos[k].tipo.erro == -1 and campos[k].tipo.tipo == (TIPO_F32 as u32))
+    }
+    // idempotente: a 2a chamada nao registra outra struct
+    sem_quat_garantir(&c.sv)
+    expect(c.sv.qtd_struct == antes + 1)
+    s5_cena_liberar(&c)
+}
+
+test "sem_quat: conta, comparacao, conj e abs (E0333)" {
+    var pre: [1]str = {"conj"}
+    var c = S5Cena{}
+    s5_cena_montar(&c, pre[..])
+    sem_quat_garantir(&c.sv)
+    let q: u32 = c.sv.tipo_quat
+    let f32t: u32 = TIPO_F32 as u32
+    let v3: u32 = tipo_array(&c.sv.tipos, f32t, 3)
+    expect(eh_vetor3_f32(&c.sv, v3) and not eh_vetor3_f32(&c.sv, tipo_array(&c.sv.tipos, f32t, 4)) and not eh_vetor3_f32(&c.sv, tipo_array(&c.sv.tipos, TIPO_I32 as u32, 3)) and not eh_vetor3_f32(&c.sv, f32t))
+    var fa = s5_folha(q, false)
+    var fb = s5_folha(q, false)
+    var e = frontend.Expr{tipo_no = frontend.EX_BINARIO as u8, op = frontend.OP_SOMA as u8, a = &fa, b = &fb, pos = 4, pos_op = 6}
+    expect(sem_conta_quat(&c.sv, &e) and e.tipo == q)
+    e.op = frontend.OP_SUB as u8
+    e.tipo = 0
+    expect(sem_conta_quat(&c.sv, &e) and e.tipo == q)
+    e.op = frontend.OP_MUL as u8
+    e.tipo = 0
+    expect(sem_conta_quat(&c.sv, &e) and e.tipo == q)
+    // quat * k e k * quat (f32)
+    fb = s5_folha(f32t, false)
+    e.tipo = 0
+    expect(sem_conta_quat(&c.sv, &e) and e.tipo == q)
+    fa = s5_folha(f32t, false)
+    fb = s5_folha(q, false)
+    e.tipo = 0
+    expect(sem_conta_quat(&c.sv, &e) and e.tipo == q)
+    // q * v gira o vetor; v * q nao existe; v diferente de [3]f32 erra
+    fa = s5_folha(q, false)
+    fb = s5_folha(v3, false)
+    expect(sem_conta_quat(&c.sv, &e) and e.tipo == v3)
+    fa = s5_folha(v3, false)
+    fb = s5_folha(q, false)
+    expect(not sem_conta_quat(&c.sv, &e))
+    expect(c.diag.codigo == common.E0333 and c.diag.off == 6 and (c.diag.causa or_else "") == "v * q nao existe: o quat gira o vetor, escreva q * v")
+    fa = s5_folha(q, false)
+    fb = s5_folha(tipo_array(&c.sv.tipos, TIPO_I32 as u32, 3), false)
+    expect(not sem_conta_quat(&c.sv, &e))
+    expect(c.diag.codigo == common.E0333 and (c.diag.causa or_else "") == "q * v pede v: [3]f32 sem unidade, nao [3]i32")
+    fb = s5_folha(TIPO_BOOL as u32, false)
+    expect(not sem_conta_quat(&c.sv, &e))
+    expect(c.diag.codigo == common.E0333 and (c.diag.causa or_else "") == "q * k pede k: f32 sem unidade, nao bool")
+    // soma com escalar e as contas que nao existem
+    e.op = frontend.OP_SOMA as u8
+    fb = s5_folha(f32t, false)
+    expect(not sem_conta_quat(&c.sv, &e))
+    expect(c.diag.codigo == common.E0333 and (c.diag.causa or_else "") == "q + r e q - r pedem dois quat (quat com escalar so existe em *)")
+    e.op = frontend.OP_SUB as u8
+    expect(not sem_conta_quat(&c.sv, &e) and (c.diag.causa or_else "") == "q + r e q - r pedem dois quat (quat com escalar so existe em *)")
+    e.op = frontend.OP_DIV as u8
+    expect(not sem_conta_quat(&c.sv, &e))
+    expect(c.diag.codigo == common.E0333 and (c.diag.causa or_else "") == "quat nao tem '/' nem '%': so + - * (q * k e k * q com k: f32)")
+    e.op = frontend.OP_RESTO as u8
+    expect(not sem_conta_quat(&c.sv, &e) and (c.diag.causa or_else "") == "quat nao tem '/' nem '%': so + - * (q * k e k * q com k: f32)")
+    // comparacao (lista estatica)
+    expect(not sem_comparacao_quat(&c.sv, &e))
+    expect(c.diag.codigo == common.E0333 and c.diag.off == 6 and (c.diag.causa or_else "") == "quat nao tem ==, != nem ordem: compare os campos x, y, z e w um a um")
+    // abs de quat e a norma (f32)
+    e.tipo = 0
+    expect(sem_abs_de_quat(&c.sv, &e) and e.tipo == f32t)
+    // conj
+    var um: [1]u32 = {q}
+    var ch = S5Chamada{}
+    s5_chamada_montar(&ch, s5_nome(&c, "conj"), um[..])
+    expect(sem_chamar_conj(&c.sv, &ch.e) and ch.e.tipo == q)
+    ch.folhas[0].tipo = TIPO_I32 as u32
+    expect(not sem_chamar_conj(&c.sv, &ch.e))
+    expect(c.diag.codigo == common.E0333 and c.diag.off == 100 and (c.diag.causa or_else "") == "conj pede quat, nao i32")
+    s5_chamada_liberar(&ch)
+    s5_cena_liberar(&c)
+}

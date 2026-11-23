@@ -1,0 +1,333 @@
+// nativo/a64/a64_emitir.fj - contexto do gerador A64 e primitivas de emissao (palavras, saltos entre blocos, acessos a memoria)
+// Versao: 0.6.0
+// Changelog: 0.6.0 - A4.3: campo dinamico do A64Ctx; a recusa X0001 cita o alvo certo (aarch64-linux ou aarch64-linux-android).
+//            0.5.0 - A2.2(e): campo pilha do A64Ctx (simbolo de falha_pilha para a guarda de R0016).
+//            0.4.0 - A2.2(c): a64_operando aplica a extensao do operando de chamada (a64_estender_operando, a64_isel.fj 0.5.0).
+//            0.3.0 - A1.3(iii): layouts FP (FP2 FP1 FCMP RNRD FPINT FMOVI FCSEL) em a64_campos; a64_classe_de_64_bits (F64 usa X no mov de constante).
+//            0.2.0 - A1.3(iv): layout MUL3 (SMULH/UMULH/SMULL/UMULL = rm, rn, rd) em a64_campos.
+//            0.1.0 - A1.3(i) (contrato_a64 §2.1, §2.5): A64Ctx, a64_op (um ponto de montagem dos campos por layout do encoder), constantes
+//                    com mov_imm, acesso a memoria com imm12 escalado / LDUR / x16, saltos B com correcao no fim da funcao (sem relaxacao:
+//                    todo desvio condicional da funcao e `cb(n)z .+8` seguido de B, entao so o B de +-128 MiB importa).
+// Registradores: x9 x10 x11 = temporarios do isel (so-slots); x16 x17 = temporarios de apoio (offsets grandes, alvo de chamada); x29 = fp;
+// slots dos vregs em [x29 + vreg_off + 8*v] (sempre 8 bytes, store/load de 64 bits; os bits acima da classe sao indefinidos).
+
+import "common"
+import "nativo/bir"
+import "nativo/obj"
+
+const A64_SEM_SIMBOLO: u32 = 4294967295
+const A64_PALAVRA_NOP: u32 = 0xD503201F
+const A64_PALAVRA_B: u32 = 0x14000000
+const A64_LIMITE_SALTO: i64 = 33554432 // B: imm26 sinalizado = +-2^25 palavras
+const R_XZR: u32 = 31
+const R_SP: u32 = 31
+const R_FP: u32 = 29
+const R_LR: u32 = 30
+const R_T0: u32 = 9
+const R_T1: u32 = 10
+const R_T2: u32 = 11
+const R_TA: u32 = 16
+const R_TB: u32 = 17
+// tamanho em bytes do acesso (= escala do imm12) das formas LDR/STR sem sinal, indexado por forma - A64F_STRB (54..72)
+const A64_PASSO_LDST: [19]i64 = {1, 1, 1, 1, 2, 2, 2, 2, 4, 4, 4, 8, 8, 4, 4, 8, 8, 16, 16}
+const A64_LDST_PRIMEIRA: u32 = 54
+const A64_LDUR_DISTANCIA: u32 = 19 // A64F_STURB - A64F_STRB
+
+struct A64Salto {
+    off: u32
+    bloco: u32
+}
+
+struct A64Ops {
+    rd: u32
+    rn: u32
+    rm: u32
+    imm: u32
+    imm2: u32
+}
+
+struct A64Ctx {
+    p: ^bir.BirPrograma
+    o: ^obj.Objeto
+    erro: ^common.Diag
+    f: ^bir.BirFuncao
+    texto: u32
+    obj_sim: []u32 // simbolo da BIR -> simbolo do Objeto (A64_SEM_SIMBOLO = ainda nao referido)
+    slot_off: []u32 // offset (a partir de x29) de cada slot agregado da BIR
+    vreg_off: u32 // offset (a partir de x29) do slot do vreg 0
+    saida: u32 // bytes da area de argumentos de pilha, no fundo do quadro (multiplo de 16)
+    quadro: u32 // bytes que o prologo tira do sp (multiplo de 16)
+    ordem: []u32 // blocos na ordem de emissao (frios por ultimo)
+    pos_ordem: u32
+    bloco_off: []u32
+    saltos: [dynamic]A64Salto
+    pos: u32 // posicao no fonte da instrucao corrente (para o diagnostico)
+    pilha: u32 // simbolo BIR de falha_pilha: guarda de R0016 no prologo (so dev com runtime a64); A64_ALC_SEM = sem guarda
+    dinamico: bool // A4.3: alvo aarch64-linux-android (foreign por GOT, .so com exports)
+    macho: bool // I2: alvos iOS (foreign por GOT como o android; entrada chamada pelo dyld)
+}
+
+// recusa por clareza (X0001): nunca emitir codigo errado (contrato_a64 §8)
+proc a64_recusa(c: ^A64Ctx, o_que: str) -> bool {
+    var alvo: str = "aarch64-linux"
+    if c.macho {
+        alvo = "aarch64-apple-ios"
+    } else if c.dinamico {
+        alvo = "aarch64-linux-android"
+    }
+    let causa = format(f"{o_que} ainda nao suportado no alvo {alvo}", alloc = heap)
+    defer delete(causa)
+    return common.diag_relatar(c.erro, common.X0001, c.pos, causa)
+}
+
+proc a64_offset(c: ^A64Ctx) -> u32 {
+    return len(c.o.secoes[c.texto as u64].bytes) as u32
+}
+
+// uma palavra de instrucao, little-endian, no fim do .text
+proc a64_palavra(c: ^A64Ctx, w: u32) {
+    let bytes: ^[dynamic]u8 = &c.o.secoes[c.texto as u64].bytes
+    append(bytes, item = (w & 255) as u8)
+    append(bytes, item = ((w >> 8) & 255) as u8)
+    append(bytes, item = ((w >> 16) & 255) as u8)
+    append(bytes, item = ((w >> 24) & 255) as u8)
+}
+
+proc a64_bool_u64(b: bool) -> u64 {
+    if b {
+        return 1
+    }
+    return 0
+}
+
+// classes de 64 bits (I64 e F64) usam registrador X no mov de constante; as demais, W
+proc a64_classe_de_64_bits(classe: u8) -> bool {
+    let k = classe as i32
+    return (k == bir.BC_I64) or (k == bir.BC_F64)
+}
+
+// Campos do encoder na ordem de cada layout (a64_codificar.fj A64_LAY_*): rd/rn/rm = registradores; imm e imm2 por layout:
+// ADDI imm=imm12 imm2=sh | ADDR imm=imm6 imm2=shift | LOGR imm=imm6 imm2=N | BITF imm=immr imm2=imms | DP3 | MADD imm=ra | CSEL imm=cond |
+// B26 imm=imm26 | BCOND imm=imm19 imm2=cond | CBZ imm=imm19 (rd = rt) | RN | IMM16 imm=imm16 | NADA | LDST imm=imm12 | LDUR imm=imm9 | LDP imm=imm7 (rm = rt2).
+// LIMITE: 85 linhas e cognitiva 24 - tabela de layouts, um if por layout (uma forma por ramo; achatar em outro formato mudaria o contrato do encoder)
+proc a64_campos(forma: u32, x: bool, o: A64Ops) -> A64Campos {
+    let sf = a64_bool_u64(x)
+    let rd = o.rd as u64
+    let rn = o.rn as u64
+    let rm = o.rm as u64
+    let imm = o.imm as u64
+    let imm2 = o.imm2 as u64
+    let lay = A64_FORMA_LAY[forma as int] as int
+    if lay == A64L_ADDI {
+        return A64Campos{v = {sf, imm2, imm, rn, rd, 0, 0, 0}}
+    }
+    if lay == A64L_ADDR {
+        return A64Campos{v = {sf, imm2, rm, imm, rn, rd, 0, 0}}
+    }
+    if lay == A64L_LOGR {
+        return A64Campos{v = {sf, 0, imm2, rm, imm, rn, rd, 0}}
+    }
+    if lay == A64L_BITF {
+        return A64Campos{v = {sf, imm, imm2, rn, rd, 0, 0, 0}}
+    }
+    if lay == A64L_DP3 {
+        return A64Campos{v = {sf, rm, rn, rd, 0, 0, 0, 0}}
+    }
+    if lay == A64L_MADD {
+        return A64Campos{v = {sf, rm, imm, rn, rd, 0, 0, 0}}
+    }
+    if lay == A64L_MUL3 {
+        return A64Campos{v = {rm, rn, rd, 0, 0, 0, 0, 0}}
+    }
+    if lay == A64L_CSEL {
+        return A64Campos{v = {sf, rm, imm, rn, rd, 0, 0, 0}}
+    }
+    if lay == A64L_B26 {
+        return A64Campos{v = {imm, 0, 0, 0, 0, 0, 0, 0}}
+    }
+    if lay == A64L_BCOND {
+        return A64Campos{v = {imm, imm2, 0, 0, 0, 0, 0, 0}}
+    }
+    if lay == A64L_CBZ {
+        return A64Campos{v = {sf, imm, rd, 0, 0, 0, 0, 0}}
+    }
+    if lay == A64L_RN {
+        return A64Campos{v = {rn, 0, 0, 0, 0, 0, 0, 0}}
+    }
+    if lay == A64L_IMM16 {
+        return A64Campos{v = {imm, 0, 0, 0, 0, 0, 0, 0}}
+    }
+    if lay == A64L_NADA {
+        return A64Campos{v = {0, 0, 0, 0, 0, 0, 0, 0}}
+    }
+    if lay == A64L_LDST {
+        return A64Campos{v = {imm, rn, rd, 0, 0, 0, 0, 0}}
+    }
+    if lay == A64L_LDUR {
+        return A64Campos{v = {imm, rn, rd, 0, 0, 0, 0, 0}}
+    }
+    if lay == A64L_LDP {
+        return A64Campos{v = {imm, rm, rn, rd, 0, 0, 0, 0}}
+    }
+    if lay == A64L_FP2 {
+        return A64Campos{v = {imm2, rm, rn, rd, 0, 0, 0, 0}}
+    }
+    if lay == A64L_FP1 {
+        return A64Campos{v = {imm2, rn, rd, 0, 0, 0, 0, 0}}
+    }
+    if lay == A64L_FCMP {
+        return A64Campos{v = {imm2, rm, rn, imm, 0, 0, 0, 0}}
+    }
+    if lay == A64L_RNRD {
+        return A64Campos{v = {rn, rd, 0, 0, 0, 0, 0, 0}}
+    }
+    if lay == A64L_FPINT {
+        return A64Campos{v = {sf, imm2, rn, rd, 0, 0, 0, 0}}
+    }
+    if lay == A64L_FMOVI {
+        return A64Campos{v = {imm2, imm, rd, 0, 0, 0, 0, 0}}
+    }
+    if lay == A64L_FCSEL {
+        return A64Campos{v = {imm2, rm, imm, rn, rd, 0, 0, 0}}
+    }
+    common.falha_interna("a64_campos: layout sem mapeamento")
+    return A64Campos{v = {0, 0, 0, 0, 0, 0, 0, 0}}
+}
+
+// monta e emite uma instrucao pela forma e pelos campos de `o`; x = sf (registradores de 64 bits)
+proc a64_op(c: ^A64Ctx, forma: u32, x: bool, o: A64Ops) {
+    var campos = a64_campos(forma, x, o)
+    a64_palavra(c, a64_codificar(forma, &campos))
+}
+
+// mov rd, rs (64 bits)
+proc a64_mov(c: ^A64Ctx, rd: u32, rs: u32) {
+    a64_op(c, A64F_ORR_REG, true, A64Ops{rd = rd, rn = R_XZR, rm = rs})
+}
+
+// rd = valor (x = 64 bits; senao 32 bits, bits altos zerados): MOVZ/MOVN + MOVK
+proc a64_const(c: ^A64Ctx, rd: u32, valor: u64, x: bool) {
+    var palavras: [4]u32 = {0, 0, 0, 0}
+    var v = valor
+    if not x {
+        v = valor & 4294967295
+    }
+    let n = a64_mov_imm(rd, v, x, &palavras)
+    for k in 0..<(n as int) {
+        a64_palavra(c, palavras[k])
+    }
+}
+
+// acesso a memoria [rn + desloc] com a forma LDR/STR sem sinal `forma` (A64F_STRB..A64F_LDR_Q): imm12 escalado,
+// LDUR/STUR (-256..255), ou o endereco montado em x16. rn nao pode ser sp quando o desloc nao cabe nas duas primeiras formas.
+proc a64_acesso(c: ^A64Ctx, forma: u32, rt: u32, rn: u32, desloc: i64) {
+    let passo = A64_PASSO_LDST[(forma - A64_LDST_PRIMEIRA) as int]
+    if (desloc >= 0) and (desloc % passo == 0) and ((desloc / passo) <= 4095) {
+        a64_op(c, forma, true, A64Ops{rd = rt, rn = rn, imm = (desloc / passo) as u32})
+        return
+    }
+    if (desloc >= -256) and (desloc <= 255) {
+        a64_op(c, forma + A64_LDUR_DISTANCIA, true, A64Ops{rd = rt, rn = rn, imm = (((desloc + 512) as u64) & 511) as u32})
+        return
+    }
+    a64_const(c, R_TA, desloc as u64, true)
+    a64_op(c, A64F_ADD_REG, true, A64Ops{rd = R_TA, rn = rn, rm = R_TA})
+    a64_op(c, forma, true, A64Ops{rd = rt, rn = R_TA})
+}
+
+// slot do vreg v: offset a partir de x29
+proc a64_slot_do_vreg(c: ^A64Ctx, v: u32) -> i64 {
+    return (c.vreg_off + 8 * v) as i64
+}
+
+proc a64_ler_vreg(c: ^A64Ctx, rd: u32, v: u32) {
+    a64_acesso(c, A64F_LDR_X, rd, R_FP, a64_slot_do_vreg(c, v))
+}
+
+proc a64_gravar_vreg(c: ^A64Ctx, rs: u32, v: u32) {
+    a64_acesso(c, A64F_STR_X, rs, R_FP, a64_slot_do_vreg(c, v))
+}
+
+// operando inteiro (vreg ou imediato) em rd; a classe do imediato decide a largura do mov
+proc a64_operando(c: ^A64Ctx, rd: u32, op: ^bir.BirOperando) -> bool {
+    let tipo = op.tipo as i32
+    if tipo == bir.BO_VREG {
+        a64_ler_vreg(c, rd, op.id)
+        if (op.extensao as i32) != bir.BE_NENHUMA {
+            a64_estender_operando(c, rd, op.classe, (op.extensao as i32) == bir.BE_SINAL)
+        }
+        return true
+    }
+    if tipo == bir.BO_IMED {
+        a64_const(c, rd, op.imed as u64, a64_classe_de_64_bits(op.classe))
+        return true
+    }
+    return a64_recusa(c, "operando que nao e vreg nem imediato")
+}
+
+// grava o resultado (rs) no vreg destino da instrucao, se ela tiver um
+proc a64_resultado(c: ^A64Ctx, ins: ^bir.BirInstr, rs: u32) {
+    if ins.dst != bir.BIR_SEM_VREG {
+        a64_gravar_vreg(c, rs, ins.dst)
+    }
+}
+
+// simbolo da BIR como simbolo do Objeto (criado na 1a referencia; funcoes definidas depois resolvem o mesmo indice)
+proc a64_simbolo(c: ^A64Ctx, indice: u32) -> u32 {
+    if c.obj_sim[indice] == A64_SEM_SIMBOLO {
+        c.obj_sim[indice] = obj.obj_simbolo_referir(c.o, c.p.simbolos[indice].nome)
+    }
+    return c.obj_sim[indice]
+}
+
+// B com alvo no bloco `bloco` (imm26 corrigido no fim da funcao)
+proc a64_b_bloco(c: ^A64Ctx, bloco: u32) {
+    append(&c.saltos, item = A64Salto{off = a64_offset(c), bloco = bloco})
+    a64_palavra(c, A64_PALAVRA_B)
+}
+
+// BL para o simbolo da BIR (reloc CALL26)
+proc a64_bl_simbolo(c: ^A64Ctx, indice: u32) {
+    let sim = a64_simbolo(c, indice)
+    let off = a64_offset(c)
+    obj.obj_relocar(c.o, obj.ObjAlvoReloc{secao = c.texto, off = off}, obj.ObjCorrecao{tipo = obj.OR_A64_CALL26, simbolo = sim, adendo = 0})
+    a64_op(c, A64F_BL, false, A64Ops{imm = 0})
+}
+
+// regrava a palavra em `off` (little-endian)
+proc a64_regravar(c: ^A64Ctx, off: u32, w: u32) {
+    let bytes: ^[dynamic]u8 = &c.o.secoes[c.texto as u64].bytes
+    bytes[off as u64] = (w & 255) as u8
+    bytes[(off + 1) as u64] = ((w >> 8) & 255) as u8
+    bytes[(off + 2) as u64] = ((w >> 16) & 255) as u8
+    bytes[(off + 3) as u64] = ((w >> 24) & 255) as u8
+}
+
+// preenche o imm26 de cada B pendente com a distancia ao bloco alvo; fora de +-128 MiB = X0001
+proc a64_corrigir_saltos(c: ^A64Ctx) -> bool {
+    for k in 0..<len(c.saltos) {
+        let s = c.saltos[k]
+        let delta: i64 = (c.bloco_off[s.bloco] as i64 - s.off as i64) / 4
+        if (delta >= A64_LIMITE_SALTO) or (delta < -A64_LIMITE_SALTO) {
+            return a64_recusa(c, "funcao grande demais (salto alem de 128 MiB)")
+        }
+        a64_regravar(c, s.off, A64_PALAVRA_B | ((((delta + 67108864) as u64) & 67108863) as u32))
+    }
+    return true
+}
+
+test "a64_campos: add x0,x1,#1 / ldr x0,[x29,#16] / cset w9,lt batem com o objdump" {
+    var soma = a64_campos(A64F_ADD_IMM, true, A64Ops{rd = 0, rn = 1, imm = 1})
+    expect(a64_codificar(A64F_ADD_IMM, &soma) == 0x91000420)
+    var carga = a64_campos(A64F_LDR_X, true, A64Ops{rd = 0, rn = R_FP, imm = 2})
+    expect(a64_codificar(A64F_LDR_X, &carga) == 0xF9400BA0)
+    var cset = a64_campos(A64F_CSINC, false, A64Ops{rd = R_T0, rn = R_XZR, rm = R_XZR, imm = 10})
+    expect(a64_codificar(A64F_CSINC, &cset) == 0x1A9FA7E9)
+}
+
+// preenche com NOP ate o proximo multiplo de n bytes (n potencia de 2 >= 4)
+proc a64_alinhar_texto(c: ^A64Ctx, n: u32) {
+    while a64_offset(c) % n != 0 {
+        a64_palavra(c, A64_PALAVRA_NOP)
+    }
+}

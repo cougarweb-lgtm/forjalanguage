@@ -1,0 +1,586 @@
+// nativo/bir/bir_construir_chamada.fj - porte de compiler/nativo/bir/bir_construir_chamada.c
+// sha256 de nativo/bir/bir_construir_chamada.c: 5e433d28277fe70e0116ce0fb60227ef65f6ec0a5717564b8199542b3f3dbe01
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.1
+// Changelog: 0.1.1 - I4g: sem thunk _time64 no a64 (runtime_forja); x64 Windows/Linux inalterados.
+
+import "common"
+import "ir"
+import "semantic"
+
+struct Passagem {
+    classe: u8
+    tam: u32
+}
+
+struct ThunkCrt {
+    simbolo_c: ?str
+    exportada: ?str
+}
+
+struct ChamadaInd {
+    alvo: u32
+    args: ?[]BirOperando
+}
+
+const MARCO_ASSINATURA: str = "M2"
+const CAUSA_CHAMADA_MAX: i32 = 400
+const TEXTO_FOREIGN_MAX: i32 = 256
+const TEXTO_RETORNO_FOREIGN: str = "retorno do proc foreign '%s'"
+const MARCO_SYSV: str = "M5b"
+const TEXTO_PROC_NULO: str = "chamada por proc nulo"
+const THUNKS_CRT: [1]ThunkCrt = {ThunkCrt{simbolo_c = "time", exportada = "_time64"}}
+
+// C: nativo/bir/bir_construir_chamada.c:41
+pub proc bir_tipo_passavel(tipos: ^semantic.Tipos, tipo: u32) -> bool {
+    var classe: u8 = 0
+    return (common.c2f_b2i32(bir_classe_do_tipo(tipos, tipo, &classe)) != 0) or (common.c2f_b2i32(bir_eh_agregado(tipos, tipo)) != 0)
+}
+
+// C: nativo/bir/bir_construir_chamada.c:49
+proc passagem_de(c: ^BirCtx, tipo: u32, saida: ^Passagem) -> bool {
+    var forma: BirSlot = BirSlot{}
+    saida^ = Passagem{}
+    if bir_classe_do_tipo((c.e as ^BirEntrada).tipos as ^semantic.Tipos, tipo, &saida.classe) {
+        return true
+    }
+    if not bir_forma(c, tipo, &forma) {
+        return false
+    }
+    saida^ = Passagem{classe = BC_I64 as u8, tam = forma.tam}
+    return true
+}
+
+// C: nativo/bir/bir_construir_chamada.c:64
+proc passagem_da_assinatura(c: ^BirCtx, variante: str, tipo: u32, saida: ^Passagem) -> bool {
+    if not bir_tipo_passavel((c.e as ^BirEntrada).tipos as ^semantic.Tipos, tipo) {
+        let nome_tipo: str = bir_nome_do_tipo((c.e as ^BirEntrada).tipos as ^semantic.Tipos, tipo) or_else "-"
+        return bir_falha_x0001(c, (c.f as ^BirFuncao).pos, {"IR_FUNCAO", variante, nome_tipo}, MARCO_ASSINATURA)
+    }
+    return passagem_de(c, tipo, saida)
+}
+
+// C: nativo/bir/bir_construir_chamada.c:71
+proc gravar_tamanho_do_parametro(c: ^BirCtx, nparams: u32, k: u32, tam: u32) {
+    if tam == 0 {
+        return
+    }
+    let f: ^BirFuncao = c.f as ^BirFuncao
+    if f.param_tam == none {
+        f.param_tam = common.arena_fatia_u32(&(c.p as ^BirPrograma).arena, nparams as int)
+    }
+    var pt: []u32 = f.param_tam or_else {}
+    pt[k] = tam
+}
+
+// C: nativo/bir/bir_construir_chamada.c:83
+proc bir_preparar_assinatura(c: ^BirCtx, irf: ?^ir.IrFuncao) -> bool {
+    var p: Passagem = Passagem{classe = 0}
+    let ptr_1: ^BirFuncao = c.f as ^BirFuncao
+    ptr_1.retorno = BC_NADA as u8
+    if (irf as ^ir.IrFuncao).retorno != (semantic.TIPO_VAZIO as u32) {
+        if not passagem_da_assinatura(c, "retorno", (irf as ^ir.IrFuncao).retorno, &p) {
+            return false
+        }
+        let ptr_2: ^BirFuncao = c.f as ^BirFuncao
+        ptr_2.retorno = p.classe
+        let ptr_3: ^BirFuncao = c.f as ^BirFuncao
+        ptr_3.retorno_tam = p.tam
+    }
+    var k: u32 = 0
+    while k < (irf as ^ir.IrFuncao).nparams {
+        if not passagem_da_assinatura(c, "parametro", ((irf as ^ir.IrFuncao).params or_else {})[k].tipo, &p) {
+            return false
+        }
+        _ = bir_novo_vreg(c, p.classe)
+        gravar_tamanho_do_parametro(c, (irf as ^ir.IrFuncao).nparams, k, p.tam)
+        k += 1
+    }
+    return true
+}
+
+// C: nativo/bir/bir_construir_chamada.c:106
+proc bir_argumento_agregado(c: ^BirCtx, i: ^ir.IrInstr, v: ^ir.Valor, saida: ^BirOperando) -> bool {
+    var forma: BirSlot = BirSlot{}
+    var origem: u32 = 0
+    var dst: u32 = 0
+    var slot: u32 = 0
+    if (not bir_forma(c, v.tipo, &forma)) or (not bir_endereco_de(c, i, v, &origem)) {
+        return false
+    }
+    slot = bir_novo_slot(c, forma.tam, max(forma.alinhamento, BIR_SLOT_ALINHAMENTO_MAX))
+    dst = bir_novo_vreg(c, BC_I64 as u8)
+    _ = bir_emitir_end_slot(c, slot, dst)
+    bir_copia_bloco(c, dst, origem, forma.tam)
+    saida^ = op_vreg(dst, BC_I64 as u8)
+    saida.tam = forma.tam
+    return true
+}
+
+// C: nativo/bir/bir_construir_chamada.c:123
+proc externo_de_fora(c: ^BirCtx, nome: i32) -> ?^ir.IrExterno {
+    var externo: ?^ir.IrExterno = none
+    if c.simbolo_do_nome[nome] != BIR_SIMBOLO_EXTERNO {
+        return none
+    }
+    externo = bir_externo_de(c, nome)
+    var tern_1: ?^ir.IrExterno = none
+    if (externo != none) and (not (externo as ^ir.IrExterno).interno) {
+        tern_1 = externo
+    }
+    return tern_1
+}
+
+// C: nativo/bir/bir_construir_chamada.c:134
+proc bir_estender_estreito(op: BirOperando, tipo: u32) -> BirOperando {
+    if (op.classe != (BC_I8 as u8)) and (op.classe != (BC_I16 as u8)) {
+        return op
+    }
+    var tern_1: i32 = BE_ZERO
+    if (common.c2f_b2i32(semantic.tipo_eh_inteiro(tipo)) != 0) and (not semantic.tipo_eh_sem_sinal(tipo)) {
+        tern_1 = BE_SINAL
+    }
+    return op_com_extensao(op, tern_1 as u8)
+}
+
+// C: nativo/bir/bir_construir_chamada.c:142
+proc construir_args(c: ^BirCtx, i: ^ir.IrInstr, de_fora: bool, saida: ^[]BirOperando) -> bool {
+    var args: []BirOperando = arena_fatia_bir_operando(&(c.p as ^BirPrograma).arena, i.nargs as int)
+    var argumentos: []ir.Valor = i.args or_else {}
+    var k: u32 = 0
+    while k < i.nargs {
+        let agregado: bool = bir_eh_agregado((c.e as ^BirEntrada).tipos as ^semantic.Tipos, argumentos[k].tipo)
+        var ok: bool = false
+        if agregado {
+            ok = bir_argumento_agregado(c, i, &argumentos[k], &args[k])
+        } else {
+            ok = bir_operando_de(c, i, &argumentos[k], &args[k])
+        }
+        if not ok {
+            return false
+        }
+        if de_fora and (not agregado) {
+            args[k] = bir_estender_estreito(args[k], argumentos[k].tipo)
+        }
+        k += 1
+    }
+    saida^ = args
+    return true
+}
+
+// C: nativo/bir/bir_construir_chamada.c:158
+proc proc_conhecido(c: ^BirCtx, i: ^ir.IrInstr) -> bool {
+    if (i.nome >= 0) and ((i.nome as u32) < c.n_nomes) and (c.simbolo_do_nome[i.nome] != BIR_SEM_SIMBOLO) {
+        return true
+    }
+    let causa: str = format(f"chamada a proc desconhecido (nome {i.nome})", alloc = heap)
+    defer delete(causa)
+    return bir_falha_inconsistente(c, causa)
+}
+
+// C: nativo/bir/bir_construir_chamada.c:169
+proc bir_externo_de(c: ^BirCtx, nome: i32) -> ?^ir.IrExterno {
+    for k in (0 as u32)..<((c.e as ^BirEntrada).ir as ^ir.IrPrograma).nexternos {
+        if (((c.e as ^BirEntrada).ir as ^ir.IrPrograma).externos or_else {})[k].nome == nome {
+            return &(((c.e as ^BirEntrada).ir as ^ir.IrPrograma).externos or_else {})[k]
+        }
+    }
+    return none
+}
+
+// C: nativo/bir/bir_construir_chamada.c:182
+proc link_eh_do_crt(link: str) -> bool {
+    return (((link == "c") or (link == "m")) or (link == "msvcrt")) or (link == "ucrt")
+}
+
+// C: nativo/bir/bir_construir_chamada.c:189
+proc simbolo_do_import(c: ^BirCtx, simbolo_c: str) -> str {
+    let irp: ^ir.IrPrograma = (c.e as ^BirEntrada).ir as ^ir.IrPrograma
+    let nomes: ^common.Interner = (c.e as ^BirEntrada).nomes as ^common.Interner
+    // I4g: o thunk time -> _time64 e so do CRT do Windows; no a64 (iOS/Android) o simbolo e o da libc do alvo.
+    if (c.p as ^BirPrograma).sysv or (c.e as ^BirEntrada).runtime_forja {
+        return simbolo_c
+    }
+    for k in (0 as u32)..<irp.nbibliotecas {
+        if not link_eh_do_crt(common.interner_texto(nomes, (irp.bibliotecas or_else {})[k])) {
+            return simbolo_c
+        }
+    }
+    for k in 0..<len(THUNKS_CRT) {
+        if (THUNKS_CRT[k].simbolo_c or_else "") == simbolo_c {
+            return THUNKS_CRT[k].exportada or_else simbolo_c
+        }
+    }
+    return simbolo_c
+}
+
+// C: nativo/bir/bir_construir_chamada.c:208
+proc simbolo_da_chamada(c: ^BirCtx, i: ^ir.IrInstr) -> u32 {
+    var externo: ?^ir.IrExterno = none
+    if c.simbolo_do_nome[i.nome] != BIR_SIMBOLO_EXTERNO {
+        return c.simbolo_do_nome[i.nome]
+    }
+    externo = bir_externo_de(c, i.nome)
+    if (externo as ^ir.IrExterno).interno {
+        return bir_simbolo_runtime(c, common.interner_texto((c.e as ^BirEntrada).nomes as ^common.Interner, (externo as ^ir.IrExterno).simbolo))
+    }
+    let arg_1: u32 = i.pos
+    let arg_2: str = simbolo_do_import(c, common.interner_texto((c.e as ^BirEntrada).nomes as ^common.Interner, (externo as ^ir.IrExterno).simbolo))
+    let arg_3: ^BirCtx = c
+    return bir_simbolo_import(arg_3, arg_2, arg_1)
+}
+
+// C: nativo/bir/bir_construir_chamada.c:220
+proc emitir_chama(c: ^BirCtx, i: ^ir.IrInstr, args: []BirOperando, retorno: u8) -> ^BirInstr {
+    let chama: ^BirInstr = bir_emitir(c, BIR_CHAMA, retorno)
+    chama.simbolo = simbolo_da_chamada(c, i)
+    chama.args = args
+    chama.nargs = i.nargs
+    return chama
+}
+
+// C: nativo/bir/bir_construir_chamada.c:231
+proc destino_agregado(c: ^BirCtx, i: ^ir.IrInstr, endereco: ^u32) -> bool {
+    var pedido: BirPedidoSlot = BirPedidoSlot{temporario = true, id = i.destino}
+    var slot: u32 = 0
+    if not bir_forma(c, i.tipo, &pedido.forma) {
+        return false
+    }
+    if i.destino >= 0 {
+        return bir_definir_slot(c, &pedido, endereco)
+    }
+    slot = bir_novo_slot(c, pedido.forma.tam, pedido.forma.alinhamento)
+    endereco^ = bir_novo_vreg(c, BC_I64 as u8)
+    _ = bir_emitir_end_slot(c, slot, endereco^)
+    return true
+}
+
+// C: nativo/bir/bir_construir_chamada.c:247
+// C2F-INDECIDIVEL: args
+proc anexar_descritores_sysv(c: ^BirCtx, i: ^ir.IrInstr, args: []BirOperando) -> bool {
+    let argumentos: []ir.Valor = i.args or_else {}
+    var k: u32 = 0
+    while k < i.nargs {
+        args[k].sysv = none
+        if bir_eh_agregado((c.e as ^BirEntrada).tipos as ^semantic.Tipos, argumentos[k].tipo) {
+            args[k].sysv = bir_descritor_sysv(c, argumentos[k].tipo)
+            if args[k].sysv == none {
+                let nome_tipo: str = bir_nome_do_tipo((c.e as ^BirEntrada).tipos as ^semantic.Tipos, argumentos[k].tipo) or_else "-"
+                return bir_falha_x0001(c, i.pos, {"CHAMA", "agregado por valor de foreign no alvo linux", nome_tipo}, MARCO_SYSV)
+            }
+        }
+        k += 1
+    }
+    return true
+}
+
+// C: nativo/bir/bir_construir_chamada.c:260
+proc chamar_com_retorno_agregado(c: ^BirCtx, i: ^ir.IrInstr, args: []BirOperando, tam: u32) -> bool {
+    var endereco: u32 = 0
+    if not destino_agregado(c, i, &endereco) {
+        return false
+    }
+    let chama: ^BirInstr = emitir_chama(c, i, args, BC_NADA as u8)
+    chama.a = op_vreg(endereco, BC_I64 as u8)
+    chama.a.tam = tam
+    if (c.p as ^BirPrograma).sysv and (externo_de_fora(c, i.nome) != none) {
+        chama.a.sysv = bir_descritor_sysv(c, i.tipo)
+        if chama.a.sysv == none {
+            let nome_tipo: str = bir_nome_do_tipo((c.e as ^BirEntrada).tipos as ^semantic.Tipos, i.tipo) or_else "-"
+            return bir_falha_x0001(c, i.pos, {"CHAMA", "retorno agregado de foreign no alvo linux", nome_tipo}, MARCO_SYSV)
+        }
+    }
+    return true
+}
+
+// C: nativo/bir/bir_construir_chamada.c:279
+// Dev: ^T e cstr devolvidos por foreign de fora passam pela checagem de NULL (R0005). ?^T e ?cstr nao.
+proc retorno_nao_nulo(c: ^BirCtx, externo: ?^ir.IrExterno) -> bool {
+    let prog: ^BirPrograma = c.p as ^BirPrograma
+    let classe: i32 = semantic.tipo_classe_de((c.e as ^BirEntrada).tipos as ^semantic.Tipos, (externo as ^ir.IrExterno).retorno)
+    let confere: bool = (prog.modo == (BM_DEV as u8)) or prog.checagem
+    return confere and ((classe == semantic.TC_PONTEIRO) or (classe == semantic.TC_CSTR))
+}
+
+// C: nativo/bir/bir_construir_chamada.c:287
+proc bir_arquivo_do_trecho(c: ^BirCtx, arquivo: u32) -> ?str {
+    let f: ?^common.Fonte = (c.e as ^BirEntrada).fonte
+    // C: f->caminho quando arquivo == 0 ou ntrechos <= 1; trechos[arquivo] so no outro ramo (sem ler o indice fora dele)
+    var tern_1: ?str = (f as ^common.Fonte).caminho
+    if not ((arquivo == 0) or ((f as ^common.Fonte).ntrechos <= 1)) {
+        tern_1 = ((f as ^common.Fonte).trechos or_else {})[arquivo].caminho
+    }
+    return tern_1
+}
+
+// C: nativo/bir/bir_construir_chamada.c:295
+proc bir_falha_se_nulo(c: ^BirCtx, valor: u32, origem: ^BirOrigemNulo) {
+    let nulo: u32 = bir_comparar(c, BCOND_EQ as u8, op_vreg(valor, BC_I64 as u8), op_imed(0, BC_I64 as u8))
+    let frio: u32 = bir_novo_bloco(c, true)
+    let segue: u32 = bir_novo_bloco(c, false)
+    bir_desvia(c, op_vreg(nulo, BC_I8 as u8), frio, segue)
+    c.cur = frio
+    var args: []BirOperando = arena_fatia_bir_operando(&(c.p as ^BirPrograma).arena, 3)
+    let oque: str = origem.oque or_else ""
+    let arquivo: str = origem.arquivo or_else ""
+    args[0] = op_vreg(bir_vreg_do_texto(c, oque, len(oque) as u32), BC_I64 as u8)
+    args[1] = op_vreg(bir_vreg_do_texto(c, arquivo, len(arquivo) as u32), BC_I64 as u8)
+    args[2] = op_imed(origem.linha as i64, BC_I32 as u8)
+    bir_armadilha(c, bir_simbolo_runtime(c, "forja_falha_nulo"), args)
+    c.cur = segue
+}
+
+// C: nativo/bir/bir_construir_chamada.c:312
+// resultado == 0 -> forja_falha_nulo("retorno do proc foreign '<nome>'", arquivo do modulo, linha do 'proc') (R0005).
+proc guarda_retorno_foreign(c: ^BirCtx, externo: ?^ir.IrExterno, resultado: u32) {
+    let ext: ^ir.IrExterno = externo as ^ir.IrExterno
+    let nome_exibido: str = common.nome_modulo_exibicao(common.interner_texto((c.e as ^BirEntrada).nomes as ^common.Interner, ext.nome))
+    let oque: str = format(f"retorno do proc foreign '{nome_exibido}'", alloc = heap)
+    defer delete(oque)
+    if (len(oque) as i32) >= TEXTO_FOREIGN_MAX {
+        let nome_cru: str = common.interner_texto((c.e as ^BirEntrada).nomes as ^common.Interner, ext.nome)
+        let aviso: str = format(f"bir: texto do foreign '{nome_cru}' passou de {TEXTO_FOREIGN_MAX} bytes", alloc = heap)
+        defer delete(aviso)
+        common.falha_interna(aviso)
+    }
+    var origem: BirOrigemNulo = BirOrigemNulo{oque = oque, arquivo = bir_arquivo_do_trecho(c, ext.arquivo), linha = ext.linha}
+    bir_falha_se_nulo(c, resultado, &origem)
+}
+
+// C: nativo/bir/bir_construir_chamada.c:323
+proc retorno_da_chamada(c: ^BirCtx, i: ^ir.IrInstr, retorno: ^Passagem) -> bool {
+    if i.tipo == (semantic.TIPO_VAZIO as u32) {
+        return true
+    }
+    if not bir_tipo_passavel((c.e as ^BirEntrada).tipos as ^semantic.Tipos, i.tipo) {
+        return bir_falha_tipo(c, i, "proc", i.tipo)
+    }
+    return passagem_de(c, i.tipo, retorno)
+}
+
+// C: nativo/bir/bir_construir_chamada.c:333
+proc destino_do_retorno(c: ^BirCtx, i: ^ir.IrInstr, classe: u8, dst: ^u32) -> bool {
+    dst^ = BIR_SEM_VREG
+    return (i.destino < 0) or (common.c2f_b2i32(bir_definir_destino(c, classe, dst)) != 0)
+}
+
+// C: nativo/bir/bir_construir_chamada.c:340
+proc chamar_escalar(c: ^BirCtx, i: ^ir.IrInstr, args: []BirOperando, classe: u8) -> bool {
+    let externo: ?^ir.IrExterno = externo_de_fora(c, i.nome)
+    let guarda: bool = (externo != none) and (common.c2f_b2i32(retorno_nao_nulo(c, externo)) != 0)
+    var dst: u32 = 0
+    if not destino_do_retorno(c, i, classe, &dst) {
+        return false
+    }
+    if (common.c2f_b2i32(guarda) != 0) and (dst == BIR_SEM_VREG) {
+        dst = bir_novo_vreg(c, BC_I64 as u8)
+    }
+    let p_1 = emitir_chama(c, i, args, classe)
+    p_1.dst = dst
+    if guarda {
+        guarda_retorno_foreign(c, externo, dst)
+    }
+    return true
+}
+
+// C: nativo/bir/bir_construir_chamada.c:357
+proc omitir_chamada_somem(c: ^BirCtx, i: ^ir.IrInstr) -> bool {
+    var retorno: Passagem = Passagem{classe = 0}
+    var destino: u32 = 0
+    if not retorno_da_chamada(c, i, &retorno) {
+        return false
+    }
+    if i.destino < 0 {
+        return true
+    }
+    if retorno.tam != 0 {
+        if not destino_agregado(c, i, &destino) {
+            return false
+        }
+        bir_zera_bloco(c, destino, retorno.tam)
+        return true
+    }
+    if not destino_do_retorno(c, i, retorno.classe, &destino) {
+        return false
+    }
+    if destino != BIR_SEM_VREG {
+        bir_mover(c, destino, op_imed(0, retorno.classe))
+    }
+    return true
+}
+
+// C: nativo/bir/bir_construir_chamada.c:379
+proc bir_regra_chamada(c: ^BirCtx, i: ^ir.IrInstr) -> bool {
+    var retorno: Passagem = Passagem{}
+    var args: []BirOperando = arena_fatia_bir_operando(&(c.p as ^BirPrograma).arena, 0)
+    // OmitirChamadaSomem antes do ProcConhecido: o proc de std:mem foi podado e nao tem simbolo
+    if ((c.p as ^BirPrograma).modo == (BM_RELEASE as u8)) and (i.nome >= 0) and ((i.nome as u32) < c.n_nomes) and bir_nome_somem(common.interner_texto((c.e as ^BirEntrada).nomes as ^common.Interner, i.nome)) {
+        return omitir_chamada_somem(c, i)
+    }
+    if not proc_conhecido(c, i) {
+        return false
+    }
+    if not retorno_da_chamada(c, i, &retorno) {
+        return false
+    }
+    let de_fora: bool = externo_de_fora(c, i.nome) != none
+    if not construir_args(c, i, de_fora, &args) {
+        return false
+    }
+    if (c.p as ^BirPrograma).sysv and de_fora and (not anexar_descritores_sysv(c, i, args)) {
+        return false
+    }
+    if retorno.tam != 0 {
+        return chamar_com_retorno_agregado(c, i, args, retorno.tam)
+    }
+    return chamar_escalar(c, i, args, retorno.classe)
+}
+
+// C: nativo/bir/bir_construir_chamada.c:406
+proc emitir_chama_ind(c: ^BirCtx, i: ^ir.IrInstr, ch: ^ChamadaInd, classe: u8) -> ^BirInstr {
+    let chama: ^BirInstr = bir_emitir(c, BIR_CHAMA_IND, classe)
+    chama.b = op_vreg(ch.alvo, BC_I64 as u8)
+    chama.args = ch.args
+    chama.nargs = i.nargs
+    return chama
+}
+
+// C: nativo/bir/bir_construir_chamada.c:416
+proc chamar_ind_escalar(c: ^BirCtx, i: ^ir.IrInstr, ch: ^ChamadaInd, classe: u8) -> bool {
+    var dst: u32 = BIR_SEM_VREG
+    if (i.destino >= 0) and (not bir_definir_destino(c, classe, &dst)) {
+        return false
+    }
+    let p_1 = emitir_chama_ind(c, i, ch, classe)
+    p_1.dst = dst
+    return true
+}
+
+// C: nativo/bir/bir_construir_chamada.c:426
+proc chamar_ind_agregado(c: ^BirCtx, i: ^ir.IrInstr, ch: ^ChamadaInd, tam: u32) -> bool {
+    var endereco: u32 = 0
+    var chama: ?^BirInstr = none
+    if not destino_agregado(c, i, &endereco) {
+        return false
+    }
+    chama = emitir_chama_ind(c, i, ch, BC_NADA as u8)
+    let ptr_1: ^BirInstr = chama as ^BirInstr
+    ptr_1.a = op_vreg(endereco, BC_I64 as u8)
+    let ptr_2: ^BirInstr = chama as ^BirInstr
+    ptr_2.a.tam = tam
+    if (c.p as ^BirPrograma).sysv {
+        let ptr_3: ^BirInstr = chama as ^BirInstr
+        ptr_3.a.sysv = bir_descritor_sysv(c, i.tipo)
+    }
+    return true
+}
+
+// C: nativo/bir/bir_construir_chamada.c:443
+// C2F-INDECIDIVEL: args
+proc anexar_descritores_sysv_do_valor(c: ^BirCtx, i: ^ir.IrInstr, args: []BirOperando) {
+    var k: u32 = 0
+    while k < i.nargs {
+        var tern_1: ?^BirSysv = none
+        if common.c2f_b2i32(bir_eh_agregado((c.e as ^BirEntrada).tipos as ^semantic.Tipos, (i.args or_else {})[k].tipo)) != 0 {
+            tern_1 = bir_descritor_sysv(c, (i.args or_else {})[k].tipo)
+        }
+        args[k].sysv = tern_1
+        k += 1
+    }
+}
+
+// C: nativo/bir/bir_construir_chamada.c:450
+proc alvo_da_chamada_ind(c: ^BirCtx, i: ^ir.IrInstr, alvo: ^u32) -> bool {
+    var op: BirOperando = BirOperando{}
+    if (not bir_operando_de(c, i, &i.a, &op)) or (not bir_operando_vreg(c, op, &op)) {
+        return false
+    }
+    alvo^ = op.id
+    let prog: ^BirPrograma = c.p as ^BirPrograma
+    if not ((prog.modo == (BM_DEV as u8)) or prog.checagem) {
+        return true
+    }
+    let posicao: common.FontePosicao = common.fonte_localizar_no_arquivo((c.e as ^BirEntrada).fonte, i.pos)
+    var origem: BirOrigemNulo = BirOrigemNulo{oque = TEXTO_PROC_NULO, arquivo = posicao.caminho, linha = posicao.linha}
+    bir_falha_se_nulo(c, alvo^, &origem)
+    return true
+}
+
+// C: nativo/bir/bir_construir_chamada.c:466
+proc bir_regra_chamada_ind(c: ^BirCtx, i: ^ir.IrInstr) -> bool {
+    var retorno: Passagem = Passagem{}
+    var ch: ChamadaInd = ChamadaInd{}
+    var args: []BirOperando = arena_fatia_bir_operando(&(c.p as ^BirPrograma).arena, 0)
+    if semantic.tipo_classe_de((c.e as ^BirEntrada).tipos as ^semantic.Tipos, i.a.tipo) != semantic.TC_PROC {
+        return bir_falha_inconsistente(c, "chamada indireta sobre valor que nao e proc")
+    }
+    if not retorno_da_chamada(c, i, &retorno) {
+        return false
+    }
+    if (not alvo_da_chamada_ind(c, i, &ch.alvo)) or (not construir_args(c, i, true, &args)) {
+        return false
+    }
+    ch.args = args
+    if (c.p as ^BirPrograma).sysv {
+        anexar_descritores_sysv_do_valor(c, i, args)
+    }
+    if retorno.tam != 0 {
+        return chamar_ind_agregado(c, i, &ch, retorno.tam)
+    }
+    return chamar_ind_escalar(c, i, &ch, retorno.classe)
+}
+
+// C: nativo/bir/bir_construir_chamada.c:486
+proc retorna_agregado(c: ^BirCtx, i: ^ir.IrInstr) -> bool {
+    var forma: BirSlot = BirSlot{}
+    var valor: BirOperando = BirOperando{}
+    var endereco: u32 = 0
+    if (not bir_forma(c, i.a.tipo, &forma)) or (not bir_endereco_de(c, i, &i.a, &endereco)) {
+        return false
+    }
+    valor = op_vreg(endereco, BC_I64 as u8)
+    valor.tam = forma.tam
+    bir_retorna(c, &valor)
+    return true
+}
+
+// C: nativo/bir/bir_construir_chamada.c:500
+proc bir_regra_retorna(c: ^BirCtx, i: ^ir.IrInstr) -> bool {
+    var valor: BirOperando = BirOperando{}
+    if i.a.tipo_no == (ir.V_NENHUM as u8) {
+        bir_retorna(c, none)
+        return true
+    }
+    if bir_eh_agregado((c.e as ^BirEntrada).tipos as ^semantic.Tipos, i.a.tipo) {
+        return retorna_agregado(c, i)
+    }
+    if not bir_operando_de(c, i, &i.a, &valor) {
+        return false
+    }
+    bir_retorna(c, &valor)
+    return true
+}
+
+test "chamada_link_eh_do_crt" {
+    expect(link_eh_do_crt("c"))
+    expect(link_eh_do_crt("m"))
+    expect(link_eh_do_crt("msvcrt"))
+    expect(link_eh_do_crt("ucrt"))
+    expect(link_eh_do_crt("kernel32") == false)
+    expect(link_eh_do_crt("") == false)
+}
+
+test "chamada_estender_estreito" {
+    expect(bir_estender_estreito(op_vreg(7, BC_I8 as u8), semantic.TIPO_I8 as u32).extensao == (BE_SINAL as u8))
+    expect(bir_estender_estreito(op_vreg(7, BC_I8 as u8), semantic.TIPO_U8 as u32).extensao == (BE_ZERO as u8))
+    expect(bir_estender_estreito(op_vreg(7, BC_I16 as u8), semantic.TIPO_I16 as u32).extensao == (BE_SINAL as u8))
+    expect(bir_estender_estreito(op_vreg(7, BC_I64 as u8), semantic.TIPO_I32 as u32).extensao == (BE_NENHUMA as u8))
+}
+
+test "chamada_arquivo_do_trecho" {
+    var fonte: common.Fonte = common.Fonte{caminho = "raiz.fj", ntrechos = 0}
+    var entrada: BirEntrada = BirEntrada{fonte = &fonte}
+    var c: BirCtx = BirCtx{e = &entrada}
+    expect((bir_arquivo_do_trecho(&c, 0) or_else "") == "raiz.fj")
+    expect((bir_arquivo_do_trecho(&c, 3) or_else "") == "raiz.fj")
+}

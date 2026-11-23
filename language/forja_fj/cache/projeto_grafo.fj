@@ -1,0 +1,176 @@
+// cache/projeto_grafo.fj - porte de compiler/cache/projeto_grafo.c, compiler/cache/projeto_grafo.h
+// sha256 de cache/projeto_grafo.c: 4d6f3f7b89ef9679855f12738f585ef21b1366fbf9537017b6f2e7bd56911038
+// sha256 de cache/projeto_grafo.h: 3bc3b9d494e7e553b4a4b167e8f4dab7399da5daad1e3ebe40a2b6bab781ec20
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.2.0
+// Changelog: 0.2.0 - G3 V4-W9: corpo real. posicao_na_trilha recebe a fatia ja com o tamanho da trilha; relatar_ciclo monta a mensagem em bytes e a passa a diag_relatar; projeto_camadas recebe ordem como fatia (o C nunca passa NULL).
+
+import "common"
+
+const SEM_CAMADA: u32 = 4294967295
+
+// C: DependenciasProntas. Todas as dependencias de k ja tem camada menor que 'rodada'.
+proc dependencias_prontas(pr: ^Produto, camada: []u32, rodada: u32) -> bool {
+    for j in (0 as u32)..<pr.ndep {
+        if camada[pr.dep[j]] >= rodada {
+            return false
+        }
+    }
+    return true
+}
+
+// C: UmaRodada. Quem esta pronto ganha a camada 'rodada'. Devolve quantos ganharam.
+proc uma_rodada(p: ^Projeto, camada: []u32, rodada: u32) -> u32 {
+    var novos: u32 = 0
+    var k: u32 = 0
+    while (k as u64) < (len(p.produtos) as u64) {
+        if (camada[k] == SEM_CAMADA) and (common.c2f_b2i32(dependencias_prontas(projeto_produto(p, k), camada, rodada)) != 0) {
+            camada[k] = rodada
+            novos += 1
+        }
+        k += 1
+    }
+    return novos
+}
+
+// C: DependenciaPresa. Primeira dependencia de pr ainda sem camada (todo produto preso tem uma).
+proc dependencia_presa(pr: ^Produto, camada: []u32) -> u32 {
+    for j in (0 as u32)..<pr.ndep {
+        if camada[pr.dep[j]] == SEM_CAMADA {
+            return pr.dep[j]
+        }
+    }
+    return pr.dep[0]
+}
+
+// C: PrimeiroSemCamada
+proc primeiro_sem_camada(camada: []u32) -> u32 {
+    var k: u32 = 0
+    while camada[k] != SEM_CAMADA {
+        k += 1
+    }
+    return k
+}
+
+// C: PosicaoNaTrilha. Posicao de produto na trilha (a fatia tem o tamanho da trilha); len(trilha) se ainda nao esta.
+proc posicao_na_trilha(trilha: []u32, produto: u32) -> u32 {
+    var pos: u32 = 0
+    while (pos < (len(trilha) as u32)) and (trilha[pos] != produto) {
+        pos += 1
+    }
+    return pos
+}
+
+// C: RelatarCiclo. Anda de dependencia presa em dependencia presa ate repetir um produto; o ciclo e o trecho desde a repeticao (B0007).
+proc relatar_ciclo(p: ^Projeto, camada: []u32, erro: ^common.Diag) {
+    var trilha = make([dynamic]u32, alloc = heap, cap = len(p.produtos) + 1)
+    defer delete(trilha)
+    var atual: u32 = primeiro_sem_camada(camada)
+    var inicio: u32 = posicao_na_trilha(trilha[..], atual)
+    while inicio == (len(trilha) as u32) {
+        append(&trilha, item = atual)
+        atual = dependencia_presa(projeto_produto(p, atual), camada)
+        inicio = posicao_na_trilha(trilha[..], atual)
+    }
+    var texto = make([dynamic]u8, alloc = heap)
+    defer delete(texto)
+    append(&texto, items = as_bytes("ciclo de dependencia: "))
+    let tam = len(trilha) as u64
+    for k in (inicio as u64)..<tam {
+        let nome_k = projeto_produto(p, trilha[k] as u32).nome or_else ""
+        format(f"{nome_k} -> ", into = &texto)
+    }
+    let nome_atual = projeto_produto(p, atual).nome or_else ""
+    format(f"{nome_atual}", into = &texto)
+    append(&texto, item = 0)
+    _ = common.diag_relatar(erro, common.B0007, 0, texto_c_de_bytes(texto[..]))
+}
+
+// C: OrdenarPorCamada. Indices por (camada, indice): o indice ja e a ordem de nome.
+proc ordenar_por_camada(p: ^Projeto, camada: []u32, maior: u32, ordem: []u32) {
+    var pos: u32 = 0
+    for c in (0 as u32)..=maior {
+        var k: u32 = 0
+        while (k as u64) < (len(p.produtos) as u64) {
+            if camada[k] == c {
+                let antes_1: u32 = pos
+                pos += 1
+                ordem[antes_1] = k
+            }
+            k += 1
+        }
+    }
+}
+
+// C: ProjetoCamadas. Camadas por Kahn; ciclo = false e B0007 em erro. camada e ordem tem len(p.produtos) posicoes (do chamador).
+pub proc projeto_camadas(p: ^Projeto, camada: []u32, ordem: []u32, erro: ^common.Diag) -> bool {
+    let n = len(p.produtos) as u32
+    var k: u32 = 0
+    while k < n {
+        camada[k] = SEM_CAMADA
+        k += 1
+    }
+    var total: u32 = 0
+    var rodada: u32 = 0
+    while total < n {
+        let novos = uma_rodada(p, camada, rodada)
+        if novos == 0 {
+            relatar_ciclo(p, camada, erro)
+            return false
+        }
+        total += novos
+        rodada += 1
+    }
+    ordenar_por_camada(p, camada, rodada - 1, ordem)
+    return true
+}
+
+// Testes dirigidos (C: PosicaoNaTrilha, ProjetoCamadas, RelatarCiclo); camadas conferidas a mao (Kahn) contra o C.
+test "grafo: posicao na trilha" {
+    var t: [3]u32 = {5, 7, 9}
+    expect(posicao_na_trilha(t[..], 7) == 1)
+    expect(posicao_na_trilha(t[..], 4) == 3)
+}
+
+test "grafo: camadas em ordem de nome" {
+    var p = Projeto{}
+    p.produtos = make([dynamic]Produto, alloc = heap)
+    defer delete(p.produtos)
+    var a = Produto{}
+    a.nome = "a"
+    append(&p.produtos, item = a)
+    var b = Produto{}
+    b.nome = "b"
+    b.ndep = 1
+    b.dep[0] = 0
+    append(&p.produtos, item = b)
+    var camada: [2]u32 = {0, 0}
+    var ordem: [2]u32 = {0, 0}
+    var d = common.Diag{}
+    expect(projeto_camadas(&p, camada[..], ordem[..], &d))
+    expect(camada[0] == 0 and camada[1] == 1)
+    expect(ordem[0] == 0 and ordem[1] == 1)
+    expect(not d.tem)
+}
+
+test "grafo: ciclo sai com B0007" {
+    var p = Projeto{}
+    p.produtos = make([dynamic]Produto, alloc = heap)
+    defer delete(p.produtos)
+    var a = Produto{}
+    a.nome = "a"
+    a.ndep = 1
+    a.dep[0] = 1
+    append(&p.produtos, item = a)
+    var b = Produto{}
+    b.nome = "b"
+    b.ndep = 1
+    b.dep[0] = 0
+    append(&p.produtos, item = b)
+    var camada: [2]u32 = {0, 0}
+    var ordem: [2]u32 = {0, 0}
+    var d = common.Diag{}
+    expect(not projeto_camadas(&p, camada[..], ordem[..], &d))
+    expect(d.tem)
+    expect(d.codigo == common.B0007)
+}

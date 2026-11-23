@@ -1,0 +1,219 @@
+// nativo/x64/x64_regalloc_intervalos.fj - porte de compiler/nativo/x64/x64_regalloc_intervalos.c
+// sha256 de nativo/x64/x64_regalloc_intervalos.c: 0b0b5f06d667ca16e9ce5e5f11dfcd9e3c535e368449bed3e867585aba32627a
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.2.0
+// Changelog: 0.2.0 - G3 V3 L5: regalloc_intervalos com corpo real (ordem de chamada e de escrita do C).
+
+import "common"
+import "nativo/bir"
+
+struct Contexto {
+    programa: ?^bir.BirPrograma
+    f: ?^bir.BirFuncao
+    analises: ?^bir.AnalisesBir
+    saida: ?^Intervalos
+    pos_ini: ?[]u32
+    pos_fim: ?[]u32
+}
+
+const PROFUNDIDADE_MAX: u32 = 6
+const PESO_DA_PROFUNDIDADE: [7]u64 = {1, 10, 100, 1000, 10000, 100000, 1000000}
+
+// C: nativo/x64/x64_regalloc_intervalos.c:27
+proc estender(iv: ^IntervaloVreg, pos: u32) {
+    if (iv.inicio == REGALLOC_SEM_POS) or (pos < iv.inicio) {
+        iv.inicio = pos
+    }
+    if pos > iv.fim {
+        iv.fim = pos
+    }
+}
+
+// C: nativo/x64/x64_regalloc_intervalos.c:35
+proc tocar(s: ^Intervalos, vreg: u32, pos: u32, peso: u64) {
+    estender(&(s.iv or_else {})[vreg], pos)
+    let p_1 = s.iv or_else {}
+    p_1[vreg].peso += peso
+}
+
+// C: nativo/x64/x64_regalloc_intervalos.c:41
+proc tocar_operando(s: ^Intervalos, o: ^bir.BirOperando, pos: u32, peso: u64) {
+    if (o.tipo == (bir.BO_VREG as u8)) and (o.id < s.nvregs) {
+        tocar(s, o.id, pos, peso)
+    }
+}
+
+// C: nativo/x64/x64_regalloc_intervalos.c:48
+proc eh_chamada(op: u8) -> bool {
+    return ((op == (bir.BIR_CHAMA as u8)) or (op == (bir.BIR_CHAMA_IND as u8))) or (op == (bir.BIR_ARMADILHA as u8))
+}
+
+// C: nativo/x64/x64_regalloc_intervalos.c:53
+proc visitar_instrucao(c: ^Contexto, i: ^bir.BirInstr, pos: u32, peso: u64) {
+    let s: ?^Intervalos = c.saida
+    if (i.dst != bir.BIR_SEM_VREG) and (i.dst < (s as ^Intervalos).nvregs) {
+        tocar(s as ^Intervalos, i.dst, pos, peso)
+        if peso > 1 {
+            let ptr_1: ^Intervalos = s as ^Intervalos
+            let p_1 = ptr_1.iv or_else {}
+            p_1[i.dst].def_em_laco = true
+        }
+    }
+    tocar_operando(s as ^Intervalos, &i.a, pos, peso)
+    tocar_operando(s as ^Intervalos, &i.b, pos, peso)
+    for k in (0 as u32)..<i.nargs {
+        tocar_operando(s as ^Intervalos, &(i.args or_else {})[k], pos, peso)
+    }
+    if ((i.op == (bir.BIR_CHAMA_IND as u8)) and (i.b.tipo == (bir.BO_VREG as u8))) and (i.b.id < (s as ^Intervalos).nvregs) {
+        let ptr_2: ^Intervalos = s as ^Intervalos
+        let p_2 = ptr_2.iv or_else {}
+        p_2[i.b.id].regra_antiga = true
+    }
+    if ((i.op == (bir.BIR_CHAMA as u8)) and (i.a.tipo == (bir.BO_VREG as u8))) and (i.a.id < (s as ^Intervalos).nvregs) {
+        let ptr_3: ^Intervalos = s as ^Intervalos
+        let p_3 = ptr_3.iv or_else {}
+        p_3[i.a.id].regra_antiga = true
+    }
+    if eh_chamada(i.op) {
+        let ptr_4: ^Intervalos = s as ^Intervalos
+        let p_4 = ptr_4.chamadas_ate or_else {}
+        p_4[pos] = 1
+    }
+    if sysv_eh_chamada_do_programa(c.programa as ^bir.BirPrograma, i) {
+        let ptr_5: ^Intervalos = s as ^Intervalos
+        ptr_5.tem_sysv = true
+    }
+}
+
+// C: nativo/x64/x64_regalloc_intervalos.c:77
+proc posicionar_blocos(c: ^Contexto) {
+    let a: ?^bir.AnalisesBir = c.analises
+    var pos: u32 = 0
+    var r: u32 = 0
+    while r < (a as ^bir.AnalisesBir).nrpo {
+        let b: u32 = ((a as ^bir.AnalisesBir).rpo or_else {})[r]
+        let bloco: ^bir.BirBloco = &(c.f as ^bir.BirFuncao).blocos[b]
+        let prof: u32 = min(((a as ^bir.AnalisesBir).prof_laco or_else {})[b], PROFUNDIDADE_MAX)
+        let p_1 = c.pos_ini or_else {}
+        p_1[b] = pos + 1
+        for k in (0 as u32)..<bloco.n {
+            pos += 1
+            let arg_1: u64 = PESO_DA_PROFUNDIDADE[prof]
+            let arg_2: u32 = pos
+            let arg_3: ^bir.BirInstr = &bloco.instrs[k]
+            let arg_4: ^Contexto = c
+            visitar_instrucao(arg_4, arg_3, arg_2, arg_1)
+        }
+        let p_2 = c.pos_fim or_else {}
+        p_2[b] = pos
+        r += 1
+    }
+}
+
+// C: nativo/x64/x64_regalloc_intervalos.c:94
+proc estender_por_conjunto(s: ^Intervalos, conjunto: ^bir.ConjuntoVivo, pos: u32) {
+    for k in (0 as u32)..<conjunto.n {
+        estender(&(s.iv or_else {})[(conjunto.v or_else {})[k]], pos)
+    }
+}
+
+// C: nativo/x64/x64_regalloc_intervalos.c:101
+proc estender_pela_vivacidade(c: ^Contexto) {
+    let a: ?^bir.AnalisesBir = c.analises
+    var r: u32 = 0
+    while r < (a as ^bir.AnalisesBir).nrpo {
+        let b: u32 = ((a as ^bir.AnalisesBir).rpo or_else {})[r]
+        if (c.f as ^bir.BirFuncao).blocos[b].n == 0 {
+            r += 1
+            continue
+        }
+        estender_por_conjunto(c.saida as ^Intervalos, &((a as ^bir.AnalisesBir).vivo_entra or_else {})[b], (c.pos_ini or_else {})[b])
+        estender_por_conjunto(c.saida as ^Intervalos, &((a as ^bir.AnalisesBir).vivo_sai or_else {})[b], (c.pos_fim or_else {})[b])
+        r += 1
+    }
+}
+
+// C: nativo/x64/x64_regalloc_intervalos.c:116
+proc marcar_carregadas_por_laco(c: ^Contexto) {
+    let a: ?^bir.AnalisesBir = c.analises
+    var k: u32 = 0
+    while k < (a as ^bir.AnalisesBir).nlacos {
+        let vivo: ^bir.ConjuntoVivo = &((a as ^bir.AnalisesBir).vivo_entra or_else {})[((a as ^bir.AnalisesBir).lacos or_else {})[k].cabecalho]
+        var j: u32 = 0
+        while j < vivo.n {
+            if ((c.saida as ^Intervalos).iv or_else {})[(vivo.v or_else {})[j]].def_em_laco {
+                let ptr_1: ^Intervalos = c.saida as ^Intervalos
+                let p_1 = ptr_1.iv or_else {}
+                p_1[(vivo.v or_else {})[j]].carregada = true
+            }
+            j += 1
+        }
+        k += 1
+    }
+}
+
+// C: nativo/x64/x64_regalloc_intervalos.c:132
+proc cruza_chamada(s: ^Intervalos, iv: ^IntervaloVreg, alvo_linux: bool) -> bool {
+    if ((common.c2f_b2i32(iv.regra_antiga) != 0) or (common.c2f_b2i32(s.tem_sysv) != 0)) or (common.c2f_b2i32(alvo_linux) != 0) {
+        return ((s.chamadas_ate or_else {})[iv.fim] - (s.chamadas_ate or_else {})[iv.inicio]) > 0
+    }
+    if iv.fim <= (iv.inicio + 1) {
+        return false
+    }
+    return ((s.chamadas_ate or_else {})[iv.fim - 1] - (s.chamadas_ate or_else {})[iv.inicio]) > 0
+}
+
+// C: nativo/x64/x64_regalloc_intervalos.c:142
+proc finalizar_intervalos(c: ^Contexto) {
+    let s: ?^Intervalos = c.saida
+    for pos in (1 as u32)..=(s as ^Intervalos).npos {
+        let ptr_1: ^Intervalos = s as ^Intervalos
+        let p_1 = ptr_1.chamadas_ate or_else {}
+        p_1[pos] += ((s as ^Intervalos).chamadas_ate or_else {})[pos - 1]
+    }
+    var v: u32 = 0
+    while v < (s as ^Intervalos).nvregs {
+        let iv: ^IntervaloVreg = &((s as ^Intervalos).iv or_else {})[v]
+        let classe: u8 = ((c.f as ^bir.BirFuncao).classe_vreg or_else {})[v]
+        if iv.inicio == REGALLOC_SEM_POS {
+            v += 1
+            continue
+        }
+        if v < (c.f as ^bir.BirFuncao).nparams {
+            iv.inicio = 0
+        }
+        iv.real = bir.bir_classe_eh_xmm(classe as i32)
+        iv.elegivel = (((classe as i32) >= bir.BC_I8) and ((classe as i32) <= bir.BC_V128)) and (not ((v < (c.f as ^bir.BirFuncao).nparams) and (common.c2f_b2i32(abi_win_param_em_bytes(c.f, v)) != 0)))
+        iv.cruza_chamada = cruza_chamada(s as ^Intervalos, iv, (c.programa as ^bir.BirPrograma).sysv)
+        v += 1
+    }
+}
+
+// C: nativo/x64/x64_regalloc_intervalos.c:162
+proc contar_posicoes(f: ^bir.BirFuncao, a: ^bir.AnalisesBir) -> u32 {
+    var n: u32 = 0
+    for r in (0 as u32)..<a.nrpo {
+        n += f.blocos[(a.rpo or_else {})[r]].n
+    }
+    return n
+}
+
+// C: nativo/x64/x64_regalloc_intervalos.c:171
+proc regalloc_intervalos(programa: ^bir.BirPrograma, f: ^bir.BirFuncao, a: ^bir.AnalisesBir, saida: ^Intervalos) {
+    let arena: ^common.Arena = saida.arena as ^common.Arena
+    let npos: u32 = contar_posicoes(f, a)
+    saida^ = Intervalos{arena = saida.arena, nvregs = f.nvregs, npos = npos}
+    saida.iv = arena_fatia_intervalo_vreg(arena, (f.nvregs + 1) as int)
+    saida.chamadas_ate = common.arena_fatia_u32(arena, (npos + 2) as int)
+    var c = Contexto{programa = programa, f = f, analises = a, saida = saida}
+    c.pos_ini = common.arena_fatia_u32(arena, (f.nblocos + 1) as int)
+    c.pos_fim = common.arena_fatia_u32(arena, (f.nblocos + 1) as int)
+    let ivs: []IntervaloVreg = saida.iv or_else {}
+    for v in (0 as u32)..<f.nvregs {
+        ivs[v].inicio = REGALLOC_SEM_POS
+    }
+    posicionar_blocos(&c)
+    estender_pela_vivacidade(&c)
+    marcar_carregadas_por_laco(&c)
+    finalizar_intervalos(&c)
+}

@@ -1,0 +1,196 @@
+// semantic/sem_sorteio.fj - porte de compiler/semantic/sem_sorteio.c
+// sha256 de semantic/sem_sorteio.c: 4a175fdccfe795f40a09bcdf73cb10e074b16d321b72d76c5d9fd1cd84a033b9
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "common"
+import "frontend"
+
+// C: semantic/sem_sorteio.c:15
+// O texto do Interner e o str exato do nome (tamanho e bytes), a mesma conta do strlen + memcmp do C.
+proc nome_eh_texto(s: ^Semantica, nome: i32, texto: str) -> bool {
+    return common.interner_texto(nomes_da_sem(s), nome) == texto
+}
+
+// C: semantic/sem_sorteio.c:22
+proc eh_rng_do_rand(s: ^Semantica, d: ?^frontend.Decl) -> bool {
+    if (d == none) or ((d as ^frontend.Decl).tipo_no != (frontend.D_STRUCT as u8)) or ((d as ^frontend.Decl).modulo == 0) or (s.modulos == none) {
+        return false
+    }
+    if not nome_eh_texto(s, (d as ^frontend.Decl).nome, "Rng") {
+        return false
+    }
+    let m: frontend.Modulo = modulos_da_sem(s).itens[(d as ^frontend.Decl).modulo as int]
+    return (m.origem == (frontend.MOD_STD as u8)) and nome_eh_texto(s, m.caminho, "std:rand")
+}
+
+// C: semantic/sem_sorteio.c:32
+pub proc sem_below_do_rng(s: ^Semantica, ponteiro: u32) -> ?^frontend.Decl {
+    var rng: ?^frontend.Decl = none
+    if common.c2f_s2u_32(tipo_classe_de(&s.tipos, ponteiro)) != (TC_PONTEIRO as u32) {
+        return none
+    }
+    rng = sem_decl_da_struct(s, ponteiro)
+    if not eh_rng_do_rand(s, rng) {
+        return none
+    }
+    var d: ?^frontend.Decl = (s.programa as ^frontend.Programa).primeira
+    while d != none {
+        if ((((d as ^frontend.Decl).tipo_no == (frontend.D_PROC as u8)) and (((d as ^frontend.Decl).modulo as i32) == ((rng as ^frontend.Decl).modulo as i32))) and (common.c2f_b2i32((d as ^frontend.Decl).publico) != 0)) and (common.c2f_b2i32(nome_eh_texto(s, (d as ^frontend.Decl).nome, "below")) != 0) {
+            return d
+        }
+        d = (d as ^frontend.Decl).prox
+    }
+    return none
+}
+
+// C: semantic/sem_sorteio.c:45
+proc erro_rng(s: ^Semantica, e: ^frontend.Expr, motivo: str) -> bool {
+    let msg_1 = format(f"{sem_nome_texto(s, e.nome)}: o rng nao e ^rand.Rng de std:rand ({motivo})", alloc = heap)
+    defer delete(msg_1)
+    return sem_erro(s, common.E0338, e.pos_op, msg_1)
+}
+
+// C: semantic/sem_sorteio.c:51
+proc conferir_rng(s: ^Semantica, e: ^frontend.Expr) -> bool {
+    let rng: ?^frontend.Arg = argumento_do_parametro(e, 1)
+    if rng == none {
+        return erro_rng(s, e, "falta o argumento rng = &r")
+    }
+    if not sem_checar(s, (rng as ^frontend.Arg).valor, TIPO_VAZIO as u32) {
+        return false
+    }
+    if sem_below_do_rng(s, ((rng as ^frontend.Arg).valor as ^frontend.Expr).tipo) != none {
+        return true
+    }
+    return erro_rng(s, e, "passe o endereco de um Rng: rng = &r, com r de rand.seed")
+}
+
+// C: semantic/sem_sorteio.c:61
+proc colecao_do_sorteio(s: ^Semantica, e: ^frontend.Expr, escolha: bool, elemento: ^u32) -> bool {
+    let v: ?^frontend.Expr = (argumento_do_parametro(e, 0) as ^frontend.Arg).valor
+    return (common.c2f_b2i32(sem_checar(s, v, TIPO_VAZIO as u32)) != 0) and (common.c2f_b2i32(sem_colecao_ja_checada(s, e, 0, not escolha, elemento)) != 0)
+}
+
+// C: semantic/sem_sorteio.c:68
+proc chamar_sorteio(s: ^Semantica, e: ^frontend.Expr, escolha: bool) -> bool {
+    var elemento: u32 = 0
+    if (not sem_ligar_embutido(s, e, s.params_lista[(ASS_SORTEIO as int)..<((ASS_SORTEIO as int) + 2)])) or (not colecao_do_sorteio(s, e, escolha, &elemento)) {
+        return false
+    }
+    if not conferir_rng(s, e) {
+        return false
+    }
+    if not escolha {
+        e.tipo = TIPO_VAZIO as u32
+        return true
+    }
+    if not sem_lista_sem_dono(s, e, elemento, "sortearia") {
+        return false
+    }
+    let ponteiro: bool = tipo_classe_de(&s.tipos, elemento) == TC_PONTEIRO
+    if ponteiro {
+        e.tipo = tipo_anulavel(&s.tipos, tipo_de(&s.tipos, elemento).a)
+    } else {
+        e.tipo = tipo_opcional(&s.tipos, elemento)
+    }
+    return true
+}
+
+// C: semantic/sem_sorteio.c:84
+proc sem_chamar_shuffle(s: ^Semantica, e: ^frontend.Expr) -> bool {
+    return chamar_sorteio(s, e, false)
+}
+
+// C: semantic/sem_sorteio.c:89
+proc sem_chamar_choice(s: ^Semantica, e: ^frontend.Expr) -> bool {
+    return chamar_sorteio(s, e, true)
+}
+
+// G3 S5: testes dirigidos (so existem em `forja test`)
+test "sem_sorteio: nome_eh_texto e eh_rng_do_rand" {
+    var pre: [4]str = {"Rng", "Outro", "std:rand", "std:mat"}
+    var c = S5Cena{}
+    s5_cena_montar(&c, pre[..])
+    let id_rng: i32 = s5_nome(&c, "Rng")
+    expect(nome_eh_texto(&c.sv, id_rng, "Rng") and not nome_eh_texto(&c.sv, id_rng, "Rn") and not nome_eh_texto(&c.sv, id_rng, "Rngx") and not nome_eh_texto(&c.sv, id_rng, "rng"))
+    // sem decl, decl que nao e struct, modulo 0, sem modulos
+    expect(not eh_rng_do_rand(&c.sv, none))
+    var d = frontend.Decl{tipo_no = frontend.D_STRUCT as u8, nome = id_rng, modulo = 1}
+    expect(not eh_rng_do_rand(&c.sv, &d))
+    var mods: [1]frontend.Modulos = {frontend.Modulos{}}
+    mods[0].n = 2
+    mods[0].itens[1] = frontend.Modulo{caminho = s5_nome(&c, "std:rand"), origem = frontend.MOD_STD as u8}
+    c.sv.modulos = mods[..]
+    expect(eh_rng_do_rand(&c.sv, &d))
+    d.modulo = 0
+    expect(not eh_rng_do_rand(&c.sv, &d))
+    d.modulo = 1
+    d.tipo_no = frontend.D_PROC as u8
+    expect(not eh_rng_do_rand(&c.sv, &d))
+    d.tipo_no = frontend.D_STRUCT as u8
+    d.nome = s5_nome(&c, "Outro")
+    expect(not eh_rng_do_rand(&c.sv, &d))
+    d.nome = id_rng
+    mods[0].itens[1].caminho = s5_nome(&c, "std:mat")
+    expect(not eh_rng_do_rand(&c.sv, &d))
+    mods[0].itens[1].caminho = s5_nome(&c, "std:rand")
+    mods[0].itens[1].origem = 0
+    expect(not eh_rng_do_rand(&c.sv, &d))
+    c.sv.modulos = none
+    s5_cena_liberar(&c)
+}
+
+test "sem_sorteio: chamar_sorteio (shuffle e choice, rng, E0338)" {
+    var pre: [6]str = {"Rng", "below", "std:rand", "shuffle", "choice", "Outro"}
+    var c = S5Cena{}
+    s5_cena_montar(&c, pre[..])
+    let id_rng: i32 = s5_nome(&c, "Rng")
+    // modulo 1 = std:rand; a struct Rng e o proc publico below dele
+    var mods: [1]frontend.Modulos = {frontend.Modulos{}}
+    mods[0].n = 2
+    mods[0].itens[1] = frontend.Modulo{caminho = s5_nome(&c, "std:rand"), origem = frontend.MOD_STD as u8}
+    c.sv.modulos = mods[..]
+    let d_rng: ^frontend.Decl = s4_novo_decl(&c.sv)
+    d_rng.tipo_no = frontend.D_STRUCT as u8
+    d_rng.nome = id_rng
+    d_rng.modulo = 1
+    let d_below: ^frontend.Decl = s4_novo_decl(&c.sv)
+    d_below.tipo_no = frontend.D_PROC as u8
+    d_below.nome = s5_nome(&c, "below")
+    d_below.modulo = 1
+    d_below.publico = true
+    d_rng.prox = d_below
+    c.prog.primeira = d_rng
+    c.prog.ultima = d_below
+    let y: ^Simbolo = &(c.sv.globais or_else {})[id_rng]
+    y.categoria = SIM_STRUCT as u8
+    y.tipo = tipo_struct(&c.sv.tipos, id_rng)
+    y.decl = d_rng
+    let prng: u32 = tipo_ponteiro(&c.sv.tipos, y.tipo)
+    expect(sem_below_do_rng(&c.sv, prng) == d_below and sem_below_do_rng(&c.sv, y.tipo) == none)
+    let i32t: u32 = TIPO_I32 as u32
+    let fatia: u32 = tipo_fatia(&c.sv.tipos, i32t)
+    var dois: [2]u32 = {fatia, prng}
+    var ch = S5Chamada{}
+    // shuffle(v, rng = &r) -> vazio
+    s5_chamada_montar(&ch, s5_nome(&c, "shuffle"), dois[..])
+    expect(sem_chamar_shuffle(&c.sv, &ch.e) and ch.e.tipo == (TIPO_VAZIO as u32))
+    // choice(v, rng = &r) -> ?T; com elemento ponteiro -> ?^T
+    expect(sem_chamar_choice(&c.sv, &ch.e) and ch.e.tipo == tipo_opcional(&c.sv.tipos, i32t))
+    ch.folhas[0].tipo = tipo_fatia(&c.sv.tipos, tipo_ponteiro(&c.sv.tipos, i32t))
+    expect(sem_chamar_choice(&c.sv, &ch.e) and ch.e.tipo == tipo_anulavel(&c.sv.tipos, i32t))
+    // rng que nao e o Rng do std:rand: E0338 com a causa
+    ch.folhas[0].tipo = fatia
+    ch.folhas[1].tipo = tipo_ponteiro(&c.sv.tipos, i32t)
+    ch.e.nome = s5_nome(&c, "choice")
+    expect(not sem_chamar_choice(&c.sv, &ch.e))
+    expect(c.diag.codigo == common.E0338 and c.diag.off == 9 and (c.diag.causa or_else "") == "choice: o rng nao e ^rand.Rng de std:rand (passe o endereco de um Rng: rng = &r, com r de rand.seed)")
+    ch.e.nome = s5_nome(&c, "shuffle")
+    expect(not sem_chamar_shuffle(&c.sv, &ch.e))
+    expect((c.diag.causa or_else "") == "shuffle: o rng nao e ^rand.Rng de std:rand (passe o endereco de um Rng: rng = &r, com r de rand.seed)")
+    // (colecao que nao e lista, array nem fatia: E0310 -> sem_relacionar -> rel_do_uso, stub do S8: sem execucao)
+    s5_chamada_liberar(&ch)
+    c.sv.modulos = none
+    s5_cena_liberar(&c)
+}

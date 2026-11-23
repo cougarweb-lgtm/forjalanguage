@@ -1,0 +1,396 @@
+// std do pacote zip, leitor (0.1.0, 22/11/2026): par do zip.fj. Abre o .zip inteiro em memoria, le o diretorio central,
+// descomprime (metodo 0 stored e 8 deflate raw, por vendor:compression) e confere o crc32 de cada entrada.
+// Nomes UTF-8 viram str. extrair_tudo recusa nome com `..`, caminho absoluto, letra de unidade ou segmento vazio (zip-slip).
+// Sem zip64: marca zip64 ou entrada acima de 4 GiB = LerError.grande_demais. Outro metodo = LerError.metodo_nao_suportado.
+// O arquivo inteiro fica na memoria; cada ler_entrada devolve uma lista nova (dona: delete).
+//
+// USO (o .fj raiz precisa de vendor\ ao lado: junção para language\vendor):
+//     import "vendor:compression/zip_ler"
+//     var z = try zip_ler.abrir_zip("entrada.zip")
+//     defer zip_ler.fechar_zip(&z)
+//     let bytes = try zip_ler.ler_entrada(&z, "xl/workbook.xml")   // dona: delete(bytes)
+//     try zip_ler.extrair_tudo(&z, "pasta_destino")
+//
+// Changelog: 0.1.0 - abrir_zip, ler_entrada, extrair_tudo, fechar_zip.
+
+import "vendor:compression/compression"
+import "std:file"
+import "std:path"
+
+pub enum LerError {
+    arquivo
+    formato
+    metodo_nao_suportado
+    crc
+    nome_perigoso
+    nao_achou
+    grande_demais
+    gravar
+    descompressao
+}
+
+const TAM_FIM: int = 22
+const TAM_CENTRAL: int = 46
+const TAM_LOCAL: int = 30
+const MAX_COMENTARIO: int = 65535
+const LIMITE_U16: int = 65535
+const LIMITE_U32: int = 4294967295
+const ASSINATURA_LOCAL: int = 0x04034B50
+const ASSINATURA_CENTRAL: int = 0x02014B50
+const ASSINATURA_FIM: int = 0x06054B50
+const METODO_STORED: int = 0
+const METODO_DEFLATE: int = 8
+const TAM_PEDACO: int = 65536
+const BARRA: u8 = 47
+const BARRA_INVERTIDA: u8 = 92
+const DOIS_PONTOS: u8 = 58
+const PONTO: u8 = 46
+
+pub struct Entrada {
+    nome: str
+    metodo: int
+    tamanho: int
+    comprimido: int
+    crc: u32
+    offset: int
+}
+
+pub struct Zip {
+    dados: [dynamic]u8
+    entradas: [dynamic]Entrada
+}
+
+struct Passo {
+    consumido: int
+    escrito: int
+    feito: bool
+}
+
+// Abre o .zip inteiro e le o diretorio central. O Zip e dono dos bytes e dos nomes: feche com fechar_zip.
+pub proc abrir_zip(caminho: str) -> Zip ! LerError {
+    var z = Zip{dados = try ler_arquivo(caminho), entradas = make([dynamic]Entrada, alloc = heap)}
+    switch falha in ler_diretorio(&z) {
+    case LerError:
+        fechar_zip(&z)
+        return falha
+    default:
+        return z
+    }
+    return LerError.formato
+}
+
+// Bytes do arquivo inteiro (lista dona, devolvida por movimento).
+proc ler_arquivo(caminho: str) -> [dynamic]u8 ! LerError {
+    switch r in file.read_all(caminho, alloc = heap) {
+    case [dynamic]u8:
+        return r
+    case file.FileError:
+        return LerError.arquivo
+    }
+    return LerError.arquivo
+}
+
+// Libera nomes, entradas e bytes do arquivo. Depois disto o Zip nao serve mais.
+pub proc fechar_zip(z: ^Zip) {
+    for i in 0..<len(z.entradas) {
+        delete(z.entradas[i].nome)
+    }
+    delete(z.entradas)
+    delete(z.dados)
+}
+
+// Devolve os bytes descomprimidos da entrada com este nome (lista nova, dona: delete). Confere o crc32.
+pub proc ler_entrada(z: ^Zip, nome: str) -> [dynamic]u8 ! LerError {
+    let i = indice_entrada(z, nome)
+    if i < 0 {
+        return LerError.nao_achou
+    }
+    let saida = try descomprimir(z, i)
+    return saida
+}
+
+// Extrai todas as entradas para pasta (criada se nao existir), com as subpastas do nome.
+// Todos os nomes sao validados antes da primeira gravacao: um nome ruim nao deixa extracao pela metade.
+pub proc extrair_tudo(z: ^Zip, pasta: str) -> ! LerError {
+    for i in 0..<len(z.entradas) {
+        if not nome_seguro(z.entradas[i].nome) {
+            return LerError.nome_perigoso
+        }
+    }
+    if not file.is_dir(pasta) {
+        if file.make_dir(pasta, all = true) != none {
+            return LerError.gravar
+        }
+    }
+    for i in 0..<len(z.entradas) {
+        try extrair_entrada(z, i, pasta)
+    }
+    return
+}
+
+// Acha o registro de fim (procura de tras para frente, porque pode haver comentario de ate 64 KiB).
+// Depois le cada registro do diretorio central.
+proc ler_diretorio(z: ^Zip) -> ! LerError {
+    let tam = len(z.dados)
+    if tam < TAM_FIM {
+        return LerError.formato
+    }
+    var fim: int = -1
+    var i: int = tam - TAM_FIM
+    let menor: int = max(0, tam - TAM_FIM - MAX_COMENTARIO)
+    while i >= menor {
+        let assinatura = try le32(z.dados[..], i)
+        if assinatura == ASSINATURA_FIM {
+            fim = i
+            break
+        }
+        i -= 1
+    }
+    if fim < 0 {
+        return LerError.formato
+    }
+    let total = try le16(z.dados[..], fim + 10)
+    let tam_central = try le32(z.dados[..], fim + 12)
+    let inicio = try le32(z.dados[..], fim + 16)
+    if total == LIMITE_U16 or tam_central == LIMITE_U32 or inicio == LIMITE_U32 {
+        return LerError.grande_demais
+    }
+    if inicio + tam_central > fim {
+        return LerError.formato
+    }
+    var pos = inicio
+    var n: int = 0
+    while n < total {
+        pos = try ler_registro(z, pos)
+        n += 1
+    }
+    if pos != inicio + tam_central {
+        return LerError.formato
+    }
+    return
+}
+
+// Le um registro do diretorio central em pos, guarda a entrada e devolve a posicao do proximo registro.
+proc ler_registro(z: ^Zip, pos: int) -> int ! LerError {
+    let assinatura = try le32(z.dados[..], pos)
+    if assinatura != ASSINATURA_CENTRAL {
+        return LerError.formato
+    }
+    let metodo = try le16(z.dados[..], pos + 10)
+    let crc_lido = try le32(z.dados[..], pos + 16)
+    let comprimido = try le32(z.dados[..], pos + 20)
+    let tamanho = try le32(z.dados[..], pos + 24)
+    let nome_tam = try le16(z.dados[..], pos + 28)
+    let extra_tam = try le16(z.dados[..], pos + 30)
+    let coment_tam = try le16(z.dados[..], pos + 32)
+    let offset = try le32(z.dados[..], pos + 42)
+    if comprimido == LIMITE_U32 or tamanho == LIMITE_U32 or offset == LIMITE_U32 {
+        return LerError.grande_demais
+    }
+    let nome_ini = pos + TAM_CENTRAL
+    let proximo = nome_ini + nome_tam + extra_tam + coment_tam
+    if proximo > len(z.dados) {
+        return LerError.formato
+    }
+    let nome = from_bytes(z.dados[nome_ini..<(nome_ini + nome_tam)], alloc = heap)
+    append(&z.entradas, item = Entrada{nome = nome, metodo = metodo, tamanho = tamanho, comprimido = comprimido, crc = crc_lido as u32, offset = offset})
+    return proximo
+}
+
+proc indice_entrada(z: ^Zip, nome: str) -> int {
+    for i in 0..<len(z.entradas) {
+        if z.entradas[i].nome == nome {
+            return i
+        }
+    }
+    return -1
+}
+
+// Descomprime a entrada i. Valida tamanho e crc32; a lista devolvida e nova e fica com quem chamou.
+proc descomprimir(z: ^Zip, i: int) -> [dynamic]u8 ! LerError {
+    let e = z.entradas[i]
+    if e.metodo != METODO_STORED and e.metodo != METODO_DEFLATE {
+        return LerError.metodo_nao_suportado
+    }
+    let inicio = try inicio_dados(z, e.offset)
+    let fim = inicio + e.comprimido
+    if fim > len(z.dados) or inicio > fim {
+        return LerError.formato
+    }
+    if e.metodo == METODO_STORED and e.comprimido != e.tamanho {
+        return LerError.formato
+    }
+    var saida = make([dynamic]u8, alloc = heap)
+    if e.metodo == METODO_STORED {
+        for k in inicio..<fim {
+            append(&saida, item = z.dados[k])
+        }
+    } else {
+        switch r in inflar(z.dados[inicio..<fim], &saida) {
+        case LerError:
+            delete(saida)
+            return r
+        default:
+        }
+    }
+    if len(saida) != e.tamanho {
+        delete(saida)
+        return LerError.formato
+    }
+    if compression.crc(saida[..], 0) != e.crc {
+        delete(saida)
+        return LerError.crc
+    }
+    return saida
+}
+
+// Deflate raw (sem cabecalho zlib) de origem para saida, em pedacos de TAM_PEDACO.
+// Sem progresso e sem fim do fluxo = entrada truncada.
+proc inflar(origem: []u8, saida: ^[dynamic]u8) -> ! LerError {
+    var fluxo = try fluxo_inflate()
+    defer compression.stream_close(&fluxo)
+    var pedaco: [TAM_PEDACO]u8 = {}
+    var pos: int = 0
+    var feito = false
+    while not feito {
+        let passo = try empurrar_inflate(&fluxo, origem[pos..<len(origem)], pedaco[..])
+        for k in 0..<passo.escrito {
+            append(saida, item = pedaco[k])
+        }
+        pos += passo.consumido
+        feito = passo.feito
+        if not feito and passo.consumido == 0 and passo.escrito == 0 {
+            return LerError.descompressao
+        }
+    }
+    return
+}
+
+// Descompressor raw do compression. O erro da zlib vira LerError.descompressao.
+proc fluxo_inflate() -> compression.Stream ! LerError {
+    switch r in compression.stream_inflate(compression.StreamFormat.raw) {
+    case compression.Stream:
+        return r
+    case compression.ZlibError:
+        return LerError.descompressao
+    }
+    return LerError.descompressao
+}
+
+// Empurra um pedaco de entrada ao inflate e devolve quanto foi lido, quanto saiu e se o fluxo acabou.
+proc empurrar_inflate(fluxo: ^compression.Stream, entrada: []u8, saida: []u8) -> Passo ! LerError {
+    switch r in compression.stream_push(fluxo, entrada, saida, false) {
+    case compression.StreamStep:
+        return Passo{consumido = r.consumed as int, escrito = r.written as int, feito = r.done}
+    case compression.ZlibError:
+        return LerError.descompressao
+    }
+    return LerError.descompressao
+}
+
+// Onde comecam os bytes da entrada: depois do cabecalho local, do nome e do campo extra que o local repete.
+proc inicio_dados(z: ^Zip, cabecalho: int) -> int ! LerError {
+    let assinatura = try le32(z.dados[..], cabecalho)
+    if assinatura != ASSINATURA_LOCAL {
+        return LerError.formato
+    }
+    let nome_tam = try le16(z.dados[..], cabecalho + 26)
+    let extra_tam = try le16(z.dados[..], cabecalho + 28)
+    return cabecalho + TAM_LOCAL + nome_tam + extra_tam
+}
+
+// Grava uma entrada em pasta. Entrada que termina em barra e so pasta: cria e segue.
+proc extrair_entrada(z: ^Zip, i: int, pasta: str) -> ! LerError {
+    let nome = z.entradas[i].nome
+    let destino = path.join2(pasta, nome, alloc = heap)
+    defer delete(destino)
+    try criar_pastas(destino, len(pasta))
+    let bytes_nome = as_bytes(nome)
+    if bytes_nome[len(bytes_nome) - 1] == BARRA or bytes_nome[len(bytes_nome) - 1] == BARRA_INVERTIDA {
+        return
+    }
+    var dados = try descomprimir(z, i)
+    let falha = file.write_all(destino, dados[..])
+    delete(dados)
+    if falha != none {
+        return LerError.gravar
+    }
+    return
+}
+
+// Cria cada pasta do caminho depois de `inicio` (a propria pasta raiz ja existe).
+proc criar_pastas(destino: str, inicio: int) -> ! LerError {
+    let b = as_bytes(destino)
+    let comeco = inicio + 1
+    for k in comeco..<len(b) {
+        if b[k] == BARRA or b[k] == BARRA_INVERTIDA {
+            let parcial = from_bytes(b[0..<k], alloc = heap)
+            if not file.is_dir(parcial) {
+                if file.make_dir(parcial) != none {
+                    delete(parcial)
+                    return LerError.gravar
+                }
+            }
+            delete(parcial)
+        }
+    }
+    return
+}
+
+// Nome seguro: sem caminho absoluto, sem letra de unidade, sem segmento `..`, sem segmento vazio no meio.
+proc nome_seguro(nome: str) -> bool {
+    let b = as_bytes(nome)
+    if len(b) == 0 {
+        return false
+    }
+    if b[0] == BARRA or b[0] == BARRA_INVERTIDA {
+        return false
+    }
+    var inicio: int = 0
+    var k: int = 0
+    while k < len(b) {
+        if b[k] == DOIS_PONTOS {
+            return false
+        }
+        if b[k] == BARRA or b[k] == BARRA_INVERTIDA {
+            if segmento_invalido(b, inicio, k) {
+                return false
+            }
+            inicio = k + 1
+        }
+        k += 1
+    }
+    if inicio == len(b) {
+        return true
+    }
+    return not segmento_invalido(b, inicio, len(b))
+}
+
+proc segmento_invalido(b: []u8, ini: int, fim: int) -> bool {
+    let tam = fim - ini
+    if tam == 0 {
+        return true
+    }
+    if tam == 2 and b[ini] == PONTO and b[ini + 1] == PONTO {
+        return true
+    }
+    return false
+}
+
+// Inteiro little endian de 2 bytes (sem sinal) em `at`. Fora da faixa = formato.
+proc le16(b: []u8, at: int) -> int ! LerError {
+    if at < 0 or at + 2 > len(b) {
+        return LerError.formato
+    }
+    let v = (b[at] as u32) | ((b[at + 1] as u32) << 8)
+    return v as int
+}
+
+// Inteiro little endian de 4 bytes (sem sinal) em `at`. Cabe em int, mas o chamador confere o limite de zip64.
+proc le32(b: []u8, at: int) -> int ! LerError {
+    if at < 0 or at + 4 > len(b) {
+        return LerError.formato
+    }
+    let v = (b[at] as u64) | ((b[at + 1] as u64) << 8) | ((b[at + 2] as u64) << 16) | ((b[at + 3] as u64) << 24)
+    return v as int
+}

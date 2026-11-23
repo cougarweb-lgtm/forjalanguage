@@ -1,0 +1,538 @@
+// std:net - testes do modulo (M5 P53). Anexados ao texto de std:net SO em forja test std:net (o build normal nao os ve).
+// Versao: 0.3.0. Changelog: 0.3.0 - R9: TCP em 127.0.0.1: eco de 1 MB em pedacos de 7 B a 64 KB (servidor numa thread do mesmo processo), conexao recusada, timeout de accept, o outro lado fecha (recv = 0 e send = fechado_pelo_outro), porta em uso, timeout de recv e close duplo. A thread vem de 3 foreign de std:thread declarados aqui (o pedaco nao tem import). 0.2.0 - M5 P54: ICMP de porta fechada nao derruba o recv (vira timeout), datagrama maior que o buffer = datagrama_maior e resto descartado, timeout 0 em 1000 chamadas. 0.1.0 - M5 P53: endereco invalido (abc, porta 99999, vazio), eco em 127.0.0.1 porta 0 com datagrama de 1200 bytes ida e volta, timeout de 100 ms, porta em uso, close duplo.
+// Sem import e sem proc main: o pedaco fica dentro do modulo, entao chama as procs dele SEM prefixo. So 127.0.0.1 (o Firewall nao abre).
+
+// Socket aberto em addr; h = 0 se falhou.
+proc abrir(addr: str) -> UdpSocket {
+    switch r in udp_bind(addr) {
+    case UdpSocket:
+        return r
+    case NetError:
+        return UdpSocket{h = 0}
+    }
+    return UdpSocket{h = 0}
+}
+
+// Padrao por indice: o byte no deslocamento i vale i % 251.
+proc preencher(q: []u8) {
+    for i in 0..<len(q) {
+        q[i] = (i % 251) as u8
+    }
+}
+
+proc iguais(a: []u8, b: []u8) -> bool {
+    if len(a) != len(b) {
+        return false
+    }
+    for i in 0..<len(a) {
+        if a[i] != b[i] {
+            return false
+        }
+    }
+    return true
+}
+
+// Ida e volta: o cliente manda 1200 bytes ao servidor; o servidor responde ao remetente (texto) e o cliente confere o eco.
+proc eco_com(servidor: ^UdpSocket, cliente: ^UdpSocket, destino: str) -> bool {
+    var quadro: [1200]u8 = {}
+    preencher(quadro[..])
+    switch enviado in udp_send_to(cliente, destino, quadro[..]) {
+    case int:
+        if enviado != 1200 {
+            return false
+        }
+    case NetError:
+        return false
+    }
+    var recebido: [1200]u8 = {}
+    switch r in udp_recv_from(servidor, recebido[..], 1000, heap) {
+    case UdpRecebido:
+        let ida_ok = r.quantos == 1200 and iguais(recebido[..], quadro[..])
+        defer delete(r.de)
+        if not ida_ok {
+            return false
+        }
+        return eco_volta(servidor, cliente, r.de, recebido[..])
+    case NetError:
+        return false
+    }
+    return false
+}
+
+// O servidor manda os mesmos bytes de volta ao remetente; o cliente recebe e compara.
+proc eco_volta(servidor: ^UdpSocket, cliente: ^UdpSocket, remetente: str, dados: []u8) -> bool {
+    switch enviado in udp_send_to(servidor, remetente, dados) {
+    case int:
+        if enviado != 1200 {
+            return false
+        }
+    case NetError:
+        return false
+    }
+    var volta: [1200]u8 = {}
+    switch r in udp_recv_from(cliente, volta[..], 1000, heap) {
+    case UdpRecebido:
+        defer delete(r.de)
+        return r.quantos == 1200 and iguais(volta[..], dados)
+    case NetError:
+        return false
+    }
+    return false
+}
+
+test "endereco invalido: abc, porta 99999 e vazio" {
+    expect(abrir("abc").h == 0)
+    expect(abrir("1.2.3.4:99999").h == 0)
+    expect(abrir("").h == 0)
+}
+
+test "eco de 1200 bytes em 127.0.0.1 porta 0" {
+    var servidor = abrir("127.0.0.1:0")
+    var cliente = abrir("127.0.0.1:0")
+    expect(servidor.h != 0)
+    expect(cliente.h != 0)
+    switch ende in udp_local_addr(&servidor, heap) {
+    case str:
+        expect(eco_com(&servidor, &cliente, ende))
+        delete(ende)
+    case NetError:
+        expect(false)
+    }
+    _ = udp_close(&cliente)
+    _ = udp_close(&servidor)
+}
+
+test "timeout de 100 ms sem trafego" {
+    var s = abrir("127.0.0.1:0")
+    var buf: [16]u8 = {}
+    switch r in udp_recv_from(&s, buf[..], 100, heap) {
+    case UdpRecebido:
+        expect(false)
+    case NetError:
+        expect(r == NetError.timeout)
+    }
+    _ = udp_close(&s)
+}
+
+test "porta em uso: segundo bind na mesma porta" {
+    var primeiro = abrir("127.0.0.1:0")
+    expect(primeiro.h != 0)
+    switch ende in udp_local_addr(&primeiro, heap) {
+    case str:
+        switch r in udp_bind(ende) {
+        case UdpSocket:
+            expect(false)
+        case NetError:
+            expect(r == NetError.porta_em_uso)
+        }
+        delete(ende)
+    case NetError:
+        expect(false)
+    }
+    _ = udp_close(&primeiro)
+}
+
+test "close duplo e uso depois de close devolvem fechado" {
+    var s = abrir("127.0.0.1:0")
+    expect(udp_close(&s) == none)
+    let segundo = udp_close(&s) or_else NetError.endereco_invalido
+    expect(segundo == NetError.fechado)
+}
+
+test "ICMP de porta fechada nao derruba o recv seguinte (SIO_UDP_CONNRESET)" {
+    var alvo = abrir("127.0.0.1:0")
+    expect(alvo.h != 0)
+    switch ende in udp_local_addr(&alvo, heap) {
+    case str:
+        _ = udp_close(&alvo)
+        var emissor = abrir("127.0.0.1:0")
+        expect(emissor.h != 0)
+        var quadro: [16]u8 = {}
+        switch n in udp_send_to(&emissor, ende, quadro[..]) {
+        case int:
+            expect(n == 16)
+        case NetError:
+            expect(false)
+        }
+        var buf: [16]u8 = {}
+        switch r in udp_recv_from(&emissor, buf[..], 200, heap) {
+        case UdpRecebido:
+            expect(false)
+        case NetError:
+            expect(r == NetError.timeout)
+        }
+        _ = udp_close(&emissor)
+        delete(ende)
+    case NetError:
+        expect(false)
+    }
+}
+
+test "datagrama maior que o buffer: datagrama_maior e o resto descartado" {
+    var s = abrir("127.0.0.1:0")
+    var c = abrir("127.0.0.1:0")
+    expect(s.h != 0)
+    expect(c.h != 0)
+    switch ende in udp_local_addr(&s, heap) {
+    case str:
+        var grande: [1200]u8 = {}
+        switch n in udp_send_to(&c, ende, grande[..]) {
+        case int:
+            expect(n == 1200)
+        case NetError:
+            expect(false)
+        }
+        var pequeno: [100]u8 = {}
+        switch r in udp_recv_from(&s, pequeno[..], 1000, heap) {
+        case UdpRecebido:
+            expect(false)
+        case NetError:
+            expect(r == NetError.datagrama_maior)
+        }
+        switch r2 in udp_recv_from(&s, pequeno[..], 100, heap) {
+        case UdpRecebido:
+            expect(false)
+        case NetError:
+            expect(r2 == NetError.timeout)
+        }
+        delete(ende)
+    case NetError:
+        expect(false)
+    }
+    _ = udp_close(&c)
+    _ = udp_close(&s)
+}
+
+test "timeout 0 nao bloqueia: 1000 chamadas seguidas devolvem timeout" {
+    var s = abrir("127.0.0.1:0")
+    var buf: [16]u8 = {}
+    var timeouts = 0
+    var chamadas = 0
+    while chamadas < 1000 {
+        chamadas += 1
+        switch r in udp_recv_from(&s, buf[..], 0, heap) {
+        case UdpRecebido:
+            expect(false)
+        case NetError:
+            if r == NetError.timeout {
+                timeouts += 1
+            }
+        }
+    }
+    expect(timeouts == 1000)
+    _ = udp_close(&s)
+}
+
+// ---- TCP (R9). So 127.0.0.1; todo recv/accept com prazo, para a falha nunca travar o teste.
+
+// As 3 foreign de std:thread (o pedaco nao tem import): cria a thread, espera o fim e fecha o handle.
+foreign {
+    proc forja_thread_criar(rotina: proc(q: rawptr) -> u32, arg: rawptr) -> u64
+    proc forja_thread_esperar(h: u64) -> i32
+    proc forja_thread_fechar(h: u64)
+}
+
+const MEGA: int = 1048576
+const PRAZO_TCP_MS: i32 = 5000
+
+// O que a thread do servidor de eco recebe: o socket em escuta e, na volta, quantos bytes devolveu (-1 = falhou).
+struct ContextoEco {
+    escuta: ^TcpListener
+    eco: int = 0
+}
+
+// Socket em escuta em addr; h = 0 se falhou.
+proc ouvir(addr: str) -> TcpListener {
+    switch r in tcp_listen(addr) {
+    case TcpListener:
+        return r
+    case NetError:
+        return TcpListener{h = 0}
+    }
+    return TcpListener{h = 0}
+}
+
+// Conexao a addr; h = 0 se falhou.
+proc conectar(addr: str) -> TcpSocket {
+    switch r in tcp_connect(addr, PRAZO_TCP_MS) {
+    case TcpSocket:
+        return r
+    case NetError:
+        return TcpSocket{h = 0}
+    }
+    return TcpSocket{h = 0}
+}
+
+// Conexao aceita em l; h = 0 se falhou.
+proc aceitar(l: ^TcpListener) -> TcpSocket {
+    switch r in tcp_accept(l, PRAZO_TCP_MS) {
+    case TcpSocket:
+        return r
+    case NetError:
+        return TcpSocket{h = 0}
+    }
+    return TcpSocket{h = 0}
+}
+
+// Devolve tudo o que le de s, ate o outro lado fechar (recv = 0). Total devolvido; -1 se algo falhou.
+proc ecoar_ate_fechar(s: ^TcpSocket) -> int {
+    var buf = make([dynamic]u8, alloc = heap, len = 65536)
+    defer delete(buf)
+    let v = buf[..]
+    var total = 0
+    while true {
+        switch n in tcp_recv(s, v, PRAZO_TCP_MS) {
+        case int:
+            if n == 0 {
+                return total
+            }
+            switch e in tcp_send(s, v[0..<n]) {
+            case int:
+                total += e
+            case NetError:
+                return -1
+            }
+        case NetError:
+            return -1
+        }
+    }
+    return total
+}
+
+// Corpo da thread do servidor: aceita 1 conexao e faz o eco dela. O resultado vai em ctx.eco.
+proc servidor_eco(q: rawptr) -> u32 {
+    let ctx = q as ^ContextoEco
+    switch conexao in tcp_accept(ctx.escuta, PRAZO_TCP_MS) {
+    case TcpSocket:
+        var s = conexao
+        ctx.eco = ecoar_ate_fechar(&s)
+        _ = tcp_close(&s)
+    case NetError:
+        ctx.eco = -1
+    }
+    return 0
+}
+
+// Manda os bytes de enviar e le de volta o mesmo tanto em volta (len(volta) == len(enviar)); true se o eco e igual.
+proc ida_e_volta(c: ^TcpSocket, enviar: []u8, volta: []u8) -> bool {
+    let n = len(enviar)
+    switch enviado in tcp_send(c, enviar) {
+    case int:
+        if enviado != n {
+            return false
+        }
+    case NetError:
+        return false
+    }
+    var lidos = 0
+    while lidos < n {
+        switch r in tcp_recv(c, volta[lidos..<n], PRAZO_TCP_MS) {
+        case int:
+            if r == 0 {
+                return false
+            }
+            lidos += r
+        case NetError:
+            return false
+        }
+    }
+    return iguais(volta, enviar)
+}
+
+// Manda 1 MB em pedacos de 7 B a 64 KB (um pedaco por vez: manda e espera o eco), conferindo cada eco.
+proc eco_de_um_mega(c: ^TcpSocket) -> bool {
+    var fonte = make([dynamic]u8, alloc = heap, len = MEGA)
+    defer delete(fonte)
+    var volta = make([dynamic]u8, alloc = heap, len = 65536)
+    defer delete(volta)
+    let f = fonte[..]
+    let v = volta[..]
+    preencher(f)
+    let tamanhos: [8]int = {7, 64, 1000, 4096, 65536, 11, 20000, 65535}
+    var pos = 0
+    var k = 0
+    while pos < MEGA {
+        var n = tamanhos[k % 8]
+        if pos + n > MEGA {
+            n = MEGA - pos
+        }
+        if not ida_e_volta(c, f[pos..<pos + n], v[0..<n]) {
+            return false
+        }
+        pos += n
+        k += 1
+    }
+    return true
+}
+
+// Cliente do eco: conecta em ende, faz o eco de 1 MB e fecha.
+proc cliente_eco(ende: str) -> bool {
+    var c = conectar(ende)
+    if c.h == 0 {
+        return false
+    }
+    let ok = eco_de_um_mega(&c)
+    _ = tcp_close(&c)
+    return ok
+}
+
+// Manda 1 KB ate o send falhar (no maximo 1000 vezes). O erro; timeout se nunca falhou.
+proc enviar_ate_cair(c: ^TcpSocket) -> NetError {
+    var quadro: [1024]u8 = {}
+    var total = 0
+    var vezes = 0
+    while vezes < 1000 {
+        vezes += 1
+        switch r in tcp_send(c, quadro[..]) {
+        case int:
+            total += r
+        case NetError:
+            return r
+        }
+    }
+    return NetError.timeout
+}
+
+// true se o recv de c devolve 0 (o outro lado fechou).
+proc recv_devolve_zero(c: ^TcpSocket) -> bool {
+    var buf: [16]u8 = {}
+    switch r in tcp_recv(c, buf[..], PRAZO_TCP_MS) {
+    case int:
+        return r == 0
+    case NetError:
+        return false
+    }
+    return false
+}
+
+test "eco TCP de 1 MB em pedacos de 7 B a 64 KB com o servidor numa thread" {
+    var escuta = ouvir("127.0.0.1:0")
+    expect(escuta.h != 0)
+    var ctx = ContextoEco{escuta = &escuta}
+    switch ende in tcp_local_addr(&escuta, heap) {
+    case str:
+        let th = forja_thread_criar(servidor_eco, &ctx as rawptr)
+        expect(th != 0)
+        expect(cliente_eco(ende))
+        if th != 0 {
+            _ = forja_thread_esperar(th)
+            forja_thread_fechar(th)
+        }
+        delete(ende)
+    case NetError:
+        expect(false)
+    }
+    expect(ctx.eco == MEGA)
+    _ = tcp_listener_close(&escuta)
+}
+
+test "conexao recusada: ninguem escuta na porta" {
+    var escuta = ouvir("127.0.0.1:0")
+    expect(escuta.h != 0)
+    switch ende in tcp_local_addr(&escuta, heap) {
+    case str:
+        _ = tcp_listener_close(&escuta)
+        switch r in tcp_connect(ende, 10000) {
+        case TcpSocket:
+            expect(false)
+        case NetError:
+            expect(r == NetError.conexao_recusada)
+        }
+        delete(ende)
+    case NetError:
+        expect(false)
+    }
+}
+
+test "timeout de accept sem ninguem conectando" {
+    var escuta = ouvir("127.0.0.1:0")
+    expect(escuta.h != 0)
+    switch r in tcp_accept(&escuta, 100) {
+    case TcpSocket:
+        expect(false)
+    case NetError:
+        expect(r == NetError.timeout)
+    }
+    switch r2 in tcp_accept(&escuta, 0) {
+    case TcpSocket:
+        expect(false)
+    case NetError:
+        expect(r2 == NetError.timeout)
+    }
+    _ = tcp_listener_close(&escuta)
+}
+
+test "o outro lado fecha: recv devolve 0 e o send acaba em fechado_pelo_outro" {
+    var escuta = ouvir("127.0.0.1:0")
+    expect(escuta.h != 0)
+    switch ende in tcp_local_addr(&escuta, heap) {
+    case str:
+        var cliente = conectar(ende)
+        var servidor = aceitar(&escuta)
+        expect(cliente.h != 0)
+        expect(servidor.h != 0)
+        _ = tcp_close(&servidor)
+        expect(recv_devolve_zero(&cliente))
+        expect(enviar_ate_cair(&cliente) == NetError.fechado_pelo_outro)
+        _ = tcp_close(&cliente)
+        delete(ende)
+    case NetError:
+        expect(false)
+    }
+    _ = tcp_listener_close(&escuta)
+}
+
+test "porta em uso: segundo tcp_listen na mesma porta" {
+    var primeiro = ouvir("127.0.0.1:0")
+    expect(primeiro.h != 0)
+    switch ende in tcp_local_addr(&primeiro, heap) {
+    case str:
+        switch r in tcp_listen(ende) {
+        case TcpListener:
+            expect(false)
+        case NetError:
+            expect(r == NetError.porta_em_uso)
+        }
+        delete(ende)
+    case NetError:
+        expect(false)
+    }
+    _ = tcp_listener_close(&primeiro)
+}
+
+test "recv sem dados expira em timeout; close duplo e uso depois de close = fechado; endereco invalido" {
+    var escuta = ouvir("127.0.0.1:0")
+    expect(escuta.h != 0)
+    switch ende in tcp_local_addr(&escuta, heap) {
+    case str:
+        var cliente = conectar(ende)
+        var servidor = aceitar(&escuta)
+        var buf: [16]u8 = {}
+        switch r in tcp_recv(&cliente, buf[..], 100) {
+        case int:
+            expect(false)
+        case NetError:
+            expect(r == NetError.timeout)
+        }
+        expect(tcp_close(&servidor) == none)
+        expect((tcp_close(&servidor) or_else NetError.endereco_invalido) == NetError.fechado)
+        switch r2 in tcp_send(&servidor, buf[..]) {
+        case int:
+            expect(false)
+        case NetError:
+            expect(r2 == NetError.fechado)
+        }
+        _ = tcp_close(&cliente)
+        delete(ende)
+    case NetError:
+        expect(false)
+    }
+    expect(tcp_listener_close(&escuta) == none)
+    expect((tcp_listener_close(&escuta) or_else NetError.endereco_invalido) == NetError.fechado)
+    switch r3 in tcp_connect("abc", 100) {
+    case TcpSocket:
+        expect(false)
+    case NetError:
+        expect(r3 == NetError.endereco_invalido)
+    }
+}

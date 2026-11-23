@@ -1,0 +1,335 @@
+// semantic/sem_parecido.fj - porte de compiler/semantic/sem_parecido.c
+// sha256 de semantic/sem_parecido.c: a0de8ca6c5145ff4a2b238b94dabc846dc87fdfb08d46153a34db48cc2a4e954
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "common"
+import "frontend"
+
+// C: semantic/sem_parecido.c:15
+proc ver_nome(s: ^Semantica, nome: i32, busca: ^common.Parecidos, pos: u32) {
+    let texto: str = sem_nome_texto(s, nome)
+    common.parecidos_ver_em(busca, texto, len(texto) as u64, pos)
+}
+
+// C: semantic/sem_parecido.c:21
+proc sem_parecido_iniciar(s: ^Semantica, codigo: i32, pos: u32, nome: i32, sp: ^SemParecido) {
+    sp.codigo = codigo
+    sp.pos = pos
+    let texto: str = sem_nome_texto(s, nome)
+    let arg_1: u64 = len(texto) as u64
+    let arg_2: str = texto
+    let arg_3: ^common.Parecidos = &sp.busca
+    common.parecidos_iniciar(arg_3, arg_2, arg_1)
+}
+
+// C: semantic/sem_parecido.c:29
+proc ver_locais(s: ^Semantica, busca: ^common.Parecidos) {
+    var i: u64 = 0
+    while i < (len(s.escopo.pilha) as u64) {
+        let local: ^LocalInfo = &s.escopo.pilha[i]
+        ver_nome(s, local.nome, busca, local.pos)
+        i += 1
+    }
+}
+
+// C: semantic/sem_parecido.c:38
+proc ver_globais_visiveis(s: ^Semantica, busca: ^common.Parecidos) {
+    var nome: i32 = 0
+    while nome < transmute(s.qtd_nomes, to = i32) {
+        let y: ^Simbolo = &(s.globais or_else {})[nome]
+        if y.categoria == (SIM_NENHUM as u8) {
+            nome += 1
+            continue
+        }
+        if (y.decl != none) and (((y.decl as ^frontend.Decl).modulo as i32) != (s.modulo_atual as i32)) {
+            nome += 1
+            continue
+        }
+        var tern_1: u32 = common.PARECIDO_SEM_POS
+        if y.decl != none {
+            tern_1 = (y.decl as ^frontend.Decl).pos
+        }
+        ver_nome(s, nome, busca, tern_1)
+        nome += 1
+    }
+}
+
+// C: semantic/sem_parecido.c:48
+proc ver_pub_do_modulo(s: ^Semantica, modulo: u8, busca: ^common.Parecidos) {
+    var nome: i32 = 0
+    while nome < transmute(s.qtd_nomes, to = i32) {
+        let d: ?^frontend.Decl = (s.globais or_else {})[nome].decl
+        if ((d != none) and (((d as ^frontend.Decl).modulo as i32) == (modulo as i32))) and (common.c2f_b2i32((d as ^frontend.Decl).publico) != 0) {
+            ver_nome(s, nome, busca, (d as ^frontend.Decl).pos)
+        }
+        nome += 1
+    }
+}
+
+// C: semantic/sem_parecido.c:56
+proc sem_parecidos_de_nome(s: ^Semantica, modulo: u8, sp: ^SemParecido) {
+    if modulo != 0 {
+        ver_pub_do_modulo(s, modulo, &sp.busca)
+        return
+    }
+    ver_locais(s, &sp.busca)
+    ver_globais_visiveis(s, &sp.busca)
+}
+
+// C: semantic/sem_parecido.c:66
+proc sem_parecidos_de_campos(s: ^Semantica, estrutura: ?^frontend.Decl, sp: ^SemParecido) {
+    for i in (0 as u32)..<(estrutura as ^frontend.Decl).ncampos {
+        ver_nome(s, ((estrutura as ^frontend.Decl).campos or_else {})[i].nome, &sp.busca, ((estrutura as ^frontend.Decl).campos or_else {})[i].pos)
+    }
+}
+
+// C: semantic/sem_parecido.c:71
+proc sem_parecidos_de_membros(s: ^Semantica, enumeracao: ?^frontend.Decl, sp: ^SemParecido) {
+    for i in (0 as u32)..<(enumeracao as ^frontend.Decl).nmembros {
+        ver_nome(s, ((enumeracao as ^frontend.Decl).membros or_else {})[i].nome, &sp.busca, ((enumeracao as ^frontend.Decl).membros or_else {})[i].pos)
+    }
+}
+
+// C: semantic/sem_parecido.c:76
+// C2F-13: params fundido em nparams (len)
+proc sem_parecidos_de_params(s: ^Semantica, params: []frontend.Param, sp: ^SemParecido) {
+    for i in (0 as u32)..<(len(params) as u32) {
+        ver_nome(s, params[i].nome, &sp.busca, params[i].pos)
+    }
+}
+
+// C: semantic/sem_parecido.c:82
+// ASSINATURA ALTERADA no lote (C: void, `char *causa` editado no lugar): devolve a causa nova, de heap (o chamador faz delete).
+// C2F-32: os snprintf em sequencia cortam, no total, em cap - 1 bytes (o resto do cap vira 1 e nada mais entra).
+proc anexar_parecidos(busca: ^common.Parecidos, causa: str, cap: u64) -> str {
+    var b = make([dynamic]u8, alloc = heap)
+    defer delete(b)
+    append(&b, item = causa)
+    var i: u32 = 0
+    while i < busca.qtd {
+        if i == 0 {
+            append(&b, item = " (parecido: ")
+        } else {
+            append(&b, item = ", ")
+        }
+        let nome = busca.nomes[i].texto or_else ""
+        append(&b, item = "'")
+        append(&b, items = as_bytes(nome)[0..<(busca.nomes[i].tam as int)])
+        append(&b, item = "'")
+        i += 1
+    }
+    append(&b, item = ")")
+    let t = to_str(&b)
+    defer delete(t)
+    return common.c2f_cortar(t, (cap as int) - 1)
+}
+
+// C: semantic/sem_parecido.c:94
+// ASSINATURA ALTERADA no lote (C: `char *json` de saida): devolve o JSON, de heap (o chamador faz delete).
+proc montar_json_parecidos(busca: ^common.Parecidos, cap: u64) -> str {
+    var b = make([dynamic]u8, alloc = heap)
+    defer delete(b)
+    append(&b, item = "[")
+    var i: u32 = 0
+    while i < busca.qtd {
+        if i != 0 {
+            append(&b, item = ", ")
+        }
+        let nome = busca.nomes[i].texto or_else ""
+        append(&b, item = "\"")
+        append(&b, items = as_bytes(nome)[0..<(busca.nomes[i].tam as int)])
+        append(&b, item = "\"")
+        i += 1
+    }
+    append(&b, item = "]")
+    let t = to_str(&b)
+    defer delete(t)
+    return common.c2f_cortar(t, (cap as int) - 1)
+}
+
+// C: semantic/sem_parecido.c:105
+// C2F-37: `fmt, ...` virou `msg: str` (mensagem ja pronta)
+proc sem_erro_parecido(s: ^Semantica, sp: ^SemParecido, msg: str) -> bool {
+    let causa = common.c2f_cortar(msg, 511) // char causa[512]
+    defer delete(causa)
+    if sp.busca.qtd == 0 {
+        _ = common.diag_relatar(s.diag as ^common.Diag, sp.codigo, sp.pos, causa)
+        sem_relacionar(s)
+        return false
+    }
+    let anexada = anexar_parecidos(&sp.busca, causa, 512)
+    defer delete(anexada)
+    let json = montar_json_parecidos(&sp.busca, 384) // char json[384]
+    defer delete(json)
+    _ = common.diag_relatar(s.diag as ^common.Diag, sp.codigo, sp.pos, anexada)
+    common.diag_acrescentar_extra(s.diag as ^common.Diag, "parecidos", json)
+    sem_sugerir_parecido(s, sp)
+    sem_relacionar_parecidos(s, &sp.busca)
+    sem_relacionar(s)
+    return false
+}
+
+// G3 S8: anexar/montar com Parecidos montado a mao (alvo 'contador': 'contado' a distancia 1, 'contadorrr' a 2); o corte em cap - 1 vale no total.
+test "sem_parecido: anexar_parecidos e montar_json_parecidos" {
+    var p: common.Parecidos = common.Parecidos{}
+    common.parecidos_iniciar(&p, "contador", 8)
+    common.parecidos_ver_em(&p, "contadorrr", 10, 42)
+    common.parecidos_ver_em(&p, "contado", 7, 22)
+    common.parecidos_ver_em(&p, "contador", 8, 5) // distancia 0: nao e candidato
+    common.parecidos_ver_em(&p, "xyz", 3, 6) // longe: nao e candidato
+    expect(p.qtd == 2)
+    let causa = anexar_parecidos(&p, "nome 'contador' nao declarado", 512)
+    defer delete(causa)
+    expect(causa == "nome 'contador' nao declarado (parecido: 'contado', 'contadorrr')")
+    let json = montar_json_parecidos(&p, 384)
+    defer delete(json)
+    expect(json == "[\"contado\", \"contadorrr\"]")
+    let curta = anexar_parecidos(&p, "abc", 20) // cabem 19 bytes
+    defer delete(curta)
+    expect(curta == "abc (parecido: 'con")
+    let json_curto = montar_json_parecidos(&p, 8) // cabem 7 bytes
+    defer delete(json_curto)
+    expect(json_curto == "[\"conta")
+    var vazia: common.Parecidos = common.Parecidos{}
+    common.parecidos_iniciar(&vazia, "contador", 8)
+    let sem_nomes = montar_json_parecidos(&vazia, 384)
+    defer delete(sem_nomes)
+    expect(sem_nomes == "[]")
+    let causa_vazia = anexar_parecidos(&vazia, "x", 512)
+    defer delete(causa_vazia)
+    expect(causa_vazia == "x)") // o C fecha o parentese mesmo sem candidato (o chamador so usa com qtd > 0)
+}
+
+// G3 S8: E0201 de ponta a ponta; oraculo = forja.exe real em
+// proc main() { let contado = 1; let contadorrr = 2; print(contador) }: causa com "(parecido: ...)", extra "parecidos", sugestao provavel, 2 relacionados "parecido".
+test "sem_parecido: SemErroParecido com 2 candidatos (oraculo forja check)" {
+    var sv: Semantica = Semantica{}
+    var f: common.Fonte = common.Fonte{}
+    var d: common.Diag = common.Diag{}
+    var ar: common.Arena = common.Arena{}
+    var nomes: common.Interner = common.Interner{}
+    var prog: frontend.Programa = frontend.Programa{}
+    s8_preparar(&sv, &f, &d, &ar, &nomes, &prog, "proc main() {\n    let contado = 1\n    let contadorrr = 2\n    print(contador)\n}\n", common.E0201)
+    let alvo: i32 = common.internar(&nomes, "contador", 8)
+    let n1: i32 = common.internar(&nomes, "contado", 7)
+    let n2: i32 = common.internar(&nomes, "contadorrr", 10)
+    var sp: SemParecido = SemParecido{}
+    sem_parecido_iniciar(&sv, common.E0201, 67, alvo, &sp)
+    ver_nome(&sv, alvo, &sp.busca, 1)
+    ver_nome(&sv, n2, &sp.busca, 42)
+    ver_nome(&sv, n1, &sp.busca, 22)
+    expect(sp.busca.qtd == 2 and sp.busca.limite == 2)
+    expect(not sem_erro_parecido(&sv, &sp, "nome 'contador' nao declarado como variavel ou constante"))
+    expect(d.codigo == common.E0201 and d.off == 67)
+    expect((d.causa or_else "") == "nome 'contador' nao declarado como variavel ou constante (parecido: 'contado', 'contadorrr')")
+    expect((d.extras or_else "") == "\"parecidos\": [\"contado\", \"contadorrr\"]")
+    expect(d.sug.n == 1 and (d.sug.itens[0].confianca as i32) == common.DIAG_PROVAVEL and (d.sug.itens[0].descricao or_else "") == "troque 'contador' por 'contado'")
+    expect(d.sug.itens[0].nedicoes == 1 and d.sug.itens[0].edicoes[0].ini == 67 and d.sug.itens[0].edicoes[0].fim == 75 and (d.sug.itens[0].edicoes[0].novo or_else "") == "contado")
+    expect(d.rel.n == 2 and (d.rel.itens[0].papel as i32) == common.DIAG_REL_PARECIDO and d.rel.itens[0].off == 22 and d.rel.itens[1].off == 42)
+    expect((d.rel.itens[0].nota or_else "") == "parecido #1: 'contado' (distancia 1)" and (d.rel.itens[1].nota or_else "") == "parecido #2: 'contadorrr' (distancia 2)")
+    // sem candidatos: so a causa (sem "(parecido: ...)", sem extra, sem sugestao)
+    d = common.Diag{}
+    d.tem = true
+    d.codigo = common.E0201
+    var vazio: SemParecido = SemParecido{}
+    sem_parecido_iniciar(&sv, common.E0201, 67, alvo, &vazio)
+    expect(not sem_erro_parecido(&sv, &vazio, "nome 'contador' nao declarado"))
+    expect((d.causa or_else "") == "nome 'contador' nao declarado" and (d.extras or_else "") == "" and d.sug.n == 0 and d.rel.n == 0)
+    // empate de distancia entre os 2 primeiros: sem sugestao automatica (candidatos 'contadora' e 'contadorb' a distancia 1)
+    d = common.Diag{}
+    d.tem = true
+    d.codigo = common.E0201
+    var empate: SemParecido = SemParecido{}
+    sem_parecido_iniciar(&sv, common.E0201, 67, alvo, &empate)
+    ver_nome(&sv, common.internar(&nomes, "contadora", 9), &empate.busca, 22)
+    ver_nome(&sv, common.internar(&nomes, "contadorb", 9), &empate.busca, 42)
+    expect(empate.busca.qtd == 2 and empate.busca.nomes[0].distancia == empate.busca.nomes[1].distancia)
+    expect(not sem_erro_parecido(&sv, &empate, "nome 'contador' nao declarado"))
+    expect(d.sug.n == 0 and d.rel.n == 2)
+    // outro codigo (E0102): nao sugere mesmo com candidato
+    d = common.Diag{}
+    d.tem = true
+    d.codigo = common.E0102
+    var outro: SemParecido = SemParecido{}
+    sem_parecido_iniciar(&sv, common.E0102, 67, alvo, &outro)
+    ver_nome(&sv, n1, &outro.busca, 22)
+    expect(not sem_erro_parecido(&sv, &outro, "x"))
+    expect(d.sug.n == 0 and d.rel.n == 1 and (d.causa or_else "") == "x (parecido: 'contado')")
+    s8_liberar(&f, &nomes, &ar)
+}
+
+// G3 S8: origem dos candidatos (locais, globais visiveis, pub do modulo, campos, membros, parametros).
+test "sem_parecido: locais, globais, pub do modulo, campos, membros e params" {
+    var sv: Semantica = Semantica{}
+    var f: common.Fonte = common.Fonte{}
+    var d: common.Diag = common.Diag{}
+    var ar: common.Arena = common.Arena{}
+    var nomes: common.Interner = common.Interner{}
+    var prog: frontend.Programa = frontend.Programa{}
+    s8_preparar(&sv, &f, &d, &ar, &nomes, &prog, "x", common.E0201)
+    let alvo: i32 = common.internar(&nomes, "contador", 8)
+    let n1: i32 = common.internar(&nomes, "contado", 7)
+    let n2: i32 = common.internar(&nomes, "contadorrr", 10)
+    sv.qtd_nomes = len(nomes.nomes) as u32
+    var gl = make([dynamic]Simbolo, alloc = heap)
+    defer delete(gl)
+    for _k in 0..<5 {
+        append(&gl, item = Simbolo{})
+    }
+    var d1: frontend.Decl = frontend.Decl{}
+    d1.modulo = 1
+    d1.publico = true
+    d1.pos = 22
+    var d2: frontend.Decl = frontend.Decl{}
+    d2.modulo = 1
+    d2.publico = false
+    d2.pos = 42
+    gl[n1] = Simbolo{categoria = SIM_CONST as u8} // global sem declaracao no fonte (embutido): pos PARECIDO_SEM_POS
+    gl[n2] = Simbolo{categoria = SIM_CONST as u8, decl = &d2} // de outro modulo: nao e candidato sem apelido
+    sv.globais = gl[0..<len(gl)]
+    sv.escopo.pilha = make([dynamic]LocalInfo, alloc = heap)
+    defer delete(sv.escopo.pilha)
+    append(&sv.escopo.pilha, item = LocalInfo{nome = n2, pos = 42})
+    var sp: SemParecido = SemParecido{}
+    sem_parecido_iniciar(&sv, common.E0201, 67, alvo, &sp)
+    sem_parecidos_de_nome(&sv, 0, &sp) // locais, depois globais visiveis
+    expect(sp.busca.qtd == 2 and sp.busca.nomes[0].pos == common.PARECIDO_SEM_POS and sp.busca.nomes[1].pos == 42)
+    expect((sp.busca.nomes[0].texto or_else "") == "contado" and (sp.busca.nomes[1].texto or_else "") == "contadorrr")
+    // pub do modulo 1: so o de d1 (d2 nao e pub)
+    gl[n1] = Simbolo{categoria = SIM_CONST as u8, decl = &d1}
+    var sp2: SemParecido = SemParecido{}
+    sem_parecido_iniciar(&sv, common.E0201, 67, alvo, &sp2)
+    sem_parecidos_de_nome(&sv, 1, &sp2)
+    expect(sp2.busca.qtd == 1 and sp2.busca.nomes[0].pos == 22)
+    // campos, membros e parametros: o nome e a posicao de cada um
+    var cs = make([dynamic]frontend.Campo, alloc = heap)
+    defer delete(cs)
+    append(&cs, item = frontend.Campo{nome = n1, pos = 5})
+    append(&cs, item = frontend.Campo{nome = n2, pos = 9})
+    var estrutura: frontend.Decl = frontend.Decl{}
+    estrutura.campos = cs[..]
+    estrutura.ncampos = 2
+    var sp3: SemParecido = SemParecido{}
+    sem_parecido_iniciar(&sv, common.E0201, 67, alvo, &sp3)
+    sem_parecidos_de_campos(&sv, &estrutura, &sp3)
+    expect(sp3.busca.qtd == 2 and sp3.busca.nomes[0].pos == 5 and sp3.busca.nomes[1].pos == 9)
+    var ms = make([dynamic]frontend.Membro, alloc = heap)
+    defer delete(ms)
+    append(&ms, item = frontend.Membro{nome = n2, pos = 11})
+    var enumeracao: frontend.Decl = frontend.Decl{}
+    enumeracao.membros = ms[..]
+    enumeracao.nmembros = 1
+    var sp4: SemParecido = SemParecido{}
+    sem_parecido_iniciar(&sv, common.E0201, 67, alvo, &sp4)
+    sem_parecidos_de_membros(&sv, &enumeracao, &sp4)
+    expect(sp4.busca.qtd == 1 and sp4.busca.nomes[0].pos == 11)
+    var ps = make([dynamic]frontend.Param, alloc = heap)
+    defer delete(ps)
+    append(&ps, item = frontend.Param{nome = n1, pos = 3})
+    var sp5: SemParecido = SemParecido{}
+    sem_parecido_iniciar(&sv, common.E0201, 67, alvo, &sp5)
+    sem_parecidos_de_params(&sv, ps[..], &sp5)
+    expect(sp5.busca.qtd == 1 and sp5.busca.nomes[0].pos == 3 and sp5.codigo == common.E0201 and sp5.pos == 67)
+    s8_liberar(&f, &nomes, &ar)
+}

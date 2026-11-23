@@ -1,0 +1,143 @@
+// std:sha (A81) -sha256 (FIPS 180-4) e hmac_sha256 (RFC 2104) sobre []u8. Forja pura (sem foreign), igual nos 2 backends.
+// Versao: 0.1.0. Changelog: 0.1.0 - L3 (A81): sha256 e hmac_sha256. sha1 e md5 ficam de fora (so para conferencia, no plano).
+// Vetores publicados: sha256("abc") = ba7816bf...; sha256("") = e3b0c442...; hmac RFC 4231 casos 1, 2, 3 e 6.
+// Saida em [32]u8 (big endian por palavra, como na norma). Para texto hexadecimal, converta o resultado no chamador.
+// Sem alocacao para sha256; hmac_sha256 usa listas temporarias no heap e libera antes de devolver.
+
+const SHA_K: [64]u32 = {
+    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+}
+
+const SHA_H0: [8]u32 = {0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19}
+
+const BLOCO_BYTES: int = 64
+const PADDING_LIMITE: int = 56
+const PADDING_TAMANHO_CURTO: int = 64
+const PADDING_TAMANHO_LONGO: int = 128
+const BYTE_UM_BIT: u8 = 0x80
+const BITS_POR_BYTE: u64 = 8
+const MASCARA_BYTE: u64 = 0xFF
+const MASCARA_U32: u32 = 0xFF
+const HMAC_BLOCO: int = 64
+const HMAC_IPAD: u8 = 0x36
+const HMAC_OPAD: u8 = 0x5C
+
+// Palavra big endian de 4 bytes a partir de at (quem chama confere a faixa).
+proc ler_be32(b: []u8, at: int) -> u32 {
+    return ((b[at] as u32) << 24) | ((b[at + 1] as u32) << 16) | ((b[at + 2] as u32) << 8) | (b[at + 3] as u32)
+}
+
+// Processa um bloco de 64 bytes de b a partir de at sobre o estado h e devolve o novo estado (a soma com h e feita no fim, como na norma).
+proc comprime(h: [8]u32, b: []u8, at: int) -> [8]u32 {
+    var w: [64]u32 = {}
+    for i in 0..<16 {
+        w[i] = ler_be32(b, at + 4 * i)
+    }
+    for i in 16..<64 {
+        let x = w[i - 15]
+        let s0 = rotate_right(x, n = 7) ~ rotate_right(x, n = 18) ~ (x >> 3)
+        let y = w[i - 2]
+        let s1 = rotate_right(y, n = 17) ~ rotate_right(y, n = 19) ~ (y >> 10)
+        w[i] = wrapping_add(wrapping_add(w[i - 16], b = s0), b = wrapping_add(w[i - 7], b = s1))
+    }
+    var st = h
+    for i in 0..<64 {
+        let e = st[4]
+        let a = st[0]
+        let s1 = rotate_right(e, n = 6) ~ rotate_right(e, n = 11) ~ rotate_right(e, n = 25)
+        let ch = st[6] ~ (e & (st[5] ~ st[6]))
+        let t1 = wrapping_add(wrapping_add(st[7], b = s1), b = wrapping_add(ch, b = wrapping_add(SHA_K[i], b = w[i])))
+        let s0 = rotate_right(a, n = 2) ~ rotate_right(a, n = 13) ~ rotate_right(a, n = 22)
+        let maj = (a & st[1]) ~ (a & st[2]) ~ (st[1] & st[2])
+        let t2 = wrapping_add(s0, b = maj)
+        st[7] = st[6]
+        st[6] = st[5]
+        st[5] = e
+        st[4] = wrapping_add(st[3], b = t1)
+        st[3] = st[2]
+        st[2] = st[1]
+        st[1] = a
+        st[0] = wrapping_add(t1, b = t2)
+    }
+    var res = h
+    for i in 0..<8 {
+        res[i] = wrapping_add(h[i], b = st[i])
+    }
+    return res
+}
+
+// SHA-256 de b: 32 bytes. Vazio e valido (o hash do vazio tem 32 bytes).
+pub proc sha256(b: []u8) -> [32]u8 {
+    let n = len(b)
+    var h = SHA_H0
+    let cheios = n / BLOCO_BYTES
+    for i in 0..<cheios {
+        h = comprime(h, b, i * BLOCO_BYTES)
+    }
+    // Padding: 0x80, zeros e o comprimento em bits (64 bits, big endian) no fim do ultimo bloco.
+    let resto = n - cheios * BLOCO_BYTES
+    var fim: [128]u8 = {}
+    for i in 0..<resto {
+        fim[i] = b[cheios * BLOCO_BYTES + i]
+    }
+    fim[resto] = BYTE_UM_BIT
+    var total = PADDING_TAMANHO_CURTO
+    if resto >= PADDING_LIMITE {
+        total = PADDING_TAMANHO_LONGO
+    }
+    let bits = (n as u64) * 8
+    for i in 0..<8 {
+        fim[total - 1 - i] = ((bits >> ((i as u64) * BITS_POR_BYTE)) & MASCARA_BYTE) as u8
+    }
+    h = comprime(h, fim[..], 0)
+    if total == PADDING_TAMANHO_LONGO {
+        h = comprime(h, fim[..], BLOCO_BYTES)
+    }
+    var out: [32]u8 = {}
+    for i in 0..<8 {
+        // `as u8` confere a faixa em dev (R0002): mascara antes de estreitar.
+        out[i * 4] = ((h[i] >> 24) & MASCARA_U32) as u8
+        out[i * 4 + 1] = ((h[i] >> 16) & MASCARA_U32) as u8
+        out[i * 4 + 2] = ((h[i] >> 8) & MASCARA_U32) as u8
+        out[i * 4 + 3] = (h[i] & MASCARA_U32) as u8
+    }
+    return out
+}
+
+// HMAC-SHA256 (RFC 2104): chave mais longa que o bloco (64) e trocada pelo seu sha256; o resto e zerado ate 64 bytes.
+pub proc hmac_sha256(key: []u8, msg: []u8) -> [32]u8 {
+    var chave: [64]u8 = {}
+    if len(key) > HMAC_BLOCO {
+        let curta = sha256(key)
+        for i in 0..<32 {
+            chave[i] = curta[i]
+        }
+    } else {
+        for i in 0..<len(key) {
+            chave[i] = key[i]
+        }
+    }
+    var interno = make([dynamic]u8, alloc = heap)
+    defer delete(interno)
+    for i in 0..<HMAC_BLOCO {
+        append(&interno, item = chave[i] ~ HMAC_IPAD)
+    }
+    append(&interno, items = msg)
+    let ih = sha256(interno[..])
+    var externo = make([dynamic]u8, alloc = heap)
+    defer delete(externo)
+    for i in 0..<HMAC_BLOCO {
+        append(&externo, item = chave[i] ~ HMAC_OPAD)
+    }
+    for i in 0..<32 {
+        append(&externo, item = ih[i])
+    }
+    return sha256(externo[..])
+}

@@ -1,0 +1,439 @@
+// driver/filho_win.fj - porte de compiler/driver/filho_win.c, compiler/driver/filho_win.h
+// sha256 de driver/filho_win.c: 61170e14af9f475167531d3ae8d33898f4fe49b5ff00bf3603ebaf74af6a20c8
+// sha256 de driver/filho_win.h: 513e60a017a717de4ff5b5fb88cb10cc469b4499f15bc495bbb95f9bd18b0f85
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.2.0
+// Changelog: 0.2.0 - G3 V5-P2: corpo real pelo std:process, num laco so (sem threads, evento nem CancelSynchronousIo). CreateProcess suspenso + HANDLE_LIST + Job + pipes + 2 leitores
+//            viram process.spawn (stdin herdado; stderr em pipe; stdout em pipe so com limite de saida) e, a cada volta: read_available (o que ja chegou) -> orcamento de saida ->
+//            filtro de R-code -> destino; process.wait com prazo curto (PASSO_LEITURA_MS, no maximo, para a saida nao esperar o passo do tempo); process.peak_memory (pico do Job).
+//            Orcamento perde trava/evento (so um fio); Canal perde leitura/thread. Saem: ler_canal, criar_canal, herdavel_do_padrao, criar_job, lista_de_handles, criar_suspenso,
+//            prender_e_soltar, juntar_leitores, fechar_se_aberto, iniciar_leitores, preparar_canais. Desvios do C: o filho nasce solto (o std:process nao tem "suspenso": o tempo conta
+//            do retorno do spawn) e o teto duro de memoria (2x + 64 MiB) e por processo (mem_limit_bytes), nao pelo Job inteiro.
+
+import "std:process"
+import "common"
+
+struct FilhoPedido {
+    exe: ?str
+    args: ?[]str
+    limite_tempo_s: f64
+    limite_mem: u64
+    limite_saida: u64
+    enriquecer: bool
+}
+
+struct FilhoResultado {
+    fim: i32
+    codigo: u32
+    descartados: u64
+    pico_mem: u64
+}
+
+// Quanto da saida ainda pode sair: os dois canais dividem o mesmo orcamento (stdout + stderr).
+struct Orcamento {
+    limite: u64
+    usado: u64
+    descartados: u64
+    estourou: bool
+}
+
+struct Canal {
+    destino: ?^common.Saida
+    filtrar: bool
+    filtro: RcodeFiltro
+    saida: [dynamic]u8
+}
+
+struct Execucao {
+    orcamento: Orcamento
+    canal: [2]Canal
+    filho: process.Process
+    inicio_ns: u64
+}
+
+const FILHO_TERMINOU: i32 = 0
+const FILHO_ESTOUROU_TEMPO: i32 = 1
+const FILHO_ESTOUROU_MEMORIA: i32 = 2
+const FILHO_ESTOUROU_SAIDA: i32 = 3
+const LEITURA_TAM: i32 = 16384
+const PASSO_MEMORIA_MS: i32 = 5
+const PASSO_TEMPO_MAX_MS: i32 = 1000
+const PASSO_LEITURA_MS: u32 = 10
+const TETO_FOLGA_BYTES: u64 = 67108864
+const CANAL_STDOUT: i32 = 0
+const CANAL_STDERR: i32 = 1
+const CANAIS: i32 = 2
+
+// C: driver/filho_win.c:54
+// Quantos dos 'n' bytes lidos ainda cabem no limite; o resto e contado como descartado.
+proc reservar(o: ^Orcamento, n: u64) -> u64 {
+    var livre: u64 = 0
+    if o.limite > o.usado {
+        livre = o.limite - o.usado
+    }
+    var cabe: u64 = livre
+    if n <= livre {
+        cabe = n
+    }
+    o.usado += cabe
+    o.descartados += n - cabe
+    if cabe < n {
+        o.estourou = true
+    }
+    return cabe
+}
+
+// C: driver/filho_win.c:72
+proc emitir(c: ^Canal, dados: []u8) {
+    if len(dados) == 0 {
+        return
+    }
+    common.c2f_saida_escrever(c.destino as ^common.Saida, dados)
+}
+
+// C: driver/filho_win.c:83
+// Um pedaco lido do canal: reserva no orcamento, passa pelo filtro de R-code (se o canal filtra) e vai ao destino.
+proc tratar_canal(c: ^Canal, o: ^Orcamento, dados: []u8) {
+    if len(dados) == 0 {
+        return
+    }
+    let cabe = reservar(o, len(dados) as u64)
+    if cabe == 0 {
+        return
+    }
+    let parte: []u8 = dados[0..<(cabe as int)]
+    if not c.filtrar {
+        emitir(c, parte)
+        return
+    }
+    clear(&c.saida)
+    rcode_filtro_alimentar(&c.filtro, parte, cabe, &c.saida)
+    emitir(c, c.saida[..])
+}
+
+// C: driver/filho_win.c:217
+proc segundos_desde(e: ^Execucao) -> f64 {
+    return ((common.relogio_ns() - e.inicio_ns) as f64) / 1000000000.0
+}
+
+// C: driver/filho_win.c:225
+// Pico de memoria confirmada do Job do filho; 0 se nao der para ler.
+proc pico_de_memoria(filho: process.Process) -> u64 {
+    switch pico in process.peak_memory(filho) {
+    case u64:
+        return pico
+    case process.ProcessError:
+        return 0
+    }
+    return 0
+}
+
+// C: driver/filho_win.c:234
+proc proximo_passo(e: ^Execucao, p: ^FilhoPedido) -> u32 {
+    var falta: f64 = 0.0
+    if p.limite_mem > 0 {
+        return PASSO_MEMORIA_MS as u32
+    }
+    if p.limite_tempo_s <= 0.0 {
+        return 4294967295
+    }
+    falta = (p.limite_tempo_s - segundos_desde(e)) * 1000.0
+    if falta < 1.0 {
+        return 1
+    }
+    var tern_1: u32 = 0
+    if falta > 1000.0 {
+        tern_1 = PASSO_TEMPO_MAX_MS as u32
+    } else {
+        tern_1 = (falta as u32) + 1
+    }
+    return tern_1
+}
+
+// Le o que o filho ja escreveu, sem bloquear, e entrega aos canais; devolve quantos bytes chegaram.
+proc drenar(e: ^Execucao, saida: ^[dynamic]u8, erro: ^[dynamic]u8) -> int {
+    clear(saida)
+    clear(erro)
+    let n = process.read_available(e.filho, saida, erro)
+    tratar_canal(&e.canal[CANAL_STDOUT as int], &e.orcamento, saida[..])
+    tratar_canal(&e.canal[CANAL_STDERR as int], &e.orcamento, erro[..])
+    return n
+}
+
+// C: driver/filho_win.c:246
+// Espera o filho terminar ou um limite estourar, entregando a saida a cada volta.
+proc esperar(e: ^Execucao, p: ^FilhoPedido, saida: ^[dynamic]u8, erro: ^[dynamic]u8) -> i32 {
+    while true {
+        _ = drenar(e, saida, erro)
+        if e.orcamento.estourou {
+            return FILHO_ESTOUROU_SAIDA
+        }
+        let passo: u32 = min(proximo_passo(e, p), PASSO_LEITURA_MS)
+        if process.wait(e.filho, timeout_ms = passo as int) {
+            return FILHO_TERMINOU
+        }
+        if (p.limite_tempo_s > 0.0) and (segundos_desde(e) >= p.limite_tempo_s) {
+            return FILHO_ESTOUROU_TEMPO
+        }
+        if (p.limite_mem > 0) and (pico_de_memoria(e.filho) > p.limite_mem) {
+            return FILHO_ESTOUROU_MEMORIA
+        }
+    }
+    return FILHO_TERMINOU
+}
+
+// C: driver/filho_win.c:285
+// Limite do orcamento, os dois destinos (stdout e stderr do forja) e o buffer de cada canal; so o stderr filtra R-code, e so se o pedido manda.
+proc iniciar_execucao(e: ^Execucao, p: ^FilhoPedido, destino_out: ^common.Saida, destino_err: ^common.Saida) {
+    e.orcamento.limite = 18446744073709551615
+    if p.limite_saida > 0 {
+        e.orcamento.limite = p.limite_saida
+    }
+    e.canal[CANAL_STDOUT as int].destino = destino_out
+    e.canal[CANAL_STDOUT as int].saida = make([dynamic]u8, alloc = heap)
+    e.canal[CANAL_STDERR as int].destino = destino_err
+    e.canal[CANAL_STDERR as int].saida = make([dynamic]u8, alloc = heap)
+    e.canal[CANAL_STDERR as int].filtrar = p.enriquecer
+    rcode_filtro_iniciar(&e.canal[CANAL_STDERR as int].filtro)
+    rcode_filtro_iniciar(&e.canal[CANAL_STDOUT as int].filtro)
+}
+
+// C: driver/filho_win.c:317
+// Inicia o filho: stdin herdado, stderr no pipe (filtrado) e stdout no pipe so se ha limite de saida; o teto duro de memoria e 2x o limite + 64 MiB. false = nada ficou rodando.
+proc disparar(e: ^Execucao, p: ^FilhoPedido, erro: ^u32) -> bool {
+    var cmd = process.Command{program = p.exe or_else "", args = p.args or_else {}, env = {}, cwd = "", timeout_ms = 0, stdin = process.Stdio.inherit, stdout = process.Stdio.inherit, stderr = process.Stdio.pipe}
+    if p.limite_saida > 0 {
+        cmd.stdout = process.Stdio.pipe
+    }
+    if p.limite_mem > 0 {
+        cmd.mem_limit_bytes = (p.limite_mem * 2) + TETO_FOLGA_BYTES
+    }
+    switch f in process.spawn(cmd) {
+    case process.Process:
+        e.filho = f
+        e.inicio_ns = common.relogio_ns()
+        return true
+    case process.ProcessError:
+        erro^ = erro_do_spawn(f)
+        return false
+    }
+    return false
+}
+
+// C: driver/filho_win.c:332
+// Encerra o filho (com limite ou estouro, o Job inteiro), espera, entrega o que sobrou nos pipes e fecha o veredito.
+proc concluir_2(e: ^Execucao, p: ^FilhoPedido, fim: i32, r: ^FilhoResultado, saida: ^[dynamic]u8, erro: ^[dynamic]u8) {
+    let com_limite = (p.limite_tempo_s > 0.0) or (p.limite_mem > 0) or (p.limite_saida > 0)
+    if com_limite or (fim != FILHO_TERMINOU) {
+        process.kill(e.filho) // estouro, ou sobra de neto: nada fica vivo segurando o pipe
+    }
+    while not process.wait(e.filho, timeout_ms = 1000) {
+        continue
+    }
+    while drenar(e, saida, erro) > 0 {
+        continue
+    }
+    for k in 0..<(CANAIS as int) {
+        if e.canal[k].filtrar {
+            clear(&e.canal[k].saida)
+            rcode_filtro_fechar(&e.canal[k].filtro, &e.canal[k].saida)
+            emitir(&e.canal[k], e.canal[k].saida[..])
+        }
+    }
+    r.fim = fim
+    r.codigo = common.c2f_trunc_u32(common.c2f_s2u_64(process.exit_code(e.filho) as i64))
+    r.pico_mem = 0
+    if p.limite_mem > 0 {
+        r.pico_mem = pico_de_memoria(e.filho)
+    }
+    r.descartados = e.orcamento.descartados
+    if fim != FILHO_TERMINOU {
+        return
+    }
+    if e.orcamento.estourou {
+        r.fim = FILHO_ESTOUROU_SAIDA
+    } else if (p.limite_mem > 0) and (r.pico_mem > p.limite_mem) {
+        r.fim = FILHO_ESTOUROU_MEMORIA
+    }
+}
+
+// C: driver/filho_win.c:350
+// Solta o filho e os buffers; os destinos (Saida) sao de quem chamou.
+proc liberar(e: ^Execucao) {
+    process.close(e.filho)
+    for k in 0..<(CANAIS as int) {
+        delete(e.canal[k].saida)
+    }
+}
+
+// C: driver/filho_win.c:362
+// Roda o filho com os destinos de stdout e stderr dados (o filho_executar usa os do forja; o teste usa Saida em memoria).
+proc executar_em(pedido: ^FilhoPedido, resultado: ^FilhoResultado, erro: ^u32, destino_out: ^common.Saida, destino_err: ^common.Saida) -> bool {
+    let e = new(Execucao, alloc = heap)
+    defer delete(e)
+    iniciar_execucao(e, pedido, destino_out, destino_err)
+    erro^ = 0
+    if not disparar(e, pedido, erro) {
+        liberar(e)
+        return false
+    }
+    var saida = make([dynamic]u8, alloc = heap)
+    defer delete(saida)
+    var falha = make([dynamic]u8, alloc = heap)
+    defer delete(falha)
+    let fim = esperar(e, pedido, &saida, &falha)
+    concluir_2(e, pedido, fim, resultado, &saida, &falha)
+    liberar(e)
+    return true
+}
+
+// C: driver/filho_win.c:362
+// Roda o filho ate o fim ou ate um limite estourar. false = nao iniciou; *erro = o codigo do sistema.
+proc filho_executar(pedido: ^FilhoPedido, resultado: ^FilhoResultado, erro: ^u32) -> bool {
+    let destino_out = common.c2f_saida_stdout()
+    let destino_err = common.c2f_saida_stderr()
+    common.c2f_saida_binaria(destino_err) // os bytes do filho saem crus, como o WriteFile do C
+    let ok = executar_em(pedido, resultado, erro, destino_out, destino_err)
+    _ = common.c2f_saida_fechar(destino_out)
+    _ = common.c2f_saida_fechar(destino_err)
+    return ok
+}
+
+// ---------------------------------------------------------------- testes (G3 V5-P2): filhos de verdade (cmd, ping, python)
+
+struct ProvaFilho {
+    r: FilhoResultado
+    erro: u32
+    saida: ?^common.Saida
+    stderr: ?^common.Saida
+}
+
+// Roda 'exe args' com os limites e Saida em memoria nos dois destinos; devolve se iniciou.
+proc prova_rodar(exe: str, args: []str, tempo_s: f64, mem: u64, limite_saida: u64, enriquecer: bool, p: ^ProvaFilho) -> bool {
+    var pedido = FilhoPedido{exe = exe, args = args, limite_tempo_s = tempo_s, limite_mem = mem, limite_saida = limite_saida, enriquecer = enriquecer}
+    let so = common.c2f_saida_memoria(false)
+    p.saida = so
+    let se = common.c2f_saida_memoria(false)
+    p.stderr = se
+    return executar_em(&pedido, &p.r, &p.erro, so, se)
+}
+
+proc prova_liberar(p: ^ProvaFilho) {
+    _ = common.c2f_saida_fechar(p.saida as ^common.Saida)
+    _ = common.c2f_saida_fechar(p.stderr as ^common.Saida)
+}
+
+// O destino em memoria tem exatamente este texto.
+proc saida_igual(s: ^common.Saida, esperado: str) -> bool {
+    let t = from_bytes(s.buf[..], alloc = heap)
+    defer delete(t)
+    return t == esperado
+}
+
+test "filho que sai com codigo: fim TERMINOU e o exit code, sem limite nenhum" {
+    var a: [2]str = {"/c", "exit /b 5"}
+    var p = ProvaFilho{}
+    expect(prova_rodar("cmd.exe", a[..], 0.0, 0, 0, true, &p))
+    expect(p.r.fim == FILHO_TERMINOU)
+    expect(p.r.codigo == 5)
+    expect(p.r.descartados == 0)
+    expect(p.r.pico_mem == 0)
+    prova_liberar(&p)
+}
+
+test "filho que imprime, com limite de saida folgado e tempo: stdout inteiro, descartados 0, exit 0" {
+    var a: [2]str = {"/c", "echo oi"}
+    var p = ProvaFilho{}
+    expect(prova_rodar("cmd.exe", a[..], 30.0, 0, 1000, true, &p))
+    expect(p.r.fim == FILHO_TERMINOU)
+    expect(p.r.codigo == 0)
+    expect(p.r.descartados == 0)
+    expect(saida_igual(p.saida as ^common.Saida, "oi\r\n"))
+    prova_liberar(&p)
+}
+
+test "filho que estoura o tempo e morto (ping -n 30): fim TEMPO em bem menos que a vida do filho" {
+    var a: [3]str = {"-n", "30", "127.0.0.1"}
+    var p = ProvaFilho{}
+    let ini = common.relogio_ns()
+    expect(prova_rodar("ping.exe", a[..], 0.5, 0, 0, true, &p))
+    let gasto_s = ((common.relogio_ns() - ini) as f64) / 1000000000.0
+    expect(p.r.fim == FILHO_ESTOUROU_TEMPO)
+    expect(gasto_s >= 0.5)
+    expect(gasto_s < 10.0)
+    prova_liberar(&p)
+}
+
+test "filho que escreve muito no stdout passa do limite de saida: corta no limite e conta o resto" {
+    var a: [2]str = {"-c", "print('x' * 100000)"}
+    var p = ProvaFilho{}
+    expect(prova_rodar("python", a[..], 30.0, 0, 1000, true, &p))
+    expect(p.r.fim == FILHO_ESTOUROU_SAIDA)
+    expect(len((p.saida as ^common.Saida).buf) == 1000)
+    expect(p.r.descartados > 0)
+    prova_liberar(&p)
+}
+
+test "R-code no stderr: com enriquecer a linha ganha explicacao, forma_certa e spec; sem enriquecer sai como veio" {
+    let linha: str = "{\"codigo\": \"R0003\", \"causa\": \"x\"}"
+    var a: [2]str = {"-c", "import sys; sys.stderr.write('{\"codigo\": \"R0003\", \"causa\": \"x\"}\\n')"}
+    var p = ProvaFilho{}
+    expect(prova_rodar("python", a[..], 0.0, 0, 0, true, &p))
+    expect(p.r.fim == FILHO_TERMINOU)
+    let t = from_bytes((p.stderr as ^common.Saida).buf[..], alloc = heap)
+    expect(t[0..<(len(linha) - 1)] == linha[0..<(len(linha) - 1)])
+    expect(len(t) > (len(linha) + 20))
+    expect(contem(t, len(t) as u64, ", \"explicacao\": \""))
+    expect(contem(t, len(t) as u64, ", \"forma_certa\": \""))
+    expect(contem(t, len(t) as u64, ", \"spec\": \""))
+    delete(t)
+    prova_liberar(&p)
+    var q = ProvaFilho{}
+    expect(prova_rodar("python", a[..], 0.0, 0, 0, false, &q))
+    expect(saida_igual(q.stderr as ^common.Saida, "{\"codigo\": \"R0003\", \"causa\": \"x\"}\n") or saida_igual(q.stderr as ^common.Saida, "{\"codigo\": \"R0003\", \"causa\": \"x\"}\r\n"))
+    prova_liberar(&q)
+}
+
+test "filho que estoura a memoria: fim MEMORIA com pico acima do limite" {
+    var a: [2]str = {"-c", "import time; l = [bytearray(10485760) for i in range(30)]; time.sleep(3)"}
+    var p = ProvaFilho{}
+    expect(prova_rodar("python", a[..], 30.0, 52428800, 0, true, &p))
+    expect(p.r.fim == FILHO_ESTOUROU_MEMORIA)
+    expect(p.r.pico_mem > 52428800)
+    prova_liberar(&p)
+}
+
+test "programa que nao existe: nao inicia e devolve o erro do sistema (2)" {
+    var p = ProvaFilho{}
+    expect(not prova_rodar("C:\\nao_existe_forja\\x.exe", {}, 0.0, 0, 0, true, &p))
+    expect(p.erro == 2)
+    prova_liberar(&p)
+}
+
+test "reservar: corta no limite, conta o descartado e marca o estouro uma vez" {
+    var o = Orcamento{limite = 10}
+    expect(reservar(&o, 4) == 4)
+    expect(not o.estourou)
+    expect(reservar(&o, 4) == 4)
+    expect(reservar(&o, 4) == 2)
+    expect(o.estourou)
+    expect(o.usado == 10)
+    expect(o.descartados == 2)
+    expect(reservar(&o, 3) == 0)
+    expect(o.descartados == 5)
+}
+
+test "proximo_passo: 5 ms com limite de memoria, sem prazo sem limites, o que falta do tempo (teto 1 s)" {
+    let e = new(Execucao, alloc = heap)
+    defer delete(e)
+    e.inicio_ns = common.relogio_ns()
+    var p = FilhoPedido{limite_mem = 1}
+    expect(proximo_passo(e, &p) == 5)
+    p = FilhoPedido{}
+    expect(proximo_passo(e, &p) == 4294967295)
+    p = FilhoPedido{limite_tempo_s = 100.0}
+    expect(proximo_passo(e, &p) == 1000)
+    p = FilhoPedido{limite_tempo_s = 0.0001}
+    e.inicio_ns = common.relogio_ns() - 1000000000
+    expect(proximo_passo(e, &p) == 1)
+}

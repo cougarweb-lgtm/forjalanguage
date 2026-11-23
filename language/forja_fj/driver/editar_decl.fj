@@ -1,0 +1,389 @@
+// driver/editar_decl.fj - porte de compiler/driver/editar_decl.c
+// sha256 de driver/editar_decl.c: b432cd5da1ac0a20d414de46c7083de03f24d17c47126166fff01708f1dbd1ad
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "common"
+import "frontend"
+import "semantic"
+
+struct Insercao {
+    p: ?^Plano
+    arquivo: u32
+    lugar: i32
+    vizinha: ?^frontend.Decl
+    texto: ?str
+    onde: u32
+    ins: [dynamic]u8
+}
+
+const TOPO_LINHA: i32 = 0
+const TOPO_COMECO: i32 = 1
+const TOPO_CABECALHO: i32 = 2
+
+// C: driver/editar_decl.c:19
+proc texto_aparado(p: ^Plano, texto: ?str) -> ?str {
+    let bytes_do_texto: []u8 = as_bytes(texto or_else "")
+    var ini: int = 0
+    var fim: int = len(bytes_do_texto)
+    while (ini < fim) and eh_branco_do_texto(bytes_do_texto[ini]) {
+        ini += 1
+    }
+    while (fim > ini) and eh_branco_do_texto(bytes_do_texto[fim - 1]) {
+        fim -= 1
+    }
+    if fim == ini {
+        _ = plano_erro(p, "o texto a inserir esta vazio")
+        return none
+    }
+    return from_bytes(bytes_do_texto[ini..<fim], alloc = common.arena_mem(p.arena as ^common.Arena))
+}
+
+// '\n' '\r' ' ' '\t' das pontas do texto a inserir (os mesmos do C)
+proc eh_branco_do_texto(c: u8) -> bool {
+    return (c == 10) or (c == 13) or (c == 32) or (c == 9)
+}
+
+// C: driver/editar_decl.c:34
+proc texto_depois_de_linha(q: ^Consulta, apos: u32, texto: ?str, ins: ^[dynamic]u8) -> u32 {
+    var seguinte: u32 = 0
+    var outra: u32 = 0
+    var branco: bool = false
+    var outra_branca: bool = false
+    if (common.c2f_b2i32(editar_linha_seguinte(q, apos, &seguinte, &branco)) != 0) and (not branco) {
+        let txt_1 = texto or_else "(null)"
+        format(f"\n{txt_1}\n\n", into = ins)
+        return seguinte
+    }
+    if (common.c2f_b2i32(branco) != 0) and (common.c2f_b2i32(editar_linha_seguinte(q, seguinte, &outra, &outra_branca)) != 0) {
+        let txt_2 = texto or_else "(null)"
+        format(f"{txt_2}\n\n", into = ins)
+        return outra
+    }
+    let txt_3 = texto or_else "(null)"
+    format(f"\n\n{txt_3}", into = ins)
+    return apos
+}
+
+// C: driver/editar_decl.c:63
+proc texto_antes_de_linha(q: ^Consulta, i: ^Insercao, ini: u32) {
+    if (ini > consulta_inicio_do_arquivo(q, ini)) and editar_linha_tem_texto(q, ini - 1) {
+        append(&i.ins, item = "\n")
+    }
+    append(&i.ins, item = (i.texto or_else ""))
+    append(&i.ins, item = "\n\n")
+}
+
+// C: driver/editar_decl.c:74
+proc depois_dos_imports(q: ^Consulta, arquivo: u32, topo: ^i32) -> u32 {
+    var ultimo: ?^frontend.Decl = none
+    var onde: u32 = 0
+    var cabecalho: bool = false
+    var d: ?^frontend.Decl = ((q.c as ^Compilacao).sem.programa as ^frontend.Programa).primeira
+    while d != none {
+        if ((d as ^frontend.Decl).tipo_no == (frontend.D_IMPORT as u8)) and (editar_arquivo_do_offset(q, (d as ^frontend.Decl).pos) == arquivo) {
+            ultimo = d
+        }
+        d = (d as ^frontend.Decl).prox
+    }
+    topo^ = TOPO_LINHA
+    if ultimo != none {
+        return editar_fim_da_linha(q, (ultimo as ^frontend.Decl).pos)
+    }
+    if not editar_ponto_sem_imports(q, arquivo, &onde, &cabecalho) {
+        return editar_fim_do_conteudo(q, arquivo)
+    }
+    var tern_1: i32 = TOPO_COMECO
+    if common.c2f_b2i32(cabecalho) != 0 {
+        tern_1 = TOPO_CABECALHO
+    }
+    topo^ = tern_1
+    return onde
+}
+
+// C: driver/editar_decl.c:91
+proc ponto_do_texto(i: ^Insercao) -> bool {
+    let q: ?^Consulta = (i.p as ^Plano).q
+    var f: FaixaDecl = FaixaDecl{}
+    var topo: i32 = TOPO_LINHA
+    if (common.c2f_s2u_32(i.lugar) == (LUGAR_DEPOIS_DE as u32)) or (common.c2f_s2u_32(i.lugar) == (LUGAR_ANTES_DE as u32)) {
+        if not editar_faixa_da_decl(i.p as ^Plano, i.vizinha, &f) {
+            return false
+        }
+        var tern_1: u32 = f.ini_texto
+        if common.c2f_s2u_32(i.lugar) == (LUGAR_DEPOIS_DE as u32) {
+            tern_1 = texto_depois_de_linha(q as ^Consulta, f.fim_texto, i.texto, &i.ins)
+        }
+        i.onde = tern_1
+        if common.c2f_s2u_32(i.lugar) == (LUGAR_ANTES_DE as u32) {
+            texto_antes_de_linha(q as ^Consulta, i, i.onde)
+        }
+        return true
+    }
+    var tern_2: u32 = 0
+    if common.c2f_s2u_32(i.lugar) == (LUGAR_APOS_IMPORTS as u32) {
+        tern_2 = depois_dos_imports(q as ^Consulta, i.arquivo, &topo)
+    } else {
+        tern_2 = editar_fim_do_conteudo(q as ^Consulta, i.arquivo)
+    }
+    i.onde = tern_2
+    if common.c2f_s2u_32(topo) == (TOPO_COMECO as u32) {
+        let txt_1 = i.texto or_else "(null)"
+        format(f"{txt_1}\n\n", into = &i.ins)
+    } else if common.c2f_s2u_32(topo) == (TOPO_CABECALHO as u32) {
+        let txt_2 = i.texto or_else "(null)"
+        format(f"\n\n{txt_2}", into = &i.ins)
+    } else if i.onde == consulta_inicio_do_arquivo(q as ^Consulta, i.onde) {
+        let txt_3 = i.texto or_else "(null)"
+        format(f"{txt_3}\n", into = &i.ins)
+    } else {
+        i.onde = texto_depois_de_linha(q as ^Consulta, i.onde, i.texto, &i.ins)
+    }
+    return true
+}
+
+// C: driver/editar_decl.c:112
+proc editar_inserir_texto(p: ^Plano, arquivo: u32, lugar: i32, vizinha: ?^frontend.Decl, texto: ?str) -> bool {
+    var i: Insercao = Insercao{}
+    i.p = p
+    i.arquivo = arquivo
+    i.lugar = lugar
+    i.vizinha = vizinha
+    i.texto = texto_aparado(p, texto)
+    i.ins = make([dynamic]u8, alloc = heap)
+    defer delete(i.ins)
+    if (i.texto == none) or (not editar_modulo_editavel(p, frontend.modulos_pacote_do_arquivo(&((p.q as ^Consulta).c as ^Compilacao).modulos, arquivo) as u8)) {
+        return false
+    }
+    if not ponto_do_texto(&i) {
+        return false
+    }
+    let novo: str = from_bytes(i.ins[..], alloc = heap)
+    defer delete(novo)
+    return editar_trocar_no_arquivo(p, i.onde, i.onde, novo)
+}
+
+// C: driver/editar_decl.c:125
+proc marca_ligada(item: ?^JsonValor, chave: str) -> bool {
+    let v: ?^JsonValor = json_membro(item, chave)
+    return ((v != none) and (common.c2f_s2u_32((v as ^JsonValor).tipo) == (JSON_BOOL as u32))) and ((v as ^JsonValor).numero != 0)
+}
+
+// C: driver/editar_decl.c:133
+proc ler_lugar(p: ^Plano, lugar: ^i32, vizinha: ^?^frontend.Decl) -> bool {
+    let depois: ?str = json_texto_de(p.item, "depois_de")
+    let antes: ?str = json_texto_de(p.item, "antes_de")
+    let pedidas: i32 = common.c2f_b2i32(depois != none) + common.c2f_b2i32(antes != none) + common.c2f_b2i32(marca_ligada(p.item, "no_fim")) + common.c2f_b2i32(marca_ligada(p.item, "no_inicio_depois_dos_imports"))
+    var id: ?str = antes
+    if depois != none {
+        id = depois
+    }
+    if pedidas != 1 {
+        return plano_erro(p, "indique UMA posicao: depois_de (id), antes_de (id), no_fim ou no_inicio_depois_dos_imports")
+    }
+    vizinha^ = none
+    if id != none {
+        let id_txt: str = id or_else ""
+        let achada: ?^frontend.Decl = consulta_achar_decl(p.q as ^Consulta, id)
+        if achada == none {
+            let msg_1 = format(f"'{id_txt}' nao e declaracao do projeto (use o nome ou o id de 'forja consultar simbolos')", alloc = heap)
+            defer delete(msg_1)
+            return plano_erro(p, msg_1)
+        }
+        if (achada as ^frontend.Decl).externo {
+            let msg_2 = format(f"'{id_txt}' e de um bloco 'foreign': use o proprio bloco como vizinho", alloc = heap)
+            defer delete(msg_2)
+            return plano_erro(p, msg_2)
+        }
+        vizinha^ = achada
+    }
+    if depois != none {
+        lugar^ = LUGAR_DEPOIS_DE
+    } else if antes != none {
+        lugar^ = LUGAR_ANTES_DE
+    } else if marca_ligada(p.item, "no_fim") {
+        lugar^ = LUGAR_NO_FIM
+    } else {
+        lugar^ = LUGAR_APOS_IMPORTS
+    }
+    return true
+}
+
+// C: driver/editar_decl.c:151
+proc arquivo_da_insercao(p: ^Plano, vizinha: ?^frontend.Decl) -> i32 {
+    var tern_1: ?str = none
+    if json_texto_de(p.item, "modulo") != none {
+        tern_1 = json_texto_de(p.item, "modulo")
+    } else {
+        tern_1 = json_texto_de(p.item, "arquivo")
+    }
+    let nome: ?str = tern_1
+    var arquivo: u32 = 0
+    var modulo: i32 = 0
+    if (nome == none) and (vizinha == none) {
+        let msg_1 = format(f"falta \"modulo\" ou \"arquivo\" (em no_fim e no_inicio_depois_dos_imports)", alloc = heap)
+        defer delete(msg_1)
+        _ = plano_erro(p, msg_1)
+        return -1
+    }
+    if vizinha != none {
+        var tern_2: i32 = (vizinha as ^frontend.Decl).modulo as i32
+        if nome != none {
+            tern_2 = editar_achar_modulo(p, nome)
+        }
+        modulo = tern_2
+        arquivo = editar_arquivo_do_offset(p.q as ^Consulta, (vizinha as ^frontend.Decl).pos)
+    } else {
+        modulo = editar_achar_modulo_e_arquivo(p, nome, &arquivo)
+    }
+    if ((modulo >= 0) and (vizinha != none)) and (((vizinha as ^frontend.Decl).modulo as i32) != modulo) {
+        let txt_1 = nome or_else "(null)"
+        let msg_2 = format(f"a declaracao de referencia esta em outro modulo que o pedido (\"{txt_1}\")", alloc = heap)
+        defer delete(msg_2)
+        _ = plano_erro(p, msg_2)
+        return -1
+    }
+    var tern_3: i32 = transmute(arquivo, to = i32)
+    if modulo < 0 {
+        tern_3 = -1
+    }
+    return tern_3
+}
+
+// C: driver/editar_decl.c:174
+proc editar_inserir_decl(p: ^Plano, alvo: str, texto: str) -> bool {
+    var lugar: i32 = LUGAR_NO_FIM
+    var vizinha: ?^frontend.Decl = none
+    var arquivo: i32 = 0
+    if not ler_lugar(p, &lugar, &vizinha) {
+        return false
+    }
+    arquivo = arquivo_da_insercao(p, vizinha)
+    return (arquivo >= 0) and (common.c2f_b2i32(editar_inserir_texto(p, common.c2f_s2u_32(arquivo), lugar, vizinha, texto)) != 0)
+}
+
+// C: driver/editar_decl.c:188
+proc decl_removivel(p: ^Plano, d: ?^frontend.Decl) -> bool {
+    let tipo_ok: bool = (common.c2f_b2i32(consulta_eh_simbolo(d)) != 0) or ((d as ^frontend.Decl).tipo_no == (frontend.D_TEST as u8))
+    if not tipo_ok {
+        let msg_1 = format(f"so se remove proc, struct, enum, union, const, unit e test", alloc = heap)
+        defer delete(msg_1)
+        return plano_erro(p, msg_1)
+    }
+    if (d as ^frontend.Decl).externo {
+        let msg_2 = format(f"a declaracao e de um bloco 'foreign': remova o bloco inteiro com trocar_no", alloc = heap)
+        defer delete(msg_2)
+        return plano_erro(p, msg_2)
+    }
+    if consulta_entrada_de(p.q as ^Consulta, d) != none {
+        let msg_3 = format(f"a declaracao e ponto de entrada (main ou pub export): nao se remove", alloc = heap)
+        defer delete(msg_3)
+        return plano_erro(p, msg_3)
+    }
+    return editar_modulo_editavel(p, (d as ^frontend.Decl).modulo)
+}
+
+// C: driver/editar_decl.c:199
+// "arquivo:linha:coluna" do uso: 96 bytes do caminho e 120 do texto (os %.96s e %.120s do C). Arena: quem chama nao libera.
+proc local_do_uso(p: ^Plano, off: u32) -> str {
+    let f: ^common.Fonte = &((p.q as ^Consulta).c as ^Compilacao).fonte
+    let pos: common.FontePosicao = common.fonte_localizar_no_arquivo(f, off)
+    let rel: str = caminho_relativo_texto(p, pos.caminho)
+    defer delete(rel)
+    let rel_corte: str = rel[0..<min(len(rel), 96)]
+    let local: str = format(f"{rel_corte}:{pos.linha}:{pos.coluna}", alloc = common.arena_mem(p.arena as ^common.Arena))
+    return local[0..<min(len(local), 120)]
+}
+
+// Acrescenta 'texto' a 'saida' sem passar de 'teto' bytes no total (o snprintf do C corta assim).
+proc anexar_ate(saida: ^[dynamic]u8, texto: str, teto: int) {
+    let cabe: int = teto - len(saida^)
+    append(saida, item = texto[0..<min(len(texto), cabe)])
+}
+
+// C: driver/editar_decl.c:209
+// Conta os usos de fora da declaracao; os 3 primeiros vao em 'lista' ("a:1:2, b:3:4", no maximo 199 bytes).
+proc usos_de_fora(p: ^Plano, d: ?^frontend.Decl, lista: ^[dynamic]u8) -> u32 {
+    let q: ^Consulta = p.q as ^Consulta
+    let ini: u32 = consulta_inicio_decl(q, d)
+    let fim: u32 = frontend.ast_fim_decl(&q.fim, d)
+    var total: u32 = 0
+    var k: int = 0
+    while k < len(q.indice.usos) {
+        let u: ^semantic.IndUso = &q.indice.usos[k]
+        k += 1
+        if (u.alvo != d) or ((u.pos_nome >= ini) and (u.pos_nome < fim)) {
+            continue
+        }
+        if total < 3 {
+            if total > 0 {
+                anexar_ate(lista, ", ", 199)
+            }
+            anexar_ate(lista, local_do_uso(p, u.pos_nome), 199)
+        }
+        total += 1
+    }
+    return total
+}
+
+// C: driver/editar_decl.c:229
+// Recusa se a declaracao ainda e usada fora dela, a menos que o ops.json diga "forcar": true.
+proc sem_referencias(p: ^Plano, d: ?^frontend.Decl) -> bool {
+    if marca_ligada(p.item, "forcar") {
+        return true
+    }
+    var lista: [dynamic]u8 = make([dynamic]u8, alloc = heap)
+    defer delete(lista)
+    let usos: u32 = usos_de_fora(p, d, &lista)
+    if usos == 0 {
+        return true
+    }
+    let q: ^Consulta = p.q as ^Consulta
+    let nome_decl: i32 = (d as ^frontend.Decl).nome
+    let tam_nome: int = common.interner_tam(&(q.c as ^Compilacao).nomes, nome_decl) as int
+    let nome_txt: str = common.interner_texto(&(q.c as ^Compilacao).nomes, nome_decl)[0..<tam_nome]
+    let lista_txt: str = from_bytes(lista[..], alloc = heap)
+    defer delete(lista_txt)
+    let msg_1 = format(f"'{nome_txt}' ainda tem {usos} referencia(s) no projeto ({lista_txt}): troque-as na mesma lista de operacoes e use \"forcar\": true para o check decidir", alloc = heap)
+    defer delete(msg_1)
+    return plano_erro(p, msg_1)
+}
+
+test "eh_branco_do_texto: LF, CR, espaco e tab sao brancos" {
+    expect(eh_branco_do_texto(10))
+    expect(eh_branco_do_texto(13))
+    expect(eh_branco_do_texto(32))
+    expect(eh_branco_do_texto(9))
+    expect(not eh_branco_do_texto(97))
+}
+
+test "anexar_ate: corta no teto e conta o que ja estava na lista" {
+    var b: [dynamic]u8 = make([dynamic]u8, alloc = heap)
+    defer delete(b)
+    anexar_ate(&b, "abcdef", 4)
+    anexar_ate(&b, "XYZ", 4)
+    let s: str = from_bytes(b[..], alloc = heap)
+    defer delete(s)
+    expect(s == "abcd")
+}
+
+// C: driver/editar_decl.c:241
+proc editar_remover_decl(p: ^Plano, id: str, sem_texto: str) -> bool {
+    let d: ?^frontend.Decl = consulta_achar_decl(p.q as ^Consulta, id)
+    var f: FaixaDecl = FaixaDecl{}
+    var imp: ?^Imports = none
+    var ok: bool = false
+    if d == none {
+        let msg_1 = format(f"'{id}' nao e declaracao do projeto (use o nome ou o id de 'forja consultar simbolos')", alloc = heap)
+        defer delete(msg_1)
+        return plano_erro(p, msg_1)
+    }
+    if ((not decl_removivel(p, d)) or (not sem_referencias(p, d))) or (not editar_faixa_da_decl(p, d, &f)) {
+        return false
+    }
+    imp = imports_iniciar(p)
+    imports_descontar_decl(imp, d)
+    ok = (common.c2f_b2i32(editar_trocar_no_arquivo(p, f.ini_remocao, f.fim_remocao, "")) != 0) and (common.c2f_b2i32(imports_aplicar(imp)) != 0)
+    imports_liberar(imp)
+    return ok
+}

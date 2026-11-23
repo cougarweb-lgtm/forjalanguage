@@ -1,0 +1,92 @@
+// nativo/nativo_interface.fj - porte de compiler/nativo/nativo_interface.c, compiler/nativo/nativo_interface.h
+// sha256 de nativo/nativo_interface.c: cba1671b989a9ea2e3cf5e33371007533c84e2b5edd5d04330e8d3f97df3c0a6
+// sha256 de nativo/nativo_interface.h: 8bf649dd310ca42148e6ddd86656a8b90db59efdbf13c4e8cad6ebec14046283
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.2.0
+// Changelog: 0.2.0 - I5: nos alvos iOS (dylib) o ponteiro `texto` de forja_dll_info nao e relocado (fica 0).
+
+import "backend"
+import "common"
+import "ir"
+import "nativo/bir"
+import "nativo/obj"
+import "semantic"
+
+const DLL_INFO_ALINHAMENTO: u32 = 8
+const DLL_INFO_BITS_BYTE: u32 = 8
+
+// C: nativo/nativo_interface.c:17
+proc anexar_le(b: ^[dynamic]u8, v: u64, n: u32) {
+    var k: u32 = 0
+    while k < n {
+        let deslocamento: u64 = (k * DLL_INFO_BITS_BYTE) as u64
+        append(b, item = ((v >> deslocamento) & 255) as u8)
+        k += 1
+    }
+}
+
+// C: nativo/nativo_interface.c:26
+proc nativo_abrir_rdata(o: ^obj.Objeto) -> u32 {
+    var rdata: u32 = 4294967295
+    var s: ?^obj.ObjSecao = none
+    var k: u32 = 0
+    while ((k as u64) < (len(o.secoes) as u64)) and (rdata == 4294967295) {
+        if (o.secoes[k as u64].nome or_else "") == ".rdata" {
+            rdata = k
+        }
+        k += 1
+    }
+    if rdata == 4294967295 {
+        rdata = obj.obj_secao_abrir(o, ".rdata", obj.OS_RDATA, DLL_INFO_ALINHAMENTO)
+    }
+    s = &o.secoes[rdata as u64]
+    if (s as ^obj.ObjSecao).alinhamento < DLL_INFO_ALINHAMENTO {
+        let ptr_1: ^obj.ObjSecao = s as ^obj.ObjSecao
+        ptr_1.alinhamento = DLL_INFO_ALINHAMENTO
+    }
+    return rdata
+}
+
+// C: nativo/nativo_interface.c:43
+proc nativo_interface_dll(programa: ^obj.Objeto, pedido: ^NativoPedido) -> bool {
+    if not pedido.dll {
+        return true
+    }
+    let rdata: u32 = nativo_abrir_rdata(programa)
+    let s: ^obj.ObjSecao = &programa.secoes[rdata as u64]
+    var texto = make([dynamic]u8, alloc = heap, cap = 256)
+    defer delete(texto)
+    backend.emitir_interface_dll(pedido.ir as ^ir.IrPrograma, pedido.tipos as ^semantic.Tipos, pedido.nomes as ^common.Interner, &texto)
+    while (len(s.bytes) as u64) % (DLL_INFO_ALINHAMENTO as u64) != 0 {
+        append(&s.bytes, item = (0 as u8))
+    }
+    let off: u32 = len(s.bytes) as u32
+    anexar_le(&s.bytes, backend.DLL_INFO_MAGIC as u64, 4)
+    anexar_le(&s.bytes, backend.DLL_INFO_FORMATO as u64, 4)
+    anexar_le(&s.bytes, common.hash64(texto[..], len(texto) as u64, common.HASH64_SEMENTE), 8)
+    anexar_le(&s.bytes, 0, 8)
+    anexar_le(&s.bytes, len(texto) as u64, 8)
+    append(&s.bytes, items = texto[..])
+    append(&s.bytes, item = (0 as u8))
+    let simbolo: u32 = obj.obj_simbolo_definir(programa, bir.DLL_INFO_SIMBOLO_DADOS, rdata as i32, off)
+    // I5 (dylib iOS): o .rdata fica no __TEXT, que o dyld nao deixa rebasear; o campo `texto` (ponteiro) fica 0 e o texto segue logo depois do cabecalho (DLL_INFO_TAM)
+    let alvo_nome: str = pedido.alvo or_else ""
+    if (alvo_nome == "aarch64-apple-ios") or (alvo_nome == "aarch64-apple-ios-sim") {
+        return true
+    }
+    obj.obj_relocar(programa, obj.ObjAlvoReloc{secao = rdata, off = off + backend.DLL_INFO_OFF_TEXTO}, obj.ObjCorrecao{tipo = obj.OR_ADDR64, simbolo = simbolo, adendo = backend.DLL_INFO_TAM as i64})
+    return true
+}
+
+// anexar_le grava os n bytes menos significativos de v, em ordem little-endian (como o C).
+test "nativo_interface_anexar_le_little_endian" {
+    var b = make([dynamic]u8, alloc = heap, cap = 8)
+    defer delete(b)
+    anexar_le(&b, 0x0102030405060708, 4)
+    expect(len(b) == 4)
+    expect(b[0] == (8 as u8))
+    expect(b[3] == (5 as u8))
+    anexar_le(&b, 0xFF, 1)
+    expect(len(b) == 5)
+    expect(b[4] == (255 as u8))
+}

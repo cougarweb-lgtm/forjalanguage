@@ -1,0 +1,204 @@
+// std:fmt, pedaco number (parte do modulo std:fmt: veja fmt.fj)
+// Versao: 0.3.0. Changelog: 0.3.0 - B01e2: number, integer, percent, compact e bytes ganham `alloc: Allocator` (ultimo parametro, sem padrao); o texto vai para o alocador do chamador. 0.2.0 - IA1-S2g: compact, write_compact (estilo curto CLDR: "1,2 mil") e bytes, write_bytes (tamanho em KiB/MiB ou kB/MB, inteiro exato). 0.1.0 - IA1-S2e: number, integer, percent e as variantes write_number, write_integer, write_percent.
+// Posse: number, integer, percent, compact e bytes devolvem texto DONO do alocador que o chamador passou: delete(texto) so se o alloc foi heap. write_* acrescentam ao builder do chamador (buf = &b), na ordem valor, buf, regiao (padrao do text.encode); as formas donas chamam as write_*.
+// number e percent: o valor e reduzido a 15 algarismos significativos e depois arredondado em `decimals` (0 a 15; fora disso = panic R0003) no modo `rounding`; padrao half_up. Zero nunca leva sinal ("-0,00" nao existe). NaN = "NaN"; infinito = "∞" ou "-∞".
+// percent: v e a FRACAO (0.125 = "12,5%"); o expoente decimal sobe 2 sem multiplicar o f64. O "%" vai depois do numero, com espaco se a regiao pede (percent_space); NaN e infinito saem sem "%".
+// integer: o int inteiro (menor e maior int inclusive), com milhar da regiao. Passar o Locale (~700 bytes) por valor custa uma copia por chamada, so nas procs publicas.
+
+// v na regiao loc, com decimals casas.
+pub proc write_number(v: f64, buf: ^[dynamic]u8, loc: Locale, decimals: int = 2, rounding: Rounding = Rounding.half_up) {
+    let spec = make_spec(loc, decimals = decimals, rounding = rounding, shift = 0)
+    _ = write_decimal(v, buf, spec)
+}
+
+// v na regiao loc, com decimals casas: texto dono. number(1234.5, loc = PT_BR) = "1.234,50".
+pub proc number(v: f64, loc: Locale, decimals: int = 2, rounding: Rounding = Rounding.half_up, alloc: Allocator) -> str {
+    var buf = make([dynamic]u8, alloc = alloc, cap = 32)
+    defer delete(buf)
+    write_number(v, buf = &buf, loc = loc, decimals = decimals, rounding = rounding)
+    return to_str(&buf)
+}
+
+// O inteiro v na regiao loc (sem casas decimais).
+pub proc write_integer(v: int, buf: ^[dynamic]u8, loc: Locale) {
+    var dg = Digits{}
+    load_int_digits(v, &dg)
+    write_digits(&dg, buf, make_spec(loc, decimals = 0, rounding = Rounding.down, shift = 0))
+}
+
+// O inteiro v na regiao loc: texto dono. integer(1234567, loc = PT_BR) = "1.234.567".
+pub proc integer(v: int, loc: Locale, alloc: Allocator) -> str {
+    var buf = make([dynamic]u8, alloc = alloc, cap = 32)
+    defer delete(buf)
+    write_integer(v, buf = &buf, loc = loc)
+    return to_str(&buf)
+}
+
+// A fracao v como porcentagem na regiao loc (0.125 = "12,5%").
+pub proc write_percent(v: f64, buf: ^[dynamic]u8, loc: Locale, decimals: int = 0, rounding: Rounding = Rounding.half_up) {
+    let spec = make_spec(loc, decimals = decimals, rounding = rounding, shift = PERCENT_SHIFT)
+    if not write_decimal(v, buf, spec) {
+        return
+    }
+    if loc.percent_space {
+        append(buf, item = " ")
+    }
+    append(buf, item = "%")
+}
+
+// A fracao v como porcentagem na regiao loc: texto dono. percent(0.0115, loc = PT_BR, decimals = 2) = "1,15%".
+pub proc percent(v: f64, loc: Locale, decimals: int = 0, rounding: Rounding = Rounding.half_up, alloc: Allocator) -> str {
+    var buf = make([dynamic]u8, alloc = alloc, cap = 32)
+    defer delete(buf)
+    write_percent(v, buf = &buf, loc = loc, decimals = decimals, rounding = rounding)
+    return to_str(&buf)
+}
+
+const COMPACT_STEP: int = 3
+const COMPACT_MAX_UNIT: int = 4
+
+// Unidade compacta de um valor com `point` algarismos inteiros: 0 = sem sufixo (ate 999), 1 = mil, 2 = milhao, 3 = bilhao, 4 = trilhao (de 1e12 em diante, sem unidade maior).
+proc compact_unit(point: int) -> int {
+    if point <= COMPACT_STEP {
+        return 0
+    }
+    var tier = (point - 1) / COMPACT_STEP
+    if tier > COMPACT_MAX_UNIT {
+        tier = COMPACT_MAX_UNIT
+    }
+    return tier
+}
+
+// Arredonda dg (half_up) para a unidade pedida: sem sufixo, so a parte inteira; com sufixo, 2 algarismos significativos quando o valor escalado e menor que 10 (1 casa) e so a parte inteira dai em diante.
+proc round_for_unit(dg: ^Digits, tier: int) {
+    let int_digits = dg.point - tier * COMPACT_STEP
+    var keep = int_digits
+    if tier > 0 and int_digits == 1 {
+        keep = 2
+    }
+    round_digits(dg, keep, rounding = Rounding.half_up)
+}
+
+// Escolhe a unidade de dg e o arredonda. O vai-um pode promover a unidade seguinte (999950 -> 1 mi): arredonda de novo nela (o valor ja e 1 seguido de zeros, nada muda).
+proc round_compact(dg: ^Digits) -> int {
+    let first = compact_unit(dg.point)
+    round_for_unit(dg, tier = first)
+    let tier = compact_unit(dg.point)
+    if tier != first {
+        round_for_unit(dg, tier = tier)
+    }
+    return tier
+}
+
+// O sufixo compacto da regiao para a unidade (1 a 4).
+proc compact_suffix(loc: Locale, tier: int) -> str {
+    if tier == 1 {
+        return loc.compact_k
+    }
+    if tier == 2 {
+        return loc.compact_m
+    }
+    if tier == 3 {
+        return loc.compact_b
+    }
+    return loc.compact_t
+}
+
+// v no estilo curto da regiao: ate 2 algarismos significativos e o sufixo de mil/milhao/bilhao/trilhao ("1,2 mil", "3 mi"). Abaixo de 1000 e o inteiro arredondado (half_up) sem sufixo. NaN e infinito saem como em number.
+pub proc write_compact(v: f64, buf: ^[dynamic]u8, loc: Locale) {
+    var spec = make_spec(loc, decimals = 0, rounding = Rounding.half_up, shift = 0)
+    var dg = Digits{}
+    if load_float_digits(v, shift = 0, dg = &dg) != KIND_FINITE {
+        _ = write_decimal(v, buf, spec)
+        return
+    }
+    round_digits(&dg, keep = SIGNIFICANT_DIGITS, rounding = Rounding.half_even)
+    let tier = round_compact(&dg)
+    dg.point -= tier * COMPACT_STEP
+    if tier > 0 and dg.point == 1 and digit_at(&dg, index = 1) != 0 {
+        spec.decimals = 1
+    }
+    write_digits(&dg, buf, spec)
+    if tier > 0 {
+        append(buf, item = compact_suffix(loc, tier))
+    }
+}
+
+// v no estilo curto da regiao: texto dono. compact(1234.0, loc = PT_BR) = "1,2 mil"; compact(999950.0, loc = PT_BR) = "1 mi".
+pub proc compact(v: f64, loc: Locale, alloc: Allocator) -> str {
+    var buf = make([dynamic]u8, alloc = alloc, cap = 32)
+    defer delete(buf)
+    write_compact(v, buf = &buf, loc = loc)
+    return to_str(&buf)
+}
+
+const BYTES_MAX_UNIT: int = 6
+const BINARY_BASE: u64 = 1024
+const SI_BASE: u64 = 1000
+const BINARY_UNITS: [7]str = {"B", "KiB", "MiB", "GiB", "TiB", "PiB", "EiB"}
+const SI_UNITS: [7]str = {"B", "kB", "MB", "GB", "TB", "PB", "EB"}
+const TENTHS: u64 = 10
+
+// Expoente da maior unidade que cabe em m (0 = abaixo da base) e o valor dessa unidade em bytes.
+struct ByteUnit {
+    exponent: int = 0
+    size: u64 = 1
+}
+
+// A maior unidade (base^exponent, exponent ate 6) que nao passa de m.
+proc byte_unit_of(m: u64, base: u64) -> ByteUnit {
+    var found = ByteUnit{}
+    while found.exponent < BYTES_MAX_UNIT and m / found.size >= base {
+        found.size = found.size * base
+        found.exponent += 1
+    }
+    return found
+}
+
+// m / step.size em decimos, com 1 casa arredondada half_up sobre a fracao EXATA (r * 10 nunca estoura: r < size <= 2^60).
+proc tenths_of(m: u64, step: ByteUnit) -> u64 {
+    let whole = m / step.size
+    let rest = (m % step.size) * TENTHS
+    var tenths = whole * TENTHS + rest / step.size
+    if (rest % step.size) * 2 >= step.size {
+        tenths += 1
+    }
+    return tenths
+}
+
+// n bytes na regiao loc, em inteiro exato: base 1024 (KiB, MiB...) com binary = true, base 1000 (kB, MB...) com false. Abaixo de 1 unidade-base e o inteiro + " B". Senao 1 casa half_up, ",0" cortado; o vai-um que estoura a base promove a unidade seguinte (1048575 -> "1 MiB"); no maior expoente nao promove. Espaco U+0020; sem milhar.
+pub proc write_bytes(n: int, buf: ^[dynamic]u8, loc: Locale, binary: bool = true) {
+    var units = SI_UNITS
+    var base = SI_BASE
+    if binary {
+        units = BINARY_UNITS
+        base = BINARY_BASE
+    }
+    let m = magnitude(n)
+    var step = byte_unit_of(m, base)
+    var tenths = tenths_of(m, step)
+    if step.exponent < BYTES_MAX_UNIT and tenths >= base * TENTHS {
+        step.exponent += 1
+        tenths = TENTHS
+    }
+    if n < 0 {
+        append(buf, item = "-")
+    }
+    let whole = (tenths / TENTHS) as int
+    let fraction = (tenths % TENTHS) as int
+    format(f"{whole}", into = buf)
+    if fraction != 0 {
+        append(buf, item = loc.decimal_sep)
+        format(f"{fraction}", into = buf)
+    }
+    append(buf, item = " ")
+    append(buf, item = units[step.exponent])
+}
+
+// n bytes na regiao loc: texto dono. bytes(1536, loc = PT_BR) = "1,5 KiB"; bytes(1000000, loc = PT_BR, binary = false) = "1 MB".
+pub proc bytes(n: int, loc: Locale, binary: bool = true, alloc: Allocator) -> str {
+    var buf = make([dynamic]u8, alloc = alloc, cap = 32)
+    defer delete(buf)
+    write_bytes(n, buf = &buf, loc = loc, binary = binary)
+    return to_str(&buf)
+}

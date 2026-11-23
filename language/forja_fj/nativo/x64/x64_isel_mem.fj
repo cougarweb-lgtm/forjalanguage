@@ -1,0 +1,164 @@
+// nativo/x64/x64_isel_mem.fj - porte de compiler/nativo/x64/x64_isel_mem.c
+// sha256 de nativo/x64/x64_isel_mem.c: 35ae7db0e82c1d4ad2c8d5bef915cd71fedb56161678b778d187f6c98bb6eef2
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "common"
+import "nativo/bir"
+import "nativo/obj"
+
+struct DadoMem {
+    bytes: u8
+    largura_mem: u8
+    bits_carga: u8
+    bits_grava: u8
+    carga: u16
+    grava: u16
+}
+
+const DADOS_MEM: [4]DadoMem = {DadoMem{bytes = 8, largura_mem = 64, bits_carga = 64, bits_grava = 64, carga = 3, grava = 7}, DadoMem{bytes = 4, largura_mem = 32, bits_carga = 32, bits_grava = 32, carga = 2, grava = 6}, DadoMem{bytes = 2, largura_mem = 16, bits_carga = 32, bits_grava = 16, carga = 60, grava = 62}, DadoMem{bytes = 1, largura_mem = 8, bits_carga = 32, bits_grava = 8, carga = 4, grava = 5}}
+
+// C: nativo/x64/x64_isel_mem.c:16
+proc isel_end_slot(c: ^X64Ctx, i: ^bir.BirInstr) -> bool {
+    let desloc_slot: i32 = c.slot_off[i.a.imed as int] as i32
+    let slot: MOperando = m_mem(X64_RBP, -desloc_slot, 64)
+    if not x64_emitir(c, mi2(FX_LEA64_RM as u16, m_reg(X64_RAX, 64), slot)) {
+        return false
+    }
+    return isel_guardar(c, i.dst, X64_RAX)
+}
+
+// C: nativo/x64/x64_isel_mem.c:33 - o C devolve ponteiro para a tabela ou NULL; a Forja nao toma endereco de const (E0301), entao devolve a linha por valor e bytes == 0 marca "sem linha" (NULL do C)
+proc dado_de_bytes(bytes: u32) -> DadoMem {
+    for k in 0..<len(DADOS_MEM) {
+        if (DADOS_MEM[k].bytes as u32) == bytes {
+            return DADOS_MEM[k]
+        }
+    }
+    return DadoMem{}
+}
+
+// C: nativo/x64/x64_isel_mem.c:42
+proc isel_carrega(c: ^X64Ctx, i: ^bir.BirInstr) -> bool {
+    let bits: u8 = aloc_bits(i.classe)
+    let origem: MOperando = m_mem(X64_RCX, i.desloc, bits)
+    let dado: DadoMem = dado_de_bytes((bits as u32) / 8)
+    if i.classe == (bir.BC_V128 as u8) {
+        return isel_carrega_vetor(c, i)
+    }
+    var carga: MInstr = mi0(0)
+    if bir.bir_classe_eh_real(i.classe as i32) {
+        var forma_real: i32 = FX_MOVSS_XM
+        if i.classe == (bir.BC_F64 as u8) {
+            forma_real = FX_MOVSD_XM
+        }
+        carga = mi2(forma_real as u16, m_xmm(0), origem)
+    } else {
+        carga = mi2(dado.carga, m_reg(X64_RAX, dado.bits_carga), origem)
+    }
+    if not isel_carregar(c, X64_RCX, &i.a, bir.BE_NENHUMA as u8) {
+        return false
+    }
+    if not x64_emitir(c, carga) {
+        return false
+    }
+    return isel_guardar(c, i.dst, X64_RAX)
+}
+
+// C: nativo/x64/x64_isel_mem.c:58
+proc isel_grava(c: ^X64Ctx, i: ^bir.BirInstr) -> bool {
+    let bits: u8 = aloc_bits(i.b.classe)
+    let destino: MOperando = m_mem(X64_RCX, i.desloc, bits)
+    let dado: DadoMem = dado_de_bytes((bits as u32) / 8)
+    if i.b.classe == (bir.BC_V128 as u8) {
+        return isel_grava_vetor(c, i)
+    }
+    if (not isel_carregar(c, X64_RCX, &i.a, bir.BE_NENHUMA as u8)) or (not isel_carregar(c, X64_RAX, &i.b, bir.BE_NENHUMA as u8)) {
+        return false
+    }
+    if bir.bir_classe_eh_real(i.b.classe as i32) {
+        return isel_guardar_xmm(c, i.b.classe, destino, 0)
+    }
+    let arg_1: MOperando = m_reg(X64_RAX, dado.bits_grava)
+    let arg_2: MOperando = destino
+    let arg_3: u16 = dado.grava
+    return x64_emitir(c, mi2(arg_3, arg_2, arg_1))
+}
+
+// C: nativo/x64/x64_isel_mem.c:74
+// Bloco de n bytes em pedacos de 8, 4, 2 e 1 (ordem de DADOS_MEM): carrega de [rdx+off] no rax (so na copia) e grava em [rcx+off]
+proc pecas_do_bloco(c: ^X64Ctx, n: u32, copia: bool) -> bool {
+    var resta: u32 = n
+    var off: u32 = 0
+    for k in 0..<len(DADOS_MEM) {
+        let d: DadoMem = DADOS_MEM[k]
+        while resta >= (d.bytes as u32) {
+            if copia {
+                if not x64_emitir(c, mi2(d.carga, m_reg(X64_RAX, d.bits_carga), m_mem(X64_RDX, off as i32, d.largura_mem))) {
+                    return false
+                }
+            }
+            if not x64_emitir(c, mi2(d.grava, m_mem(X64_RCX, off as i32, d.largura_mem), m_reg(X64_RAX, d.bits_grava))) {
+                return false
+            }
+            resta = resta - (d.bytes as u32)
+            off = off + (d.bytes as u32)
+        }
+    }
+    return true
+}
+
+// C: nativo/x64/x64_isel_mem.c:91
+proc isel_copia_mem(c: ^X64Ctx, i: ^bir.BirInstr) -> bool {
+    if (not isel_carregar(c, X64_RCX, &i.a, bir.BE_NENHUMA as u8)) or (not isel_carregar(c, X64_RDX, &i.b, bir.BE_NENHUMA as u8)) {
+        return false
+    }
+    return pecas_do_bloco(c, common.c2f_s2u_32(i.desloc), true)
+}
+
+// C: nativo/x64/x64_isel_mem.c:98
+proc isel_zera_mem(c: ^X64Ctx, i: ^bir.BirInstr) -> bool {
+    if not isel_carregar(c, X64_RCX, &i.a, bir.BE_NENHUMA as u8) {
+        return false
+    }
+    let arg_1: MOperando = m_reg(X64_RAX, 32)
+    let arg_2: MOperando = m_reg(X64_RAX, 32)
+    return (common.c2f_b2i32(x64_emitir(c, mi2(FX_XOR32_RR as u16, arg_2, arg_1))) != 0) and (common.c2f_b2i32(pecas_do_bloco(c, common.c2f_s2u_32(i.desloc), false)) != 0)
+}
+
+// C: nativo/x64/x64_isel_mem.c:107
+proc isel_ler_bytes(c: ^X64Ctx, reg: i32, base: i32, bytes: u32) -> bool {
+    let dado: DadoMem = dado_de_bytes(bytes)
+    if dado.bytes == 0 {
+        return x64_sem_regra(c, "agregado", "leitura de agregado que nao tem 1, 2, 4 ou 8 bytes")
+    }
+    let arg_1: MOperando = m_mem(base, 0, dado.largura_mem)
+    let arg_2: MOperando = m_reg(reg, dado.bits_carga)
+    let arg_3: u16 = dado.carga
+    return x64_emitir(c, mi2(arg_3, arg_2, arg_1))
+}
+
+// C: nativo/x64/x64_isel_mem.c:116
+proc isel_gravar_bytes(c: ^X64Ctx, base: i32, reg: i32, bytes: u32) -> bool {
+    let dado: DadoMem = dado_de_bytes(bytes)
+    if dado.bytes == 0 {
+        return x64_sem_regra(c, "agregado", "gravacao de agregado que nao tem 1, 2, 4 ou 8 bytes")
+    }
+    let arg_1: MOperando = m_reg(reg, dado.bits_grava)
+    let arg_2: MOperando = m_mem(base, 0, dado.largura_mem)
+    let arg_3: u16 = dado.grava
+    return x64_emitir(c, mi2(arg_3, arg_2, arg_1))
+}
+
+// C: nativo/x64/x64_isel_mem.c:126
+proc isel_bloco_mem(c: ^X64Ctx, n: u32) -> bool {
+    if n <= bir.BIR_COPIA_MEM_MAX {
+        return pecas_do_bloco(c, n, true)
+    }
+    let arg_1: MOperando = m_imed(transmute(n, to = i32) as i64)
+    let arg_2: MOperando = m_reg(X64_R8, 32)
+    if not x64_emitir(c, mi2(FX_MOV32_RI as u16, arg_2, arg_1)) {
+        return false
+    }
+    return x64_emitir(c, mi1(FX_CALL_REL32 as u16, m_simbolo(obj.obj_simbolo_referir(c.o as ^obj.Objeto, (c.p as ^bir.BirPrograma).nomes_mem.copia))))
+}

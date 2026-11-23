@@ -1,0 +1,633 @@
+// frontend/idioma_parser.fj - porte de compiler/frontend/idioma_parser.c
+// sha256 de frontend/idioma_parser.c: a8a1217ac868611b7365f0fe73afd030d38feb84fb7ed34dde3bf14900018177
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.2.0
+// Changelog: 0.2.0 - G3 P-front B: corpo real. NAO_ACHEI vira u32 (era i64: os indices do parser sao u32). As tabelas PALAVRAS/STD (const char *const[], terminadas em NULL) viram
+//            []str locais (const nao tem fatia, N2). Os char achado[16]/novo[24]/recuo/novo[32] viram str: as palavras casadas tem no maximo 8 bytes, entao nenhum corte do snprintf age.
+
+import "common"
+
+struct Achado {
+    id: i32
+    ini: u32
+    fim: u32
+    achado: ?str
+    palavra: ?str
+    dica: ?str
+}
+
+struct Colchetes {
+    fecha: u32
+    elementos: u32
+    tipo: ?str
+}
+
+const NAO_ACHEI: u32 = 4294967295
+const RECUO_MAX: i32 = 20
+
+pub const DETECTOR_DETECTAR_INCREMENTO: u16 = 1
+pub const DETECTOR_DETECTAR_INTERROGACAO: u16 = 2
+pub const DETECTOR_DETECTAR_ATRIBUICAO_CURTA: u16 = 3
+pub const DETECTOR_DETECTAR_ELIF: u16 = 4
+pub const DETECTOR_DETECTAR_PALAVRA_DE_PROC: u16 = 5
+pub const DETECTOR_DETECTAR_FOR_C: u16 = 6
+pub const DETECTOR_DETECTAR_BLOCO_NA_LINHA: u16 = 7
+pub const DETECTOR_DETECTAR_THROW: u16 = 8
+pub proc chamar_detector(tag: u16, p: ^Parser, esperado: str) -> bool {
+    if tag == 1 {
+        return detectar_incremento(p, esperado)
+    }
+    if tag == 2 {
+        return detectar_interrogacao(p, esperado)
+    }
+    if tag == 3 {
+        return detectar_atribuicao_curta(p, esperado)
+    }
+    if tag == 4 {
+        return detectar_elif(p, esperado)
+    }
+    if tag == 5 {
+        return detectar_palavra_de_proc(p, esperado)
+    }
+    if tag == 6 {
+        return detectar_for_c(p, esperado)
+    }
+    if tag == 7 {
+        return detectar_bloco_na_linha(p, esperado)
+    }
+    if tag == 8 {
+        return detectar_throw(p, esperado)
+    }
+    panic("tag de detector fora da tabela: frontend.chamar_detector")
+    return false
+}
+
+// C: frontend/idioma_parser.c:25
+proc relatar(p: ^Parser, a: ^Achado) -> bool {
+    _ = common.idioma_relatar(p.diag as ^common.Diag, a.id, a.ini, (a.achado or_else ""))
+    if a.palavra != none {
+        common.idioma_sugerir_palavra(p.diag as ^common.Diag, p.fonte as ^common.Fonte, a.ini, a.fim, a.palavra)
+    } else {
+        let txt_1 = a.dica or_else "(null)"
+        let msg_1 = format(f"{txt_1}", alloc = heap)
+        defer delete(msg_1)
+        _ = common.diag_sugerir(&(p.diag as ^common.Diag).sug, common.DIAG_SO_DICA, msg_1)
+    }
+    return true
+}
+
+// C: frontend/idioma_parser.c:34
+// O token k encosta no seguinte (sem espaco entre os dois): '&' '&', '+' '+', ':' '='. So vale com k antes do EOF.
+proc colados(p: ^Parser, k: u32) -> bool {
+    return p.toks[k].off + (p.toks[k].len_c as u32) == p.toks[k + 1].off
+}
+
+// C: frontend/idioma_parser.c:39
+proc fim_de_linha(tipo: i32) -> bool {
+    return (common.c2f_s2u_32(tipo) == (TK_NL as u32)) or (common.c2f_s2u_32(tipo) == (TK_EOF as u32))
+}
+
+// C: frontend/idioma_parser.c:45
+// C2F-N1: palavras era `const char *const *` terminado em NULL; vira []str.
+// O nome (IDENT) do token k e exatamente um destes.
+proc nome_entre(p: ^Parser, k: u32, palavras: []str) -> bool {
+    let t = &p.toks[k]
+    if (t.tipo as i32) != TK_IDENT {
+        return false
+    }
+    let f = p.fonte as ^common.Fonte
+    let ini = t.off as int
+    for i in 0..<len(palavras) {
+        if len(palavras[i]) == (t.len_c as int) and common.c2f_memcmp(f.texto[ini..<(ini + len(palavras[i]))], as_bytes(palavras[i])) == 0 {
+            return true
+        }
+    }
+    return false
+}
+
+// C: frontend/idioma_parser.c:58
+proc parser_idioma_operador(p: ^Parser) -> bool {
+    let t: i32 = tipo_atual(p)
+    let off: u32 = token_atual(p).off
+    let e_logico: bool = common.c2f_s2u_32(t) == (TK_AMP as u32)
+    if (common.c2f_s2u_32(tipo_seguinte(p)) != common.c2f_s2u_32(t)) or (not colados(p, p.cur)) {
+        return false
+    }
+    var tern_1: i32 = common.IDI_OU_LOGICO
+    if common.c2f_b2i32(e_logico) != 0 {
+        tern_1 = common.IDI_E_LOGICO
+    }
+    var tern_2: str = "||"
+    if common.c2f_b2i32(e_logico) != 0 {
+        tern_2 = "&&"
+    }
+    var tern_3: str = "or"
+    if common.c2f_b2i32(e_logico) != 0 {
+        tern_3 = "and"
+    }
+    var lit_1 = Achado{id = tern_1, ini = off, fim = off + 2, achado = tern_2, palavra = tern_3, dica = none}
+    return relatar(p, &lit_1)
+}
+
+// C: frontend/idioma_parser.c:68
+proc parser_idioma_negacao(p: ^Parser) {
+    let off: u32 = token_atual(p).off
+    var lit_1 = Achado{id = common.IDI_NEGACAO, ini = off, fim = off + 1, achado = "!", palavra = "not", dica = none}
+    _ = relatar(p, &lit_1)
+}
+
+// C: frontend/idioma_parser.c:76
+proc parser_idioma_xor(p: ^Parser) -> bool {
+    let seguinte: i32 = tipo_seguinte(p)
+    let off: u32 = token_atual(p).off
+    if ((common.c2f_s2u_32(seguinte) != (TK_IDENT as u32)) and (common.c2f_s2u_32(seguinte) != (TK_INT as u32))) and (common.c2f_s2u_32(seguinte) != (TK_REAL as u32)) {
+        return false
+    }
+    var lit_1 = Achado{id = common.IDI_XOR_CIRCUNFLEXO, ini = off, fim = off + 1, achado = "^", palavra = "~", dica = none}
+    return relatar(p, &lit_1)
+}
+
+// C: frontend/idioma_parser.c:87
+proc detectar_incremento(p: ^Parser, esperado: str) -> bool {
+    let t = tipo_atual(p)
+    let off = token_atual(p).off
+    let prefixo = esperado == "comando"
+    if (t != TK_PLUS and t != TK_MINUS) or tipo_seguinte(p) != t or not colados(p, p.cur) {
+        return false
+    }
+    if not prefixo and esperado != "'=', '+=' ou '-='" {
+        return false
+    }
+    var achado = "--"
+    if t == TK_PLUS {
+        achado = "++"
+    }
+    if prefixo or not fim_de_linha(p.toks[p.cur + 2].tipo as i32) {
+        var sem_palavra = Achado{id = common.IDI_INCREMENTO, ini = off, fim = off + 2, achado = achado, palavra = none, dica = "troque ++ por += 1 (e -- por -= 1) como comando proprio, depois do nome da variavel"}
+        return relatar(p, &sem_palavra)
+    }
+    var troca = "-= 1"
+    if t == TK_PLUS {
+        troca = "+= 1"
+    }
+    var com_palavra = Achado{id = common.IDI_INCREMENTO, ini = off, fim = off + 2, achado = achado, palavra = troca, dica = none}
+    return relatar(p, &com_palavra)
+}
+
+// C: frontend/idioma_parser.c:104
+// Indice do '(' ou '[' que casa com o fecha-parenteses/colchete em 'fecha' (na mesma linha), ou NAO_ACHEI.
+proc abridor_de(p: ^Parser, fecha: u32) -> u32 {
+    var abre = TK_LCOLCHETE
+    if (p.toks[fecha].tipo as i32) == TK_RPAREN {
+        abre = TK_LPAREN
+    }
+    let fecho = p.toks[fecha].tipo as i32
+    var fundo: i32 = 0
+    var k: u32 = fecha + 1
+    while k > 0 {
+        let t = p.toks[k - 1].tipo as i32
+        if t == TK_NL or t == TK_EOF {
+            return NAO_ACHEI
+        }
+        if t == fecho {
+            fundo += 1
+        }
+        if t == abre {
+            fundo -= 1
+            if fundo == 0 {
+                return k - 1
+            }
+        }
+        k -= 1
+    }
+    return NAO_ACHEI
+}
+
+// C: frontend/idioma_parser.c:119
+// Inicio da cadeia nome(.nome | (..) | [..] | ^)* que termina logo antes do token atual; NAO_ACHEI se a expressao nao e uma cadeia.
+proc inicio_da_cadeia(p: ^Parser) -> u32 {
+    var k: u32 = p.cur
+    while k > 0 {
+        let t = p.toks[k - 1].tipo as i32
+        if t == TK_RPAREN or t == TK_RCOLCHETE {
+            k = abridor_de(p, k - 1)
+            if k == NAO_ACHEI {
+                return NAO_ACHEI
+            }
+        } else if t == TK_CARET {
+            k -= 1
+        } else if t == TK_IDENT {
+            k -= 1
+            if k == 0 or (p.toks[k - 1].tipo as i32) != TK_DOT {
+                return k
+            }
+            k -= 1
+        } else {
+            return NAO_ACHEI
+        }
+    }
+    return NAO_ACHEI
+}
+
+// C: frontend/idioma_parser.c:141
+proc fecha_expressao(t: i32) -> bool {
+    return ((((common.c2f_b2i32(fim_de_linha(t)) != 0) or (common.c2f_s2u_32(t) == (TK_RPAREN as u32))) or (common.c2f_s2u_32(t) == (TK_COMMA as u32))) or (common.c2f_s2u_32(t) == (TK_RBRACE as u32))) or (common.c2f_s2u_32(t) == (TK_RCOLCHETE as u32))
+}
+
+// C: frontend/idioma_parser.c:147
+// O '?' atual fecha um 'x?' de Rust: certa quando a cadeia anterior e clara (try entra antes dela e o '?' sai).
+proc relatar_try_de_rust(p: ^Parser) -> bool {
+    let off = token_atual(p).off
+    let inicio = inicio_da_cadeia(p)
+    let d = p.diag as ^common.Diag
+    _ = common.idioma_relatar(d, common.IDI_TRY_RUST, off, "?")
+    if inicio == NAO_ACHEI {
+        _ = common.diag_sugerir(&d.sug, common.DIAG_SO_DICA, "tire o '?' e escreva try antes da expressao")
+        return true
+    }
+    _ = common.diag_sugerir(&d.sug, common.DIAG_CERTA, "escreva try antes da expressao e tire o '?'")
+    _ = common.diag_editar(&d.sug, p.toks[inicio].off, p.toks[inicio].off, "try ")
+    _ = common.diag_editar(&d.sug, off, off + 1, "")
+    return true
+}
+
+// C: frontend/idioma_parser.c:162
+proc detectar_interrogacao(p: ^Parser, esperado: str) -> bool {
+    if tipo_atual(p) != TK_INTERROGA or p.cur == 0 or (p.toks[p.cur - 1].tipo as i32) == TK_NL {
+        return false
+    }
+    if fecha_expressao(p.toks[p.cur + 1].tipo as i32) {
+        return relatar_try_de_rust(p)
+    }
+    var k: u32 = p.cur + 1
+    while not fim_de_linha(p.toks[k].tipo as i32) {
+        if (p.toks[k].tipo as i32) == TK_COLON {
+            var ternario = Achado{id = common.IDI_TERNARIO, ini = token_atual(p).off, fim = 0, achado = "?", palavra = none, dica = "troque o 'c ? a : b' por um if com else que atribui a variavel"}
+            return relatar(p, &ternario)
+        }
+        k += 1
+    }
+    return false
+}
+
+// C: frontend/idioma_parser.c:177
+proc detectar_atribuicao_curta(p: ^Parser, esperado: str) -> bool {
+    let off = token_atual(p).off
+    var inicio = p.cur
+    if tipo_atual(p) != TK_COLON or tipo_seguinte(p) != TK_ASSIGN or not colados(p, p.cur) {
+        return false
+    }
+    if esperado != "'=', '+=' ou '-='" {
+        return false
+    }
+    while inicio > 0 and (p.toks[inicio - 1].tipo as i32) != TK_NL {
+        inicio -= 1
+    }
+    let d = p.diag as ^common.Diag
+    _ = common.idioma_relatar(d, common.IDI_ATRIBUICAO_CURTA, off, ":=")
+    if inicio + 1 != p.cur or (p.toks[inicio].tipo as i32) != TK_IDENT {
+        _ = common.diag_sugerir(&d.sug, common.DIAG_SO_DICA, "escreva let antes do nome e troque ':=' por '='")
+        return true
+    }
+    _ = common.diag_sugerir(&d.sug, common.DIAG_CERTA, "escreva let antes do nome e troque ':=' por '='")
+    _ = common.diag_editar(&d.sug, p.toks[inicio].off, p.toks[inicio].off, "let ")
+    _ = common.diag_editar(&d.sug, off, off + 2, "=")
+    return true
+}
+
+// C: frontend/idioma_parser.c:197
+proc detectar_elif(p: ^Parser, esperado: str) -> bool {
+    var palavras: [3]str = {"elif", "elsif", "elseif"}
+    let t = token_atual(p)
+    if esperado != "fim de linha" or p.cur == 0 or (p.toks[p.cur - 1].tipo as i32) != TK_RBRACE or not nome_entre(p, p.cur, palavras[..]) {
+        return false
+    }
+    let achado = texto_do_token(p, t) // char achado[16]: a palavra casada tem no maximo 6 bytes
+    defer delete(achado)
+    var lit = Achado{id = common.IDI_ELIF, ini = t.off, fim = t.off + (t.len_c as u32), achado = achado, palavra = "else if", dica = none}
+    return relatar(p, &lit)
+}
+
+// C: frontend/idioma_parser.c:208
+proc detectar_palavra_de_proc(p: ^Parser, esperado: str) -> bool {
+    var palavras: [5]str = {"fn", "func", "def", "function", "fun"}
+    let t = token_atual(p)
+    if not common.c2f_prefixo_igual(esperado, "declaracao", 10) or not nome_entre(p, p.cur, palavras[..]) {
+        return false
+    }
+    if (p.toks[p.cur + 1].tipo as i32) != TK_IDENT or (p.toks[p.cur + 2].tipo as i32) != TK_LPAREN {
+        return false
+    }
+    let achado = texto_do_token(p, t) // char achado[16]: a palavra casada tem no maximo 8 bytes
+    defer delete(achado)
+    var lit = Achado{id = common.IDI_PALAVRA_DE_PROC, ini = t.off, fim = t.off + (t.len_c as u32), achado = achado, palavra = "proc", dica = none}
+    return relatar(p, &lit)
+}
+
+// C: frontend/idioma_parser.c:220
+proc detectar_for_c(p: ^Parser, esperado: str) -> bool {
+    if esperado != "nome da variavel do laco" or tipo_atual(p) != TK_LPAREN or p.cur == 0 or (p.toks[p.cur - 1].tipo as i32) != KW_FOR {
+        return false
+    }
+    var lit = Achado{id = common.IDI_FOR_ESTILO_C, ini = p.toks[p.cur - 1].off, fim = 0, achado = "for (...)", palavra = none, dica = "troque o cabecalho pelo for da Forja: for i in 0..<n { ou for item in lista {"}
+    return relatar(p, &lit)
+}
+
+// C: frontend/idioma_parser.c:230
+// Indice do '}' que fecha o '{' anterior ao token atual, se esta na mesma linha e e o ultimo token dela; NAO_ACHEI senao (else depois, '{' dentro, varias linhas).
+proc fecho_na_linha(p: ^Parser) -> u32 {
+    var fundo: i32 = 1
+    var k: u32 = p.cur
+    while not fim_de_linha(p.toks[k].tipo as i32) {
+        if (p.toks[k].tipo as i32) == TK_LBRACE {
+            return NAO_ACHEI
+        }
+        if (p.toks[k].tipo as i32) == TK_RBRACE {
+            fundo -= 1
+            if fundo == 0 {
+                if fim_de_linha(p.toks[k + 1].tipo as i32) {
+                    return k
+                }
+                return NAO_ACHEI
+            }
+        }
+        k += 1
+    }
+    return NAO_ACHEI
+}
+
+// C: frontend/idioma_parser.c:242
+proc recuo_da_linha(f: ^common.Fonte, off: u32, recuo: []u8) -> bool {
+    var k: u32 = off
+    var n: u32 = 0
+    while (k > 0) and (f.texto[k - 1] != 10) { // '\n'
+        k -= 1
+    }
+    while (f.texto[k] == 32) or (f.texto[k] == 9) {
+        if n == (RECUO_MAX as u32) {
+            return false
+        }
+        let antes_1: u32 = n
+        n += 1
+        recuo[antes_1] = f.texto[k]
+        k += 1 // ' ' '\t'
+    }
+    recuo[n] = 0 // '\0'
+    return true
+}
+
+// C: frontend/idioma_parser.c:256
+// Quebra a linha em duas edicoes: depois do '{' e antes do '}'. O fim de linha acompanha o arquivo (CRLF se a linha termina em \r).
+// snprintf(novo, DIAG_NOVO_MAX, ...): eol (2) + recuo (20) + 4 espacos = 26 < 32, entao nenhum corte age.
+proc sugerir_quebra_do_bloco(p: ^Parser, abre: u32, fecha: u32) {
+    let f = p.fonte as ^common.Fonte
+    let d = p.diag as ^common.Diag
+    var recuo_buf: [21]u8 = {} // char recuo[RECUO_MAX + 1]
+    let corpo = p.toks[p.cur].off
+    var fim_espaco = p.toks[fecha].off
+    var k = fim_espaco
+    var eol = "\n"
+    if not recuo_da_linha(f, p.toks[abre].off, recuo_buf[..]) {
+        _ = common.diag_sugerir(&d.sug, common.DIAG_SO_DICA, "ponha o corpo em linhas proprias, depois do '{' e antes do '}'")
+        return
+    }
+    let recuo = from_bytes(recuo_buf[0..<common.c2f_strlen_b(recuo_buf[..])], alloc = heap)
+    defer delete(recuo)
+    while f.texto[k] != 10 and f.texto[k] != 0 { // '\n' '\0'
+        k += 1
+    }
+    if k > 0 and f.texto[k - 1] == 13 { // '\r'
+        eol = "\r\n"
+    }
+    _ = common.diag_sugerir(&d.sug, common.DIAG_CERTA, "ponha o corpo em linhas proprias, depois do '{' e antes do '}'")
+    let novo_abre = format(f"{eol}{recuo}    ", alloc = heap)
+    defer delete(novo_abre)
+    _ = common.diag_editar(&d.sug, p.toks[abre].off + 1, corpo, novo_abre)
+    while fim_espaco > corpo and (f.texto[fim_espaco - 1] == 32 or f.texto[fim_espaco - 1] == 9) { // ' ' '\t'
+        fim_espaco -= 1
+    }
+    let novo_fecha = format(f"{eol}{recuo}", alloc = heap)
+    defer delete(novo_fecha)
+    _ = common.diag_editar(&d.sug, fim_espaco, p.toks[fecha].off, novo_fecha)
+}
+
+// C: frontend/idioma_parser.c:277
+proc detectar_bloco_na_linha(p: ^Parser, esperado: str) -> bool {
+    if esperado != "fim de linha depois de '{'" or p.cur == 0 or (p.toks[p.cur - 1].tipo as i32) != TK_LBRACE {
+        return false
+    }
+    let abre = p.cur - 1 // o C calcula antes do teste (unsigned da a volta com cur == 0); aqui so depois, com cur >= 1
+    let fecha = fecho_na_linha(p)
+    _ = common.idioma_relatar(p.diag as ^common.Diag, common.IDI_BLOCO_NA_LINHA, p.toks[abre].off, "{")
+    if fecha == NAO_ACHEI {
+        _ = common.diag_sugerir(&(p.diag as ^common.Diag).sug, common.DIAG_SO_DICA, "ponha o corpo em linhas proprias, depois do '{' e antes do '}'")
+    } else {
+        sugerir_quebra_do_bloco(p, abre, fecha)
+    }
+    return true
+}
+
+// C: frontend/idioma_parser.c:291
+proc detectar_throw(p: ^Parser, esperado: str) -> bool {
+    var palavras: [2]str = {"throw", "raise"}
+    let sozinha = p.cur >= 1 and (p.cur == 1 or (p.toks[p.cur - 2].tipo as i32) == TK_NL or (p.toks[p.cur - 2].tipo as i32) == TK_LBRACE)
+    if esperado != "'=', '+=' ou '-='" or not sozinha or not nome_entre(p, p.cur - 1, palavras[..]) {
+        return false
+    }
+    let membro = tipo_atual(p) == TK_IDENT and (p.toks[p.cur + 1].tipo as i32) == TK_DOT and (p.toks[p.cur + 2].tipo as i32) == TK_IDENT and fim_de_linha(p.toks[p.cur + 3].tipo as i32)
+    let t = &p.toks[p.cur - 1]
+    let achado = texto_do_token(p, t) // char achado[16]: a palavra casada tem 5 bytes
+    defer delete(achado)
+    if not membro {
+        var sem_return = Achado{id = common.IDI_THROW, ini = t.off, fim = 0, achado = achado, palavra = none, dica = "troque a palavra por return e devolva um membro do enum de erro (return Erro.falhou)"}
+        return relatar(p, &sem_return)
+    }
+    var com_return = Achado{id = common.IDI_THROW, ini = t.off, fim = t.off + (t.len_c as u32), achado = achado, palavra = "return", dica = none}
+    return relatar(p, &com_return)
+}
+
+// C: frontend/idioma_parser.c:310
+proc parser_idioma_import(p: ^Parser) -> bool {
+    var palavras: [4]str = {"os", "mem", "file", "arquivo"}
+    let t = token_atual(p)
+    if not nome_entre(p, p.cur, palavras[..]) or not fim_de_linha(p.toks[p.cur + 1].tipo as i32) {
+        return false
+    }
+    let achado = texto_do_token(p, t) // char achado[16]: a palavra casada tem no maximo 7 bytes
+    defer delete(achado)
+    var std_nome = achado
+    if achado == "arquivo" {
+        std_nome = "file" // L3c: std:arquivo virou std:file
+    }
+    let aspa = "\""
+    let novo = format(f"{aspa}std:{std_nome}{aspa}", alloc = heap) // char novo[24]: no maximo 12 bytes
+    defer delete(novo)
+    var lit = Achado{id = common.IDI_IMPORT_SEM_STD, ini = t.off, fim = t.off + (t.len_c as u32), achado = achado, palavra = novo, dica = none}
+    return relatar(p, &lit)
+}
+
+// C: frontend/idioma_parser.c:328
+proc tipo_do_literal(t: i32) -> ?str {
+    let sw_1 = common.c2f_s2u_32(t)
+    if sw_1 == (TK_INT as u32) {
+        return "int"
+    } else if sw_1 == (TK_REAL as u32) {
+        return "f32"
+    } else if sw_1 == (TK_TEXTO as u32) {
+        return "str"
+    } else if sw_1 == (KW_TRUE as u32) or sw_1 == (KW_FALSE as u32) {
+        return "bool"
+    } else {
+        return none
+    }
+    return none
+}
+
+// C: frontend/idioma_parser.c:340
+// Soma o token k (nivel 0) ao que se sabe dos itens: virgula conta item; literal fixa o tipo; '-' de numero negativo passa; o resto desfaz o tipo.
+proc contar_item(p: ^Parser, k: u32, c: ^Colchetes, misto: ^bool) {
+    let t = p.toks[k].tipo as i32
+    let tipo = tipo_do_literal(t)
+    if t == TK_COMMA {
+        c.elementos += 1
+    } else if t == TK_MINUS {
+        return
+    } else if tipo == none or (c.tipo != none and (c.tipo or_else "") != (tipo or_else "")) {
+        misto^ = true
+    } else {
+        c.tipo = tipo
+    }
+}
+
+// C: frontend/idioma_parser.c:352
+proc variacao_de_nivel(t: i32) -> i32 {
+    if ((common.c2f_s2u_32(t) == (TK_LCOLCHETE as u32)) or (common.c2f_s2u_32(t) == (TK_LPAREN as u32))) or (common.c2f_s2u_32(t) == (TK_LBRACE as u32)) {
+        return 1
+    }
+    if ((common.c2f_s2u_32(t) == (TK_RCOLCHETE as u32)) or (common.c2f_s2u_32(t) == (TK_RPAREN as u32))) or (common.c2f_s2u_32(t) == (TK_RBRACE as u32)) {
+        return -1
+    }
+    return 0
+}
+
+// C: frontend/idioma_parser.c:360
+// Fecha a contagem: n virgulas = n + 1 itens ('[]' = 0 itens); virgula no fim ou item que nao e literal desfaz o tipo.
+proc fechar_contagem(p: ^Parser, c: ^Colchetes, misto: bool) {
+    let vazio = c.fecha == p.cur + 1
+    if not vazio {
+        c.elementos += 1
+    }
+    if misto or (not vazio and (p.toks[c.fecha - 1].tipo as i32) == TK_COMMA) {
+        c.tipo = none
+    }
+}
+
+// C: frontend/idioma_parser.c:368
+proc ler_colchetes(p: ^Parser) -> Colchetes {
+    var c = Colchetes{fecha = NAO_ACHEI, elementos = 0, tipo = none}
+    var fundo: i32 = 0
+    var misto = false
+    var k: u32 = p.cur + 1
+    while not fim_de_linha(p.toks[k].tipo as i32) {
+        let t = p.toks[k].tipo as i32
+        let variacao = variacao_de_nivel(t)
+        if t == TK_RCOLCHETE and fundo == 0 {
+            c.fecha = k
+            fechar_contagem(p, &c, misto)
+            return c
+        }
+        fundo += variacao
+        if fundo > 0 or variacao != 0 {
+            misto = true
+        } else {
+            contar_item(p, k, &c, &misto)
+        }
+        k += 1
+    }
+    return c
+}
+
+// C: frontend/idioma_parser.c:390
+// Indice do 1o token da linha do token atual.
+proc inicio_da_linha(p: ^Parser) -> u32 {
+    var k: u32 = p.cur
+    while k > 0 and (p.toks[k - 1].tipo as i32) != TK_NL {
+        k -= 1
+    }
+    return k
+}
+
+// C: frontend/idioma_parser.c:399
+// 'let|var nome = [..]' (sem tipo) e 'let|var nome: [N]T = [..]' (com array fixo): as duas formas em que a troca fecha sozinha.
+proc sugerir_array(p: ^Parser, c: ^Colchetes) {
+    let f = p.fonte as ^common.Fonte
+    let ini = inicio_da_linha(p)
+    let abre = p.cur
+    let nome = &p.toks[ini + 1]
+    let decl = (p.toks[ini].tipo as i32) == KW_LET or (p.toks[ini].tipo as i32) == KW_VAR
+    let sem_tipo = decl and (nome.tipo as i32) == TK_IDENT and ini + 2 == abre - 1 and (p.toks[abre - 1].tipo as i32) == TK_ASSIGN
+    let com_tipo = decl and (nome.tipo as i32) == TK_IDENT and (p.toks[ini + 2].tipo as i32) == TK_COLON and (p.toks[ini + 3].tipo as i32) == TK_LCOLCHETE and (p.toks[ini + 4].tipo as i32) == TK_INT and (p.toks[abre - 1].tipo as i32) == TK_ASSIGN
+    let fim_da_linha = c.fecha != NAO_ACHEI and fim_de_linha(p.toks[c.fecha + 1].tipo as i32)
+    var troca = common.IdiomaTroca{}
+    // snprintf(novo, DIAG_NOVO_MAX, ": [%u]%s = {", ...) < DIAG_NOVO_MAX: o tamanho que TERIA (a frase inteira) cabe
+    let tipo_do_array = c.tipo or_else "(null)"
+    let novo = format(f": [{c.elementos}]{tipo_do_array} = {{", alloc = heap)
+    defer delete(novo)
+    if fim_da_linha and sem_tipo and c.tipo != none and len(novo) < (common.DIAG_NOVO_MAX as int) {
+        common.idioma_troca_somar(&troca, f.texto, nome.off + (nome.len_c as u32), p.toks[abre].off + 1, novo)
+        common.idioma_troca_somar(&troca, f.texto, p.toks[c.fecha].off, p.toks[c.fecha].off + 1, "}")
+    } else if fim_da_linha and com_tipo {
+        common.idioma_troca_somar(&troca, f.texto, p.toks[abre].off, p.toks[abre].off + 1, "{")
+        common.idioma_troca_somar(&troca, f.texto, p.toks[c.fecha].off, p.toks[c.fecha].off + 1, "}")
+    }
+    common.idioma_sugerir(p.diag as ^common.Diag, common.DIAG_CERTA, "troque os colchetes por chaves e declare o tipo: let a: [N]T = {a, b}", &troca)
+}
+
+// C: frontend/idioma_parser.c:421
+proc parser_idioma_array(p: ^Parser) {
+    var c: Colchetes = ler_colchetes(p)
+    let arg_1: str = "[a, b]"
+    let arg_2: u32 = token_atual(p).off
+    let arg_3: ^common.Diag = p.diag as ^common.Diag
+    _ = common.idioma_relatar(arg_3, common.IDI_ARRAY_COLCHETE, arg_2, arg_1)
+    sugerir_array(p, &c)
+}
+
+// C: frontend/idioma_parser.c:437
+// C2F-80: DETECTORES (8 ponteiros de funcao) -> tags 1..8 de chamar_detector, na ordem do C.
+proc parser_idioma(p: ^Parser, esperado: str) -> bool {
+    for i in 1..=8 {
+        if chamar_detector(i as u16, p, esperado) {
+            return true
+        }
+    }
+    return false
+}
+
+// C: frontend/idioma_parser.c:447
+proc parser_idioma_try_bloco(p: ^Parser) {
+    var lit = Achado{id = common.IDI_TRY_CATCH, ini = p.toks[p.cur - 1].off, fim = 0, achado = "try { } catch", palavra = none, dica = "chame o proc numa linha e trate o resultado com switch r in f() { case T: ... case E: ... } (ou try / or_else)"}
+    _ = relatar(p, &lit)
+}
+
+// C: frontend/idioma_parser.c:453
+proc eh_tipo_inteiro(sym: i32) -> bool {
+    return (((((((((sym == SYM_INT) or (sym == SYM_I32)) or (sym == SYM_I8)) or (sym == SYM_I16)) or (sym == SYM_I64)) or (sym == SYM_U8)) or (sym == SYM_U16)) or (sym == SYM_U32)) or (sym == SYM_U64)) or (sym == SYM_UINT)
+}
+
+// C: frontend/idioma_parser.c:459
+proc parser_idioma_main(p: ^Parser, d: ^Decl) -> bool {
+    if d.nome != SYM_MAIN or d.nparams != 0 or tipo_atual(p) != TK_ARROW {
+        return false
+    }
+    let tipo = &p.toks[p.cur + 1]
+    if (tipo.tipo as i32) != TK_IDENT or not eh_tipo_inteiro(tipo.sym) {
+        return false
+    }
+    let nome_tipo = texto_do_token(p, tipo)
+    defer delete(nome_tipo)
+    let achado = format(f"-> {nome_tipo}", alloc = heap) // char achado[40]: o nome de um tipo inteiro tem no maximo 4 bytes
+    defer delete(achado)
+    var lit = Achado{id = common.IDI_MAIN_COM_RETORNO, ini = token_atual(p).off, fim = 0, achado = achado, palavra = none, dica = "tire '-> tipo', acrescente import \"std:os\" e termine com os.exit(n) onde o codigo de saida for n"}
+    return relatar(p, &lit)
+}

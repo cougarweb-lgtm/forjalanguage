@@ -1,0 +1,655 @@
+// frontend/lexer.fj - porte de compiler/frontend/lexer.c, compiler/frontend/lexer.h
+// sha256 de frontend/lexer.c: a42d0024ac6a4835d4e79abb19077456d6cb82414f14b8006ae0a08ec67fbb4f
+// sha256 de frontend/lexer.h: 7a0455ace0e654e886ade56e513de694de8ced270bd9994ece116e33ee287d29
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "common"
+
+pub struct LexerComentario {
+    inicio: u32
+    fim: u32
+}
+
+pub struct Lexer {
+    fonte: ?^common.Fonte
+    nomes: ?^common.Interner
+    diag: ?^common.Diag
+    erros: ?^common.DiagLista
+    comentarios: ?^[dynamic]LexerComentario
+    tokens: [dynamic]Token
+    inicio: u32
+}
+
+const PALAVRAS_CHAVE: [34]str = {"const", "let", "var", "proc", "struct", "enum", "union", "unit", "pub", "export", "import", "as", "foreign", "test", "if", "else", "for", "in", "while", "switch", "case", "default", "break", "continue", "return", "defer", "try", "or_else", "and", "or", "not", "true", "false", "none"}
+const NOMES_EMBUTIDOS: [33]str = {"i32", "int", "f32", "bool", "print", "main", "expect", "i8", "i16", "i64", "u8", "u16", "u32", "u64", "uint", "f64", "str", "cstr", "rawptr", "link", "new", "make", "dynamic", "map", "bit_set", "soa", "matrix", "size_of", "align_of", "offset_of", "static_assert", "quat", "Allocator"}
+
+// C: frontend/lexer.c:48
+pub proc lexer_nomes_iniciais(nomes: ^common.Interner) {
+    for i in (0 as i32)..<KW_QTD {
+        let arg_1: u32 = (len(PALAVRAS_CHAVE[i]) as u64) as u32
+        let arg_2: str = PALAVRAS_CHAVE[i]
+        let arg_3: ^common.Interner = nomes
+        _ = common.internar(arg_3, arg_2, arg_1)
+    }
+    for i in (0 as i32)..<(SYM_QTD - KW_QTD) {
+        let arg_4: u32 = (len(NOMES_EMBUTIDOS[i]) as u64) as u32
+        let arg_5: str = NOMES_EMBUTIDOS[i]
+        let arg_6: ^common.Interner = nomes
+        _ = common.internar(arg_6, arg_5, arg_4)
+    }
+}
+
+// C: frontend/lexer.c:54
+proc eh_digito(ch: u8) -> bool {
+    return (common.c2f_char_i32(ch) >= 48) and (common.c2f_char_i32(ch) <= 57) // '0' '9'
+}
+
+// C: frontend/lexer.c:55
+proc eh_inicio_de_nome(ch: u8) -> bool {
+    return (((common.c2f_char_i32(ch) >= 65) and (common.c2f_char_i32(ch) <= 90)) or ((common.c2f_char_i32(ch) >= 97) and (common.c2f_char_i32(ch) <= 122))) or (ch == 95) // 'A' 'Z' 'a' 'z' '_'
+}
+
+// C: frontend/lexer.c:56
+proc eh_parte_de_nome(ch: u8) -> bool {
+    return (common.c2f_b2i32(eh_inicio_de_nome(ch)) != 0) or (common.c2f_b2i32(eh_digito(ch)) != 0)
+}
+
+// C: frontend/lexer.c:58
+proc empurrar_token(lx: ^Lexer, tipo: i32, off: u32, len_c: u32, sym: i32) {
+    var tam: u32 = len_c
+    if tam > 65535 { // UINT16_MAX: len satura
+        tam = 65535
+    }
+    append(&lx.tokens, item = Token{off = off, sym = sym, len_c = tam as u16, tipo = tipo as u8})
+}
+
+// C2F-33: nao ha visao str de bytes sem copia; o texto lido da Fonte vira str de heap so para internar (Internar copia o nome na arena)
+proc internar_bytes(lx: ^Lexer, s: []u8, ini: u32, tam: u32) -> i32 {
+    let t = from_bytes(s[ini..<(ini + tam)], alloc = heap)
+    defer delete(t)
+    return common.internar(lx.nomes as ^common.Interner, t, tam)
+}
+
+// C: frontend/lexer.c:68
+proc empurrar_quebra(lx: ^Lexer, off: u32) {
+    let v: ^[dynamic]Token = &lx.tokens
+    if ((len(v^) as u64) == 0) or (v[(len(v^) as u64) - 1].tipo == (TK_NL as u8)) {
+        return
+    }
+    empurrar_token(lx, TK_NL, off, 1, -1)
+}
+
+// C: frontend/lexer.c:76
+proc fim_do_numero(s: []u8, i: u32, real: ^bool) -> u32 {
+    var j: u32 = i
+    while eh_digito(s[j]) {
+        j += 1
+    }
+    real^ = (s[j] == 46) and (common.c2f_b2i32(eh_digito(s[j + 1])) != 0) // '.'
+    if not real^ {
+        return j
+    }
+    j += 1
+    while eh_digito(s[j]) {
+        j += 1
+    }
+    return j
+}
+
+// C: frontend/lexer.c:87
+proc eh_prefixo_de_numero(a: u8, b: u8) -> bool {
+    return (a == 48) and ((b == 120) or (b == 98)) // '0' 'x' 'b'
+}
+
+// C: frontend/lexer.c:89
+proc eh_digito_hex(ch: u8) -> bool {
+    return ((common.c2f_b2i32(eh_digito(ch)) != 0) or ((common.c2f_char_i32(ch) >= 97) and (common.c2f_char_i32(ch) <= 102))) or ((common.c2f_char_i32(ch) >= 65) and (common.c2f_char_i32(ch) <= 70)) // 'a' 'f' 'A' 'F'
+}
+
+// C: frontend/lexer.c:93
+proc ler_numero_prefixado(lx: ^Lexer, i: ^u32) -> bool {
+    let s: []u8 = (lx.fonte as ^common.Fonte).texto
+    let hex: bool = s[i^ + 1] == 120 // 'x'
+    var j: u32 = i^ + 2
+    while eh_parte_de_nome(s[j]) {
+        j += 1
+    }
+    if j == (i^ + 2) {
+        let prefixo = common.c2f_byte_texto(common.c2f_char_i32(s[i^ + 1]) as u8)
+        defer delete(prefixo)
+        let msg_1 = format(f"faltam digitos depois de '0{prefixo}'", alloc = heap)
+        defer delete(msg_1)
+        return common.diag_relatar(lx.diag as ^common.Diag, common.E0001, i^, msg_1)
+    }
+    for k in (i^ + 2)..<j {
+        var tern_1: i32 = common.c2f_b2i32((s[k] == 48) or (s[k] == 49))
+        if common.c2f_b2i32(hex) != 0 {
+            tern_1 = common.c2f_b2i32(eh_digito_hex(s[k]))
+        }
+        if tern_1 != 0 { // '0' '1'
+            continue
+        }
+        var tern_2: str = "binario"
+        if common.c2f_b2i32(hex) != 0 {
+            tern_2 = "hexadecimal"
+        }
+        var tern_3: str = "0 e 1"
+        if common.c2f_b2i32(hex) != 0 {
+            tern_3 = "0-9 e a-f"
+        }
+        let ruim = common.c2f_byte_texto(common.c2f_char_i32(s[k]) as u8)
+        defer delete(ruim)
+        let msg_2 = format(f"'{ruim}' nao e digito {tern_2} (use {tern_3})", alloc = heap)
+        defer delete(msg_2)
+        return common.diag_relatar(lx.diag as ^common.Diag, common.E0001, k, msg_2)
+    }
+    empurrar_token(lx, TK_INT, i^, j - i^, -1)
+    i^ = j
+    return true
+}
+
+// C: frontend/lexer.c:112
+pub proc lexer_ler_inteiro_u64(s: []u8, valor: ^u64) -> bool {
+    // C2F-18/N1: cursor (s, k); o C le ate o NUL, aqui o fim da fatia conta como NUL (c2f_nul_em_b)
+    var v: u64 = 0
+    var k: int = 0
+    if eh_prefixo_de_numero(common.c2f_nul_em_b(s, 0), common.c2f_nul_em_b(s, 1)) {
+        let hex: bool = common.c2f_nul_em_b(s, 1) == 120 // 'x'
+        k = 2
+        while true {
+            let c: u8 = common.c2f_nul_em_b(s, k)
+            var cabe: bool = (c == 48) or (c == 49) // '0' '1'
+            if hex {
+                cabe = eh_digito_hex(c)
+            }
+            if not cabe {
+                break
+            }
+            var d: u64 = (c as u64) - 48 // '0'
+            if not eh_digito(c) {
+                d = (((c | 32) as u64) - 97) + 10 // 'a'
+            }
+            var corte: u64 = 63
+            if hex {
+                corte = 60
+            }
+            if (v >> corte) != 0 {
+                return false
+            }
+            var desloca: u64 = 1
+            if hex {
+                desloca = 4
+            }
+            v = (v << desloca) | d
+            k += 1
+        }
+        valor^ = v
+        return true
+    }
+    while eh_digito(common.c2f_nul_em_b(s, k)) {
+        let d: u64 = (common.c2f_nul_em_b(s, k) as u64) - 48 // '0'
+        if v > ((18446744073709551615 - d) / 10) {
+            return false
+        }
+        v = (v * 10) + d
+        k += 1
+    }
+    valor^ = v
+    return true
+}
+
+// C: frontend/lexer.c:136
+proc casar_simbolo(s: []u8, tipo: ^i32) -> u32 {
+    let a: u8 = s[0]
+    let b: u8 = s[1]
+    let sw_1 = common.c2f_char_i32(a)
+    if sw_1 == 40 { // '('
+        tipo^ = TK_LPAREN
+        return 1
+    } else if sw_1 == 41 { // ')'
+        tipo^ = TK_RPAREN
+        return 1
+    } else if sw_1 == 123 { // '{'
+        tipo^ = TK_LBRACE
+        return 1
+    } else if sw_1 == 125 { // '}'
+        tipo^ = TK_RBRACE
+        return 1
+    } else if sw_1 == 44 { // ','
+        tipo^ = TK_COMMA
+        return 1
+    } else if sw_1 == 58 { // ':'
+        tipo^ = TK_COLON
+        return 1
+    } else if sw_1 == 42 { // '*'
+        tipo^ = TK_STAR
+        return 1
+    } else if sw_1 == 47 { // '/'
+        tipo^ = TK_SLASH
+        return 1
+    } else if sw_1 == 37 { // '%'
+        tipo^ = TK_PERCENT
+        return 1
+    } else if sw_1 == 94 { // '^'
+        tipo^ = TK_CARET
+        return 1
+    } else if sw_1 == 38 { // '&'
+        tipo^ = TK_AMP
+        return 1
+    } else if sw_1 == 61 { // '='
+        if b == 61 { // '='
+            tipo^ = TK_EQ
+            return 2
+        }
+        tipo^ = TK_ASSIGN
+        return 1
+    } else if sw_1 == 33 { // '!'
+        if b == 61 { // '='
+            tipo^ = TK_NE
+            return 2
+        }
+        tipo^ = TK_BANG
+        return 1
+    } else if sw_1 == 124 { // '|'
+        tipo^ = TK_PIPE
+        return 1
+    } else if sw_1 == 126 { // '~'
+        tipo^ = TK_TIL
+        return 1
+    } else if sw_1 == 35 { // '#'
+        tipo^ = TK_HASH
+        return 1
+    } else if sw_1 == 63 { // '?'
+        tipo^ = TK_INTERROGA
+        return 1
+    } else if sw_1 == 91 { // '['
+        tipo^ = TK_LCOLCHETE
+        return 1
+    } else if sw_1 == 93 { // ']'
+        tipo^ = TK_RCOLCHETE
+        return 1
+    } else if sw_1 == 60 { // '<'
+        if b == 60 { // '<'
+            tipo^ = TK_SHL
+            return 2
+        }
+        if b == 61 { // '='
+            tipo^ = TK_LE
+            return 2
+        }
+        tipo^ = TK_LT
+        return 1
+    } else if sw_1 == 62 { // '>'
+        if b == 62 { // '>'
+            tipo^ = TK_SHR
+            return 2
+        }
+        if b == 61 { // '='
+            tipo^ = TK_GE
+            return 2
+        }
+        tipo^ = TK_GT
+        return 1
+    } else if sw_1 == 43 { // '+'
+        if b == 61 { // '='
+            tipo^ = TK_PLUSEQ
+            return 2
+        }
+        tipo^ = TK_PLUS
+        return 1
+    } else if sw_1 == 45 { // '-'
+        if b == 61 { // '='
+            tipo^ = TK_MINUSEQ
+            return 2
+        }
+        if b == 62 { // '>'
+            tipo^ = TK_ARROW
+            return 2
+        }
+        tipo^ = TK_MINUS
+        return 1
+    } else if sw_1 == 46 { // '.'
+        if (b == 46) and (s[2] == 60) { // '.' '<'
+            tipo^ = TK_DOTDOTLT
+            return 3
+        }
+        if (b == 46) and (s[2] == 61) { // '.' '='
+            tipo^ = TK_DOTDOTEQ
+            return 3
+        }
+        if b == 46 { // '.'
+            tipo^ = TK_DOTDOT
+            return 2
+        }
+        tipo^ = TK_DOT
+        return 1
+    } else {
+        return 0
+    }
+    return 0
+}
+
+// C: frontend/lexer.c:182
+proc ler_texto(lx: ^Lexer, i: ^u32) -> bool {
+    let f = lx.fonte as ^common.Fonte
+    let s: []u8 = f.texto
+    let n: u32 = f.tam as u32
+    var j: u32 = i^ + 1
+    while (j < n) and (s[j] != 34) and (s[j] != 10) { // '"' '\n'
+        if (s[j] == 92) and (s[j + 1] != 10) { // '\\' '\n'
+            j += 2
+        } else {
+            j += 1
+        }
+    }
+    if (j >= n) or (s[j] != 34) { // '"'
+        return common.diag_relatar(lx.diag as ^common.Diag, common.E0001, i^, "texto sem fechar na linha: falta a aspa de fechamento")
+    }
+    let sym: i32 = internar_bytes(lx, s, i^ + 1, (j - i^) - 1)
+    empurrar_token(lx, TK_TEXTO, i^, (j + 1) - i^, sym)
+    i^ = j + 1
+    return true
+}
+
+// C: frontend/lexer.c:194
+proc ler_nome(lx: ^Lexer, i: ^u32) -> bool {
+    let s: []u8 = (lx.fonte as ^common.Fonte).texto
+    var j: u32 = i^ + 1
+    while eh_parte_de_nome(s[j]) {
+        j += 1
+    }
+    // 'f' colado na aspa abre f"...": testado depois do nome
+    if (s[j] == 34) and (j == (i^ + 1)) and (s[i^] == 102) { // '"' 'f'
+        return lexer_ler_f_texto(lx, i)
+    }
+    let sym: i32 = internar_bytes(lx, s, i^, j - i^)
+    var tipo: i32 = TK_IDENT
+    if sym < KW_QTD {
+        tipo = KW_CONST + sym
+    }
+    empurrar_token(lx, tipo, i^, j - i^, sym)
+    i^ = j
+    return true
+}
+
+// C: frontend/lexer.c:208
+// C2F: s era `const char *` (str); aqui []u8 (a Fonte, SENT): o C anda para tras ate o '\n' e le alem do fim, o que um str nao permite
+proc linha_comeca_com_for_c(s: []u8, i: u32) -> bool {
+    var k: u32 = i
+    while (k > 0) and (s[k - 1] != 10) { // '\n'
+        k -= 1
+    }
+    while (s[k] == 32) or (s[k] == 9) { // ' ' '\t'
+        k += 1
+    }
+    // strncmp(s + k, "for", 3) != 0
+    if (s[k] != 102) or (s[k + 1] != 111) or (s[k + 2] != 114) { // 'f' 'o' 'r'
+        return false
+    }
+    k += 3
+    while (s[k] == 32) or (s[k] == 9) { // ' ' '\t'
+        k += 1
+    }
+    return s[k] == 40 // '('
+}
+
+// C: frontend/lexer.c:222
+proc ponto_e_virgula_invalido(lx: ^Lexer, i: u32) -> bool {
+    let s: []u8 = (lx.fonte as ^common.Fonte).texto
+    let d = lx.diag as ^common.Diag
+    var k: u32 = i + 1
+    while (s[k] == 32) or (s[k] == 9) or (s[k] == 13) { // ' ' '\t' '\r'
+        k += 1
+    }
+    let fim_da_linha: bool = (s[k] == 10) or (s[k] == 0) or ((s[k] == 47) and (s[k + 1] == 47)) // '\n' '\0' '/' '/'
+    if linha_comeca_com_for_c(s, i) {
+        _ = common.idioma_relatar(d, common.IDI_FOR_ESTILO_C, i, "for (;;)")
+        _ = common.diag_sugerir(&d.sug, common.DIAG_SO_DICA, "troque o cabecalho pelo for da Forja: for i in 0..<n {")
+        return false
+    }
+    _ = common.idioma_relatar(d, common.IDI_PONTO_E_VIRGULA, i, ";")
+    if fim_da_linha {
+        _ = common.diag_sugerir(&d.sug, common.DIAG_CERTA, "remova o ';' do fim da linha")
+        _ = common.diag_editar(&d.sug, i, i + 1, "")
+    } else {
+        _ = common.diag_sugerir(&d.sug, common.DIAG_SO_DICA, "um comando por linha: troque o ';' por uma quebra de linha")
+    }
+    return false
+}
+
+// C: frontend/lexer.c:244
+proc caractere_invalido(lx: ^Lexer, i: u32) -> bool {
+    let ch: u8 = (lx.fonte as ^common.Fonte).texto[i]
+    if ch == 59 { // ';'
+        return ponto_e_virgula_invalido(lx, i)
+    }
+    if ((ch as i32) >= 33) and ((ch as i32) < 127) {
+        let visivel = common.c2f_byte_texto((ch as i32) as u8)
+        defer delete(visivel)
+        let msg_1 = format(f"caractere invalido '{visivel}'", alloc = heap)
+        defer delete(msg_1)
+        return common.diag_relatar(lx.diag as ^common.Diag, common.E0001, i, msg_1)
+    }
+    if (ch as i32) >= 128 {
+        let hex_2 = common.c2f_hex_maiusc(common.c2f_s2u_64((ch as i32) as i64), 2)
+        defer delete(hex_2)
+        let msg_2 = format(f"caractere fora do ASCII (byte 0x{hex_2}): nome, tipo e comando so usam a-z, A-Z, 0-9 e _ (sem acento); acento so vale dentro de texto entre aspas", alloc = heap)
+        defer delete(msg_2)
+        return common.diag_relatar(lx.diag as ^common.Diag, common.E0001, i, msg_2)
+    }
+    let hex_3 = common.c2f_hex_maiusc(common.c2f_s2u_64((ch as i32) as i64), 2)
+    defer delete(hex_3)
+    let msg_3 = format(f"caractere invalido (byte 0x{hex_3})", alloc = heap)
+    defer delete(msg_3)
+    return common.diag_relatar(lx.diag as ^common.Diag, common.E0001, i, msg_3)
+}
+
+// C: frontend/lexer.c:257
+proc ler_um(lx: ^Lexer, i: ^u32) -> bool {
+    let s: []u8 = (lx.fonte as ^common.Fonte).texto
+    if eh_inicio_de_nome(s[i^]) {
+        return ler_nome(lx, i)
+    }
+    if s[i^] == 34 { // '"'
+        return ler_texto(lx, i)
+    }
+    if eh_digito(s[i^]) {
+        if eh_prefixo_de_numero(s[i^], s[i^ + 1]) {
+            return ler_numero_prefixado(lx, i)
+        }
+        var real: bool = false
+        let fim: u32 = fim_do_numero(s, i^, &real)
+        var tipo_num: i32 = TK_INT
+        if real {
+            tipo_num = TK_REAL
+        }
+        empurrar_token(lx, tipo_num, i^, fim - i^, -1)
+        i^ = fim
+        return true
+    }
+    var tipo: i32 = 0
+    let n: u32 = casar_simbolo(s[i^..<len(s)], &tipo)
+    if n == 0 {
+        return caractere_invalido(lx, i^)
+    }
+    empurrar_token(lx, tipo, i^, n, -1)
+    i^ += n
+    return true
+}
+
+// C: frontend/lexer.c:279
+proc lexer_ler_token_simples(lx: ^Lexer, i: ^u32) -> bool {
+    return ler_um(lx, i)
+}
+
+// C: frontend/lexer.c:286
+proc recuperar_da_linha(lx: ^Lexer, i: ^u32, n: u32) -> bool {
+    let s: []u8 = (lx.fonte as ^common.Fonte).texto
+    if (lx.erros == none) or (not common.diag_lista_guardar(lx.erros, lx.diag as ^common.Diag, 0)) {
+        return false
+    }
+    while (i^ < n) and (s[i^] != 10) { // '\n'
+        i^ += 1
+    }
+    return true
+}
+
+// C: frontend/lexer.c:296
+// C2F: s era `const char *` (str); aqui []u8 (a Fonte, SENT), como em linha_comeca_com_for_c
+proc bloco_de_uma_linha(s: []u8, ini: u32, fecho: u32, fecha: bool) -> bool {
+    if not fecha {
+        return false
+    }
+    for m in ini..<fecho { // memchr(s + ini, '\n', fecho - ini) != NULL
+        if s[m] == 10 { // '\n'
+            return false
+        }
+    }
+    var k: u32 = fecho + 2
+    while (s[k] == 32) or (s[k] == 9) or (s[k] == 13) { // ' ' '\t' '\r'
+        k += 1
+    }
+    return (s[k] == 10) or (s[k] == 0) // '\n' '\0'
+}
+
+// C: frontend/lexer.c:305
+proc sugerir_comentario_de_linha(lx: ^Lexer, ini: u32, fecho: u32, fecha: bool) {
+    let s: []u8 = (lx.fonte as ^common.Fonte).texto
+    let d = lx.diag as ^common.Diag
+    if not bloco_de_uma_linha(s, ini, fecho, fecha) {
+        _ = common.diag_sugerir(&d.sug, common.DIAG_SO_DICA, "escreva // no comeco de cada linha do comentario e tire o fecho do bloco")
+        return
+    }
+    var inicio_do_fecho: u32 = fecho
+    while (inicio_do_fecho > (ini + 2)) and ((s[inicio_do_fecho - 1] == 32) or (s[inicio_do_fecho - 1] == 9)) { // ' ' '\t'
+        inicio_do_fecho -= 1
+    }
+    _ = common.diag_sugerir(&d.sug, common.DIAG_CERTA, "troque o comentario de bloco pelo comentario de linha //")
+    _ = common.diag_editar(&d.sug, ini, ini + 2, "//")
+    _ = common.diag_editar(&d.sug, inicio_do_fecho, fecho + 2, "")
+}
+
+// C: frontend/lexer.c:320
+proc comentario_de_bloco_alheio(lx: ^Lexer, i: ^u32, n: u32) -> bool {
+    let s: []u8 = (lx.fonte as ^common.Fonte).texto
+    var fecho: u32 = i^ + 2
+    while (fecho < n) and (not ((s[fecho] == 42) and (s[fecho + 1] == 47))) { // '*' '/'
+        fecho += 1
+    }
+    _ = common.idioma_relatar(lx.diag as ^common.Diag, common.IDI_COMENTARIO_DE_BLOCO, i^, "/*")
+    sugerir_comentario_de_linha(lx, i^, fecho, fecho < n)
+    if (lx.erros == none) or (not common.diag_lista_guardar(lx.erros, lx.diag as ^common.Diag, 0)) {
+        return false
+    }
+    var tern_1: u32 = n
+    if fecho < n {
+        tern_1 = fecho + 2
+    }
+    i^ = tern_1
+    return true
+}
+
+// C: frontend/lexer.c:334
+proc saltar_comentario(lx: ^Lexer, i: ^u32, n: u32) -> bool {
+    let s: []u8 = (lx.fonte as ^common.Fonte).texto
+    let inicio: u32 = i^
+    if s[i^ + 1] == 42 { // '*'
+        return comentario_de_bloco_alheio(lx, i, n)
+    }
+    while (i^ < n) and (s[i^] != 10) { // '\n'
+        i^ += 1
+    }
+    if lx.comentarios != none {
+        append(lx.comentarios as ^[dynamic]LexerComentario, item = LexerComentario{inicio = inicio, fim = i^})
+    }
+    return true
+}
+
+// C: frontend/lexer.c:348
+// LIMITE: cognitiva 20 (laco de despacho por caractere: quebra, espaco, comentario e token na mesma cadeia; cada ramo ja delega a uma funcao)
+pub proc lexer_analisar(lx: ^Lexer) -> bool {
+    let f = lx.fonte as ^common.Fonte
+    let s: []u8 = f.texto
+    // Contrato da Fonte: posicoes de 32 bits e NUL em texto[tam]; ler_nome, fim_do_numero e ler_texto leem 1 caractere alem do fim
+    if f.tam > (common.FONTE_TAM_MAX as u64) {
+        let msg_1 = format(f"lexer: fonte de {f.tam} bytes passa do limite de {common.FONTE_TAM_MAX} (posicoes de 32 bits)", alloc = heap)
+        defer delete(msg_1)
+        common.falha_interna(msg_1)
+        return false
+    }
+    if s[f.tam] != 0 {
+        common.falha_interna("lexer: a fonte nao termina em NUL (contrato de FonteLer e FonteDeTexto)")
+        return false
+    }
+    var i: u32 = lx.inicio
+    let n: u32 = f.tam as u32
+    if cap(lx.tokens) > 0 { // lexer reaproveitado (modulos): mesmo vetor, tokens do trecho novo
+        clear(&lx.tokens)
+    } else {
+        lx.tokens = make([dynamic]Token, alloc = heap)
+    }
+    reserve(&lx.tokens, (((n - i) / 2) + 64) as int) // fonte real tem ~0,35 token por byte; acima disso o vetor dobra normalmente
+    while i < n {
+        let ch: u8 = s[i]
+        if ch == 10 { // '\n'
+            empurrar_quebra(lx, i)
+            i += 1
+        } else if (ch == 32) or (ch == 9) or (ch == 13) { // ' ' '\t' '\r'
+            i += 1
+        } else if (ch == 47) and ((s[i + 1] == 47) or (s[i + 1] == 42)) { // '/' '/' '*'
+            if not saltar_comentario(lx, &i, n) {
+                return false
+            }
+        } else if not ler_um(lx, &i) {
+            if not recuperar_da_linha(lx, &i, n) {
+                return false
+            }
+        }
+    }
+    empurrar_token(lx, TK_EOF, n, 0, -1)
+    return (lx.erros == none) or ((lx.erros as ^common.DiagLista).n == 0)
+}
+
+// C: frontend/lexer.c:377
+pub proc lexer_liberar(lx: ^Lexer) {
+    delete(lx.tokens)
+}
+
+// So para os `test` do pacote (common.fonte_de_texto nao e pub): Fonte em memoria com a sentinela de 4 zeros (C2F-18); quem chama usa common.fonte_liberar
+proc fonte_de_teste(texto: str) -> common.Fonte {
+    var f: common.Fonte = common.Fonte{}
+    f.dono_texto = make([dynamic]u8, alloc = heap)
+    append(&f.dono_texto, items = as_bytes(texto))
+    resize(&f.dono_texto, len(texto) + 4)
+    f.caminho = "t.fj"
+    f.texto = f.dono_texto[..]
+    f.tam = len(texto) as u64
+    return f
+}
+
+// G3 P-front A: o dump de tokens do C (let x = 12 -> LET IDENT ASSIGN INT NL EOF) e o E0001 de caractere invalido, conferidos no diferencial C x Forja
+test "lexer: tokens, palavra-chave e caractere invalido" {
+    var a: common.Arena = common.Arena{}
+    var nomes: common.Interner = common.Interner{}
+    common.interner_iniciar(&nomes, &a)
+    lexer_nomes_iniciais(&nomes)
+    var f: common.Fonte = fonte_de_teste("let x = 12\n")
+    var d: common.Diag = common.Diag{}
+    var lx: Lexer = Lexer{fonte = &f, nomes = &nomes, diag = &d}
+    expect(lexer_analisar(&lx))
+    expect(len(lx.tokens) == 6)
+    expect(lx.tokens[0].tipo == (KW_LET as u8) and lx.tokens[1].tipo == (TK_IDENT as u8) and lx.tokens[2].tipo == (TK_ASSIGN as u8))
+    expect(lx.tokens[3].tipo == (TK_INT as u8) and lx.tokens[4].tipo == (TK_NL as u8) and lx.tokens[5].tipo == (TK_EOF as u8))
+    lexer_liberar(&lx)
+    common.fonte_liberar(&f)
+    var f2: common.Fonte = fonte_de_teste("a $ b\n")
+    var d2: common.Diag = common.Diag{}
+    var lx2: Lexer = Lexer{fonte = &f2, nomes = &nomes, diag = &d2}
+    expect(not lexer_analisar(&lx2))
+    expect(d2.tem and d2.off == 2)
+    lexer_liberar(&lx2)
+    common.fonte_liberar(&f2)
+    common.interner_liberar(&nomes)
+    common.arena_liberar(&a)
+}

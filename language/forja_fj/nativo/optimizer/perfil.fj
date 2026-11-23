@@ -1,0 +1,222 @@
+// nativo/optimizer/perfil.fj - porte de compiler/nativo/optimizer/perfil.c, compiler/nativo/optimizer/perfil.h
+// sha256 de nativo/optimizer/perfil.c: 5324509f3c0d8c29e210a0cca36f03ddd9115fd6e674f1e893ddd63514f4d718
+// sha256 de nativo/optimizer/perfil.h: 96a61b6f5d08e591a7541adeb0e3fde12ed998dc59cfc488aa7f4d1dbaecc1a1
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "common"
+import "nativo/bir"
+
+struct PerfilCtx {
+    programa: ?^bir.BirPrograma
+    entrar: u32
+    sair: u32
+    finalizar: u32
+    proc_sair: u32
+    instrumenta: bool
+    id: u32
+}
+
+const PERFIL_PREFIXO_FUNCAO: str = "fj_"
+const PERFIL_SIMBOLO_ENTRAR: str = "forja_perfil_entrar"
+const PERFIL_SIMBOLO_SAIR: str = "forja_perfil_sair"
+const PERFIL_SIMBOLO_FINALIZAR: str = "forja_perfil_finalizar"
+const PERFIL_SIMBOLO_PROC_SAIR: str = "forja_proc_sair"
+pub const PERFIL_NOME_MAX: u32 = 512
+const PERFIL_ID_LIMITE: u32 = 1048576
+
+// C: nativo/optimizer/perfil.c:29
+pub proc otim_perfil_proc(programa: ?^bir.BirPrograma, funcao: ^bir.BirFuncao) -> bool {
+    return ((funcao.nblocos > 0) and (not funcao.sintetica)) and common.c2f_prefixo_igual(((programa as ^bir.BirPrograma).simbolos[funcao.simbolo].nome or_else ""), PERFIL_PREFIXO_FUNCAO, len(PERFIL_PREFIXO_FUNCAO))
+}
+
+// C: nativo/optimizer/perfil.c:35
+pub proc otim_perfil_nome(programa: ?^bir.BirPrograma, funcao: ^bir.BirFuncao, saida: []u8, cap: u64) {
+    let prog: ^bir.BirPrograma = programa as ^bir.BirPrograma
+    let nome_completo: str = prog.simbolos[funcao.simbolo].nome or_else ""
+    let chave: str = nome_completo[len(PERFIL_PREFIXO_FUNCAO)..<len(nome_completo)]
+    let puro: str = common.nome_modulo_exibicao(chave)
+    let destino: []u8 = saida[0..<(cap as int)]
+    if len(puro) == len(chave) {
+        _ = common.c2f_snprintf(destino, chave)
+        return
+    }
+    var digitos: int = 0
+    while digitos < len(chave) and chave[digitos] >= 48 and chave[digitos] <= 57 {
+        digitos += 1
+    }
+    let k: int = (len(chave) - len(puro)) - digitos - 1
+    let prefixo: str = chave[digitos..<(digitos + k)]
+    let texto: str = format(f"{prefixo}.{puro}", alloc = heap)
+    _ = common.c2f_snprintf(destino, texto)
+    delete(texto)
+}
+
+// C: nativo/optimizer/perfil.c:51
+// Simbolo BS_RUNTIME com este nome; cria no fim da lista se ainda nao existe.
+proc simbolo_runtime(p: ^bir.BirPrograma, nome: str) -> u32 {
+    var k: u32 = 0
+    while k < p.nsimbolos {
+        if (p.simbolos[k].tipo == (bir.BS_RUNTIME as u8)) and ((p.simbolos[k].nome or_else "") == nome) {
+            return k
+        }
+        k += 1
+    }
+    append(&p.simbolos, item = bir.BirSimbolo{nome = nome, tipo = (bir.BS_RUNTIME as u8), tam = (len(nome) as u32)})
+    let indice: u32 = p.nsimbolos
+    p.nsimbolos += 1
+    p.cap_simbolos = (cap(p.simbolos) as u64) as u32
+    return indice
+}
+
+// C: nativo/optimizer/perfil.c:68
+// Instrucao sintetica (ir nulo); pos e a da instrucao vizinha. Com id, um argumento imediato i32.
+proc chamada(c: ^PerfilCtx, simbolo: u32, com_id: bool, pos: u32) -> bir.BirInstr {
+    var i = bir.BirInstr{}
+    i.op = (bir.BIR_CHAMA as u8)
+    i.classe = (bir.BC_NADA as u8)
+    i.dst = bir.BIR_SEM_VREG
+    i.simbolo = simbolo
+    i.alvo[0] = bir.BIR_SEM_BLOCO
+    i.alvo[1] = bir.BIR_SEM_BLOCO
+    i.pos = pos
+    if com_id {
+        let prog: ^bir.BirPrograma = c.programa as ^bir.BirPrograma
+        let args: []bir.BirOperando = bir.arena_fatia_bir_operando(&prog.arena, 1)
+        args[0] = bir.BirOperando{tipo = (bir.BO_IMED as u8), classe = (bir.BC_I32 as u8), imed = (c.id as i64)}
+        i.args = args
+        i.nargs = 1
+    }
+    return i
+}
+
+// C: nativo/optimizer/perfil.c:81
+proc contar_insercoes(c: ^PerfilCtx, b: ^bir.BirBloco, entrada: bool) -> u32 {
+    var tern_1: u32 = 0
+    if (common.c2f_b2i32(entrada) != 0) and (common.c2f_b2i32(c.instrumenta) != 0) {
+        tern_1 = 1
+    }
+    var n: u32 = tern_1
+    for k in (0 as u32)..<b.n {
+        if (common.c2f_b2i32(c.instrumenta) != 0) and (b.instrs[k].op == (bir.BIR_RETORNA as u8)) {
+            n += 1
+        } else if (b.instrs[k].op == (bir.BIR_CHAMA as u8)) and (b.instrs[k].simbolo == c.proc_sair) {
+            n += 1
+        }
+    }
+    return n
+}
+
+// C: nativo/optimizer/perfil.c:95
+// Refaz a lista do bloco in-place (Forja nao move [dynamic] de struct): cresce com append e preenche de tras para frente, cada instrucao antes da sua chamada.
+proc inserir_no_bloco(c: ^PerfilCtx, b: ^bir.BirBloco, entrada: bool) {
+    let extras: u32 = contar_insercoes(c, b, entrada)
+    if extras == 0 {
+        return
+    }
+    let n: u32 = b.n
+    var pos_entrada: u32 = bir.BIR_SEM_POS
+    if n > 0 {
+        pos_entrada = b.instrs[0].pos
+    }
+    var k: u32 = 0
+    while k < extras {
+        append(&b.instrs, item = bir.BirInstr{})
+        k += 1
+    }
+    var j: u32 = n + extras
+    var idx: u32 = n
+    while idx > 0 {
+        idx -= 1
+        let x: bir.BirInstr = b.instrs[idx]
+        j -= 1
+        b.instrs[j] = x
+        if c.instrumenta and (x.op == (bir.BIR_RETORNA as u8)) {
+            j -= 1
+            b.instrs[j] = chamada(c, c.sair, true, x.pos)
+        } else if (x.op == (bir.BIR_CHAMA as u8)) and (x.simbolo == c.proc_sair) {
+            j -= 1
+            b.instrs[j] = chamada(c, c.finalizar, false, x.pos)
+        }
+    }
+    if entrada and c.instrumenta {
+        j -= 1
+        b.instrs[j] = chamada(c, c.entrar, true, pos_entrada)
+    }
+    b.n = n + extras
+    b.cap = (cap(b.instrs) as u64) as u32
+}
+
+// C: nativo/optimizer/perfil.c:122
+proc otim_perfil_aplicar(programa: ^bir.BirPrograma, relato: ^[dynamic]u8) {
+    var c = PerfilCtx{programa = programa, proc_sair = bir.BIR_SEM_SIMBOLO}
+    var proximo_id: u32 = 0
+    c.entrar = simbolo_runtime(programa, PERFIL_SIMBOLO_ENTRAR)
+    c.sair = simbolo_runtime(programa, PERFIL_SIMBOLO_SAIR)
+    c.finalizar = simbolo_runtime(programa, PERFIL_SIMBOLO_FINALIZAR)
+    var k: u32 = 0
+    while k < programa.nsimbolos {
+        if (programa.simbolos[k].tipo == (bir.BS_RUNTIME as u8)) and ((programa.simbolos[k].nome or_else "") == PERFIL_SIMBOLO_PROC_SAIR) {
+            c.proc_sair = k
+        }
+        k += 1
+    }
+    let fatia: []bir.BirFuncao = programa.funcoes or_else {}
+    var i: u32 = 0
+    while i < programa.nfuncoes {
+        let f: ^bir.BirFuncao = &fatia[i]
+        c.instrumenta = otim_perfil_proc(programa, f)
+        if c.instrumenta and (proximo_id >= PERFIL_ID_LIMITE) {
+            common.falha_interna("perfil: mais de 1048576 procs de usuario (o limite da tabela FPF1)")
+        }
+        if c.instrumenta {
+            c.id = proximo_id
+            proximo_id += 1
+            let nome_f: str = programa.simbolos[f.simbolo].nome or_else ""
+            format(f"perfil {nome_f}: id {c.id}\n", into = relato)
+        } else {
+            c.id = 0
+        }
+        var b: u32 = 0
+        while b < f.nblocos {
+            inserir_no_bloco(&c, &f.blocos[b], b == 0)
+            b += 1
+        }
+        i += 1
+    }
+}
+
+test "perfil_nome_sem_chave_de_modulo" {
+    var prog = bir.BirPrograma{}
+    prog.simbolos = make([dynamic]bir.BirSimbolo, alloc = heap, cap = 4)
+    append(&prog.simbolos, item = bir.BirSimbolo{nome = "fj_main"})
+    var f = bir.BirFuncao{}
+    var saida: [64]u8 = {}
+    otim_perfil_nome(&prog, &f, saida[..], 64)
+    let texto: str = from_bytes(saida[0..<common.c2f_strlen_b(saida[..])], alloc = heap)
+    expect(texto == "main")
+    delete(texto)
+    delete(prog.simbolos)
+}
+
+test "perfil_insere_entrada_e_saidas" {
+    var prog = bir.BirPrograma{}
+    var c = PerfilCtx{programa = &prog, instrumenta = true, id = 3, entrar = 5, sair = 6, finalizar = 7, proc_sair = 8}
+    var b = bir.BirBloco{}
+    b.instrs = make([dynamic]bir.BirInstr, alloc = heap, cap = 4)
+    append(&b.instrs, item = bir.BirInstr{op = (bir.BIR_CHAMA as u8), simbolo = 8, pos = 1})
+    append(&b.instrs, item = bir.BirInstr{op = (bir.BIR_RETORNA as u8), pos = 2})
+    b.n = 2
+    inserir_no_bloco(&c, &b, true)
+    expect(b.n == 5)
+    expect(b.instrs[0].simbolo == 5)
+    expect(b.instrs[0].nargs == 1)
+    expect(b.instrs[1].simbolo == 7)
+    expect(b.instrs[2].simbolo == 8)
+    expect(b.instrs[3].simbolo == 6)
+    expect(b.instrs[3].nargs == 1)
+    expect(b.instrs[4].op == (bir.BIR_RETORNA as u8))
+    expect(b.instrs[4].pos == 2)
+    delete(b.instrs)
+    common.arena_liberar(&prog.arena)
+}

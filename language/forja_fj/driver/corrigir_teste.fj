@@ -1,0 +1,147 @@
+// driver/corrigir_teste.fj - testes do porte de driver\{json_leitor, corrigir_diag, cmd_corrigir}.c (G3, V5-C); so blocos test, entradas pequenas em memoria, sem arquivo no disco.
+// Versao: 0.1.0
+// Changelog: 0.1.0 - V5-C: parser JSON, caminho, etapa, leitura de diagnosticos, argumentos e motivo da piora; saidas conferidas contra o C.
+
+import "common"
+
+proc json_de_texto(a: ^common.Arena, t: str) -> ?^JsonValor {
+    return json_ler(a, t, len(t) as u64)
+}
+
+test "json_ler_objeto_numero_texto" {
+    var a = common.Arena{}
+    let v = json_de_texto(&a, "{\"a\": 1, \"b\": \"x\\ny\", \"c\": [true, false, null]}")
+    expect(v != none)
+    expect((v as ^JsonValor).tipo == JSON_OBJETO)
+    expect(json_numero_de(v, "a", 0) == 1)
+    expect((json_texto_de(v, "b") or_else "") == "x\ny")
+    expect(json_numero_de(v, "falta", 7) == 7)
+    expect(json_texto_de(v, "a") == none)
+    common.arena_liberar(&a)
+}
+
+test "json_ler_recusa_texto_torto" {
+    var a = common.Arena{}
+    expect(json_de_texto(&a, "[1,]") == none)
+    expect(json_de_texto(&a, "{\"a\" 1}") == none)
+    expect(json_de_texto(&a, "\"abc") == none)
+    expect(json_de_texto(&a, "1 2") == none)
+    expect(json_de_texto(&a, "truex") == none)
+    expect(json_de_texto(&a, "nul") == none)
+    expect(json_de_texto(&a, "\"a\tb\"") == none)
+    expect(json_de_texto(&a, "-") == none)
+    common.arena_liberar(&a)
+}
+
+test "json_ler_numeros_e_escapes" {
+    var a = common.Arena{}
+    let n1 = json_de_texto(&a, "-12")
+    expect(n1 != none)
+    expect((n1 as ^JsonValor).numero == -12)
+    let n2 = json_de_texto(&a, "1.5e3")
+    expect((n2 as ^JsonValor).numero == 1)
+    let n3 = json_de_texto(&a, "007")
+    expect((n3 as ^JsonValor).numero == 7)
+    let s1 = json_de_texto(&a, "\"\\u00e9\"")
+    expect(s1 != none)
+    let b1 = as_bytes((s1 as ^JsonValor).texto or_else "")
+    expect(len(b1) == 2)
+    expect(b1[0] == 195)
+    expect(b1[1] == 169)
+    let s2 = json_de_texto(&a, "\"\\ud83d\\ude00\"")
+    expect(s2 != none)
+    let b2 = as_bytes((s2 as ^JsonValor).texto or_else "")
+    expect(len(b2) == 4)
+    expect(b2[0] == 240)
+    expect(b2[3] == 128)
+    let s3 = json_de_texto(&a, "\"\\u07ff\"")
+    let b3 = as_bytes((s3 as ^JsonValor).texto or_else "")
+    expect(len(b3) == 2)
+    expect(b3[0] == 223)
+    expect(b3[1] == 191)
+    let s4 = json_de_texto(&a, "\"\\u0800\"")
+    let b4 = as_bytes((s4 as ^JsonValor).texto or_else "")
+    expect(len(b4) == 3)
+    expect(b4[0] == 224)
+    expect(b4[2] == 128)
+    expect(json_de_texto(&a, "\"\\udc00\"") == none)
+    expect(json_de_texto(&a, "\"\\ud83d\"") == none)
+    common.arena_liberar(&a)
+}
+
+test "corrigir_mesmo_caminho_e_etapa" {
+    expect(corrigir_mesmo_caminho("C:\\a\\B.fj", "c:/a/b.fj"))
+    expect(not corrigir_mesmo_caminho("a", "ab"))
+    expect(not corrigir_mesmo_caminho("a/b", "a/b/"))
+    expect(etapa_do_codigo(as_bytes("E0101")) == 0)
+    expect(etapa_do_codigo(as_bytes("E0707")) == 1)
+    expect(etapa_do_codigo(as_bytes("R0009")) == 2)
+    expect(etapa_do_codigo(as_bytes("E")) == 1)
+    expect(etapa_do_codigo(as_bytes("")) == 2)
+}
+
+test "ler_argumentos_uso" {
+    var p = Pedido{}
+    var argv: [4]str = {"--aplicar", "--codigo", "E0202", "a.fj"}
+    expect(ler_argumentos(4, argv[..], &p) == none)
+    expect(p.aplicar)
+    expect((p.codigo or_else "") == "E0202")
+    expect((p.arquivo or_else "") == "a.fj")
+    var q = Pedido{}
+    var v2: [1]str = {"-x"}
+    expect((ler_argumentos(1, v2[..], &q) or_else "") == "opcao desconhecida")
+    var r = Pedido{}
+    var v3: [2]str = {"a.fj", "b.fj"}
+    expect((ler_argumentos(2, v3[..], &r) or_else "") == "so um arquivo por vez")
+    var s = Pedido{}
+    var v4: [1]str = {"x"}
+    expect((ler_argumentos(0, v4[..], &s) or_else "") == "falta o arquivo .fj")
+    var t = Pedido{}
+    var v5: [1]str = {""}
+    expect(ler_argumentos(1, v5[..], &t) == none)
+    expect((t.arquivo or_else "x") == "")
+}
+
+test "ler_diagnosticos_linhas" {
+    var a = common.Arena{}
+    var r = ResultadoCheck{}
+    let texto: str = "{\"codigo\": \"E0202\", \"arquivo\": \"a.fj\", \"linha\": 3, \"coluna\": 4, \"confianca\": \"certa\", \"sugestao\": \"x\", \"id\": \"i1\", \"correcao\": [{\"arquivo\": \"a.fj\", \"linha\": 3, \"coluna\": 4, \"coluna_fim\": 5, \"linha_fim\": 3, \"antigo\": \"a\", \"novo\": \"b\"}]}\n{\"sem\": 1}\nnao e json\n"
+    ler_diagnosticos(&a, "a.fj", texto, len(texto) as u64, &r)
+    expect(r.n == 1)
+    let itens = r.itens or_else {}
+    expect((itens[0].codigo or_else "") == "E0202")
+    expect(itens[0].linha == 3)
+    expect(itens[0].nedicoes == 1)
+    expect(itens[0].edicoes_no_alvo)
+    expect((itens[0].confianca or_else "") == "certa")
+    expect(corrigir_tem_codigo(&r, "E0202"))
+    expect(not corrigir_tem_codigo(&r, "E0101"))
+    common.arena_liberar(&a)
+}
+
+test "motivo_da_piora_subiu_e_etapa" {
+    var a = common.Arena{}
+    var antes = ResultadoCheck{}
+    var lista_antes = arena_fatia_diag_lido(&a, 1)
+    lista_antes[0].codigo = "R0001"
+    antes.itens = lista_antes
+    antes.n = 1
+    var sel = Selecao{}
+    var depois = ResultadoCheck{}
+    var lista_depois = arena_fatia_diag_lido(&a, 2)
+    lista_depois[0].codigo = "R0001"
+    lista_depois[0].linha = 1
+    lista_depois[1].codigo = "E0101"
+    lista_depois[1].linha = 9
+    depois.itens = lista_depois
+    depois.n = 2
+    expect((motivo_da_piora(&a, &sel, &antes, &depois) or_else "") == "o numero de erros subiu de 1 para 2")
+    var so_um = ResultadoCheck{}
+    so_um.itens = lista_depois
+    so_um.n = 1
+    lista_depois[0].codigo = "E0101"
+    expect((motivo_da_piora(&a, &sel, &antes, &so_um) or_else "") == "apareceu erro de etapa anterior: E0101 na linha 1")
+    lista_depois[0].codigo = "R0001"
+    expect(motivo_da_piora(&a, &sel, &antes, &so_um) == none)
+    common.arena_liberar(&a)
+}

@@ -1,0 +1,270 @@
+// nativo/x64/x64_gerar.fj - porte de compiler/nativo/x64/x64_gerar.c, compiler/nativo/x64/x64_gerar.h
+// sha256 de nativo/x64/x64_gerar.c: 9262958c2c5d3982043bef0085bac49ddbf8034c652c48bee8ec0611d6bd6e8c
+// sha256 de nativo/x64/x64_gerar.h: a104c98949e5d574fc023ec92fa499c862c94e82db79cf6210202cca0ecad9be
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "common"
+import "nativo/bir"
+import "nativo/dbg"
+import "nativo/obj"
+
+const FATIA_REGS: i32 = 0
+const FATIA_ISEL: i32 = 1
+const FATIA_CODIFICAR: i32 = 2
+const GERAR_NOME_TEXTO: i32 = 24
+
+// C: nativo/x64/x64_gerar.c:36
+proc fatiar(c: ^X64Ctx, fatia: i32) {
+    var agora: u64 = 0
+    let t: ?^AlvoTempos = c.tempos
+    if t == none {
+        return
+    }
+    agora = common.relogio_ns()
+    if common.c2f_s2u_32(fatia) == (FATIA_REGS as u32) {
+        let ptr_1: ^AlvoTempos = t as ^AlvoTempos
+        ptr_1.regs_ns += agora - c.marca
+    } else if common.c2f_s2u_32(fatia) == (FATIA_ISEL as u32) {
+        let ptr_2: ^AlvoTempos = t as ^AlvoTempos
+        ptr_2.isel_ns += agora - c.marca
+    } else {
+        let ptr_3: ^AlvoTempos = t as ^AlvoTempos
+        ptr_3.codificar_ns += agora - c.marca
+    }
+    c.marca = agora
+}
+
+// C: nativo/x64/x64_gerar.c:54
+proc gerar_bloco(c: ^X64Ctx, bloco: ^bir.BirBloco) -> bool {
+    var k: u32 = 0
+    while k < bloco.n {
+        var consumidas: i32 = 0
+        if c.dbg != none {
+            let arg_1: u32 = bloco.instrs[k].pos
+            let arg_2: u32 = x64_offset(c)
+            let arg_3: ?^dbg.DbgPrograma = c.dbg
+            dbg.dbg_linha_vista(arg_3, arg_2, arg_1)
+        }
+        if (c.f as ^bir.BirFuncao).isel_otim {
+            consumidas = isel_otim_tentar(c, bloco, k)
+        }
+        if consumidas < 0 {
+            return false
+        }
+        if consumidas > 0 {
+            k += common.c2f_s2u_32(consumidas) - 1
+            k += 1
+            continue
+        }
+        c.instr_idx = k as int
+        if not x64_selecionar(c, &bloco.instrs[k]) {
+            return false
+        }
+        k += 1
+    }
+    return true
+}
+
+// C: nativo/x64/x64_gerar.c:75
+proc gerar_corpo(c: ^X64Ctx) -> bool {
+    let f = c.f as ^bir.BirFuncao
+    c.pos_ordem = 0
+    while c.pos_ordem < c.nordem {
+        let bloco: u32 = (c.ordem or_else {})[c.pos_ordem]
+        var bo_off: []u32 = c.bloco_off or_else {}
+        bo_off[bloco] = x64_offset(c)
+        c.instr = c.instr[0..<0]
+        c.instr_idx = 0
+        if bloco == f.nblocos {
+            c.origem = ORIGEM_EPILOGO as u8
+            if not quadro_epilogo(c) {
+                return false
+            }
+        } else {
+            c.origem = ORIGEM_CODIGO as u8
+            if f.blocos[bloco].frio {
+                c.origem = ORIGEM_FRIO as u8
+            }
+            if not gerar_bloco(c, &f.blocos[bloco]) {
+                return false
+            }
+        }
+        c.pos_ordem += 1
+    }
+    return true
+}
+
+// C: nativo/x64/x64_gerar.c:95
+proc gerar_codigo(c: ^X64Ctx) -> bool {
+    c.instr = c.instr[0..<0]
+    c.origem = ORIGEM_PROLOGO as u8
+    if not aloc_classes_suportadas(c) {
+        return false
+    }
+    fatiar(c, FATIA_REGS)
+    if not quadro_prologo(c) {
+        return false
+    }
+    if not gerar_corpo(c) {
+        return false
+    }
+    fatiar(c, FATIA_ISEL)
+    x64_corrigir_saltos(c)
+    x64_unwind_registrar(c)
+    if c.dbg != none {
+        dbg.dbg_proc_fechar(c.dbg, x64_offset(c))
+    }
+    x64_padding(c)
+    return true
+}
+
+// C: nativo/x64/x64_gerar.c:114
+proc gerar_funcao(c: ^X64Ctx, f: ^bir.BirFuncao) -> bool {
+    var arena = common.Arena{}
+    c.f = f
+    c.usos = common.arena_fatia_u8(&arena, 0)
+    c.defs = common.arena_fatia_u8(&arena, 0)
+    if f.isel_otim {
+        c.usos = common.arena_fatia_u8(&arena, (f.nvregs + 1) as int)
+        c.defs = common.arena_fatia_u8(&arena, (f.nvregs + 1) as int)
+        isel_otim_contar_usos(f, c.usos, c.defs)
+    }
+    c.quadro = quadro_calcular(c.p as ^bir.BirPrograma, f)
+    let slot_off = common.arena_fatia_u32(&arena, (f.nslots + 1) as int)
+    _ = quadro_posicionar_slots(f, slot_off)
+    c.slot_off = slot_off
+    c.nordem = f.nblocos + 1
+    c.ordem = common.arena_fatia_u32(&arena, c.nordem as int)
+    c.bloco_off = common.arena_fatia_u32(&arena, (c.nordem + 1) as int)
+    c.cls = arena_fatia_abi_arg(&arena, (c.quadro.maxargs + 1) as int)
+    c.abi = arena_fatia_abi_local(&arena, (c.quadro.maxargs + 1) as int)
+    quadro_ordenar(f, c.ordem or_else {})
+    c.saltos = make([dynamic]SaltoLocal, alloc = heap, cap = 16)
+    c.inicio = x64_offset(c)
+    let nome = (c.p as ^bir.BirPrograma).simbolos[f.simbolo as u64].nome
+    c.func_sim = obj.obj_simbolo_definir(c.o as ^obj.Objeto, nome, c.texto as i32, c.inicio)
+    if c.dbg != none {
+        var abertura = dbg.DbgAbertura{simbolo = nome, inicio = c.inicio, quadro = c.quadro.tam}
+        dbg.dbg_proc_abrir(c.dbg as ^dbg.DbgPrograma, f, &abertura)
+        x64_dbg_locais(c)
+    }
+    if c.lista != none {
+        x64_listar_funcao(c)
+    }
+    let ok = gerar_codigo(c)
+    delete(c.saltos)
+    common.arena_liberar(&arena)
+    fatiar(c, FATIA_CODIFICAR)
+    return ok
+}
+
+// C: nativo/x64/x64_gerar.c:158
+proc alinhamento_do_rdata(p: ^bir.BirPrograma) -> u32 {
+    var maior: u32 = 1
+    for k in (0 as u32)..<p.nsimbolos {
+        if (p.simbolos[k].tipo == (bir.BS_DADO as u8)) and (p.simbolos[k].alinhamento > maior) {
+            maior = p.simbolos[k].alinhamento
+        }
+    }
+    return maior
+}
+
+// C: nativo/x64/x64_gerar.c:170
+proc definir_em_rdata(o: ^obj.Objeto, rdata: u32, s: ^bir.BirSimbolo) -> u32 {
+    let dados: ^obj.ObjSecao = &o.secoes[rdata as u64]
+    let eh_dado: bool = s.tipo == (bir.BS_DADO as u8)
+    if eh_dado {
+        while (len(dados.bytes) as u64) % (s.alinhamento as u64) != 0 {
+            append(&dados.bytes, item = (0 as u8))
+        }
+    }
+    let off = len(dados.bytes) as u32
+    var nome: str = ""
+    if eh_dado {
+        nome = format(f".d{s.ordem}", alloc = frame)
+    } else {
+        nome = format(f".s{s.ordem}", alloc = frame)
+    }
+    let bs = as_bytes(s.bytes or_else "")
+    for k in 0..<(s.tam as int) {
+        append(&dados.bytes, item = bs[k])
+    }
+    if s.tipo == (bir.BS_TEXTO as u8) {
+        append(&dados.bytes, item = (0 as u8))
+    }
+    return obj.obj_simbolo_definir(o, nome, rdata as i32, off)
+}
+
+// C: nativo/x64/x64_gerar.c:187
+// C2F-INDECIDIVEL: obj_sim
+proc definir_simbolos(p: ^bir.BirPrograma, o: ^obj.Objeto, obj_sim: []u32) {
+    var rdata: u32 = 0
+    var tem_rdata: bool = false
+    var k: u32 = 0
+    while k < p.nsimbolos {
+        let s: ^bir.BirSimbolo = &p.simbolos[k]
+        if (s.tipo != (bir.BS_TEXTO as u8)) and (s.tipo != (bir.BS_DADO as u8)) {
+            obj_sim[k] = obj.obj_simbolo_referir(o, s.nome)
+            k += 1
+            continue
+        }
+        if not tem_rdata {
+            rdata = obj.obj_secao_abrir(o, ".rdata", obj.OS_RDATA, alinhamento_do_rdata(p))
+        }
+        tem_rdata = true
+        obj_sim[k] = definir_em_rdata(o, rdata, s)
+        k += 1
+    }
+}
+
+// C: nativo/x64/x64_gerar.c:207
+proc iniciar_colheita(c: ^X64Ctx, colheita: ?^AlvoColheita) {
+    if colheita == none {
+        return
+    }
+    c.lista = (colheita as ^AlvoColheita).lista
+    c.tempos = (colheita as ^AlvoColheita).tempos
+    c.dbg = (colheita as ^AlvoColheita).dbg
+    c.rastreio = (common.c2f_b2i32((colheita as ^AlvoColheita).rastreio) != 0) and ((colheita as ^AlvoColheita).dbg != none)
+    c.guarda = (colheita as ^AlvoColheita).guarda
+    if c.tempos != none {
+        c.marca = common.relogio_ns()
+    }
+}
+
+// C: nativo/x64/x64_gerar.c:220
+pub proc x64_gerar(programa: ^bir.BirPrograma, o: ^obj.Objeto, erro: ^common.Diag, colheita: ^AlvoColheita) -> bool {
+    var arena = common.Arena{}
+    var c: X64Ctx = X64Ctx{p = programa, o = o, erro = erro}
+    let tabela_formas = FORMAS_X64
+    var formas = make([dynamic]FormaX64, alloc = heap, cap = 137)
+    defer delete(formas)
+    for k in 0..<137 {
+        append(&formas, item = tabela_formas[k])
+    }
+    c.formas = formas[..]
+    let obj_sim = common.arena_fatia_u32(&arena, (programa.nsimbolos + 1) as int)
+    var ok: bool = true
+    iniciar_colheita(&c, colheita)
+    c.texto = obj.obj_secao_abrir(o, ".text", obj.OS_TEXTO, X64_ALINHAMENTO_FUNCAO)
+    c.pdata = obj.obj_secao_abrir(o, ".pdata", obj.OS_PDATA, X64_ALINHAMENTO_UNWIND)
+    c.xdata = obj.obj_secao_abrir(o, ".xdata", obj.OS_XDATA, X64_ALINHAMENTO_UNWIND)
+    c.sim_xdata = obj.obj_simbolo_definir(o, ".unwind", c.xdata as i32, 0)
+    definir_simbolos(programa, o, obj_sim)
+    c.obj_sim = obj_sim
+    fatiar(&c, FATIA_CODIFICAR)
+    var k: u32 = 0
+    while ok and (k < programa.nfuncoes) {
+        ok = gerar_funcao(&c, &(programa.funcoes or_else {})[k])
+        k += 1
+    }
+    if ok and (programa.nentradas_sysv != 0) {
+        ok = x64_gerar_entradas_sysv(&c)
+    }
+    if ok and c.rastreio {
+        x64_rastro_fechar(&c)
+    }
+    common.arena_liberar(&arena)
+    return ok
+}

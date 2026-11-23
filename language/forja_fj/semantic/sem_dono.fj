@@ -1,0 +1,563 @@
+// semantic/sem_dono.fj - porte de compiler/semantic/sem_dono.c
+// sha256 de semantic/sem_dono.c: b0484cff7d6c113250d6813c3aedffb7d06533b3983d430c31b958e4b8fcc6d6
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "common"
+
+struct Cena {
+    onde: ?str
+    linha: ?str
+    trecho: ?str
+    lista: bool
+}
+
+const TRECHO: i32 = 80
+const ONDE: i32 = 160
+const TEXTO_LOCAL: i32 = 1024
+const ONDE_QUALQUER: i32 = 0
+const ONDE_RETURN: i32 = 1
+const ONDE_ITEM: i32 = 2
+
+// C: semantic/sem_dono.c:25
+proc char_de_nome_2(c: u8) -> bool {
+    return char_de_nome(c) // isalnum((unsigned char)c) || c == '_'
+}
+
+// C: semantic/sem_dono.c:30
+proc espaco(c: u8) -> bool {
+    return (c == 32) or (c == 9) // ' ' '\t'
+}
+
+// C: semantic/sem_dono.c:35
+// Cena (char[] no C) guarda cada campo como str de frame, ja cortado no tamanho do buffer do C (cap - 1)
+proc montar_cena(s: ^Semantica, pos: u32, tipo: u32, c: ^Cena) {
+    var onde: [160]u8 = {}
+    var linha: [80]u8 = {}
+    var trecho: [80]u8 = {}
+    common.diag_descrever_onde(s.fonte, pos, onde[..], ONDE as u64)
+    sem_linha_do_fonte(s, pos, linha[..])
+    sem_trecho_do_fonte(s, pos, false, trecho[..])
+    c.onde = str_do_buffer(onde[..])
+    c.linha = str_do_buffer(linha[..])
+    c.trecho = str_do_buffer(trecho[..])
+    c.lista = tipo_classe_de(&s.tipos, tipo) == TC_DINAMICO
+}
+
+// C: semantic/sem_dono.c:44
+proc abrir(s: ^Semantica, confianca: i32, texto: str) -> bool {
+    let msg_1 = format(f"{texto}", alloc = heap)
+    defer delete(msg_1)
+    return common.diag_sugerir(&(s.diag as ^common.Diag).sug, confianca, msg_1)
+}
+
+// C: semantic/sem_dono.c:50
+proc editar(s: ^Semantica, ini: u32, fim: u32, novo: str) {
+    let aberta: ^common.DiagSugestao = &(s.diag as ^common.Diag).sug.itens[((s.diag as ^common.Diag).sug.n as i32) - 1]
+    if common.diag_editar(&(s.diag as ^common.Diag).sug, ini, fim, novo) {
+        return
+    }
+    aberta.confianca = common.DIAG_SO_DICA as u8
+    aberta.nedicoes = 0
+}
+
+// C: semantic/sem_dono.c:64
+// G3 S7: t passou de ?str para []u8 (o texto da Fonte e []u8; o chamador e so este arquivo)
+proc onde_da_copia_em(t: []u8, pos: u32) -> i32 {
+    var i: u32 = pos
+    while (i > 0) and espaco(t[i - 1]) {
+        i -= 1
+    }
+    if (i >= 6) and palavra_antes(t, i, "return") and ((i == 6) or (not char_de_nome_2(t[i - 7]))) {
+        return ONDE_RETURN
+    }
+    if (i == 0) or (t[i - 1] != 61) { // '='
+        return ONDE_QUALQUER
+    }
+    i -= 1
+    while (i > 0) and espaco(t[i - 1]) {
+        i -= 1
+    }
+    if (i >= 4) and palavra_antes(t, i, "item") and ((i == 4) or (not char_de_nome_2(t[i - 5]))) {
+        return ONDE_ITEM
+    }
+    return ONDE_QUALQUER
+}
+
+// G3 S7 (sem par no C): strncmp(t + i - len(palavra), palavra, len(palavra)) == 0; o chamador garante i >= len(palavra)
+proc palavra_antes(t: []u8, i: u32, palavra: str) -> bool {
+    let n: u32 = len(palavra) as u32
+    for k in 0..<len(palavra) {
+        if t[(i - n) as int + k] != palavra[k] {
+            return false
+        }
+    }
+    return true
+}
+
+// C: semantic/sem_dono.c:76
+proc forma_do_return(s: ^Semantica, c: ^Cena) {
+    let onde: str = c.onde or_else ""
+    let linha: str = c.linha or_else ""
+    let trecho: str = c.trecho or_else ""
+    let explicacao = format(f"Na {onde} o return da linha '{linha}' devolve '{trecho}', que e dono: so um local se move para fora, e devolver um campo ou elemento copiaria o dono (duas donas da mesma memoria).", alloc = heap)
+    defer delete(explicacao)
+    var forma: str = ""
+    var dica: str = ""
+    if c.lista {
+        let t24 = common.c2f_cortar(trecho, 24) // %.24s
+        defer delete(t24)
+        forma = format(f"Devolva uma fatia emprestada: troque o retorno do proc por []T e escreva return {trecho}[..] na linha '{linha}' (ou receba um ^[dynamic]T e preencha por ele).", alloc = frame)
+        dica = format(f"devolva {t24}[..] com o retorno do proc como []T (empresta), ou receba ^[dynamic]T e preencha", alloc = frame)
+    } else {
+        let t30 = common.c2f_cortar(trecho, 30) // %.30s
+        defer delete(t30)
+        forma = format(f"Receba um ponteiro para o dono (^T) e preencha ou leia por ele em vez de devolver '{trecho}' na linha '{linha}'.", alloc = frame)
+        dica = format(f"receba ^T e escreva por ele em vez de devolver {t30} (um dono so se move de um local)", alloc = frame)
+    }
+    common.diag_forma(s.diag as ^common.Diag, explicacao, forma)
+    _ = abrir(s, common.DIAG_SO_DICA, dica)
+}
+
+// C: semantic/sem_dono.c:95
+proc forma_do_item(s: ^Semantica, c: ^Cena) {
+    let onde: str = c.onde or_else ""
+    let linha: str = c.linha or_else ""
+    let trecho: str = c.trecho or_else ""
+    let t30 = common.c2f_cortar(trecho, 30) // %.30s
+    defer delete(t30)
+    let explicacao = format(f"Na {onde} o append da linha '{linha}' passa '{trecho}' como item, mas '{trecho}' ja e dono: copiar criaria duas donas da mesma memoria.", alloc = heap)
+    defer delete(explicacao)
+    let forma = format(f"Passe um valor novo no item da linha '{linha}' (make(...)) ou guarde fatias: declare a lista de fora de []T e escreva item = {trecho}[..].", alloc = heap)
+    defer delete(forma)
+    let dica = format(f"o item precisa ser valor novo ou fatia: guarde []T e passe {t30}[..]", alloc = heap)
+    defer delete(dica)
+    common.diag_forma(s.diag as ^common.Diag, explicacao, forma)
+    _ = abrir(s, common.DIAG_SO_DICA, dica)
+}
+
+// C: semantic/sem_dono.c:107
+proc forma_da_copia(s: ^Semantica, c: ^Cena) {
+    let onde: str = c.onde or_else ""
+    let linha: str = c.linha or_else ""
+    let trecho: str = c.trecho or_else ""
+    let explicacao = format(f"Na {onde} a linha '{linha}' copia '{trecho}', que e dono (lista, map, soa ou struct com lista): copiar criaria duas donas da mesma memoria.", alloc = heap)
+    defer delete(explicacao)
+    if c.lista {
+        let forma = format(f"Empreste em vez de copiar na linha '{linha}': escreva &{trecho} (o nome novo vira ponteiro; use ^ para ler) ou {trecho}[..] (fatia que le e altera os elementos).", alloc = heap)
+        defer delete(forma)
+        common.diag_forma(s.diag as ^common.Diag, explicacao, forma)
+    } else {
+        let forma = format(f"Empreste em vez de copiar na linha '{linha}': escreva &{trecho} (o nome novo vira ponteiro; use ^ ou .campo para ler e alterar).", alloc = heap)
+        defer delete(forma)
+        common.diag_forma(s.diag as ^common.Diag, explicacao, forma)
+    }
+}
+
+// C: semantic/sem_dono.c:124
+proc caso_da_copia(s: ^Semantica, pos: u32, tipo: u32) {
+    var c: Cena = Cena{}
+    let onde: i32 = onde_da_copia_em((s.fonte as ^common.Fonte).texto, pos)
+    montar_cena(s, pos, tipo, &c)
+    if onde == ONDE_RETURN {
+        forma_do_return(s, &c)
+    } else if (onde == ONDE_ITEM) and c.lista {
+        forma_do_item(s, &c)
+    } else {
+        forma_da_copia(s, &c)
+    }
+}
+
+// C: semantic/sem_dono.c:138
+proc nome_do_item_seguido_de_in(t: []u8, pos: u32, ini: ^u32, fim: ^u32) -> bool {
+    var i: u32 = pos
+    while espaco(t[i]) {
+        i += 1
+    }
+    ini^ = i
+    while char_de_nome_2(t[i]) {
+        i += 1
+    }
+    fim^ = i
+    while espaco(t[i]) {
+        i += 1
+    }
+    return (((fim^ > ini^) and (t[i] == 105)) and (t[i + 1] == 110)) and (not char_de_nome_2(t[i + 2])) // 'i' 'n'
+}
+
+// C: semantic/sem_dono.c:150
+proc caso_do_for(s: ^Semantica, pos: u32) {
+    var c: Cena = Cena{}
+    let t: []u8 = (s.fonte as ^common.Fonte).texto
+    var ini: u32 = 0
+    var fim: u32 = 0
+    let simples: bool = nome_do_item_seguido_de_in(t, pos, &ini, &fim)
+    var nome: str = ""
+    montar_cena(s, pos, TIPO_VAZIO as u32, &c)
+    let onde: str = c.onde or_else ""
+    let linha: str = c.linha or_else ""
+    let explicacao = format(f"Na {onde} o for da linha '{linha}' copia cada elemento, e cada elemento e uma lista (dono): copiar criaria varias donas da mesma memoria.", alloc = heap)
+    defer delete(explicacao)
+    if simples and ((fim - ini) < (TRECHO as u32)) {
+        nome = from_bytes(t[(ini as int)..<(fim as int)], alloc = frame) // %.*s de fim - ini bytes
+    }
+    var forma: str = ""
+    var dica: str = ""
+    if len(nome) > 0 {
+        forma = format(f"Escreva & antes do nome do item na linha '{linha}': for &{nome} in ...; o item vira ponteiro (use {nome}^ ou {nome}.campo no corpo).", alloc = frame)
+        dica = format(f"escreva for &{nome} in ...: o item vira ponteiro (use {nome}^ no corpo)", alloc = frame)
+    } else {
+        forma = format(f"Empreste o item na linha '{linha}': escreva & antes do nome do item (a forma for &item in ...), que vira ponteiro.", alloc = frame)
+        dica = "escreva & antes do nome do item no for: o item vira ponteiro"
+    }
+    common.diag_forma(s.diag as ^common.Diag, explicacao, forma)
+    var confianca: i32 = common.DIAG_SO_DICA
+    if len(nome) > 0 {
+        confianca = common.DIAG_PROVAVEL
+    }
+    if (not abrir(s, confianca, dica)) or (len(nome) == 0) {
+        return
+    }
+    editar(s, ini, ini, "&")
+}
+
+// C: semantic/sem_dono.c:174
+proc caso_do_parametro(s: ^Semantica, pos: u32) {
+    var c: Cena = Cena{}
+    montar_cena(s, pos, TIPO_VAZIO as u32, &c)
+    let onde: str = c.onde or_else ""
+    let linha: str = c.linha or_else ""
+    let trecho: str = c.trecho or_else ""
+    var sufixo: str = "T"
+    if common.c2f_prefixo_igual(trecho, "[dynamic]", 9) {
+        sufixo = trecho[9..<len(trecho)]
+    }
+    let fatia_inteira = format(f"[]{sufixo}", alloc = heap)
+    defer delete(fatia_inteira)
+    let fatia = common.c2f_cortar(fatia_inteira, 79) // char fatia[TRECHO]
+    defer delete(fatia)
+    let t20 = common.c2f_cortar(trecho, 20) // %.20s
+    defer delete(t20)
+    let f20 = common.c2f_cortar(fatia, 20)
+    defer delete(f20)
+    let explicacao = format(f"Na {onde} o parametro da linha '{linha}' recebe '{trecho}' por valor, o que copiaria a lista: parametro nao recebe lista por valor.", alloc = heap)
+    defer delete(explicacao)
+    let forma = format(f"Troque '{trecho}' por ^{trecho} (o proc altera a lista; chame com &lista) ou por {fatia} (o proc le e altera os elementos; chame com lista[..]).", alloc = heap)
+    defer delete(forma)
+    let dica = format(f"troque o tipo por ^{t20} (altera a lista; chame f(&l)) ou {f20} (le; chame f(l[..]))", alloc = heap)
+    defer delete(dica)
+    common.diag_forma(s.diag as ^common.Diag, explicacao, forma)
+    _ = abrir(s, common.DIAG_SO_DICA, dica)
+}
+
+// C: semantic/sem_dono.c:191
+// G3 S7: t passou de ?str para []u8 (o texto da Fonte e []u8; o chamador e so este arquivo)
+proc fim_do_tipo_do_campo(t: []u8, pos: u32) -> u32 {
+    var i: u32 = pos
+    while (i > 0) and espaco(t[i - 1]) {
+        i -= 1
+    }
+    if (i == 0) or (t[i - 1] != 61) { // '='
+        return 0
+    }
+    i -= 1
+    while (i > 0) and espaco(t[i - 1]) {
+        i -= 1
+    }
+    return i
+}
+
+// C: semantic/sem_dono.c:203
+proc fim_do_padrao(t: []u8, pos: u32) -> u32 {
+    var fim: u32 = pos
+    var fundo: i32 = 0
+    var texto: bool = false
+    var i: u32 = pos
+    while ((t[i] != 0) and (t[i] != 10)) and (t[i] != 13) { // '\0' '\n' '\r'
+        let c: u8 = t[i]
+        if c == 34 { // '"'
+            texto = not texto
+        }
+        if (not texto) and (c == 47) and (t[i + 1] == 47) { // '/' '/'
+            break
+        }
+        if (not texto) and ((c == 40) or (c == 91) or (c == 123)) { // strchr("([{", c)
+            fundo += 1
+        }
+        if (not texto) and ((c == 41) or (c == 93) or (c == 125)) { // strchr(")]}", c)
+            fundo -= 1
+        }
+        if not espaco(c) {
+            fim = i + 1
+        }
+        i += 1
+    }
+    if (fundo == 0) and (not texto) {
+        return fim
+    }
+    return 0
+}
+
+// C: semantic/sem_dono.c:219
+proc caso_do_padrao(s: ^Semantica, pos: u32) {
+    var c: Cena = Cena{}
+    let t: []u8 = (s.fonte as ^common.Fonte).texto
+    let ini: u32 = fim_do_tipo_do_campo(t, pos)
+    let fim: u32 = fim_do_padrao(t, pos)
+    let cabe: bool = (ini > 0) and (fim > pos)
+    montar_cena(s, pos, TIPO_VAZIO as u32, &c)
+    let onde: str = c.onde or_else ""
+    let linha: str = c.linha or_else ""
+    let explicacao = format(f"Na {onde} o campo '{linha}' tem um padrao que aloca; um dono com padrao alocaria escondido a cada literal da struct.", alloc = heap)
+    defer delete(explicacao)
+    let forma = format(f"Tire o padrao da linha '{linha}' (a lista nasce vazia, sem alocador) e escreva o campo = make(...) em cada literal que cria a struct.", alloc = heap)
+    defer delete(forma)
+    common.diag_forma(s.diag as ^common.Diag, explicacao, forma)
+    var confianca: i32 = common.DIAG_SO_DICA
+    if cabe {
+        confianca = common.DIAG_PROVAVEL
+    }
+    if (not abrir(s, confianca, "tire o padrao do campo (a lista nasce vazia) e passe make(...) no campo de cada literal da struct")) or (not cabe) {
+        return
+    }
+    editar(s, ini, fim, "")
+}
+
+// C: semantic/sem_dono.c:234
+proc sem_forma_do_dono(s: ^Semantica, caso: i32, pos: u32, tipo: u32) {
+    if (not (s.diag as ^common.Diag).tem) or (common.c2f_s2u_32((s.diag as ^common.Diag).codigo) != (common.E0311 as u32)) {
+        return
+    }
+    let sw_1 = common.c2f_s2u_32(caso)
+    if sw_1 == (DONO_COPIA as u32) {
+        caso_da_copia(s, pos, tipo)
+    } else if sw_1 == (DONO_FOR as u32) {
+        caso_do_for(s, pos)
+    } else if sw_1 == (DONO_PARAMETRO as u32) {
+        caso_do_parametro(s, pos)
+    } else if sw_1 == (DONO_CAMPO_PADRAO as u32) {
+        caso_do_padrao(s, pos)
+    }
+}
+
+// G3 S7: leitura do fonte (onde da copia, nome do item do for, fim do tipo do campo, fim do padrao): posicoes calculadas a mao sobre o C
+test "sem_dono: onde da copia, item do for, fim do tipo e do padrao" {
+    var f1: common.Fonte = sem_allocator_teste_fonte("return x")
+    defer delete(f1.dono_texto)
+    expect(onde_da_copia_em(f1.texto, 7) == ONDE_RETURN and onde_da_copia_em(f1.texto, 0) == ONDE_QUALQUER and onde_da_copia_em(f1.texto, 6) == ONDE_RETURN)
+    var f2: common.Fonte = sem_allocator_teste_fonte("  return  x")
+    defer delete(f2.dono_texto)
+    expect(onde_da_copia_em(f2.texto, 10) == ONDE_RETURN)
+    var f3: common.Fonte = sem_allocator_teste_fonte("xreturn x")
+    defer delete(f3.dono_texto)
+    expect(onde_da_copia_em(f3.texto, 8) == ONDE_QUALQUER)
+    var f3b: common.Fonte = sem_allocator_teste_fonte("_return x")
+    defer delete(f3b.dono_texto)
+    expect(onde_da_copia_em(f3b.texto, 8) == ONDE_QUALQUER)
+    var f3c: common.Fonte = sem_allocator_teste_fonte("  return\tx")
+    defer delete(f3c.dono_texto)
+    expect(onde_da_copia_em(f3c.texto, 9) == ONDE_RETURN)
+    var f4: common.Fonte = sem_allocator_teste_fonte("append(&l, item = x)")
+    defer delete(f4.dono_texto)
+    expect(onde_da_copia_em(f4.texto, 18) == ONDE_ITEM)
+    var f5: common.Fonte = sem_allocator_teste_fonte("myitem = x")
+    defer delete(f5.dono_texto)
+    expect(onde_da_copia_em(f5.texto, 9) == ONDE_QUALQUER)
+    var f6: common.Fonte = sem_allocator_teste_fonte("item = x")
+    defer delete(f6.dono_texto)
+    expect(onde_da_copia_em(f6.texto, 7) == ONDE_ITEM)
+    var f7: common.Fonte = sem_allocator_teste_fonte("let r = f(x)")
+    defer delete(f7.dono_texto)
+    expect(onde_da_copia_em(f7.texto, 8) == ONDE_QUALQUER)
+    var f8: common.Fonte = sem_allocator_teste_fonte("i = x")
+    defer delete(f8.dono_texto)
+    expect(onde_da_copia_em(f8.texto, 4) == ONDE_QUALQUER)
+    // nome do item seguido de 'in'
+    var ini: u32 = 99
+    var fim: u32 = 99
+    var g1: common.Fonte = sem_allocator_teste_fonte("for  item in xs")
+    defer delete(g1.dono_texto)
+    expect(nome_do_item_seguido_de_in(g1.texto, 3, &ini, &fim) and ini == 5 and fim == 9)
+    var g2: common.Fonte = sem_allocator_teste_fonte("for i, v in xs")
+    defer delete(g2.dono_texto)
+    expect(not nome_do_item_seguido_de_in(g2.texto, 3, &ini, &fim) and ini == 4 and fim == 5)
+    var g3: common.Fonte = sem_allocator_teste_fonte("for index in xs")
+    defer delete(g3.dono_texto)
+    expect(nome_do_item_seguido_de_in(g3.texto, 3, &ini, &fim) and ini == 4 and fim == 9)
+    var g4: common.Fonte = sem_allocator_teste_fonte("for x inn y")
+    defer delete(g4.dono_texto)
+    expect(not nome_do_item_seguido_de_in(g4.texto, 3, &ini, &fim))
+    var g5: common.Fonte = sem_allocator_teste_fonte("for  in xs")
+    defer delete(g5.dono_texto)
+    expect(not nome_do_item_seguido_de_in(g5.texto, 3, &ini, &fim) and ini == 5 and fim == 7)
+    var g6: common.Fonte = sem_allocator_teste_fonte("for  (")
+    defer delete(g6.dono_texto)
+    expect(not nome_do_item_seguido_de_in(g6.texto, 3, &ini, &fim) and ini == fim)
+    var g7: common.Fonte = sem_allocator_teste_fonte("for a_1 in")
+    defer delete(g7.dono_texto)
+    expect(nome_do_item_seguido_de_in(g7.texto, 3, &ini, &fim) and ini == 4 and fim == 7)
+    // fim do tipo do campo
+    var h1: common.Fonte = sem_allocator_teste_fonte("x: [dynamic]int  =  make(1)")
+    defer delete(h1.dono_texto)
+    expect(fim_do_tipo_do_campo(h1.texto, 20) == 15 and fim_do_tipo_do_campo(h1.texto, 3) == 0 and fim_do_tipo_do_campo(h1.texto, 0) == 0)
+    var h2: common.Fonte = sem_allocator_teste_fonte("=x")
+    defer delete(h2.dono_texto)
+    expect(fim_do_tipo_do_campo(h2.texto, 1) == 0)
+    var h3: common.Fonte = sem_allocator_teste_fonte("a\t=\tx")
+    defer delete(h3.dono_texto)
+    expect(fim_do_tipo_do_campo(h3.texto, 3) == 1)
+    // fim do padrao
+    var p1: common.Fonte = sem_allocator_teste_fonte("campo: [dynamic]int = make(int, 4) // c")
+    defer delete(p1.dono_texto)
+    expect(fim_do_padrao(p1.texto, 22) == 34)
+    var p2: common.Fonte = sem_allocator_teste_fonte("f: [dynamic]int = make(int  ")
+    defer delete(p2.dono_texto)
+    expect(fim_do_padrao(p2.texto, 18) == 0)
+    var p3: common.Fonte = sem_allocator_teste_fonte("a = \"x//y\" // z")
+    defer delete(p3.dono_texto)
+    expect(fim_do_padrao(p3.texto, 4) == 10)
+    var p4: common.Fonte = sem_allocator_teste_fonte("a = [ 1, 2 ]   ")
+    defer delete(p4.dono_texto)
+    expect(fim_do_padrao(p4.texto, 4) == 12)
+    var p5: common.Fonte = sem_allocator_teste_fonte("a = (1")
+    defer delete(p5.dono_texto)
+    expect(fim_do_padrao(p5.texto, 4) == 0)
+    var p6: common.Fonte = sem_allocator_teste_fonte("a = \"abc")
+    defer delete(p6.dono_texto)
+    expect(fim_do_padrao(p6.texto, 4) == 0)
+    var p7: common.Fonte = sem_allocator_teste_fonte("a = ]")
+    defer delete(p7.dono_texto)
+    expect(fim_do_padrao(p7.texto, 4) == 0)
+    var p8: common.Fonte = sem_allocator_teste_fonte("a = {1}\nb")
+    defer delete(p8.dono_texto)
+    expect(fim_do_padrao(p8.texto, 4) == 7 and fim_do_padrao(p8.texto, 7) == 7)
+    expect(espaco(32) and espaco(9) and not espaco(10) and not espaco(97))
+    expect(char_de_nome_2(97) and char_de_nome_2(90) and char_de_nome_2(48) and char_de_nome_2(95) and not char_de_nome_2(45) and not char_de_nome_2(32) and not char_de_nome_2(0))
+}
+
+// G3 S7: texto exato (copiado do C) do ultimo diagnostico: explicacao e forma
+proc sem_dono_teste_forma(dg: ^common.Diag, explicacao: str, forma: str) -> bool {
+    return ((dg.explicacao or_else "") == explicacao) and ((dg.forma or_else "") == forma)
+}
+
+// G3 S7: um E0311 recem-aberto, como o SemErro o deixa antes de sem_forma_do_dono
+proc sem_dono_teste_novo(dg: ^common.Diag) {
+    dg^ = common.Diag{}
+    dg.tem = true
+    dg.codigo = common.E0311
+}
+
+// G3 S7: frases (explicacao, forma, dica) e edicoes de cada caso do E0311 com Semantica, Fonte e Diag montados a mao
+test "sem_dono: casos do E0311" {
+    var arena: common.Arena = common.Arena{}
+    var nomes: common.Interner = common.Interner{}
+    var dims: DimTabela = DimTabela{}
+    var dg: common.Diag = common.Diag{}
+    var sv: Semantica = Semantica{}
+    common.interner_iniciar(&nomes, &arena)
+    dim_iniciar(&dims)
+    sv.nomes = slice_from(&nomes, len = 1)
+    sv.arena = &arena
+    sv.diag = &dg
+    tipos_iniciar(&sv.tipos, &nomes, &dims)
+    let t_lista: u32 = tipo_dinamico(&sv.tipos, TIPO_INT as u32)
+    let t_int: u32 = TIPO_INT as u32
+    // fora do E0311 nada acontece
+    var f0: common.Fonte = sem_allocator_teste_fonte("  return v.itens\n")
+    defer delete(f0.dono_texto)
+    sv.fonte = &f0
+    dg = common.Diag{}
+    sem_forma_do_dono(&sv, DONO_COPIA, 9, t_int)
+    expect(not dg.tem and dg.forma == none and dg.sug.n == 0)
+    dg.tem = true
+    dg.codigo = common.E0310
+    sem_forma_do_dono(&sv, DONO_COPIA, 9, t_int)
+    expect(dg.forma == none and dg.sug.n == 0)
+    // return de campo dono: valor e lista
+    sem_dono_teste_novo(&dg)
+    sem_forma_do_dono(&sv, DONO_COPIA, 9, t_int)
+    expect(sem_dono_teste_forma(&dg, "Na linha 1, coluna 10 o return da linha 'return v.itens' devolve 'v.itens', que e dono: so um local se move para fora, e devolver um campo ou elemento copiaria o dono (duas donas da mesma memoria).", "Receba um ponteiro para o dono (^T) e preencha ou leia por ele em vez de devolver 'v.itens' na linha 'return v.itens'."))
+    expect(dg.sug.n == 1 and dg.sug.itens[0].confianca == (common.DIAG_SO_DICA as u8) and dg.sug.itens[0].nedicoes == 0 and (dg.sug.itens[0].descricao or_else "") == "receba ^T e escreva por ele em vez de devolver v.itens (um dono so se move de um local)")
+    sem_dono_teste_novo(&dg)
+    sem_forma_do_dono(&sv, DONO_COPIA, 9, t_lista)
+    expect(sem_dono_teste_forma(&dg, "Na linha 1, coluna 10 o return da linha 'return v.itens' devolve 'v.itens', que e dono: so um local se move para fora, e devolver um campo ou elemento copiaria o dono (duas donas da mesma memoria).", "Devolva uma fatia emprestada: troque o retorno do proc por []T e escreva return v.itens[..] na linha 'return v.itens' (ou receba um ^[dynamic]T e preencha por ele)."))
+    expect(dg.sug.n == 1 and (dg.sug.itens[0].descricao or_else "") == "devolva v.itens[..] com o retorno do proc como []T (empresta), ou receba ^[dynamic]T e preencha")
+    // item de append (so a lista) e copia simples
+    var f1: common.Fonte = sem_allocator_teste_fonte("  append(&l, item = xs)\n")
+    defer delete(f1.dono_texto)
+    sv.fonte = &f1
+    sem_dono_teste_novo(&dg)
+    sem_forma_do_dono(&sv, DONO_COPIA, 20, t_lista)
+    expect(sem_dono_teste_forma(&dg, "Na linha 1, coluna 21 o append da linha 'append(&l, item = xs)' passa 'xs' como item, mas 'xs' ja e dono: copiar criaria duas donas da mesma memoria.", "Passe um valor novo no item da linha 'append(&l, item = xs)' (make(...)) ou guarde fatias: declare a lista de fora de []T e escreva item = xs[..]."))
+    expect(dg.sug.n == 1 and dg.sug.itens[0].confianca == (common.DIAG_SO_DICA as u8) and (dg.sug.itens[0].descricao or_else "") == "o item precisa ser valor novo ou fatia: guarde []T e passe xs[..]")
+    sem_dono_teste_novo(&dg)
+    sem_forma_do_dono(&sv, DONO_COPIA, 20, t_int)
+    expect(sem_dono_teste_forma(&dg, "Na linha 1, coluna 21 a linha 'append(&l, item = xs)' copia 'xs', que e dono (lista, map, soa ou struct com lista): copiar criaria duas donas da mesma memoria.", "Empreste em vez de copiar na linha 'append(&l, item = xs)': escreva &xs (o nome novo vira ponteiro; use ^ ou .campo para ler e alterar)."))
+    expect(dg.sug.n == 0)
+    var f2: common.Fonte = sem_allocator_teste_fonte("  let b = a\n")
+    defer delete(f2.dono_texto)
+    sv.fonte = &f2
+    sem_dono_teste_novo(&dg)
+    sem_forma_do_dono(&sv, DONO_COPIA, 10, t_lista)
+    expect(sem_dono_teste_forma(&dg, "Na linha 1, coluna 11 a linha 'let b = a' copia 'a', que e dono (lista, map, soa ou struct com lista): copiar criaria duas donas da mesma memoria.", "Empreste em vez de copiar na linha 'let b = a': escreva &a (o nome novo vira ponteiro; use ^ para ler) ou a[..] (fatia que le e altera os elementos)."))
+    sem_dono_teste_novo(&dg)
+    sem_forma_do_dono(&sv, DONO_COPIA, 10, t_int)
+    expect(sem_dono_teste_forma(&dg, "Na linha 1, coluna 11 a linha 'let b = a' copia 'a', que e dono (lista, map, soa ou struct com lista): copiar criaria duas donas da mesma memoria.", "Empreste em vez de copiar na linha 'let b = a': escreva &a (o nome novo vira ponteiro; use ^ ou .campo para ler e alterar)."))
+    // for item sobre listas: com edicao (provavel) e sem nome simples (so dica)
+    var f3: common.Fonte = sem_allocator_teste_fonte("  for item in xs {\n")
+    defer delete(f3.dono_texto)
+    sv.fonte = &f3
+    sem_dono_teste_novo(&dg)
+    sem_forma_do_dono(&sv, DONO_FOR, 5, TIPO_VAZIO as u32)
+    expect(sem_dono_teste_forma(&dg, "Na linha 1, coluna 6 o for da linha 'for item in xs {' copia cada elemento, e cada elemento e uma lista (dono): copiar criaria varias donas da mesma memoria.", "Escreva & antes do nome do item na linha 'for item in xs {': for &item in ...; o item vira ponteiro (use item^ ou item.campo no corpo)."))
+    expect(dg.sug.n == 1 and dg.sug.itens[0].confianca == (common.DIAG_PROVAVEL as u8) and (dg.sug.itens[0].descricao or_else "") == "escreva for &item in ...: o item vira ponteiro (use item^ no corpo)")
+    expect(dg.sug.itens[0].nedicoes == 1 and dg.sug.itens[0].edicoes[0].ini == 6 and dg.sug.itens[0].edicoes[0].fim == 6 and (dg.sug.itens[0].edicoes[0].novo or_else "") == "&")
+    var f4: common.Fonte = sem_allocator_teste_fonte("  for i, v in xs {\n")
+    defer delete(f4.dono_texto)
+    sv.fonte = &f4
+    sem_dono_teste_novo(&dg)
+    sem_forma_do_dono(&sv, DONO_FOR, 5, TIPO_VAZIO as u32)
+    expect(sem_dono_teste_forma(&dg, "Na linha 1, coluna 6 o for da linha 'for i, v in xs {' copia cada elemento, e cada elemento e uma lista (dono): copiar criaria varias donas da mesma memoria.", "Empreste o item na linha 'for i, v in xs {': escreva & antes do nome do item (a forma for &item in ...), que vira ponteiro."))
+    expect(dg.sug.n == 1 and dg.sug.itens[0].confianca == (common.DIAG_SO_DICA as u8) and dg.sug.itens[0].nedicoes == 0 and (dg.sug.itens[0].descricao or_else "") == "escreva & antes do nome do item no for: o item vira ponteiro")
+    // parametro [dynamic]T
+    var f5: common.Fonte = sem_allocator_teste_fonte("  proc f(l: [dynamic]int) {\n")
+    defer delete(f5.dono_texto)
+    sv.fonte = &f5
+    sem_dono_teste_novo(&dg)
+    sem_forma_do_dono(&sv, DONO_PARAMETRO, 12, TIPO_VAZIO as u32)
+    expect(sem_dono_teste_forma(&dg, "Na linha 1, coluna 13 o parametro da linha 'proc f(l: [dynamic]int) {' recebe '[dynamic]int' por valor, o que copiaria a lista: parametro nao recebe lista por valor.", "Troque '[dynamic]int' por ^[dynamic]int (o proc altera a lista; chame com &lista) ou por []int (o proc le e altera os elementos; chame com lista[..])."))
+    expect(dg.sug.n == 1 and dg.sug.itens[0].confianca == (common.DIAG_SO_DICA as u8) and (dg.sug.itens[0].descricao or_else "") == "troque o tipo por ^[dynamic]int (altera a lista; chame f(&l)) ou []int (le; chame f(l[..]))")
+    var f6: common.Fonte = sem_allocator_teste_fonte("  p(x)\n")
+    defer delete(f6.dono_texto)
+    sv.fonte = &f6
+    sem_dono_teste_novo(&dg)
+    sem_forma_do_dono(&sv, DONO_PARAMETRO, 4, TIPO_VAZIO as u32)
+    expect(sem_dono_teste_forma(&dg, "Na linha 1, coluna 5 o parametro da linha 'p(x)' recebe 'x' por valor, o que copiaria a lista: parametro nao recebe lista por valor.", "Troque 'x' por ^x (o proc altera a lista; chame com &lista) ou por []T (o proc le e altera os elementos; chame com lista[..])."))
+    expect((dg.sug.itens[0].descricao or_else "") == "troque o tipo por ^x (altera a lista; chame f(&l)) ou []T (le; chame f(l[..]))")
+    // campo dono com padrao: edicao que apaga o padrao e so dica quando nao ha '='
+    var f7: common.Fonte = sem_allocator_teste_fonte("  itens: [dynamic]int = make([dynamic]int)  // c\n")
+    defer delete(f7.dono_texto)
+    sv.fonte = &f7
+    sem_dono_teste_novo(&dg)
+    sem_forma_do_dono(&sv, DONO_CAMPO_PADRAO, 24, TIPO_VAZIO as u32)
+    expect(sem_dono_teste_forma(&dg, "Na linha 1, coluna 25 o campo 'itens: [dynamic]int = make([dynamic]int)' tem um padrao que aloca; um dono com padrao alocaria escondido a cada literal da struct.", "Tire o padrao da linha 'itens: [dynamic]int = make([dynamic]int)' (a lista nasce vazia, sem alocador) e escreva o campo = make(...) em cada literal que cria a struct."))
+    expect(dg.sug.n == 1 and dg.sug.itens[0].confianca == (common.DIAG_PROVAVEL as u8) and (dg.sug.itens[0].descricao or_else "") == "tire o padrao do campo (a lista nasce vazia) e passe make(...) no campo de cada literal da struct")
+    expect(dg.sug.itens[0].nedicoes == 1 and dg.sug.itens[0].edicoes[0].ini == 21 and dg.sug.itens[0].edicoes[0].fim == 42 and (dg.sug.itens[0].edicoes[0].novo or_else "x") == "")
+    var f8: common.Fonte = sem_allocator_teste_fonte("  itens: x\n")
+    defer delete(f8.dono_texto)
+    sv.fonte = &f8
+    sem_dono_teste_novo(&dg)
+    sem_forma_do_dono(&sv, DONO_CAMPO_PADRAO, 9, TIPO_VAZIO as u32)
+    expect(dg.sug.n == 1 and dg.sug.itens[0].confianca == (common.DIAG_SO_DICA as u8) and dg.sug.itens[0].nedicoes == 0)
+    // editar: a edicao que nao cabe rebaixa a sugestao a so_dica
+    sem_dono_teste_novo(&dg)
+    expect(abrir(&sv, common.DIAG_PROVAVEL, "d"))
+    editar(&sv, 1, 2, "&")
+    expect(dg.sug.itens[0].confianca == (common.DIAG_PROVAVEL as u8) and dg.sug.itens[0].nedicoes == 1)
+    editar(&sv, 3, 4, "um texto novo que passa de trinta e dois bytes")
+    expect(dg.sug.itens[0].confianca == (common.DIAG_SO_DICA as u8) and dg.sug.itens[0].nedicoes == 0)
+    tipos_liberar(&sv.tipos)
+    dim_liberar(&dims)
+    common.interner_liberar(&nomes)
+    common.arena_liberar(&arena)
+}

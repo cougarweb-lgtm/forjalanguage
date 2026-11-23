@@ -1,0 +1,117 @@
+// nativo/x64/x64_listar.fj - porte de compiler/nativo/x64/x64_listar.c
+// sha256 de nativo/x64/x64_listar.c: e0fd77a69892d2fa9f6c174393ab4a10fb59416e5cdf893eec24bd4c09a815a2
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "common"
+import "nativo/bir"
+import "nativo/obj"
+
+// C: nativo/x64/x64_listar.c:15
+proc guardar_texto(lista: ?^AlvoListagem, texto: ?str) -> u32 {
+    let alvo = lista as ^AlvoListagem
+    let offset = len(alvo.textos) as u32
+    let bytes_texto = as_bytes(texto or_else "")
+    for k in 0..<len(bytes_texto) {
+        append(&alvo.textos, item = bytes_texto[k])
+    }
+    append(&alvo.textos, item = (0 as u8))
+    return offset
+}
+
+// C: nativo/x64/x64_listar.c:23
+proc funcao_atual(c: ^X64Ctx) -> ^ListaFuncao {
+    return &(c.lista as ^AlvoListagem).funcoes[(len((c.lista as ^AlvoListagem).funcoes) as u64) - 1]
+}
+
+// C: nativo/x64/x64_listar.c:28
+proc x64_listar_funcao(c: ^X64Ctx) {
+    let alvo = c.lista as ^AlvoListagem
+    let bir_f = c.f as ^bir.BirFuncao
+    append(&alvo.funcoes, item = ListaFuncao{})
+    let f: ^ListaFuncao = &alvo.funcoes[len(alvo.funcoes) - 1]
+    f.nome = guardar_texto(c.lista, (c.p as ^bir.BirPrograma).simbolos[bir_f.simbolo as u64].nome)
+    f.inicio = c.inicio
+    f.pos = bir_f.pos
+    f.nslots_agregado = bir_f.nslots
+    if bir_f.nslots == 0 {
+        return
+    }
+    f.slots_agregado = make([dynamic]ListaSlot, alloc = heap, cap = bir_f.nslots as int)
+    for k in 0..<(bir_f.nslots as int) {
+        append(&f.slots_agregado, item = ListaSlot{tam = bir_f.slots[k].tam, alinhamento = bir_f.slots[k].alinhamento, offset = c.slot_off[k]})
+    }
+}
+
+// C: nativo/x64/x64_listar.c:47
+proc simbolo_da_instr(c: ^X64Ctx, mi: ^MInstr) -> u32 {
+    var k: u8 = 0
+    while (k as i32) < (mi.nops as i32) {
+        let o: ^MOperando = &mi.op[k]
+        let aponta: bool = (common.c2f_s2u_32(o.tipo) == (MO_SIMBOLO as u32)) or ((common.c2f_s2u_32(o.tipo) == (MO_MEM as u32)) and (common.c2f_s2u_32(o.base) == (X64_RIP as u32)))
+        if aponta {
+            let arg_1: ?str = (c.o as ^obj.Objeto).simbolos[o.simbolo as u64].nome
+            let arg_2: ?^AlvoListagem = c.lista
+            return guardar_texto(arg_2, arg_1) + 1
+        }
+        k += 1
+    }
+    return 0
+}
+
+// C: nativo/x64/x64_listar.c:60
+proc local_na_bir(c: ^X64Ctx, registro: ^ListaInstr) {
+    registro.bloco = LISTA_SEM_INDICE
+    registro.indice = LISTA_SEM_INDICE
+    registro.pos = bir.BIR_SEM_POS
+    if len(c.instr) == 0 {
+        return
+    }
+    registro.bloco = (c.ordem or_else {})[c.pos_ordem]
+    registro.indice = c.instr_idx as u32
+    registro.pos = c.instr[0].pos
+}
+
+// C: nativo/x64/x64_listar.c:72
+proc x64_listar_instr(c: ^X64Ctx, mi: ^MInstr, tam: u32) {
+    var texto: [dynamic]u8 = make([dynamic]u8, alloc = heap, cap = 64)
+    defer delete(texto)
+    x64_formatar(mi, &texto)
+    var dados: str = "?"
+    if len(texto) > 0 {
+        dados = from_bytes(texto[..], alloc = frame)
+    }
+    let alvo = c.lista as ^AlvoListagem
+    append(&alvo.instrs, item = ListaInstr{})
+    let registro: ^ListaInstr = &alvo.instrs[len(alvo.instrs) - 1]
+    registro.funcao = (len(alvo.funcoes) as u32) - 1
+    registro.off = x64_offset(c) - tam
+    registro.tam = tam
+    registro.origem = c.origem
+    registro.texto = guardar_texto(c.lista, dados)
+    registro.simbolo = simbolo_da_instr(c, mi)
+    local_na_bir(c, registro)
+}
+
+// C: nativo/x64/x64_listar.c:88
+// C2F-13: unwind fundido em tam_unwind (len)
+proc x64_listar_quadro(c: ^X64Ctx, fim: u32, unwind: []u8) {
+    let f = funcao_atual(c)
+    f.fim = fim
+    f.quadro = c.quadro.tam
+    f.slots = c.quadro.slots
+    f.maxargs = c.quadro.maxargs
+    f.sondagem = 0
+    if c.quadro.sondar {
+        f.sondagem = 1
+    }
+    f.push = c.prologo.push
+    f.fpreg = c.prologo.fpreg
+    f.alocacao = c.prologo.alocacao
+    f.tam_unwind = (len(unwind) as u64) as u8
+    var copia: [32]u8 = {}
+    for k in 0..<len(unwind) {
+        copia[k] = unwind[k]
+    }
+    f.unwind = copia
+}

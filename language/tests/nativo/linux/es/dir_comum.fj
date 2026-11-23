@@ -1,0 +1,123 @@
+// std:file no Linux (M5 P28b-1) - modulo comum do read_dir.fj (em /tmp) e do read_dir_mnt.fj (em /mnt/c, o 9p do WSL: d_type pode vir DT_UNKNOWN). Nao e caso de teste (sem main).
+import "std:file" as fs
+
+proc erro_texto(e: fs.FileError) -> str {
+    var t: str = "other"
+    switch e {
+    case fs.FileError.not_found:
+        t = "not_found"
+    case fs.FileError.no_permission:
+        t = "no_permission"
+    case fs.FileError.other:
+        t = "other"
+    case fs.FileError.already_exists:
+        t = "already_exists"
+    case fs.FileError.is_directory:
+        t = "is_directory"
+    case fs.FileError.not_directory:
+        t = "not_directory"
+    case fs.FileError.not_empty:
+        t = "not_empty"
+    case fs.FileError.closed:
+        t = "closed"
+    case fs.FileError.unsupported:
+        t = "unsupported"
+    case fs.FileError.locked:
+        t = "locked"
+    }
+    return t
+}
+
+// Imprime o rotulo e o resultado (ok ou o erro tipado) de uma operacao.
+proc passo(rotulo: str, erro: ?fs.FileError) {
+    switch e in erro {
+    case fs.FileError:
+        print(f"{rotulo} {erro_texto(e)}")
+    case none:
+        print(f"{rotulo} ok")
+    }
+}
+
+proc kind_texto(k: fs.FileKind) -> str {
+    var t: str = "other"
+    switch k {
+    case fs.FileKind.file:
+        t = "file"
+    case fs.FileKind.dir:
+        t = "dir"
+    case fs.FileKind.link:
+        t = "link"
+    case fs.FileKind.other:
+        t = "other"
+    }
+    return t
+}
+
+proc criar_arquivo(caminho: str) {
+    let erro = fs.write_all(caminho, data = as_bytes("x"))
+    if erro != none {
+        print(f"falha ao criar {caminho}")
+    }
+}
+
+// Lista a pasta: todos os itens se forem poucos (<= 12), senao so a contagem e o primeiro e o ultimo (ordem pelos bytes do nome).
+proc listar(rotulo: str, caminho: str) {
+    switch r in fs.read_dir(caminho, alloc = heap) {
+    case fs.DirList:
+        let n = len(r.items)
+        print(f"{rotulo} itens={n}")
+        if n <= 12 {
+            for item in r.items[..] {
+                print(f"  {item.name} {kind_texto(item.kind)} ({len(item.name)})")
+            }
+        } else {
+            let primeiro = r.items[0]
+            let ultimo = r.items[n - 1]
+            print(f"  primeiro {primeiro.name} {kind_texto(primeiro.kind)}")
+            print(f"  ultimo {ultimo.name} {kind_texto(ultimo.kind)}")
+        }
+        delete(r.items)
+        delete(r.data)
+    case fs.FileError:
+        print(f"{rotulo} {erro_texto(r)}")
+    }
+}
+
+// Cria a pasta `base` com 9 itens (nomes que testam a ordem por bytes, UTF-8, nome longo e subpasta), outra pasta com `quantos` arquivos e uma vazia; lista tudo e apaga.
+pub proc executar(base: str, quantos: int) {
+    let _limpa = fs.remove_dir(base, all = true)
+    passo("mkdir base", fs.make_dir(base))
+    let nomes: [8]str = {"10", "9", "A.txt", "a.txt", "b.txt", "z", "ç.txt", "nxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"}
+    for nome in nomes {
+        let caminho = format(f"{base}/{nome}", alloc = heap)
+        defer delete(caminho)
+        criar_arquivo(caminho)
+    }
+    let sub = format(f"{base}/sub", alloc = heap)
+    defer delete(sub)
+    passo("mkdir sub", fs.make_dir(sub))
+    let cheia = format(f"{base}/cheia", alloc = heap)
+    defer delete(cheia)
+    passo("mkdir cheia", fs.make_dir(cheia))
+    for i in 0..<quantos {
+        let caminho = format(f"{cheia}/g{i:05}", alloc = heap)
+        defer delete(caminho)
+        criar_arquivo(caminho)
+    }
+    let vazia = format(f"{base}/vazia", alloc = heap)
+    defer delete(vazia)
+    passo("mkdir vazia", fs.make_dir(vazia))
+    listar("base", base)
+    listar("cheia", cheia)
+    listar("vazia", vazia)
+    let arquivo = format(f"{base}/z", alloc = heap)
+    defer delete(arquivo)
+    listar("sobre arquivo", arquivo)
+    let ausente = format(f"{base}/ausente", alloc = heap)
+    defer delete(ausente)
+    listar("ausente", ausente)
+    listar("vazio", "")
+    passo("apagar tudo", fs.remove_dir(base, all = true))
+    let existe = fs.exists(base)
+    print(f"base existe depois={existe}")
+}

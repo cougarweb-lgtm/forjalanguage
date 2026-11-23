@@ -1,0 +1,246 @@
+// nativo/nativo_entradas.fj - porte de compiler/nativo/nativo_entradas.c, compiler/nativo/nativo_entradas.h
+// sha256 de nativo/nativo_entradas.c: cc42e8c7922e3a0e5165def449d2949c8a9ea83a7b9898f9319a46c1d7766dc3
+// sha256 de nativo/nativo_entradas.h: ae93dca2ba1ba87be24e6b011f613a3ebb74898641bec54094d26b7279632296
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "std:file"
+import "std:os"
+import "common"
+import "nativo/obj"
+
+struct Entrada {
+    caminho: ?str
+    tipo: ?str
+    tamanho: u64
+    mtime: u64
+    hash: u64
+}
+
+const ENTRADAS_TAM_CAMINHO: i32 = 1100
+const ENTRADAS_PREFIXO_STD: str = "std:"
+const ENTRADAS_CABECALHO: str = "# forja-entradas 1\n"
+// ENAMETOOLONG do MSVC (errno.h) = 38, o mesmo valor que common.fonte usa
+const ENTRADAS_ERRNO_NOME_LONGO: i32 = 38
+// mtime do C e FILETIME (100 ns desde 1601-01-01); o std:file da o mtime em ns desde 1970: 11644473600 s = 116444736000000000 unidades de 100 ns
+const ENTRADAS_EPOCA_FILETIME: u64 = 116444736000000000
+
+// C: nativo/nativo_entradas.c:32
+// tamanho e mtime do arquivo; zeros se sumiu (o orquestrador re-hasheia e ve que mudou)
+proc entrada_medir_arquivo(e: ^Entrada) {
+    e.tamanho = 0
+    e.mtime = 0
+    switch info in file.stat(e.caminho or_else "") {
+    case file.FileInfo:
+        e.tamanho = info.size as u64
+        e.mtime = (info.mtime_ns / 100) as u64 + ENTRADAS_EPOCA_FILETIME
+    case file.FileError:
+        return
+    }
+}
+
+// C: nativo/nativo_entradas.c:45
+// caminho completo (os.abs_path, o _fullpath do C); false = o caminho nao coube no buffer de 1100 bytes
+proc entrada_acrescentar(entradas: ^[dynamic]Entrada, tipo: str, caminho: str, hash_c: u64) -> bool {
+    switch absoluto in os.abs_path(caminho, alloc = heap) {
+    case str:
+        if len(absoluto) >= (ENTRADAS_TAM_CAMINHO as int) {
+            delete(absoluto)
+            return false
+        }
+        var nova = Entrada{caminho = absoluto, tipo = tipo, tamanho = 0, mtime = 0, hash = hash_c}
+        entrada_medir_arquivo(&nova)
+        append(entradas, item = nova)
+        return true
+    case os.OsError:
+        return false
+    }
+    return false
+}
+
+// C: nativo/nativo_entradas.c:58
+proc trecho_da_fonte(f: ^common.Fonte, k: u32) -> common.FonteTrecho {
+    if f.ntrechos == 0 {
+        return common.FonteTrecho{inicio = 0, fim = f.tam as u32, linha_base = 0, caminho = f.caminho}
+    }
+    return (f.trechos or_else {})[k]
+}
+
+// C: nativo/nativo_entradas.c:65
+// cada trecho da Fonte vira uma linha "fj" com o hash do proprio texto; o std: nao entra (e do compilador)
+proc coletar_fontes(f: ^common.Fonte, entradas: ^[dynamic]Entrada) -> bool {
+    var n: u32 = 1
+    if f.ntrechos != 0 {
+        n = f.ntrechos
+    }
+    var k: u32 = 0
+    while k < n {
+        let t: common.FonteTrecho = trecho_da_fonte(f, k)
+        let caminho_trecho: str = t.caminho or_else ""
+        if not common.c2f_prefixo_igual(caminho_trecho, ENTRADAS_PREFIXO_STD, len(ENTRADAS_PREFIXO_STD)) {
+            let hash_trecho: u64 = common.hash64(f.texto[(t.inicio as u64)..<(t.fim as u64)], (t.fim - t.inicio) as u64, common.HASH64_SEMENTE)
+            if not entrada_acrescentar(entradas, "fj", caminho_trecho, hash_trecho) {
+                return false
+            }
+        }
+        k += 1
+    }
+    return true
+}
+
+// C: nativo/nativo_entradas.c:81
+// o arquivo e do Windows (%SystemRoot%\...): fica fora, para uma atualizacao do sistema nao recompilar todos os projetos
+proc eh_do_sistema(caminho: str) -> bool {
+    let raiz: str = os.env("SystemRoot") or_else ""
+    let tam: int = len(raiz)
+    if tam == 0 or len(caminho) <= tam {
+        return false
+    }
+    if common.c2f_stricmp(caminho[0..<tam], raiz) != 0 {
+        return false
+    }
+    let separador: u8 = caminho[tam]
+    return separador == 92 or separador == 47
+}
+
+// C: nativo/nativo_entradas.c:89
+proc coletar_libs(libs: ?^obj.BibliotecasResolvidas, entradas: ^[dynamic]Entrada) -> bool {
+    var k: u64 = 0
+    while (libs != none) and (k < (len((libs as ^obj.BibliotecasResolvidas).lidas) as u64)) {
+        let lida: ^obj.BibliotecaLida = &(libs as ^obj.BibliotecasResolvidas).lidas[k]
+        if eh_do_sistema((lida.caminho or_else "")) {
+            k += 1
+            continue
+        }
+        if not entrada_acrescentar(entradas, "lib", (lida.caminho or_else ""), lida.hash) {
+            return false
+        }
+        k += 1
+    }
+    return true
+}
+
+// C: nativo/nativo_entradas.c:103
+// B12: cada #load lido vira uma linha "load" (o caminho ja e absoluto, vindo do driver)
+proc coletar_cargas(cargas: ?^[dynamic]NativoCarga, entradas: ^[dynamic]Entrada) -> bool {
+    if cargas == none {
+        return true
+    }
+    let lista: ^[dynamic]NativoCarga = cargas as ^[dynamic]NativoCarga
+    var k: u64 = 0
+    while k < (len(lista^) as u64) {
+        let carga: ^NativoCarga = &(lista^)[k]
+        if not entrada_acrescentar(entradas, "load", (carga.caminho or_else ""), carga.hash) {
+            return false
+        }
+        k += 1
+    }
+    return true
+}
+
+// C: nativo/nativo_entradas.c:115
+// L1b: cada pasta de modulo de pasta vira uma linha "pasta" (caminho absoluto; o hash e o da lista dos nomes dos .fj)
+proc coletar_pacotes(pacotes: ?^[dynamic]NativoPacote, entradas: ^[dynamic]Entrada) -> bool {
+    if pacotes == none {
+        return true
+    }
+    let lista: ^[dynamic]NativoPacote = pacotes as ^[dynamic]NativoPacote
+    var k: u64 = 0
+    while k < (len(lista^) as u64) {
+        let pacote: ^NativoPacote = &(lista^)[k]
+        if not entrada_acrescentar(entradas, "pasta", (pacote.caminho or_else ""), pacote.hash) {
+            return false
+        }
+        k += 1
+    }
+    return true
+}
+
+// C: nativo/nativo_entradas.c:126
+// ordem por caminho (strcmp dos bytes); usado pela ordenacao e pela tira-repetido de montar_texto
+proc comparar_entradas(a: ^Entrada, b: ^Entrada) -> i32 {
+    return common.c2f_strcmp(a.caminho or_else "", b.caminho or_else "")
+}
+
+// C: nativo/nativo_entradas.c:135 (qsort do C substituido por insercao estavel: a ordem de chaves distintas e a mesma)
+proc ordenar_entradas(entradas: ^[dynamic]Entrada) {
+    var i: u64 = 1
+    while i < (len(entradas^) as u64) {
+        var j: u64 = i
+        while (j > 0) and (comparar_entradas(&(entradas^)[j - 1], &(entradas^)[j]) > 0) {
+            let esquerda: ^Entrada = &(entradas^)[j - 1]
+            let direita: ^Entrada = &(entradas^)[j]
+            let antes: Entrada = esquerda^
+            esquerda^ = direita^
+            direita^ = antes
+            j -= 1
+        }
+        i += 1
+    }
+}
+
+// C: nativo/nativo_entradas.c:132
+// texto do arquivo: cabecalho e uma linha por entrada, em ordem de caminho; o mesmo caminho lido duas vezes sai uma vez
+proc montar_texto(entradas: ^[dynamic]Entrada, texto: ^[dynamic]u8) {
+    append(texto, item = ENTRADAS_CABECALHO)
+    ordenar_entradas(entradas)
+    var k: u64 = 0
+    while k < (len(entradas^) as u64) {
+        let e: ^Entrada = &(entradas^)[k]
+        let repetida: bool = (k > 0) and (comparar_entradas(e, &(entradas^)[k - 1]) == 0)
+        if not repetida {
+            let tipo_txt: str = e.tipo or_else ""
+            let caminho_txt: str = e.caminho or_else ""
+            format(f"{tipo_txt}\t{caminho_txt}\t{e.tamanho}\t{e.mtime}\t{e.hash:016x}\n", into = texto)
+        }
+        k += 1
+    }
+}
+
+// libera os caminhos (heap de os.abs_path) guardados na lista; o tipo e texto de programa, nao se libera
+proc liberar_caminhos(entradas: ^[dynamic]Entrada) {
+    var k: u64 = 0
+    while k < (len(entradas^) as u64) {
+        let e: ^Entrada = &(entradas^)[k]
+        switch caminho_txt in e.caminho {
+        case str:
+            delete(caminho_txt)
+        case none:
+        }
+        k += 1
+    }
+}
+
+// C: nativo/nativo_entradas.c:146
+proc nativo_entradas_gravar(pedido: ^NativoPedido, libs: ^obj.BibliotecasResolvidas, errno_saida: ^i32) -> bool {
+    var entradas: [dynamic]Entrada = make([dynamic]Entrada, alloc = heap)
+    defer delete(entradas)
+    defer liberar_caminhos(&entradas)
+    var texto: [dynamic]u8 = make([dynamic]u8, alloc = heap)
+    defer delete(texto)
+    let fonte: ^common.Fonte = pedido.fonte as ^common.Fonte
+    let ok: bool = coletar_fontes(fonte, &entradas) and coletar_libs(libs, &entradas) and coletar_cargas(pedido.cargas, &entradas) and coletar_pacotes(pedido.pacotes, &entradas)
+    if not ok {
+        errno_saida^ = ENTRADAS_ERRNO_NOME_LONGO
+        return false
+    }
+    montar_texto(&entradas, &texto)
+    let dados: str = from_bytes(texto[..], alloc = heap)
+    defer delete(dados)
+    return common.arquivo_gravar_atomico(pedido.entradas, dados, len(dados) as u64, errno_saida)
+}
+
+// testes: texto e ordem conferidos a mao contra nativo_entradas.c (cabecalho, formato "%s\t%s\t%llu\t%llu\t%016llx\n")
+test "montar_texto ordena por caminho e tira a linha repetida" {
+    var es: [dynamic]Entrada = make([dynamic]Entrada, alloc = heap)
+    defer delete(es)
+    append(&es, item = Entrada{caminho = "b.fj", tipo = "fj", tamanho = 1, mtime = 2, hash = 255})
+    append(&es, item = Entrada{caminho = "a.fj", tipo = "lib", tamanho = 3, mtime = 4, hash = 16})
+    append(&es, item = Entrada{caminho = "b.fj", tipo = "fj", tamanho = 1, mtime = 2, hash = 255})
+    var t: [dynamic]u8 = make([dynamic]u8, alloc = heap)
+    defer delete(t)
+    montar_texto(&es, &t)
+    let s: str = from_bytes(t[..], alloc = heap)
+    defer delete(s)
+    expect(s == "# forja-entradas 1\nlib\ta.fj\t3\t4\t0000000000000010\nfj\tb.fj\t1\t2\t00000000000000ff\n")
+}

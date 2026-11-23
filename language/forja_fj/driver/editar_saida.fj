@@ -1,0 +1,220 @@
+// driver/editar_saida.fj - porte de compiler/driver/editar_saida.c
+// sha256 de driver/editar_saida.c: e1a87f098ee8931918b545b479d61258592c797653ad43480f3f5d525329a6b5
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "common"
+import "nativo"
+
+const DIAGNOSTICOS_MAX: i32 = 5
+
+// C: driver/editar_saida.c:15
+// minuscula de um byte ASCII (o _strnicmp do C compara sem caixa)
+proc minuscula_ascii(c: u8) -> u8 {
+    if (c >= 65) and (c <= 90) { // 'A' 'Z'
+        return c + 32
+    }
+    return c
+}
+
+// os n primeiros bytes de a e b iguais sem caixa (_strnicmp); quem chama garante que os dois tem n bytes
+proc prefixo_sem_caixa(a: []u8, b: []u8, n: int) -> bool {
+    for i in 0..<n {
+        if minuscula_ascii(a[i]) != minuscula_ascii(b[i]) {
+            return false
+        }
+    }
+    return true
+}
+
+// onde o absoluto deixa a pasta da raiz: a pasta da raiz e o que vem antes da ultima barra (strrchr); 0 = o absoluto inteiro
+proc inicio_relativo(ab: []u8, rz: []u8) -> int {
+    let tam_rz: int = common.c2f_strlen_b(rz)
+    var n: int = tam_rz
+    for k in 0..<tam_rz {
+        if rz[k] == 92 { // '\\'
+            n = k
+        }
+    }
+    if n > common.c2f_strlen_b(ab) {
+        return 0
+    }
+    if not prefixo_sem_caixa(ab, rz, n) {
+        return 0
+    }
+    if ab[n] != 92 { // '\\'
+        return 0
+    }
+    return n + 1
+}
+
+// copia origem para saida com as barras normais, no maximo tam - 1 bytes e o NUL no fim (o snprintf do C)
+proc copiar_com_barras(origem: []u8, saida: []u8, tam: u64) {
+    let lim: int = min(len(origem), (tam as int) - 1)
+    for i in 0..<lim {
+        if origem[i] == 92 { // '\\' vira '/'
+            saida[i] = 47
+        } else {
+            saida[i] = origem[i]
+        }
+    }
+    saida[lim] = 0
+}
+
+// C: driver/editar_saida.c:15
+// Caminho para mostrar: relativo a pasta da raiz do projeto, com barras normais (absoluto se estiver fora dela). Sem _fullpath (algum dos dois falhou), o caminho cru.
+proc editar_caminho_relativo(p: ^Plano, caminho: ?str, saida: []u8, tam: u64) {
+    let q: ^Consulta = p.q as ^Consulta
+    var absoluto: [600]u8 = {}
+    var raiz: [600]u8 = {}
+    caminho_absoluto(absoluto[..], 600, caminho)
+    caminho_absoluto(raiz[..], 600, (q.c as ^Compilacao).fonte.caminho)
+    let ab: []u8 = absoluto[..]
+    let rz: []u8 = raiz[..]
+    var origem = make([dynamic]u8, alloc = heap)
+    defer delete(origem)
+    if (common.c2f_strlen_b(ab) > 0) and (common.c2f_strlen_b(rz) > 0) {
+        let ini: int = inicio_relativo(ab, rz)
+        append(&origem, items = ab[ini..<common.c2f_strlen_b(ab)])
+    } else {
+        append(&origem, items = as_bytes(caminho or_else ""))
+    }
+    copiar_com_barras(origem[..], saida, tam)
+}
+
+// posicao da primeira ocorrencia de pat em texto (strstr do C), -1 se nao ha
+proc posicao_de_bytes(texto: []u8, pat: []u8) -> int {
+    let n: int = len(pat)
+    var i: int = 0
+    while (i + n) <= len(texto) {
+        if common.c2f_memcmp(texto[i..<(i + n)], pat) == 0 {
+            return i
+        }
+        i += 1
+    }
+    return -1
+}
+
+// C: driver/editar_saida.c:34
+// O JSON cru de um diagnostico do check da copia, com a pasta da copia tirada dos caminhos.
+proc anexar_sem_prefixo(b: ^[dynamic]u8, texto: str, prefixo: ?str) {
+    let pre: []u8 = as_bytes(prefixo or_else "")
+    let n: int = len(pre)
+    let tb: []u8 = as_bytes(texto)
+    var inicio: int = 0
+    while n > 0 {
+        let achou: int = posicao_de_bytes(tb[inicio..<len(tb)], pre)
+        if achou < 0 {
+            break
+        }
+        append(b, items = tb[inicio..<(inicio + achou)])
+        inicio += achou + n
+    }
+    append(b, items = tb[inicio..<len(tb)])
+}
+
+// C: driver/editar_saida.c:46
+proc emitir_operacoes(b: ^[dynamic]u8, p: ^Plano) {
+    append(b, item = ", \"operacoes\": [")
+    var k: u32 = 0
+    while k < p.noperacoes {
+        let o: ^Operacao = &p.operacoes[k]
+        var tern_1: str = "{\"op\": "
+        if k > 0 {
+            tern_1 = ", {\"op\": "
+        }
+        append(b, item = tern_1)
+        let arg_1: u64 = len((o.op or_else "")) as u64
+        let arg_2: ?str = o.op
+        let arg_3: ^[dynamic]u8 = b
+        edicoes_json_texto(arg_3, arg_2, arg_1)
+        append(b, item = ", \"alvo\": ")
+        edicoes_json_texto_ou_nulo(b, o.alvo)
+        append(b, item = ", \"novo\": ")
+        edicoes_json_texto_ou_nulo(b, o.novo)
+        format(f", \"edicoes\": {o.edicoes}}}", into = b)
+        k += 1
+    }
+    append(b, item = "]")
+}
+
+// C: driver/editar_saida.c:63
+proc emitir_edicoes_2(b: ^[dynamic]u8, p: ^Plano) {
+    var primeira: bool = true
+    append(b, item = ", \"edicoes\": [")
+    var k: u32 = 0
+    while k < p.narquivos {
+        var j: u32 = 0
+        while j < p.arquivos[k].n {
+            if not primeira {
+                append(b, item = ", ")
+            }
+            edicoes_json_edicao(b, &p.arquivos[k].edicoes[j], p.arquivos[k].relativo)
+            primeira = false
+            j += 1
+        }
+        k += 1
+    }
+    append(b, item = "]")
+}
+
+// texto JSON de um booleano (true/false, como o %s do C)
+proc texto_booleano(v: bool) -> str {
+    if v {
+        return "true"
+    }
+    return "false"
+}
+
+// C: driver/editar_saida.c:78
+proc emitir_diagnosticos(b: ^[dynamic]u8, r: ^Resposta) {
+    append(b, item = ", \"diagnosticos\": [")
+    var k: u32 = 0
+    while (r.depois != none) and (k < (r.depois as ^ResultadoCheck).n) and (k < (DIAGNOSTICOS_MAX as u32)) {
+        if k > 0 {
+            append(b, item = ", ")
+        }
+        let bruto: str = ((((r.depois as ^ResultadoCheck).itens or_else {})[k].bruto)) or_else ""
+        anexar_sem_prefixo(b, bruto, r.prefixo_copia)
+        k += 1
+    }
+    append(b, item = "]")
+}
+
+// C: driver/editar_saida.c:88
+// A resposta JSON de uma linha (chaves em ordem fixa: a mesma entrada da os mesmos bytes).
+proc editar_emitir_resposta(p: ^Plano, r: ^Resposta) {
+    var b = make([dynamic]u8, alloc = heap)
+    defer delete(b)
+    let desfeito: bool = (r.depois != none) and (not r.valido)
+    format(f"{{\"editar_versao\": \"{EDITAR_VERSAO}\", \"comando\": \"editar\", \"alvo\": ", into = &b)
+    nativo.json_caminho(&b, r.alvo)
+    let aplicar: str = texto_booleano(r.aplicar)
+    format(f", \"aplicar\": {aplicar}", into = &b)
+    emitir_operacoes(&b, p)
+    emitir_edicoes_2(&b, p)
+    append(&b, item = ", \"diff\": ")
+    if r.diff != none {
+        let txt_diff: str = from_bytes((r.diff as ^[dynamic]u8)[..], alloc = heap)
+        defer delete(txt_diff)
+        edicoes_json_texto(&b, txt_diff, len(txt_diff) as u64)
+    } else {
+        edicoes_json_texto(&b, "", 0)
+    }
+    append(&b, item = ", \"erros_antes\": 0, \"erros_depois\": ")
+    if r.erros_depois < 0 {
+        append(&b, item = "null")
+    } else {
+        format(f"{r.erros_depois}", into = &b)
+    }
+    emitir_diagnosticos(&b, r)
+    let valido: str = texto_booleano(r.valido)
+    let aplicado: str = texto_booleano(r.aplicado)
+    let desfeito_txt: str = texto_booleano(desfeito)
+    format(f", \"valido\": {valido}, \"aplicado\": {aplicado}, \"desfeito\": {desfeito_txt}, \"motivo\": ", into = &b)
+    edicoes_json_texto_ou_nulo(&b, r.motivo)
+    append(&b, item = "}\n")
+    let saida = common.c2f_saida_stdout()
+    common.c2f_saida_escrever(saida, b[..])
+    _ = common.c2f_saida_fechar(saida)
+}

@@ -1,0 +1,319 @@
+// nativo/wasm/wasm_ops.fj - emissao das operacoes escalares inteiras da BIR no alvo wasm32-wasip1
+// Versao: 0.1.1 (W1.e3a: CONST/aritmetica/logica/CMP/EXT/TRUNC/DIV/REM/SHL/SHR/NOT/NEG/SELECIONA inteiros; as ops reais vao para wasm_real.fj, a memoria para wasm_mem.fj; vetor segue X0001)
+// Convencao: vreg i8/i16/i32 = local i32 (i8/i16 com bits altos indefinidos); i64 = local i64. A extensao (sinal ou zero) e feita
+// ao EMPILHAR o operando quando a operacao depende dos bits altos (CMP, DIV, REM, SHR, EXT, SELECIONA, argumento com extensao).
+
+import "common"
+import "nativo/bir"
+import "nativo/fmt" as pefmt
+
+const OP_I32_SUB: u8 = 0x6B
+const OP_I64_SUB: u8 = 0x7D
+const OP_I32_XOR: u8 = 0x73
+const OP_I64_XOR: u8 = 0x85
+const OP_I32_EXTEND8_S: u8 = 0xC0
+const OP_I32_EXTEND16_S: u8 = 0xC1
+const OP_I32_WRAP_I64: u8 = 0xA7
+const OP_I64_EXTEND_I32_S: u8 = 0xAC
+const OP_I64_EXTEND_I32_U: u8 = 0xAD
+const OP_SELECT: u8 = 0x1B
+
+// add sub mul and or xor (indice = op BIR - BIR_ADD)
+const WOP_I32_BIN: [6]u8 = {0x6A, 0x6B, 0x6C, 0x71, 0x72, 0x73}
+const WOP_I64_BIN: [6]u8 = {0x7C, 0x7D, 0x7E, 0x83, 0x84, 0x85}
+// eq ne lt_s le_s gt_s ge_s lt_u le_u gt_u ge_u (indice = aux da BIR)
+const WOP_I32_CMP: [10]u8 = {0x46, 0x47, 0x48, 0x4C, 0x4A, 0x4E, 0x49, 0x4D, 0x4B, 0x4F}
+const WOP_I64_CMP: [10]u8 = {0x51, 0x52, 0x53, 0x57, 0x55, 0x59, 0x54, 0x58, 0x56, 0x5A}
+// div_s div_u rem_s rem_u
+const WOP_I32_DIV: [4]u8 = {0x6D, 0x6E, 0x6F, 0x70}
+const WOP_I64_DIV: [4]u8 = {0x7F, 0x80, 0x81, 0x82}
+
+// Nome da op da BIR (ordem de bir.fj BIR_CONST..BIR_ZERA_MEM) para as mensagens X0001
+const WASM_NOMES_OP: [39]str = {"const", "copia", "add", "sub", "mul", "and", "or", "xor", "neg", "cmp", "ext_s", "ext_z", "trunc", "add_ov", "sub_ov", "mul_ov", "neg_ov", "end_simbolo", "chama", "salta", "desvia", "retorna", "armadilha", "div", "rem", "shl", "shr", "not", "i_para_f", "f_para_f", "raiz", "chama_ind", "seleciona", "splat", "end_slot", "carrega", "grava", "copia_mem", "zera_mem"}
+
+proc wasm_nome_do_op(op: u8) -> str {
+    if (op as u64) < (len(WASM_NOMES_OP) as u64) {
+        return WASM_NOMES_OP[op]
+    }
+    return "op desconhecida"
+}
+
+proc wasm_classe_inteira(classe: u8) -> bool {
+    let c = classe as i32
+    return (c >= bir.BC_I8) and (c <= bir.BC_I64)
+}
+
+proc wasm_classe_i64(classe: u8) -> bool {
+    return (classe as i32) == bir.BC_I64
+}
+
+// Operando ausente ou inteiro
+proc wasm_operando_inteiro(op: bir.BirOperando) -> bool {
+    return ((op.tipo as i32) == bir.BO_NADA) or wasm_classe_inteira(op.classe)
+}
+
+proc wasm_gravar_destino(ins: ^bir.BirInstr, corpo: ^[dynamic]u8) {
+    append(corpo, item = OP_LOCAL_SET)
+    pefmt.wasm_leb_u32(corpo, ins.dst)
+}
+
+// Empilha o operando estendido pela classe: i8/i16 viram i32 com sinal (sinal = true) ou com zeros
+proc wasm_empilhar_ext(op: bir.BirOperando, corpo: ^[dynamic]u8, sinal: bool) -> bool {
+    if not wasm_empilhar(op, corpo) {
+        return false
+    }
+    let classe = op.classe as i32
+    if (classe != bir.BC_I8) and (classe != bir.BC_I16) {
+        return true
+    }
+    if sinal {
+        if classe == bir.BC_I8 {
+            append(corpo, item = OP_I32_EXTEND8_S)
+        } else {
+            append(corpo, item = OP_I32_EXTEND16_S)
+        }
+        return true
+    }
+    var mascara: i32 = 255
+    if classe == bir.BC_I16 {
+        mascara = 65535
+    }
+    append(corpo, item = OP_I32_CONST)
+    pefmt.wasm_leb_s32(corpo, mascara)
+    append(corpo, item = OP_I32_AND)
+    return true
+}
+
+// Empilha o resultado (i32 0/1) da comparacao inteira a COND b; cond = aux de CMP (0..9)
+proc wasm_empilhar_comparacao(a: bir.BirOperando, b: bir.BirOperando, cond: u8, corpo: ^[dynamic]u8) -> bool {
+    let c = cond as i32
+    if c > bir.BCOND_GE_U {
+        return false
+    }
+    let com_sinal: bool = (c >= bir.BCOND_LT_S) and (c <= bir.BCOND_GE_S)
+    if not (wasm_empilhar_ext(a, corpo, com_sinal) and wasm_empilhar_ext(b, corpo, com_sinal)) {
+        return false
+    }
+    if wasm_classe_i64(a.classe) {
+        append(corpo, item = WOP_I64_CMP[cond])
+    } else {
+        append(corpo, item = WOP_I32_CMP[cond])
+    }
+    return true
+}
+
+// a OP b com tabela de 6 (add sub mul and or xor)
+proc wasm_emitir_binaria(ins: ^bir.BirInstr, corpo: ^[dynamic]u8, erro: ^common.Diag) -> bool {
+    if not (wasm_empilhar(ins.a, corpo) and wasm_empilhar(ins.b, corpo)) {
+        return wasm_nao_suportado(erro, ins.pos, "operando que nao e vreg nem imediato inteiro")
+    }
+    let indice: u32 = ((ins.op as i32) - bir.BIR_ADD) as u32
+    if wasm_classe_i64(ins.classe) {
+        append(corpo, item = WOP_I64_BIN[indice])
+    } else {
+        append(corpo, item = WOP_I32_BIN[indice])
+    }
+    wasm_gravar_destino(ins, corpo)
+    return true
+}
+
+proc wasm_emitir_neg_not(ins: ^bir.BirInstr, corpo: ^[dynamic]u8, erro: ^common.Diag) -> bool {
+    let em_i64: bool = wasm_classe_i64(ins.classe)
+    let eh_neg: bool = (ins.op as i32) == bir.BIR_NEG
+    if eh_neg {
+        // 0 - a
+        if em_i64 {
+            append(corpo, item = OP_I64_CONST)
+            pefmt.wasm_leb_s64(corpo, 0)
+        } else {
+            append(corpo, item = OP_I32_CONST)
+            pefmt.wasm_leb_s32(corpo, 0)
+        }
+    }
+    if not wasm_empilhar(ins.a, corpo) {
+        return wasm_nao_suportado(erro, ins.pos, "operando que nao e vreg nem imediato inteiro")
+    }
+    if eh_neg {
+        if em_i64 {
+            append(corpo, item = OP_I64_SUB)
+        } else {
+            append(corpo, item = OP_I32_SUB)
+        }
+    } else {
+        // not a = a xor -1
+        if em_i64 {
+            append(corpo, item = OP_I64_CONST)
+            pefmt.wasm_leb_s64(corpo, -1)
+            append(corpo, item = OP_I64_XOR)
+        } else {
+            append(corpo, item = OP_I32_CONST)
+            pefmt.wasm_leb_s32(corpo, -1)
+            append(corpo, item = OP_I32_XOR)
+        }
+    }
+    wasm_gravar_destino(ins, corpo)
+    return true
+}
+
+proc wasm_emitir_cmp(ins: ^bir.BirInstr, corpo: ^[dynamic]u8, erro: ^common.Diag) -> bool {
+    if not wasm_empilhar_comparacao(ins.a, ins.b, ins.aux, corpo) {
+        return wasm_nao_suportado(erro, ins.pos, "comparacao de real ou operando invalido")
+    }
+    wasm_gravar_destino(ins, corpo)
+    return true
+}
+
+// EXT_S/EXT_Z: operando estendido ate i32; para destino i64 ainda extend_i32
+proc wasm_emitir_extensao(ins: ^bir.BirInstr, corpo: ^[dynamic]u8, erro: ^common.Diag) -> bool {
+    let com_sinal: bool = (ins.op as i32) == bir.BIR_EXT_S
+    if not wasm_empilhar_ext(ins.a, corpo, com_sinal) {
+        return wasm_nao_suportado(erro, ins.pos, "extensao de operando invalido")
+    }
+    if wasm_classe_i64(ins.classe) and (not wasm_classe_i64(ins.a.classe)) {
+        if com_sinal {
+            append(corpo, item = OP_I64_EXTEND_I32_S)
+        } else {
+            append(corpo, item = OP_I64_EXTEND_I32_U)
+        }
+    }
+    wasm_gravar_destino(ins, corpo)
+    return true
+}
+
+proc wasm_emitir_trunc(ins: ^bir.BirInstr, corpo: ^[dynamic]u8, erro: ^common.Diag) -> bool {
+    if not wasm_empilhar(ins.a, corpo) {
+        return wasm_nao_suportado(erro, ins.pos, "truncamento de operando invalido")
+    }
+    if wasm_classe_i64(ins.a.classe) and (not wasm_classe_i64(ins.classe)) {
+        append(corpo, item = OP_I32_WRAP_I64)
+    }
+    wasm_gravar_destino(ins, corpo)
+    return true
+}
+
+// DIV/REM (aux: BIR_SINAL = com sinal); a BIR ja protege divisor zero e MIN / -1
+proc wasm_emitir_divisao(ins: ^bir.BirInstr, corpo: ^[dynamic]u8, erro: ^common.Diag) -> bool {
+    let com_sinal: bool = (ins.aux as i32) == bir.BIR_SINAL
+    if not (wasm_empilhar_ext(ins.a, corpo, com_sinal) and wasm_empilhar_ext(ins.b, corpo, com_sinal)) {
+        return wasm_nao_suportado(erro, ins.pos, "divisao com operando invalido")
+    }
+    var indice: u32 = 0
+    if (ins.op as i32) == bir.BIR_REM {
+        indice = 2
+    }
+    if not com_sinal {
+        indice += 1
+    }
+    if wasm_classe_i64(ins.classe) {
+        append(corpo, item = WOP_I64_DIV[indice])
+    } else {
+        append(corpo, item = WOP_I32_DIV[indice])
+    }
+    wasm_gravar_destino(ins, corpo)
+    return true
+}
+
+// SHL/SHR (SHR e logico; a BIR garante contagem < bits); a contagem vai na largura do valor
+proc wasm_emitir_deslocamento(ins: ^bir.BirInstr, corpo: ^[dynamic]u8, erro: ^common.Diag) -> bool {
+    let eh_shl: bool = (ins.op as i32) == bir.BIR_SHL
+    let em_i64: bool = wasm_classe_i64(ins.classe)
+    var ok: bool = false
+    if eh_shl {
+        ok = wasm_empilhar(ins.a, corpo)
+    } else {
+        ok = wasm_empilhar_ext(ins.a, corpo, false)
+    }
+    ok = ok and wasm_empilhar_ext(ins.b, corpo, false)
+    if not ok {
+        return wasm_nao_suportado(erro, ins.pos, "deslocamento com operando invalido")
+    }
+    let contagem_i64: bool = wasm_classe_i64(ins.b.classe)
+    if em_i64 and (not contagem_i64) {
+        append(corpo, item = OP_I64_EXTEND_I32_U)
+    }
+    if (not em_i64) and contagem_i64 {
+        append(corpo, item = OP_I32_WRAP_I64)
+    }
+    if em_i64 {
+        var op64: u8 = 0x88 // i64.shr_u
+        if eh_shl {
+            op64 = 0x86 // i64.shl
+        }
+        append(corpo, item = op64)
+    } else {
+        var op32: u8 = 0x76 // i32.shr_u
+        if eh_shl {
+            op32 = 0x74 // i32.shl
+        }
+        append(corpo, item = op32)
+    }
+    wasm_gravar_destino(ins, corpo)
+    return true
+}
+
+// dst = (args[0] COND args[1]) ? a : b  ->  select
+proc wasm_emitir_seleciona(ins: ^bir.BirInstr, corpo: ^[dynamic]u8, erro: ^common.Diag) -> bool {
+    let args: []bir.BirOperando = ins.args or_else {}
+    if ins.nargs != 2 {
+        return wasm_nao_suportado(erro, ins.pos, "seleciona sem 2 argumentos de comparacao")
+    }
+    if not (wasm_empilhar(ins.a, corpo) and wasm_empilhar(ins.b, corpo)) {
+        return wasm_nao_suportado(erro, ins.pos, "seleciona com operando invalido")
+    }
+    if wasm_classe_real(args[0].classe) or wasm_classe_real(args[1].classe) {
+        if not wasm_real_empilhar_comparacao(args[0], args[1], ins.aux as i32, corpo) {
+            return wasm_nao_suportado(erro, ins.pos, "seleciona com comparacao de real invalida")
+        }
+    } else if not (wasm_operando_inteiro(args[0]) and wasm_operando_inteiro(args[1]) and wasm_empilhar_comparacao(args[0], args[1], ins.aux, corpo)) {
+        return wasm_nao_suportado(erro, ins.pos, "seleciona com comparacao invalida")
+    }
+    append(corpo, item = OP_SELECT)
+    wasm_gravar_destino(ins, corpo)
+    return true
+}
+
+// Despacho das operacoes escalares inteiras; o resto (real, vetor, CHAMA_IND) segue X0001
+proc wasm_emitir_op(ins: ^bir.BirInstr, corpo: ^[dynamic]u8, erro: ^common.Diag) -> bool {
+    let op = ins.op as i32
+    let inteiro: bool = wasm_operando_inteiro(ins.a) and wasm_operando_inteiro(ins.b) and wasm_classe_inteira(ins.classe)
+    if (op == bir.BIR_CMP) and wasm_operando_inteiro(ins.a) and wasm_operando_inteiro(ins.b) {
+        return wasm_emitir_cmp(ins, corpo, erro)
+    }
+    if (op == bir.BIR_CARREGA) or (op == bir.BIR_GRAVA) or (op == bir.BIR_COPIA_MEM) or (op == bir.BIR_ZERA_MEM) {
+        return wasm_emitir_memoria(ins, corpo, erro)
+    }
+    if wasm_real_aplica(ins) {
+        return wasm_emitir_real(ins, corpo, erro)
+    }
+    if (op == bir.BIR_SELECIONA) and wasm_classe_real(ins.classe) {
+        return wasm_emitir_seleciona(ins, corpo, erro) // resultado real: a, b reais e a comparacao pode ser inteira ou real
+    }
+    if not inteiro {
+        return wasm_nao_suportado(erro, ins.pos, wasm_nome_do_op(ins.op))
+    }
+    if op == bir.BIR_CONST {
+        return wasm_emitir_copia(ins, corpo, erro)
+    }
+    if (op >= bir.BIR_ADD) and (op <= bir.BIR_XOR) {
+        return wasm_emitir_binaria(ins, corpo, erro)
+    }
+    if (op == bir.BIR_NEG) or (op == bir.BIR_NOT) {
+        return wasm_emitir_neg_not(ins, corpo, erro)
+    }
+    if (op == bir.BIR_EXT_S) or (op == bir.BIR_EXT_Z) {
+        return wasm_emitir_extensao(ins, corpo, erro)
+    }
+    if op == bir.BIR_TRUNC {
+        return wasm_emitir_trunc(ins, corpo, erro)
+    }
+    if (op == bir.BIR_DIV) or (op == bir.BIR_REM) {
+        return wasm_emitir_divisao(ins, corpo, erro)
+    }
+    if (op == bir.BIR_SHL) or (op == bir.BIR_SHR) {
+        return wasm_emitir_deslocamento(ins, corpo, erro)
+    }
+    if op == bir.BIR_SELECIONA {
+        return wasm_emitir_seleciona(ins, corpo, erro)
+    }
+    return wasm_nao_suportado(erro, ins.pos, wasm_nome_do_op(ins.op))
+}

@@ -1,0 +1,142 @@
+// std:image 0.1.0 - decodifica PNG, JPEG e GIF (primeiro quadro) para a Forja, por cima da stb_image 2.34 (dominio publico / MIT) em vendor\libstbi.a (Windows) e vendor\linux\libstbi.a (Linux).
+// Versao: 0.1.0
+// Changelog: 0.1.0 - primeira versao: info (so cabecalho), decode (1..4 canais), pixels (vista) e free. So PNG, JPEG e GIF (STBI_ONLY_*); PNG de 16 bits sai em 8 bits (conversao da stb).
+//
+// COMO USAR (o .fj raiz precisa de uma pasta vendor\ ao lado: libstbi.a, image\image.fj, image\image_c.fj; ver MEM-FORJA-GUIA-10):
+//     import "vendor:image/image"
+//     ...
+//     let dados = try file.read_all("foto.png", alloc = heap)     // [dynamic]u8 DONA
+//     defer delete(dados)
+//     let cabecalho = try image.info(dados[..])                   // largura, altura, canais do arquivo
+//     let img = try image.decode(dados[..])                       // RGBA (want_channels = 4 por padrao)
+//     defer image.free(img)
+//     let pixels = image.pixels(img)                              // []u8 de width*height*channels bytes
+//
+// TEXTO: esta API nao tem parametro de texto publico. A mensagem da stb (stbi_failure_reason) nao e exposta: erro_da_stb a traduz por texto.
+//
+// DONOS E EMPRESTADOS (a regra que evita vazamento e ponteiro solto):
+//   - decode devolve Image DONA do bloco de pixels alocado pela stb: chame image.free(img) UMA vez (depois nao use img.pixels nem pixels(img)).
+//   - pixels(img) devolve VISTA ([]u8) do bloco: vale ate o image.free. Para guardar, copie os bytes.
+//   - info e decode EMPRESTAM data ([]u8 do chamador): a stb le e nao guarda; a Image devolvida nao depende de data.
+// Limite: stbi_failure_reason e global (STBI_NO_THREAD_LOCALS): nao decodifique em duas threads ao mesmo tempo.
+//
+// ERRO: ImageError.
+//   invalid_data   = nao e imagem suportada/valida, arquivo truncado, bytes aleatorios, vazio (data com 0 bytes) ou conteudo corrompido.
+//   unsupported    = want_channels fora de 1..4, ou recurso que a stb nao decodifica (mensagem "unsupported ...").
+//   too_large      = dimensao acima de 16384 (STBI_MAX_DIMENSIONS, cabecalho forjado), GIF com saida grande demais ou data maior que 2^31-1 bytes.
+//   out_of_memory  = a stb nao conseguiu alocar o bloco de pixels.
+//
+// VERIFICAR: forja run language\exemplos_libs\image_basico.fj   (e: python -I language\exemplos_libs\oraculos\image.py <pasta de fixtures>)
+
+import "vendor:image/image_c" as ic
+import "std:text" as text
+
+pub enum ImageError {
+    invalid_data
+    unsupported
+    too_large
+    out_of_memory
+}
+
+pub struct ImageInfo {
+    width: i32
+    height: i32
+    channels: i32
+}
+
+// Imagem decodificada. Dona do bloco de pixels: image.free uma vez.
+pub struct Image {
+    pixels: ?^u8
+    width: i32
+    height: i32
+    channels: i32
+}
+
+// data.len cabe em i32 (a stb recebe len como int): acima disso nao chega a stb.
+const IMAGE_BYTES_MAXIMOS: int = 2147483647
+const IMAGE_CANAIS_MINIMOS: i32 = 1
+const IMAGE_CANAIS_MAXIMOS: i32 = 4
+
+// Traduz o motivo da stb (texto fixo em ingles) para ImageError. Texto nao reconhecido vira invalid_data.
+proc erro_da_stb() -> ImageError {
+    let motivo = ic.stbi_failure_reason()
+    if motivo == none {
+        return ImageError.invalid_data
+    }
+    let texto_motivo = (motivo or_else "") as str
+    if text.str_contains(texto_motivo, "outofmem") {
+        return ImageError.out_of_memory
+    }
+    if text.str_contains(texto_motivo, "too large") or text.str_contains(texto_motivo, "toobig") {
+        return ImageError.too_large
+    }
+    if text.str_contains(texto_motivo, "unsupported") {
+        return ImageError.unsupported
+    }
+    return ImageError.invalid_data
+}
+
+// Le so o cabecalho: largura, altura e canais do arquivo, sem decodificar os pixels. Erros: invalid_data, too_large, unsupported.
+pub proc info(data: []u8) -> ImageInfo ! ImageError {
+    if len(data) == 0 {
+        return ImageError.invalid_data
+    }
+    if len(data) > IMAGE_BYTES_MAXIMOS {
+        return ImageError.too_large
+    }
+    var largura: i32 = 0
+    var altura: i32 = 0
+    var canais: i32 = 0
+    let codigo = ic.stbi_info_from_memory(&data[0], len(data) as i32, &largura, &altura, &canais)
+    if codigo == 0 {
+        return erro_do_cabecalho(data)
+    }
+    return ImageInfo{width = largura, height = altura, channels = canais}
+}
+
+// stbi_info_from_memory tenta um formato depois do outro e a ultima tentativa sobrescreve o motivo
+// (PNG com dimensao acima do limite sairia como "unknown image type"). Por isso o motivo e refeito pela
+// decodificacao, que para no formato que casa e falha no cabecalho antes de alocar pixel.
+proc erro_do_cabecalho(data: []u8) -> ImageError {
+    switch img in decode(data) {
+    case Image:
+        free(img)
+        return ImageError.invalid_data
+    case ImageError:
+        return img
+    }
+    return ImageError.invalid_data
+}
+
+// Decodifica para want_channels canais (1..4; 4 = RGBA, padrao). Erros: invalid_data, unsupported, too_large, out_of_memory.
+pub proc decode(data: []u8, want_channels: i32 = 4) -> Image ! ImageError {
+    if want_channels < IMAGE_CANAIS_MINIMOS or want_channels > IMAGE_CANAIS_MAXIMOS {
+        return ImageError.unsupported
+    }
+    if len(data) == 0 {
+        return ImageError.invalid_data
+    }
+    if len(data) > IMAGE_BYTES_MAXIMOS {
+        return ImageError.too_large
+    }
+    var largura: i32 = 0
+    var altura: i32 = 0
+    var canais_do_arquivo: i32 = 0
+    let bloco = ic.stbi_load_from_memory(&data[0], len(data) as i32, &largura, &altura, &canais_do_arquivo, want_channels)
+    if bloco == none {
+        return erro_da_stb()
+    }
+    return Image{pixels = bloco, width = largura, height = altura, channels = want_channels}
+}
+
+// Vista dos pixels: width * height * channels bytes, linha a linha, de cima para baixo, sem preenchimento. Vale ate image.free.
+pub proc pixels(img: Image) -> []u8 {
+    let total = (img.width as int) * (img.height as int) * (img.channels as int)
+    // `as ^u8` de um opcional checa nulo (R0005); decode so devolve Image com bloco nao nulo.
+    return slice_from(img.pixels as ^u8, len = total)
+}
+
+// Libera o bloco de pixels da stb. Chame uma vez por Image (dono unico).
+pub proc free(img: Image) {
+    ic.stbi_image_free((img.pixels as ^u8) as rawptr)
+}

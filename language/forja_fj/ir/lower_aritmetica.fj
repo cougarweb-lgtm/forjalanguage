@@ -1,0 +1,264 @@
+// ir/lower_aritmetica.fj - porte de compiler/ir/lower_aritmetica.c
+// sha256 de ir/lower_aritmetica.c: 3d8af0c434d5c8ae880ddc8624b623aba5b9e8dc592a532b0bd32f9b4d368281
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "common"
+import "frontend"
+import "semantic"
+
+struct Conta {
+    resultado: Valor
+    estourou: Valor
+    alto: Valor
+}
+
+const OP_ADD_I: i32 = 0
+const OP_SUB_I: i32 = 1
+const OP_MUL_I: i32 = 2
+const FAMILIA_SATURATING: i32 = 1
+const FAMILIA_CHECKED: i32 = 2
+const FAMILIA_OVERFLOWING: i32 = 3
+const METADE_BITS: i32 = 32
+const LARGURA_MAXIMA: i32 = 64
+const METADE_MASCARA: u64 = 4294967295
+
+// C: ir/lower_aritmetica.c:25
+proc lo_mul_hi(k: ^LoCtx, a: Valor, b: Valor) -> Valor {
+    let mascara: Valor = lw_valor_int(METADE_MASCARA as i64, semantic.TIPO_UINT as u32)
+    let meia: Valor = lw_valor_int(METADE_BITS as i64, semantic.TIPO_UINT as u32)
+    let al: Valor = lo_binario(k, frontend.OP_BIT_E as u8, semantic.TIPO_UINT as u32, a, mascara)
+    let ah: Valor = lo_binario(k, frontend.OP_DESLOCA_DIR as u8, semantic.TIPO_UINT as u32, a, meia)
+    let bl: Valor = lo_binario(k, frontend.OP_BIT_E as u8, semantic.TIPO_UINT as u32, b, mascara)
+    let bh: Valor = lo_binario(k, frontend.OP_DESLOCA_DIR as u8, semantic.TIPO_UINT as u32, b, meia)
+    let p0: Valor = lo_binario(k, frontend.OP_MUL as u8, semantic.TIPO_UINT as u32, al, bl)
+    let p1: Valor = lo_binario(k, frontend.OP_MUL as u8, semantic.TIPO_UINT as u32, al, bh)
+    let p2: Valor = lo_binario(k, frontend.OP_MUL as u8, semantic.TIPO_UINT as u32, ah, bl)
+    let p3: Valor = lo_binario(k, frontend.OP_MUL as u8, semantic.TIPO_UINT as u32, ah, bh)
+    let arg_1: Valor = lo_binario(k, frontend.OP_BIT_E as u8, semantic.TIPO_UINT as u32, p1, mascara)
+    let arg_2: Valor = lo_binario(k, frontend.OP_DESLOCA_DIR as u8, semantic.TIPO_UINT as u32, p0, meia)
+    let arg_3: ^LoCtx = k
+    var meio: Valor = lo_binario(arg_3, frontend.OP_SOMA as u8, semantic.TIPO_UINT as u32, arg_2, arg_1)
+    meio = lo_binario(k, frontend.OP_SOMA as u8, semantic.TIPO_UINT as u32, meio, lo_binario(k, frontend.OP_BIT_E as u8, semantic.TIPO_UINT as u32, p2, mascara))
+    var alto: Valor = lo_binario(k, frontend.OP_SOMA as u8, semantic.TIPO_UINT as u32, p3, lo_binario(k, frontend.OP_DESLOCA_DIR as u8, semantic.TIPO_UINT as u32, p1, meia))
+    alto = lo_binario(k, frontend.OP_SOMA as u8, semantic.TIPO_UINT as u32, alto, lo_binario(k, frontend.OP_DESLOCA_DIR as u8, semantic.TIPO_UINT as u32, p2, meia))
+    return lo_binario(k, frontend.OP_SOMA as u8, semantic.TIPO_UINT as u32, alto, lo_binario(k, frontend.OP_DESLOCA_DIR as u8, semantic.TIPO_UINT as u32, meio, meia))
+}
+
+// C: ir/lower_aritmetica.c:42
+proc menor(k: ^LoCtx, a: Valor, b: Valor) -> Valor {
+    return lo_binario(k, frontend.OP_MENOR as u8, semantic.TIPO_BOOL as u32, a, b)
+}
+
+// C: ir/lower_aritmetica.c:47
+proc diferente(k: ^LoCtx, a: Valor, b: Valor) -> Valor {
+    return lo_binario(k, frontend.OP_DIFERENTE as u8, semantic.TIPO_BOOL as u32, a, b)
+}
+
+// C: ir/lower_aritmetica.c:52
+proc conta_soma(k: ^LoCtx, tipo: u32, a: Valor, b: Valor) -> Conta {
+    let r: Valor = lo_binario(k, frontend.OP_SOMA_VOLTA as u8, tipo, a, b)
+    if semantic.tipo_eh_sem_sinal(tipo) {
+        return Conta{resultado = r, estourou = menor(k, r, a), alto = lw_valor_bool(true)}
+    }
+    let b_negativo: Valor = menor(k, b, lw_valor_int(0, tipo))
+    return Conta{resultado = r, estourou = diferente(k, b_negativo, menor(k, r, a)), alto = lo_nao(k, b_negativo)}
+}
+
+// C: ir/lower_aritmetica.c:60
+proc conta_sub(k: ^LoCtx, tipo: u32, a: Valor, b: Valor) -> Conta {
+    let r: Valor = lo_binario(k, frontend.OP_SUB_VOLTA as u8, tipo, a, b)
+    if semantic.tipo_eh_sem_sinal(tipo) {
+        return Conta{resultado = r, estourou = menor(k, a, b), alto = lw_valor_bool(false)}
+    }
+    let b_negativo: Valor = menor(k, b, lw_valor_int(0, tipo))
+    return Conta{resultado = r, estourou = diferente(k, b_negativo, menor(k, a, r)), alto = b_negativo}
+}
+
+// C: ir/lower_aritmetica.c:69
+proc magnitude(k: ^LoCtx, tipo: u32, x: Valor) -> Valor {
+    if semantic.tipo_eh_sem_sinal(tipo) {
+        return lo_converte(k, semantic.TIPO_UINT as u32, x)
+    }
+    let modulo: i32 = lo_local(k, tipo, x)
+    let zero: Valor = lw_valor_int(0, tipo)
+    let fora: ^IrBloco = lo_entra_se(k, menor(k, x, zero))
+    lo_atribui(k, modulo, tipo, lo_binario(k, frontend.OP_SUB_VOLTA as u8, tipo, zero, x))
+    lo_sai_do_se(k, fora)
+    let arg_1: Valor = lw_valor_local(modulo, tipo)
+    let arg_2: u32 = lo_sem_sinal(tipo)
+    let arg_3: ^LoCtx = k
+    return lo_converte(k, semantic.TIPO_UINT as u32, lo_transmuta(arg_3, arg_2, arg_1))
+}
+
+// C: ir/lower_aritmetica.c:81
+proc limite_do_produto(k: ^LoCtx, tipo: u32, negativo: Valor) -> Valor {
+    let largura: u32 = lo_largura(k, tipo)
+    var tern_1: u64 = (1 << ((largura as u64) & 63)) - 1
+    if largura == (LARGURA_MAXIMA as u32) {
+        tern_1 = 18446744073709551615
+    }
+    let todos: u64 = tern_1
+    if semantic.tipo_eh_sem_sinal(tipo) {
+        return lw_valor_int(transmute(todos, to = i64), semantic.TIPO_UINT as u32)
+    }
+    let positivo: u64 = 1 << (((largura - 1) as u64) & 63)
+    let limite: i32 = lo_local(k, semantic.TIPO_UINT as u32, lw_valor_int(transmute(positivo - 1, to = i64), semantic.TIPO_UINT as u32))
+    let fora: ^IrBloco = lo_entra_se(k, negativo)
+    lo_atribui(k, limite, semantic.TIPO_UINT as u32, lw_valor_int(transmute(positivo, to = i64), semantic.TIPO_UINT as u32))
+    lo_sai_do_se(k, fora)
+    return lw_valor_local(limite, semantic.TIPO_UINT as u32)
+}
+
+// C: ir/lower_aritmetica.c:94
+proc conta_mul(k: ^LoCtx, tipo: u32, a: Valor, b: Valor) -> Conta {
+    let r: Valor = lo_binario(k, frontend.OP_MUL_VOLTA as u8, tipo, a, b)
+    let ma: Valor = magnitude(k, tipo, a)
+    let mb: Valor = magnitude(k, tipo, b)
+    let baixo: Valor = lo_binario(k, frontend.OP_MUL_VOLTA as u8, semantic.TIPO_UINT as u32, ma, mb)
+    let sinal: bool = not semantic.tipo_eh_sem_sinal(tipo)
+    let zero: Valor = lw_valor_int(0, tipo)
+    var negativo: Valor = lw_valor_bool(false)
+    if sinal {
+        // C2F-45: diferente(menor(a), menor(b)) avalia o 2o argumento antes (direita para a esquerda, N5)
+        let menor_b: Valor = menor(k, b, zero)
+        let menor_a: Valor = menor(k, a, zero)
+        negativo = diferente(k, menor_a, menor_b)
+    }
+    var estourou: Valor = menor(k, limite_do_produto(k, tipo, negativo), baixo)
+    if lo_largura(k, tipo) == (LARGURA_MAXIMA as u32) {
+        let alta_nao_zero: Valor = diferente(k, lo_mul_hi(k, ma, mb), lw_valor_int(0, semantic.TIPO_UINT as u32))
+        estourou = lo_binario(k, frontend.OP_OU as u8, semantic.TIPO_BOOL as u32, alta_nao_zero, estourou)
+    }
+    var alto: Valor = lw_valor_bool(true)
+    if sinal {
+        alto = lo_nao(k, negativo)
+    }
+    return Conta{resultado = r, estourou = estourou, alto = alto}
+}
+
+// C: ir/lower_aritmetica.c:110
+// C2F-INDECIDIVEL: op
+proc calcular_2(k: ^LoCtx, operacao: i32, tipo: u32, op: []Valor) -> Conta {
+    if operacao == OP_ADD_I {
+        return conta_soma(k, tipo, op[0], op[1])
+    }
+    if operacao == OP_SUB_I {
+        return conta_sub(k, tipo, op[0], op[1])
+    }
+    return conta_mul(k, tipo, op[0], op[1])
+}
+
+// C: ir/lower_aritmetica.c:120
+proc saturar(k: ^LoCtx, tipo: u32, conta: ^Conta) -> Valor {
+    let saida: i32 = lo_local(k, tipo, conta.resultado)
+    var fora: ?^IrBloco = lo_entra_se(k, conta.estourou)
+    lo_atribui(k, saida, tipo, lw_valor_int(semantic.tipo_inteiro_min(tipo), tipo))
+    lo_sai_do_se(k, fora as ^IrBloco)
+    fora = lo_entra_se(k, lo_binario(k, frontend.OP_E as u8, semantic.TIPO_BOOL as u32, conta.estourou, conta.alto))
+    lo_atribui(k, saida, tipo, lw_valor_int(transmute(semantic.tipo_inteiro_max(tipo), to = i64), tipo))
+    lo_sai_do_se(k, fora as ^IrBloco)
+    return lw_valor_local(saida, tipo)
+}
+
+// C: ir/lower_aritmetica.c:133
+proc checar(k: ^LoCtx, opcional: u32, conta: ^Conta) -> Valor {
+    let saida: i32 = lo_local(k, opcional, lw_valor_nenhum())
+    let fora: ^IrBloco = lo_entra_se(k, lo_nao(k, conta.estourou))
+    let embrulho: ^IrInstr = lw_nova_instr(k.c as ^LowerCtx, IR_EMBRULHA, k.pos)
+    embrulho.destino = lw_novo_temp(k.c as ^LowerCtx)
+    embrulho.tipo = opcional
+    embrulho.a = conta.resultado
+    lo_atribui(k, saida, opcional, lw_valor_temp(embrulho.destino, opcional))
+    lo_sai_do_se(k, fora)
+    return lw_valor_local(saida, opcional)
+}
+
+// C: ir/lower_aritmetica.c:146
+proc par_do_estouro(k: ^LoCtx, tupla: u32, conta: ^Conta) -> Valor {
+    let i: ^IrInstr = lw_nova_instr(k.c as ^LowerCtx, IR_TUPLA, k.pos)
+    i.destino = lw_novo_temp(k.c as ^LowerCtx)
+    i.tipo = tupla
+    i.args = lw_args(k.c as ^LowerCtx, 2)
+    let args_tupla: []Valor = i.args or_else {}
+    args_tupla[0] = conta.resultado
+    args_tupla[1] = conta.estourou
+    i.nargs = 2
+    return lw_valor_temp(i.destino, tupla)
+}
+
+// C: ir/lower_aritmetica.c:158
+// C2F-INDECIDIVEL: op
+proc operar(k: ^LoCtx, e: ^frontend.Expr, op: []Valor) -> Valor {
+    let relativo: i32 = e.ref_id - frontend.EMB_WRAPPING_ADD
+    let familia: i32 = relativo / frontend.EMB_ARIT_FAMILIA_TAM
+    let operacao: i32 = relativo % frontend.EMB_ARIT_FAMILIA_TAM
+    let tipo: u32 = ((e.args or_else {})[0].valor as ^frontend.Expr).tipo
+    if familia == 0 {
+        return lo_binario(k, (frontend.OP_SOMA_VOLTA + operacao) as u8, tipo, op[0], op[1])
+    }
+    var conta: Conta = calcular_2(k, operacao, tipo, op)
+    if familia == FAMILIA_SATURATING {
+        return saturar(k, tipo, &conta)
+    }
+    if familia == FAMILIA_CHECKED {
+        return checar(k, e.tipo, &conta)
+    }
+    return par_do_estouro(k, e.tipo, &conta)
+}
+
+// C: ir/lower_aritmetica.c:170
+proc lw_aritmetica(c: ^LowerCtx, e: ^frontend.Expr) -> Valor {
+    var k = LoCtx{c = c, pos = e.pos_op}
+    var op: [2]Valor = {}
+    if (e.ref_id >= frontend.EMB_ROTATE_LEFT) and (e.ref_id != frontend.EMB_MUL_HI_U64) {
+        return lw_bits(c, e)
+    }
+    var i: u32 = 0
+    while i < e.nargs {
+        let parte: frontend.Arg = (e.args or_else {})[i]
+        op[parte.indice as u32] = lw_expr(c, parte.valor)
+        i += 1
+    }
+    op[0] = lo_em_local(&k, op[0])
+    if e.ref_id == frontend.EMB_MUL_HI_U64 {
+        return lo_mul_hi(&k, op[0], op[1])
+    }
+    return operar(&k, e, op[..])
+}
+
+// Valores do C (ParDoEstouro): TUPLA destino = (resultado, estourou); o destino e o primeiro temporario.
+test "lower_aritmetica: par do estouro segue ParDoEstouro do C" {
+    var a: common.Arena = common.Arena{}
+    defer common.arena_liberar(&a)
+    var bloco: IrBloco = IrBloco{}
+    var c: LowerCtx = LowerCtx{}
+    c.arena = &a
+    c.atual = &bloco
+    var k: LoCtx = LoCtx{c = &c, pos = 3}
+    var conta: Conta = Conta{resultado = lw_valor_int(7, 4), estourou = lw_valor_bool(true), alto = lw_valor_bool(false)}
+    let r: Valor = par_do_estouro(&k, 9, &conta)
+    expect(r.tipo == 9 and r.id == 0)
+    let i: ^IrInstr = bloco.primeira as ^IrInstr
+    expect(i.op == IR_TUPLA as u8 and i.nargs == 2 and i.tipo == 9 and i.pos == 3)
+    let args: []Valor = i.args or_else {}
+    expect(args[0].inteiro == 7 and args[1].inteiro == 1)
+}
+
+// Valores do C (LimiteDoProduto em lower_aritmetica.c): sem sinal = todos os bits; com sinal = 2^(N-1) - 1 (local inicial).
+test "lower_aritmetica: limite do produto segue LimiteDoProduto do C" {
+    var a: common.Arena = common.Arena{}
+    defer common.arena_liberar(&a)
+    var bloco: IrBloco = IrBloco{}
+    var c: LowerCtx = LowerCtx{}
+    var sem = semantic.Semantica{}
+    c.sem = &sem
+    c.arena = &a
+    c.atual = &bloco
+    var k: LoCtx = LoCtx{c = &c, pos = 1}
+    expect(limite_do_produto(&k, semantic.TIPO_U8 as u32, lw_valor_bool(false)).inteiro == 255)
+    expect(limite_do_produto(&k, semantic.TIPO_U16 as u32, lw_valor_bool(false)).inteiro == 65535)
+    expect(limite_do_produto(&k, semantic.TIPO_I8 as u32, lw_valor_bool(false)).tipo_no == V_LOCAL as u8)
+    let primeiro: ^IrInstr = bloco.primeira as ^IrInstr
+    expect(primeiro.op == IR_LOCAL as u8 and primeiro.a.inteiro == 127)
+}

@@ -1,0 +1,518 @@
+// Testes do std:json 0.2.0 (cJSON 1.7.19): caminho feliz, JSON invalido, campo ausente, tipo errado, indice fora, arquivo; get_path e path_* (aninhado, indice, erros e `at`, sintaxe invalida),
+// remove_field/remove_item, push_bool/null/list, UTF-8 e escapes, nome vazio e documento de 1000 itens (em dev, vazamento = R0009: tudo e liberado).
+// Versao: 0.2.0. Changelog: 0.2.0 - S2g-json (J01+J02): rotulos index/value, 9 testes novos. 0.1.0 - primeira versao (6 testes).
+// RODAR (a partir desta pasta, porque os testes abrem manifesto_clipes.json por caminho relativo):
+//     cd language\exemplos_libs
+//     forja test teste_json.fj
+// ESPERADO: todos os testes passam (a contagem sai no resumo do forja test).
+
+import "vendor:json/json"
+
+proc main() {
+    print("use: forja test teste_json.fj")
+}
+
+test "abrir devolve invalido para texto que nao e JSON" {
+    switch r in json.parse("{") {
+    case json.Json:
+        expect(false)
+    case json.JsonError:
+        expect(r == json.JsonError.invalid)
+    }
+    switch r in json.parse("") {
+    case json.Json:
+        expect(false)
+    case json.JsonError:
+        expect(r == json.JsonError.invalid)
+    }
+    switch r in json.parse("[1, 2,") {
+    case json.Json:
+        expect(false)
+    case json.JsonError:
+        expect(r == json.JsonError.invalid)
+    }
+    switch r in json.parse_str("{\"a\": }") {
+    case json.Json:
+        expect(false)
+    case json.JsonError:
+        expect(r == json.JsonError.invalid)
+    }
+}
+
+test "campo ausente, objeto sem o campo e tipo errado" {
+    let doc = json.parse("{\"a\": 1, \"s\": \"x\", \"l\": [10, 20]}") or_else json.Json{no = none, dono = false}
+    defer json.close(doc)
+    expect(json.has_field(doc, name = "a"))
+    expect(not json.has_field(doc, name = "nao_existe"))
+    switch r in json.field(doc, name = "nao_existe") {
+    case json.Json:
+        expect(false)
+    case json.JsonError:
+        expect(r == json.JsonError.missing)
+    }
+    switch r in json.field_text(doc, name = "a") {
+    case str:
+        expect(false)
+    case json.JsonError:
+        expect(r == json.JsonError.wrong_type)
+    }
+    switch r in json.field_int(doc, name = "s") {
+    case i64:
+        expect(false)
+    case json.JsonError:
+        expect(r == json.JsonError.wrong_type)
+    }
+    switch r in json.field_bool(doc, name = "a") {
+    case bool:
+        expect(false)
+    case json.JsonError:
+        expect(r == json.JsonError.wrong_type)
+    }
+    let lista = json.field(doc, name = "l") or_else json.Json{no = none, dono = false}
+    switch r in json.field(lista, name = "a") {
+    case json.Json:
+        expect(false)
+    case json.JsonError:
+        expect(r == json.JsonError.wrong_type)
+    }
+}
+
+test "indice fora da lista e item em quem nao e lista" {
+    let doc = json.parse("{\"l\": [10, 20], \"o\": {}}") or_else json.Json{no = none, dono = false}
+    defer json.close(doc)
+    let lista = json.field(doc, name = "l") or_else json.Json{no = none, dono = false}
+    expect(json.size(lista) == 2)
+    switch r in json.item(lista, index = 2) {
+    case json.Json:
+        expect(false)
+    case json.JsonError:
+        expect(r == json.JsonError.missing)
+    }
+    switch r in json.item(lista, index = -1) {
+    case json.Json:
+        expect(false)
+    case json.JsonError:
+        expect(r == json.JsonError.missing)
+    }
+    switch r in json.item(doc, index = 0) {
+    case json.Json:
+        expect(false)
+    case json.JsonError:
+        expect(r == json.JsonError.wrong_type)
+    }
+    let ultimo = json.item(lista, index = 1) or_else json.Json{no = none, dono = false}
+    expect((json.integer(ultimo) or_else -1) == 20)
+}
+
+test "tipos, valores e texto com acento" {
+    let doc = json.parse("{\"n\": 2.5, \"t\": \"a\\\"b\\u00e9\", \"b\": false, \"z\": null, \"l\": [], \"o\": {}}") or_else json.Json{no = none, dono = false}
+    defer json.close(doc)
+    expect(json.kind(json.field(doc, name = "n") or_else doc) == json.JsonKind.number)
+    expect(json.kind(json.field(doc, name = "t") or_else doc) == json.JsonKind.text)
+    expect(json.kind(json.field(doc, name = "b") or_else doc) == json.JsonKind.boolean)
+    expect(json.kind(json.field(doc, name = "z") or_else doc) == json.JsonKind.null)
+    expect(json.kind(json.field(doc, name = "l") or_else doc) == json.JsonKind.list)
+    expect(json.kind(json.field(doc, name = "o") or_else doc) == json.JsonKind.object)
+    expect((json.field_int(doc, name = "n") or_else -1) == 2)
+    expect((json.field_bool(doc, name = "b") or_else true) == false)
+    let t = json.field_text(doc, name = "t") or_else "?"
+    expect(t == "a\"bé")
+    expect(json.size(doc) == 6)
+    expect((json.key(doc, index = 0) or_else "?") == "n")
+    expect((json.key(doc, index = 5) or_else "?") == "o")
+}
+
+test "arquivo inexistente e manifesto de clipes" {
+    switch r in json.parse_file("nao_existe.json") {
+    case json.Json:
+        expect(false)
+    case json.JsonError:
+        expect(r == json.JsonError.file)
+    }
+    let doc = json.parse_file("manifesto_clipes.json") or_else json.Json{no = none, dono = false}
+    defer json.close(doc)
+    expect((json.field_text(doc, name = "modelo") or_else "?") == "aguia")
+    expect((json.field_bool(doc, name = "carregar_tudo") or_else true) == false)
+    let clipes = json.field(doc, name = "clipes") or_else doc
+    expect(json.size(clipes) == 3)
+    let terceiro = json.item(clipes, index = 2) or_else doc
+    expect((json.field_text(terceiro, name = "nome") or_else "?") == "bater_asas")
+    expect((json.field_bool(terceiro, name = "laco") or_else true) == false)
+}
+
+// true se get_path(doc, path) falha com `erro` e grava `pos` em at.
+proc path_fails(doc: json.Json, path: str, erro: json.JsonError, pos: int) -> bool {
+    var onde: int = -1
+    switch r in json.get_path(doc, path = path, at = &onde) {
+    case json.Json:
+        return false
+    case json.JsonError:
+        return r == erro and onde == pos
+    }
+    return false
+}
+
+// Idem para a leitura de texto de path_text.
+proc text_fails(doc: json.Json, path: str, erro: json.JsonError, pos: int) -> bool {
+    var onde: int = -1
+    switch r in json.path_text(doc, path = path, at = &onde) {
+    case str:
+        return false
+    case json.JsonError:
+        return r == erro and onde == pos
+    }
+    return false
+}
+
+// Poe n objetos {"id": i, "nome": "item i"} na lista.
+proc encher(lista: json.Json, n: int) -> ! json.JsonError {
+    for i in 0..<n {
+        let o = try json.push_object(lista)
+        try json.set_number(o, name = "id", value = i as f64)
+        let rotulo = format(f"item {i}", alloc = heap)
+        defer delete(rotulo)
+        try json.set_text(o, name = "nome", value = rotulo)
+    }
+}
+
+test "get_path em documento aninhado: campo, indice, indice inicial e caminho vazio" {
+    let doc = json.parse("{\"a\": {\"b\": [{\"c\": \"um\", \"n\": 5}, {\"c\": \"dois\"}, 7]}, \"m\": [[1, 2], [3, 4]]}") or_else json.Json{no = none, dono = false}
+    defer json.close(doc)
+    expect((json.path_text(doc, path = "a.b[0].c") or_else "?") == "um")
+    expect((json.path_text(doc, path = "a.b[1].c") or_else "?") == "dois")
+    expect((json.path_int(doc, path = "a.b[2]") or_else -1) == 7)
+    expect((json.path_int(doc, path = "m[1][0]") or_else -1) == 3)
+    expect((json.path_int(doc, path = "m[0][1]") or_else -1) == 2)
+    let b = json.get_path(doc, path = "a.b") or_else doc
+    expect(json.size(b) == 3)
+    let todo = json.get_path(doc, path = "") or_else b
+    expect(json.size(todo) == 2)
+    var onde: int = 99
+    let ok = json.get_path(doc, path = "a.b[0]", at = &onde) or_else doc
+    expect(onde == 99)
+    expect(json.size(ok) == 2)
+    let lista = json.parse("[{\"x\": 3}, [8]]") or_else json.Json{no = none, dono = false}
+    defer json.close(lista)
+    expect((json.path_int(lista, path = "[0].x") or_else -1) == 3)
+    expect((json.path_int(lista, path = "[1][0]") or_else -1) == 8)
+}
+
+test "get_path: missing e wrong_type apontam o segmento que falhou" {
+    let doc = json.parse("{\"a\": {\"b\": [{\"c\": \"um\"}, 7], \"s\": \"x\"}, \"z\": null, \"t\": true, \"n\": 1.5}") or_else json.Json{no = none, dono = false}
+    defer json.close(doc)
+    expect(path_fails(doc, "zz", json.JsonError.missing, 0))
+    expect(path_fails(doc, "a.x", json.JsonError.missing, 2))
+    expect(path_fails(doc, "a.b[2]", json.JsonError.missing, 3))
+    expect(path_fails(doc, "a.b[99999999999999999999]", json.JsonError.missing, 3))
+    expect(path_fails(doc, "a.b[0].d", json.JsonError.missing, 7))
+    expect(path_fails(doc, "[0]", json.JsonError.wrong_type, 0))
+    expect(path_fails(doc, "a[0]", json.JsonError.wrong_type, 1))
+    expect(path_fails(doc, "a.b.c", json.JsonError.wrong_type, 4))
+    expect(path_fails(doc, "a.s.c", json.JsonError.wrong_type, 4))
+    expect(path_fails(doc, "z.c", json.JsonError.wrong_type, 2))
+    expect(path_fails(doc, "t.c", json.JsonError.wrong_type, 2))
+    expect(path_fails(doc, "n[0]", json.JsonError.wrong_type, 1))
+    expect(path_fails(doc, "a.s[0]", json.JsonError.wrong_type, 3))
+}
+
+test "get_path: sintaxe invalida da invalid_path e a posicao" {
+    let doc = json.parse("{\"a\": {\"b\": [1, 2]}}") or_else json.Json{no = none, dono = false}
+    defer json.close(doc)
+    expect(path_fails(doc, ".", json.JsonError.invalid_path, 0))
+    expect(path_fails(doc, ".a", json.JsonError.invalid_path, 0))
+    expect(path_fails(doc, "a.", json.JsonError.invalid_path, 2))
+    expect(path_fails(doc, "a..b", json.JsonError.invalid_path, 2))
+    expect(path_fails(doc, "a.[0]", json.JsonError.invalid_path, 2))
+    expect(path_fails(doc, "a.b[x]", json.JsonError.invalid_path, 3))
+    expect(path_fails(doc, "a.b[", json.JsonError.invalid_path, 3))
+    expect(path_fails(doc, "a.b[1", json.JsonError.invalid_path, 3))
+    expect(path_fails(doc, "a.b[]", json.JsonError.invalid_path, 3))
+    expect(path_fails(doc, "a.b[-1]", json.JsonError.invalid_path, 3))
+    expect(path_fails(doc, "a.b[1]]", json.JsonError.invalid_path, 6))
+    expect(path_fails(doc, "a]", json.JsonError.invalid_path, 1))
+    expect(path_fails(doc, "]", json.JsonError.invalid_path, 0))
+    expect(path_fails(doc, "[x]", json.JsonError.invalid_path, 0))
+    expect(path_fails(doc, "[", json.JsonError.invalid_path, 0))
+    expect(path_fails(doc, "a b", json.JsonError.missing, 0))
+}
+
+test "path_text, path_int, path_number e path_bool: valor e erro de leitura com at" {
+    let doc = json.parse("{\"a\": {\"b\": [{\"c\": \"um\", \"n\": 5, \"f\": 1.5, \"t\": true}, 7]}, \"s\": \"x\"}") or_else json.Json{no = none, dono = false}
+    defer json.close(doc)
+    expect((json.path_int(doc, path = "a.b[0].n") or_else -1) == 5)
+    expect((json.path_number(doc, path = "a.b[0].f") or_else -1.0) == 1.5)
+    expect((json.path_bool(doc, path = "a.b[0].t") or_else false))
+    expect((json.path_text(doc, path = "s") or_else "?") == "x")
+    expect(text_fails(doc, "a.b[0].n", json.JsonError.wrong_type, 7))
+    expect(text_fails(doc, "a.b[1]", json.JsonError.wrong_type, 3))
+    expect(text_fails(doc, "s.q", json.JsonError.wrong_type, 2))
+    expect(text_fails(doc, "a.b[0].zz", json.JsonError.missing, 7))
+    expect(text_fails(doc, "a..b", json.JsonError.invalid_path, 2))
+    var onde: int = -1
+    switch r in json.path_int(doc, path = "a.b[0].c", at = &onde) {
+    case i64:
+        expect(false)
+    case json.JsonError:
+        expect(r == json.JsonError.wrong_type and onde == 7)
+    }
+    switch r in json.path_number(doc, path = "s", at = &onde) {
+    case f64:
+        expect(false)
+    case json.JsonError:
+        expect(r == json.JsonError.wrong_type and onde == 0)
+    }
+    switch r in json.path_bool(doc, path = "a.b[0].n", at = &onde) {
+    case bool:
+        expect(false)
+    case json.JsonError:
+        expect(r == json.JsonError.wrong_type and onde == 7)
+    }
+}
+
+test "remove_field e remove_item apagam, dao missing e wrong_type, e o dump confirma" {
+    let doc = json.parse("{\"a\": 1, \"b\": [10, 20, 30], \"c\": {\"d\": 1}}") or_else json.Json{no = none, dono = false}
+    defer json.close(doc)
+    let b = json.field(doc, name = "b") or_else doc
+    switch r in json.remove_item(b, index = 1) {
+    case json.JsonError:
+        expect(false)
+    default:
+        expect(true)
+    }
+    switch r in json.remove_field(doc, name = "a") {
+    case json.JsonError:
+        expect(false)
+    default:
+        expect(true)
+    }
+    switch r in json.remove_field(doc, name = "c") {
+    case json.JsonError:
+        expect(false)
+    default:
+        expect(true)
+    }
+    switch r in json.remove_field(doc, name = "a") {
+    case json.JsonError:
+        expect(r == json.JsonError.missing)
+    default:
+        expect(false)
+    }
+    switch r in json.remove_field(b, name = "x") {
+    case json.JsonError:
+        expect(r == json.JsonError.wrong_type)
+    default:
+        expect(false)
+    }
+    switch r in json.remove_item(b, index = 2) {
+    case json.JsonError:
+        expect(r == json.JsonError.missing)
+    default:
+        expect(false)
+    }
+    switch r in json.remove_item(b, index = -1) {
+    case json.JsonError:
+        expect(r == json.JsonError.missing)
+    default:
+        expect(false)
+    }
+    switch r in json.remove_item(doc, index = 0) {
+    case json.JsonError:
+        expect(r == json.JsonError.wrong_type)
+    default:
+        expect(false)
+    }
+    switch g in json.dump(doc, pretty = false) {
+    case str:
+        expect(g == "{\"b\":[10,30]}")
+        delete(g)
+    case json.JsonError:
+        expect(false)
+    }
+}
+
+test "push_bool, push_null e push_list; erro em quem nao e lista" {
+    let raiz = json.new_list() or_else json.Json{no = none, dono = false}
+    defer json.close(raiz)
+    switch r in json.push_bool(raiz, value = true) {
+    case json.JsonError:
+        expect(false)
+    default:
+        expect(true)
+    }
+    switch r in json.push_bool(raiz, value = false) {
+    case json.JsonError:
+        expect(false)
+    default:
+        expect(true)
+    }
+    switch r in json.push_null(raiz) {
+    case json.JsonError:
+        expect(false)
+    default:
+        expect(true)
+    }
+    let filha = json.push_list(raiz) or_else raiz
+    switch r in json.push_text(filha, value = "ok") {
+    case json.JsonError:
+        expect(false)
+    default:
+        expect(true)
+    }
+    expect(json.size(raiz) == 4)
+    expect((json.path_bool(raiz, path = "[0]") or_else false))
+    expect(not (json.path_bool(raiz, path = "[1]") or_else true))
+    expect(json.kind(json.item(raiz, index = 2) or_else raiz) == json.JsonKind.null)
+    expect((json.path_text(raiz, path = "[3][0]") or_else "?") == "ok")
+    let objeto = json.new_object() or_else json.Json{no = none, dono = false}
+    defer json.close(objeto)
+    switch r in json.push_bool(objeto, value = true) {
+    case json.JsonError:
+        expect(r == json.JsonError.wrong_type)
+    default:
+        expect(false)
+    }
+    switch r in json.push_null(objeto) {
+    case json.JsonError:
+        expect(r == json.JsonError.wrong_type)
+    default:
+        expect(false)
+    }
+    switch r in json.push_list(objeto) {
+    case json.Json:
+        expect(false)
+    case json.JsonError:
+        expect(r == json.JsonError.wrong_type)
+    }
+    switch g in json.dump(raiz, pretty = false) {
+    case str:
+        expect(g == "[true,false,null,[\"ok\"]]")
+        delete(g)
+    case json.JsonError:
+        expect(false)
+    }
+}
+
+test "UTF-8, aspas e escapes: nome e valor, dump ida e volta; nome vazio" {
+    let doc = json.new_object() or_else json.Json{no = none, dono = false}
+    defer json.close(doc)
+    let nome = "nomé ção"
+    let valor = "açaí \"x\" \\ barra\n linha"
+    switch r in json.set_text(doc, name = nome, value = valor) {
+    case json.JsonError:
+        expect(false)
+    default:
+        expect(true)
+    }
+    switch r in json.set_text(doc, name = "", value = "vazio") {
+    case json.JsonError:
+        expect(false)
+    default:
+        expect(true)
+    }
+    switch r in json.set_text(doc, name = "q\"uo", value = "") {
+    case json.JsonError:
+        expect(false)
+    default:
+        expect(true)
+    }
+    expect((json.field_text(doc, name = nome) or_else "?") == valor)
+    expect((json.field_text(doc, name = "") or_else "?") == "vazio")
+    expect(json.has_field(doc, name = ""))
+    expect(not json.has_field(doc, name = "nome"))
+    switch g in json.dump(doc, pretty = false) {
+    case str:
+        let volta = json.parse_str(g) or_else json.Json{no = none, dono = false}
+        expect((json.field_text(volta, name = nome) or_else "?") == valor)
+        expect((json.field_text(volta, name = "q\"uo") or_else "?") == "")
+        expect((json.field_text(volta, name = "") or_else "?") == "vazio")
+        expect(json.size(volta) == 3)
+        json.close(volta)
+        delete(g)
+    case json.JsonError:
+        expect(false)
+    }
+    expect((json.path_text(doc, path = "nomé ção") or_else "?") == valor)
+    expect(path_fails(doc, "q\"uo.x", json.JsonError.wrong_type, 5))
+}
+
+test "documento grande: 1000 itens, get_path em laco, remocao e nada vaza" {
+    let raiz = json.new_list() or_else json.Json{no = none, dono = false}
+    defer json.close(raiz)
+    switch r in encher(raiz, 1000) {
+    case json.JsonError:
+        expect(false)
+    default:
+        expect(true)
+    }
+    expect(json.size(raiz) == 1000)
+    var erradas: int = 0
+    for i in 0..<1000 {
+        let caminho = format(f"[{i}].id", alloc = heap)
+        let nome_do_item = format(f"[{i}].nome", alloc = heap)
+        let id = json.path_int(raiz, path = caminho) or_else -1
+        let nome = json.path_text(raiz, path = nome_do_item) or_else "?"
+        let esperado = format(f"item {i}", alloc = heap)
+        if id != i or nome != esperado {
+            erradas += 1
+        }
+        delete(caminho)
+        delete(nome_do_item)
+        delete(esperado)
+    }
+    expect(erradas == 0)
+    for _k in 0..<500 {
+        switch r in json.remove_item(raiz, index = 0) {
+        case json.JsonError:
+            expect(false)
+        default:
+            expect(true)
+        }
+    }
+    expect(json.size(raiz) == 500)
+    expect((json.path_int(raiz, path = "[0].id") or_else -1) == 500)
+    expect((json.path_text(raiz, path = "[499].nome") or_else "?") == "item 999")
+    expect(path_fails(raiz, "[500].id", json.JsonError.missing, 0))
+    switch g in json.dump(raiz, pretty = true) {
+    case str:
+        let volta = json.parse_str(g) or_else json.Json{no = none, dono = false}
+        expect(json.size(volta) == 500)
+        json.close(volta)
+        delete(g)
+    case json.JsonError:
+        expect(false)
+    }
+}
+
+test "criar, gerar e reabrir da o mesmo conteudo" {
+    let saida = json.new_object() or_else json.Json{no = none, dono = false}
+    defer json.close(saida)
+    switch r in json.set_text(saida, name = "k", value = "v") {
+    case json.JsonError:
+        expect(false)
+    default:
+        expect(true)
+    }
+    let lista = json.set_list(saida, name = "l") or_else saida
+    switch r in json.push_number(lista, value = 1.0) {
+    case json.JsonError:
+        expect(false)
+    default:
+        expect(true)
+    }
+    switch g in json.dump(saida, pretty = false) {
+    case str:
+        expect(g == "{\"k\":\"v\",\"l\":[1]}")
+        let volta = json.parse_str(g) or_else json.Json{no = none, dono = false}
+        expect((json.field_text(volta, name = "k") or_else "?") == "v")
+        json.close(volta)
+        delete(g)
+    case json.JsonError:
+        expect(false)
+    }
+    switch r in json.set_number(lista, name = "x", value = 1.0) {
+    case json.JsonError:
+        expect(r == json.JsonError.wrong_type)
+    default:
+        expect(false)
+    }
+}

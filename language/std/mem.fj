@@ -1,0 +1,192 @@
+// std:mem - alocadores Arena e Pool da Forja (Linguagem v1.8). API em ingles (ADR-39); o corpo chama o runtime direto.
+// Changelog: 0.4.0 - M6 P71b: track_handle(kind, h) e untrack_handle(h) (D-M6-8): handle de lib C no rastreador de DEV; vivo no fim = R0009 "tipo":"handle", untrack de desconhecido = R0008; em release as chamadas somem.
+//            0.3.0 - M6 P71a: snapshot() e report_since(&s) (D-M6-8): contadores do rastreador de heap de DEV; em release o compilador tira as chamadas (custo zero). track_handle/untrack_handle ficam para o P71b.
+//            0.2.0 - M5 P52: VirtualArena (va_reserve, va_alloc, va_reset, va_committed, va_release) sobre 4 primitivas do runtime (forja_varena_*, rt_varena_win.c); o bump pointer e o commit sob demanda sao Forja pura.
+foreign {
+    proc forja_arena_criar(bloco: int) -> u32
+    proc forja_arena_limpar(id: u32)
+    proc forja_arena_destruir(id: u32)
+    proc forja_arena_usado(id: u32) -> int
+    proc forja_pool_criar(por_bloco: int) -> u32
+    proc forja_pool_destruir(id: u32)
+    proc forja_pool_vivos(id: u32) -> int
+}
+
+pub struct Arena {
+    id: u32 = 0
+}
+
+pub struct Pool {
+    id: u32 = 0
+}
+
+pub proc arena_create(block_size: int = 65536) -> Arena {
+    return Arena{id = forja_arena_criar(block_size)}
+}
+
+pub proc arena_reset(a: Arena) {
+    forja_arena_limpar(a.id)
+}
+
+pub proc arena_destroy(a: Arena) {
+    forja_arena_destruir(a.id)
+}
+
+pub proc arena_used(a: Arena) -> int {
+    return forja_arena_usado(a.id)
+}
+
+pub proc pool_create(per_block: int = 64) -> Pool {
+    return Pool{id = forja_pool_criar(per_block)}
+}
+
+pub proc pool_destroy(p: Pool) {
+    forja_pool_destruir(p.id)
+}
+
+pub proc pool_live(p: Pool) -> int {
+    return forja_pool_vivos(p.id)
+}
+
+// Snapshot e report_since (M6 P71a): so o rastreador de DEV conta; em release as duas chamadas somem no compilador (lista fechada, bir_somem.c) e estes foreign nem entram no exe.
+foreign {
+    proc forja_memsnap_serie() -> u32
+    proc forja_memsnap_vivos() -> int
+    proc forja_memsnap_bytes() -> int
+    proc forja_memsnap_relatar(serie: u32, vivos: int, bytes: int)
+}
+
+// Retrato dos contadores do heap por valor: serie = o nascimento do proximo bloco (separa os nascidos depois), vivos e bytes = blocos de heap vivos nesse momento.
+pub struct MemSnapshot {
+    serie: u32 = 0
+    vivos: int = 0
+    bytes: int = 0
+}
+
+// Tira o retrato dos contadores. Em release devolve zeros (a chamada some).
+pub proc snapshot() -> MemSnapshot {
+    return MemSnapshot{serie = forja_memsnap_serie(), vivos = forja_memsnap_vivos(), bytes = forja_memsnap_bytes()}
+}
+
+// Escreve UMA linha JSON no stderr ({"tipo": "mem_report", ...}) com os blocos de heap nascidos depois de s e ainda vivos, agrupados por local (arquivo:linha) + pilha, os 20 de mais bytes.
+pub proc report_since(s: ^MemSnapshot) {
+    forja_memsnap_relatar(s.serie, s.vivos, s.bytes)
+}
+
+// Handles de lib C (M6 P71b): o rastreador de DEV guarda o handle com a pilha de quem o registrou; vivo no fim do programa = R0009 "tipo":"handle" (exit 101); em release as duas chamadas somem
+// (como assert com NDEBUG em C: os argumentos nao tem efeito algum).
+foreign {
+    proc forja_handle_track(kind: cstr, h: rawptr)
+    proc forja_handle_untrack(h: rawptr)
+}
+
+// Registra h (ponteiro/handle devolvido por uma lib C) como vivo; kind (copiado, ate 47 bytes) so nomeia o recurso no relatorio. Registrar de novo o mesmo h so atualiza kind e pilha. h nulo e ignorado.
+pub proc track_handle(kind: cstr, h: rawptr) {
+    forja_handle_track(kind, h)
+}
+
+// Tira h do rastreio quando a lib C o liberou. h que nunca foi registrado (ou ja saiu) = R0008. h nulo e ignorado.
+pub proc untrack_handle(h: rawptr) {
+    forja_handle_untrack(h)
+}
+
+// VirtualArena (M5 P52): reserva de espaco de enderecos sem commit; a RAM so entra quando va_alloc usa a pagina (commit sob demanda, em passos de 64 KiB).
+foreign {
+    proc forja_varena_reservar(tam: int) -> int
+    proc forja_varena_commit(endereco: int, tam: int) -> i32
+    proc forja_varena_liberar(endereco: int)
+    proc forja_varena_ponteiro(endereco: int) -> rawptr
+}
+
+// Passo do commit e granularidade da reserva: 64 KiB, o tamanho de regiao do Windows.
+const VARENA_PASSO: int = 65536
+// Acima disso nao ha reserva possivel (64 TiB): recusa antes de a conta de inteiro estourar.
+const VARENA_LIMITE: int = 70368744177664
+
+// Erro do VirtualArena: sem_reserva = o sistema nao reservou; sem_memoria = o commit foi recusado; esgotada = o alloc passa do reservado; invalido = bytes ou align <= 0, ou arena sem va_reserve.
+pub enum VarenaError { sem_reserva, sem_memoria, esgotada, invalido }
+
+// base = inicio da reserva (0 = nao reservada; valor zero valido); reservado, usado (bump pointer) e commitado em bytes.
+pub struct VirtualArena {
+    base: int = 0
+    reservado: int = 0
+    usado: int = 0
+    commitado: int = 0
+}
+
+// Arredonda para cima num multiplo de VARENA_PASSO.
+proc arredondar_passo(valor: int) -> int {
+    return (valor + VARENA_PASSO - 1) / VARENA_PASSO * VARENA_PASSO
+}
+
+// Reserva bytes (arredondado para 64 KiB) sem commit: nao ocupa RAM ate va_alloc usar as paginas.
+pub proc va_reserve(bytes: int) -> VirtualArena ! VarenaError {
+    if bytes <= 0 {
+        return VarenaError.invalido
+    }
+    if bytes > VARENA_LIMITE {
+        return VarenaError.sem_reserva
+    }
+    let tamanho = arredondar_passo(bytes)
+    let base = forja_varena_reservar(tamanho)
+    if base == 0 {
+        return VarenaError.sem_reserva
+    }
+    return VirtualArena{base = base, reservado = tamanho}
+}
+
+// Commita de commitado ate fim (arredondado para 64 KiB e limitado ao reservado). false = o sistema recusou.
+proc commitar_ate(va: ^VirtualArena, fim: int) -> bool {
+    var ate = arredondar_passo(fim)
+    if ate > va.reservado {
+        ate = va.reservado
+    }
+    if forja_varena_commit(va.base + va.commitado, ate - va.commitado) == 0 {
+        return false
+    }
+    va.commitado = ate
+    return true
+}
+
+// Bump pointer: o bloco comeca no proximo multiplo de align, cabe no reservado e commita so o que falta. Devolve o endereco do bloco.
+pub proc va_alloc(va: ^VirtualArena, bytes: int, align: int) -> rawptr ! VarenaError {
+    if va.base == 0 or bytes <= 0 or align <= 0 {
+        return VarenaError.invalido
+    }
+    if align > va.reservado {
+        return VarenaError.esgotada
+    }
+    let inicio = (va.usado + align - 1) / align * align
+    if bytes > va.reservado - inicio {
+        return VarenaError.esgotada
+    }
+    let fim = inicio + bytes
+    if fim > va.commitado {
+        if not commitar_ate(va, fim) {
+            return VarenaError.sem_memoria
+        }
+    }
+    va.usado = fim
+    return forja_varena_ponteiro(va.base + inicio)
+}
+
+// Volta o bump pointer a 0 sem devolver nem recommitar: a memoria fica commitada para o proximo ciclo.
+pub proc va_reset(va: ^VirtualArena) {
+    va.usado = 0
+}
+
+// Bytes commitados (RAM que a arena ja ocupou). Zero logo depois de va_reserve.
+pub proc va_committed(va: VirtualArena) -> int {
+    return va.commitado
+}
+
+// Devolve a reserva inteira ao sistema e zera a arena. Chamar de novo e seguro (base 0 nao faz nada).
+pub proc va_release(va: ^VirtualArena) {
+    if va.base != 0 {
+        forja_varena_liberar(va.base)
+    }
+    va.base = 0
+    va.reservado = 0
+    va.usado = 0
+    va.commitado = 0
+}

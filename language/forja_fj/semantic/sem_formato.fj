@@ -1,0 +1,314 @@
+// semantic/sem_formato.fj - porte de compiler/semantic/sem_formato.c
+// sha256 de semantic/sem_formato.c: 5a9118963b94b93979f1a87ce0eacb230e201a9410c098b6620877eaa24a82fc
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "std:text"
+import "common"
+import "frontend"
+
+// C: semantic/sem_formato.c:13
+proc eh_digito(c: u8) -> bool {
+    return (common.c2f_char_i32(c) >= 48) and (common.c2f_char_i32(c) <= 57) // '0' '9'
+}
+
+// C: semantic/sem_formato.c:16
+// C2F-17: o cursor `const char **p` virou (texto, indice ^int); `**p` = c2f_nul_em (0 alem do fim, como o NUL do C)
+proc ler_digitos(texto: str, p: ^int, maximo: u32, valor: ^u32) -> bool {
+    var v: u32 = 0
+    if not eh_digito(common.c2f_nul_em(texto, p^)) {
+        return false
+    }
+    while eh_digito(common.c2f_nul_em(texto, p^)) {
+        v = v * 10 + ((common.c2f_nul_em(texto, p^) as u32) - 48) // '0'
+        if v > maximo {
+            return false
+        }
+        p^ = p^ + 1
+    }
+    valor^ = v
+    return true
+}
+
+// C: semantic/sem_formato.c:30
+proc ler_largura(texto: str, p: ^int, fmt_c: ^u32) -> bool {
+    var largura: u32 = 0
+    if common.c2f_nul_em(texto, p^) == 48 { // '0'
+        fmt_c^ = fmt_c^ | (frontend.FMT_ZERO as u32)
+        p^ = p^ + 1
+        if (not ler_digitos(texto, p, 255, &largura)) or (largura == 0) {
+            return false
+        }
+    } else if eh_digito(common.c2f_nul_em(texto, p^)) and (not ler_digitos(texto, p, 255, &largura)) {
+        return false
+    }
+    fmt_c^ = fmt_c^ | largura
+    return true
+}
+
+// C: semantic/sem_formato.c:45
+proc ler_precisao(texto: str, p: ^int, fmt_c: ^u32) -> bool {
+    var precisao: u32 = 0
+    if common.c2f_nul_em(texto, p^) != 46 { // '.'
+        return true
+    }
+    p^ = p^ + 1
+    if (not eh_digito(common.c2f_nul_em(texto, p^))) or (not ler_digitos(texto, p, 30, &precisao)) {
+        return false
+    }
+    fmt_c^ = fmt_c^ | ((precisao + 1) << 8) // FMT_PRECISAO_DESLOC
+    return true
+}
+
+// C: semantic/sem_formato.c:56
+proc ler_formato(texto: str, fmt_c: ^u32) -> bool {
+    var p: int = 0
+    fmt_c^ = 0
+    if common.c2f_nul_em(texto, p) == 0 {
+        return false
+    }
+    if (not ler_largura(texto, &p, fmt_c)) or (not ler_precisao(texto, &p, fmt_c)) {
+        return false
+    }
+    if common.c2f_nul_em(texto, p) == 120 { // 'x'
+        fmt_c^ = fmt_c^ | (frontend.FMT_HEX as u32)
+        p = p + 1
+    }
+    return common.c2f_nul_em(texto, p) == 0
+}
+
+// C: semantic/sem_formato.c:69
+proc tipo_de_formato_aceito(s: ^Semantica, t: u32) -> bool {
+    return ((((common.c2f_b2i32(tipo_eh_inteiro(t)) != 0) or (t == (TIPO_BOOL as u32))) or (t == (TIPO_STR as u32))) or (t == (TIPO_CSTR as u32))) or (common.c2f_b2i32(tipo_eh_real(&s.tipos, t)) != 0)
+}
+
+// C: semantic/sem_formato.c:75
+proc conferir_formato_do_tipo(s: ^Semantica, fmt_c: u32, t: u32, pos: u32) -> bool {
+    if (((fmt_c >> 8) & (frontend.FMT_PRECISAO_MASCARA as u32)) != 0) and (not tipo_eh_real(&s.tipos, t)) {
+        let msg_1 = format(f"'.precisao' so vale para real (f32, f64, unidade)", alloc = heap)
+        defer delete(msg_1)
+        return sem_erro(s, common.E0315, pos, msg_1)
+    }
+    if ((fmt_c & (frontend.FMT_HEX as u32)) != 0) and (not tipo_eh_sem_sinal(t)) {
+        let msg_2 = format(f"'x' so vale para inteiro sem sinal: converta com 'as u64'", alloc = heap)
+        defer delete(msg_2)
+        return sem_erro(s, common.E0315, pos, msg_2)
+    }
+    if ((fmt_c & (frontend.FMT_ZERO as u32)) != 0) and (not tipo_eh_numerico(&s.tipos, t)) {
+        let msg_3 = format(f"'0' so vale para numero", alloc = heap)
+        defer delete(msg_3)
+        return sem_erro(s, common.E0315, pos, msg_3)
+    }
+    return true
+}
+
+// C: semantic/sem_formato.c:92
+proc campos_depuraveis(s: ^Semantica, t: u32, culpado: ^u32) -> bool {
+    let estrutura: ?^frontend.Decl = sem_decl_da_struct(s, t)
+    if (estrutura == none) or (common.c2f_b2i32((estrutura as ^frontend.Decl).externo) != 0) {
+        culpado^ = t
+        return false
+    }
+    var k: u32 = 0
+    while k < (estrutura as ^frontend.Decl).ncampos {
+        if not tipo_depuravel(s, ((estrutura as ^frontend.Decl).campos or_else {})[k].tipo.tipo, culpado) {
+            return false
+        }
+        k += 1
+    }
+    return true
+}
+
+// C: semantic/sem_formato.c:107
+proc tipo_depuravel(s: ^Semantica, t: u32, culpado: ^u32) -> bool {
+    let classe: i32 = tipo_classe_de(&s.tipos, t)
+    if (common.c2f_b2i32(tipo_de_formato_aceito(s, t)) != 0) or (common.c2f_s2u_32(classe) == (TC_ENUM as u32)) {
+        return true
+    }
+    if common.c2f_s2u_32(classe) == (TC_ARRAY as u32) {
+        return tipo_depuravel(s, tipo_de(&s.tipos, t).a, culpado)
+    }
+    if common.c2f_s2u_32(classe) == (TC_STRUCT as u32) {
+        return campos_depuraveis(s, t, culpado)
+    }
+    culpado^ = t
+    return false
+}
+
+// C: semantic/sem_formato.c:118
+proc chave_depurar(s: ^Semantica, a: ^frontend.Arg, texto: str) -> bool {
+    var culpado: u32 = (a.valor as ^frontend.Expr).tipo
+    var tipo: [96]u8 = {}
+    if texto != "?" {
+        let msg_1 = format(f"':?' nao combina com largura, precisao, zeros nem hex: escreva so {{expr:?}}", alloc = heap)
+        defer delete(msg_1)
+        return sem_erro(s, common.E0315, a.pos_nome, msg_1)
+    }
+    if not tipo_depuravel(s, (a.valor as ^frontend.Expr).tipo, &culpado) {
+        sem_descrever(s, culpado, tipo[..], 96)
+        let nome_tipo = from_bytes(tipo[0..<common.c2f_strlen_b(tipo[..])], alloc = heap)
+        defer delete(nome_tipo)
+        let msg_2 = format(f"':?' ainda nao mostra {nome_tipo}", alloc = heap)
+        defer delete(msg_2)
+        return sem_erro(s, common.E0315, (a.valor as ^frontend.Expr).pos, msg_2)
+    }
+    a.indice = frontend.FMT_DEPURAR
+    return true
+}
+
+// C: semantic/sem_formato.c:134
+proc conferir_chave(s: ^Semantica, a: ^frontend.Arg) -> bool {
+    var fmt_c: u32 = 0
+    var tipo: [96]u8 = {}
+    if a.nome >= 0 {
+        if text.index_byte(sem_nome_texto(s, a.nome), 63) != none { // '?'
+            return chave_depurar(s, a, sem_nome_texto(s, a.nome))
+        }
+    }
+    if not tipo_de_formato_aceito(s, (a.valor as ^frontend.Expr).tipo) {
+        sem_descrever(s, (a.valor as ^frontend.Expr).tipo, tipo[..], 96)
+        let nome_tipo = from_bytes(tipo[0..<common.c2f_strlen_b(tipo[..])], alloc = heap)
+        defer delete(nome_tipo)
+        let msg_1 = format(f"{{...}} de tipo {nome_tipo} nao se formata: aceitos inteiros, bool, str, cstr, f32, f64 e unidade", alloc = heap)
+        defer delete(msg_1)
+        return sem_erro(s, common.E0315, (a.valor as ^frontend.Expr).pos, msg_1)
+    }
+    if a.nome >= 0 {
+        let texto = sem_nome_texto(s, a.nome)
+        if not ler_formato(texto, &fmt_c) {
+            let msg_2 = format(f"formato '{texto}' invalido: use [0][largura 1..255][.precisao 0..30][x]", alloc = heap)
+            defer delete(msg_2)
+            return sem_erro(s, common.E0315, a.pos_nome, msg_2)
+        }
+        if not conferir_formato_do_tipo(s, fmt_c, (a.valor as ^frontend.Expr).tipo, a.pos_nome) {
+            return false
+        }
+    }
+    if tipo_eh_real(&s.tipos, (a.valor as ^frontend.Expr).tipo) and (((fmt_c >> 8) & (frontend.FMT_PRECISAO_MASCARA as u32)) == 0) {
+        fmt_c = fmt_c | (frontend.FMT_CURTO as u32) // Ryu P2: real sem precisao = Display curto
+    }
+    a.indice = fmt_c as i32
+    return true
+}
+
+// C: semantic/sem_formato.c:155
+proc chave_do_f_texto(s: ^Semantica, a: ^frontend.Arg) -> bool {
+    return (common.c2f_b2i32(sem_expr(s, a.valor, TIPO_VAZIO as u32)) != 0) and (common.c2f_b2i32(conferir_chave(s, a)) != 0)
+}
+
+// C: semantic/sem_formato.c:161
+proc sem_f_texto_do_argumento(s: ^Semantica, chamada: ^frontend.Expr) -> bool {
+    let valor: ?^frontend.Expr = (chamada.args or_else {})[0].valor
+    let arena: ^common.Arena = s.arena as ^common.Arena
+    // C2F-20: new(Expr, alloc = arena) e E1003 fora do pacote frontend; o no sai de uma lista de 1 elemento na arena (a arena nunca libera nem move)
+    var no_texto = make([dynamic]frontend.Expr, alloc = common.arena_mem(arena), cap = 1)
+    append(&no_texto, item = frontend.Expr{})
+    let texto: ^frontend.Expr = &no_texto[0]
+    let partes: []frontend.Arg = frontend.arena_fatia_arg(arena, 1)
+    partes[0] = frontend.Arg{nome = -1, pos_nome = (valor as ^frontend.Expr).pos, valor = valor, indice = 0}
+    texto.tipo_no = frontend.EX_FTEXTO as u8
+    texto.pos = (valor as ^frontend.Expr).pos
+    texto.pos_op = (valor as ^frontend.Expr).pos
+    texto.nargs = 1
+    texto.args = partes
+    texto.tipo = TIPO_STR as u32
+    if not conferir_chave(s, &partes[0]) {
+        return false
+    }
+    let args_chamada: []frontend.Arg = chamada.args or_else {}
+    args_chamada[0].valor = texto
+    return true
+}
+
+// C: semantic/sem_formato.c:177
+proc sem_f_texto(s: ^Semantica, e: ^frontend.Expr) -> bool {
+    e.tipo = TIPO_STR as u32
+    var i: u32 = 0
+    while i < e.nargs {
+        let a: ^frontend.Arg = &(e.args or_else {})[i]
+        var tern_1: i32 = 0
+        if a.indice < 0 {
+            tern_1 = common.c2f_b2i32(sem_checar(s, a.valor, TIPO_STR as u32))
+        } else {
+            tern_1 = common.c2f_b2i32(chave_do_f_texto(s, a))
+        }
+        let ok: bool = tern_1 != 0
+        if not ok {
+            return false
+        }
+        i += 1
+    }
+    return true
+}
+
+// C: semantic/sem_formato.c:189
+proc sem_chamar_formato(s: ^Semantica, e: ^frontend.Expr) -> bool {
+    if sem_formato_tem_into(s, e) {
+        return sem_chamar_formato_into(s, e) // L9f: format(f"...", into = &buf)
+    }
+    if not sem_ligar_embutido(s, e, s.params_format[..]) {
+        return false
+    }
+    let texto: ?^frontend.Expr = (e.args or_else {})[0].valor
+    if (texto as ^frontend.Expr).tipo_no != (frontend.EX_FTEXTO as u8) {
+        let msg_1 = format(f"format pede f\"...\" como 1o argumento", alloc = heap)
+        defer delete(msg_1)
+        return sem_erro(s, common.E0315, (texto as ^frontend.Expr).pos, msg_1)
+    }
+    if (not sem_f_texto(s, texto as ^frontend.Expr)) or (not sem_conferir_alocador(s, e, &(e.args or_else {})[1])) {
+        return false
+    }
+    if e.ref_id == frontend.EMB_FORMAT {
+        e.tipo = TIPO_STR as u32
+    } else {
+        e.tipo = TIPO_CSTR as u32
+    }
+    return true
+}
+
+// Valor de ler_formato (0xFFFFFFFF se recusa): FMT_ZERO 8192, FMT_HEX 16384, precisao + 1 em 8..12 (valores do C: sem_formato.c:56).
+proc teste_formato(texto: str) -> u32 {
+    var f: u32 = 12345
+    if not ler_formato(texto, &f) {
+        return 4294967295
+    }
+    return f
+}
+
+test "sem_formato: ler_formato largura, zeros, precisao e hex" {
+    expect(teste_formato("") == 4294967295)
+    expect(teste_formato("5") == 5)
+    expect(teste_formato("05") == 8197)
+    expect(teste_formato("0") == 4294967295)
+    expect(teste_formato("00") == 4294967295)
+    expect(teste_formato("255") == 255)
+    expect(teste_formato("256") == 4294967295)
+    expect(teste_formato("0255") == 8447)
+    expect(teste_formato(".3") == 1024)
+    expect(teste_formato("5.3") == 1029)
+    expect(teste_formato(".17") == 4608)
+    expect(teste_formato(".18") == 4864)
+    expect(teste_formato(".30") == 7936)
+    expect(teste_formato(".31") == 4294967295)
+    expect(teste_formato(".") == 4294967295)
+    expect(teste_formato("x") == 16384)
+    expect(teste_formato("08x") == 24584)
+    expect(teste_formato("05.2x") == 25349)
+    expect(teste_formato("5y") == 4294967295)
+    expect(teste_formato("x5") == 4294967295)
+    expect(teste_formato("5xx") == 4294967295)
+    expect(teste_formato("?") == 4294967295)
+}
+
+test "sem_formato: eh_digito e cursor de ler_digitos" {
+    expect(eh_digito(48) and eh_digito(57))
+    expect(not eh_digito(47) and not eh_digito(58) and not eh_digito(176) and not eh_digito(0))
+    var p: int = 0
+    var v: u32 = 7
+    expect(ler_digitos("12ab", &p, 255, &v) and p == 2 and v == 12)
+    p = 0
+    v = 7
+    expect(not ler_digitos("ab", &p, 255, &v) and p == 0 and v == 7)
+    p = 0
+    expect(not ler_digitos("1234", &p, 255, &v) and p == 3 and v == 7)
+}

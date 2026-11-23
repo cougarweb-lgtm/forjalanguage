@@ -1,0 +1,787 @@
+// std:file (antes std:arquivo) - ler e gravar um arquivo inteiro, em modo binario (Linguagem v1.11, M5 P26c). API em ingles (ADR-39); o corpo chama o runtime direto.
+// Versao: 0.8.0. Changelog: 0.8.0 - D-G3-L2b: lock no Linux (flock + unlink no close; so comentario aqui, o corpo nao muda). 0.7.0 - D-G3-L2a bloco D: lock (modo 4 de forja_fs_abrir: acesso exclusivo, apaga ao fechar) e FileError.locked (codigo 10). 0.6.0 - M6d P92f: posse de handle (creates em forja_fs_abrir, forja_arquivo_abrir_ler, forja_arquivo_criar, forja_fs_pasta_abrir; destroys nos fechar): File aberto e nao fechado = R0009 handle em dev. 0.5.0 - A52: make_temp_file e make_temp_dir (Forja pura sobre std:os: nome <prefixo>-<16 hex de random_bytes(8)>, CREATE_NEW exclusivo, ate 8 tentativas se ja existe); devolvem o caminho DONO do alocador do chamador. 0.4.0 -S3 P6 (D8): sistema de arquivos (exists, is_file, is_dir, stat, remove, rename, copy_file, make_dir, remove_dir, read_dir; FileKind, FileInfo, DirEntry, DirList) pelo runtime forja_fs_* e std:path. 0.3.0 - S3 P5b-1: handle de arquivo (File, OpenMode, SeekFrom; open, read, write, write_str, seek, tell, flush, close, append_str) pelo runtime forja_fs_* (rt_es_win.c, forja_rt_es.h); FileError ganha already_exists, is_directory, not_directory, not_empty, closed e unsupported (os 3 primeiros seguem na ordem); read_all, write_all e read_lines seguem com forja_arquivo_*. 0.2.0 - B01e2: read_all e read_lines ganham `alloc: Allocator` (ultimo parametro, sem padrao); a lista de bytes (e as de Lines) vem do alocador do chamador, o caminho em cstr continua temporario no heap.
+// Caminho em UTF-8 (acento e espaco valem no Windows). Sem traducao de fim de linha: os bytes vao e voltam como estao. Tamanho sempre em 64 bits.
+// Posse: read_all devolve a lista DONA dos bytes, do alocador que o chamador passou, ou o erro; quem recebe o valor da delete(data) (colecao: vale em qualquer alloc). Com o erro nao ha lista para liberar. Esquecer e R0009 em dev.
+import "std:path" as pastas
+import "std:os" as os
+
+foreign {
+    proc forja_arquivo_abrir_ler(caminho: cstr, erro: ^i32) -> u64 creates
+    proc forja_arquivo_criar(caminho: cstr, erro: ^i32) -> u64 creates
+    proc forja_arquivo_tamanho(arquivo: u64) -> i64
+    proc forja_arquivo_ler(arquivo: u64, destino: ^u8, quantos: i64) -> i64
+    proc forja_arquivo_gravar(arquivo: u64, origem: ^u8, quantos: i64) -> i64
+    proc forja_arquivo_fechar(arquivo: u64) -> i32 destroys arquivo
+    proc forja_fs_abrir(caminho: cstr, modo: i32, erro: ^i32) -> u64 creates
+    proc forja_fs_ler(h: u64, destino: ^u8, n: i64, erro: ^i32) -> i64
+    proc forja_fs_gravar(h: u64, origem: ^u8, n: i64, erro: ^i32) -> i64
+    proc forja_fs_posicionar(h: u64, desloc: i64, origem: i32, erro: ^i32) -> i64
+    proc forja_fs_descarregar(h: u64, erro: ^i32) -> i32
+    proc forja_fs_fechar(h: u64) destroys h
+    proc forja_fs_info(caminho: cstr, tamanho: ^i64, mtime_ns: ^i64, tipo: ^i32) -> i32
+    proc forja_fs_remover(caminho: cstr) -> i32
+    proc forja_fs_renomear(origem: cstr, destino: cstr) -> i32
+    proc forja_fs_copiar(origem: cstr, destino: cstr) -> i32
+    proc forja_fs_criar_pasta(caminho: cstr) -> i32
+    proc forja_fs_remover_pasta(caminho: cstr) -> i32
+    proc forja_fs_pasta_abrir(caminho: cstr, erro: ^i32) -> u64 creates
+    proc forja_fs_pasta_proximo(h: u64, destino: ^u8, n: i64, tipo: ^i32) -> i64
+    proc forja_fs_pasta_fechar(h: u64) destroys h
+}
+
+pub enum FileError { not_found, no_permission, other, already_exists, is_directory, not_directory, not_empty, closed, unsupported, locked }
+
+// Codigos neutros do runtime (rt_sys.h: SYS_ARQ_*; forja_rt_arquivo.h: FORJA_ARQ_*).
+const ARQUIVO_NAO_EXISTE: i32 = 1
+const ARQUIVO_SEM_PERMISSAO: i32 = 2
+// Bloco de leitura: 64 KiB na pilha (o tamanho do array e o mesmo valor).
+const ARQUIVO_BLOCO: i64 = 65536
+
+proc arquivo_erro(codigo: i32) -> FileError {
+    if codigo == ARQUIVO_NAO_EXISTE {
+        return FileError.not_found
+    }
+    if codigo == ARQUIVO_SEM_PERMISSAO {
+        return FileError.no_permission
+    }
+    return FileError.other
+}
+
+// Capacidade a reservar: o tamanho do arquivo, ou 0 quando o sistema nao sabe (dispositivo).
+proc arquivo_reserva(tamanho: i64) -> int {
+    if tamanho > 0 {
+        return tamanho as int
+    }
+    return 0
+}
+
+// Le o arquivo aberto direto no destino ate enche-lo ou chegar ao fim: devolve quantos bytes entraram, ou -1 na falha de leitura (L-05: sem laco por byte).
+proc arquivo_ler_direto(arquivo: u64, destino: []u8) -> i64 {
+    let alvo = len(destino) as i64
+    var total: i64 = 0
+    while total < alvo {
+        let lidos = forja_arquivo_ler(arquivo, destino = &destino[total], quantos = alvo - total)
+        if lidos < 0 {
+            return -1
+        }
+        if lidos == 0 {
+            break
+        }
+        total += lidos
+    }
+    return total
+}
+
+// Le o arquivo aberto ate o fim, bloco a bloco, anexando cada bloco de uma vez em dados (cobre o que passou do tamanho informado e o dispositivo sem tamanho). false = falha de leitura.
+proc arquivo_ler_blocos(arquivo: u64, dados: ^[dynamic]u8) -> bool {
+    var bloco: [65536]u8 = {}
+    var lidos: i64 = 1
+    while lidos > 0 {
+        lidos = forja_arquivo_ler(arquivo, destino = &bloco[0], quantos = ARQUIVO_BLOCO)
+        if lidos < 0 {
+            return false
+        }
+        append(dados, items = bloco[0..<lidos])
+    }
+    return true
+}
+
+// Le o arquivo todo: a lista com os bytes, ou o motivo (L-01: 'T ! E' com dono; try ou switch r in read_all(..)).
+pub proc read_all(path: str, alloc: Allocator) -> [dynamic]u8 ! FileError {
+    let c = format_c(f"{path}", alloc = heap)
+    defer delete(c)
+    var codigo: i32 = 0
+    let arquivo = forja_arquivo_abrir_ler(c, erro = &codigo)
+    if arquivo == 0 {
+        return arquivo_erro(codigo)
+    }
+    let tamanho = arquivo_reserva(forja_arquivo_tamanho(arquivo))
+    var dados = make([dynamic]u8, alloc = alloc, len = tamanho)
+    var ok = true
+    if tamanho > 0 {
+        let direto = arquivo_ler_direto(arquivo, destino = dados[..])
+        ok = direto >= 0
+        if ok {
+            resize(&dados, len = direto as int)
+        }
+    }
+    if ok {
+        ok = arquivo_ler_blocos(arquivo, dados = &dados)
+    }
+    let _fechou = forja_arquivo_fechar(arquivo)
+    if not ok {
+        delete(dados)
+        return FileError.other
+    }
+    return dados
+}
+
+// As linhas de um arquivo de texto (L-07). items sao visoes dentro de data (cada fim de linha virou um byte 0 la dentro): data e a dona dos bytes.
+// Posse: data e items vem do alocador que o chamador passou; quem recebe da delete(lines.items) e delete(lines.data); esquecer e R0009 em dev (com alloc heap). Nao acrescente em data enquanto usar items.
+pub struct Lines {
+    data: [dynamic]u8
+    items: [dynamic]str
+}
+
+const BYTE_FIM_DE_LINHA: u8 = 10
+const BYTE_RETORNO: u8 = 13
+
+// A linha que comeca em inicio, ja terminada por um byte 0 em dados: texto emprestado de dados.
+proc linha_em(dados: []u8, inicio: int) -> str {
+    return &dados[inicio] as rawptr as cstr as str
+}
+
+// Troca o fim de linha em dados[fim] (e o retorno de carro antes dele, se houver) por byte 0 e anota a linha que comecou em inicio.
+proc fechar_linha(dados: []u8, fim: int, inicio: int, itens: ^[dynamic]str) {
+    if fim > inicio and dados[fim - 1] == BYTE_RETORNO {
+        dados[fim - 1] = 0
+    }
+    dados[fim] = 0
+    append(itens, item = linha_em(dados, inicio))
+}
+
+// Le o arquivo todo e separa em linhas por LF ou CRLF; a ultima linha sem fim de linha vale, e um arquivo vazio tem zero linhas.
+pub proc read_lines(path: str, alloc: Allocator) -> Lines ! FileError {
+    var lines = Lines{data = try read_all(path, alloc = alloc), items = make([dynamic]str, alloc = alloc)}
+    let total = len(lines.data)
+    append(&lines.data, item = 0)
+    var inicio = 0
+    for i in 0..<total {
+        if lines.data[i] == BYTE_FIM_DE_LINHA {
+            fechar_linha(lines.data[..], fim = i, inicio = inicio, itens = &lines.items)
+            inicio = i + 1
+        }
+    }
+    if inicio < total {
+        fechar_linha(lines.data[..], fim = total, inicio = inicio, itens = &lines.items)
+    }
+    return lines
+}
+
+// Grava os bytes no arquivo, criando-o ou zerando o que havia; none quando deu certo.
+pub proc write_all(path: str, data: []u8) -> ?FileError {
+    let c = format_c(f"{path}", alloc = heap)
+    defer delete(c)
+    var codigo: i32 = 0
+    let arquivo = forja_arquivo_criar(c, erro = &codigo)
+    if arquivo == 0 {
+        return arquivo_erro(codigo)
+    }
+    var falhou = false
+    if len(data) > 0 {
+        falhou = forja_arquivo_gravar(arquivo, origem = &data[0], quantos = len(data) as i64) < 0
+    }
+    if forja_arquivo_fechar(arquivo) != 0 {
+        falhou = true
+    }
+    if falhou {
+        return FileError.other
+    }
+    return none
+}
+
+// Handle de arquivo (S3 P5b-1, D6): File guarda o handle opaco de forja_fs_* (rt_es_win.c); id = 0 = fechado. Quem abre fecha (close, ou defer close(&f)).
+pub struct File {
+    id: u64
+}
+
+pub enum OpenMode { read, write, append, create }
+
+pub enum SeekFrom { start, current, end }
+
+// Modo e origem na ordem do runtime (forja_rt_es.h: FORJA_FS_MODO_* e FORJA_FS_ORIGEM_*).
+const FS_MODO_LER: i32 = 0
+const FS_MODO_GRAVAR: i32 = 1
+const FS_MODO_ANEXAR: i32 = 2
+const FS_MODO_CRIAR: i32 = 3
+const FS_MODO_TRAVA: i32 = 4
+const FS_ORIGEM_INICIO: i32 = 0
+const FS_ORIGEM_ATUAL: i32 = 1
+const FS_ORIGEM_FIM: i32 = 2
+// Codigos neutros do handle que nao estao no bloco de leitura (FORJA_FS_ERR_*, 4..9).
+const FS_ERRO_JA_EXISTE: i32 = 4
+const FS_ERRO_DIRETORIO: i32 = 5
+const FS_ERRO_NAO_DIRETORIO: i32 = 6
+const FS_ERRO_NAO_VAZIO: i32 = 7
+const FS_ERRO_NAO_SUPORTADO: i32 = 8
+const FS_ERRO_FECHADO: i32 = 9
+const FS_ERRO_OCUPADO: i32 = 10
+
+// OpenMode -> codigo do runtime: read = existente so leitura; write = cria ou zera; append = acrescenta; create = falha se ja existe.
+proc modo_codigo(mode: OpenMode) -> i32 {
+    if mode == OpenMode.write {
+        return FS_MODO_GRAVAR
+    }
+    if mode == OpenMode.append {
+        return FS_MODO_ANEXAR
+    }
+    if mode == OpenMode.create {
+        return FS_MODO_CRIAR
+    }
+    return FS_MODO_LER
+}
+
+// SeekFrom -> origem do runtime (inicio, atual ou fim).
+proc origem_codigo(from: SeekFrom) -> i32 {
+    if from == SeekFrom.current {
+        return FS_ORIGEM_ATUAL
+    }
+    if from == SeekFrom.end {
+        return FS_ORIGEM_FIM
+    }
+    return FS_ORIGEM_INICIO
+}
+
+// Codigo neutro do handle -> FileError. Os codigos 1..3 valem como em arquivo_erro; 4..9 sao os novos membros.
+proc handle_erro(codigo: i32) -> FileError {
+    if codigo == ARQUIVO_NAO_EXISTE {
+        return FileError.not_found
+    }
+    if codigo == ARQUIVO_SEM_PERMISSAO {
+        return FileError.no_permission
+    }
+    if codigo == FS_ERRO_JA_EXISTE {
+        return FileError.already_exists
+    }
+    if codigo == FS_ERRO_DIRETORIO {
+        return FileError.is_directory
+    }
+    if codigo == FS_ERRO_NAO_DIRETORIO {
+        return FileError.not_directory
+    }
+    if codigo == FS_ERRO_NAO_VAZIO {
+        return FileError.not_empty
+    }
+    if codigo == FS_ERRO_NAO_SUPORTADO {
+        return FileError.unsupported
+    }
+    if codigo == FS_ERRO_FECHADO {
+        return FileError.closed
+    }
+    if codigo == FS_ERRO_OCUPADO {
+        return FileError.locked
+    }
+    return FileError.other
+}
+
+// Abre o arquivo no modo pedido. Caminho vazio = not_found (o runtime decide).
+pub proc open(path: str, mode: OpenMode) -> File ! FileError {
+    let c = format_c(f"{path}", alloc = heap)
+    defer delete(c)
+    var codigo: i32 = 0
+    let h = forja_fs_abrir(c, modo_codigo(mode), erro = &codigo)
+    if h == 0 {
+        return handle_erro(codigo)
+    }
+    return File{id = h}
+}
+
+// Trava exclusiva do arquivo (cria se nao existe): nenhum outro processo nem handle o abre enquanto durar; close solta a trava e APAGA o arquivo. Ja travado = locked.
+// Windows: share 0 + DELETE_ON_CLOSE (o sistema apaga ate se o processo morrer sem fechar). Linux (L2b): flock LOCK_EX|LOCK_NB (por open file description: o 2o lock no MESMO processo tambem da locked) e unlink no close;
+// DIVERGENCIA: se o processo morrer sem fechar, o arquivo FICA no Linux (a disputa e pelo flock, nao pela existencia: o proximo lock o reaproveita). A trava do Linux e consultiva: so vale contra quem usa lock/flock.
+pub proc lock(path: str) -> File ! FileError {
+    let c = format_c(f"{path}", alloc = heap)
+    defer delete(c)
+    var codigo: i32 = 0
+    let h = forja_fs_abrir(c, FS_MODO_TRAVA, erro = &codigo)
+    if h == 0 {
+        return handle_erro(codigo)
+    }
+    return File{id = h}
+}
+
+// Le ate len(into) bytes: quantos leu, 0 = fim. Com into vazio devolve 0 sem olhar o handle (so o caminho com bytes confere o handle).
+pub proc read(f: ^File, into: []u8) -> int ! FileError {
+    if len(into) == 0 {
+        return 0
+    }
+    var codigo: i32 = 0
+    let lidos = forja_fs_ler(f.id, destino = &into[0], n = len(into) as i64, erro = &codigo)
+    if lidos < 0 {
+        return handle_erro(codigo)
+    }
+    return lidos as int
+}
+
+// Grava todos os bytes de data (repete ate sair tudo). Com data vazia nao toca no handle.
+pub proc write(f: ^File, data: []u8) -> ?FileError {
+    if len(data) == 0 {
+        return none
+    }
+    var codigo: i32 = 0
+    let gravados = forja_fs_gravar(f.id, origem = &data[0], n = len(data) as i64, erro = &codigo)
+    if gravados < 0 {
+        return handle_erro(codigo)
+    }
+    return none
+}
+
+// Grava o texto (bytes UTF-8 como estao) no handle.
+pub proc write_str(f: ^File, text: str) -> ?FileError {
+    return write(f, as_bytes(text))
+}
+
+// Move a posicao do handle (offset em bytes a partir de from); devolve a posicao nova.
+pub proc seek(f: ^File, offset: i64, from: SeekFrom) -> i64 ! FileError {
+    var codigo: i32 = 0
+    let nova = forja_fs_posicionar(f.id, offset, origem_codigo(from), erro = &codigo)
+    if nova < 0 {
+        return handle_erro(codigo)
+    }
+    return nova
+}
+
+// Posicao atual do handle.
+pub proc tell(f: ^File) -> i64 ! FileError {
+    return seek(f, 0, SeekFrom.current)
+}
+
+// Descarrega o que foi gravado no disco (FlushFileBuffers: lento; use com moderacao).
+pub proc flush(f: ^File) -> ?FileError {
+    var codigo: i32 = 0
+    let ok = forja_fs_descarregar(f.id, erro = &codigo)
+    if ok < 0 {
+        return handle_erro(codigo)
+    }
+    return none
+}
+
+// Fecha o handle e zera o id: operar depois disso da closed. Fechar de novo nao faz nada.
+pub proc close(f: ^File) {
+    forja_fs_fechar(f.id)
+    f.id = 0
+}
+
+// Acrescenta o texto ao fim do arquivo (cria se nao existe). none quando deu certo.
+pub proc append_str(path: str, text: str) -> ?FileError {
+    var resultado: ?FileError = none
+    switch r in open(path, mode = OpenMode.append) {
+    case File:
+        var f = r
+        resultado = write_str(&f, text)
+        close(&f)
+    case FileError:
+        resultado = r
+    }
+    return resultado
+}
+
+// Tipo do item no runtime (FORJA_FS_TIPO_*, mesma ordem do FileKind). Juncao e link simbolico = link.
+const FS_TIPO_ARQUIVO: i32 = 0
+const FS_TIPO_PASTA: i32 = 1
+const FS_TIPO_LINK: i32 = 2
+// Bloco de nome de pasta: 1024 bytes cabem um nome UTF-8 de ate 260 caracteres. O array de reunir_nomes tem o mesmo tamanho.
+const FS_NOME_BLOCO: i64 = 1024
+
+pub enum FileKind { file, dir, link, other }
+
+// Dados de um caminho: tamanho em bytes, mtime em ns desde 1970 (UTC) e o tipo (link nao e seguido).
+pub struct FileInfo {
+    size: i64
+    mtime_ns: i64
+    kind: FileKind
+}
+
+// Item de uma pasta: name e a vista dentro de DirList.data; kind vem do runtime sem seguir link.
+pub struct DirEntry {
+    name: str
+    kind: FileKind
+}
+
+// Conteudo de uma pasta: data e dona dos nomes (cada um seguido de byte 0) e items sai ordenado pelos bytes do nome.
+// Posse igual a Lines: quem recebe da delete(lista.items) e delete(lista.data).
+pub struct DirList {
+    data: [dynamic]u8
+    items: [dynamic]DirEntry
+}
+
+// Tipo do runtime -> FileKind.
+proc tipo_kind(tipo: i32) -> FileKind {
+    if tipo == FS_TIPO_PASTA {
+        return FileKind.dir
+    }
+    if tipo == FS_TIPO_LINK {
+        return FileKind.link
+    }
+    if tipo == FS_TIPO_ARQUIVO {
+        return FileKind.file
+    }
+    return FileKind.other
+}
+
+// Codigo do runtime -> erro opcional: 0 quer dizer que deu certo (none).
+proc sem_erro_ou(codigo: i32) -> ?FileError {
+    if codigo == 0 {
+        return none
+    }
+    return handle_erro(codigo)
+}
+
+// Consulta o caminho sem seguir link. Caminho vazio = not_found (o runtime decide).
+pub proc stat(path: str) -> FileInfo ! FileError {
+    let c = format_c(f"{path}", alloc = heap)
+    defer delete(c)
+    var tamanho: i64 = 0
+    var mtime: i64 = 0
+    var tipo: i32 = 0
+    let codigo = forja_fs_info(c, tamanho = &tamanho, mtime_ns = &mtime, tipo = &tipo)
+    if codigo != 0 {
+        return handle_erro(codigo)
+    }
+    return FileInfo{size = tamanho, mtime_ns = mtime, kind = tipo_kind(tipo)}
+}
+
+// O caminho existe, de qualquer tipo (link incluido). Erro de consulta vira false.
+pub proc exists(path: str) -> bool {
+    var achou = false
+    switch _info in stat(path) {
+    case FileInfo:
+        achou = true
+    case FileError:
+        achou = false
+    }
+    return achou
+}
+
+// O caminho existe e e do tipo pedido, sem seguir link (link nao e file nem dir). Erro de consulta vira false.
+proc tem_tipo(path: str, tipo: FileKind) -> bool {
+    var achou = false
+    switch info in stat(path) {
+    case FileInfo:
+        achou = info.kind == tipo
+    case FileError:
+        achou = false
+    }
+    return achou
+}
+
+// Arquivo comum (link nao conta).
+pub proc is_file(path: str) -> bool {
+    return tem_tipo(path, FileKind.file)
+}
+
+// Pasta comum (juncao nao conta: e link).
+pub proc is_dir(path: str) -> bool {
+    return tem_tipo(path, FileKind.dir)
+}
+
+// Apaga um arquivo. Pasta devolve is_directory (use remove_dir).
+pub proc remove_file(path: str) -> ?FileError {
+    let c = format_c(f"{path}", alloc = heap)
+    defer delete(c)
+    return sem_erro_ou(forja_fs_remover(c))
+}
+
+// Renomeia from para to, sobrescrevendo to (MoveFileExW).
+pub proc rename(from: str, to: str) -> ?FileError {
+    let origem = format_c(f"{from}", alloc = heap)
+    defer delete(origem)
+    let destino = format_c(f"{to}", alloc = heap)
+    defer delete(destino)
+    return sem_erro_ou(forja_fs_renomear(origem, destino))
+}
+
+// Copia o arquivo de from para to, sobrescrevendo to (CopyFileW).
+pub proc copy_file(from: str, to: str) -> ?FileError {
+    let origem = format_c(f"{from}", alloc = heap)
+    defer delete(origem)
+    let destino = format_c(f"{to}", alloc = heap)
+    defer delete(destino)
+    return sem_erro_ou(forja_fs_copiar(origem, destino))
+}
+
+// Cria so o ultimo nivel: 0 ou o codigo do runtime.
+proc criar_uma(path: str) -> i32 {
+    let c = format_c(f"{path}", alloc = heap)
+    defer delete(c)
+    return forja_fs_criar_pasta(c)
+}
+
+// make_dir(all) depois de um nivel que falhou: pasta que ja existe vale; o pai que falta e criado antes (a recursao para quando o pai existe ou nao tem mais pai).
+proc criar_com_pais(path: str, codigo: i32) -> ?FileError {
+    if codigo == FS_ERRO_JA_EXISTE {
+        if is_dir(path) {
+            return none
+        }
+        return handle_erro(codigo)
+    }
+    if codigo != ARQUIVO_NAO_EXISTE {
+        return handle_erro(codigo)
+    }
+    let pai = pastas.dir(path)
+    if pai == path {
+        return handle_erro(codigo)
+    }
+    let erro_pai = make_dir(pai, all = true)
+    if erro_pai == none {
+        return sem_erro_ou(criar_uma(path))
+    }
+    return erro_pai
+}
+
+// Cria a pasta. Com all = true, cria os pais que faltam e pasta que ja existe vale (como mkdir -p); sem all, ja existe = already_exists.
+pub proc make_dir(path: str, all: bool = false) -> ?FileError {
+    let codigo = criar_uma(path)
+    if codigo == 0 {
+        return none
+    }
+    if not all {
+        return handle_erro(codigo)
+    }
+    return criar_com_pais(path, codigo)
+}
+
+// Remove a pasta vazia: cheia = not_empty; arquivo = not_directory.
+proc remove_pasta_vazia(path: str) -> ?FileError {
+    let c = format_c(f"{path}", alloc = heap)
+    defer delete(c)
+    return sem_erro_ou(forja_fs_remover_pasta(c))
+}
+
+// Link (juncao ou link simbolico) sai sem entrar: RemoveDirectoryW tira o link de pasta sem tocar no destino; DeleteFileW tira o de arquivo.
+proc apagar_link(path: str) -> ?FileError {
+    if remove_pasta_vazia(path) == none {
+        return none
+    }
+    return remove_file(path)
+}
+
+// Apaga o conteudo da pasta (recursivo) e depois a pasta vazia.
+proc esvaziar_e_remover(path: str) -> ?FileError {
+    var resultado: ?FileError = none
+    switch r in read_dir(path, alloc = heap) {
+    case DirList:
+        resultado = apagar_itens(path, r.items[..])
+        delete(r.items)
+        delete(r.data)
+    case FileError:
+        resultado = r
+    }
+    if resultado == none {
+        return remove_pasta_vazia(path)
+    }
+    return resultado
+}
+
+// Apaga um item da pasta pelo tipo que o read_dir deu (sem seguir link). join2 de std:path monta o caminho do filho.
+proc apagar_entrada(pasta: str, item: DirEntry) -> ?FileError {
+    let filho = pastas.join2(pasta, item.name, alloc = heap)
+    defer delete(filho)
+    if item.kind == FileKind.link {
+        return apagar_link(filho)
+    }
+    if item.kind == FileKind.dir {
+        return esvaziar_e_remover(filho)
+    }
+    return remove_file(filho)
+}
+
+// Apaga os itens em ordem e para no primeiro erro.
+proc apagar_itens(pasta: str, itens: []DirEntry) -> ?FileError {
+    for item in itens {
+        let erro = apagar_entrada(pasta, item)
+        if erro == none {
+            continue
+        }
+        return erro
+    }
+    return none
+}
+
+// Pasta: esvazia e remove. Link: sai sem entrar. Qualquer outra coisa: not_directory (remove_dir nunca apaga arquivo).
+proc apagar_pasta_ou_link(path: str, kind: FileKind) -> ?FileError {
+    if kind == FileKind.link {
+        return apagar_link(path)
+    }
+    if kind != FileKind.dir {
+        return FileError.not_directory
+    }
+    return esvaziar_e_remover(path)
+}
+
+// Ponto de entrada do remove_dir(all): consulta o caminho sem seguir link antes de apagar qualquer coisa.
+proc remover_arvore(path: str) -> ?FileError {
+    var resultado: ?FileError = none
+    switch info in stat(path) {
+    case FileInfo:
+        resultado = apagar_pasta_ou_link(path, info.kind)
+    case FileError:
+        resultado = info
+    }
+    return resultado
+}
+
+// Remove a pasta: sem all so a vazia; com all, a arvore toda, sem entrar em link.
+pub proc remove_dir(path: str, all: bool = false) -> ?FileError {
+    if not all {
+        return remove_pasta_vazia(path)
+    }
+    return remover_arvore(path)
+}
+
+// Nomes da pasta sem "." e "..": cada um vai para dados seguido de byte 0; itens leva o tipo; inicios, a posicao do nome em dados. Devolve 0 no fim ou o codigo do erro.
+proc reunir_nomes(pasta: u64, dados: ^[dynamic]u8, itens: ^[dynamic]DirEntry, inicios: ^[dynamic]int) -> i32 {
+    var nome: [1024]u8 = {}
+    var tipo_item: i32 = 0
+    var total = 0
+    var seguir = true
+    while seguir {
+        let tam = forja_fs_pasta_proximo(pasta, destino = &nome[0], n = FS_NOME_BLOCO, tipo = &tipo_item)
+        if tam < 0 {
+            return (-tam) as i32
+        }
+        if tam == 0 {
+            seguir = false
+        } else {
+            let usado = tam as int
+            append(inicios, item = total)
+            append(dados, items = nome[0..<tam])
+            append(dados, item = 0)
+            append(itens, item = DirEntry{name = "", kind = tipo_kind(tipo_item)})
+            total += usado + 1
+        }
+    }
+    return 0
+}
+
+// Com dados parado (ja nao cresce), cada item ganha a vista do nome dentro de dados, ate o byte 0 que reunir_nomes pos.
+proc ligar_nomes(itens: []DirEntry, dados: []u8, inicios: []int) {
+    for k in 0..<len(itens) {
+        itens[k].name = linha_em(dados, inicios[k])
+    }
+}
+
+// Ordem de read_dir: bytes do nome, um a um; quando um e prefixo do outro, o mais curto vem antes.
+proc nome_antes(a: ^DirEntry, b: ^DirEntry) -> bool {
+    let x = as_bytes(a.name)
+    let y = as_bytes(b.name)
+    let comum = min(len(x), len(y))
+    for i in 0..<comum {
+        if x[i] != y[i] {
+            return x[i] < y[i]
+        }
+    }
+    return len(x) < len(y)
+}
+
+// Lista a pasta sem "." e "..", ordenada pelos bytes do nome. Erro: o do runtime (not_found, not_directory...).
+pub proc read_dir(path: str, alloc: Allocator) -> DirList ! FileError {
+    let c = format_c(f"{path}", alloc = heap)
+    defer delete(c)
+    var codigo: i32 = 0
+    let pasta = forja_fs_pasta_abrir(c, erro = &codigo)
+    if pasta == 0 {
+        return handle_erro(codigo)
+    }
+    var lista = DirList{data = make([dynamic]u8, alloc = alloc), items = make([dynamic]DirEntry, alloc = alloc)}
+    var inicios = make([dynamic]int, alloc = heap)
+    defer delete(inicios)
+    let falha = reunir_nomes(pasta, &lista.data, &lista.items, &inicios)
+    forja_fs_pasta_fechar(pasta)
+    if falha != 0 {
+        delete(lista.items)
+        delete(lista.data)
+        return handle_erro(falha)
+    }
+    ligar_nomes(lista.items[..], lista.data[..], inicios[..])
+    sort_by(lista.items[..], less = nome_antes)
+    return lista
+}
+
+// Tentativas de nome novo quando o sorteado ja existe (8 bytes aleatorios: so colide por azar ou por pasta adulterada).
+const TEMP_TENTATIVAS: int = 8
+const TEMP_BYTES_SORTEIO: int = 8
+
+// OsError -> FileError (so os 3 que o std:os pode dar na pasta temporaria ou no sorteio).
+proc os_para_file_erro(erro: os.OsError) -> FileError {
+    if erro == os.OsError.not_found {
+        return FileError.not_found
+    }
+    if erro == os.OsError.no_permission {
+        return FileError.no_permission
+    }
+    return FileError.other
+}
+
+// O prefixo nao pode ter separador nem byte 0: ele e so o comeco do NOME, nunca um caminho.
+proc prefixo_temp_valido(prefixo: str) -> bool {
+    for b in as_bytes(prefixo) {
+        if b == 0 or b == BYTE_BARRA_INVERTIDA or b == BYTE_BARRA {
+            return false
+        }
+    }
+    return true
+}
+
+const BYTE_BARRA_INVERTIDA: u8 = 92
+const BYTE_BARRA: u8 = 47
+
+// Cria o item novo e exclusivo: arquivo com OpenMode.create (falha se ja existe) e fechado na hora; pasta com make_dir sem all.
+proc criar_temp_exclusivo(caminho: str, pasta: bool) -> ?FileError {
+    if pasta {
+        return make_dir(caminho)
+    }
+    var resultado: ?FileError = none
+    switch r in open(caminho, mode = OpenMode.create) {
+    case File:
+        var f = r
+        close(&f)
+    case FileError:
+        resultado = r
+    }
+    return resultado
+}
+
+// Nome <prefixo>-<16 hex>, dentro de dir, ate TEMP_TENTATIVAS vezes enquanto o nome ja existir. O caminho sai DONO do alocador do chamador.
+proc criar_temp(dir: str, prefixo: str, pasta: bool, alloc: Allocator) -> str ! FileError {
+    for _tentativa in 0..<TEMP_TENTATIVAS {
+        var sorteio: [8]u8 = {}
+        let erro_sorteio = os.random_bytes(sorteio[..])
+        if erro_sorteio != none {
+            return FileError.other
+        }
+        let nome = format(f"{prefixo}-{sorteio[0]:02x}{sorteio[1]:02x}{sorteio[2]:02x}{sorteio[3]:02x}{sorteio[4]:02x}{sorteio[5]:02x}{sorteio[6]:02x}{sorteio[7]:02x}", alloc = heap)
+        defer delete(nome)
+        // O candidato fica em heap (delete so libera heap): so o que deu certo e copiado para o alocador do chamador.
+        let candidato = pastas.join2(dir, nome, alloc = heap)
+        defer delete(candidato)
+        switch e in criar_temp_exclusivo(candidato, pasta) {
+        case none:
+            return format(f"{candidato}", alloc = alloc)
+        case FileError:
+            if e != FileError.already_exists {
+                return e
+            }
+        }
+    }
+    return FileError.already_exists
+}
+
+// Valida o prefixo, acha a pasta e cria o item novo.
+proc criar_temp_em(prefixo: str, in_dir: str, pasta: bool, alloc: Allocator) -> str ! FileError {
+    if not prefixo_temp_valido(prefixo) {
+        return FileError.unsupported
+    }
+    if len(in_dir) > 0 {
+        return criar_temp(in_dir, prefixo, pasta = pasta, alloc = alloc)
+    }
+    switch d in os.temp_dir(alloc = heap) {
+    case str:
+        defer delete(d)
+        return criar_temp(d, prefixo, pasta = pasta, alloc = alloc)
+    case os.OsError:
+        return os_para_file_erro(d)
+    }
+    return FileError.other
+}
+
+// Cria um arquivo vazio e novo, de nome <prefix>-<16 hex>, em in_dir (vazio = pasta temporaria do sistema) e devolve o caminho. O arquivo nasce exclusivo (CREATE_NEW) e e fechado.
+// prefix com separador ou byte 0 = unsupported. Posse: o caminho e DONO do alocador que o chamador passou: quem recebe faz delete e remove_file.
+pub proc make_temp_file(prefix: str, in_dir: str = "", alloc: Allocator) -> str ! FileError {
+    return criar_temp_em(prefix, in_dir, pasta = false, alloc = alloc)
+}
+
+// Igual a make_temp_file, mas cria uma pasta vazia (make_dir sem all). Quem recebe faz delete do caminho e remove_dir.
+pub proc make_temp_dir(prefix: str, in_dir: str = "", alloc: Allocator) -> str ! FileError {
+    return criar_temp_em(prefix, in_dir, pasta = true, alloc = alloc)
+}

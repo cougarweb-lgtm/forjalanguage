@@ -1,0 +1,495 @@
+// nativo/obj/ar_ler.fj - porte de compiler/nativo/obj/ar_ler.c, compiler/nativo/obj/ar_ler.h
+// sha256 de nativo/obj/ar_ler.c: 985db74ce6537c6963dbbe2227cbbf2fea3d27c519508c35aa4a861e13e5de7e
+// sha256 de nativo/obj/ar_ler.h: 138518c04f7ea72c28f4a41d4c1bfa3487899ab09562d81a4cfbf98181d00c8d
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "common"
+
+struct ArMembro {
+    tipo: i32
+    nome: ?[]u8
+    nome_tam: u64
+    dados: ?[]u8
+    tam: u64
+    off: u64
+}
+
+struct ArSimbolo {
+    nome: ?[]u8
+    nome_tam: u64
+    membro_off: u32
+}
+
+struct ArIterador {
+    bytes: ?[]u8
+    n: u64
+    pos: u64
+    nomes_longos: ?[]u8
+    nomes_tam: u64
+}
+
+struct AriMs2 {
+    membros: u32
+    simbolos: u32
+    pos_numeros: u64
+    pos_nomes: u64
+}
+
+struct AriIndices {
+    primeiro: ArMembro
+    segundo: ArMembro
+}
+
+const AR_OBJETO: i32 = 0
+const AR_INDICE: i32 = 1
+const AR_NOMES: i32 = 2
+// C2F-82 macro ARI_MAGICA_ELF = "\x7f" "ELF"  (expandida no uso)
+const ARI_TAM_MAGICA_ELF: u32 = 4
+const ARI_ASSINATURA: str = "!<arch>\n"
+const ARI_TAM_ASSINATURA: u32 = 8
+const ARI_TAM_CABECALHO: u32 = 60
+const ARI_TAM_NOME: u32 = 16
+const ARI_OFF_TAMANHO: u32 = 48
+const ARI_TAM_CAMPO_TAMANHO: u32 = 10
+const ARI_OFF_FIM: u32 = 58
+const ARI_INDICE_64: str = "/SYM64/"
+const ARI_TAM_CONTADOR: u32 = 4
+const ARI_TAM_INDICE_MS: u32 = 2
+
+// C: nativo/obj/ar_ler.c:28
+proc ari_cabe(it: ^ArIterador, off: u64, len_c: u64) -> bool {
+    return (off <= it.n) and (len_c <= (it.n - off))
+}
+
+// C: nativo/obj/ar_ler.c:33
+proc ari_malformado(erro: ^common.Diag, motivo: str, pos: u64) -> bool {
+    let msg_1 = format(f"arquivo ar malformado no offset {pos}: {motivo}", alloc = heap)
+    defer delete(msg_1)
+    return common.diag_relatar(erro, common.X0105, 0, msg_1)
+}
+
+// C: nativo/obj/ar_ler.c:38
+proc ar_iniciar(it: ^ArIterador, bytes: ^u8, n: u64, erro: ^common.Diag) -> bool {
+    it^ = ArIterador{bytes = slice_from(bytes, len = n as int), n = n, pos = ARI_TAM_ASSINATURA as u64}
+    if n < (ARI_TAM_ASSINATURA as u64) {
+        return common.diag_relatar(erro, common.X0105, 0, "a biblioteca nao e um arquivo ar (falta a assinatura \"!<arch>\\n\")")
+    }
+    let dados: []u8 = it.bytes or_else {}
+    if common.c2f_memcmp(dados[0..<(ARI_TAM_ASSINATURA as int)], as_bytes(ARI_ASSINATURA)) != 0 {
+        return common.diag_relatar(erro, common.X0105, 0, "a biblioteca nao e um arquivo ar (falta a assinatura \"!<arch>\\n\")")
+    }
+    return true
+}
+
+// C: nativo/obj/ar_ler.c:47
+// C2F-INDECIDIVEL: cab
+proc ari_tamanho(cab: []u8, tam: ^u64) -> bool {
+    var valor: u64 = 0
+    var i: u64 = 0
+    while ((i < (ARI_TAM_CAMPO_TAMANHO as u64)) and ((cab[(ARI_OFF_TAMANHO as u64) + i] as i32) >= 48)) and ((cab[(ARI_OFF_TAMANHO as u64) + i] as i32) <= 57) {
+        valor = (valor * 10) + common.c2f_s2u_64(((cab[(ARI_OFF_TAMANHO as u64) + i] as i32) - 48) as i64) // '0'
+        i += 1 // '0' '9'
+    }
+    for j in i..<(ARI_TAM_CAMPO_TAMANHO as u64) {
+        if cab[(ARI_OFF_TAMANHO as u64) + j] != 32 { // ' '
+            return false
+        }
+    }
+    tam^ = valor
+    return i > 0
+}
+
+// C: nativo/obj/ar_ler.c:61
+// C2F-33: o nome e vista do cabecalho (o C guardava ponteiro; a Forja guarda a fatia)
+proc ari_nome_curto(cab: []u8, m: ^ArMembro) {
+    var n: u64 = 0
+    while (n < (ARI_TAM_NOME as u64)) and (cab[n] != 47) { // '/'
+        n += 1
+    }
+    if n == (ARI_TAM_NOME as u64) {
+        while (n > 0) and (cab[n - 1] == 32) { // ' '
+            n -= 1
+        }
+    }
+    m.nome = cab[0..<(n as int)]
+    m.nome_tam = n
+}
+
+// C: nativo/obj/ar_ler.c:75
+// C2F-INDECIDIVEL: cab
+proc ari_offset_do_nome_longo(cab: []u8) -> u64 {
+    var off: u64 = 0
+    var i: u64 = 1
+    while ((i < (ARI_TAM_NOME as u64)) and ((cab[i] as i32) >= 48)) and ((cab[i] as i32) <= 57) {
+        off = (off * 10) + common.c2f_s2u_64(((cab[i] as i32) - 48) as i64) // '0'
+        i += 1 // '0' '9'
+    }
+    return off
+}
+
+// C: nativo/obj/ar_ler.c:84
+proc ari_fim_do_nome_longo(it: ^ArIterador, off: u64) -> u64 {
+    var fim: u64 = off
+    while ((fim < it.nomes_tam) and ((it.nomes_longos or_else {})[fim] != 47)) and ((it.nomes_longos or_else {})[fim] != 10) { // '/' '\n'
+        fim += 1
+    }
+    return fim
+}
+
+// C: nativo/obj/ar_ler.c:93
+proc ari_nome_longo(it: ^ArIterador, cab: []u8, m: ^ArMembro, erro: ^common.Diag) -> bool {
+    let off: u64 = ari_offset_do_nome_longo(cab)
+    if (it.nomes_longos == none) or (off >= it.nomes_tam) {
+        return ari_malformado(erro, "nome longo sem a tabela \"//\" ou fora dela", it.pos)
+    }
+    let fim: u64 = ari_fim_do_nome_longo(it, off)
+    let nomes: []u8 = it.nomes_longos or_else {}
+    m.nome = nomes[(off as int)..<(fim as int)]
+    m.nome_tam = fim - off
+    return true
+}
+
+// C: nativo/obj/ar_ler.c:105
+// C2F-INDECIDIVEL: cab
+proc ari_especial(cab: []u8, tipo: ^i32) -> bool {
+    if (cab[1] == 32) or (common.c2f_memcmp(cab[0..<7], as_bytes(ARI_INDICE_64)) == 0) { // ' '
+        tipo^ = AR_INDICE
+        return true
+    }
+    if (cab[1] == 47) and (cab[2] == 32) { // '/' ' '
+        tipo^ = AR_NOMES
+        return true
+    }
+    return false
+}
+
+// C: nativo/obj/ar_ler.c:119
+// C2F-INDECIDIVEL: cab
+proc ari_nomear(it: ^ArIterador, cab: []u8, m: ^ArMembro, erro: ^common.Diag) -> bool {
+    if cab[0] != 47 { // '/'
+        m.tipo = AR_OBJETO
+        ari_nome_curto(cab, m)
+        return true
+    }
+    if ari_especial(cab, &m.tipo) {
+        return true
+    }
+    m.tipo = AR_OBJETO
+    if (cab[1] < 48) or (cab[1] > 57) { // '0' '9'
+        return ari_malformado(erro, "nome de membro que comeca com '/' e nao e indice, \"//\" nem \"/<n>\"", it.pos)
+    }
+    return ari_nome_longo(it, cab, m, erro)
+}
+
+// C: nativo/obj/ar_ler.c:135
+// C2F-INDECIDIVEL: cab
+proc ari_conferir_cabecalho(it: ^ArIterador, cab: []u8, tam: ^u64, erro: ^common.Diag) -> bool {
+    if not ari_cabe(it, it.pos, ARI_TAM_CABECALHO as u64) {
+        return ari_malformado(erro, "cabecalho de membro truncado", it.pos)
+    }
+    if ((cab[ARI_OFF_FIM] != 96) or (cab[ARI_OFF_FIM + 1] != 10)) or (not ari_tamanho(cab, tam)) { // '`' '\n'
+        return ari_malformado(erro, "cabecalho de membro invalido (tamanho ou marca final)", it.pos)
+    }
+    if not ari_cabe(it, it.pos + (ARI_TAM_CABECALHO as u64), tam^) {
+        return ari_malformado(erro, "membro maior que o arquivo", it.pos)
+    }
+    return true
+}
+
+// C: nativo/obj/ar_ler.c:146
+proc ar_proximo(it: ^ArIterador, membro: ^ArMembro, erro: ^common.Diag) -> bool {
+    var tam: u64 = 0
+    if it.pos >= it.n {
+        return false
+    }
+    let bytes: []u8 = it.bytes or_else {}
+    let cab: []u8 = bytes[(it.pos as int)..<(len(bytes))]
+    if not ari_conferir_cabecalho(it, cab, &tam, erro) {
+        return false
+    }
+    membro^ = ArMembro{dados = cab[(ARI_TAM_CABECALHO as int)..<(((ARI_TAM_CABECALHO as u64) + tam) as int)], tam = tam, off = it.pos}
+    if not ari_nomear(it, cab, membro, erro) {
+        return false
+    }
+    if membro.tipo == AR_NOMES {
+        it.nomes_longos = membro.dados
+        it.nomes_tam = tam
+    }
+    it.pos += (ARI_TAM_CABECALHO as u64) + tam + (tam & 1)
+    return true
+}
+
+// C: nativo/obj/ar_ler.c:167
+// C2F-INDECIDIVEL: p
+proc ari_le32_be(p: []u8) -> u32 {
+    return ((((p[0] as u32) << 24) | ((p[1] as u32) << 16)) | ((p[2] as u32) << 8)) | (p[3] as u32)
+}
+
+// C: nativo/obj/ar_ler.c:172
+// C2F-INDECIDIVEL: p
+proc ari_le32_le(p: []u8) -> u32 {
+    return (((p[0] as u32) | ((p[1] as u32) << 8)) | ((p[2] as u32) << 16)) | ((p[3] as u32) << 24)
+}
+
+// C: nativo/obj/ar_ler.c:177
+// C2F-INDECIDIVEL: p
+proc ari_le16_le(p: []u8) -> u32 {
+    return (p[0] as u32) | ((p[1] as u32) << 8)
+}
+
+// C: nativo/obj/ar_ler.c:183
+proc ari_empurrar_nome(m: ^ArMembro, pos: ^u64, membro_off: u32, simbolos: ^[dynamic]ArSimbolo) -> bool {
+    let dados: []u8 = m.dados or_else {}
+    let ini: u64 = pos^
+    var fim: u64 = ini
+    while (fim < m.tam) and (dados[(fim as int)] != 0) {
+        fim += 1
+    }
+    if fim == m.tam {
+        return false
+    }
+    append(simbolos, item = ArSimbolo{nome = dados[(ini as int)..<(fim as int)], nome_tam = fim - ini, membro_off = membro_off})
+    pos^ = fim + 1
+    return true
+}
+
+// C: nativo/obj/ar_ler.c:198
+proc ari_indice_be(m: ^ArMembro, simbolos: ^[dynamic]ArSimbolo, erro: ^common.Diag) -> bool {
+    if m.tam == 0 {
+        return true
+    }
+    if m.tam < (ARI_TAM_CONTADOR as u64) {
+        return ari_malformado(erro, "indice de simbolos menor que o contador", m.off)
+    }
+    let dados: []u8 = m.dados or_else {}
+    let qtd: u32 = ari_le32_be(dados[0..<(ARI_TAM_CONTADOR as int)])
+    var pos: u64 = (ARI_TAM_CONTADOR as u64) + ((qtd as u64) * (ARI_TAM_CONTADOR as u64))
+    if pos > m.tam {
+        return ari_malformado(erro, "indice de simbolos truncado (offsets)", m.off)
+    }
+    var i: u32 = 0
+    while i < qtd {
+        let ini_off: u64 = (ARI_TAM_CONTADOR as u64) + ((i as u64) * (ARI_TAM_CONTADOR as u64))
+        let off: u32 = ari_le32_be(dados[(ini_off as int)..<((ini_off + (ARI_TAM_CONTADOR as u64)) as int)])
+        if not ari_empurrar_nome(m, &pos, off, simbolos) {
+            return ari_malformado(erro, "nome de simbolo do indice sem o NUL final", m.off)
+        }
+        i += 1
+    }
+    return true
+}
+
+// C: nativo/obj/ar_ler.c:224
+proc ari_ms2_ler(m: ^ArMembro, t: ^AriMs2, erro: ^common.Diag) -> bool {
+    if m.tam < (ARI_TAM_CONTADOR as u64) {
+        return ari_malformado(erro, "2o indice de simbolos menor que o contador", m.off)
+    }
+    let dados: []u8 = m.dados or_else {}
+    t.membros = common.c2f_ler_u32_le(dados, 0)
+    let pos_qtd: u64 = (ARI_TAM_CONTADOR as u64) + ((t.membros as u64) * (ARI_TAM_CONTADOR as u64))
+    if (pos_qtd > m.tam) or ((m.tam - pos_qtd) < (ARI_TAM_CONTADOR as u64)) {
+        return ari_malformado(erro, "2o indice de simbolos truncado (offsets dos membros)", m.off)
+    }
+    t.simbolos = common.c2f_ler_u32_le(dados, pos_qtd as int)
+    t.pos_numeros = pos_qtd + (ARI_TAM_CONTADOR as u64)
+    t.pos_nomes = t.pos_numeros + ((t.simbolos as u64) * (ARI_TAM_INDICE_MS as u64))
+    if t.pos_nomes > m.tam {
+        return ari_malformado(erro, "2o indice de simbolos truncado (numeros de membro)", m.off)
+    }
+    return true
+}
+
+// C: nativo/obj/ar_ler.c:241
+proc ari_indice_ms2(m: ^ArMembro, simbolos: ^[dynamic]ArSimbolo, erro: ^common.Diag) -> bool {
+    var t: AriMs2 = AriMs2{}
+    if not ari_ms2_ler(m, &t, erro) {
+        return false
+    }
+    let dados: []u8 = m.dados or_else {}
+    var pos: u64 = t.pos_nomes
+    var i: u32 = 0
+    while i < t.simbolos {
+        let ini_num: u64 = t.pos_numeros + ((i as u64) * (ARI_TAM_INDICE_MS as u64))
+        let numero: u32 = ari_le16_le(dados[(ini_num as int)..<((ini_num + (ARI_TAM_INDICE_MS as u64)) as int)])
+        if (numero == 0) or (numero > t.membros) {
+            return ari_malformado(erro, "2o indice de simbolos com numero de membro fora da tabela", m.off)
+        }
+        let ini_off: u64 = (ARI_TAM_CONTADOR as u64) + (((numero - 1) as u64) * (ARI_TAM_CONTADOR as u64))
+        let off: u32 = ari_le32_le(dados[(ini_off as int)..<((ini_off + (ARI_TAM_CONTADOR as u64)) as int)])
+        if not ari_empurrar_nome(m, &pos, off, simbolos) {
+            return ari_malformado(erro, "nome de simbolo do 2o indice sem o NUL final", m.off)
+        }
+        i += 1
+    }
+    return true
+}
+
+// C: nativo/obj/ar_ler.c:265
+proc ari_guardar_indice(achados: ^AriIndices, m: ^ArMembro) {
+    if achados.primeiro.dados == none {
+        achados.primeiro = m^
+    } else if achados.segundo.dados == none {
+        achados.segundo = m^
+    }
+}
+
+// C: nativo/obj/ar_ler.c:273
+proc ari_achar_indices(bytes: ^u8, n: u64, achados: ^AriIndices, erro: ^common.Diag) -> bool {
+    var it: ArIterador = ArIterador{}
+    var m: ArMembro = ArMembro{}
+    if not ar_iniciar(&it, bytes, n, erro) {
+        return false
+    }
+    while (common.c2f_b2i32(ar_proximo(&it, &m, erro)) != 0) and (common.c2f_s2u_32(m.tipo) != (AR_OBJETO as u32)) {
+        if common.c2f_s2u_32(m.tipo) != (AR_INDICE as u32) {
+            continue
+        }
+        ari_guardar_indice(achados, &m)
+    }
+    return not erro.tem
+}
+
+// C: nativo/obj/ar_ler.c:287
+proc ar_eh_elf(dados: ^u8, n: u64) -> bool {
+    if n < (ARI_TAM_MAGICA_ELF as u64) {
+        return false
+    }
+    let magica: []u8 = slice_from(dados, len = ARI_TAM_MAGICA_ELF as int)
+    return (magica[0] == 127) and (magica[1] == 69) and (magica[2] == 76) and (magica[3] == 70) // "\x7fELF"
+}
+
+// C: nativo/obj/ar_ler.c:292
+proc ar_relatar_membro_elf(erro: ^common.Diag, membro: str, e: ^ElfLErro) -> bool {
+    if common.c2f_s2u_32(e.codigo) == (ELFL_RELOC_FORA_DO_CENSO as u32) {
+        let msg_1 = format(f"biblioteca estatica, membro '{membro}': relocacao de tipo {e.tipo_reloc} ({elf_l_nome_reloc(e.tipo_reloc)}) fora do censo do ligador nativo (o libc.a ja usa so o censo)", alloc = heap)
+        defer delete(msg_1)
+        return common.diag_relatar(erro, common.X0110, 0, msg_1)
+    }
+    let txt_1 = e.mensagem or_else "(null)"
+    let msg_2 = format(f"biblioteca estatica, membro '{membro}': {txt_1}", alloc = heap)
+    defer delete(msg_2)
+    return common.diag_relatar(erro, common.X0105, 0, msg_2)
+}
+
+// C: nativo/obj/ar_ler.c:300
+// C2F-13: bytes fundido em n (len)
+proc ar_ler_indice(bytes: []u8, simbolos: ^[dynamic]ArSimbolo, erro: ^common.Diag) -> bool {
+    simbolos^ = make([dynamic]ArSimbolo, alloc = heap)
+    var achados: AriIndices = AriIndices{}
+    var sem_byte: u8 = 0
+    var inicio: ^u8 = &sem_byte
+    if len(bytes) > 0 {
+        inicio = &bytes[0]
+    }
+    if not ari_achar_indices(inicio, len(bytes) as u64, &achados, erro) {
+        return false
+    }
+    if achados.primeiro.dados == none {
+        return common.diag_relatar(erro, common.X0105, 0, "a biblioteca estatica nao tem indice de simbolos (falta rodar 'ar s' ou ranlib); sem ele nao ha como escolher os membros")
+    }
+    let off_primeiro: u64 = achados.primeiro.off
+    if common.c2f_memcmp(bytes[(off_primeiro as int)..<((off_primeiro + 7) as int)], as_bytes(ARI_INDICE_64)) == 0 {
+        return ari_malformado(erro, "indice \"/SYM64/\" (offsets de 64 bits) nao e suportado", off_primeiro)
+    }
+    if achados.segundo.dados != none {
+        return ari_indice_ms2(&achados.segundo, simbolos, erro)
+    }
+    return ari_indice_be(&achados.primeiro, simbolos, erro)
+}
+
+// Testes: ar montado em memoria (sem arquivo), com o indice BE do 1o "/" e o MS2 do 2o "/".
+proc ari_teste_copiar(dest: []u8, at: int, fonte: []u8) {
+    for k in 0..<len(fonte) {
+        dest[at + k] = fonte[k]
+    }
+}
+
+// Cabecalho de 60 bytes: nome em 0, tamanho em 48 (10 campos, completados com espacos), marca "`" "\n" em 58.
+proc ari_teste_cabecalho(dest: []u8, at: int, nome: str, tam: str) {
+    ari_teste_copiar(dest, at, as_bytes(nome))
+    ari_teste_copiar(dest, at + 48, as_bytes(tam))
+    for k in len(tam)..<10 {
+        dest[at + 48 + k] = 32
+    }
+    ari_teste_copiar(dest, at + 58, as_bytes("`\n"))
+}
+
+test "ar_ler_indice_be_um_simbolo" {
+    var be: [10]u8 = {0, 0, 0, 1, 0, 0, 0, 64, 102, 0}
+    var m = ArMembro{dados = be[..], tam = 10, off = 0}
+    var sims: [dynamic]ArSimbolo = make([dynamic]ArSimbolo, alloc = heap)
+    defer delete(sims)
+    var erro: common.Diag = common.Diag{tem = false}
+    expect(ari_indice_be(&m, &sims, &erro))
+    expect(len(sims) == 1)
+    expect(sims[0].membro_off == 64)
+    expect(sims[0].nome_tam == 1)
+    expect((sims[0].nome or_else {})[0] == 102)
+    expect(not erro.tem)
+}
+
+test "ar_ler_indice_be_vazio_e_erros" {
+    var vazio: [1]u8 = {0}
+    var m0 = ArMembro{dados = vazio[..], tam = 0, off = 0}
+    var sims: [dynamic]ArSimbolo = make([dynamic]ArSimbolo, alloc = heap)
+    defer delete(sims)
+    var erro0: common.Diag = common.Diag{tem = false}
+    expect(ari_indice_be(&m0, &sims, &erro0))
+    expect(len(sims) == 0)
+    var trunc: [8]u8 = {0, 0, 0, 5, 0, 0, 0, 0}
+    var m1 = ArMembro{dados = trunc[..], tam = 8, off = 0}
+    var erro1: common.Diag = common.Diag{tem = false}
+    expect(not ari_indice_be(&m1, &sims, &erro1))
+    expect(erro1.tem)
+    var sem_nul: [10]u8 = {0, 0, 0, 1, 0, 0, 0, 64, 102, 65}
+    var m2 = ArMembro{dados = sem_nul[..], tam = 10, off = 0}
+    var erro2: common.Diag = common.Diag{tem = false}
+    expect(not ari_indice_be(&m2, &sims, &erro2))
+    expect(erro2.tem)
+}
+
+test "ar_ler_indice_ms2_um_simbolo" {
+    var ms2: [16]u8 = {1, 0, 0, 0, 64, 0, 0, 0, 1, 0, 0, 0, 1, 0, 103, 0}
+    var m = ArMembro{dados = ms2[..], tam = 16, off = 0}
+    var sims: [dynamic]ArSimbolo = make([dynamic]ArSimbolo, alloc = heap)
+    defer delete(sims)
+    var erro: common.Diag = common.Diag{tem = false}
+    expect(ari_indice_ms2(&m, &sims, &erro))
+    expect(len(sims) == 1)
+    expect(sims[0].membro_off == 64)
+    expect((sims[0].nome or_else {})[0] == 103)
+    var ms2_zero: [16]u8 = {1, 0, 0, 0, 64, 0, 0, 0, 1, 0, 0, 0, 0, 0, 103, 0}
+    var m0 = ArMembro{dados = ms2_zero[..], tam = 16, off = 0}
+    var erro0: common.Diag = common.Diag{tem = false}
+    expect(not ari_indice_ms2(&m0, &sims, &erro0))
+    expect(erro0.tem)
+}
+
+test "ar_ler_indice_ar_completo" {
+    var be: [10]u8 = {0, 0, 0, 1, 0, 0, 0, 64, 102, 0}
+    var ms2: [16]u8 = {1, 0, 0, 0, 64, 0, 0, 0, 1, 0, 0, 0, 1, 0, 103, 0}
+    var buf: [154]u8 = {}
+    ari_teste_copiar(buf[..], 0, as_bytes(ARI_ASSINATURA))
+    ari_teste_cabecalho(buf[..], 8, "/ ", "10")
+    ari_teste_copiar(buf[..], 68, be[..])
+    ari_teste_cabecalho(buf[..], 78, "/ ", "16")
+    ari_teste_copiar(buf[..], 138, ms2[..])
+    var sims: [dynamic]ArSimbolo = make([dynamic]ArSimbolo, alloc = heap)
+    delete(sims) // ar_ler_indice inicia a lista (como VecIniciar do C); o make acima so fixa o tipo
+    var erro: common.Diag = common.Diag{tem = false}
+    expect(ar_ler_indice(buf[..], &sims, &erro))
+    defer delete(sims)
+    expect(len(sims) == 1)
+    expect(sims[0].membro_off == 64)
+    expect((sims[0].nome or_else {})[0] == 103)
+    expect(not erro.tem)
+    var so_sig: [8]u8 = {}
+    ari_teste_copiar(so_sig[..], 0, as_bytes(ARI_ASSINATURA))
+    var sem_indice: [dynamic]ArSimbolo = make([dynamic]ArSimbolo, alloc = heap)
+    delete(sem_indice)
+    var erro2: common.Diag = common.Diag{tem = false}
+    expect(not ar_ler_indice(so_sig[..], &sem_indice, &erro2))
+    expect(erro2.tem)
+    defer delete(sem_indice)
+}

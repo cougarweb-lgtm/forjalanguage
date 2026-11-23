@@ -1,0 +1,335 @@
+// nativo/x64/x64_interno.fj - porte de compiler/nativo/x64/x64_interno.h
+// sha256 de nativo/x64/x64_interno.h: e98629d2ced13b6960957b67c4a1d5668f6414ffd6fe8fe7659973a722945cac
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "common"
+import "nativo/bir"
+import "nativo/dbg"
+import "nativo/obj"
+
+struct AbiLocal {
+    na_pilha: bool
+    reg: i32
+    desloc: i32
+    bytes: u8
+}
+
+struct AbiArg {
+    classe: i32
+    tam: u32
+}
+
+struct Quadro {
+    slots: u32
+    agregados: u32
+    maxargs: u32
+    tam: u32
+    sondar: bool
+    salva: bool
+    salvos: u32
+    regs_salvos: u32
+    empurrados: u32
+    regs_salvos_xmm: u32
+    salvos_xmm: u32
+}
+
+struct SaltoLocal {
+    fim: u32
+    bloco: u32
+}
+
+struct PrologoMarcas {
+    push: u32
+    fpreg: u32
+    alocacao: u32
+    salvo: [7]u32
+}
+
+struct X64Ctx {
+    p: ?^bir.BirPrograma
+    f: ?^bir.BirFuncao
+    o: ?^obj.Objeto
+    erro: ?^common.Diag
+    lista: ?^AlvoListagem
+    texto: u32
+    pdata: u32
+    xdata: u32
+    sim_xdata: u32
+    func_sim: u32
+    inicio: u32
+    prologo: PrologoMarcas
+    obj_sim: []u32 // C2F-INDECIDIVEL
+    quadro: Quadro
+    slot_off: []u32 // C2F-INDECIDIVEL
+    ordem: ?[]u32
+    nordem: u32
+    pos_ordem: u32
+    bloco_off: ?[]u32
+    saltos: [dynamic]SaltoLocal
+    cls: ?[]AbiArg
+    abi: ?[]AbiLocal
+    instr: []bir.BirInstr
+    instr_idx: int
+    origem: u8
+    tempos: ?^AlvoTempos
+    marca: u64
+    rastreio: bool
+    guarda: bool
+    dbg: ?^dbg.DbgPrograma
+    plantio: i32 // F2: FORJA_TESTE_PLANTAR lido 1x (o C faz static qual); valido so com plantio_lido
+    plantio_lido: bool
+    formas: []FormaX64 // F2: copia unica de FORMAS_X64 (indexar a const por indice de execucao monta a tabela inteira a cada acesso)
+    usos: []u8 // C2F-INDECIDIVEL
+    defs: []u8 // C2F-INDECIDIVEL
+}
+
+struct AlocOperando {
+    em_reg: bool
+    reg: i32
+    desloc: i32
+    largura: u8
+}
+
+struct RegraIsel {
+    nome: ?str
+    fn: u16
+}
+
+struct FormasAritmeticas {
+    rr: [2]u16
+    ri: [2]u16
+}
+
+const ABI_RET_VAZIO: i32 = 0
+const ABI_RET_RAX: i32 = 1
+const ABI_RET_XMM0: i32 = 2
+const ABI_RET_OCULTO: i32 = 3
+const X64_ALINHAMENTO_FUNCAO: u32 = 16
+const X64_ALINHAMENTO_UNWIND: u32 = 4
+const X64_BYTE_PADDING: i32 = 204
+const X64_PAGINA: u32 = 4096
+const X64_TAM_MAX_INSTR: u32 = 15
+const X64_SLOT_BYTES: u32 = 8
+const X64_VETOR_BYTES: u32 = 16
+const ABI_WIN_REGS_ARG: u32 = 4
+const ABI_WIN_SOMBRA: u32 = 32
+const ABI_WIN_REG_RETORNO: i32 = 0
+const ABI_WIN_BYTES_ARG: u32 = 8
+const X64_MAX_SALVOS: u32 = 7
+// C2F-A1 extern REGRAS_ISEL (const RegraIsel[39]) = dado .incbin: #load pendente (construir.bat)
+// C2F-A1 extern CC_DA_COND (const X64Cond[10]) = dado .incbin: #load pendente (construir.bat)
+// C2F-A1 extern FORMAS_ARIT (const FormasAritmeticas[39]) = dado .incbin: #load pendente (construir.bat)
+
+pub proc arena_fatia_abi_arg(a: ^common.Arena, n: int) -> []AbiArg {
+    var l = make([dynamic]AbiArg, alloc = common.arena_mem(a), cap = n)
+    for i in 0..<n {
+        append(&l, item = AbiArg{})
+    }
+    return l[..]
+}
+
+pub proc arena_fatia_abi_local(a: ^common.Arena, n: int) -> []AbiLocal {
+    var l = make([dynamic]AbiLocal, alloc = common.arena_mem(a), cap = n)
+    for i in 0..<n {
+        append(&l, item = AbiLocal{})
+    }
+    return l[..]
+}
+
+pub const ISEL_FN_ISEL_ARITMETICA: u16 = 1
+pub const ISEL_FN_ISEL_OV: u16 = 2
+pub const ISEL_FN_ISEL_CMP: u16 = 3
+pub const ISEL_FN_ISEL_NEG: u16 = 4
+pub const ISEL_FN_ISEL_MOVER: u16 = 5
+pub const ISEL_FN_ISEL_EXTENSAO_SINAL: u16 = 6
+pub const ISEL_FN_ISEL_EXTENSAO_ZERO: u16 = 7
+pub const ISEL_FN_ISEL_END_SIMBOLO: u16 = 8
+pub const ISEL_FN_ISEL_DIVISAO: u16 = 9
+pub const ISEL_FN_ISEL_DESLOCAMENTO: u16 = 10
+pub const ISEL_FN_ISEL_NOT: u16 = 11
+pub const ISEL_FN_ISEL_CHAMA: u16 = 12
+pub const ISEL_FN_ISEL_ARMADILHA: u16 = 13
+pub const ISEL_FN_ISEL_SALTA: u16 = 14
+pub const ISEL_FN_ISEL_DESVIA: u16 = 15
+pub const ISEL_FN_ISEL_RETORNA: u16 = 16
+pub const ISEL_FN_ISEL_END_SLOT: u16 = 17
+pub const ISEL_FN_ISEL_CARREGA: u16 = 18
+pub const ISEL_FN_ISEL_GRAVA: u16 = 19
+pub const ISEL_FN_ISEL_COPIA_MEM: u16 = 20
+pub const ISEL_FN_ISEL_ZERA_MEM: u16 = 21
+pub const ISEL_FN_ISEL_SELECIONA: u16 = 22
+pub const ISEL_FN_ISEL_I_PARA_F: u16 = 23
+pub const ISEL_FN_ISEL_RAIZ: u16 = 24
+pub const ISEL_FN_ISEL_SPLAT: u16 = 25
+pub const ISEL_FN_ISEL_F_PARA_F: u16 = 26
+pub proc chamar_isel_fn(tag: u16, c: ^X64Ctx, i: ^bir.BirInstr) -> bool {
+    if tag == 1 {
+        return isel_aritmetica(c, i)
+    }
+    if tag == 2 {
+        return isel_ov(c, i)
+    }
+    if tag == 3 {
+        return isel_cmp(c, i)
+    }
+    if tag == 4 {
+        return isel_neg(c, i)
+    }
+    if tag == 5 {
+        return isel_mover(c, i)
+    }
+    if tag == 6 {
+        return isel_extensao_sinal(c, i)
+    }
+    if tag == 7 {
+        return isel_extensao_zero(c, i)
+    }
+    if tag == 8 {
+        return isel_end_simbolo(c, i)
+    }
+    if tag == 9 {
+        return isel_divisao(c, i)
+    }
+    if tag == 10 {
+        return isel_deslocamento(c, i)
+    }
+    if tag == 11 {
+        return isel_not(c, i)
+    }
+    if tag == 12 {
+        return isel_chama(c, i)
+    }
+    if tag == 13 {
+        return isel_armadilha(c, i)
+    }
+    if tag == 14 {
+        return isel_salta(c, i)
+    }
+    if tag == 15 {
+        return isel_desvia(c, i)
+    }
+    if tag == 16 {
+        return isel_retorna(c, i)
+    }
+    if tag == 17 {
+        return isel_end_slot(c, i)
+    }
+    if tag == 18 {
+        return isel_carrega(c, i)
+    }
+    if tag == 19 {
+        return isel_grava(c, i)
+    }
+    if tag == 20 {
+        return isel_copia_mem(c, i)
+    }
+    if tag == 21 {
+        return isel_zera_mem(c, i)
+    }
+    if tag == 22 {
+        return isel_seleciona(c, i)
+    }
+    if tag == 23 {
+        return isel_i_para_f(c, i)
+    }
+    if tag == 24 {
+        return isel_raiz(c, i)
+    }
+    if tag == 25 {
+        return isel_splat(c, i)
+    }
+    if tag == 26 {
+        return isel_f_para_f(c, i)
+    }
+    // C2F: o C nao chama fn NULL (X64Selecionar checa antes); tag fora de 1..26 vira o mesmo X64SemRegra, sem o numero do op
+    return x64_sem_regra(c, "fn", "tag de isel fora da tabela REGRAS_ISEL")
+}
+
+// C: nativo/x64/x64_interno.h:122
+proc m_reg(reg: i32, largura: u8) -> MOperando {
+    var o: MOperando = MOperando{tipo = 0}
+    o.tipo = MO_REG
+    o.base = reg
+    o.largura = largura
+    return o
+}
+
+// C: nativo/x64/x64_interno.h:131
+proc m_mem(base: i32, desloc: i32, largura: u8) -> MOperando {
+    var o: MOperando = m_reg(base, largura)
+    o.tipo = MO_MEM
+    o.desloc = desloc
+    return o
+}
+
+// C: nativo/x64/x64_interno.h:139
+proc m_xmm(numero: u8) -> MOperando {
+    var o: MOperando = MOperando{tipo = 0}
+    o.tipo = MO_XMM
+    o.base = numero as i32
+    o.largura = 128
+    return o
+}
+
+// C: nativo/x64/x64_interno.h:148
+proc m_imed(valor: i64) -> MOperando {
+    var o: MOperando = MOperando{tipo = 0}
+    o.tipo = MO_IMED
+    o.imed = valor
+    return o
+}
+
+// C: nativo/x64/x64_interno.h:156
+proc m_bloco(bloco: u32) -> MOperando {
+    var o: MOperando = MOperando{tipo = 0}
+    o.tipo = MO_BLOCO
+    o.imed = bloco as i64
+    return o
+}
+
+// C: nativo/x64/x64_interno.h:164
+proc m_simbolo(simbolo: u32) -> MOperando {
+    var o: MOperando = MOperando{tipo = 0}
+    o.tipo = MO_SIMBOLO
+    o.simbolo = simbolo
+    return o
+}
+
+// C: nativo/x64/x64_interno.h:172
+proc mi0(forma: u16) -> MInstr {
+    var mi: MInstr = MInstr{forma = 0}
+    mi.forma = forma
+    return mi
+}
+
+// C: nativo/x64/x64_interno.h:179
+proc mi1(forma: u16, a: MOperando) -> MInstr {
+    var mi: MInstr = mi0(forma)
+    mi.nops = 1
+    mi.op[0] = a
+    return mi
+}
+
+// C: nativo/x64/x64_interno.h:187
+proc mi2(forma: u16, a: MOperando, b: MOperando) -> MInstr {
+    var mi: MInstr = mi1(forma, a)
+    mi.nops = 2
+    mi.op[1] = b
+    return mi
+}
+
+// C: nativo/x64/x64_interno.h:195
+proc mi3(forma: u16, a: MOperando, b: MOperando, c: MOperando) -> MInstr {
+    var mi: MInstr = mi2(forma, a, b)
+    mi.nops = 3
+    mi.op[2] = c
+    return mi
+}
+
+// C: nativo/x64/x64_interno.h:203
+proc mi_cc(forma: u16, cond: i32, a: MOperando) -> MInstr {
+    var mi: MInstr = mi1(forma, a)
+    mi.cond = cond
+    return mi
+}

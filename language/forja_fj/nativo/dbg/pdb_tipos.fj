@@ -1,0 +1,506 @@
+// nativo/dbg/pdb_tipos.fj - porte de compiler/nativo/dbg/pdb_tipos.c
+// sha256 de nativo/dbg/pdb_tipos.c: c3a9898c7e181c2e8a2f66525d6cf8d58431f243550e26eefac72692756f24db
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.2.0
+// Changelog: 0.2.0 - G3 V4-W6: 13 stubs promovidos (registros LF_*, TPI sob demanda, PdbTipoIndice); pdb_nome grava o NUL explicito (C: strlen + 1).
+
+import "common"
+import "ir"
+import "semantic"
+
+struct PdbEstrutura {
+    nome: ?str
+    qtd: u32
+    campos: u32
+    tam: u32
+}
+
+const CV_T_VOID: u32 = 3
+const CV_T_U8: u32 = 105
+const CV_T_UQUAD: u32 = 35
+const CV_T_INT4: u32 = 116
+const CV_T_UINT4: u32 = 117
+const CV_T_INT8: u32 = 118
+const CV_PTR_64: u32 = 1536
+const CV_SIMPLES_MAX: u32 = 256
+const CV_ATTR_PTR64: u32 = 65548
+const CV_ATTR_PUBLICO: u32 = 3
+const CV_PROP_FWDREF: u32 = 128
+const CV_REG_MAX: u32 = 65280
+const CV_TAM_MEMBRO_MAX: u32 = 24
+const PDB_EM_CURSO: u32 = 1
+const LF_POINTER: u32 = 4098
+const LF_FIELDLIST: u32 = 4611
+const LF_ENUMERATE: u32 = 5378
+const LF_ARRAY: u32 = 5379
+const LF_STRUCTURE: u32 = 5381
+const LF_ENUM: u32 = 5383
+const LF_MEMBER: u32 = 5389
+const PDB_MEMBROS_LISTA: i32 = 5
+const NOMES_LISTA_2: [5]str = {"ptr", "len", "cap", "alocador", "epoca"}
+// C2F:? tabela PAD (const char[3]): inteiro -13 fora de u8
+
+// C: nativo/dbg/pdb_tipos.c:41
+proc pdb_escalar(c: i32) -> u32 {
+    let sw_1 = common.c2f_s2u_32(c)
+    if sw_1 == (semantic.TC_BOOL as u32) {
+        return 48
+    } else if sw_1 == (semantic.TC_I8 as u32) {
+        return 104
+    } else if sw_1 == (semantic.TC_U8 as u32) {
+        return 105
+    } else if sw_1 == (semantic.TC_I16 as u32) {
+        return 114
+    } else if sw_1 == (semantic.TC_U16 as u32) {
+        return 115
+    } else if sw_1 == (semantic.TC_I32 as u32) {
+        return 116
+    } else if sw_1 == (semantic.TC_U32 as u32) {
+        return 117
+    } else if sw_1 == (semantic.TC_INT as u32) {
+        return 118
+    } else if sw_1 == (semantic.TC_UINT as u32) {
+        return 119
+    } else if sw_1 == (semantic.TC_REAL as u32) {
+        return 64
+    } else if sw_1 == (semantic.TC_F64 as u32) {
+        return 65
+    } else {
+        return 0
+    }
+    return 0
+}
+
+// C: nativo/dbg/pdb_tipos.c:60
+proc pdb_tipo_simples(t: ^semantic.Tipos, id: u32) -> u32 {
+    let c: i32 = semantic.tipo_classe_de(t, id)
+    var apontado: u32 = 0
+    if (common.c2f_s2u_32(c) == (semantic.TC_RAWPTR as u32)) or (common.c2f_s2u_32(c) == (semantic.TC_CSTR as u32)) {
+        return CV_PTR_64 | CV_T_VOID
+    }
+    if common.c2f_s2u_32(c) != (semantic.TC_PONTEIRO as u32) {
+        return pdb_escalar(c)
+    }
+    apontado = pdb_escalar(semantic.tipo_classe_de(t, semantic.tipo_de(t, id).a))
+    var tern_1: u32 = 0
+    if apontado != 0 {
+        tern_1 = CV_PTR_64 | apontado
+    }
+    return tern_1
+}
+
+// C: nativo/dbg/pdb_tipos.c:73
+// memset(t, 0): o chamador declara o PdbTipos zerado; aqui so se ajustam os campos que tem valor inicial.
+proc pdb_tipos_iniciar(t: ^PdbTipos, tipos: ^semantic.Tipos, ir_c: ^ir.IrPrograma, nomes: ^common.Interner) {
+    t.tipos = tipos
+    t.ir = ir_c
+    t.nomes = nomes
+    t.reg = make([dynamic]u8, alloc = heap) // o C anexa em Buf zerado (BufAnexar aloca)
+    t.indice = none
+    t.ntipos = 0
+    t.lay_pronto = false
+    t.proximo = PDB_PRIMEIRO_TIPO
+}
+
+// C: nativo/dbg/pdb_tipos.c:82
+proc pdb_tipos_liberar(t: ^PdbTipos) {
+    delete(t.reg)
+    common.arena_liberar(&t.arena)
+}
+
+// C: nativo/dbg/pdb_tipos.c:91
+// Fecha o buffer em multiplo de 4 com LF_PAD (F3 F2 F1, terminando em F1).
+proc pdb_alinhar4(b: ^[dynamic]u8) {
+    var pad: [3]u8 = {243, 242, 241}
+    let n: u64 = (4 - ((len(b^) as u64) & 3)) & 3
+    if n != 0 {
+        append(b, items = pad[(3 - n) ..< 3])
+    }
+}
+
+// C: nativo/dbg/pdb_tipos.c:100
+proc pdb_reg_abrir(b: ^[dynamic]u8, leaf: u32) -> u64 {
+    let pos: u64 = len(b^) as u64
+    pdb_u16(b, 0)
+    pdb_u16(b, leaf)
+    return pos
+}
+
+// C: nativo/dbg/pdb_tipos.c:110
+// Fecha o registro aberto em pos e devolve o TypeIndex dele (o tamanho gravado nao conta o proprio campo).
+proc pdb_reg_fechar(t: ^PdbTipos, pos: u64) -> u32 {
+    pdb_alinhar4(&t.reg)
+    let tam: u64 = (len(t.reg) as u64) - pos - 2
+    if tam > 0xFFFF {
+        let msg_1 = format(f"pdb: registro de tipo de {tam} bytes passa de 64 KiB", alloc = heap)
+        defer delete(msg_1)
+        common.falha_interna(msg_1)
+    }
+    t.reg[pos] = common.c2f_trunc_u8(tam)
+    t.reg[pos + 1] = common.c2f_trunc_u8(tam >> 8)
+    let id: u32 = t.proximo
+    t.proximo += 1
+    return id
+}
+
+// C: nativo/dbg/pdb_tipos.c:124
+// Numeric leaf: < 0x8000 direto; senao LF_ULONG (0x8004) ou LF_UQUADWORD (0x800A); negativos em LF_CHAR/SHORT/LONG/QUADWORD.
+proc pdb_numero(b: ^[dynamic]u8, v: i64) {
+    let sem_sinal: u64 = common.c2f_s2u_64(v)
+    if v >= 0 and v < 0x8000 {
+        pdb_u16(b, common.c2f_trunc_u32(sem_sinal))
+    } else if v >= 0 and v <= 0xFFFFFFFF {
+        pdb_u16(b, 0x8004)
+        pdb_u32(b, common.c2f_trunc_u32(sem_sinal))
+    } else if v >= 0 {
+        pdb_u16(b, 0x800A)
+        pdb_u32(b, common.c2f_trunc_u32(sem_sinal))
+        pdb_u32(b, common.c2f_trunc_u32(sem_sinal >> 32))
+    } else if v >= -128 {
+        pdb_u16(b, 0x8000)
+        append(b, item = common.c2f_trunc_u8(sem_sinal))
+    } else if v >= -32768 {
+        pdb_u16(b, 0x8001)
+        pdb_u16(b, common.c2f_trunc_u32(sem_sinal))
+    } else if v >= -2147483648 {
+        pdb_u16(b, 0x8003)
+        pdb_u32(b, common.c2f_trunc_u32(sem_sinal))
+    } else {
+        pdb_u16(b, 0x8009)
+        pdb_u32(b, common.c2f_trunc_u32(sem_sinal))
+        pdb_u32(b, common.c2f_trunc_u32(sem_sinal >> 32))
+    }
+}
+
+// C: nativo/dbg/pdb_tipos.c:151
+// Nome C: os bytes do texto seguidos de um NUL (strlen + 1). Fatia de str nao traz o NUL: grava-se a mao.
+proc pdb_nome(b: ^[dynamic]u8, s: str) {
+    append(b, items = as_bytes(s))
+    append(b, item = 0 as u8)
+}
+
+// C: nativo/dbg/pdb_tipos.c:156
+proc pdb_reg_membro(b: ^[dynamic]u8, tipo: u32, off: u32, nome: str) {
+    pdb_u16(b, LF_MEMBER)
+    pdb_u16(b, CV_ATTR_PUBLICO)
+    pdb_u32(b, tipo)
+    pdb_numero(b, off as i64)
+    pdb_nome(b, nome)
+    pdb_alinhar4(b)
+}
+
+// C: nativo/dbg/pdb_tipos.c:168
+proc pdb_layout(t: ^PdbTipos) {
+    if t.lay_pronto {
+        return
+    }
+    ir.layout_calcular(t.tipos as ^semantic.Tipos, t.ir as ^ir.IrPrograma, &t.arena, &t.lay)
+    t.lay_pronto = true
+}
+
+// C: nativo/dbg/pdb_tipos.c:176
+proc pdb_tamanho(t: ^PdbTipos, id: u32) -> u32 {
+    pdb_layout(t)
+    var tern_1: u32 = 0
+    if id < t.lay.qtd {
+        tern_1 = (t.lay.tipos or_else {})[id].tam
+    }
+    return tern_1
+}
+
+// C: nativo/dbg/pdb_tipos.c:183
+proc pdb_ponteiro_para(t: ^PdbTipos, alvo: u32) -> u32 {
+    var pos: u64 = 0
+    if alvo < CV_SIMPLES_MAX {
+        return CV_PTR_64 | alvo
+    }
+    pos = pdb_reg_abrir(&t.reg, LF_POINTER)
+    pdb_u32(&t.reg, alvo)
+    pdb_u32(&t.reg, CV_ATTR_PTR64)
+    return pdb_reg_fechar(t, pos)
+}
+
+// C: nativo/dbg/pdb_tipos.c:196
+proc pdb_reg_array(t: ^PdbTipos, elem: u32, tam: u32) -> u32 {
+    let pos: u64 = pdb_reg_abrir(&t.reg, LF_ARRAY)
+    pdb_u32(&t.reg, elem)
+    pdb_u32(&t.reg, CV_T_UQUAD)
+    pdb_numero(&t.reg, tam as i64)
+    pdb_nome(&t.reg, "")
+    return pdb_reg_fechar(t, pos)
+}
+
+// C: nativo/dbg/pdb_tipos.c:207
+proc pdb_reg_bytes(t: ^PdbTipos, id: u32) -> u32 {
+    return pdb_reg_array(t, CV_T_U8, pdb_tamanho(t, id))
+}
+
+// C: nativo/dbg/pdb_tipos.c:213
+proc pdb_indice_de(t: ^PdbTipos, id: u32) -> u32 {
+    let idx: u32 = pdb_tipo_indice(t, id)
+    var tern_1: u32 = CV_T_VOID
+    if idx != 0 {
+        tern_1 = idx
+    }
+    return tern_1
+}
+
+// C: nativo/dbg/pdb_tipos.c:223
+proc pdb_reg_estrutura(t: ^PdbTipos, e: ^PdbEstrutura, propriedade: u32) -> u32 {
+    let pos: u64 = pdb_reg_abrir(&t.reg, LF_STRUCTURE)
+    pdb_u16(&t.reg, e.qtd)
+    pdb_u16(&t.reg, propriedade)
+    pdb_u32(&t.reg, e.campos)
+    pdb_u32(&t.reg, 0)
+    pdb_u32(&t.reg, 0)
+    pdb_numero(&t.reg, e.tam as i64)
+    pdb_nome(&t.reg, (e.nome or_else ""))
+    return pdb_reg_fechar(t, pos)
+}
+
+// C: nativo/dbg/pdb_tipos.c:238
+// str, []T e [dynamic]T: membros ptr (aponta para o elemento), len e cap (int), alocador e epoca (u32), nos offsets do layout.
+proc pdb_reg_lista(t: ^PdbTipos, id: u32, nome: str, qtd_max: u32) -> u32 {
+    let tipos = t.tipos as ^semantic.Tipos
+    let info: ^semantic.TipoInfo = semantic.tipo_de(tipos, id)
+    var elem: u32 = info.a
+    var qtd: u32 = ir.layout_qtd_membros(&t.lay, id)
+    var ptr: u32 = 0
+    var campos: u32 = 0
+    if common.c2f_s2u_32(semantic.tipo_classe_de(tipos, id)) == (semantic.TC_TEXTO as u32) {
+        elem = semantic.TIPO_U8 as u32
+    }
+    ptr = pdb_ponteiro_para(t, pdb_indice_de(t, elem))
+    if qtd > qtd_max {
+        qtd = qtd_max
+    }
+    let pos: u64 = pdb_reg_abrir(&t.reg, LF_FIELDLIST)
+    var k: u32 = 0
+    while k < qtd {
+        var tipo_membro: u32 = CV_T_UINT4
+        if k == 0 {
+            tipo_membro = ptr
+        } else if k <= 2 {
+            tipo_membro = CV_T_INT8
+        }
+        pdb_reg_membro(&t.reg, tipo_membro, ir.layout_offset_campo(&t.lay, id, k), NOMES_LISTA_2[k])
+        k += 1
+    }
+    campos = pdb_reg_fechar(t, pos)
+    var e = PdbEstrutura{nome = nome, qtd = qtd, campos = campos, tam = pdb_tamanho(t, id)}
+    return pdb_reg_estrutura(t, &e, 0)
+}
+
+// C: nativo/dbg/pdb_tipos.c:258
+proc pdb_resolver_campos(t: ^PdbTipos, s: ?^ir.IrStruct) -> u32 {
+    var total: u32 = 0
+    var k: u32 = 0
+    while k < (s as ^ir.IrStruct).ncampos {
+        _ = pdb_indice_de(t, ((s as ^ir.IrStruct).campos or_else {})[k].tipo)
+        total += CV_TAM_MEMBRO_MAX + ((len(common.interner_texto(t.nomes as ^common.Interner, ((s as ^ir.IrStruct).campos or_else {})[k].nome)) as u64) as u32)
+        k += 1
+    }
+    return total
+}
+
+// C: nativo/dbg/pdb_tipos.c:270
+// struct com definicao na IR: membros pelo nome do campo, tipo e offset do layout. Opaca ou sem definicao, ou grande demais: bytes.
+proc pdb_reg_struct(t: ^PdbTipos, id: u32) -> u32 {
+    pdb_layout(t)
+    let s: ?^ir.IrStruct = ir.layout_estrutura(t.tipos as ^semantic.Tipos, t.ir as ^ir.IrPrograma, id)
+    if s == none {
+        return pdb_reg_bytes(t, id)
+    }
+    if (s as ^ir.IrStruct).opaco or (pdb_resolver_campos(t, s) > CV_REG_MAX) {
+        return pdb_reg_bytes(t, id)
+    }
+    let st: ^ir.IrStruct = s as ^ir.IrStruct
+    let pos: u64 = pdb_reg_abrir(&t.reg, LF_FIELDLIST)
+    var k: u32 = 0
+    while k < st.ncampos {
+        let campo = (st.campos or_else {})[k]
+        let idx_tipo: u32 = pdb_indice_de(t, campo.tipo)
+        pdb_reg_membro(&t.reg, idx_tipo, ir.layout_offset_campo(&t.lay, id, k), common.interner_texto(t.nomes as ^common.Interner, campo.nome))
+        k += 1
+    }
+    var e = PdbEstrutura{}
+    e.campos = pdb_reg_fechar(t, pos)
+    e.nome = common.interner_texto(t.nomes as ^common.Interner, transmute(semantic.tipo_de(t.tipos as ^semantic.Tipos, id).a, to = i32))
+    e.qtd = st.ncampos
+    e.tam = pdb_tamanho(t, id)
+    return pdb_reg_estrutura(t, &e, 0)
+}
+
+// C: nativo/dbg/pdb_tipos.c:290
+proc pdb_achar_enum(ir_c: ^ir.IrPrograma, nome: i32) -> ?^ir.IrEnum {
+    for k in (0 as u32)..<ir_c.nenums {
+        if (ir_c.enums or_else {})[k].nome == nome {
+            return &(ir_c.enums or_else {})[k]
+        }
+    }
+    return none
+}
+
+// C: nativo/dbg/pdb_tipos.c:300
+// enum: LF_FIELDLIST de LF_ENUMERATE (valor da IR ou o indice) e LF_ENUM com o tipo base pelo tamanho. Sem definicao na IR ou grande demais: bytes.
+proc pdb_reg_enum(t: ^PdbTipos, id: u32) -> u32 {
+    let nome: i32 = transmute(semantic.tipo_de(t.tipos as ^semantic.Tipos, id).a, to = i32)
+    let e: ?^ir.IrEnum = pdb_achar_enum(t.ir as ^ir.IrPrograma, nome)
+    if e == none {
+        return pdb_reg_bytes(t, id)
+    }
+    let en: ^ir.IrEnum = e as ^ir.IrEnum
+    if (en.nmembros as u64) * (CV_TAM_MEMBRO_MAX as u64) > (CV_REG_MAX as u64) {
+        return pdb_reg_bytes(t, id)
+    }
+    let tam: u32 = pdb_tamanho(t, id)
+    let pos: u64 = pdb_reg_abrir(&t.reg, LF_FIELDLIST)
+    var k: u32 = 0
+    while k < en.nmembros {
+        var valor: i64 = k as i64
+        if en.valores != none {
+            valor = (en.valores or_else {})[k]
+        }
+        pdb_u16(&t.reg, LF_ENUMERATE)
+        pdb_u16(&t.reg, CV_ATTR_PUBLICO)
+        pdb_numero(&t.reg, valor)
+        pdb_nome(&t.reg, common.interner_texto(t.nomes as ^common.Interner, (en.membros or_else {})[k]))
+        pdb_alinhar4(&t.reg)
+        k += 1
+    }
+    let campos: u32 = pdb_reg_fechar(t, pos)
+    var base: u32 = CV_T_INT4
+    if tam == 1 {
+        base = 0x68
+    } else if tam == 2 {
+        base = 0x72
+    } else if tam == 8 {
+        base = CV_T_INT8
+    }
+    let pos_enum: u64 = pdb_reg_abrir(&t.reg, LF_ENUM)
+    pdb_u16(&t.reg, en.nmembros)
+    pdb_u16(&t.reg, 0)
+    pdb_u32(&t.reg, base)
+    pdb_u32(&t.reg, campos)
+    pdb_nome(&t.reg, common.interner_texto(t.nomes as ^common.Interner, nome))
+    return pdb_reg_fechar(t, pos_enum)
+}
+
+// C: nativo/dbg/pdb_tipos.c:329
+// [N]T: LF_ARRAY do elemento com o tamanho do layout em bytes.
+proc pdb_reg_vetor(t: ^PdbTipos, id: u32) -> u32 {
+    let elem: u32 = pdb_indice_de(t, semantic.tipo_de(t.tipos as ^semantic.Tipos, id).a)
+    return pdb_reg_array(t, elem, pdb_tamanho(t, id))
+}
+
+// C: nativo/dbg/pdb_tipos.c:337
+// Struct no meio do proprio registro (ciclo): LF_STRUCTURE fwdref sem membros, uma vez por tipo (guardada na 2a metade do vetor).
+proc pdb_reg_adiantado(t: ^PdbTipos, id: u32) -> u32 {
+    let indice = t.indice or_else {}
+    let slot: u64 = (t.ntipos as u64) + (id as u64)
+    if indice[slot] != 0 {
+        return indice[slot]
+    }
+    if common.c2f_s2u_32(semantic.tipo_classe_de(t.tipos as ^semantic.Tipos, id)) != (semantic.TC_STRUCT as u32) {
+        return CV_T_VOID
+    }
+    var e = PdbEstrutura{}
+    e.nome = common.interner_texto(t.nomes as ^common.Interner, transmute(semantic.tipo_de(t.tipos as ^semantic.Tipos, id).a, to = i32))
+    let registro: u32 = pdb_reg_estrutura(t, &e, CV_PROP_FWDREF)
+    indice[slot] = registro
+    return registro
+}
+
+// C: nativo/dbg/pdb_tipos.c:352
+// Despacho por classe: so o tipo nao simples chega aqui.
+proc pdb_registrar(t: ^PdbTipos, id: u32, c: i32) -> u32 {
+    let cu: u32 = common.c2f_s2u_32(c)
+    if cu == (semantic.TC_PONTEIRO as u32) or cu == (semantic.TC_ANULAVEL as u32) {
+        return pdb_ponteiro_para(t, pdb_indice_de(t, semantic.tipo_de(t.tipos as ^semantic.Tipos, id).a))
+    }
+    if cu == (semantic.TC_TEXTO as u32) {
+        pdb_layout(t)
+        return pdb_reg_lista(t, id, "str", 2)
+    }
+    if cu == (semantic.TC_FATIA as u32) {
+        pdb_layout(t)
+        return pdb_reg_lista(t, id, "[]T", 2)
+    }
+    if cu == (semantic.TC_DINAMICO as u32) {
+        pdb_layout(t)
+        return pdb_reg_lista(t, id, "[dynamic]T", PDB_MEMBROS_LISTA as u32)
+    }
+    if cu == (semantic.TC_ARRAY as u32) {
+        return pdb_reg_vetor(t, id)
+    }
+    if cu == (semantic.TC_STRUCT as u32) {
+        return pdb_reg_struct(t, id)
+    }
+    if cu == (semantic.TC_ENUM as u32) {
+        return pdb_reg_enum(t, id)
+    }
+    return pdb_reg_bytes(t, id)
+}
+
+// C: nativo/dbg/pdb_tipos.c:368
+// TypeIndex de id: o simples direto, ou o registro LF_* (gravado agora, em ordem topologica, se ainda nao existe). 0 = tipo sem forma.
+proc pdb_tipo_indice(t: ^PdbTipos, id: u32) -> u32 {
+    let tipos = t.tipos as ^semantic.Tipos
+    let simples: u32 = pdb_tipo_simples(tipos, id)
+    if simples != 0 {
+        return simples
+    }
+    let c: i32 = semantic.tipo_classe_de(tipos, id)
+    let cu: u32 = common.c2f_s2u_32(c)
+    if cu == (semantic.TC_VAZIO as u32) or cu == (semantic.TC_VENENO as u32) {
+        return 0
+    }
+    if t.indice == none {
+        t.ntipos = len(tipos.itens) as u32
+        let tabela = common.arena_fatia_u32(&t.arena, (2 * (t.ntipos as u64)) as int)
+        for k in (0 as u64)..<(2 * (t.ntipos as u64)) {
+            tabela[k] = 0
+        }
+        t.indice = tabela
+    }
+    if id >= t.ntipos {
+        let msg_1 = format(f"pdb: tipo {id} fora da tabela de tipos ({t.ntipos})", alloc = heap)
+        defer delete(msg_1)
+        common.falha_interna(msg_1)
+    }
+    let indice = t.indice or_else {}
+    if indice[id] >= PDB_PRIMEIRO_TIPO {
+        return indice[id]
+    }
+    if indice[id] == PDB_EM_CURSO {
+        return pdb_reg_adiantado(t, id)
+    }
+    indice[id] = PDB_EM_CURSO
+    let registro: u32 = pdb_registrar(t, id, c)
+    indice[id] = registro
+    return registro
+}
+
+test "pdb_numero_e_alinhar4_formas_codeview" {
+    var b = make([dynamic]u8, alloc = heap)
+    defer delete(b)
+    pdb_numero(&b, 5)
+    expect(len(b) == 2)
+    expect(b[0] == 5)
+    pdb_numero(&b, -1)
+    expect(len(b) == 5)
+    expect(b[2] == 0)
+    expect(b[3] == 128)
+    expect(b[4] == 255)
+    pdb_alinhar4(&b)
+    expect(len(b) == 8)
+    expect(b[5] == 243)
+    expect(b[6] == 242)
+    expect(b[7] == 241)
+}
+
+test "pdb_escalar_codigos_do_cv" {
+    expect(pdb_escalar(semantic.TC_I32 as i32) == 116)
+    expect(pdb_escalar(semantic.TC_U8 as i32) == 105)
+    expect(pdb_escalar(semantic.TC_REAL as i32) == 64)
+}

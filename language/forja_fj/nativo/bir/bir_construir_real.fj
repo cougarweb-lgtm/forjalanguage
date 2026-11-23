@@ -1,0 +1,293 @@
+// nativo/bir/bir_construir_real.fj - porte de compiler/nativo/bir/bir_construir_real.c
+// sha256 de nativo/bir/bir_construir_real.c: 7c675bbbb89795651d257f8812cc18ec9f3d918cd9425134c8b140f11b0b8704
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "common"
+import "frontend"
+import "ir"
+import "semantic"
+
+const MASCARA_BYTES: u32 = 16
+const MASCARA_ALINHAMENTO: u32 = 16
+const ARGS_AS_DE_REAL: u32 = 3
+const OPS_REAIS: [4]u8 = {2, 3, 4, 23}
+const CONDS_REAIS: [6]u8 = {10, 11, 12, 13, 14, 15}
+// C: nativo/bir/bir_construir_real.c:24
+// f32: conversao direta double -> float (sem texto); f64: os bits do double. O f32 fica nos 32 bits baixos.
+proc bits_do_real(valor: f64, classe: u8) -> i64 {
+    if classe == (BC_F64 as u8) {
+        return transmute(valor, to = i64)
+    }
+    let f32_valor: f32 = valor as f32
+    let bits32: u32 = transmute(f32_valor, to = u32)
+    return bits32 as i64
+}
+
+// C: nativo/bir/bir_construir_real.c:39
+proc bir_imediato_real(v: ^ir.Valor, classe: u8, saida: ^BirOperando) -> bool {
+    var tern_1: f64 = v.inteiro as f64
+    if v.tipo_no == (ir.V_REAL as u8) {
+        tern_1 = v.real
+    }
+    let valor: f64 = tern_1
+    saida^ = op_imed(bits_do_real(valor, classe), classe)
+    return true
+}
+
+// C: nativo/bir/bir_construir_real.c:54
+proc eh_comparacao_real(op: u8) -> bool {
+    return ((op as i32) >= frontend.OP_IGUAL) and ((op as i32) <= frontend.OP_MAIOR_IGUAL)
+}
+
+// C: nativo/bir/bir_construir_real.c:59
+proc eh_aritmetica_real(op: u8) -> bool {
+    return ((op as i32) >= frontend.OP_SOMA) and ((op as i32) <= frontend.OP_DIV)
+}
+
+// C: nativo/bir/bir_construir_real.c:64
+proc bir_conta_real(c: ^BirCtx, i: ^ir.IrInstr, ab: [2]BirOperando) -> bool {
+    let compara: bool = eh_comparacao_real(i.op_aux)
+    var dst: u32 = 0
+    if (not compara) and (not eh_aritmetica_real(i.op_aux)) {
+        return bir_falha_inconsistente(c, "operador sem sentido em real")
+    }
+    var tern_1: i32 = ab[0].classe as i32
+    if common.c2f_b2i32(compara) != 0 {
+        tern_1 = BC_I8
+    }
+    if not bir_definir_destino(c, tern_1 as u8, &dst) {
+        return false
+    }
+    if compara {
+        _ = bir_emitir_pedido(c, BirPedido{op = BIR_CMP as u8, aux = CONDS_REAIS[(i.op_aux as i32) - frontend.OP_IGUAL], dst = dst, a = ab[0], b = ab[1]})
+    } else {
+        _ = bir_emitir_pedido(c, BirPedido{op = OPS_REAIS[(i.op_aux as i32) - frontend.OP_SOMA], dst = dst, a = ab[0], b = ab[1]})
+    }
+    return true
+}
+
+// C: nativo/bir/bir_construir_real.c:85
+// MASCARA_F32 = {[3] = 0x80} e MASCARA_F64 = {[7] = 0x80} (16 bytes): montadas aqui porque a Forja nao tem const de bytes com zero.
+proc bir_negar_real_em(c: ^BirCtx, a: BirOperando, dst: u32) {
+    var mascara = make([dynamic]u8, alloc = heap, cap = 16)
+    defer delete(mascara)
+    var k: u32 = 0
+    while k < MASCARA_BYTES {
+        append(&mascara, item = 0 as u8)
+        k += 1
+    }
+    var bit_sinal: u32 = 3
+    if a.classe == (BC_F64 as u8) {
+        bit_sinal = 7
+    }
+    mascara[bit_sinal] = 128 as u8
+    let bytes_mascara: str = to_str(&mascara)
+    defer delete(bytes_mascara)
+    let simbolo: u32 = bir_simbolo_dado(c, bytes_mascara, MASCARA_BYTES, MASCARA_ALINHAMENTO)
+    _ = bir_emitir_pedido(c, BirPedido{op = BIR_NEG as u8, dst = dst, a = a, b = op_simbolo(simbolo)})
+}
+
+// C: nativo/bir/bir_construir_real.c:93
+proc bir_negar_real(c: ^BirCtx, a: BirOperando) -> bool {
+    var dst: u32 = 0
+    if not bir_definir_destino(c, a.classe, &dst) {
+        return false
+    }
+    bir_negar_real_em(c, a, dst)
+    return true
+}
+
+// C: nativo/bir/bir_construir_real.c:104
+proc bir_raiz_real(c: ^BirCtx, a: BirOperando) -> bool {
+    var dst: u32 = 0
+    if not bir_definir_destino(c, a.classe, &dst) {
+        return false
+    }
+    _ = bir_emitir_pedido(c, BirPedido{op = BIR_RAIZ as u8, dst = dst, a = a})
+    return true
+}
+
+// C: nativo/bir/bir_construir_real.c:117
+proc uint_para_real(c: ^BirCtx, v: BirOperando, dst: u32) {
+    let grande: u32 = bir_novo_bloco(c, false)
+    let pequeno: u32 = bir_novo_bloco(c, false)
+    let fim: u32 = bir_novo_bloco(c, false)
+    let negativo: u32 = bir_comparar(c, BCOND_LT_S as u8, v, op_imed(0, BC_I64 as u8))
+    var metade: u32 = 0
+    var bit: u32 = 0
+    var junta: u32 = 0
+    bir_desvia(c, op_vreg(negativo, BC_I8 as u8), grande, pequeno)
+    c.cur = pequeno
+    _ = bir_emitir_pedido(c, BirPedido{op = BIR_I_PARA_F as u8, aux = BIR_SINAL as u8, dst = dst, a = v})
+    bir_salta(c, fim)
+    c.cur = grande
+    metade = bir_conta_nova(c, BC_I64 as u8, BirPedido{op = BIR_SHR as u8, aux = BIR_SEM_SINAL as u8, a = v, b = op_imed(1, BC_I64 as u8)})
+    bit = bir_conta_nova(c, BC_I64 as u8, BirPedido{op = BIR_AND as u8, a = v, b = op_imed(1, BC_I64 as u8)})
+    junta = bir_conta_nova(c, BC_I64 as u8, BirPedido{op = BIR_OR as u8, a = op_vreg(metade, BC_I64 as u8), b = op_vreg(bit, BC_I64 as u8)})
+    _ = bir_emitir_pedido(c, BirPedido{op = BIR_I_PARA_F as u8, aux = BIR_SINAL as u8, dst = dst, a = op_vreg(junta, BC_I64 as u8)})
+    _ = bir_emitir_pedido(c, BirPedido{op = BIR_ADD as u8, dst = dst, a = op_vreg(dst, ((c.f as ^BirFuncao).classe_vreg or_else {})[dst]), b = op_vreg(dst, ((c.f as ^BirFuncao).classe_vreg or_else {})[dst])})
+    bir_salta(c, fim)
+    c.cur = fim
+}
+
+// C: nativo/bir/bir_construir_real.c:138
+proc alargar_a32(c: ^BirCtx, v: BirOperando, sem_sinal: bool) -> BirOperando {
+    var tern_1: i32 = BIR_EXT_S
+    if common.c2f_b2i32(sem_sinal) != 0 {
+        tern_1 = BIR_EXT_Z
+    }
+    return op_vreg(bir_conta_nova(c, BC_I32 as u8, BirPedido{op = tern_1 as u8, a = v}), BC_I32 as u8)
+}
+
+// C: nativo/bir/bir_construir_real.c:144
+proc inteiro_puro_para_real(c: ^BirCtx, v: BirOperando, sem_sinal: bool, dst: u32) {
+    if (v.classe == (BC_I64 as u8)) and (common.c2f_b2i32(sem_sinal) != 0) {
+        uint_para_real(c, v, dst)
+        return
+    }
+    var tern_1: i32 = BIR_SINAL
+    if common.c2f_b2i32(sem_sinal) != 0 {
+        tern_1 = BIR_SEM_SINAL
+    }
+    _ = bir_emitir_pedido(c, BirPedido{op = BIR_I_PARA_F as u8, aux = tern_1 as u8, dst = dst, a = v})
+}
+
+// C: nativo/bir/bir_construir_real.c:154
+proc inteiro_para_real(c: ^BirCtx, i: ^ir.IrInstr, v: BirOperando, destino: u8) -> bool {
+    var v_v: BirOperando = v
+    var sem_sinal: bool = semantic.tipo_eh_sem_sinal(i.a.tipo)
+    var dst: u32 = 0
+    if (not bir_operando_vreg(c, v_v, &v_v)) or (not bir_definir_destino(c, destino, &dst)) {
+        return false
+    }
+    if (v_v.classe as i32) < BC_I32 {
+        v_v = alargar_a32(c, v_v, sem_sinal)
+        sem_sinal = false
+    }
+    inteiro_puro_para_real(c, v_v, sem_sinal, dst)
+    return true
+}
+
+// C: nativo/bir/bir_construir_real.c:169
+proc real_para_real(c: ^BirCtx, v: BirOperando, destino: u8) -> bool {
+    var dst: u32 = 0
+    if not bir_definir_destino(c, destino, &dst) {
+        return false
+    }
+    if (v.classe as i32) == (destino as i32) {
+        bir_mover(c, dst, v)
+    } else {
+        _ = bir_emitir_pedido(c, BirPedido{op = BIR_F_PARA_F as u8, dst = dst, a = v})
+    }
+    return true
+}
+
+// C: nativo/bir/bir_construir_real.c:190
+// C: nativo/bir/bir_construir_real.c:186 (AS_DE_REAL, na ordem da tabela; int = i64, uint = u64). Sem tabela: o destino fora dela da none.
+proc funcao_as_de_real(destino: u32) -> ?str {
+    if destino == (semantic.TIPO_I8 as u32) {
+        return "forja_as_i8_de_f64"
+    }
+    if destino == (semantic.TIPO_I16 as u32) {
+        return "forja_as_i16_de_f64"
+    }
+    if destino == (semantic.TIPO_I32 as u32) {
+        return "forja_as_i32_de_f64"
+    }
+    if destino == (semantic.TIPO_INT as u32) {
+        return "forja_as_i64_de_f64"
+    }
+    if destino == (semantic.TIPO_U8 as u32) {
+        return "forja_as_u8_de_f64"
+    }
+    if destino == (semantic.TIPO_U16 as u32) {
+        return "forja_as_u16_de_f64"
+    }
+    if destino == (semantic.TIPO_U32 as u32) {
+        return "forja_as_u32_de_f64"
+    }
+    if destino == (semantic.TIPO_UINT as u32) {
+        return "forja_as_u64_de_f64"
+    }
+    return none
+}
+
+// C: nativo/bir/bir_construir_real.c:200
+// Real -> inteiro: forja_as_<S>_de_f64(double, arquivo, linha) do runtime do modo; o f32 vai antes a f64 (cvtss2sd).
+proc real_para_inteiro(c: ^BirCtx, i: ^ir.IrInstr, v: BirOperando, destino: u8) -> bool {
+    let funcao_opt: ?str = funcao_as_de_real(i.tipo)
+    if funcao_opt == none {
+        return bir_falha_tipo(c, i, "-", i.tipo)
+    }
+    let prog: ^BirPrograma = c.p as ^BirPrograma
+    let args: []BirOperando = arena_fatia_bir_operando(&prog.arena, ARGS_AS_DE_REAL as int)
+    var v_f64: BirOperando = v
+    if v.classe == (BC_F32 as u8) {
+        v_f64 = op_vreg(bir_conta_nova(c, BC_F64 as u8, BirPedido{op = BIR_F_PARA_F as u8, a = v}), BC_F64 as u8)
+    }
+    args[0] = v_f64
+    var linha: u32 = 0
+    args[1] = bir_vreg_do_arquivo(c, i.pos, &linha)
+    args[2] = op_imed(linha as i64, BC_I32 as u8)
+    var dst: u32 = 0
+    if not bir_definir_destino(c, destino, &dst) {
+        return false
+    }
+    let chama: ^BirInstr = bir_emitir(c, BIR_CHAMA, destino)
+    chama.dst = dst
+    chama.simbolo = bir_simbolo_runtime(c, funcao_opt)
+    chama.args = args
+    chama.nargs = ARGS_AS_DE_REAL
+    return true
+}
+
+// C: nativo/bir/bir_construir_real.c:225
+proc converter_para_destino(c: ^BirCtx, i: ^ir.IrInstr, v: BirOperando, destino: u8) -> bool {
+    let tipos: ?^semantic.Tipos = (c.e as ^BirEntrada).tipos
+    if not semantic.tipo_eh_real(tipos as ^semantic.Tipos, i.tipo) {
+        return real_para_inteiro(c, i, v, destino)
+    }
+    var tern_1: i32 = 0
+    if common.c2f_b2i32(semantic.tipo_eh_real(tipos as ^semantic.Tipos, i.a.tipo)) != 0 {
+        tern_1 = common.c2f_b2i32(real_para_real(c, v, destino))
+    } else {
+        tern_1 = common.c2f_b2i32(inteiro_para_real(c, i, v, destino))
+    }
+    return tern_1 != 0
+}
+
+// C: nativo/bir/bir_construir_real.c:234
+proc bir_conversao_real(c: ^BirCtx, i: ^ir.IrInstr) -> bool {
+    let tipos: ?^semantic.Tipos = (c.e as ^BirEntrada).tipos
+    var destino: u8 = BC_NADA as u8
+    var v: BirOperando = BirOperando{}
+    if (not semantic.tipo_eh_numerico(tipos as ^semantic.Tipos, i.a.tipo)) or (not semantic.tipo_eh_numerico(tipos as ^semantic.Tipos, i.tipo)) {
+        var tern_1: u32 = i.a.tipo
+        if common.c2f_b2i32(semantic.tipo_eh_numerico(tipos as ^semantic.Tipos, i.a.tipo)) != 0 {
+            tern_1 = i.tipo
+        }
+        return bir_falha_tipo(c, i, "-", tern_1)
+    }
+    if (not bir_operando_de(c, i, &i.a, &v)) or (not bir_classe_do_tipo(tipos as ^semantic.Tipos, i.tipo, &destino)) {
+        return false
+    }
+    return converter_para_destino(c, i, v, destino)
+}
+
+// ---------------------------------------------------------------- testes (puros: bits do literal e tabela de funcao)
+
+test "bir_construir_real_bits_do_real" {
+    expect(bits_do_real(1.5, BC_F32 as u8) == 1069547520)
+    expect(bits_do_real(0.1, BC_F32 as u8) == 1036831949)
+    expect(bits_do_real(1.0, BC_F64 as u8) == 4607182418800017408)
+    expect(bits_do_real(0.1, BC_F64 as u8) == 4591870180066957722)
+}
+
+test "bir_construir_real_funcao_as_de_real" {
+    expect((funcao_as_de_real(semantic.TIPO_I8 as u32) or_else "") == "forja_as_i8_de_f64")
+    expect((funcao_as_de_real(semantic.TIPO_INT as u32) or_else "") == "forja_as_i64_de_f64")
+    expect((funcao_as_de_real(semantic.TIPO_U32 as u32) or_else "") == "forja_as_u32_de_f64")
+    expect((funcao_as_de_real(semantic.TIPO_UINT as u32) or_else "") == "forja_as_u64_de_f64")
+    expect(funcao_as_de_real(semantic.TIPO_STR as u32) == none)
+}

@@ -1,0 +1,764 @@
+// driver/migrar_analise.fj - porte de compiler/driver/migrar_analise.c, compiler/driver/migrar_analise.h
+// sha256 de driver/migrar_analise.c: fcfb2ffc0defe1428fcbc7df052c5fef93c2dc83128fa7f25d5b602d59e1c187
+// sha256 de driver/migrar_analise.h: d8c4aa130818aa3b552792740501c8f6d7938bddd5250fc16a3441e5e99c5ec9
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "common"
+
+struct MigrarTroca {
+    linha: u32
+    coluna: u32
+    coluna_fim: u32
+    classe: i32
+    antigo: ?str
+    novo: ?str
+    linha_fim: u32
+    grupo: i32
+    comentario: bool
+}
+
+struct MigrarRevisao {
+    linha: u32
+    coluna: u32
+    trecho: ?str
+    formas: ?[]str
+    nformas: u32
+}
+
+struct MigrarResultado {
+    estado: i32
+    diagnostico: ?str
+    motivo: ?str
+    trocas: ?[]MigrarTroca
+    ntrocas: u32
+    linhas_iguais: bool
+    revisoes: ?[]MigrarRevisao
+    nrevisoes: u32
+    novo: [dynamic]u8
+}
+
+struct MigrarEntrada {
+    caminho: ?str
+    original: ?str
+    tam: u64
+    comentarios: bool
+}
+
+struct Entrada {
+    caminho: ?str
+    texto: ?str
+    tam: u64
+    arena: ?^common.Arena
+}
+
+struct Leitura {
+    compilou: bool
+    codigo: ?str
+    itens: ?[]MigrarTroca
+    n: u32
+    avisos: ?str
+}
+
+struct Grupo {
+    antigo: ?str
+    novo: ?str
+}
+
+struct Grupos {
+    itens: [64]Grupo
+    n: u32
+}
+
+struct Falha {
+    codigo: ?str
+    frase: ?str
+}
+
+struct Contexto3 {
+    e: Entrada
+    original: ?str
+    tam_original: u64
+    t: ?[]MigrarTroca
+    n: u32
+    ct: ?[]MigrarTroca
+    nct: u32
+}
+
+struct Linha {
+    p: ?str
+    tam: u64
+    lf: bool
+}
+
+const GRUPOS_MAX: i32 = 64
+const MIGRAR_SEM_TROCAS: i32 = 0
+const MIGRAR_OK: i32 = 1
+const MIGRAR_NAO_ANALISADO: i32 = 2
+const MIGRAR_REVISAO: i32 = 3
+const MIGRAR_REVISAO_COMENTARIO: i32 = 4
+// C2F:? tabela TEXTOS (const char *const[5]): folha {'s': 'sem_trocas'} para ^u8
+
+pub proc arena_fatia_migrar_revisao(a: ^common.Arena, n: int) -> []MigrarRevisao {
+    var l = make([dynamic]MigrarRevisao, alloc = common.arena_mem(a), cap = n)
+    for i in 0..<n {
+        append(&l, item = MigrarRevisao{})
+    }
+    return l[..]
+}
+
+pub proc arena_fatia_migrar_troca(a: ^common.Arena, n: int) -> []MigrarTroca {
+    var l = make([dynamic]MigrarTroca, alloc = common.arena_mem(a), cap = n)
+    for i in 0..<n {
+        append(&l, item = MigrarTroca{})
+    }
+    return l[..]
+}
+
+// C: driver/migrar_analise.c:44
+proc migrar_estado_texto(estado: i32) -> str {
+    let textos: [5]str = {"sem_trocas", "ok", "nao_analisado", "revisao", "revisao_comentario"}
+    if (estado < 0) or (estado > 4) {
+        return "?"
+    }
+    return textos[estado as int]
+}
+
+// C: driver/migrar_analise.c:51
+// Copia o texto para a arena (o C usa ArenaCopiarTexto com strlen; aqui o str ja traz o tamanho).
+proc copiar(a: ^common.Arena, s: ?str) -> str {
+    return from_bytes(as_bytes(s or_else ""), alloc = common.arena_mem(a))
+}
+
+// C: driver/migrar_analise.c:59
+// O texto do Entrada vira copia da Fonte (adotar_texto copia); o indice de linhas sai junto, como o FonteIndexarLinhas do C.
+proc carregar_fonte(f: ^common.Fonte, e: ^Entrada) -> bool {
+    let adotado: bool = common.fonte_adotar_texto(f, e.caminho, e.texto, e.tam)
+    _ = common.fonte_indexar_linhas(f)
+    return adotado
+}
+
+// C: driver/migrar_analise.c:72
+proc codigo_do_erro(c: ?^Compilacao, arena: ^common.Arena) -> ?str {
+    let comp: ^Compilacao = c as ^Compilacao
+    if comp.sem.lista.n > 0 {
+        return copiar(arena, common.diag_codigo_texto(comp.sem.lista.itens[0].codigo))
+    }
+    if comp.diag.tem {
+        return copiar(arena, common.diag_codigo_texto(comp.diag.codigo))
+    }
+    return none
+}
+
+// C: driver/migrar_analise.c:78
+// Comparador de qsort virou inteiro -1/0/1 com a mesma ordem de ComparaTroca (off, depois tam); usado na chave de repeticao.
+proc compara_troca(a: ^common.RenTroca, b: ^common.RenTroca) -> i32 {
+    if a.off != b.off {
+        if a.off < b.off {
+            return -1
+        }
+        return 1
+    }
+    if a.tam < b.tam {
+        return -1
+    }
+    if a.tam > b.tam {
+        return 1
+    }
+    return 0
+}
+
+// C: driver/migrar_analise.c:87
+// Ordem total para sort_by (less): a chave de compara_troca e, nos empates, classe, antigo e novo.
+proc ordena_troca(a: ^common.RenTroca, b: ^common.RenTroca) -> bool {
+    let c = compara_troca(a, b)
+    if c != 0 {
+        return c < 0
+    }
+    if a.classe != b.classe {
+        return a.classe < b.classe
+    }
+    let c_antigo = common.c2f_strcmp(a.antigo or_else "", b.antigo or_else "")
+    if c_antigo != 0 {
+        return c_antigo < 0
+    }
+    return common.c2f_strcmp(a.novo or_else "", b.novo or_else "") < 0
+}
+
+// C: driver/migrar_analise.c:99
+proc fim_da_raiz(f: ^common.Fonte) -> u32 {
+    var tern_1: u32 = f.tam as u32
+    if f.ntrechos > 0 {
+        tern_1 = (f.trechos or_else {})[0].fim
+    }
+    return tern_1
+}
+
+// C: driver/migrar_analise.c:105
+proc para_migrar_troca(f: ^common.Fonte, t: ^common.RenTroca, arena: ^common.Arena) -> MigrarTroca {
+    var m: MigrarTroca = MigrarTroca{classe = t.classe, antigo = copiar(arena, t.antigo), novo = copiar(arena, t.novo), grupo = -1}
+    common.fonte_localizar(f, t.off, &m.linha, &m.coluna)
+    m.coluna_fim = m.coluna + t.tam
+    // S3 P4: troca de linha inteira leva a linha toda (com o LF), antigo vira o texto da linha
+    if (t.classe == common.REN_LIBM_LINHA) and (t.tam > 0) {
+        m.antigo = from_bytes(f.texto[(t.off as int)..<((t.off + t.tam) as int)], alloc = common.arena_mem(arena))
+        m.linha_fim = m.linha + 1
+        m.coluna = 1
+        m.coluna_fim = 1
+    }
+    return m
+}
+
+// C: driver/migrar_analise.c:121
+proc somar_aviso(avisos: ^[dynamic]u8, t: ^common.RenTroca) {
+    var tern_1: str = ""
+    if (len(avisos^) as u64) > 0 {
+        tern_1 = "; "
+    }
+    let txt_1 = t.antigo or_else "(null)"
+    let txt_2 = t.novo or_else "(null)"
+    format(f"{tern_1}'{txt_1}' nao migra para std:math: {txt_2}", into = avisos)
+}
+
+// C: driver/migrar_analise.c:127
+// C: driver/migrar_analise.c:127 (ColetarTrocas): ordena as brutas (qsort -> sort_by, ordem total), tira as repetidas e as de fora do arquivo raiz
+proc coletar_trocas(c: ?^Compilacao, reg: ^common.RenTrocas, arena: ^common.Arena, l: ^Leitura) {
+    let comp: ^Compilacao = c as ^Compilacao
+    let fim: u32 = fim_da_raiz(&comp.fonte)
+    var itens: []MigrarTroca = arena_fatia_migrar_troca(arena, len(reg.itens) + 1)
+    var avisos: [dynamic]u8 = make([dynamic]u8, alloc = heap)
+    defer delete(avisos)
+    if len(reg.itens) > 0 {
+        sort_by(reg.itens[..], less = ordena_troca)
+    }
+    var n: u32 = 0
+    for k in (0 as u32)..<(len(reg.itens) as u32) {
+        var repetida: bool = false
+        if k > 0 {
+            repetida = compara_troca(&reg.itens[k], &reg.itens[k - 1]) == 0
+        }
+        if (reg.itens[k].off >= fim) or repetida {
+            continue
+        }
+        if reg.itens[k].classe == common.REN_LIBM_AVISO {
+            somar_aviso(&avisos, &reg.itens[k])
+        } else {
+            itens[n] = para_migrar_troca(&comp.fonte, &reg.itens[k], arena)
+            n += 1
+        }
+    }
+    l.itens = itens[0..<(n as int)]
+    l.n = n
+    if len(avisos) > 0 {
+        l.avisos = from_bytes(avisos[..], alloc = common.arena_mem(arena))
+    }
+}
+
+// C: driver/migrar_analise.c:148
+proc so_falta_main(c: ?^Compilacao) -> bool {
+    return ((c as ^Compilacao).sem.lista.n == 1) and (common.c2f_s2u_32((c as ^Compilacao).sem.lista.itens[0].codigo) == (common.E0201 as u32))
+}
+
+// C: driver/migrar_analise.c:154
+// C: driver/migrar_analise.c:154 (LerFormasAntigas): front-end + semantica com Diag.trocas ligado; nada e impresso nem gravado.
+// Compilacao, Opcoes e RenTrocas vao no heap (o C os tinha por ponteiro; o diag guarda o endereco).
+proc ler_formas_antigas(e: ^Entrada, l: ^Leitura) {
+    l^ = Leitura{}
+    let c: ^Compilacao = new(Compilacao, alloc = heap)
+    defer delete(c)
+    let o: ^Opcoes = new(Opcoes, alloc = heap)
+    defer delete(o)
+    let reg: ^common.RenTrocas = common.ren_trocas_novo()
+    defer delete(reg)
+    if not carregar_fonte(&c.fonte, e) {
+        return
+    }
+    o^ = Opcoes{comando = "check", entrada = e.caminho}
+    iniciar_compilacao(c)
+    c.opcoes = o
+    c.sem.lista.teto = opcoes_max_erros(o)
+    common.ren_trocas_iniciar(reg)
+    c.diag.trocas = reg
+    l.compilou = analisar_sintaxe(c, true) and (analisar_semantica(c) or so_falta_main(c))
+    if l.compilou {
+        coletar_trocas(c, reg, e.arena as ^common.Arena, l)
+    } else {
+        l.codigo = codigo_do_erro(c, e.arena as ^common.Arena)
+    }
+    common.ren_trocas_liberar(reg)
+    liberar_compilacao(c)
+}
+
+// C: driver/migrar_analise.c:182
+// O que vem depois do ultimo '/' (47) ou ':' (58) do texto
+proc ultimo_segmento(texto: str) -> str {
+    let b: []u8 = as_bytes(texto)
+    var p: int = len(texto)
+    while (p > 0) and (b[p - 1] != 47) and (b[p - 1] != 58) {
+        p -= 1
+    }
+    return texto[p..<len(texto)]
+}
+
+// C: driver/migrar_analise.c:191
+proc chave_do_grupo(t: ^MigrarTroca, g: ^Grupo) -> bool {
+    if (common.c2f_s2u_32(t.classe) == (common.REN_LIBM as u32)) or (common.c2f_s2u_32(t.classe) == (common.REN_LIBM_LINHA as u32)) {
+        g^ = Grupo{antigo = "libm", novo = "libm"}
+        return true
+    }
+    if common.c2f_s2u_32(t.classe) == (common.REN_QUALIFICADOR as u32) {
+        g^ = Grupo{antigo = t.antigo, novo = t.novo}
+        return true
+    }
+    if common.c2f_s2u_32(t.classe) != (common.REN_MODULO as u32) {
+        return false
+    }
+    g^ = Grupo{antigo = ultimo_segmento((t.antigo or_else "")), novo = ultimo_segmento((t.novo or_else ""))}
+    return (g.antigo or_else "") != (g.novo or_else "")
+}
+
+// C: driver/migrar_analise.c:206
+proc achar_grupo(gs: ^Grupos, antigo: str) -> u32 {
+    var j: u32 = 0
+    while (j < gs.n) and ((gs.itens[j].antigo or_else "") != antigo) {
+        j += 1
+    }
+    return j
+}
+
+// C: driver/migrar_analise.c:214
+// C2F-13: t fundido em n (len)
+proc atribuir_grupos(t: []MigrarTroca, gs: ^Grupos) {
+    gs.n = 0
+    for k in (0 as u32)..<(len(t) as u32) {
+        var g: Grupo = Grupo{}
+        var j: u32 = 0
+        if not chave_do_grupo(&t[k], &g) {
+            continue
+        }
+        j = achar_grupo(gs, (g.antigo or_else ""))
+        if (j == gs.n) and (gs.n == (GRUPOS_MAX as u32)) {
+            continue
+        }
+        if j == gs.n {
+            let antes_1: u32 = gs.n
+            gs.n += 1
+            gs.itens[antes_1] = g
+        }
+        t[k].grupo = transmute(j, to = i32)
+    }
+}
+
+// C: driver/migrar_analise.c:231
+proc edicao_da_troca(t: ^MigrarTroca) -> Edicao {
+    return Edicao{linha = t.linha, coluna = t.coluna, coluna_fim = t.coluna_fim, antigo = t.antigo, novo = t.novo, linha_fim = t.linha_fim}
+}
+
+// C: driver/migrar_analise.c:237
+// C2F-INDECIDIVEL: usar
+// C2F: o Edicao* + n do C virou a fatia devolvida (len = ne); a arena guarda o bloco como no C.
+proc edicoes_de(c: ^Contexto3, usar: []bool, ne: ^u32, comentarios: bool) -> []Edicao {
+    let t: []MigrarTroca = c.t or_else {}
+    let ct: []MigrarTroca = c.ct or_else {}
+    var ed: []Edicao = arena_fatia_edicao(c.e.arena as ^common.Arena, (c.n as int) + (c.nct as int) + 1)
+    var m: u32 = 0
+    for k in (0 as u32)..<c.n {
+        if usar[k] {
+            ed[m] = edicao_da_troca(&t[k])
+            m += 1
+        }
+    }
+    if comentarios {
+        for k in (0 as u32)..<c.nct {
+            ed[m] = edicao_da_troca(&ct[k])
+            m += 1
+        }
+    }
+    ne^ = m
+    return ed[0..<(m as int)]
+}
+
+// C: driver/migrar_analise.c:249
+// C2F: usar ^bool virou a fatia (o C passava o vetor de marcas); o texto migrado e a releitura saem daqui.
+proc conjunto_valido(c: ^Contexto3, usar: []bool, falha: ^Falha) -> bool {
+    var ne: u32 = 0
+    let ed: []Edicao = edicoes_de(c, usar, &ne, false)
+    var migrado: [dynamic]u8 = make([dynamic]u8, alloc = heap)
+    defer delete(migrado)
+    var e: Entrada = c.e
+    var l: Leitura = Leitura{}
+    falha^ = Falha{codigo = none, frase = "as edicoes nao se aplicam ao texto"}
+    if edicoes_aplicar(c.e.texto, c.e.tam, ed, &migrado, none) != EDICAO_OK {
+        return false
+    }
+    let texto_novo: str = from_bytes(migrado[..], alloc = heap)
+    defer delete(texto_novo)
+    e.texto = texto_novo
+    e.tam = len(texto_novo) as u64
+    ler_formas_antigas(&e, &l)
+    if not l.compilou {
+        falha^ = Falha{codigo = l.codigo, frase = "o arquivo migrado nao compila"}
+        return false
+    }
+    if l.n != (c.n - ne) {
+        falha^ = Falha{codigo = none, frase = "o arquivo migrado nao tem exatamente as formas antigas que ficaram de fora"}
+    }
+    return l.n == (c.n - ne)
+}
+
+// C: driver/migrar_analise.c:271
+// C2F-13: usar fundido em n (len)
+proc marcar_todas(usar: []bool, valor: bool) {
+    for k in (0 as u32)..<(len(usar) as u32) {
+        usar[k] = valor
+    }
+}
+
+// C: driver/migrar_analise.c:276
+// C2F-INDECIDIVEL: usar
+proc marcar_grupo(c: ^Contexto3, usar: []bool, grupo: i32, valor: bool) {
+    var k: u32 = 0
+    while k < c.n {
+        if (c.t or_else {})[k].grupo == grupo {
+            usar[k] = valor
+        }
+        k += 1
+    }
+}
+
+// C: driver/migrar_analise.c:283
+proc frase_do_grupo(motivo: ^[dynamic]u8, g: ^Grupo, falha: ^Falha) {
+    if len(motivo^) > 0 {
+        append(motivo, items = as_bytes("; "))
+    }
+    let frase: str = falha.frase or_else ""
+    let codigo: str = falha.codigo or_else ""
+    var espaco: str = ""
+    if falha.codigo != none {
+        espaco = " "
+    }
+    if (g.antigo or_else "") == "libm" {
+        format(f"a migracao da libm fica como esta: {frase}{espaco}{codigo}", into = motivo)
+        return
+    }
+    let antigo: str = g.antigo or_else ""
+    let novo: str = g.novo or_else ""
+    format(f"o import e os usos de '{antigo}.' ficam como estao: com o qualificador '{novo}' {frase}{espaco}{codigo}", into = motivo)
+}
+
+// C: driver/migrar_analise.c:295
+// C2F: usar ^bool virou a fatia (mesmo motivo de conjunto_valido).
+proc aceitar_grupos(c: ^Contexto3, gs: ^Grupos, usar: []bool, r: ^MigrarResultado) {
+    var motivo: [dynamic]u8 = make([dynamic]u8, alloc = heap)
+    defer delete(motivo)
+    for j in (0 as u32)..<gs.n {
+        var falha: Falha = Falha{}
+        marcar_grupo(c, usar, j as i32, true)
+        if conjunto_valido(c, usar, &falha) {
+            continue
+        }
+        marcar_grupo(c, usar, j as i32, false)
+        frase_do_grupo(&motivo, &gs.itens[j], &falha)
+        if r.diagnostico == none {
+            r.diagnostico = falha.codigo
+        }
+    }
+    r.motivo = ""
+    if len(motivo) > 0 {
+        r.motivo = from_bytes(motivo[..], alloc = common.arena_mem(c.e.arena as ^common.Arena))
+    }
+}
+
+// C: driver/migrar_analise.c:313
+// C2F-INDECIDIVEL: usar
+proc decidir(c: ^Contexto3, gs: ^Grupos, usar: []bool, r: ^MigrarResultado) {
+    var falha: Falha = Falha{}
+    let t: []MigrarTroca = c.t or_else {}
+    marcar_todas(usar, true)
+    if conjunto_valido(c, usar, &falha) {
+        return
+    }
+    r.estado = MIGRAR_REVISAO
+    r.diagnostico = falha.codigo
+    for k in (0 as u32)..<c.n {
+        usar[k] = t[k].grupo < 0
+    }
+    if (gs.n > 0) and conjunto_valido(c, usar, &falha) {
+        aceitar_grupos(c, gs, usar, r)
+        return
+    }
+    marcar_todas(usar, false)
+    r.motivo = copiar(c.e.arena as ^common.Arena, falha.frase)
+    if falha.codigo != none {
+        r.diagnostico = falha.codigo
+    }
+}
+
+// C: driver/migrar_analise.c:336
+// C2F: ponteiro + fim do C viraram o texto restante (str); a linha termina no LF ou no fim do texto.
+proc proxima_linha(p: str) -> Linha {
+    let b: []u8 = as_bytes(p)
+    var k: int = 0
+    while (k < len(b)) and (b[k] != 10) {
+        k += 1
+    }
+    if k < len(b) {
+        return Linha{p = p[0..<(k + 1)], tam = (k + 1) as u64, lf = true}
+    }
+    return Linha{p = p, tam = len(p) as u64, lf = false}
+}
+
+// C: driver/migrar_analise.c:344
+// Sem troca: igual byte a byte. Com troca: so muda por dentro, o LF (ou fim do arquivo) fica onde estava.
+proc linha_confere(antes: ^Linha, depois: ^Linha, tem_troca: bool) -> bool {
+    if tem_troca {
+        return antes.lf == depois.lf
+    }
+    return (antes.tam == depois.tam) and ((antes.p or_else "") == (depois.p or_else ""))
+}
+
+// C: driver/migrar_analise.c:351
+// C2F-13: t fundido em nt (len). C2F: os dois textos chegam como str (o novo sai de r.novo, copiado por quem chama).
+proc linhas_iguais(antes: str, depois: str, t: []MigrarTroca) -> bool {
+    var a: str = antes
+    var b: str = depois
+    let nt: u32 = len(t) as u32
+    var linha: u32 = 1
+    var k: u32 = 0
+    while (len(a) > 0) and (len(b) > 0) {
+        var la: Linha = proxima_linha(a)
+        var lb: Linha = proxima_linha(b)
+        while (k < nt) and (t[k].linha < linha) {
+            k += 1
+        }
+        if not linha_confere(&la, &lb, (k < nt) and (t[k].linha == linha)) {
+            return false
+        }
+        a = a[(la.tam as int)..<len(a)]
+        b = b[(lb.tam as int)..<len(b)]
+        linha += 1
+    }
+    return (len(a) == 0) and (len(b) == 0)
+}
+
+// C: driver/migrar_analise.c:368
+// O clear mantem a alocacao de r.novo (quem criou o resultado e quem da delete).
+proc sem_trocas_que_valem(r: ^MigrarResultado, motivo: str) {
+    r.estado = MIGRAR_REVISAO
+    r.motivo = motivo
+    r.ntrocas = 0
+    clear(&r.novo)
+}
+
+// C: driver/migrar_analise.c:377
+// Ordem total de ComparaPosicao (linha, coluna, coluna_fim, linha_fim, classe, antigo, novo), como less de sort_by.
+proc compara_posicao(a: ^MigrarTroca, b: ^MigrarTroca) -> bool {
+    if a.linha != b.linha {
+        return a.linha < b.linha
+    }
+    if a.coluna != b.coluna {
+        return a.coluna < b.coluna
+    }
+    if a.coluna_fim != b.coluna_fim {
+        return a.coluna_fim < b.coluna_fim
+    }
+    if a.linha_fim != b.linha_fim {
+        return a.linha_fim < b.linha_fim
+    }
+    if a.classe != b.classe {
+        return a.classe < b.classe
+    }
+    let c_antigo = common.c2f_strcmp(a.antigo or_else "", b.antigo or_else "")
+    if c_antigo != 0 {
+        return c_antigo < 0
+    }
+    return common.c2f_strcmp(a.novo or_else "", b.novo or_else "") < 0
+}
+
+// C: driver/migrar_analise.c:391
+// C2F-INDECIDIVEL: usar
+// C2F: o vetor + n do C viraram a fatia devolvida (len = n); o bloco e da arena, como no C.
+proc trocas_que_valem(c: ^Contexto3, usar: []bool, n: ^u32) -> []MigrarTroca {
+    let t: []MigrarTroca = c.t or_else {}
+    let ct: []MigrarTroca = c.ct or_else {}
+    var validas: []MigrarTroca = arena_fatia_migrar_troca(c.e.arena as ^common.Arena, (c.n as int) + (c.nct as int) + 1)
+    var m: u32 = 0
+    for k in (0 as u32)..<c.n {
+        if usar[k] {
+            validas[m] = t[k]
+            m += 1
+        }
+    }
+    for k in (0 as u32)..<c.nct {
+        validas[m] = ct[k]
+        m += 1
+    }
+    n^ = m
+    if (c.nct > 0) and (m > 1) {
+        sort_by(validas[0..<(m as int)], less = compara_posicao)
+    }
+    return validas[0..<(m as int)]
+}
+
+// C: driver/migrar_analise.c:404
+// C2F-13: validas fundido em n (len)
+proc tem_linha_inteira(validas: []MigrarTroca) -> bool {
+    for k in (0 as u32)..<(len(validas) as u32) {
+        if validas[k].linha_fim > 0 {
+            return true
+        }
+    }
+    return false
+}
+
+// C: driver/migrar_analise.c:413
+// Monta as trocas que valem e o arquivo migrado (BOM e quebras do original); confere que as linhas ficaram iguais.
+proc finalizar(c: ^Contexto3, usar: []bool, r: ^MigrarResultado) {
+    var ne: u32 = 0
+    let ed: []Edicao = edicoes_de(c, usar, &ne, true)
+    let validas: []MigrarTroca = trocas_que_valem(c, usar, &r.ntrocas)
+    r.trocas = validas
+    if r.ntrocas == 0 {
+        return
+    }
+    var primeiro: ?^Edicao = none
+    if ne > 0 {
+        primeiro = &ed[0]
+    }
+    if not edicoes_montar_arquivo(c.original or_else "", c.tam_original, primeiro, ne, &r.novo) {
+        sem_trocas_que_valem(r, "as edicoes nao se aplicam ao arquivo")
+        return
+    }
+    // S3 P4: linha inteira sai ou entra; a releitura de conjunto_valido ja conferiu o arquivo
+    if tem_linha_inteira(validas) {
+        return
+    }
+    let antes: str = (c.original or_else "")[0..<(c.tam_original as int)]
+    let depois: str = from_bytes(r.novo[..], alloc = heap)
+    defer delete(depois)
+    r.linhas_iguais = linhas_iguais(antes, depois, validas)
+    if not r.linhas_iguais {
+        sem_trocas_que_valem(r, "a troca mudaria as linhas do arquivo")
+    }
+}
+
+// C: driver/migrar_analise.c:434
+proc ler_comentarios(c: ^Contexto3, r: ^MigrarResultado) {
+    var saida: ComentariosSaida = ComentariosSaida{}
+    migrar_comentarios((c.e.caminho or_else ""), c.e.texto, c.e.tam, c.e.arena as ^common.Arena, &saida)
+    c.ct = saida.trocas
+    c.nct = saida.ntrocas
+    r.revisoes = saida.revisoes
+    r.nrevisoes = saida.nrevisoes
+}
+
+// C: driver/migrar_analise.c:446
+proc fechar_estado(r: ^MigrarResultado) {
+    if (common.c2f_s2u_32(r.estado) == (MIGRAR_SEM_TROCAS as u32)) and (r.ntrocas > 0) {
+        r.estado = MIGRAR_OK
+    }
+    if (common.c2f_s2u_32(r.estado) == (MIGRAR_SEM_TROCAS as u32)) and (r.nrevisoes > 0) {
+        r.estado = MIGRAR_REVISAO_COMENTARIO
+    }
+}
+
+// C: driver/migrar_analise.c:452 (MigrarArquivo)
+// r sai zerado com r.novo criado aqui (heap): quem chama faz delete(r.novo) quando acabar.
+proc migrar_arquivo(entrada: ^MigrarEntrada, arena: ^common.Arena, r: ^MigrarResultado) {
+    let original: str = entrada.original or_else ""
+    var bom: u64 = 0
+    if edicoes_tem_bom(as_bytes(original), entrada.tam) {
+        bom = EDICOES_BOM_TAM as u64
+    }
+    var c: Contexto3 = Contexto3{}
+    c.e = Entrada{caminho = entrada.caminho, texto = original[(bom as int)..<len(original)], tam = entrada.tam - bom, arena = arena}
+    c.original = entrada.original
+    c.tam_original = entrada.tam
+    r^ = MigrarResultado{novo = make([dynamic]u8, alloc = heap), linhas_iguais = true}
+    var l: Leitura = Leitura{}
+    ler_formas_antigas(&c.e, &l)
+    if not l.compilou {
+        r.estado = MIGRAR_NAO_ANALISADO
+        r.diagnostico = l.codigo
+        return
+    }
+    r.motivo = l.avisos
+    c.t = l.itens
+    c.n = l.n
+    if entrada.comentarios {
+        ler_comentarios(&c, r)
+    }
+    if (c.n == 0) and (c.nct == 0) {
+        fechar_estado(r)
+        return
+    }
+    let usar: []bool = common.arena_fatia_bool(arena, c.n as int)
+    if c.n > 0 {
+        var grupos: Grupos = Grupos{n = 0}
+        atribuir_grupos(c.t or_else {}, &grupos)
+        r.estado = MIGRAR_OK
+        decidir(&c, &grupos, usar, r)
+    }
+    finalizar(&c, usar, r)
+    fechar_estado(r)
+}
+
+test "migrar_analise: estado_texto cobre os 5 estados e ? fora da faixa" {
+    expect(migrar_estado_texto(0) == "sem_trocas")
+    expect(migrar_estado_texto(1) == "ok")
+    expect(migrar_estado_texto(2) == "nao_analisado")
+    expect(migrar_estado_texto(3) == "revisao")
+    expect(migrar_estado_texto(4) == "revisao_comentario")
+    expect(migrar_estado_texto(5) == "?")
+    expect(migrar_estado_texto(-1) == "?")
+}
+
+test "migrar_analise: ultimo_segmento corta no ultimo / ou :" {
+    expect(ultimo_segmento("std:arquivo") == "arquivo")
+    expect(ultimo_segmento("vendor:db/db") == "db")
+    expect(ultimo_segmento("sem_barra") == "sem_barra")
+    expect(ultimo_segmento("fim/") == "")
+}
+
+test "migrar_analise: proxima_linha corta no LF e leva o fim do texto" {
+    let l1 = proxima_linha("ab\ncd")
+    expect(l1.tam == 3)
+    expect(l1.lf)
+    let l2 = proxima_linha("cd")
+    expect(l2.tam == 2)
+    expect(not l2.lf)
+}
+
+test "migrar_analise: linhas_iguais aceita troca so no miolo e recusa linha alterada ou sumida" {
+    var t: [1]MigrarTroca = {}
+    t[0].linha = 1
+    expect(linhas_iguais("x\nb\n", "y\nb\n", t[..]))
+    expect(not linhas_iguais("x\nb\n", "x\nc\n", t[..]))
+    expect(not linhas_iguais("x\n", "x\ny\n", t[..]))
+}
+
+test "migrar_analise: compara_troca e ordena_troca seguem off, tam e classe" {
+    var a = common.RenTroca{off = 1, tam = 2}
+    var b = common.RenTroca{off = 2, tam = 1}
+    var c = common.RenTroca{off = 1, tam = 2, classe = 3}
+    expect(compara_troca(&a, &b) == -1)
+    expect(compara_troca(&b, &a) == 1)
+    expect(compara_troca(&a, &a) == 0)
+    expect(ordena_troca(&a, &b))
+    expect(ordena_troca(&a, &c))
+    expect(not ordena_troca(&c, &a))
+}
+
+test "migrar_analise: frase_do_grupo separa por '; ' e so põe o codigo quando existe" {
+    var m: [dynamic]u8 = make([dynamic]u8, alloc = heap)
+    defer delete(m)
+    var g_libm = Grupo{antigo = "libm", novo = "libm"}
+    var f_com = Falha{codigo = "E0110", frase = "nao valeu"}
+    frase_do_grupo(&m, &g_libm, &f_com)
+    var g_arq = Grupo{antigo = "arquivo", novo = "file"}
+    var f_sem = Falha{codigo = none, frase = "nao valeu"}
+    frase_do_grupo(&m, &g_arq, &f_sem)
+    let s: str = from_bytes(m[..], alloc = heap)
+    defer delete(s)
+    expect(s == "a migracao da libm fica como esta: nao valeu E0110; o import e os usos de 'arquivo.' ficam como estao: com o qualificador 'file' nao valeu")
+}

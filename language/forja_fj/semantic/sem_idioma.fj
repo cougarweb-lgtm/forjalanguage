@@ -1,0 +1,721 @@
+// semantic/sem_idioma.fj - porte de compiler/semantic/sem_idioma.c
+// sha256 de semantic/sem_idioma.c: f13c899efd5b0866158ce930c7547e1c52057645fe900f44925caf0aed6008bc
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "common"
+import "frontend"
+
+struct NomeAlheio {
+    nome: ?str
+    id: i32
+    certo: ?str
+}
+
+struct ImprimeAlheio {
+    objeto: ?str
+    metodo: ?str
+    sozinha: bool
+}
+
+struct Argumentos {
+    fecha: u32
+    virgula1: u32
+    virgula2: u32
+}
+
+const NOME_ACHADO_MAX: i32 = 48
+const LIMITE_DE_FAIXA_MAX: i32 = 14
+const COD_E0110: i32 = 144 // so dos test: common.E0110 nao e pub (conferido em "sem_idioma: tabelas ...")
+
+// Nome que outra linguagem usa no lugar de uma palavra da Forja (ordem do C).
+const NOMES_ALHEIOS: [10]NomeAlheio = {
+    NomeAlheio{nome = "nil", id = common.IDI_NULO, certo = "none"},
+    NomeAlheio{nome = "null", id = common.IDI_NULO, certo = "none"},
+    NomeAlheio{nome = "NULL", id = common.IDI_NULO, certo = "none"},
+    NomeAlheio{nome = "nullptr", id = common.IDI_NULO, certo = "none"},
+    NomeAlheio{nome = "None", id = common.IDI_NULO, certo = "none"},
+    NomeAlheio{nome = "undefined", id = common.IDI_NULO, certo = "none"},
+    NomeAlheio{nome = "True", id = common.IDI_BOOL_ALHEIO, certo = "true"},
+    NomeAlheio{nome = "TRUE", id = common.IDI_BOOL_ALHEIO, certo = "true"},
+    NomeAlheio{nome = "False", id = common.IDI_BOOL_ALHEIO, certo = "false"},
+    NomeAlheio{nome = "FALSE", id = common.IDI_BOOL_ALHEIO, certo = "false"}
+}
+const TIPOS_ALHEIOS: [2]NomeAlheio = {
+    NomeAlheio{nome = "string", id = common.IDI_TIPO_TEXTO, certo = "str"},
+    NomeAlheio{nome = "String", id = common.IDI_TIPO_TEXTO, certo = "str"}
+}
+// objeto.metodo( que imprime em outra linguagem; 'sozinha': uma linha e um argumento, como o print da Forja.
+const IMPRIMES: [5]ImprimeAlheio = {
+    ImprimeAlheio{objeto = "console", metodo = "log", sozinha = true},
+    ImprimeAlheio{objeto = "fmt", metodo = "Println", sozinha = true},
+    ImprimeAlheio{objeto = "fmt", metodo = "Print", sozinha = false},
+    ImprimeAlheio{objeto = "fmt", metodo = "Printf", sozinha = false},
+    ImprimeAlheio{objeto = "Console", metodo = "WriteLine", sozinha = true}
+}
+// proc solto que imprime em outra linguagem (so quando o proc nao foi declarado).
+const IMPRIMES_SOLTOS: [3]ImprimeAlheio = {
+    ImprimeAlheio{objeto = "println", metodo = "", sozinha = true},
+    ImprimeAlheio{objeto = "puts", metodo = "", sozinha = true},
+    ImprimeAlheio{objeto = "printf", metodo = "", sozinha = false}
+}
+// ALTERADO no lote: o C termina estas listas com NULL; aqui o tamanho e o da lista (sem sentinela).
+const TAMANHOS: [4]str = {"len", "length", "size", "count"}
+const ACRESCENTAS: [3]str = {"append", "push", "push_back"}
+
+// C: semantic/sem_idioma.c:49
+proc pular_espacos(t: []u8, i: u32) -> u32 {
+    var i_v: u32 = i
+    while (sug_byte(t, i_v) == 32) or (sug_byte(t, i_v) == 9) { // ' ' '\t'
+        i_v += 1
+    }
+    return i_v
+}
+
+// C: semantic/sem_idioma.c:56
+proc fim_do_texto(t: []u8, i: u32) -> u32 {
+    var i_v: u32 = i
+    i_v += 1
+    while ((sug_byte(t, i_v) != 0) and (sug_byte(t, i_v) != 10)) and (sug_byte(t, i_v) != 34) { // '\0' '\n' '"'
+        if (sug_byte(t, i_v) == 92) and (sug_byte(t, i_v + 1) != 0) { // '\\' '\0'
+            i_v += 1
+        }
+        i_v += 1
+    }
+    return i_v
+}
+
+// C: semantic/sem_idioma.c:68
+// LIMITE: cognitiva 16 (varredura de um caractere por volta com 5 ramos excludentes: texto, abre, fecha-do-nivel, fecha-interno e virgula; quebrar espalharia o estado fundo/virgulas).
+// ASSINATURA ALTERADA no lote: t: ?str -> []u8 (texto da fonte).
+proc ler_argumentos(t: []u8, abre: u32) -> Argumentos {
+    var a: Argumentos = Argumentos{}
+    var fundo: i32 = 0
+    var i: u32 = abre + 1
+    while (sug_byte(t, i) != 0) and (sug_byte(t, i) != 10) {
+        let c: u8 = sug_byte(t, i)
+        if c == 34 { // '"'
+            i = fim_do_texto(t, i)
+        } else if (c == 40) or (c == 91) or (c == 123) { // '(' '[' '{'
+            fundo += 1
+        } else if (c == 41) and (fundo == 0) { // ')'
+            a.fecha = i
+            return a
+        } else if (c == 41) or (c == 93) or (c == 125) { // ')' ']' '}'
+            fundo -= 1
+        } else if (c == 44) and (fundo == 0) { // ','
+            if a.virgula1 == 0 {
+                a.virgula1 = i
+            } else if a.virgula2 == 0 {
+                a.virgula2 = i
+            }
+        }
+        i += 1
+    }
+    return a
+}
+
+// C: semantic/sem_idioma.c:92
+// ASSINATURA ALTERADA no lote: t: ?str -> []u8 (texto da fonte).
+proc argumento_unico(t: []u8, abre: u32, a: ^Argumentos) -> bool {
+    return ((a.fecha != 0) and (a.virgula1 == 0)) and (pular_espacos(t, abre + 1) < a.fecha)
+}
+
+// C: semantic/sem_idioma.c:99
+// LIMITE: parametros 5 (Semantica e id sao os dois donos do diagnostico; pos, achado e novo descrevem uma troca so; agrupar criaria um tipo de uso unico).
+proc relatar_troca(s: ^Semantica, id: i32, pos: u32, achado: str, novo: str) -> bool {
+    var troca: common.IdiomaTroca = common.IdiomaTroca{}
+    let t: []u8 = (s.fonte as ^common.Fonte).texto
+    let tam: u32 = len(achado) as u32
+    let no_fonte: bool = fonte_tem_em(t, pos, achado)
+    _ = common.idioma_relatar(s.diag as ^common.Diag, id, pos, achado)
+    if no_fonte {
+        common.idioma_troca_somar(&troca, t, pos, pos + tam, novo)
+    }
+    let descricao = format(f"troque '{achado}' por '{novo}'", alloc = heap) // char descricao[DIAG_DESCRICAO_MAX]: o corte em 119 bytes acontece em diag_sugerir
+    defer delete(descricao)
+    common.idioma_sugerir(s.diag as ^common.Diag, common.DIAG_CERTA, descricao, &troca)
+    return true
+}
+
+// C: semantic/sem_idioma.c:115
+proc relatar_so_dica(s: ^Semantica, id: i32, pos: u32, achado: str, dica: str) -> bool {
+    _ = common.idioma_relatar(s.diag as ^common.Diag, id, pos, achado)
+    common.idioma_sugerir(s.diag as ^common.Diag, common.DIAG_SO_DICA, dica, none)
+    return true
+}
+
+// C: semantic/sem_idioma.c:122
+// ASSINATURA ALTERADA no lote (C devolvia `const NomeAlheio *`; &TAB[k] de const e E0301): copia a entrada achada em `achado`.
+// C2F-13: tabela fundido em qtd (len)
+proc achar_nome_alheio(tabela: []NomeAlheio, nome: str, achado: ^NomeAlheio) -> bool {
+    for i in (0 as u64)..<(len(tabela) as u64) {
+        if (tabela[i].nome or_else "") == nome {
+            achado^ = tabela[i]
+            return true
+        }
+    }
+    return false
+}
+
+// C: semantic/sem_idioma.c:133
+// ASSINATURA ALTERADA no lote: t: ?str -> []u8 (texto da fonte).
+proc abre_do_metodo(t: []u8, depois_do_objeto: u32, metodo: str) -> u32 {
+    let i: u32 = depois_do_objeto
+    let tam: u32 = len(metodo) as u32
+    if (sug_byte(t, i) != 46) or (not fonte_tem_em(t, i + 1, metodo)) or char_de_nome(sug_byte(t, i + 1 + tam)) { // '.'
+        return 0
+    }
+    let depois: u32 = pular_espacos(t, i + 1 + tam)
+    if sug_byte(t, depois) == 40 { // '('
+        return depois
+    }
+    return 0
+}
+
+// C: semantic/sem_idioma.c:145
+// LIMITE: parametros 5 (pos, abre e achado localizam o trecho no fonte; 'sozinha' decide entre troca certa e so dica; agrupar criaria um tipo de uso unico).
+proc relatar_imprime(s: ^Semantica, pos: u32, abre: u32, achado: str, sozinha: bool) -> bool {
+    let t: []u8 = (s.fonte as ^common.Fonte).texto
+    var a: Argumentos = ler_argumentos(t, abre)
+    var troca: common.IdiomaTroca = common.IdiomaTroca{}
+    _ = common.idioma_relatar(s.diag as ^common.Diag, common.IDI_IMPRIME, pos, achado)
+    if sozinha and argumento_unico(t, abre, &a) {
+        common.idioma_troca_somar(&troca, t, pos, abre + 1, "print(")
+    }
+    common.idioma_sugerir(s.diag as ^common.Diag, common.DIAG_CERTA, "troque pela forma da Forja: print(valor), e print(f\"texto {x}\") para juntar texto e valores", &troca)
+    return true
+}
+
+// C: semantic/sem_idioma.c:157
+proc imprime_como_metodo(s: ^Semantica, e: ^frontend.Expr, nome: str) -> bool {
+    let t: []u8 = (s.fonte as ^common.Fonte).texto
+    let depois: u32 = e.pos_op + (len(nome) as u32)
+    for i in 0..<5 {
+        let item: ImprimeAlheio = IMPRIMES[i]
+        var abre: u32 = 0
+        if (item.objeto or_else "") == nome {
+            abre = abre_do_metodo(t, depois, item.metodo or_else "")
+        }
+        if abre == 0 {
+            continue
+        }
+        let metodo: str = item.metodo or_else ""
+        let completo = format(f"{nome}.{metodo}", alloc = heap)
+        defer delete(completo)
+        let achado = common.c2f_cortar(completo, (NOME_ACHADO_MAX as int) - 1) // char achado[NOME_ACHADO_MAX]
+        defer delete(achado)
+        return relatar_imprime(s, e.pos_op, abre, achado, item.sozinha)
+    }
+    return false
+}
+
+// C: semantic/sem_idioma.c:174
+proc sem_idioma_de_nome(s: ^Semantica, e: ^frontend.Expr) -> bool {
+    let nome: str = sem_nome_texto(s, e.nome)
+    var x: NomeAlheio = NomeAlheio{}
+    var tabela: [10]NomeAlheio = NOMES_ALHEIOS
+    if achar_nome_alheio(tabela[..], nome, &x) {
+        return relatar_troca(s, x.id, e.pos_op, nome, x.certo or_else "")
+    }
+    return imprime_como_metodo(s, e, nome)
+}
+
+// C: semantic/sem_idioma.c:183
+proc sem_idioma_de_tipo(s: ^Semantica, nome: i32, pos: u32) -> bool {
+    let texto: str = sem_nome_texto(s, nome)
+    var x: NomeAlheio = NomeAlheio{}
+    var tabela: [2]NomeAlheio = TIPOS_ALHEIOS
+    return achar_nome_alheio(tabela[..], texto, &x) and relatar_troca(s, x.id, pos, texto, x.certo or_else "")
+}
+
+// C: semantic/sem_idioma.c:194
+// ASSINATURA ALTERADA no lote: t: ?str -> []u8 (texto da fonte).
+proc depois_do_in(t: []u8, pos: u32) -> bool {
+    var i: u32 = pos
+    while (i > 0) and ((sug_byte(t, i - 1) == 32) or (sug_byte(t, i - 1) == 9)) { // ' ' '\t'
+        i -= 1
+    }
+    return (((i >= 2) and (sug_byte(t, i - 2) == 105)) and (sug_byte(t, i - 1) == 110)) and ((i == 2) or (not char_de_nome(sug_byte(t, i - 3)))) // 'i' 'n'
+}
+
+// C: semantic/sem_idioma.c:203
+// ASSINATURA ALTERADA no lote: t: ?str -> []u8 (texto da fonte).
+// strchr(".()[]+-*/% ", c) casa tambem o NUL do fim do conjunto: c == 0 conta como membro (fiel ao C).
+proc argumento_simples(t: []u8, ini: u32, fim: u32) -> bool {
+    var i: u32 = ini
+    while i < fim {
+        let c: u8 = sug_byte(t, i)
+        let no_conjunto: bool = (c == 0) or (c == 46) or (c == 40) or (c == 41) or (c == 91) or (c == 93) or (c == 43) or (c == 45) or (c == 42) or (c == 47) or (c == 37) or (c == 32) // .()[]+-*/% e espaco
+        if (not char_de_nome(c)) and (not no_conjunto) {
+            return false
+        }
+        i += 1
+    }
+    return fim > ini
+}
+
+// C: semantic/sem_idioma.c:213
+// LIMITE: parametros 5 (texto + faixa [ini, fim) + destino com capacidade: a forma de snprintf; agrupar criaria um tipo de uso unico).
+// ASSINATURA ALTERADA no lote: t: ?str -> []u8 (texto da fonte).
+proc copiar_sem_espacos(t: []u8, ini: u32, fim: u32, saida: []u8, cap: u64) -> bool {
+    var ini_v: u32 = ini
+    var fim_v: u32 = fim
+    while (ini_v < fim_v) and ((sug_byte(t, ini_v) == 32) or (sug_byte(t, ini_v) == 9)) { // ' ' '\t'
+        ini_v += 1
+    }
+    while (fim_v > ini_v) and ((sug_byte(t, fim_v - 1) == 32) or (sug_byte(t, fim_v - 1) == 9)) {
+        fim_v -= 1
+    }
+    if ((fim_v - ini_v) as u64) >= cap {
+        return false
+    }
+    var k: u32 = 0
+    while k < (fim_v - ini_v) {
+        saida[k] = sug_byte(t, ini_v + k)
+        k += 1
+    }
+    saida[fim_v - ini_v] = 0
+    return true
+}
+
+// C: semantic/sem_idioma.c:224
+proc relatar_range(s: ^Semantica, pos: u32, abre: u32) -> bool {
+    let t: []u8 = (s.fonte as ^common.Fonte).texto
+    let a: Argumentos = ler_argumentos(t, abre)
+    var troca: common.IdiomaTroca = common.IdiomaTroca{}
+    var de: [14]u8 = {}
+    var ate: [14]u8 = {}
+    var limite_a: u32 = a.fecha
+    if a.virgula1 != 0 {
+        limite_a = a.virgula1
+    }
+    let simples: bool = ((((a.fecha != 0) and depois_do_in(t, pos)) and (a.virgula2 == 0)) and argumento_simples(t, abre + 1, limite_a)) and ((a.virgula1 == 0) or argumento_simples(t, a.virgula1 + 1, a.fecha))
+    _ = common.idioma_relatar(s.diag as ^common.Diag, common.IDI_RANGE, pos, "range")
+    if simples and (a.virgula1 == 0) {
+        common.idioma_troca_somar(&troca, t, pos, abre + 1, "0..<")
+        common.idioma_troca_somar(&troca, t, a.fecha, a.fecha + 1, "")
+    } else if (simples and copiar_sem_espacos(t, abre + 1, a.virgula1, de[..], LIMITE_DE_FAIXA_MAX as u64)) and copiar_sem_espacos(t, a.virgula1 + 1, a.fecha, ate[..], LIMITE_DE_FAIXA_MAX as u64) {
+        let texto_de = from_bytes(de[0..<common.c2f_strlen_b(de[..])], alloc = heap)
+        defer delete(texto_de)
+        let texto_ate = from_bytes(ate[0..<common.c2f_strlen_b(ate[..])], alloc = heap)
+        defer delete(texto_ate)
+        let novo = format(f"{texto_de}..<{texto_ate}", alloc = heap)
+        defer delete(novo)
+        common.idioma_troca_somar(&troca, t, pos, a.fecha + 1, novo)
+    }
+    common.idioma_sugerir(s.diag as ^common.Diag, common.DIAG_CERTA, "troque range(n) por 0..<n e range(a, b) por a..<b", &troca)
+    return true
+}
+
+// C: semantic/sem_idioma.c:245
+proc sem_idioma_de_chamada(s: ^Semantica, e: ^frontend.Expr) -> bool {
+    let t: []u8 = (s.fonte as ^common.Fonte).texto
+    let nome: str = sem_nome_texto(s, e.nome)
+    let abre: u32 = pular_espacos(t, e.pos_op + (len(nome) as u32))
+    if sug_byte(t, abre) != 40 { // '('
+        return false
+    }
+    if nome == "range" {
+        return relatar_range(s, e.pos_op, abre)
+    }
+    for i in 0..<3 {
+        let item: ImprimeAlheio = IMPRIMES_SOLTOS[i]
+        if (item.objeto or_else "") != nome {
+            continue
+        }
+        if not item.sozinha {
+            return relatar_so_dica(s, common.IDI_IMPRIME, e.pos_op, nome, "troque printf por print(f\"texto {x}\"): o texto e os valores vao dentro do f\"...\"")
+        }
+        return relatar_imprime(s, e.pos_op, abre, nome, true)
+    }
+    return false
+}
+
+// C: semantic/sem_idioma.c:262
+// ASSINATURA ALTERADA no lote (C: lista terminada em NULL): fatia com o tamanho da lista.
+proc nome_entre(nome: str, lista: []str) -> bool {
+    for i in 0..<len(lista) {
+        if lista[i] == nome {
+            return true
+        }
+    }
+    return false
+}
+
+// C: semantic/sem_idioma.c:271
+proc tem_tamanho(s: ^Semantica, tipo: u32) -> bool {
+    var forma: i32 = 0
+    _ = sem_elemento_de(s, tipo, &forma)
+    return ((common.c2f_s2u_32(forma) != (FORMA_NENHUMA as u32)) or (common.c2f_b2i32(sem_eh_lista_fixa_ou_ponteiro(s, tipo)) != 0)) or (tipo == (TIPO_TEXTO as u32))
+}
+
+// C: semantic/sem_idioma.c:280
+// ASSINATURA ALTERADA no lote: t: ?str -> []u8 (texto da fonte).
+proc ponto_do_campo(t: []u8, pos_op: u32) -> u32 {
+    var i: u32 = pos_op
+    while (i > 0) and ((sug_byte(t, i - 1) == 32) or (sug_byte(t, i - 1) == 9)) { // ' ' '\t'
+        i -= 1
+    }
+    if (i > 0) and (sug_byte(t, i - 1) == 46) { // '.'
+        return i - 1
+    }
+    return 0
+}
+
+// C: semantic/sem_idioma.c:289
+// ASSINATURA ALTERADA no lote: t: ?str -> []u8 (texto da fonte).
+proc receptor_simples(t: []u8, ini: u32, ponto: u32) -> bool {
+    var i: u32 = ini
+    while i < ponto {
+        if (not char_de_nome(sug_byte(t, i))) and (sug_byte(t, i) != 46) { // '.'
+            return false
+        }
+        i += 1
+    }
+    return ponto > ini
+}
+
+// C: semantic/sem_idioma.c:298
+proc relatar_tamanho(s: ^Semantica, e: ^frontend.Expr, ponto: u32, achado: str) -> bool {
+    let t: []u8 = (s.fonte as ^common.Fonte).texto
+    var fim: u32 = e.pos_op + (len(sem_nome_texto(s, e.nome)) as u32)
+    let abre: u32 = pular_espacos(t, fim)
+    var troca: common.IdiomaTroca = common.IdiomaTroca{}
+    let chamada: bool = sug_byte(t, abre) == 40 // '('
+    let fecha_logo: bool = chamada and (sug_byte(t, pular_espacos(t, abre + 1)) == 41) // ')'
+    if chamada and fecha_logo {
+        fim = pular_espacos(t, abre + 1) + 1
+    }
+    _ = common.idioma_relatar(s.diag as ^common.Diag, common.IDI_TAMANHO, e.pos_op, achado)
+    if receptor_simples(t, e.pos, ponto) and ((not chamada) or fecha_logo) {
+        common.idioma_troca_somar(&troca, t, e.pos, e.pos, "len(")
+        common.idioma_troca_somar(&troca, t, ponto, fim, ")")
+    }
+    common.idioma_sugerir(s.diag as ^common.Diag, common.DIAG_CERTA, "troque pelo proc len(x): o tamanho nao e metodo nem campo", &troca)
+    return true
+}
+
+// C: semantic/sem_idioma.c:316
+proc receptor_eh_var(s: ^Semantica, receptor: ?^frontend.Expr) -> bool {
+    let raiz: ?^frontend.Expr = sem_raiz_da_cadeia(s, receptor)
+    var tern_1: ?^LocalInfo = none
+    if (raiz != none) and ((raiz as ^frontend.Expr).tipo_no == (frontend.EX_NOME as u8)) {
+        tern_1 = escopo_buscar(&s.escopo, (raiz as ^frontend.Expr).nome)
+    }
+    let local: ?^LocalInfo = tern_1
+    return (local != none) and ((local as ^LocalInfo).natureza == (LOC_VAR as u8))
+}
+
+// C: semantic/sem_idioma.c:325
+proc relatar_acrescentar(s: ^Semantica, e: ^frontend.Expr, ponto: u32, achado: str) -> bool {
+    let t: []u8 = (s.fonte as ^common.Fonte).texto
+    let abre: u32 = pular_espacos(t, e.pos_op + (len(sem_nome_texto(s, e.nome)) as u32))
+    var a: Argumentos = Argumentos{}
+    if sug_byte(t, abre) == 40 { // '('
+        a = ler_argumentos(t, abre)
+    }
+    var troca: common.IdiomaTroca = common.IdiomaTroca{}
+    _ = common.idioma_relatar(s.diag as ^common.Diag, common.IDI_ACRESCENTAR, e.pos_op, achado)
+    if (((sug_byte(t, abre) == 40) and argumento_unico(t, abre, &a)) and receptor_simples(t, e.pos, ponto)) and receptor_eh_var(s, e.a) {
+        common.idioma_troca_somar(&troca, t, e.pos, e.pos, "append(&")
+        common.idioma_troca_somar(&troca, t, ponto, abre + 1, ", item = ")
+    }
+    common.idioma_sugerir(s.diag as ^common.Diag, common.DIAG_CERTA, "troque pelo proc append(&x, item = v): lista nao tem metodo", &troca)
+    return true
+}
+
+// C: semantic/sem_idioma.c:341
+proc sem_idioma_de_campo(s: ^Semantica, e: ^frontend.Expr) -> bool {
+    let nome: str = sem_nome_texto(s, e.nome)
+    let ponto: u32 = ponto_do_campo((s.fonte as ^common.Fonte).texto, e.pos_op)
+    var tamanhos: [4]str = TAMANHOS
+    var acrescentas: [3]str = ACRESCENTAS
+    let tamanho: bool = nome_entre(nome, tamanhos[..])
+    let acrescenta: bool = nome_entre(nome, acrescentas[..])
+    if ((not tamanho) and (not acrescenta)) or (ponto == 0) or (not tem_tamanho(s, (e.a as ^frontend.Expr).tipo)) {
+        return false
+    }
+    let completo = format(f"x.{nome}", alloc = heap)
+    defer delete(completo)
+    let achado = common.c2f_cortar(completo, (NOME_ACHADO_MAX as int) - 1) // char achado[NOME_ACHADO_MAX]
+    defer delete(achado)
+    if tamanho {
+        return relatar_tamanho(s, e, ponto, achado)
+    }
+    return relatar_acrescentar(s, e, ponto, achado)
+}
+
+// G3 S8: funcoes puras sobre o texto, valores calculados a mao (indices contados no literal).
+test "sem_idioma: texto da fonte (argumentos, metodo, in, simples, copiar, ponto, receptor)" {
+    var b1 = s8_texto("f(a, g(1, 2), \"x,y\", z)")
+    defer delete(b1)
+    let a1: Argumentos = ler_argumentos(b1[..], 1)
+    expect(a1.virgula1 == 3 and a1.virgula2 == 12 and a1.fecha == 22) // a 3a virgula, a do texto e as de dentro de g() nao contam
+    var b2 = s8_texto("p(x)")
+    defer delete(b2)
+    var a2: Argumentos = ler_argumentos(b2[..], 1)
+    expect(a2.fecha == 3 and a2.virgula1 == 0 and a2.virgula2 == 0 and argumento_unico(b2[..], 1, &a2))
+    var b3 = s8_texto("p(\"a)\")")
+    defer delete(b3)
+    expect(ler_argumentos(b3[..], 1).fecha == 6) // o ')' do texto nao fecha
+    var b4 = s8_texto("p(a\n)")
+    defer delete(b4)
+    expect(ler_argumentos(b4[..], 1).fecha == 0) // nao fecha na linha
+    var b5 = s8_texto("p(f(1)")
+    defer delete(b5)
+    expect(ler_argumentos(b5[..], 1).fecha == 0)
+    var b6 = s8_texto("p()")
+    defer delete(b6)
+    var a6: Argumentos = ler_argumentos(b6[..], 1)
+    expect(a6.fecha == 2 and not argumento_unico(b6[..], 1, &a6)) // vazio
+    var b7 = s8_texto("p( )")
+    defer delete(b7)
+    var a7: Argumentos = ler_argumentos(b7[..], 1)
+    expect(a7.fecha == 3 and not argumento_unico(b7[..], 1, &a7))
+    var a8: Argumentos = Argumentos{fecha = 9, virgula1 = 4, virgula2 = 0}
+    expect(not argumento_unico(b2[..], 1, &a8)) // 2 argumentos
+    var a9: Argumentos = Argumentos{}
+    expect(not argumento_unico(b2[..], 1, &a9)) // nao fecha
+    var b10 = s8_texto("fmt.Println(x)")
+    defer delete(b10)
+    expect(abre_do_metodo(b10[..], 3, "Println") == 11)
+    var b11 = s8_texto("fmt.Printf (x)")
+    defer delete(b11)
+    expect(abre_do_metodo(b11[..], 3, "Print") == 0) // 'Printf' e outro nome
+    expect(abre_do_metodo(b11[..], 3, "Printf") == 11) // pula o espaco ate o '('
+    var b12 = s8_texto("console.log   (x)")
+    defer delete(b12)
+    expect(abre_do_metodo(b12[..], 7, "log") == 14)
+    var b13 = s8_texto("console.log")
+    defer delete(b13)
+    expect(abre_do_metodo(b13[..], 7, "log") == 0 and abre_do_metodo(b13[..], 7, "warn") == 0 and abre_do_metodo(b13[..], 6, "log") == 0)
+    var b14 = s8_texto("for i in range(5)")
+    defer delete(b14)
+    expect(depois_do_in(b14[..], 9))
+    expect(not depois_do_in(b14[..], 6) and not depois_do_in(b14[..], 0))
+    var b15 = s8_texto("xin range")
+    defer delete(b15)
+    expect(not depois_do_in(b15[..], 4)) // 'xin' nao e a palavra in
+    var b16 = s8_texto("in r")
+    defer delete(b16)
+    expect(depois_do_in(b16[..], 3)) // i == 2 no inicio do texto
+    var b17 = s8_texto("a + 1")
+    defer delete(b17)
+    expect(argumento_simples(b17[..], 0, 5) and not argumento_simples(b17[..], 2, 2)) // faixa vazia
+    var b18 = s8_texto("len(x) % 2")
+    defer delete(b18)
+    expect(argumento_simples(b18[..], 0, 10))
+    var b19 = s8_texto("a;b")
+    defer delete(b19)
+    expect(not argumento_simples(b19[..], 0, 3) and not argumento_simples(b19[..], 0, 3))
+    var b20 = s8_texto("ab")
+    defer delete(b20)
+    expect(argumento_simples(b20[..], 0, 3)) // o NUL conta como membro do conjunto (strchr acha o terminador): fiel ao C
+    var b21 = s8_texto("\"a\"")
+    defer delete(b21)
+    expect(not argumento_simples(b21[..], 0, 3)) // aspas nao entram
+    var saida: [14]u8 = {}
+    var b22 = s8_texto("  ab c  ")
+    defer delete(b22)
+    expect(copiar_sem_espacos(b22[..], 0, 8, saida[..], 14) and common.c2f_strlen_b(saida[..]) == 4 and saida[0] == 97 and saida[2] == 32 and saida[3] == 99)
+    expect(not copiar_sem_espacos(b22[..], 0, 8, saida[..], 4)) // 4 bytes + NUL nao cabem em 4
+    expect(copiar_sem_espacos(b22[..], 0, 8, saida[..], 5))
+    var b23 = s8_texto("    ")
+    defer delete(b23)
+    expect(copiar_sem_espacos(b23[..], 0, 4, saida[..], 14) and common.c2f_strlen_b(saida[..]) == 0)
+    var b24 = s8_texto("x.len")
+    defer delete(b24)
+    expect(ponto_do_campo(b24[..], 2) == 1 and ponto_do_campo(b24[..], 1) == 0 and ponto_do_campo(b24[..], 0) == 0)
+    var b25 = s8_texto("x . len")
+    defer delete(b25)
+    expect(ponto_do_campo(b25[..], 4) == 2)
+    var b26 = s8_texto("a.b.len")
+    defer delete(b26)
+    expect(receptor_simples(b26[..], 0, 5) and not receptor_simples(b26[..], 0, 0))
+    var b27 = s8_texto("f(x).len")
+    defer delete(b27)
+    expect(not receptor_simples(b27[..], 0, 4))
+    var b28 = s8_texto("\"a\\\"b\"c")
+    defer delete(b28)
+    expect(fim_do_texto(b28[..], 0) == 5)
+    var b29 = s8_texto("\"ab")
+    defer delete(b29)
+    expect(fim_do_texto(b29[..], 0) == 3 and pular_espacos(b29[..], 0) == 0 and pular_espacos(b24[..], 5) == 5)
+    var b30 = s8_texto(" \t x")
+    defer delete(b30)
+    expect(pular_espacos(b30[..], 0) == 3)
+}
+
+// G3 S8: tabelas de nomes e listas (ordem e conteudo do C).
+test "sem_idioma: tabelas de nomes alheios e listas" {
+    expect(COD_E0110 == common.diag_codigo_por_texto("E0110"))
+    var tabela: [10]NomeAlheio = NOMES_ALHEIOS
+    var x: NomeAlheio = NomeAlheio{}
+    expect(achar_nome_alheio(tabela[..], "nil", &x) and x.id == common.IDI_NULO and (x.certo or_else "") == "none")
+    expect(achar_nome_alheio(tabela[..], "null", &x) and achar_nome_alheio(tabela[..], "NULL", &x) and achar_nome_alheio(tabela[..], "nullptr", &x))
+    expect(achar_nome_alheio(tabela[..], "None", &x) and achar_nome_alheio(tabela[..], "undefined", &x) and x.id == common.IDI_NULO)
+    expect(achar_nome_alheio(tabela[..], "True", &x) and x.id == common.IDI_BOOL_ALHEIO and (x.certo or_else "") == "true")
+    expect(achar_nome_alheio(tabela[..], "TRUE", &x) and (x.certo or_else "") == "true")
+    expect(achar_nome_alheio(tabela[..], "False", &x) and (x.certo or_else "") == "false")
+    expect(achar_nome_alheio(tabela[..], "FALSE", &x) and x.id == common.IDI_BOOL_ALHEIO and (x.certo or_else "") == "false")
+    expect(not achar_nome_alheio(tabela[..], "Nil", &x) and not achar_nome_alheio(tabela[..], "true", &x) and not achar_nome_alheio(tabela[..], "", &x))
+    var tipos: [2]NomeAlheio = TIPOS_ALHEIOS
+    expect(achar_nome_alheio(tipos[..], "string", &x) and x.id == common.IDI_TIPO_TEXTO and (x.certo or_else "") == "str")
+    expect(achar_nome_alheio(tipos[..], "String", &x) and (x.certo or_else "") == "str")
+    expect(not achar_nome_alheio(tipos[..], "str", &x) and not achar_nome_alheio(tipos[..], "nil", &x))
+    expect(IMPRIMES[0].sozinha and (IMPRIMES[0].objeto or_else "") == "console" and (IMPRIMES[0].metodo or_else "") == "log")
+    expect((IMPRIMES[1].metodo or_else "") == "Println" and IMPRIMES[1].sozinha and (IMPRIMES[2].metodo or_else "") == "Print" and not IMPRIMES[2].sozinha)
+    expect((IMPRIMES[3].metodo or_else "") == "Printf" and not IMPRIMES[3].sozinha and (IMPRIMES[4].objeto or_else "") == "Console" and (IMPRIMES[4].metodo or_else "") == "WriteLine" and IMPRIMES[4].sozinha)
+    expect((IMPRIMES_SOLTOS[0].objeto or_else "") == "println" and IMPRIMES_SOLTOS[0].sozinha and (IMPRIMES_SOLTOS[1].objeto or_else "") == "puts" and IMPRIMES_SOLTOS[1].sozinha)
+    expect((IMPRIMES_SOLTOS[2].objeto or_else "") == "printf" and not IMPRIMES_SOLTOS[2].sozinha)
+    var tam: [4]str = TAMANHOS
+    var acr: [3]str = ACRESCENTAS
+    expect(nome_entre("len", tam[..]) and nome_entre("length", tam[..]) and nome_entre("size", tam[..]) and nome_entre("count", tam[..]))
+    expect(not nome_entre("append", tam[..]) and not nome_entre("", tam[..]) and not nome_entre("lenx", tam[..]))
+    expect(nome_entre("append", acr[..]) and nome_entre("push", acr[..]) and nome_entre("push_back", acr[..]) and not nome_entre("len", acr[..]) and not nome_entre("pop", acr[..]))
+}
+
+// G3 S8: relato por nome, tipo e chamada; so os caminhos sem troca mecanica (a troca mecanica passa por common.idioma_troca_somar, que copia o texto novo para o heap sem dono).
+// Oraculo = forja.exe real: fmt.Printf (so_dica), printf (so_dica), range(1, 5, 2) (so_dica), 'string' fora do lugar (so_dica).
+test "sem_idioma: relato sem troca (Printf, printf, range com passo, tipo)" {
+    var sv: Semantica = Semantica{}
+    var f: common.Fonte = common.Fonte{}
+    var d: common.Diag = common.Diag{}
+    var ar: common.Arena = common.Arena{}
+    var nomes: common.Interner = common.Interner{}
+    var prog: frontend.Programa = frontend.Programa{}
+    s8_preparar(&sv, &f, &d, &ar, &nomes, &prog, "proc main() {\n    fmt.Printf(\"a\")\n}\n", COD_E0110)
+    var e: frontend.Expr = frontend.Expr{}
+    e.nome = common.internar(&nomes, "fmt", 3)
+    e.pos_op = 18
+    expect(sem_idioma_de_nome(&sv, &e))
+    expect(d.codigo == COD_E0110 and d.off == 18 and (d.causa or_else "") == "forma de outra linguagem: 'fmt.Printf' imprime em C, JS, Go e Java; na Forja e print(...)")
+    expect(d.sug.n == 1 and (d.sug.itens[0].confianca as i32) == common.DIAG_SO_DICA and d.sug.itens[0].nedicoes == 0)
+    expect((d.sug.itens[0].descricao or_else "") == "troque pela forma da Forja: print(valor), e print(f\"texto {x}\") para juntar texto e valores")
+    // nome sem '.metodo(' ou objeto desconhecido: nao relata
+    e.nome = common.internar(&nomes, "main", 4)
+    e.pos_op = 5
+    d = common.Diag{}
+    expect(not sem_idioma_de_nome(&sv, &e) and not d.tem)
+    s8_liberar(&f, &nomes, &ar)
+    // printf( solto: so dica
+    var sv2: Semantica = Semantica{}
+    var f2: common.Fonte = common.Fonte{}
+    var d2: common.Diag = common.Diag{}
+    var ar2: common.Arena = common.Arena{}
+    var nomes2: common.Interner = common.Interner{}
+    s8_preparar(&sv2, &f2, &d2, &ar2, &nomes2, &prog, "proc main() {\n    printf(\"x\")\n}\n", COD_E0110)
+    var e2: frontend.Expr = frontend.Expr{}
+    e2.nome = common.internar(&nomes2, "printf", 6)
+    e2.pos_op = 18
+    expect(sem_idioma_de_chamada(&sv2, &e2))
+    expect((d2.causa or_else "") == "forma de outra linguagem: 'printf' imprime em C, JS, Go e Java; na Forja e print(...)")
+    expect(d2.sug.n == 1 and (d2.sug.itens[0].confianca as i32) == common.DIAG_SO_DICA and d2.sug.itens[0].nedicoes == 0)
+    expect((d2.sug.itens[0].descricao or_else "") == "troque printf por print(f\"texto {x}\"): o texto e os valores vao dentro do f\"...\"")
+    // sem '(' depois do nome, ou outro nome: false e nada relatado
+    e2.nome = common.internar(&nomes2, "outro", 5)
+    d2 = common.Diag{}
+    expect(not sem_idioma_de_chamada(&sv2, &e2) and not d2.tem)
+    e2.nome = common.internar(&nomes2, "proc", 4)
+    e2.pos_op = 0
+    expect(not sem_idioma_de_chamada(&sv2, &e2) and not d2.tem) // "proc main": depois do nome vem 'm', nao '('
+    s8_liberar(&f2, &nomes2, &ar2)
+    // range(1, 5, 2): com passo (2 virgulas) nao ha troca
+    var sv3: Semantica = Semantica{}
+    var f3: common.Fonte = common.Fonte{}
+    var d3: common.Diag = common.Diag{}
+    var ar3: common.Arena = common.Arena{}
+    var nomes3: common.Interner = common.Interner{}
+    s8_preparar(&sv3, &f3, &d3, &ar3, &nomes3, &prog, "proc main() {\n    for i in range(1, 5, 2) {\n        print(i)\n    }\n}\n", COD_E0110)
+    var e3: frontend.Expr = frontend.Expr{}
+    e3.nome = common.internar(&nomes3, "range", 5)
+    e3.pos_op = 27
+    expect(sem_idioma_de_chamada(&sv3, &e3))
+    expect((d3.causa or_else "") == "forma de outra linguagem: 'range' gera a faixa em Python; na Forja e 'a..<b'")
+    expect(d3.sug.n == 1 and (d3.sug.itens[0].confianca as i32) == common.DIAG_SO_DICA and d3.sug.itens[0].nedicoes == 0)
+    expect((d3.sug.itens[0].descricao or_else "") == "troque range(n) por 0..<n e range(a, b) por a..<b")
+    s8_liberar(&f3, &nomes3, &ar3)
+    // tipo 'string' fora do lugar no fonte: relata com so dica; nome que nao e tipo alheio: false
+    var sv4: Semantica = Semantica{}
+    var f4: common.Fonte = common.Fonte{}
+    var d4: common.Diag = common.Diag{}
+    var ar4: common.Arena = common.Arena{}
+    var nomes4: common.Interner = common.Interner{}
+    s8_preparar(&sv4, &f4, &d4, &ar4, &nomes4, &prog, "proc main() {\n    let x: string = \"a\"\n}\n", COD_E0110)
+    expect(sem_idioma_de_tipo(&sv4, common.internar(&nomes4, "string", 6), 99)) // pos 99 nao tem 'string': so_dica
+    expect((d4.causa or_else "") == "forma de outra linguagem: 'string' e o tipo texto de Java, C#, Go, Rust e C++; na Forja e 'str'")
+    expect(d4.sug.n == 1 and (d4.sug.itens[0].confianca as i32) == common.DIAG_SO_DICA and (d4.sug.itens[0].descricao or_else "") == "troque 'string' por 'str'")
+    d4 = common.Diag{}
+    expect(not sem_idioma_de_tipo(&sv4, common.internar(&nomes4, "str", 3), 11) and not d4.tem)
+    s8_liberar(&f4, &nomes4, &ar4)
+}
+
+// G3 S8: campo x.len / x.push sem troca mecanica (receptor com chamada, ou push sem parenteses) e tem_tamanho; oraculo = forja.exe real em s.length e l.push(1) (causas e confiancas).
+test "sem_idioma: campo (len, push) sem troca, tem_tamanho e receptor_eh_var" {
+    var sv: Semantica = Semantica{}
+    var f: common.Fonte = common.Fonte{}
+    var d: common.Diag = common.Diag{}
+    var ar: common.Arena = common.Arena{}
+    var nomes: common.Interner = common.Interner{}
+    var prog: frontend.Programa = frontend.Programa{}
+    s8_preparar(&sv, &f, &d, &ar, &nomes, &prog, "proc main() {\n    print(f(x).len)\n}\n", COD_E0110)
+    sv.tipos.itens = make([dynamic]TipoInfo, alloc = heap)
+    defer delete(sv.tipos.itens)
+    for _k in 0..<16 {
+        append(&sv.tipos.itens, item = TipoInfo{})
+    }
+    expect(tem_tamanho(&sv, TIPO_TEXTO as u32) and not tem_tamanho(&sv, TIPO_INT as u32))
+    var receptor: frontend.Expr = frontend.Expr{}
+    receptor.tipo = TIPO_TEXTO as u32
+    var e: frontend.Expr = frontend.Expr{}
+    e.a = &receptor
+    e.nome = common.internar(&nomes, "len", 3)
+    e.pos = 24
+    e.pos_op = 29
+    expect(sem_idioma_de_campo(&sv, &e)) // receptor f(x) nao e simples: so a causa e a dica
+    expect((d.causa or_else "") == "forma de outra linguagem: 'x.len' le o tamanho como metodo ou campo em Rust, JS, Java e C++; na Forja e len(x)")
+    expect(d.sug.n == 1 and (d.sug.itens[0].confianca as i32) == common.DIAG_SO_DICA and d.sug.itens[0].nedicoes == 0 and (d.sug.itens[0].descricao or_else "") == "troque pelo proc len(x): o tamanho nao e metodo nem campo")
+    // o tipo do receptor nao tem tamanho: nao e idioma
+    d = common.Diag{}
+    receptor.tipo = TIPO_INT as u32
+    expect(not sem_idioma_de_campo(&sv, &e) and not d.tem)
+    // nome que nao e len/push: nao e idioma
+    receptor.tipo = TIPO_TEXTO as u32
+    e.nome = common.internar(&nomes, "ptr", 3)
+    expect(not sem_idioma_de_campo(&sv, &e) and not d.tem)
+    s8_liberar(&f, &nomes, &ar)
+    // x.push sem '(': so dica
+    var sv2: Semantica = Semantica{}
+    var f2: common.Fonte = common.Fonte{}
+    var d2: common.Diag = common.Diag{}
+    var ar2: common.Arena = common.Arena{}
+    var nomes2: common.Interner = common.Interner{}
+    s8_preparar(&sv2, &f2, &d2, &ar2, &nomes2, &prog, "proc main() {\n    l.push\n}\n", COD_E0110)
+    sv2.tipos.itens = make([dynamic]TipoInfo, alloc = heap)
+    defer delete(sv2.tipos.itens)
+    for _k in 0..<16 {
+        append(&sv2.tipos.itens, item = TipoInfo{})
+    }
+    e.nome = common.internar(&nomes2, "push", 4)
+    e.pos = 18
+    e.pos_op = 20
+    expect(sem_idioma_de_campo(&sv2, &e))
+    expect((d2.causa or_else "") == "forma de outra linguagem: 'x.push' acrescenta ao fim como metodo em Python, JS, Rust e Java; na Forja e append(&x, item = v)")
+    expect(d2.sug.n == 1 and (d2.sug.itens[0].confianca as i32) == common.DIAG_SO_DICA and (d2.sug.itens[0].descricao or_else "") == "troque pelo proc append(&x, item = v): lista nao tem metodo")
+    // receptor_eh_var: local var sim; local let e nome sem local nao
+    let nl: i32 = common.internar(&nomes2, "l", 1)
+    sv2.qtd_nomes = len(nomes2.nomes) as u32
+    escopo_iniciar(&sv2.escopo, &ar2, sv2.qtd_nomes)
+    defer delete(sv2.escopo.pilha)
+    var ref: frontend.Expr = frontend.Expr{}
+    ref.tipo_no = frontend.EX_NOME as u8
+    ref.nome = nl
+    expect(not receptor_eh_var(&sv2, &ref))
+    var local: LocalInfo = LocalInfo{nome = nl, natureza = LOC_LET as u8}
+    escopo_empurrar(&sv2.escopo, &local)
+    expect(not receptor_eh_var(&sv2, &ref))
+    sv2.escopo.pilha[0].natureza = LOC_VAR as u8
+    expect(receptor_eh_var(&sv2, &ref))
+    s8_liberar(&f2, &nomes2, &ar2)
+}

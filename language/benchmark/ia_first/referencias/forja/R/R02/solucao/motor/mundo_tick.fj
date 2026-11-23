@@ -1,0 +1,109 @@
+// mundo_tick.fj 0.2.1 (10/11/2026) - engine:mundo_tick (M0-b/M0-c do contrato_graphics_f2.txt): passo fixo da simulacao, sem relogio proprio e sem tela.
+// Contrato: a simulacao anda em TICKS (u64) a TICK_HZ = 60; quem tem relogio (o jogo, o render) mede o tempo do quadro e o entrega a relogio_acumular, que devolve
+//   quantos ticks rodar neste quadro (no maximo TICK_MAX_POR_QUADRO; o atraso alem disso e descartado). Nada aqui le o tempo: o mesmo dt da o mesmo resultado.
+//   O acumulador guarda ns * TICK_HZ; 1 tick = TICK_UNIDADE (1e9) unidades, entao 1/60 s e exato (sem arredondar o passo para inteiro).
+// Fila de eventos: lista em alloc = frame, nasce vazia a cada quadro (fila_nova depois do frame_reset) e guarda os eventos na ordem em que foram publicados, cada um com o
+//   tick em que aconteceu; fila_contar_tick / fila_do_tick leem os de um tick. Nao use a fila depois do frame_reset do quadro que a criou (R0008 em dev).
+// Uso: import "motor/mundo_tick" as tick ; var r = tick.relogio_novo() ; let n = tick.relogio_acumular(&r, dt_ns = dt) ; for _ in 0..<n { ... tick.relogio_avancar(&r) }
+// Changelog: 0.2.1 - G18: o struct Evento virou EventoTick (nome de topo e unico no programa: colidia com plataforma.Evento quando o jogo importa janela/entrada e mundo_tick). 0.2.0 - M0-c: relogio_alfa (acumulador / TICK_UNIDADE, f64 em [0, 1)). 0.1.0 - M0-b da trilha M0 (engine:mundo_tick).
+// Verificar: forja test C:\ENGINE_GAME3D\testes_mundo\teste_tick.fj ; python C:\ENGINE_GAME3D\testes_mundo\m0_headless\verificar_m0.py
+import "motor/mundo" as mundo
+
+pub const TICK_HZ: u32 = 60
+pub const TICK_MAX_POR_QUADRO: u32 = 5
+pub const TICK_UNIDADE: u64 = 1000000000
+const TICK_DT_MAX_NS: u64 = 1000000000000
+
+pub enum TipoEvento {
+    criada
+    removida
+    tile_mudou
+}
+
+pub enum ErroFila {
+    sem_evento
+}
+
+pub struct RelogioFixo {
+    tick: u64
+    acumulador: u64
+}
+
+pub struct EventoTick {
+    tick: u64
+    tipo: TipoEvento
+    entidade: mundo.Entidade
+    dado: i64
+}
+
+pub struct FilaEventos {
+    itens: [dynamic]EventoTick
+}
+
+pub proc relogio_novo() -> RelogioFixo {
+    return RelogioFixo{tick = 0, acumulador = 0}
+}
+
+pub proc relogio_tick(r: ^RelogioFixo) -> u64 {
+    return r^.tick
+}
+
+// Soma o tempo do quadro (ns, medido por quem chama) e devolve quantos ticks rodar agora, no maximo TICK_MAX_POR_QUADRO; guarda so a fracao de tick que sobra.
+pub proc relogio_acumular(r: ^RelogioFixo, dt_ns: u64) -> u32 {
+    var dt = dt_ns
+    if dt > TICK_DT_MAX_NS {
+        dt = TICK_DT_MAX_NS
+    }
+    let total = r^.acumulador + dt * (TICK_HZ as u64)
+    var devidos = (total / TICK_UNIDADE) as u32
+    if devidos > TICK_MAX_POR_QUADRO {
+        devidos = TICK_MAX_POR_QUADRO
+    }
+    r^.acumulador = total % TICK_UNIDADE
+    return devidos
+}
+
+// Fracao de tick que sobrou no acumulador, em [0, 1): o alfa da interpolacao A/B (mundo.mundo_interpolar). Nao le relogio: so o estado do RelogioFixo.
+pub proc relogio_alfa(r: ^RelogioFixo) -> f64 {
+    return (r^.acumulador as f64) / (TICK_UNIDADE as f64)
+}
+
+pub proc relogio_avancar(r: ^RelogioFixo) {
+    r^.tick = r^.tick + 1
+}
+
+pub proc fila_nova(capacidade: int) -> FilaEventos {
+    return FilaEventos{itens = make([dynamic]EventoTick, alloc = frame, cap = capacidade)}
+}
+
+pub proc fila_publicar(f: ^FilaEventos, ev: EventoTick) {
+    append(&f^.itens, item = ev)
+}
+
+pub proc fila_total(f: ^FilaEventos) -> int {
+    return len(f^.itens)
+}
+
+pub proc fila_contar_tick(f: ^FilaEventos, tick: u64) -> u32 {
+    var contagem: u32 = 0
+    for ev in f^.itens {
+        if ev.tick == tick {
+            contagem = contagem + 1
+        }
+    }
+    return contagem
+}
+
+// O evento de numero `ordem` (0 = o primeiro publicado) entre os do tick pedido.
+pub proc fila_do_tick(f: ^FilaEventos, tick: u64, ordem: u32) -> EventoTick ! ErroFila {
+    var visto: u32 = 0
+    for ev in f^.itens {
+        if ev.tick == tick {
+            if visto == ordem {
+                return ev
+            }
+            visto = visto + 1
+        }
+    }
+    return ErroFila.sem_evento
+}

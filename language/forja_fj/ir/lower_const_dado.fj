@@ -1,0 +1,325 @@
+// ir/lower_const_dado.fj - F4 (forja 0.26.0): const de array escalar lida por indice vira dado em .rdata
+// Versao: 0.1.0
+// Verificacao: forja test forja_fj\forja.fj --filtro lower_const_dado
+//
+// Por que: cada uso de uma const de array/struct re-lowerava o inicializador (lower_nome) e o BIR emitia N stores
+// imediatos na pilha. Aqui o inicializador e lowerado UMA vez num bloco de rascunho, serializado em bytes
+// (IrDado) e o indice `TAB[i]` passa a ler direto do dado, por V_DADO (o BIR vira um endereco de simbolo).
+// So vale na leitura por indice (lw_indice): copia, fatia, `&`, `for` e argumento seguem no caminho antigo
+// (lower_nome), que da uma copia gravavel na pilha. Gravar em .rdata seria violacao de acesso.
+// Elegivel = folhas V_INT/V_BOOL/V_REAL de classe inteira/bool/enum/f32/f64 em arrays e structs aninhados.
+// Qualquer outra coisa (texto, ponteiro, proc, bit_set, uniao, calculo em tempo de execucao) = inelegivel e
+// cai no caminho antigo. Interruptor: FORJA_CONST_RDATA=0 desliga (comparacao A/B).
+//
+// Changelog: 0.1.0 - F4-1.
+
+import "common"
+import "frontend"
+import "semantic"
+import "std:os"
+
+// Estado de uma serializacao: os bytes do dado e o mapa temp -> instrucao do bloco de rascunho.
+// Sem ponteiro para o LowerCtx de proposito: guardar `c` aqui faz a analise de escape (E0706) acusar todo
+// chamador que passa &c de local. O LowerCtx vai como 1o parametro dos procs de serializacao.
+struct SerDado {
+    alvos: ?[]?^IrInstr
+    base_temp: u32
+    bytes: ?[]u8
+    ok: bool
+}
+
+// Onde gravar: tipo de destino e deslocamento em bytes dentro do dado.
+struct SerDest {
+    tipo: u32
+    desloc: u32
+}
+
+// Classes escalares que viram bytes inteiros (bool, inteiros, enum). Real tem rota propria.
+proc ser_classe_inteira(classe: i32) -> bool {
+    if (classe == semantic.TC_BOOL) or (classe == semantic.TC_I8) or (classe == semantic.TC_U8) or (classe == semantic.TC_I16) or (classe == semantic.TC_U16) {
+        return true
+    }
+    return (classe == semantic.TC_I32) or (classe == semantic.TC_U32) or (classe == semantic.TC_INT) or (classe == semantic.TC_UINT) or (classe == semantic.TC_ENUM)
+}
+
+// Grava os `tam` bytes baixos de `bits` em little endian em `desloc`; fora do dado = inelegivel.
+proc ser_gravar_bits(s: ^SerDado, desloc: u32, tam: u32, bits: u64) {
+    let dado: []u8 = s.bytes or_else {}
+    if ((desloc + tam) as int) > len(dado) {
+        s.ok = false
+        return
+    }
+    for k in 0..<tam {
+        let rolagem: u64 = (k * 8) as u64
+        dado[(desloc + k) as int] = ((bits >> rolagem) & (255 as u64)) as u8
+    }
+}
+
+// Folha escalar: o tipo de destino manda no tamanho; o valor tem de ser constante da mesma familia.
+proc ser_folha(s: ^SerDado, v: Valor, classe: i32, desloc: u32) {
+    if ((v.tipo_no == (V_INT as u8)) or (v.tipo_no == (V_BOOL as u8))) and ser_classe_inteira(classe) {
+        let tam: u32 = tamanho_escalar(classe)
+        ser_gravar_bits(s, desloc, tam, transmute(v.inteiro, to = u64))
+        return
+    }
+    if (v.tipo_no == (V_REAL as u8)) and (classe == semantic.TC_REAL) {
+        let f: f32 = v.real as f32
+        ser_gravar_bits(s, desloc, 4, transmute(f, to = u32) as u64)
+        return
+    }
+    if (v.tipo_no == (V_REAL as u8)) and (classe == semantic.TC_F64) {
+        ser_gravar_bits(s, desloc, 8, transmute(v.real, to = u64))
+        return
+    }
+    s.ok = false
+}
+
+proc ser_array(c: ^LowerCtx, s: ^SerDado, ins: ^IrInstr, dest: SerDest) {
+    let info: ^semantic.TipoInfo = semantic.tipo_de(&(c.sem as ^semantic.Semantica).tipos, dest.tipo)
+    let elemento: u32 = info.a
+    if (ins.nargs > info.b) or (elemento >= c.layouts.qtd) {
+        s.ok = false
+        return
+    }
+    let tam_elemento: u32 = layout_de(&c.layouts, elemento).tam
+    if tam_elemento == 0 {
+        s.ok = false
+        return
+    }
+    let args: []Valor = ins.args or_else {}
+    for k in 0..<ins.nargs {
+        ser_valor(c, s, args[k as int], SerDest{tipo = elemento, desloc = dest.desloc + k * tam_elemento})
+    }
+}
+
+proc ser_struct(c: ^LowerCtx, s: ^SerDado, ins: ^IrInstr, dest: SerDest) {
+    let sem: ^semantic.Semantica = c.sem as ^semantic.Semantica
+    let tipo: u32 = dest.tipo
+    let est: ?^IrStruct = layout_estrutura(&sem.tipos, c.prog as ^IrPrograma, tipo)
+    if (est == none) or ((est as ^IrStruct).opaco) or (ins.nargs != (est as ^IrStruct).ncampos) {
+        s.ok = false
+        return
+    }
+    if (tipo >= c.layouts.qtd) or (layout_qtd_membros(&c.layouts, tipo) < ins.nargs) {
+        s.ok = false
+        return
+    }
+    let campos: []IrCampo = (est as ^IrStruct).campos or_else {}
+    let args: []Valor = ins.args or_else {}
+    for k in 0..<ins.nargs {
+        ser_valor(c, s, args[k as int], SerDest{tipo = campos[k as int].tipo, desloc = dest.desloc + layout_offset_campo(&c.layouts, tipo, k)})
+    }
+}
+
+// Valor temporario = literal aninhado (array ou struct) do bloco de rascunho; o resto e folha.
+proc ser_agregado(c: ^LowerCtx, s: ^SerDado, v: Valor, dest: SerDest) {
+    let tipo: u32 = dest.tipo
+    let classe: i32 = classe_de(c, tipo)
+    let alvos: []?^IrInstr = s.alvos or_else {}
+    let indice: i32 = v.id - (s.base_temp as i32)
+    if (indice < 0) or (indice as int) >= len(alvos) {
+        s.ok = false
+        return
+    }
+    let achada: ?^IrInstr = alvos[indice as int]
+    if (achada == none) or ((achada as ^IrInstr).tipo != tipo) {
+        s.ok = false
+        return
+    }
+    let ins: ^IrInstr = achada as ^IrInstr
+    if (classe == semantic.TC_ARRAY) and (ins.op == (IR_ARRAY as u8)) {
+        ser_array(c, s, ins, dest)
+    } else if (classe == semantic.TC_STRUCT) and (ins.op == (IR_STRUCT as u8)) {
+        ser_struct(c, s, ins, dest)
+    } else {
+        s.ok = false
+    }
+}
+
+// V_INT de enum guarda a posicao do membro; o BIR grava o valor declarado (bir_inteiro_do_valor: valores[posicao],
+// truncado em i32). O dado em .rdata tem de gravar o mesmo numero.
+proc ser_valor_do_membro(c: ^LowerCtx, tipo: u32, posicao: i64) -> i64 {
+    let prog: ^IrPrograma = c.prog as ^IrPrograma
+    let nome: i32 = transmute(semantic.tipo_de(&(c.sem as ^semantic.Semantica).tipos, tipo).a, to = i32)
+    let enums: []IrEnum = prog.enums or_else {}
+    for k in 0..<prog.nenums {
+        let en: ^IrEnum = &enums[k as int]
+        if en.nome != nome {
+            continue
+        }
+        var valor: i64 = posicao
+        if (en.valores != none) and (posicao >= 0) and (posicao < (en.nmembros as i64)) {
+            valor = (en.valores or_else {})[posicao as int]
+        }
+        return (valor as i32) as i64
+    }
+    return (posicao as i32) as i64
+}
+
+proc ser_valor(c: ^LowerCtx, s: ^SerDado, v: Valor, dest: SerDest) {
+    if not s.ok {
+        return
+    }
+    if v.tipo_no == (V_TEMP as u8) {
+        ser_agregado(c, s, v, dest)
+        return
+    }
+    let classe: i32 = classe_de(c, dest.tipo)
+    var folha: Valor = v
+    if (classe == semantic.TC_ENUM) and (v.tipo_no == (V_INT as u8)) {
+        folha.inteiro = ser_valor_do_membro(c, dest.tipo, v.inteiro)
+    }
+    ser_folha(s, folha, classe, dest.desloc)
+}
+
+// Indexa o bloco de rascunho por destino. Qualquer instrucao que nao seja literal de array/struct
+// (chamada, conta, verificacao de faixa em tempo de execucao...) torna a const inelegivel.
+proc ser_indexar_rascunho(alvos: []?^IrInstr, rascunho: ^IrBloco, base_temp: u32) -> bool {
+    var atual: ?^IrInstr = rascunho.primeira
+    while atual != none {
+        let ins: ^IrInstr = atual as ^IrInstr
+        let indice: i32 = ins.destino - (base_temp as i32)
+        let literal: bool = (ins.op == (IR_ARRAY as u8)) or (ins.op == (IR_STRUCT as u8))
+        if (not literal) or (indice < 0) or ((indice as int) >= len(alvos)) {
+            return false
+        }
+        alvos[indice as int] = ins
+        atual = ins.prox
+    }
+    return true
+}
+
+// Serializa o valor lowerado em bytes e registra o IrDado; devolve a marca do cache (k + 1) ou -1.
+proc lw_dado_gravar(c: ^LowerCtx, rascunho: ^IrBloco, v: Valor, tipo: u32, base_temp: u32, fim_temp: u32) -> i32 {
+    let prog: ^IrPrograma = c.prog as ^IrPrograma
+    if (tipo >= c.layouts.qtd) or (v.tipo_no != (V_TEMP as u8)) or (fim_temp < base_temp) {
+        return -1
+    }
+    let tam: u32 = layout_de(&c.layouts, tipo).tam
+    if tam == 0 {
+        return -1
+    }
+    let n: int = (fim_temp - base_temp) as int
+    var alvos = make([dynamic]?^IrInstr, alloc = heap, cap = n + 1)
+    defer delete(alvos)
+    for k in 0..<n {
+        append(&alvos, item = none)
+    }
+    if not ser_indexar_rascunho(alvos[..], rascunho, base_temp) {
+        return -1
+    }
+    var s: SerDado = SerDado{alvos = alvos[..], base_temp = base_temp, bytes = common.arena_fatia_u8(c.arena as ^common.Arena, tam as int), ok = true}
+    ser_valor(c, &s, v, SerDest{tipo = tipo, desloc = 0})
+    if not s.ok {
+        return -1
+    }
+    let dados: []IrDado = prog.dados or_else {}
+    if (prog.ndados as int) >= len(dados) {
+        return -1
+    }
+    dados[prog.ndados as int] = IrDado{bytes = s.bytes, tam = tam, ali = layout_de(&c.layouts, tipo).ali}
+    prog.ndados += 1
+    return (prog.ndados as i32)
+}
+
+// Lowera o inicializador da const num bloco de rascunho (reusa dobra, padroes e faixas do lowering normal),
+// restaura bloco e contador de temporarios e serializa. Erro de diagnostico = inelegivel (o caminho antigo
+// reporta o mesmo erro no uso).
+proc lw_dado_criar(c: ^LowerCtx, e: ^frontend.Expr) -> i32 {
+    let sem: ^semantic.Semantica = c.sem as ^semantic.Semantica
+    let diag: ^common.Diag = sem.diag as ^common.Diag
+    if diag.tem {
+        return -1
+    }
+    // O lowering so calcula os layouts quando o programa usa size_of/offset_of (usa_layout); o BIR os refaz depois.
+    if c.layouts.qtd == 0 {
+        layout_calcular(&sem.tipos, c.prog as ^IrPrograma, c.arena as ^common.Arena, &c.layouts)
+    }
+    let decl: ^frontend.Decl = (c.consts or_else {})[e.ref_id] as ^frontend.Decl
+    let temps_antes: u32 = c.ntemps
+    // bloco na arena (nao local): o c.atual guarda o ponteiro e a analise de escape (E0706) barra endereco de local
+    var lista = make([dynamic]IrBloco, alloc = common.arena_mem(c.arena as ^common.Arena), cap = 1)
+    append(&lista, item = IrBloco{})
+    let fatia: []IrBloco = lista[..]
+    let rascunho: ^IrBloco = &fatia[0]
+    let anterior: ^IrBloco = lw_trocar_bloco(c, rascunho)
+    let v: Valor = lw_expr(c, decl.init)
+    _ = lw_trocar_bloco(c, anterior)
+    let temps_depois: u32 = c.ntemps
+    c.ntemps = temps_antes
+    if diag.tem {
+        return -1
+    }
+    return lw_dado_gravar(c, rascunho, v, e.tipo, temps_antes, temps_depois)
+}
+
+// Ponto de entrada do lw_indice: `TAB[i]` com TAB = const de array nao escalar vira V_DADO.
+// true = `saida` e o dado; false = segue o caminho antigo.
+proc lw_base_dado(c: ^LowerCtx, base: ?^frontend.Expr, saida: ^Valor) -> bool {
+    if not c.const_rdata {
+        return false
+    }
+    let e: ^frontend.Expr = base as ^frontend.Expr
+    if (e.tipo_no != (frontend.EX_NOME as u8)) or (e.ref != (frontend.REF_CONST as u8)) {
+        return false
+    }
+    if (c.const_escalar or_else {})[e.ref_id] or (classe_de(c, e.tipo) != semantic.TC_ARRAY) {
+        return false
+    }
+    let marcas: []i32 = c.dado_idx or_else {}
+    var marca: i32 = marcas[e.ref_id as int]
+    if marca == 0 {
+        marca = lw_dado_criar(c, e)
+        marcas[e.ref_id as int] = marca
+    }
+    if marca < 0 {
+        return false
+    }
+    saida^ = Valor{tipo_no = V_DADO as u8, tipo = e.tipo, id = marca - 1}
+    return true
+}
+
+// FORJA_CONST_RDATA=0 desliga o recurso (A/B); qualquer outro valor, ou ausente, liga.
+proc lw_const_rdata_ligado() -> bool {
+    return (os.env("FORJA_CONST_RDATA") or_else "") != "0"
+}
+
+test "lower_const_dado: bytes little endian e fora do dado" {
+    var a = common.Arena{}
+    var s: SerDado = SerDado{bytes = common.arena_fatia_u8(&a, 8), ok = true}
+    ser_gravar_bits(&s, 0, 2, 0x1234)
+    ser_gravar_bits(&s, 2, 1, 0xFFFF)
+    ser_gravar_bits(&s, 4, 4, 0xDEADBEEF)
+    let b: []u8 = s.bytes or_else {}
+    expect(s.ok and b[0] == 0x34 and b[1] == 0x12 and b[2] == 0xFF and b[3] == 0)
+    expect(b[4] == 0xEF and b[5] == 0xBE and b[6] == 0xAD and b[7] == 0xDE)
+    ser_gravar_bits(&s, 6, 4, 1)
+    expect(not s.ok)
+    common.arena_liberar(&a)
+}
+
+test "lower_const_dado: folha real f32 e f64, -0.0 e familia errada" {
+    var a = common.Arena{}
+    var s: SerDado = SerDado{bytes = common.arena_fatia_u8(&a, 12), ok = true}
+    ser_folha(&s, Valor{tipo_no = V_REAL as u8, real = 1.5}, semantic.TC_REAL, 0)
+    ser_folha(&s, Valor{tipo_no = V_REAL as u8, real = -0.0}, semantic.TC_F64, 4)
+    let b: []u8 = s.bytes or_else {}
+    expect(s.ok and b[0] == 0 and b[1] == 0 and b[2] == 0xC0 and b[3] == 0x3F)
+    expect(b[4] == 0 and b[10] == 0 and b[11] == 0x80)
+    ser_folha(&s, Valor{tipo_no = V_INT as u8, inteiro = 3}, semantic.TC_REAL, 0)
+    expect(not s.ok)
+    common.arena_liberar(&a)
+}
+
+test "lower_const_dado: folha inteira pelo tamanho da classe" {
+    var a = common.Arena{}
+    var s: SerDado = SerDado{bytes = common.arena_fatia_u8(&a, 8), ok = true}
+    ser_folha(&s, Valor{tipo_no = V_INT as u8, inteiro = -2}, semantic.TC_I16, 0)
+    ser_folha(&s, Valor{tipo_no = V_BOOL as u8, inteiro = 1}, semantic.TC_BOOL, 2)
+    ser_folha(&s, Valor{tipo_no = V_INT as u8, inteiro = -1}, semantic.TC_I8, 3)
+    let b: []u8 = s.bytes or_else {}
+    expect(s.ok and b[0] == 0xFE and b[1] == 0xFF and b[2] == 1 and b[3] == 0xFF and b[4] == 0)
+    ser_folha(&s, Valor{tipo_no = V_TEXTO as u8}, semantic.TC_TEXTO, 0)
+    expect(not s.ok)
+    common.arena_liberar(&a)
+}

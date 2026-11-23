@@ -1,0 +1,67 @@
+// vendor:win32/ajuda: o que o windows.h nao entrega pronto (texto UTF-8 <-> UTF-16 e estado de janela sem `var` global).
+// Objetivo: app Win32 sem declarar foreign a mao nem guardar estado em variavel de topo (a Forja nao tem `var` global).
+// Versao 0.1.0. Changelog: 0.1.0 - texto UTF-8/UTF-16 e userdata da janela (GWLP_USERDATA); extraido do app area_trabalho.
+// Verificar: forja run language\exemplos_libs\win32_basico.fj   (saida em win32_basico.esperado)
+//
+// ESTADO NO WndProc SEM `var` GLOBAL: o WndProc recebe so a janela. Crie a janela e, logo depois do CreateWindowExW,
+// chame guardar_dados_da_janela(janela, &estado as rawptr) com uma struct local do main; dentro do WndProc,
+// dados_da_janela(janela) devolve o mesmo rawptr (`as ^Estado` para usar). Mensagens que chegam DURANTE o CreateWindowExW
+// (WM_NCCREATE/WM_CREATE) ainda nao tem o ponteiro: la o CREATESTRUCT traz o lp_param do CreateWindowExW (1o campo, rawptr).
+import "vendor:win32/win32"
+
+foreign {
+    link "kernel32"
+    // 2o nome do mesmo simbolo C do win32.fj, agora com bytes UTF-8 (^u8): a ABI e a mesma
+    proc bytes_utf8_para_wide = "MultiByteToWideChar"(code_page: u32, flags: u32, entrada: ^u8, tam_entrada: i32, saida: ^u16, tam_saida: i32) -> i32
+    proc wide_para_bytes_utf8 = "WideCharToMultiByte"(code_page: u32, flags: u32, entrada: ^u16, tam_entrada: i32, saida: ^u8, tam_saida: i32, padrao: rawptr, usado_padrao: rawptr) -> i32
+}
+
+const CP_UTF8: u32 = 65001
+
+// Bytes UTF-8 (sem NUL) para UTF-16 com NUL no fim; saida precisa de len(entrada) + 1 unidades; devolve unidades gravadas ou -1
+pub proc bytes_para_wide(entrada: []u8, saida: []u16) -> int {
+    if len(entrada) == 0 {
+        saida[0] = 0
+        return 0
+    }
+    let gravadas = bytes_utf8_para_wide(CP_UTF8, 0, &entrada[0], len(entrada) as i32, &saida[0], (len(saida) - 1) as i32)
+    if gravadas <= 0 {
+        return -1
+    }
+    saida[gravadas as int] = 0
+    return gravadas as int
+}
+
+// Unidades UTF-16 ate o primeiro NUL (sem contar o NUL); sem NUL conta tudo
+pub proc unidades_ate_nul(entrada: []u16) -> int {
+    for i in 0..<len(entrada) {
+        if entrada[i] == 0 {
+            return i
+        }
+    }
+    return len(entrada)
+}
+
+// UTF-16 (ate o NUL) para UTF-8 em saida: bytes gravados (0 se vazio) ou -1 se falhar
+pub proc wide_para_utf8(entrada: []u16, saida: []u8) -> int {
+    let unidades = unidades_ate_nul(entrada)
+    if unidades == 0 {
+        return 0
+    }
+    let gravados = wide_para_bytes_utf8(CP_UTF8, 0, &entrada[0], unidades as i32, &saida[0], len(saida) as i32, none, none)
+    if gravados <= 0 {
+        return -1
+    }
+    return gravados as int
+}
+
+// Ponteiro guardado na janela (GWLP_USERDATA); none-equivalente (rawptr nulo) se nada foi guardado
+pub proc dados_da_janela(janela: ?^win32.Hwnd) -> rawptr {
+    let guardado = win32.GetWindowLongPtrW(janela, win32.GWLP_USERDATA)
+    return transmute(guardado as u64, to = rawptr)
+}
+
+// Guarda um ponteiro na janela (GWLP_USERDATA); chame no WM_NCCREATE com o lp_create_params do CREATESTRUCT
+pub proc guardar_dados_da_janela(janela: ?^win32.Hwnd, dados: rawptr) {
+    _ = win32.SetWindowLongPtrW(janela, win32.GWLP_USERDATA, transmute(dados, to = u64) as i64)
+}

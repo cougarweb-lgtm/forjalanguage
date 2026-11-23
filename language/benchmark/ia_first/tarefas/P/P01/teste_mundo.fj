@@ -1,0 +1,139 @@
+// teste_mundo.fj 0.1.0 (10/11/2026) - testes de unidade do engine:mundo (M0-b): registro, geracao vencida, remocao com troca e tile_de_posicao nas 6 faces.
+// Roda por `forja test` (nao tem janela nem GPU). O proc main so existe porque o forja test exige um programa.
+// Changelog: 0.1.0 - M0-b da trilha M0 (engine:mundo).
+// Verificar: $env:FORJA_ENGINE='C:\ENGINE_GAME3D\engine'; & "$env:TEMP\forja_f2_fim\forja.exe" test C:\ENGINE_GAME3D\testes_mundo\teste_mundo.fj
+import "motor/mundo" as mundo
+
+const TM_SEM_LINHA: int = -1
+const TM_OK: int = 0
+const TM_DESCONHECIDA: int = 1
+const TM_VENCIDA: int = 2
+
+proc main() {
+    print(0)
+}
+
+// Linha da entidade na tabela do tipo, ou -1 se o registro a recusa.
+proc linha_de(m: ^mundo.Mundo, e: mundo.Entidade) -> int {
+    var linha = TM_SEM_LINHA
+    switch p in mundo.mundo_posicao(m, e = e) {
+        case mundo.PosicaoNaTabela:
+            linha = p.linha as int
+        case mundo.ErroMundo:
+            linha = TM_SEM_LINHA
+    }
+    return linha
+}
+
+// 0 = removeu, 1 = entidade desconhecida, 2 = vencida.
+proc remover_codigo(m: ^mundo.Mundo, e: mundo.Entidade) -> int {
+    var codigo = TM_OK
+    switch r in mundo.mundo_remover(m, e = e) {
+        case bool:
+            codigo = TM_OK
+        case mundo.ErroMundo:
+            codigo = TM_VENCIDA
+            if r == mundo.ErroMundo.desconhecida {
+                codigo = TM_DESCONHECIDA
+            }
+    }
+    return codigo
+}
+
+proc vel_x(m: ^mundo.Mundo, e: mundo.Entidade) -> f32 {
+    let v = mundo.mundo_vel(m, e = e) or_else mundo.velocidade_zero()
+    return v.linear[0]
+}
+
+proc vel_com_x(x: f32) -> mundo.Velocidade {
+    return mundo.Velocidade{linear = {x, 0.0, 0.0}, angular = {0.0, 0.0, 0.0}}
+}
+
+test "registro: criar, tipo, linha e contagens" {
+    var m = mundo.mundo_novo(4)
+    defer mundo.mundo_destruir(&m)
+    let a = mundo.mundo_criar(&m, tipo = mundo.TipoEntidade.ator)
+    let b = mundo.mundo_criar(&m, tipo = mundo.TipoEntidade.ator)
+    let c = mundo.mundo_criar(&m, tipo = mundo.TipoEntidade.projetil)
+    expect(a.indice == 0 and a.geracao == 1)
+    expect(b.indice == 1 and c.indice == 2)
+    expect(mundo.mundo_contar(&m) == 3)
+    expect(mundo.mundo_contar_tipo(&m, tipo = mundo.TipoEntidade.ator) == 2)
+    expect(mundo.mundo_contar_tipo(&m, tipo = mundo.TipoEntidade.projetil) == 1)
+    expect(mundo.mundo_contar_tipo(&m, tipo = mundo.TipoEntidade.cenario) == 0)
+    expect(linha_de(&m, e = a) == 0 and linha_de(&m, e = b) == 1 and linha_de(&m, e = c) == 0)
+    expect(mundo.mundo_viva(&m, e = a))
+}
+
+test "colunas: vel, tile e flags por entidade" {
+    var m = mundo.mundo_novo(4)
+    defer mundo.mundo_destruir(&m)
+    let a = mundo.mundo_criar(&m, tipo = mundo.TipoEntidade.ator)
+    let b = mundo.mundo_criar(&m, tipo = mundo.TipoEntidade.ator)
+    let flags_b: bit_set[mundo.FlagEntidade] = {mundo.FlagEntidade.ativa, mundo.FlagEntidade.movel}
+    expect(mundo.mundo_definir_vel(&m, e = a, v = vel_com_x(2.5)) or_else false)
+    expect(mundo.mundo_definir_tile(&m, e = b, t = mundo.tile_de_posicao({0.0, 5.0, 0.0}, nivel = 3)) or_else false)
+    expect(mundo.mundo_definir_flags(&m, e = b, f = flags_b) or_else false)
+    let tile_b = mundo.mundo_tile(&m, e = b) or_else mundo.tile_zero()
+    let flags_lidas = mundo.mundo_flags(&m, e = b) or_else {}
+    expect(vel_x(&m, e = a) == 2.5 and vel_x(&m, e = b) == 0.0)
+    expect(tile_b.face == 2 and tile_b.nivel == 3)
+    expect(has(flags_lidas, key = mundo.FlagEntidade.movel) and not has(flags_lidas, key = mundo.FlagEntidade.visivel))
+}
+
+test "geracao vencida: handle antigo, reuso do slot e handles invalidos" {
+    var m = mundo.mundo_novo(4)
+    defer mundo.mundo_destruir(&m)
+    let velha = mundo.mundo_criar(&m, tipo = mundo.TipoEntidade.cenario)
+    expect(remover_codigo(&m, e = velha) == TM_OK)
+    expect(not mundo.mundo_viva(&m, e = velha))
+    expect(remover_codigo(&m, e = velha) == TM_VENCIDA)
+    let nova = mundo.mundo_criar(&m, tipo = mundo.TipoEntidade.cenario)
+    expect(nova.indice == velha.indice and nova.geracao == velha.geracao + 1)
+    expect(mundo.mundo_viva(&m, e = nova) and not mundo.mundo_viva(&m, e = velha))
+    expect(not mundo.mundo_viva(&m, e = mundo.Entidade{indice = 0, geracao = 0}))
+    expect(remover_codigo(&m, e = mundo.Entidade{indice = 900, geracao = 1}) == TM_DESCONHECIDA)
+    expect(mundo.mundo_contar(&m) == 1)
+}
+
+test "remocao com troca: a ultima linha ocupa o buraco e o registro e consertado" {
+    var m = mundo.mundo_novo(4)
+    defer mundo.mundo_destruir(&m)
+    let a = mundo.mundo_criar(&m, tipo = mundo.TipoEntidade.ator)
+    let b = mundo.mundo_criar(&m, tipo = mundo.TipoEntidade.ator)
+    let c = mundo.mundo_criar(&m, tipo = mundo.TipoEntidade.ator)
+    expect(mundo.mundo_definir_vel(&m, e = a, v = vel_com_x(1.0)) or_else false)
+    expect(mundo.mundo_definir_vel(&m, e = b, v = vel_com_x(2.0)) or_else false)
+    expect(mundo.mundo_definir_vel(&m, e = c, v = vel_com_x(3.0)) or_else false)
+    expect(remover_codigo(&m, e = a) == TM_OK)
+    expect(linha_de(&m, e = c) == 0 and linha_de(&m, e = b) == 1)
+    expect(vel_x(&m, e = c) == 3.0 and vel_x(&m, e = b) == 2.0)
+    expect(mundo.mundo_contar_tipo(&m, tipo = mundo.TipoEntidade.ator) == 2)
+    expect(remover_codigo(&m, e = b) == TM_OK and remover_codigo(&m, e = c) == TM_OK)
+    expect(mundo.mundo_contar(&m) == 0)
+    let d = mundo.mundo_criar(&m, tipo = mundo.TipoEntidade.ator)
+    expect(linha_de(&m, e = d) == 0 and vel_x(&m, e = d) == 0.0)
+}
+
+test "tile_de_posicao: as 6 faces do cubo pelo maior eixo" {
+    expect(mundo.tile_de_posicao({1.0, 0.25, 0.5}, nivel = 2).face == 0)
+    expect(mundo.tile_de_posicao({-1.0, 0.25, 0.5}, nivel = 2).face == 1)
+    expect(mundo.tile_de_posicao({0.25, 3.0, 0.5}, nivel = 2).face == 2)
+    expect(mundo.tile_de_posicao({0.25, -3.0, 0.5}, nivel = 2).face == 3)
+    expect(mundo.tile_de_posicao({0.25, 0.5, 9.0}, nivel = 2).face == 4)
+    expect(mundo.tile_de_posicao({0.25, 0.5, -9.0}, nivel = 2).face == 5)
+}
+
+test "tile_de_posicao: celulas, bordas, empate, origem e nivel limitado" {
+    let centro = mundo.tile_de_posicao({1.0, 0.0, 0.0}, nivel = 2)
+    expect(centro.x == 2 and centro.y == 2 and centro.nivel == 2)
+    let quina = mundo.tile_de_posicao({1.0, 1.0, 1.0}, nivel = 2)
+    expect(quina.face == 0 and quina.x == 3 and quina.y == 3)
+    let oposta = mundo.tile_de_posicao({1.0, -1.0, -1.0}, nivel = 2)
+    expect(oposta.face == 0 and oposta.x == 0 and oposta.y == 0)
+    let escala = mundo.tile_de_posicao({2.0, -1.0, 0.0}, nivel = 1)
+    expect(escala.face == 0 and escala.x == 0 and escala.y == 1)
+    let origem = mundo.tile_de_posicao({0.0, 0.0, 0.0}, nivel = 0)
+    expect(origem.face == 0 and origem.x == 0 and origem.y == 0)
+    expect(mundo.tile_de_posicao({0.0, 1.0, 0.0}, nivel = 200).nivel == mundo.MUNDO_NIVEL_MAX)
+}

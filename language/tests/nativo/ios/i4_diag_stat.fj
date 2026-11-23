@@ -1,0 +1,50 @@
+// I4f: diagnostico do stat no simulador iOS: despeja os bytes que o Darwin devolve (fstatat/fstat) e o errno, para conferir a traducao do shim.
+import "std:os"
+import "std:file"
+
+foreign {
+    link "c"
+    proc c_fstatat = "fstatat"(dirfd: i32, caminho: cstr, buf: int, flags: i32) -> i32
+    proc c_open = "open"(caminho: cstr, flags: i32) -> i32
+    proc c_fstat = "fstat"(fd: i32, buf: int) -> i32
+    proc c_errno_ptr = "__error"() -> int
+}
+
+proc despejar(titulo: str, r: i32, d: ^[18]int) {
+    let p = transmute(c_errno_ptr(), to = rawptr) as ^i32
+    let e: i32 = p^
+    print(f"{titulo} r={r} errno={e}")
+    for k in 0..<18 {
+        print(f"  w{k}={(d^[k] as u64):016x}")
+    }
+}
+
+proc sondar(caminho: cstr, nome: str, flags: i32) {
+    var d: [18]int = {}
+    let base: int = transmute(&d as rawptr, to = int)
+    let r = c_fstatat(-2 as i32, caminho, base, flags)
+    despejar(nome, r, &d)
+}
+
+proc main() {
+    let pasta = os.env("TMPDIR") or_else "/tmp"
+    let caminho = format_c(f"{pasta}/forja_i4_diag.txt", alloc = heap)
+    defer delete(caminho)
+    let falha = file.write_all(caminho as str, data = as_bytes("12345"))
+    print(f"write_all falha={falha != none}")
+    sondar(caminho, "arquivo-seguir", 0 as i32)
+    sondar(caminho, "arquivo-nofollow", 32 as i32)
+    sondar("/tmp", "pasta", 0 as i32)
+    sondar("/nao/existe/zz", "ausente", 0 as i32)
+    var d: [18]int = {}
+    let fd = c_open(caminho, 0 as i32)
+    let r = c_fstat(fd, transmute(&d as rawptr, to = int))
+    print(f"fd={fd}")
+    despejar("fstat", r, &d)
+    switch r1 in file.stat(caminho as str) {
+    case file.FileInfo:
+        print(f"file.stat size={r1.size} arquivo={r1.kind == file.FileKind.file}")
+    case file.FileError:
+        print("file.stat erro")
+    }
+}

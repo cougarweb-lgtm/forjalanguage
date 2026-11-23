@@ -1,0 +1,391 @@
+// driver/editar_imports.fj - porte de compiler/driver/editar_imports.c
+// sha256 de driver/editar_imports.c: 7163467009395623383a29f19328c05da7cd36cfe4a1584d1f5472573bbf6ebd
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "common"
+import "frontend"
+import "semantic"
+
+struct NovoImport {
+    x: u32
+    k: u8
+    apelido: ?str
+    linha: ?str
+}
+
+// base e delta: listas donas (heap), uma celula por [arquivo x modulo] (x * n + k); liberadas em imports_liberar.
+struct Imports {
+    p: ?^Plano
+    n: u32
+    narquivos: u32
+    base: [dynamic]i32
+    delta: [dynamic]i32
+    novos: [32]NovoImport
+    nnovos: u32
+}
+
+const NOVOS_MAX: i32 = 32
+const APAGAR_MAX: i32 = 64
+
+// C: driver/editar_imports.c:29
+proc editar_uso_eh_de_decl(u: ^semantic.IndUso) -> bool {
+    let sw_1 = common.c2f_s2u_32((u.alvo_tipo as i32))
+    if sw_1 == (semantic.IND_PROC as u32) or sw_1 == (semantic.IND_STRUCT as u32) or sw_1 == (semantic.IND_ENUM as u32) or sw_1 == (semantic.IND_UNIAO as u32) or sw_1 == (semantic.IND_CONST as u32) or sw_1 == (semantic.IND_UNIDADE as u32) {
+        return u.alvo != none
+    } else {
+        return false
+    }
+    return false
+}
+
+// C: driver/editar_imports.c:44
+proc editar_uso_qualificado(q: ^Consulta, u: ^semantic.IndUso, token_nome: ^u32) -> bool {
+    var tern_1: u32 = TOKEN_AUSENTE as u32
+    if common.c2f_b2i32(editar_uso_eh_de_decl(u)) != 0 {
+        tern_1 = editar_token_do_nome(q, u)
+    }
+    let i: u32 = tern_1
+    let x: u8 = editar_modulo_do_offset(q, u.pos_nome)
+    if (i == (TOKEN_AUSENTE as u32)) or (i < 2) {
+        return false
+    }
+    if ((editar_token(q, i - 1).tipo != (frontend.TK_DOT as u8)) or (editar_token(q, i - 2).tipo != (frontend.TK_IDENT as u8))) or (((u.alvo as ^frontend.Decl).modulo as i32) == (x as i32)) {
+        return false
+    }
+    let arg_1: i32 = editar_token(q, i - 2).sym
+    let arg_2: u32 = editar_arquivo_do_offset(q, u.pos_nome)
+    let arg_3: ^frontend.Modulos = &(q.c as ^Compilacao).modulos
+    if (frontend.modulos_apelido(arg_3, arg_2, arg_1) as i32) != ((u.alvo as ^frontend.Decl).modulo as i32) {
+        return false
+    }
+    token_nome^ = i
+    return true
+}
+
+// C: driver/editar_imports.c:56
+proc celula(imp: ?^Imports, x: u32, k: u8) -> u64 {
+    return ((x as u64) * ((imp as ^Imports).n as u64)) + (k as u64)
+}
+
+// C: driver/editar_imports.c:61
+// Conta as referencias qualificadas "apelido.nome" de cada [arquivo x modulo] (base). Liberar com imports_liberar.
+proc imports_iniciar(p: ^Plano) -> ?^Imports {
+    let q: ^Consulta = p.q as ^Consulta
+    let comp: ^Compilacao = q.c as ^Compilacao
+    let imp: ^Imports = new(Imports, alloc = heap)
+    imp.p = p
+    imp.n = comp.modulos.n
+    imp.narquivos = 1
+    if comp.fonte.ntrechos > 0 {
+        imp.narquivos = comp.fonte.ntrechos
+    }
+    imp.base = make([dynamic]i32, alloc = heap)
+    imp.delta = make([dynamic]i32, alloc = heap)
+    let total: u64 = (imp.narquivos as u64) * (imp.n as u64)
+    var c: u64 = 0
+    while c < total {
+        append(&imp.base, item = 0)
+        append(&imp.delta, item = 0)
+        c += 1
+    }
+    var i: u64 = 0
+    while i < (len(q.indice.usos) as u64) {
+        let u: ^semantic.IndUso = &q.indice.usos[i]
+        var token: u32 = 0
+        if editar_uso_qualificado(q, u, &token) {
+            let cel: u64 = celula(imp, editar_arquivo_do_offset(q, u.pos_nome), (u.alvo as ^frontend.Decl).modulo)
+            imp.base[cel] += 1
+        }
+        i += 1
+    }
+    return imp
+}
+
+// C: driver/editar_imports.c:82
+proc imports_liberar(imp: ?^Imports) {
+    if imp == none {
+        return
+    }
+    let i: ^Imports = imp as ^Imports
+    delete(i.base)
+    delete(i.delta)
+    delete(i)
+}
+
+// C: driver/editar_imports.c:90
+proc imports_contar(imp: ?^Imports, x: u32, k: u8, delta: i32) {
+    let i: ^Imports = imp as ^Imports
+    let c: u64 = celula(imp, x, k)
+    i.delta[c] += delta
+}
+
+// C: driver/editar_imports.c:95
+proc imports_descontar_decl(imp: ?^Imports, d: ?^frontend.Decl) {
+    let q: ?^Consulta = ((imp as ^Imports).p as ^Plano).q
+    let ini: u32 = consulta_inicio_decl(q as ^Consulta, d)
+    let fim: u32 = frontend.ast_fim_decl(&(q as ^Consulta).fim, d)
+    var i: u64 = 0
+    while i < (len((q as ^Consulta).indice.usos) as u64) {
+        let u: ^semantic.IndUso = &(q as ^Consulta).indice.usos[i]
+        var token: u32 = 0
+        if ((u.pos_nome >= ini) and (u.pos_nome < fim)) and (common.c2f_b2i32(editar_uso_qualificado(q as ^Consulta, u, &token)) != 0) {
+            let arg_1: u8 = (u.alvo as ^frontend.Decl).modulo
+            let arg_2: u32 = editar_arquivo_do_offset(q as ^Consulta, (d as ^frontend.Decl).pos)
+            let arg_3: ?^Imports = imp
+            imports_contar(arg_3, arg_2, arg_1, -1)
+        }
+        i += 1
+    }
+}
+
+// C: driver/editar_imports.c:110
+proc texto_do_nome(p: ^Plano, nome: i32) -> str {
+    return from_bytes(as_bytes(common.interner_texto(&((p.q as ^Consulta).c as ^Compilacao).nomes, nome))[0..<common.interner_tam(&((p.q as ^Consulta).c as ^Compilacao).nomes, nome) as u64], alloc = common.arena_mem(p.arena as ^common.Arena))
+}
+
+// C: driver/editar_imports.c:116
+proc apelido_ja_usado(imp: ?^Imports, x: u32, k: u8) -> ?str {
+    let mods: ^frontend.Modulos = &((((imp as ^Imports).p as ^Plano).q as ^Consulta).c as ^Compilacao).modulos
+    var i: u64 = 0
+    while i < (len(mods.apelidos) as u64) {
+        let a: ^frontend.ApelidoDeArquivo = &mods.apelidos[i]
+        if (a.arquivo == x) and ((a.modulo as i32) == (k as i32)) {
+            return texto_do_nome((imp as ^Imports).p as ^Plano, a.nome)
+        }
+        i += 1
+    }
+    for i_2 in (0 as u32)..<(imp as ^Imports).nnovos {
+        if ((imp as ^Imports).novos[i_2].x == x) and (((imp as ^Imports).novos[i_2].k as i32) == (k as i32)) {
+            return (imp as ^Imports).novos[i_2].apelido
+        }
+    }
+    return none
+}
+
+// C: driver/editar_imports.c:132
+proc apelido_ocupado(imp: ?^Imports, x: u32, nome: i32) -> bool {
+    let mods: ^frontend.Modulos = &((((imp as ^Imports).p as ^Plano).q as ^Consulta).c as ^Compilacao).modulos
+    let texto: str = texto_do_nome((imp as ^Imports).p as ^Plano, nome)
+    for i in (0 as u64)..<(len(mods.apelidos) as u64) {
+        let a: ^frontend.ApelidoDeArquivo = &mods.apelidos[i]
+        if (a.arquivo == x) and (a.nome == nome) {
+            return true
+        }
+    }
+    for i in (0 as u32)..<(imp as ^Imports).nnovos {
+        if ((imp as ^Imports).novos[i].x == x) and (((imp as ^Imports).novos[i].apelido or_else "") == texto) {
+            return true
+        }
+    }
+    return false
+}
+
+// C: driver/editar_imports.c:148
+// Agenda o import de k em x (apelido 'preferido' ou o padrao do modulo). none = erro em p.erro.
+proc agendar_import(imp: ?^Imports, x: u32, k: u8, preferido: i32) -> ?str {
+    let i: ^Imports = imp as ^Imports
+    let p: ^Plano = i.p as ^Plano
+    let mods: ^frontend.Modulos = &((p.q as ^Consulta).c as ^Compilacao).modulos
+    let alvo = mods.itens[(k as int)]
+    let mem = common.arena_mem(p.arena as ^common.Arena)
+    var nome: i32 = alvo.apelido
+    if preferido >= 0 {
+        nome = preferido
+    }
+    if k == 0 {
+        _ = plano_erro(p, "o arquivo raiz nao pode ser importado por outro modulo (E1002): a declaracao e o que ela usa teriam de ficar no mesmo modulo")
+        return none
+    }
+    if apelido_ocupado(imp, x, nome) {
+        let nome_em_msg: str = texto_do_nome(p, nome)
+        let arquivo_em_msg: str = texto_do_nome(p, mods.itens[(frontend.modulos_pacote_do_arquivo(mods, x) as int)].caminho)
+        _ = plano_erro(p, format(f"o apelido '{nome_em_msg}' ja designa outro modulo em \"{arquivo_em_msg}\": ajuste os imports a mao", alloc = mem))
+        return none
+    }
+    if i.nnovos == (NOVOS_MAX as u32) {
+        _ = plano_erro(p, "imports demais para acrescentar numa operacao so")
+        return none
+    }
+    let caminho_txt: str = texto_do_nome(p, alvo.caminho)
+    let nome_txt: str = texto_do_nome(p, nome)
+    var linha: str = format(f"import \"{caminho_txt}\"", alloc = mem)
+    if nome != alvo.apelido {
+        linha = format(f"import \"{caminho_txt}\" as {nome_txt}", alloc = mem)
+    }
+    i.novos[(i.nnovos as int)] = NovoImport{x = x, k = k, apelido = nome_txt, linha = linha}
+    i.nnovos += 1
+    return nome_txt
+}
+
+// C: driver/editar_imports.c:176
+proc imports_apelido(imp: ?^Imports, x: u32, k: u8, preferido: i32) -> ?str {
+    let existente: ?str = apelido_ja_usado(imp, x, k)
+    var tern_1: ?str = none
+    if existente != none {
+        tern_1 = existente
+    } else {
+        tern_1 = agendar_import(imp, x, k, preferido)
+    }
+    return tern_1
+}
+
+// C: driver/editar_imports.c:186
+// C2F-INDECIDIVEL: lista. Os D_IMPORT do arquivo x que perdem o ultimo uso, na ordem do arquivo; devolve quantos.
+proc imports_sem_uso(imp: ?^Imports, x: u32, lista: []?^frontend.Decl) -> u32 {
+    var n: u32 = 0
+    var d: ?^frontend.Decl = (((((imp as ^Imports).p as ^Plano).q as ^Consulta).c as ^Compilacao).sem.programa as ^frontend.Programa).primeira
+    while (d != none) and (n < (APAGAR_MAX as u32)) {
+        var c: u64 = 0
+        if ((d as ^frontend.Decl).tipo_no != (frontend.D_IMPORT as u8)) or (editar_arquivo_do_offset(((imp as ^Imports).p as ^Plano).q as ^Consulta, (d as ^frontend.Decl).pos) != x) {
+            d = (d as ^frontend.Decl).prox
+            continue
+        }
+        c = celula(imp, x, (d as ^frontend.Decl).indice as u8)
+        if ((imp as ^Imports).delta[c] < 0) and (((imp as ^Imports).base[c] + (imp as ^Imports).delta[c]) <= 0) {
+            let antes_1: u32 = n
+            n += 1
+            lista[antes_1] = d
+        }
+        d = (d as ^frontend.Decl).prox
+    }
+    return n
+}
+
+// C: driver/editar_imports.c:201
+proc ultimo_import(imp: ?^Imports, x: u32) -> ?^frontend.Decl {
+    var ultimo: ?^frontend.Decl = none
+    var d: ?^frontend.Decl = (((((imp as ^Imports).p as ^Plano).q as ^Consulta).c as ^Compilacao).sem.programa as ^frontend.Programa).primeira
+    while d != none {
+        if (((d as ^frontend.Decl).tipo_no == (frontend.D_IMPORT as u8)) and (editar_arquivo_do_offset(((imp as ^Imports).p as ^Plano).q as ^Consulta, (d as ^frontend.Decl).pos) == x)) and ((ultimo == none) or ((d as ^frontend.Decl).pos > (ultimo as ^frontend.Decl).pos)) {
+            ultimo = d
+        }
+        d = (d as ^frontend.Decl).prox
+    }
+    return ultimo
+}
+
+// C: driver/editar_imports.c:212
+// As linhas dos imports agendados para o arquivo x, separadas por LF.
+proc linhas_novas(imp: ?^Imports, x: u32, saida: ^[dynamic]u8) {
+    let i: ^Imports = imp as ^Imports
+    var k: u32 = 0
+    while k < i.nnovos {
+        if i.novos[k].x == x {
+            if len(saida^) > 0 {
+                append(saida, item = 10)
+            }
+            append(saida, items = as_bytes(i.novos[k].linha or_else ""))
+        }
+        k += 1
+    }
+}
+
+// Os bytes de um buffer viram texto na arena do plano.
+proc texto_dos_bytes(p: ^Plano, b: ^[dynamic]u8) -> str {
+    return from_bytes(b^[..], alloc = common.arena_mem(p.arena as ^common.Arena))
+}
+
+// C: driver/editar_imports.c:222
+// A 1a linha apagada passa a ter os imports novos; as outras saem inteiras. apagar = as n primeiras (C2F-13: n vem do tamanho da fatia).
+proc trocar_apagados(imp: ?^Imports, apagar: []?^frontend.Decl, novos: ^[dynamic]u8) -> bool {
+    let p: ^Plano = (imp as ^Imports).p as ^Plano
+    let q: ^Consulta = p.q as ^Consulta
+    var j: u64 = 0
+    while j < (len(apagar) as u64) {
+        let d: ^frontend.Decl = apagar[j] as ^frontend.Decl
+        let ini: u32 = editar_inicio_da_linha(q, d.pos)
+        let trocar: bool = (j == 0) and (len(novos^) > 0)
+        var fim: u32 = editar_proxima_linha(q, d.pos)
+        var texto_novo: str = ""
+        if trocar {
+            fim = editar_fim_da_linha(q, d.pos)
+            texto_novo = texto_dos_bytes(p, novos)
+        }
+        if not editar_trocar_no_arquivo(p, ini, fim, texto_novo) {
+            return false
+        }
+        j += 1
+    }
+    return true
+}
+
+// C: driver/editar_imports.c:237
+// Sem import para apagar: os novos entram depois do ultimo import, ou no topo do arquivo se ele nao tem nenhum.
+proc inserir_novos(imp: ?^Imports, x: u32, novos: ^[dynamic]u8) -> bool {
+    let p: ^Plano = (imp as ^Imports).p as ^Plano
+    let q: ^Consulta = p.q as ^Consulta
+    let mem = common.arena_mem(p.arena as ^common.Arena)
+    let ultimo: ?^frontend.Decl = ultimo_import(imp, x)
+    let novos_txt: str = texto_dos_bytes(p, novos)
+    var onde: u32 = 0
+    var seguinte: u32 = 0
+    var branco: bool = false
+    var cabecalho: bool = false
+    var texto: str = ""
+    if ultimo != none {
+        let pos_ultimo: u32 = (ultimo as ^frontend.Decl).pos
+        if editar_linha_seguinte(q, pos_ultimo, &seguinte, &branco) {
+            onde = seguinte
+            texto = format(f"{novos_txt}\n", alloc = mem)
+        } else {
+            onde = editar_fim_da_linha(q, pos_ultimo)
+            texto = format(f"\n{novos_txt}", alloc = mem)
+        }
+    } else if editar_ponto_sem_imports(q, x, &onde, &cabecalho) {
+        if cabecalho {
+            texto = format(f"\n\n{novos_txt}", alloc = mem)
+        } else {
+            texto = format(f"{novos_txt}\n\n", alloc = mem)
+        }
+    } else {
+        onde = editar_fim_do_conteudo(q, x)
+        texto = format(f"\n\n{novos_txt}", alloc = mem)
+    }
+    return editar_trocar_no_arquivo(p, onde, onde, texto)
+}
+
+// C: driver/editar_imports.c:262
+proc aplicar_no_arquivo(imp: ?^Imports, x: u32) -> bool {
+    let i: ^Imports = imp as ^Imports
+    let p: ^Plano = i.p as ^Plano
+    let mods: ^frontend.Modulos = &((p.q as ^Consulta).c as ^Compilacao).modulos
+    var apagar: [64]?^frontend.Decl = {} // APAGAR_MAX
+    let n: u32 = imports_sem_uso(imp, x, apagar[..])
+    let modulo: u8 = frontend.modulos_pacote_do_arquivo(mods, x)
+    var novos: [dynamic]u8 = make([dynamic]u8, alloc = heap)
+    defer delete(novos)
+    linhas_novas(imp, x, &novos)
+    if n > 0 {
+        return editar_modulo_editavel(p, modulo) and trocar_apagados(imp, apagar[0..<(n as int)], &novos)
+    }
+    if len(novos) > 0 {
+        return editar_modulo_editavel(p, modulo) and inserir_novos(imp, x, &novos)
+    }
+    return true
+}
+
+// C: driver/editar_imports.c:277
+proc imports_aplicar(imp: ?^Imports) -> bool {
+    var x: u32 = 0
+    while x < (imp as ^Imports).narquivos {
+        if not aplicar_no_arquivo(imp, x) {
+            return false
+        }
+        x += 1
+    }
+    return true
+}
+
+test "linhas_novas junta so as linhas do arquivo pedido" {
+    let imp: ^Imports = new(Imports, alloc = heap)
+    imp.nnovos = 3
+    imp.novos[0] = NovoImport{x = 0, k = 1, apelido = "a", linha = "import \"a\""}
+    imp.novos[1] = NovoImport{x = 1, k = 2, apelido = "b", linha = "import \"b\""}
+    imp.novos[2] = NovoImport{x = 0, k = 2, apelido = "c", linha = "import \"c\""}
+    var saida: [dynamic]u8 = make([dynamic]u8, alloc = heap)
+    defer delete(saida)
+    linhas_novas(imp, 0, &saida)
+    expect(len(saida) == 21)
+    delete(imp)
+}

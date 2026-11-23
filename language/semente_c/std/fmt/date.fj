@@ -1,0 +1,710 @@
+// std:fmt, pedaco date (parte do modulo std:fmt: veja fmt.fj)
+// Versao: 0.2.0. Changelog: 0.2.0 - B01e2: format_pattern, format_date, format_time, format_datetime e format_duration ganham `alloc: Allocator` (ultimo parametro, sem padrao). 0.1.0 - IA1-S2h: DateStyle, DateError, format_date, format_time, format_datetime, format_pattern, parse_date, parse_time, parse_pattern e format_duration, com as variantes write_*.
+// Data e hora por regiao sobre tm.DateTime de std:time (UTC, sem fuso). Posse: format_* devolvem texto DONO do alocador que o chamador passou: delete(texto) so se o alloc foi heap; write_* acrescentam ao builder do chamador (buf = &b), na ordem valor, buf, regiao; as formas donas chamam as write_*. Espaco da saida = U+0020. Dia da semana: 0 = domingo (o de std:time).
+// Estilos: short, long e full escolhem date_short, date_long e date_full da regiao; a hora e time_short (seconds = false) ou time_medium (seconds = true); format_datetime = data + U+0020 + hora. Os padroes da regiao sao valores validos: format_date, format_time e format_datetime so falham se dt tem campo fora das faixas do calendario (mes 13, 30 de fevereiro, hora 24: erro de quem chama = panic R0003). A fracao de segundo (nanosecond) nunca aparece.
+// Padrao livre (format_pattern, parse_pattern): subconjunto LDML do CLDR: d dd | M MM MMM MMMM | yy yyyy | E EEEE | H HH | h hh | m mm | s ss | a | 'texto' ('' = uma aspa, dentro ou fora de aspas) | qualquer caractere nao-letra passa literal. d/M/H/h/m/s aceitam 1 ou 2 repeticoes; M ate 4; yy e yyyy; E (nome curto) e EEEE (nome longo); a so 1. Letra ASCII fora dessa lista, repeticao fora dela (ddd, yyy, EEE, aa) ou aspa nao fechada = DateError.invalid_pattern; padrao vazio tambem.
+// Saida: yyyy = ao menos 4 algarismos com zero a esquerda ("0099"); ano maior que 9999 sai inteiro ("12345"); ano negativo leva "-" e ao menos 4 algarismos ("-0044"). yy = ano de 2 algarismos, 0 a 99, mesmo para ano negativo (floor mod 100). h/hh: 0 e 12 saem "12". a: am_text antes das 12 h, pm_text depois. MMM/E: nomes curtos da regiao; MMMM/EEEE: longos (UTF-8, com acento). write_pattern e format_pattern validam padrao e data ANTES de escrever: padrao ruim = invalid_pattern, data impossivel = out_of_range, e o builder fica intacto.
+// Leitura: parse_pattern(s, pattern, loc) = os mesmos tokens. d/M/H/h/m/s aceitam 1 ou 2 algarismos; dd/MM/HH/hh/mm/ss exatamente 2; yyyy exatamente 4 ("0000" a "9999", sem sinal); yy exatamente 2 e vira 2000 + yy; MMM/MMMM/E/EEEE casam o nome da regiao EXATO (caixa exata; o mais longo vence); a casa am_text ou pm_text da regiao. Campo ausente = 1970-01-01 00:00:00. h/hh pedem `a` (senao mismatch); `a` com H tem de bater (H >= 12 = pm). E/EEEE e conferido com o dia real. Erros: empty (texto vazio), invalid_pattern (padrao ruim), mismatch (texto fora do padrao, sobra de texto, nome desconhecido, dia da semana errado), out_of_range (campo fora da faixa: dia 32, mes 13, hora 24, h = 13; ou dia que nao existe no mes: 30/02).
+// Posicao: `at: ?^int = none` (ultimo parametro, nomeado) recebe, SO quando ha erro, o offset em bytes de s do 1o byte ruim (inicio do campo em out_of_range, em dia da semana errado e em h sem `a`; 0 em empty e invalid_pattern).
+// Duracao (format_duration, write_duration): so o estilo curto da regiao. Componentes h, min, s e ms em ordem decrescente, sem os zerados, cada um numero + U+0020 + sufixo ("1 h 5 min 3 s 250 ms"); trunca para ms (para o zero); menos de 1 s mostra so os ms; zero (ou menos de 1 ms) = "0 s"; negativa = "-" + texto do valor absoluto (o menor int funciona); sem dias (h passa de 24).
+
+pub enum DateStyle { short, long, full }
+
+// empty: texto vazio; invalid_pattern: padrao fora do subconjunto; mismatch: o texto nao casa com o padrao; out_of_range: campo fora da faixa ou dia que nao existe no mes.
+pub enum DateError { empty, invalid_pattern, mismatch, out_of_range }
+
+const PATTERN_QUOTE: u8 = 39
+const PATTERN_DAY: u8 = 100
+const PATTERN_MONTH: u8 = 77
+const PATTERN_YEAR: u8 = 121
+const PATTERN_WEEKDAY: u8 = 69
+const PATTERN_HOUR24: u8 = 72
+const PATTERN_HOUR12: u8 = 104
+const PATTERN_MINUTE: u8 = 109
+const PATTERN_SECOND: u8 = 115
+const PATTERN_AMPM: u8 = 97
+const PATTERN_UPPER_A: u8 = 65
+const PATTERN_UPPER_Z: u8 = 90
+const PATTERN_LOWER_A: u8 = 97
+const PATTERN_LOWER_Z: u8 = 122
+const TOKEN_END: int = 0
+const TOKEN_LITERAL: int = 1
+const TOKEN_FIELD: int = 2
+const TOKEN_BAD: int = 3
+const DATE_MONTHS: int = 12
+const DATE_NOON: int = 12
+const DATE_LAST_DAY: int = 31
+const DATE_LAST_HOUR: int = 23
+const DATE_LAST_MINUTE_OR_SECOND: int = 59
+const DATE_CENTURY: int = 100
+const DATE_TWO_THOUSAND: int = 2000
+const DATE_SCAN_OK: int = 0
+const DATE_SCAN_MISMATCH: int = 1
+const DATE_SCAN_RANGE: int = 2
+const DURATION_NS_PER_MS: u64 = 1000000
+const DURATION_MS_PER_SECOND: u64 = 1000
+const DURATION_UNITS_PER_STEP: u64 = 60
+
+// Posicao em pattern e se esta dentro de aspas (o estado que o leitor de tokens carrega de um token ao outro).
+struct PatternCursor {
+    pos: int = 0
+    in_quote: bool = false
+}
+
+// Um pedaco do padrao: literal (text), campo (letter repetida count vezes), fim ou erro.
+struct PatternToken {
+    kind: int = 0
+    letter: u8 = 0
+    count: int = 0
+    text: str = ""
+}
+
+proc pattern_is_letter(b: u8) -> bool {
+    return (b >= PATTERN_UPPER_A and b <= PATTERN_UPPER_Z) or (b >= PATTERN_LOWER_A and b <= PATTERN_LOWER_Z)
+}
+
+// Quantas vezes a letra de pos se repete em seguida (pelo menos 1).
+proc pattern_run(pattern: str, pos: int) -> int {
+    let letter = pattern[pos]
+    var n = 0
+    while pos + n < len(pattern) and pattern[pos + n] == letter {
+        n += 1
+    }
+    return n
+}
+
+// A letra repetida count vezes esta no subconjunto? Letra fora da lista = false.
+proc pattern_count_ok(letter: u8, count: int) -> bool {
+    if letter == PATTERN_DAY or letter == PATTERN_HOUR24 or letter == PATTERN_HOUR12 or letter == PATTERN_MINUTE or letter == PATTERN_SECOND {
+        return count <= 2
+    }
+    if letter == PATTERN_MONTH {
+        return count <= 4
+    }
+    if letter == PATTERN_YEAR {
+        return count == 2 or count == 4
+    }
+    if letter == PATTERN_WEEKDAY {
+        return count == 1 or count == 4
+    }
+    return letter == PATTERN_AMPM and count == 1
+}
+
+// Texto entre aspas a partir de cur.pos: ate a proxima aspa; '' dentro e uma aspa literal e o texto continua. Sem aspa de fechamento = BAD.
+proc pattern_quoted(pattern: str, cur: ^PatternCursor) -> PatternToken {
+    let start = cur.pos
+    var stop = start
+    while stop < len(pattern) and pattern[stop] != PATTERN_QUOTE {
+        stop += 1
+    }
+    if stop >= len(pattern) {
+        return PatternToken{kind = TOKEN_BAD}
+    }
+    if stop + 1 < len(pattern) and pattern[stop + 1] == PATTERN_QUOTE {
+        cur.pos = stop + 2
+        return PatternToken{kind = TOKEN_LITERAL, text = pattern[start..<(stop + 1)]}
+    }
+    cur.pos = stop + 1
+    cur.in_quote = false
+    return PatternToken{kind = TOKEN_LITERAL, text = pattern[start..<stop]}
+}
+
+// Aspa fora de aspas: '' e uma aspa literal; sozinha abre o trecho entre aspas.
+proc pattern_open_quote(pattern: str, cur: ^PatternCursor) -> PatternToken {
+    if cur.pos + 1 < len(pattern) and pattern[cur.pos + 1] == PATTERN_QUOTE {
+        let token = PatternToken{kind = TOKEN_LITERAL, text = pattern[cur.pos..<(cur.pos + 1)]}
+        cur.pos += 2
+        return token
+    }
+    cur.pos += 1
+    cur.in_quote = true
+    return pattern_quoted(pattern, cur)
+}
+
+// O proximo token de pattern; avanca cur. Byte nao-letra passa como literal de 1 byte (UTF-8 multibyte sai byte a byte, inteiro).
+proc pattern_next(pattern: str, cur: ^PatternCursor) -> PatternToken {
+    if cur.in_quote {
+        return pattern_quoted(pattern, cur)
+    }
+    if cur.pos >= len(pattern) {
+        return PatternToken{kind = TOKEN_END}
+    }
+    let b = pattern[cur.pos]
+    if b == PATTERN_QUOTE {
+        return pattern_open_quote(pattern, cur)
+    }
+    if not pattern_is_letter(b) {
+        let token = PatternToken{kind = TOKEN_LITERAL, text = pattern[cur.pos..<(cur.pos + 1)]}
+        cur.pos += 1
+        return token
+    }
+    let count = pattern_run(pattern, cur.pos)
+    cur.pos += count
+    if not pattern_count_ok(b, count) {
+        return PatternToken{kind = TOKEN_BAD}
+    }
+    return PatternToken{kind = TOKEN_FIELD, letter = b, count = count}
+}
+
+// O padrao inteiro e do subconjunto (e nao e vazio)?
+proc pattern_valid(pattern: str) -> bool {
+    if len(pattern) == 0 {
+        return false
+    }
+    var cur = PatternCursor{}
+    var kind = TOKEN_LITERAL
+    while kind == TOKEN_LITERAL or kind == TOKEN_FIELD {
+        kind = pattern_next(pattern, &cur).kind
+    }
+    return kind == TOKEN_END
+}
+
+// Todos os campos de dt estao nas faixas e o dia existe no mes (a fracao de segundo nao conta)?
+proc date_valid(dt: tm.DateTime) -> bool {
+    if dt.month < 1 or dt.month > DATE_MONTHS {
+        return false
+    }
+    if dt.day < 1 or dt.day > tm.days_in_month(dt.year, month = dt.month) {
+        return false
+    }
+    if dt.hour < 0 or dt.hour > DATE_LAST_HOUR {
+        return false
+    }
+    if dt.minute < 0 or dt.minute > DATE_LAST_MINUTE_OR_SECOND {
+        return false
+    }
+    return dt.second >= 0 and dt.second <= DATE_LAST_MINUTE_OR_SECOND
+}
+
+// v com no minimo width algarismos (zero a esquerda; width 1, 2 ou 4); negativo leva "-" na frente do modulo.
+proc date_write_int(v: int, width: int, buf: ^[dynamic]u8) {
+    if v < 0 {
+        append(buf, item = "-")
+    }
+    let m = magnitude(v)
+    if width == 4 {
+        format(f"{m:04}", into = buf)
+        return
+    }
+    if width == 2 {
+        format(f"{m:02}", into = buf)
+        return
+    }
+    format(f"{m}", into = buf)
+}
+
+// Hora de 12 h: 0 e 12 saem 12.
+proc date_hour12(hour: int) -> int {
+    let h = hour % DATE_NOON
+    if h == 0 {
+        return DATE_NOON
+    }
+    return h
+}
+
+// O valor numerico do campo `letter` de dt (d, M, y, H, h, m, s).
+proc date_number(dt: tm.DateTime, letter: u8) -> int {
+    if letter == PATTERN_DAY {
+        return dt.day
+    }
+    if letter == PATTERN_MONTH {
+        return dt.month
+    }
+    if letter == PATTERN_YEAR {
+        return dt.year
+    }
+    if letter == PATTERN_HOUR24 {
+        return dt.hour
+    }
+    if letter == PATTERN_HOUR12 {
+        return date_hour12(dt.hour)
+    }
+    if letter == PATTERN_MINUTE {
+        return dt.minute
+    }
+    return dt.second
+}
+
+// Nome do mes (MMM curto, MMMM longo) ou do dia da semana (E curto, EEEE longo) e am/pm.
+proc date_write_name(dt: tm.DateTime, tok: PatternToken, buf: ^[dynamic]u8, loc: Locale) {
+    if tok.letter == PATTERN_MONTH and tok.count == 3 {
+        append(buf, item = loc.months_short[dt.month - 1])
+    } else if tok.letter == PATTERN_MONTH {
+        append(buf, item = loc.months_long[dt.month - 1])
+    } else if tok.letter == PATTERN_WEEKDAY and tok.count == 1 {
+        append(buf, item = loc.weekdays_short[tm.weekday(dt)])
+    } else if tok.letter == PATTERN_WEEKDAY {
+        append(buf, item = loc.weekdays_long[tm.weekday(dt)])
+    } else if dt.hour < DATE_NOON {
+        append(buf, item = loc.am_text)
+    } else {
+        append(buf, item = loc.pm_text)
+    }
+}
+
+// O campo do token (letra repetida count vezes) de dt, na regiao loc.
+proc date_write_field(dt: tm.DateTime, tok: PatternToken, buf: ^[dynamic]u8, loc: Locale) {
+    let named = (tok.letter == PATTERN_MONTH and tok.count >= 3) or tok.letter == PATTERN_WEEKDAY or tok.letter == PATTERN_AMPM
+    if named {
+        date_write_name(dt, tok, buf, loc)
+        return
+    }
+    if tok.letter == PATTERN_YEAR and tok.count == 2 {
+        date_write_int(((dt.year % DATE_CENTURY) + DATE_CENTURY) % DATE_CENTURY, width = 2, buf = buf)
+        return
+    }
+    date_write_int(date_number(dt, tok.letter), width = tok.count, buf = buf)
+}
+
+// Escreve dt segundo pattern (ja validado, com dt valido). Literal passa; campo e formatado.
+proc pattern_render(dt: tm.DateTime, pattern: str, buf: ^[dynamic]u8, loc: Locale) {
+    var cur = PatternCursor{}
+    var tok = pattern_next(pattern, &cur)
+    while tok.kind == TOKEN_LITERAL or tok.kind == TOKEN_FIELD {
+        if tok.kind == TOKEN_LITERAL {
+            append(buf, item = tok.text)
+        } else {
+            date_write_field(dt, tok, buf, loc)
+        }
+        tok = pattern_next(pattern, &cur)
+    }
+}
+
+// O padrao da regiao para o estilo.
+proc date_style_pattern(loc: Locale, style: DateStyle) -> str {
+    if style == DateStyle.long {
+        return loc.date_long
+    }
+    if style == DateStyle.full {
+        return loc.date_full
+    }
+    return loc.date_short
+}
+
+// O padrao de hora da regiao: com segundos ou sem.
+proc date_time_pattern(loc: Locale, seconds: bool) -> str {
+    if seconds {
+        return loc.time_medium
+    }
+    return loc.time_short
+}
+
+// Escreve dt num padrao da regiao; dt com campo fora da faixa e erro de quem chama (panic R0003).
+proc date_write_locale(dt: tm.DateTime, pattern: str, buf: ^[dynamic]u8, loc: Locale) {
+    if not date_valid(dt) {
+        panic("fmt: data ou hora fora das faixas do calendario")
+    }
+    pattern_render(dt, pattern, buf, loc)
+}
+
+// dt segundo o padrao livre pattern, na regiao loc. invalid_pattern: padrao fora do subconjunto (ou vazio); out_of_range: dt com campo fora da faixa. Em erro o builder fica intacto.
+pub proc write_pattern(dt: tm.DateTime, pattern: str, buf: ^[dynamic]u8, loc: Locale) -> ! DateError {
+    if not pattern_valid(pattern) {
+        return DateError.invalid_pattern
+    }
+    if not date_valid(dt) {
+        return DateError.out_of_range
+    }
+    pattern_render(dt, pattern, buf, loc)
+}
+
+// dt segundo o padrao livre: texto dono. format_pattern(dt, "dd/MM/yyyy", loc = PT_BR) = "29/02/2000".
+pub proc format_pattern(dt: tm.DateTime, pattern: str, loc: Locale, alloc: Allocator) -> str ! DateError {
+    var buf = make([dynamic]u8, alloc = alloc, cap = 48)
+    defer delete(buf)
+    try write_pattern(dt, pattern, buf = &buf, loc = loc)
+    return to_str(&buf)
+}
+
+// A data de dt no estilo da regiao ("29/02/2000"; long "29 de fevereiro de 2000"; full "terça-feira, 29 de fevereiro de 2000").
+pub proc write_date(dt: tm.DateTime, buf: ^[dynamic]u8, loc: Locale, style: DateStyle = DateStyle.short) {
+    date_write_locale(dt, date_style_pattern(loc, style = style), buf, loc)
+}
+
+// A data de dt no estilo da regiao: texto dono.
+pub proc format_date(dt: tm.DateTime, loc: Locale, style: DateStyle = DateStyle.short, alloc: Allocator) -> str {
+    var buf = make([dynamic]u8, alloc = alloc, cap = 48)
+    defer delete(buf)
+    write_date(dt, buf = &buf, loc = loc, style = style)
+    return to_str(&buf)
+}
+
+// A hora de dt no estilo da regiao: sem segundos (time_short) ou com (seconds = true, time_medium).
+pub proc write_time(dt: tm.DateTime, buf: ^[dynamic]u8, loc: Locale, seconds: bool = false) {
+    date_write_locale(dt, date_time_pattern(loc, seconds = seconds), buf, loc)
+}
+
+// A hora de dt no estilo da regiao: texto dono.
+pub proc format_time(dt: tm.DateTime, loc: Locale, seconds: bool = false, alloc: Allocator) -> str {
+    var buf = make([dynamic]u8, alloc = alloc, cap = 32)
+    defer delete(buf)
+    write_time(dt, buf = &buf, loc = loc, seconds = seconds)
+    return to_str(&buf)
+}
+
+// Data, um U+0020 e hora de dt.
+pub proc write_datetime(dt: tm.DateTime, buf: ^[dynamic]u8, loc: Locale, style: DateStyle = DateStyle.short, seconds: bool = false) {
+    write_date(dt, buf = buf, loc = loc, style = style)
+    append(buf, item = " ")
+    write_time(dt, buf = buf, loc = loc, seconds = seconds)
+}
+
+// Data, um U+0020 e hora de dt: texto dono. format_datetime(dt, loc = PT_BR) = "29/02/2000 13:05".
+pub proc format_datetime(dt: tm.DateTime, loc: Locale, style: DateStyle = DateStyle.short, seconds: bool = false, alloc: Allocator) -> str {
+    var buf = make([dynamic]u8, alloc = alloc, cap = 64)
+    defer delete(buf)
+    write_datetime(dt, buf = &buf, loc = loc, style = style, seconds = seconds)
+    return to_str(&buf)
+}
+
+// Estado de uma leitura: o que ja foi lido (com os padroes de campo ausente) e onde estao os campos que o fim confere.
+struct DateScan {
+    pos: int = 0
+    year: int = 1970
+    month: int = 1
+    day: int = 1
+    hour: int = 0
+    minute: int = 0
+    second: int = 0
+    hour12: int = -1
+    pm: int = -1
+    weekday: int = -1
+    hour_set: bool = false
+    day_at: int = 0
+    hour_at: int = 0
+    weekday_at: int = 0
+    at: int = 0
+}
+
+// De lo a hi algarismos de s a partir de pos: o valor e quantos leu (0 = menos que lo).
+proc date_read_digits(s: str, pos: int, lo: int, hi: int) -> (value: int, size: int) {
+    var acc = 0
+    var taken = 0
+    while taken < hi and pos + taken < len(s) and is_digit(s[pos + taken]) {
+        acc = acc * DECIMAL_BASE + (s[pos + taken] - DIGIT_ZERO) as int
+        taken += 1
+    }
+    if taken < lo {
+        return 0, 0
+    }
+    return acc, taken
+}
+
+// O valor v cabe na faixa do campo? (dia 1..31, mes 1..12, h 1..12, H 0..23, m e s 0..59; ano nao tem faixa)
+proc date_in_range(letter: u8, v: int) -> bool {
+    if letter == PATTERN_DAY {
+        return v >= 1 and v <= DATE_LAST_DAY
+    }
+    if letter == PATTERN_MONTH {
+        return v >= 1 and v <= DATE_MONTHS
+    }
+    if letter == PATTERN_HOUR12 {
+        return v >= 1 and v <= DATE_NOON
+    }
+    if letter == PATTERN_HOUR24 {
+        return v <= DATE_LAST_HOUR
+    }
+    if letter == PATTERN_MINUTE or letter == PATTERN_SECOND {
+        return v <= DATE_LAST_MINUTE_OR_SECOND
+    }
+    return true
+}
+
+// Guarda o valor lido no campo do token (pos ainda e o inicio do campo).
+proc date_store(sc: ^DateScan, tok: PatternToken, v: int) {
+    if tok.letter == PATTERN_DAY {
+        sc.day = v
+        sc.day_at = sc.pos
+    } else if tok.letter == PATTERN_MONTH {
+        sc.month = v
+    } else if tok.letter == PATTERN_YEAR and tok.count == 2 {
+        sc.year = DATE_TWO_THOUSAND + v
+    } else if tok.letter == PATTERN_YEAR {
+        sc.year = v
+    } else if tok.letter == PATTERN_HOUR24 {
+        sc.hour = v
+        sc.hour_set = true
+        sc.hour_at = sc.pos
+    } else if tok.letter == PATTERN_HOUR12 {
+        sc.hour12 = v
+        sc.hour_at = sc.pos
+    } else if tok.letter == PATTERN_MINUTE {
+        sc.minute = v
+    } else {
+        sc.second = v
+    }
+}
+
+// Campo numerico: exatamente count algarismos (count 2 e yyyy) ou 1 a 2 (count 1).
+proc date_scan_number(s: str, tok: PatternToken, sc: ^DateScan) -> int {
+    var hi = tok.count
+    if tok.count == 1 {
+        hi = 2
+    }
+    let value, size = date_read_digits(s, sc.pos, tok.count, hi)
+    if size == 0 {
+        sc.at = sc.pos
+        return DATE_SCAN_MISMATCH
+    }
+    if not date_in_range(tok.letter, value) {
+        sc.at = sc.pos
+        return DATE_SCAN_RANGE
+    }
+    date_store(sc, tok, value)
+    sc.pos += size
+    return DATE_SCAN_OK
+}
+
+// O nome mais longo de names que comeca em pos de s: o indice e o tamanho (0 = nenhum).
+proc date_longest_name(s: str, pos: int, names: []str) -> (index: int, size: int) {
+    var best = 0
+    var best_index = 0
+    for i in 0..<len(names) {
+        let n = match_text(s, pos, len(s), names[i])
+        if n > best {
+            best = n
+            best_index = i
+        }
+    }
+    return best_index, best
+}
+
+// MMM ou MMMM: nome do mes da regiao.
+proc date_scan_month_name(s: str, tok: PatternToken, sc: ^DateScan, loc: Locale) -> int {
+    var names = loc.months_long
+    if tok.count == 3 {
+        names = loc.months_short
+    }
+    let index, size = date_longest_name(s, sc.pos, names[..])
+    if size == 0 {
+        sc.at = sc.pos
+        return DATE_SCAN_MISMATCH
+    }
+    sc.month = index + 1
+    sc.pos += size
+    return DATE_SCAN_OK
+}
+
+// E ou EEEE: nome do dia da semana da regiao (conferido com a data no fim).
+proc date_scan_weekday(s: str, tok: PatternToken, sc: ^DateScan, loc: Locale) -> int {
+    var names = loc.weekdays_long
+    if tok.count == 1 {
+        names = loc.weekdays_short
+    }
+    let index, size = date_longest_name(s, sc.pos, names[..])
+    if size == 0 {
+        sc.at = sc.pos
+        return DATE_SCAN_MISMATCH
+    }
+    sc.weekday = index
+    sc.weekday_at = sc.pos
+    sc.pos += size
+    return DATE_SCAN_OK
+}
+
+// a: am_text ou pm_text da regiao.
+proc date_scan_ampm(s: str, sc: ^DateScan, loc: Locale) -> int {
+    let am = match_text(s, sc.pos, len(s), loc.am_text)
+    if am > 0 {
+        sc.pm = 0
+        sc.pos += am
+        return DATE_SCAN_OK
+    }
+    let pm = match_text(s, sc.pos, len(s), loc.pm_text)
+    if pm > 0 {
+        sc.pm = 1
+        sc.pos += pm
+        return DATE_SCAN_OK
+    }
+    sc.at = sc.pos
+    return DATE_SCAN_MISMATCH
+}
+
+// Um token do padrao contra o texto em sc.pos: literal exato ou campo.
+proc date_scan_token(s: str, tok: PatternToken, sc: ^DateScan, loc: Locale) -> int {
+    if tok.kind == TOKEN_LITERAL {
+        if len(tok.text) == 0 {
+            return DATE_SCAN_OK
+        }
+        if match_text(s, sc.pos, len(s), tok.text) == 0 {
+            sc.at = sc.pos
+            return DATE_SCAN_MISMATCH
+        }
+        sc.pos += len(tok.text)
+        return DATE_SCAN_OK
+    }
+    if tok.letter == PATTERN_MONTH and tok.count >= 3 {
+        return date_scan_month_name(s, tok, sc, loc)
+    }
+    if tok.letter == PATTERN_WEEKDAY {
+        return date_scan_weekday(s, tok, sc, loc)
+    }
+    if tok.letter == PATTERN_AMPM {
+        return date_scan_ampm(s, sc, loc)
+    }
+    return date_scan_number(s, tok, sc)
+}
+
+// Junta h (12 h) com a: sem a e mismatch; com H tambem escrito, os dois tem de bater. `a` com H sem h: H >= 12 = pm.
+proc date_settle_hour(sc: ^DateScan) -> int {
+    if sc.hour12 >= 0 {
+        let converted = sc.hour12 % DATE_NOON + DATE_NOON * sc.pm
+        if sc.pm < 0 or (sc.hour_set and sc.hour != converted) {
+            sc.at = sc.hour_at
+            return DATE_SCAN_MISMATCH
+        }
+        sc.hour = converted
+        return DATE_SCAN_OK
+    }
+    if sc.pm >= 0 and sc.hour_set and (sc.hour >= DATE_NOON) != (sc.pm == 1) {
+        sc.at = sc.hour_at
+        return DATE_SCAN_MISMATCH
+    }
+    return DATE_SCAN_OK
+}
+
+// O DateTime lido (a fracao de segundo e 0).
+proc date_value(sc: ^DateScan) -> tm.DateTime {
+    return tm.DateTime{year = sc.year, month = sc.month, day = sc.day, hour = sc.hour, minute = sc.minute, second = sc.second}
+}
+
+// Confere o que so se sabe no fim: o dia existe no mes, hora e `a` combinam, o dia da semana bate com a data.
+proc date_settle(sc: ^DateScan) -> int {
+    if sc.day > tm.days_in_month(sc.year, month = sc.month) {
+        sc.at = sc.day_at
+        return DATE_SCAN_RANGE
+    }
+    let code = date_settle_hour(sc)
+    if code != DATE_SCAN_OK {
+        return code
+    }
+    if sc.weekday >= 0 and tm.weekday(date_value(sc)) != sc.weekday {
+        sc.at = sc.weekday_at
+        return DATE_SCAN_MISMATCH
+    }
+    return DATE_SCAN_OK
+}
+
+// Casa s inteiro com pattern (ja validado); devolve DATE_SCAN_*.
+proc date_scan_all(s: str, pattern: str, loc: Locale, sc: ^DateScan) -> int {
+    var cur = PatternCursor{}
+    var tok = pattern_next(pattern, &cur)
+    while tok.kind == TOKEN_LITERAL or tok.kind == TOKEN_FIELD {
+        let code = date_scan_token(s, tok, sc, loc)
+        if code != DATE_SCAN_OK {
+            return code
+        }
+        tok = pattern_next(pattern, &cur)
+    }
+    if sc.pos != len(s) {
+        sc.at = sc.pos
+        return DATE_SCAN_MISMATCH
+    }
+    return date_settle(sc)
+}
+
+proc date_error_of(code: int) -> DateError {
+    if code == DATE_SCAN_RANGE {
+        return DateError.out_of_range
+    }
+    return DateError.mismatch
+}
+
+// Grava em at (se foi pedido) o offset do 1o byte ruim.
+proc date_report_at(at: ?^int, offset: int) {
+    switch p in at {
+    case ^int:
+        p^ = offset
+    case none:
+    }
+}
+
+// O DateTime de s segundo o padrao livre pattern na regiao loc ("29/02/2000" com "dd/MM/yyyy" = 2000-02-29 00:00:00); at recebe a posicao do erro.
+pub proc parse_pattern(s: str, pattern: str, loc: Locale, at: ?^int = none) -> tm.DateTime ! DateError {
+    if not pattern_valid(pattern) {
+        date_report_at(at, offset = 0)
+        return DateError.invalid_pattern
+    }
+    if len(s) == 0 {
+        date_report_at(at, offset = 0)
+        return DateError.empty
+    }
+    var sc = DateScan{}
+    let code = date_scan_all(s, pattern, loc, &sc)
+    if code != DATE_SCAN_OK {
+        date_report_at(at, offset = sc.at)
+        return date_error_of(code)
+    }
+    return date_value(&sc)
+}
+
+// A data de s no estilo da regiao (o padrao date_short, date_long ou date_full), com a hora 00:00:00.
+pub proc parse_date(s: str, loc: Locale, style: DateStyle = DateStyle.short, at: ?^int = none) -> tm.DateTime ! DateError {
+    let dt = try parse_pattern(s, date_style_pattern(loc, style = style), loc = loc, at = at)
+    return dt
+}
+
+// A hora de s no estilo da regiao (time_short ou, com seconds = true, time_medium), na data 1970-01-01.
+pub proc parse_time(s: str, loc: Locale, seconds: bool = false, at: ?^int = none) -> tm.DateTime ! DateError {
+    let dt = try parse_pattern(s, date_time_pattern(loc, seconds = seconds), loc = loc, at = at)
+    return dt
+}
+
+// Os componentes de uma duracao, ja truncada para ms.
+struct DurationParts {
+    hours: int = 0
+    minutes: int = 0
+    seconds: int = 0
+    millis: int = 0
+}
+
+// Parte |ns| em h, min, s e ms (para o zero em ms); o menor int nao estoura (a conta e em u64).
+proc duration_split(ns: int) -> DurationParts {
+    let total_ms = magnitude(ns) / DURATION_NS_PER_MS
+    let total_s = total_ms / DURATION_MS_PER_SECOND
+    let total_min = total_s / DURATION_UNITS_PER_STEP
+    return DurationParts{
+        hours = (total_min / DURATION_UNITS_PER_STEP) as int,
+        minutes = (total_min % DURATION_UNITS_PER_STEP) as int,
+        seconds = (total_s % DURATION_UNITS_PER_STEP) as int,
+        millis = (total_ms % DURATION_MS_PER_SECOND) as int}
+}
+
+// Acrescenta um componente nao zero: U+0020 antes se ja ha texto, numero, U+0020, sufixo. Devolve se ja ha texto.
+proc duration_part(value: int, suffix: str, buf: ^[dynamic]u8, written: bool) -> bool {
+    if value == 0 {
+        return written
+    }
+    if written {
+        append(buf, item = " ")
+    }
+    format(f"{value}", into = buf)
+    append(buf, item = " ")
+    append(buf, item = suffix)
+    return true
+}
+
+// A duracao ns (nanossegundos; negativa = "-" na frente) no estilo curto da regiao: "1 h 5 min 3 s 250 ms".
+pub proc write_duration(ns: int, buf: ^[dynamic]u8, loc: Locale) {
+    let parts = duration_split(ns)
+    if parts.hours == 0 and parts.minutes == 0 and parts.seconds == 0 and parts.millis == 0 {
+        append(buf, item = "0 ")
+        append(buf, item = loc.dur_s)
+        return
+    }
+    if ns < 0 {
+        append(buf, item = "-")
+    }
+    var written = duration_part(parts.hours, loc.dur_h, buf, false)
+    written = duration_part(parts.minutes, loc.dur_min, buf, written)
+    written = duration_part(parts.seconds, loc.dur_s, buf, written)
+    _ = duration_part(parts.millis, loc.dur_ms, buf, written)
+}
+
+// A duracao ns no estilo curto da regiao: texto dono. format_duration(3903250000000, loc = PT_BR) = "1 h 5 min 3 s 250 ms".
+pub proc format_duration(ns: int, loc: Locale, alloc: Allocator) -> str {
+    var buf = make([dynamic]u8, alloc = alloc, cap = 32)
+    defer delete(buf)
+    write_duration(ns, buf = &buf, loc = loc)
+    return to_str(&buf)
+}

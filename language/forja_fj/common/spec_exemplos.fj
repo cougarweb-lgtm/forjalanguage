@@ -1,0 +1,200 @@
+// common/spec_exemplos.fj - porte de compiler/common/spec_exemplos.c, compiler/common/spec_exemplos.h
+// sha256 de common/spec_exemplos.c: 40984061a89af9287f69171470868f728c88ac72ca56ec78c4f88f04e6a4b3d9
+// sha256 de common/spec_exemplos.h: 7dd760cb482841daecc866b2b2dc58cda3892116ff8f047d0a88d8cf54d0dbb2
+// gerado por c2forja esqueleto 0.3.2; corpo real do P-common C3
+// Versao: 0.2.0
+//
+// Vistas como no spec_doc.fj (ponteiro + k = texto[k..<len(texto)]). SpecExemplo.codigo (char[8] do C) = str que e fatia do str do exemplos.txt embutido: spec_proximo_exemplo
+// (privado) recebe esse str em `texto`; o unico texto que ele le e o DOC_EXEMPLOS (spec_exemplo_do_codigo).
+
+pub struct SpecExemplo {
+    codigo: ?str
+    fixture: DocTexto
+    linha: u32
+    primeira: u32
+    forma: DocTexto
+    errado: DocTexto
+    certo: DocTexto
+}
+
+const PREFIXO_TAM: i32 = 2
+const EXEMPLO_CODIGO_MAX: i32 = 8
+
+// C: common/spec_exemplos.c:14
+proc ler_numero(resto: ^DocTexto, valor: ^u32) -> bool {
+    var n: u64 = 0
+    valor^ = 0
+    while n < resto.tam and resto.texto[n] >= 48 and resto.texto[n] <= 57 { // '0' '9'
+        valor^ = wrapping_add(wrapping_mul(valor^, 10), (resto.texto[n] - 48) as u32)
+        n += 1
+    }
+    resto.texto = resto.texto[(n as int)..<len(resto.texto)]
+    resto.tam -= n
+    return n > 0
+}
+
+// C: common/spec_exemplos.c:26
+// Palavra de *resto ate o espaco (que e consumido).
+proc ler_palavra(resto: ^DocTexto) -> DocTexto {
+    var palavra = DocTexto{texto = resto.texto, tam = 0}
+    while palavra.tam < resto.tam and resto.texto[palavra.tam] != 32 { // ' '
+        palavra.tam += 1
+    }
+    var consumir: u64 = palavra.tam
+    if palavra.tam < resto.tam {
+        consumir = palavra.tam + 1
+    }
+    resto.texto = resto.texto[(consumir as int)..<len(resto.texto)]
+    resto.tam -= consumir
+    return palavra
+}
+
+// C: common/spec_exemplos.c:39
+// "@@ codigo fixture linha primeira": false = cabecalho malformado.
+proc ler_cabecalho(linha: DocTexto, e: ^SpecExemplo, texto: str) -> bool {
+    var resto = linha
+    resto.texto = resto.texto[3..<len(resto.texto)]
+    resto.tam -= 3
+    let codigo = ler_palavra(&resto)
+    if codigo.tam == 0 or codigo.tam >= (EXEMPLO_CODIGO_MAX as u64) {
+        return false
+    }
+    let desde = len(texto) - len(codigo.texto) // o texto do codigo e um sufixo do buffer inteiro
+    e.codigo = texto[desde..<desde + (codigo.tam as int)]
+    e.fixture = ler_palavra(&resto)
+    if e.fixture.tam == 0 or not ler_numero(&resto, &e.linha) {
+        return false
+    }
+    _ = ler_palavra(&resto) // o espaco entre os dois numeros
+    return ler_numero(&resto, &e.primeira)
+}
+
+// C: common/spec_exemplos.c:55
+proc eh_cabecalho(linha: DocTexto) -> bool {
+    // "@@ " = 64 64 32
+    return linha.tam >= 3 and linha.texto[0] == 64 and linha.texto[1] == 64 and linha.texto[2] == 32
+}
+
+// C: common/spec_exemplos.c:61
+// Estende o bloco ate o fim da linha (o 1o byte do bloco e o inicio da 1a linha dele).
+proc acrescentar_linha(bloco: ^DocTexto, linha: DocTexto) {
+    if bloco.tam == 0 {
+        bloco.texto = linha.texto
+    }
+    bloco.tam = ((len(bloco.texto) - len(linha.texto)) as u64) + linha.tam
+}
+
+// C: common/spec_exemplos.c:67
+proc classificar_linha(e: ^SpecExemplo, linha: DocTexto) {
+    if linha.tam == 0 {
+        return
+    }
+    if linha.texto[0] == 61 { // '='
+        if linha.tam >= (PREFIXO_TAM as u64) {
+            e.forma.texto = linha.texto[(PREFIXO_TAM as int)..<len(linha.texto)]
+            e.forma.tam = linha.tam - (PREFIXO_TAM as u64)
+        } else {
+            e.forma.texto = linha.texto[(linha.tam as int)..<len(linha.texto)]
+            e.forma.tam = 0
+        }
+    } else if linha.texto[0] == 60 { // '<'
+        acrescentar_linha(&e.errado, linha)
+    } else if linha.texto[0] == 62 { // '>'
+        acrescentar_linha(&e.certo, linha)
+    }
+}
+
+// C: common/spec_exemplos.c:80
+proc spec_proximo_exemplo(resto: ^DocTexto, e: ^SpecExemplo, texto: str) -> bool {
+    var linha = DocTexto{}
+    var abriu = false
+    e^ = SpecExemplo{}
+    while true {
+        let antes = resto^
+        if not spec_proxima_linha(resto, &linha) {
+            break
+        }
+        if eh_cabecalho(linha) {
+            if abriu {
+                resto^ = antes
+                break
+            }
+            abriu = ler_cabecalho(linha, e, texto)
+            continue
+        }
+        if abriu {
+            classificar_linha(e, linha)
+        }
+    }
+    return abriu
+}
+
+// C: common/spec_exemplos.c:103
+pub proc spec_exemplo_do_codigo(codigo: ?str, e: ^SpecExemplo) -> bool {
+    var resto: DocTexto = doc_embutida(DOC_EXEMPLOS)
+    let texto = doc_embutida_texto(DOC_EXEMPLOS)
+    while spec_proximo_exemplo(&resto, e, texto) {
+        if (e.codigo or_else "") == (codigo or_else "") {
+            return true
+        }
+    }
+    return false
+}
+
+// C: common/spec_exemplos.c:112
+pub proc spec_imprimir_exemplo_json(saida: ^Saida, e: ^SpecExemplo) {
+    let txt_1 = e.codigo or_else "(null)"
+    let msg_1 = format(f"{{\"codigo\": \"{txt_1}\", \"fixture\": ", alloc = heap)
+    defer delete(msg_1)
+    c2f_saida_formatar(saida, msg_1)
+    spec_imprimir_texto_json(saida, e.fixture)
+    let msg_2 = format(f", \"linha\": {e.linha}, \"primeira_linha\": {e.primeira}, \"errado\": ", alloc = heap)
+    defer delete(msg_2)
+    c2f_saida_formatar(saida, msg_2)
+    spec_imprimir_linhas_json(saida, e.errado)
+    c2f_saida_escrever_texto(saida, ", \"certo\": ")
+    if e.certo.tam == 0 {
+        c2f_saida_escrever_texto(saida, "null")
+    } else {
+        spec_imprimir_linhas_json(saida, e.certo)
+    }
+    c2f_saida_escrever_texto(saida, ", \"forma_certa\": ")
+    spec_imprimir_texto_json(saida, e.forma)
+    c2f_saida_putc(saida, 125) // '}'
+}
+
+// C: common/spec_exemplos.c:126
+proc spec_imprimir_linhas_json(saida: ^Saida, bloco: DocTexto) {
+    var resto = bloco
+    var linha = DocTexto{}
+    var primeira = true
+    c2f_saida_putc(saida, 91) // '['
+    while spec_proxima_linha(&resto, &linha) {
+        var texto = DocTexto{}
+        if linha.tam >= (PREFIXO_TAM as u64) {
+            texto.texto = linha.texto[(PREFIXO_TAM as int)..<len(linha.texto)]
+            texto.tam = linha.tam - (PREFIXO_TAM as u64)
+        } else {
+            texto.texto = linha.texto[(linha.tam as int)..<len(linha.texto)]
+            texto.tam = 0
+        }
+        if not primeira {
+            c2f_saida_escrever_texto(saida, ", ")
+        }
+        spec_imprimir_texto_json(saida, texto)
+        primeira = false
+    }
+    c2f_saida_putc(saida, 93) // ']'
+}
+
+// ---- Testes: a parte de exemplos do TestaTextoDoSpec (teste_common_spec.c); o texto do diag_spec_texto fica para o P-common C2.
+test "spec_exemplo_do_codigo" {
+    var e = SpecExemplo{}
+    expect(spec_exemplo_do_codigo("E0707", &e))
+    expect((e.codigo or_else "") == "E0707")
+    expect(e.certo.tam > 0 and e.errado.tam > 0 and e.linha > 0 and e.primeira > 0 and e.primeira <= e.linha)
+    expect(not spec_exemplo_do_codigo("R0001", &e))
+    expect(not spec_exemplo_do_codigo("E0", &e))
+}
+
+// spec_imprimir_exemplo_json/spec_imprimir_linhas_json/spec_imprimir_texto_json chamam imprimir_texto_json (stub do diag.fj, lote C2): sem teste ate o C2 entrar.

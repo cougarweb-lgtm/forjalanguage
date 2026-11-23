@@ -1,0 +1,1169 @@
+// driver/opcoes.fj - porte de compiler/driver/opcoes.c, compiler/driver/opcoes.h
+// sha256 de driver/opcoes.c: 02887cdaa87c31f7bc98ede3992298aacbde30df2d0e5be56b5afb2a81b73d92
+// sha256 de driver/opcoes.h: d1a252589d5ebc4ec72d9e4d095c2aca767103ad7a12cb9816e4f45811c05284
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.7.0
+// Changelog: 0.7.0 - I5: --modo dll aceito nos alvos iOS (dylib MH_DYLIB).
+//            0.6.0 - I2: build dos alvos iOS aceito (Mach-O exe); run/test e --modo dll seguem X0003.
+//            0.5.0 - I1: alvos aarch64-apple-ios e aarch64-apple-ios-sim (OPCOES_ALVO_IOS/_IOS_SIM; alvo_eh_a64 cobre os 4 a64); build e --modo dll = X0003 (Mach-O da I2), run/test = X0003 (simulador do CI)
+// Changelog: 0.4.0 - A4.2: --runpath <dir> (DT_RUNPATH do exe PIE do alvo android; opaco, sem efeito nos outros alvos); OPCOES_CLI com 37 entradas (id 37).
+//            0.3.0 - A4.1: alvo aarch64-linux-android (OPCOES_ALVO_ANDROID; alvo_eh_a64 cobre os dois a64); --modo dll aceito so no android (placeholder ate o A4.2); run/test com X0003 proprio
+// Changelog: 0.2.0 - G3 P-driver DA: corpo real. OPCOES_CLI: destino (offsetof no C) vira o id da opcao (1..36) e a gravacao e uma cadeia de ifs (opcao_gravar_marca/_valor);
+//            achar_opcao devolve o indice na tabela (int, -1 = nao achou; o C devolvia ponteiro); ler_opcao recebe ^Opcoes (era o []Opcoes do ponteiro); anexar_argumento grava em []u8;
+//            o SaidaDiag unico (C2F-70) chega por `sd` nos conferir_*; caminho_alvo/raiz_alvo/linha viram texto do alocador frame (nenhum dono os libera).
+
+import "std:os"
+import "common"
+import "nativo"
+import "nativo/optimizer"
+
+struct Opcoes {
+    comando: ?str
+    entrada: ?str
+    saida: ?str
+    modo: ?str
+    tempos: ?str
+    backend: ?str
+    target: ?str
+    prova: ?str
+    debug_code: ?str
+    max_erros: ?str
+    simbolos: ?str
+    checagem: ?str
+    sem_otim: ?str
+    filtro: ?str
+    entradas: ?str
+    lib_pasta: ?str
+    runpath: ?str
+    jobs: ?str
+    limite_tempo: ?str
+    limite_mem: ?str
+    limite_saida: ?str
+    args_file: ?str
+    no: ?str
+    alvo_teste: ?str
+    caminho_alvo: ?str
+    raiz_alvo: ?str
+    linha: ?str
+    args_programa: ?[]str
+    nargs_programa: i32
+    tipos: bool
+    release: bool
+    suporte: bool
+    json: bool
+    sem_pos: bool
+    resumo: bool
+    traco: bool
+    pie: bool
+    guarda_memoria: bool
+    perfil: bool
+    rastreio: bool
+    stdin_fonte: bool
+    projeto: bool
+    plano: bool
+    tudo: bool
+    canonico: bool
+}
+
+struct OpcaoCli {
+    nome: ?str
+    tipo: i32
+    destino: u64
+}
+
+const OPCAO_VALOR: i32 = 0
+const OPCAO_MARCA: i32 = 1
+const OPCOES_ALVO_WINDOWS: str = "x86_64-windows"
+const OPCOES_ALVO_LINUX: str = "x86_64-linux"
+const OPCOES_ALVO_WASM: str = "wasm32-wasip1"
+const OPCOES_ALVO_WASM_APELIDO: str = "wasm"
+const OPCOES_ALVO_A64: str = "aarch64-linux" // A1.2: so build (ELF AArch64); run/test/perfil recusados com X0003
+const OPCOES_ALVO_ANDROID: str = "aarch64-linux-android" // A4.1: ELF Android (PIE dinamico no A4.2); build e --modo exe/dll; run/test com X0003
+const OPCOES_ALVO_IOS: str = "aarch64-apple-ios" // I1: Mach-O do aparelho; build com X0003 ate a I2, run/test com X0003
+const OPCOES_ALVO_IOS_SIM: str = "aarch64-apple-ios-sim" // I1: Mach-O do simulador; mesmo tratamento do aparelho nesta fatia
+const OPCOES_FILTRO_MAX: i32 = 255
+const OPCOES_JOBS_MAX: i32 = 64
+const CHECAGEM_PADRAO_RELEASE: bool = true
+const CAUSA_SEM_OTIM_MAX: int = 300
+const CAUSA_ALVO_MAX: int = 256
+const PASTA_ALVO_MAX: int = 256
+const NOME_ALVO_MAX: int = 256
+const CAMINHO_ALVO_MAX: int = 512
+const RAIZ_ALVO_MAX: int = 320
+
+// destino = id da opcao (1..36), na ordem da tabela: opcao_gravar_valor/opcao_gravar_marca levam o id ao campo de Opcoes (o offsetof do C)
+const OPCOES_CLI: [37]OpcaoCli = {
+    OpcaoCli{nome = "-o", tipo = OPCAO_VALOR, destino = 1},
+    OpcaoCli{nome = "--modo", tipo = OPCAO_VALOR, destino = 2},
+    OpcaoCli{nome = "--tempos", tipo = OPCAO_VALOR, destino = 3},
+    OpcaoCli{nome = "--backend", tipo = OPCAO_VALOR, destino = 4},
+    OpcaoCli{nome = "--target", tipo = OPCAO_VALOR, destino = 5},
+    OpcaoCli{nome = "--prova-layout", tipo = OPCAO_VALOR, destino = 6},
+    OpcaoCli{nome = "--debug-code", tipo = OPCAO_VALOR, destino = 7},
+    OpcaoCli{nome = "--max-erros", tipo = OPCAO_VALOR, destino = 8},
+    OpcaoCli{nome = "--filtro", tipo = OPCAO_VALOR, destino = 9},
+    OpcaoCli{nome = "--entradas", tipo = OPCAO_VALOR, destino = 10},
+    OpcaoCli{nome = "--lib-pasta", tipo = OPCAO_VALOR, destino = 11},
+    OpcaoCli{nome = "--jobs", tipo = OPCAO_VALOR, destino = 12},
+    OpcaoCli{nome = "--limite-tempo", tipo = OPCAO_VALOR, destino = 13},
+    OpcaoCli{nome = "--limite-mem", tipo = OPCAO_VALOR, destino = 14},
+    OpcaoCli{nome = "--limite-saida", tipo = OPCAO_VALOR, destino = 15},
+    OpcaoCli{nome = "--args-file", tipo = OPCAO_VALOR, destino = 16},
+    OpcaoCli{nome = "--no", tipo = OPCAO_VALOR, destino = 17},
+    OpcaoCli{nome = "--sem-pos", tipo = OPCAO_MARCA, destino = 18},
+    OpcaoCli{nome = "--tipos", tipo = OPCAO_MARCA, destino = 19},
+    OpcaoCli{nome = "--release", tipo = OPCAO_MARCA, destino = 20},
+    OpcaoCli{nome = "--suporte", tipo = OPCAO_MARCA, destino = 21},
+    OpcaoCli{nome = "--json", tipo = OPCAO_MARCA, destino = 22},
+    OpcaoCli{nome = "--resumo", tipo = OPCAO_MARCA, destino = 23},
+    OpcaoCli{nome = "--traco", tipo = OPCAO_MARCA, destino = 24},
+    OpcaoCli{nome = "--rastreio", tipo = OPCAO_MARCA, destino = 25},
+    OpcaoCli{nome = "--pie", tipo = OPCAO_MARCA, destino = 26},
+    OpcaoCli{nome = "--guarda-memoria", tipo = OPCAO_MARCA, destino = 27},
+    OpcaoCli{nome = "--perfil", tipo = OPCAO_MARCA, destino = 28},
+    OpcaoCli{nome = "--simbolos", tipo = OPCAO_VALOR, destino = 29},
+    OpcaoCli{nome = "--checagem", tipo = OPCAO_VALOR, destino = 30},
+    OpcaoCli{nome = "--sem-otim", tipo = OPCAO_VALOR, destino = 31},
+    OpcaoCli{nome = "--stdin", tipo = OPCAO_MARCA, destino = 32},
+    OpcaoCli{nome = "--projeto", tipo = OPCAO_MARCA, destino = 33},
+    OpcaoCli{nome = "--plano", tipo = OPCAO_MARCA, destino = 34},
+    OpcaoCli{nome = "--tudo", tipo = OPCAO_MARCA, destino = 35},
+    OpcaoCli{nome = "--canonico", tipo = OPCAO_MARCA, destino = 36},
+    OpcaoCli{nome = "--runpath", tipo = OPCAO_VALOR, destino = 37},
+}
+
+const COMANDOS: [6]str = {"check", "ast", "build", "test", "run", "explicar"}
+const PREFIXOS_3: [3]str = {"std", "vendor", "engine"}
+
+// Diagnostico sem fonte no stderr (DiagImprimirJsonSemFonte(codigo, causa, stderr)): o objeto de saida e novo a cada chamada e fechado (flush) aqui.
+proc relatar_sem_fonte_stderr(codigo: i32, causa: str, sd: ^common.SaidaDiag) {
+    let erro = common.c2f_saida_stderr()
+    common.diag_imprimir_json_sem_fonte(codigo, causa, erro, sd)
+    _ = common.c2f_saida_fechar(erro)
+}
+
+// C: driver/opcoes.c:96
+// Indice da opcao na tabela OPCOES_CLI (o C devolvia o ponteiro para a entrada); -1 = nao existe.
+proc achar_opcao(nome: str) -> int {
+    for k in 0..<len(OPCOES_CLI) {
+        if (OPCOES_CLI[k].nome or_else "") == nome {
+            return k
+        }
+    }
+    return -1
+}
+
+// o campo de Opcoes que o id (destino) da tabela nomeia: opcao com valor (o proximo argv)
+proc opcao_gravar_valor(o: ^Opcoes, id: u64, valor: str) {
+    if id == 1 { // -o
+        o.saida = valor
+    } else if id == 2 { // --modo
+        o.modo = valor
+    } else if id == 3 { // --tempos
+        o.tempos = valor
+    } else if id == 4 { // --backend
+        o.backend = valor
+    } else if id == 5 { // --target (o apelido "wasm" vira o nome canonico aqui, ponto unico)
+        if valor == OPCOES_ALVO_WASM_APELIDO {
+            o.target = OPCOES_ALVO_WASM
+        } else {
+            o.target = valor
+        }
+    } else if id == 6 { // --prova-layout
+        o.prova = valor
+    } else if id == 7 { // --debug-code
+        o.debug_code = valor
+    } else if id == 8 { // --max-erros
+        o.max_erros = valor
+    } else if id == 9 { // --filtro
+        o.filtro = valor
+    } else if id == 10 { // --entradas
+        o.entradas = valor
+    } else if id == 11 { // --lib-pasta
+        o.lib_pasta = valor
+    } else if id == 12 { // --jobs
+        o.jobs = valor
+    } else if id == 13 { // --limite-tempo
+        o.limite_tempo = valor
+    } else if id == 14 { // --limite-mem
+        o.limite_mem = valor
+    } else if id == 15 { // --limite-saida
+        o.limite_saida = valor
+    } else if id == 16 { // --args-file
+        o.args_file = valor
+    } else if id == 17 { // --no
+        o.no = valor
+    } else if id == 29 { // --simbolos
+        o.simbolos = valor
+    } else if id == 30 { // --checagem
+        o.checagem = valor
+    } else if id == 31 { // --sem-otim
+        o.sem_otim = valor
+    } else if id == 37 { // --runpath
+        o.runpath = valor
+    }
+}
+
+// opcao marca: liga o bool do campo que o id nomeia
+proc opcao_gravar_marca(o: ^Opcoes, id: u64) {
+    if id == 18 { // --sem-pos
+        o.sem_pos = true
+    } else if id == 19 { // --tipos
+        o.tipos = true
+    } else if id == 20 { // --release
+        o.release = true
+    } else if id == 21 { // --suporte
+        o.suporte = true
+    } else if id == 22 { // --json
+        o.json = true
+    } else if id == 23 { // --resumo
+        o.resumo = true
+    } else if id == 24 { // --traco
+        o.traco = true
+    } else if id == 25 { // --rastreio
+        o.rastreio = true
+    } else if id == 26 { // --pie
+        o.pie = true
+    } else if id == 27 { // --guarda-memoria
+        o.guarda_memoria = true
+    } else if id == 28 { // --perfil
+        o.perfil = true
+    } else if id == 32 { // --stdin
+        o.stdin_fonte = true
+    } else if id == 33 { // --projeto
+        o.projeto = true
+    } else if id == 34 { // --plano
+        o.plano = true
+    } else if id == 35 { // --tudo
+        o.tudo = true
+    } else if id == 36 { // --canonico
+        o.canonico = true
+    }
+}
+
+// C: driver/opcoes.c:105
+// Uma opcao (ou o arquivo de entrada) em argv[*i]. none se ok, ou o motivo do uso errado.
+proc ler_opcao(argc: i32, argv: []str, i: ^i32, o: ^Opcoes) -> ?str {
+    let a: str = argv[i^ as int]
+    if common.c2f_nul_em(a, 0) != 45 { // '-'
+        if o.entrada != none {
+            return "mais de um arquivo de entrada"
+        }
+        o.entrada = a
+        return none
+    }
+    let k: int = achar_opcao(a)
+    if k < 0 {
+        return "opcao desconhecida"
+    }
+    let op: OpcaoCli = OPCOES_CLI[k]
+    if op.tipo == OPCAO_MARCA {
+        opcao_gravar_marca(o, op.destino)
+        return none
+    }
+    if i^ + 1 >= argc {
+        return "opcao sem valor"
+    }
+    i^ = i^ + 1
+    opcao_gravar_valor(o, op.destino, argv[i^ as int])
+    return none
+}
+
+// C: driver/opcoes.c:127
+// none se ok, ou o motivo do uso errado.
+proc opcoes_ler(argc: i32, argv: []str, o: ^Opcoes) -> ?str {
+    o.comando = argv[1]
+    var i: i32 = 2
+    while i < argc {
+        if argv[i as int] == "--" { // o resto e do programa, nao do forja
+            o.args_programa = argv[((i as int) + 1)..<len(argv)]
+            o.nargs_programa = argc - i - 1
+            break
+        }
+        let erro: ?str = ler_opcao(argc, argv, &i, o)
+        if erro != none {
+            return erro
+        }
+        i = i + 1
+    }
+    if (o.entrada != none) or o.suporte or o.projeto {
+        return none
+    }
+    if (o.comando or_else "") == "explicar" {
+        return "falta o codigo do diagnostico"
+    }
+    return "falta o arquivo .fj"
+}
+
+// C: driver/opcoes.c:146
+// Acrescenta " arg" (entre aspas se tiver espaco) a saida[usado..n); devolve o novo usado, no maximo n - 1.
+proc anexar_argumento(saida: []u8, n: u64, usado: u64, arg: str) -> u64 {
+    var aspas: str = ""
+    for k in 0..<len(arg) {
+        if arg[k] == 32 { // ' '
+            aspas = "\""
+            break
+        }
+    }
+    let texto = format(f" {aspas}{arg}{aspas}", alloc = heap)
+    defer delete(texto)
+    let escrito: u64 = len(texto) as u64
+    _ = common.c2f_snprintf(saida[(usado as int)..<(n as int)], texto)
+    if escrito >= (n - usado) {
+        return n - 1
+    }
+    return usado + escrito
+}
+
+// C: driver/opcoes.c:155
+proc opcoes_linha_de_comando(argc: i32, argv: []str, saida: []u8, n: u64) {
+    var usado: u64 = common.c2f_snprintf(saida[0..<(n as int)], "forja") as u64
+    var k: i32 = 1
+    while (k < argc) and (usado < (n - 1)) {
+        usado = anexar_argumento(saida, n, usado, argv[k as int])
+        k = k + 1
+    }
+}
+
+// C: driver/opcoes.c:163
+// Variavel de ambiente do filho: valor vazio remove a variavel do processo (_putenv_s: set_env aceita valor vazio, entao o vazio vai para unset_env).
+proc definir_ambiente(nome: str, valor: ?str) {
+    let v: str = valor or_else ""
+    if len(v) == 0 {
+        _ = os.unset_env(nome)
+    } else {
+        _ = os.set_env(nome, v)
+    }
+}
+
+// C: driver/opcoes.c:168
+proc opcoes_ambiente_do_teste(o: ^Opcoes) {
+    var json: ?str = none
+    if o.json {
+        json = "1"
+    }
+    definir_ambiente("FORJA_TESTE_FILTRO", o.filtro)
+    definir_ambiente("FORJA_TESTE_JSON", json)
+}
+
+// C: driver/opcoes.c:174
+proc comando_eh(o: ?^Opcoes, nome: str) -> bool {
+    return ((o as ^Opcoes).comando or_else "") == nome
+}
+
+// C: driver/opcoes.c:179
+proc comando_conhecido(o: ^Opcoes) -> bool {
+    for k in 0..<len(COMANDOS) {
+        if comando_eh(o, COMANDOS[k]) {
+            return true
+        }
+    }
+    return false
+}
+
+// C: driver/opcoes.c:189
+proc modo_eh_c(o: ^Opcoes) -> bool {
+    return (o.modo != none) and ((o.modo or_else "") == "c")
+}
+
+// C: driver/opcoes.c:194
+proc modo_eh_dll(o: ^Opcoes) -> bool {
+    return (o.modo != none) and ((o.modo or_else "") == "dll")
+}
+
+// C: driver/opcoes.c:199
+proc backend_eh_x64(o: ^Opcoes) -> bool {
+    return (o.backend != none) and ((o.backend or_else "") == "x64")
+}
+
+// C: driver/opcoes.c:204
+proc alvo_eh_linux(o: ?^Opcoes) -> bool {
+    return ((o as ^Opcoes).target != none) and (((o as ^Opcoes).target or_else "") == OPCOES_ALVO_LINUX)
+}
+
+proc alvo_eh_wasm(o: ?^Opcoes) -> bool {
+    return ((o as ^Opcoes).target or_else "") == OPCOES_ALVO_WASM
+}
+
+proc alvo_eh_android(o: ?^Opcoes) -> bool {
+    return ((o as ^Opcoes).target or_else "") == OPCOES_ALVO_ANDROID
+}
+
+// I1: os dois alvos iOS (aparelho e simulador) entram no mesmo ramo a64
+proc alvo_eh_ios(o: ?^Opcoes) -> bool {
+    let alvo: str = (o as ^Opcoes).target or_else ""
+    return (alvo == OPCOES_ALVO_IOS) or (alvo == OPCOES_ALVO_IOS_SIM)
+}
+
+// A4.1: o android e um a64 (mesmo backend, runtime a64_rt e libm); so a recusa e a aceitacao de --modo dll divergem
+proc alvo_eh_a64(o: ?^Opcoes) -> bool {
+    return ((((o as ^Opcoes).target or_else "") == OPCOES_ALVO_A64) or alvo_eh_android(o)) or alvo_eh_ios(o)
+}
+
+// C: driver/opcoes.c:210
+proc compilacao_de_dev(o: ^Opcoes) -> bool {
+    if o.projeto {
+        return false
+    }
+    return ((common.c2f_b2i32(comando_eh(o, "build")) != 0) or (common.c2f_b2i32(comando_eh(o, "run")) != 0)) or (common.c2f_b2i32(comando_eh(o, "test")) != 0)
+}
+
+// C: driver/opcoes.c:216
+proc opcoes_resolver_backend(o: ^Opcoes) {
+    if (o.backend == none) and ((common.c2f_b2i32(compilacao_de_dev(o)) != 0) or (common.c2f_b2i32(alvo_eh_linux(o)) != 0) or alvo_eh_wasm(o) or alvo_eh_a64(o)) {
+        o.backend = "x64"
+    }
+}
+
+// C: driver/opcoes.c:221
+proc opcoes_max_erros(o: ?^Opcoes) -> u32 {
+    let oo: ^Opcoes = o as ^Opcoes
+    if oo.max_erros == none {
+        return 0
+    }
+    let texto: str = oo.max_erros or_else ""
+    var fim: int = 0
+    let n: i32 = common.c2f_strtol(texto, 10, &fim)
+    // strtol leu algum numero (fim != inicio), parou no NUL (fim no fim do texto) e o valor esta em 1..DIAG_MAX
+    if (fim > 0) and (fim == len(texto)) and (n >= 1) and (n <= common.DIAG_MAX) {
+        return n as u32
+    }
+    return 0
+}
+
+// C: driver/opcoes.c:231
+proc opcoes_jobs_texto(texto: ?str, n: ^u32) -> bool {
+    let t: str = texto or_else ""
+    if (texto == none) or (common.c2f_nul_em(t, 0) < 48) or (common.c2f_nul_em(t, 0) > 57) {
+        return false
+    }
+    var fim: int = 0
+    let v: i32 = common.c2f_strtol(t, 10, &fim)
+    if (fim != len(t)) or (v < 1) or (v > OPCOES_JOBS_MAX) {
+        return false
+    }
+    n^ = v as u32
+    return true
+}
+
+// C: driver/opcoes.c:244
+proc validar_max_erros(o: ^Opcoes) -> ?str {
+    if (o.max_erros == none) or (opcoes_max_erros(o) != 0) {
+        return none
+    }
+    return "--max-erros aceita um numero inteiro de 1 a 100"
+}
+
+// C: driver/opcoes.c:251
+proc validar_build(o: ^Opcoes) -> ?str {
+    if ((o.modo != none) and (not modo_eh_dll(o))) and ((o.modo or_else "") != "exe") {
+        return "--modo aceita exe ou dll"
+    }
+    if (o.saida == none) and (not o.suporte) {
+        return "build exige -o <saida>"
+    }
+    return none
+}
+
+// C: driver/opcoes.c:259
+// forja test <prefixo>:<nome> (S4 P2): o ':' so conta depois de 2 caracteres e antes de '\' ou '/' (C:\x.fj e um arquivo).
+proc entrada_eh_alvo(entrada: ?str) -> bool {
+    let e: str = entrada or_else ""
+    var dois: int = -1 // strchr(entrada, ':')
+    var barra: int = len(e) // strcspn(entrada, "\\/")
+    for k in 0..<len(e) {
+        if (e[k] == 58) and (dois < 0) {
+            dois = k
+        }
+        if ((e[k] == 92) or (e[k] == 47)) and (barra == len(e)) {
+            barra = k
+        }
+    }
+    if (dois < 0) or (dois < 2) {
+        return false
+    }
+    return barra > dois
+}
+
+// C: driver/opcoes.c:267
+// Prefixo do alvo (o texto antes do ':') tem que ser std, vendor ou engine.
+proc prefixo_de_alvo_conhecido(entrada: ?str) -> bool {
+    let e: str = entrada or_else ""
+    var n: int = len(e) // strcspn(entrada, ":")
+    for k in 0..<len(e) {
+        if e[k] == 58 {
+            n = k
+            break
+        }
+    }
+    for k in 0..<len(PREFIXOS_3) {
+        if e[0..<n] == PREFIXOS_3[k] {
+            return true
+        }
+    }
+    return false
+}
+
+// C: driver/opcoes.c:279
+proc validar_alvo_do_teste(o: ^Opcoes) -> ?str {
+    if ((not comando_eh(o, "test")) or (o.entrada == none)) or (not entrada_eh_alvo(o.entrada)) {
+        return none
+    }
+    if not prefixo_de_alvo_conhecido(o.entrada) {
+        return "forja test aceita std:<modulo>, vendor:<modulo> ou engine:<modulo>"
+    }
+    return none
+}
+
+// C: driver/opcoes.c:287
+proc validar_test_run(o: ^Opcoes) -> ?str {
+    let saida_do_test_linux: bool = (common.c2f_b2i32(comando_eh(o, "test")) != 0) and (common.c2f_b2i32(alvo_eh_linux(o)) != 0)
+    let erro_alvo: ?str = validar_alvo_do_teste(o)
+    if erro_alvo != none {
+        return erro_alvo
+    }
+    if (((o.saida != none) and (not saida_do_test_linux)) or (o.modo != none)) or (common.c2f_b2i32(o.tipos) != 0) {
+        return "test e run nao aceitam -o, --modo ou --tipos"
+    }
+    if (common.c2f_b2i32(o.release) != 0) and (common.c2f_b2i32(comando_eh(o, "test")) != 0) {
+        return "--release so vale em run e build exe"
+    }
+    return none
+}
+
+// C: driver/opcoes.c:299
+proc validar_explicar(o: ^Opcoes) -> ?str {
+    if (((((o.saida != none) or (o.modo != none)) or (o.tempos != none)) or (common.c2f_b2i32(o.tipos) != 0)) or (common.c2f_b2i32(o.release) != 0)) or (o.max_erros != none) {
+        return "explicar so aceita o codigo do diagnostico"
+    }
+    return none
+}
+
+// C: driver/opcoes.c:306
+proc validar_check_ast(o: ^Opcoes) -> ?str {
+    if (common.c2f_b2i32(o.tipos) != 0) and (not comando_eh(o, "ast")) {
+        return "--tipos so vale no comando ast"
+    }
+    if (o.no != none) and (common.c2f_nul_em(o.no or_else "", 0) == 0) { // '\0': o texto vazio (indexar o vazio daria R0006)
+        return "--no precisa do id do no (campo \"id\" do forja ast)"
+    }
+    if o.release {
+        return "--release so vale no build exe"
+    }
+    return none
+}
+
+// C: driver/opcoes.c:315
+proc validar_backend_alvo(o: ^Opcoes) -> ?str {
+    if (o.backend == none) and (o.target == none) {
+        return none
+    }
+    if ((common.c2f_b2i32(comando_eh(o, "build")) != 0) or (common.c2f_b2i32(comando_eh(o, "test")) != 0)) or (common.c2f_b2i32(comando_eh(o, "run")) != 0) {
+        return none
+    }
+    return "--backend e --target so valem em build, run e test"
+}
+
+// C: driver/opcoes.c:323
+proc validar_debug_code(o: ^Opcoes) -> ?str {
+    if (o.debug_code == none) or (common.c2f_b2i32(comando_eh(o, "build")) != 0) {
+        return none
+    }
+    return "--debug-code so vale em build"
+}
+
+// C: driver/opcoes.c:330
+// --suporte --json lista o que o backend x64 recusa, sem gerar exe: so build --backend x64, e as duas marcas andam juntas.
+proc validar_suporte(o: ^Opcoes) -> ?str {
+    if (not o.suporte) and (not o.json) {
+        return none
+    }
+    if not o.suporte {
+        if comando_eh(o, "test") {
+            return none
+        }
+        return "--json so vale com --suporte ou no test"
+    }
+    if (not comando_eh(o, "build")) or (not backend_eh_x64(o)) {
+        return "--suporte so vale em build --backend x64"
+    }
+    if not o.json {
+        return "--suporte exige --json"
+    }
+    if (o.saida != none) or (o.debug_code != none) {
+        return "--suporte nao gera arquivo: sem -o nem --debug-code"
+    }
+    return none
+}
+
+// C: driver/opcoes.c:341
+proc validar_traco(o: ^Opcoes) -> ?str {
+    if not o.traco {
+        return none
+    }
+    if ((not comando_eh(o, "build")) and (not comando_eh(o, "test"))) and (not comando_eh(o, "run")) {
+        return "--traco so vale em build, run e test"
+    }
+    if (common.c2f_b2i32(modo_eh_dll(o)) != 0) or (common.c2f_b2i32(o.suporte) != 0) {
+        return "--traco nao vale com --modo dll nem com --suporte"
+    }
+    return none
+}
+
+// C: driver/opcoes.c:350
+proc validar_rastreio(o: ^Opcoes) -> ?str {
+    if not o.rastreio {
+        return none
+    }
+    if ((not comando_eh(o, "build")) and (not comando_eh(o, "test"))) and (not comando_eh(o, "run")) {
+        return "--rastreio so vale em build, run e test"
+    }
+    if (common.c2f_b2i32(modo_eh_dll(o)) != 0) or (common.c2f_b2i32(o.suporte) != 0) {
+        return "--rastreio nao vale com --modo dll nem com --suporte"
+    }
+    return none
+}
+
+// C: driver/opcoes.c:359
+proc validar_guarda(o: ^Opcoes) -> ?str {
+    let comando_ok: bool = ((common.c2f_b2i32(comando_eh(o, "build")) != 0) or (common.c2f_b2i32(comando_eh(o, "run")) != 0)) or (common.c2f_b2i32(comando_eh(o, "test")) != 0)
+    let backend_c: bool = (o.backend != none) and ((o.backend or_else "") != "x64")
+    if not o.guarda_memoria {
+        return none
+    }
+    if ((((not comando_ok) or (common.c2f_b2i32(o.release) != 0)) or (common.c2f_b2i32(backend_c) != 0)) or (common.c2f_b2i32(modo_eh_dll(o)) != 0)) or (common.c2f_b2i32(o.suporte) != 0) {
+        return "--guarda-memoria so vale em dev, backend x64, exe"
+    }
+    return none
+}
+
+// C: driver/opcoes.c:370
+proc validar_perfil(o: ^Opcoes) -> ?str {
+    let comando_ok: bool = ((common.c2f_b2i32(comando_eh(o, "build")) != 0) or (common.c2f_b2i32(comando_eh(o, "run")) != 0)) or (common.c2f_b2i32(comando_eh(o, "test")) != 0)
+    if not o.perfil {
+        return none
+    }
+    if ((not comando_ok) or (common.c2f_b2i32(modo_eh_dll(o)) != 0)) or (common.c2f_b2i32(o.suporte) != 0) {
+        return "--perfil so vale em build, run e test, exe (nao com --modo dll nem --suporte)"
+    }
+    return none
+}
+
+// C: driver/opcoes.c:380
+proc validar_pie(o: ^Opcoes) -> ?str {
+    if (not o.pie) or (common.c2f_b2i32(alvo_eh_linux(o)) != 0) {
+        return none
+    }
+    return "--pie so vale com --target x86_64-linux (o static-pie e do ELF)"
+}
+
+// C: driver/opcoes.c:387
+proc validar_simbolos(o: ^Opcoes) -> ?str {
+    if ((o.simbolos == none) or ((o.simbolos or_else "") == "sim")) or ((o.simbolos or_else "") == "nao") {
+        return none
+    }
+    return "--simbolos aceita so sim ou nao"
+}
+
+// C: driver/opcoes.c:393
+proc opcoes_simbolos(o: ^Opcoes) -> bool {
+    if o.simbolos == none {
+        return not o.release
+    }
+    return (o.simbolos or_else "") == "sim"
+}
+
+// C: driver/opcoes.c:403
+proc validar_checagem(o: ^Opcoes) -> ?str {
+    let comando_ok: bool = ((common.c2f_b2i32(comando_eh(o, "build")) != 0) or (common.c2f_b2i32(comando_eh(o, "run")) != 0)) or (common.c2f_b2i32(comando_eh(o, "test")) != 0)
+    if o.checagem == none {
+        return none
+    }
+    if ((o.checagem or_else "") != "sim") and ((o.checagem or_else "") != "nao") {
+        return "--checagem aceita so sim ou nao"
+    }
+    if not comando_ok {
+        return "--checagem so vale em build, run e test"
+    }
+    if (not o.release) and ((o.checagem or_else "") == "nao") {
+        return "--checagem nao so vale com --release (o dev sempre confere indice e nulo)"
+    }
+    return none
+}
+
+// C: driver/opcoes.c:414
+proc opcoes_checagem(o: ^Opcoes) -> bool {
+    if not o.release {
+        return true
+    }
+    if o.checagem == none {
+        return CHECAGEM_PADRAO_RELEASE
+    }
+    return (o.checagem or_else "") == "sim"
+}
+
+// C: driver/opcoes.c:422
+// --sem-otim (M7a F0): passes de otimizacao da BIR desligados; so build, run e test, so --release; passo desconhecido lista os validos.
+// A causa (static char[300] no C) volta como texto do alocador frame: nenhum dono a libera.
+proc validar_sem_otim(o: ^Opcoes) -> ?str {
+    let comando_ok: bool = comando_eh(o, "build") or comando_eh(o, "run") or comando_eh(o, "test")
+    if o.sem_otim == none {
+        return none
+    }
+    if not comando_ok {
+        return "--sem-otim so vale em build, run e test"
+    }
+    if not o.release {
+        return "--sem-otim so vale com --release (o dev nunca roda passe de otimizacao)"
+    }
+    var causa = make([dynamic]u8, alloc = heap, len = CAUSA_SEM_OTIM_MAX)
+    defer delete(causa)
+    if not optimizer.otim_conferir_lista(o.sem_otim, causa[..], CAUSA_SEM_OTIM_MAX as u64) {
+        return from_bytes(causa[0..<common.c2f_strlen_b(causa[..])], alloc = frame)
+    }
+    return none
+}
+
+// C: driver/opcoes.c:435
+proc validar_entradas(o: ^Opcoes) -> ?str {
+    if (o.entradas == none) and (o.lib_pasta == none) {
+        return none
+    }
+    if not comando_eh(o, "build") {
+        return "--entradas e --lib-pasta so valem em build"
+    }
+    if o.suporte {
+        return "--suporte nao gera arquivo: sem --entradas nem --lib-pasta"
+    }
+    return none
+}
+
+// C: driver/opcoes.c:443
+proc opcoes_conferir_so_x64(o: ^Opcoes, sd: ^common.SaidaDiag) -> bool {
+    if ((o.entradas == none) and (o.lib_pasta == none)) or backend_eh_x64(o) {
+        return true
+    }
+    relatar_sem_fonte_stderr(common.X0003, "--entradas e --lib-pasta so existem com --backend x64", sd)
+    return false
+}
+
+// C: driver/opcoes.c:452
+proc opcoes_conferir_aposentados(o: ^Opcoes, sd: ^common.SaidaDiag) -> bool {
+    if modo_eh_c(o) {
+        relatar_sem_fonte_stderr(common.X0003, "o modo c (emissao de C portavel) foi aposentado na Forja 0.21.0; use --modo exe ou --modo dll", sd)
+        return false
+    }
+    if o.prova != none {
+        relatar_sem_fonte_stderr(common.X0003, "--prova-layout dependia do backend C, aposentado na Forja 0.21.0", sd)
+        return false
+    }
+    return true
+}
+
+// C: driver/opcoes.c:466
+// --backend (padrao: x64): so x64 existe; c foi aposentado na 0.21.0 e outro valor sai com X0003. false = saiu o diagnostico.
+proc conferir_backend(o: ^Opcoes, sd: ^common.SaidaDiag) -> bool {
+    let backend_texto: str = o.backend or_else ""
+    if (o.backend == none) or (backend_texto == "x64") {
+        return true
+    }
+    if backend_texto == "c" {
+        relatar_sem_fonte_stderr(common.X0003, "o backend C foi aposentado na Forja 0.21.0: o unico backend e o x64 (o padrao); --backend c nao existe mais", sd)
+        return false
+    }
+    let causa = format(f"backend desconhecido em --backend: '{backend_texto}' (validos: x64)", alloc = heap)
+    defer delete(causa)
+    relatar_sem_fonte_stderr(common.X0003, cortar_causa(causa), sd)
+    return false
+}
+
+// char causa[256] do snprintf: no maximo 255 bytes (a vista aponta para o proprio texto; o corte nao copia)
+proc cortar_causa(causa: str) -> str {
+    return causa[0..<min(len(causa), CAUSA_ALVO_MAX - 1)]
+}
+
+// C: driver/opcoes.c:482
+proc recusa_do_alvo_linux(o: ^Opcoes) -> ?str {
+    if not backend_eh_x64(o) {
+        return "o alvo x86_64-linux so existe no backend x64 (o padrao)"
+    }
+    if o.projeto {
+        return "build --projeto so gera x86_64-windows nesta versao"
+    }
+    if modo_eh_dll(o) {
+        return nativo.NATIVO_X0003_SO
+    }
+    if comando_eh(o, "run") {
+        return "o Windows nao executa ELF: build e rode no Linux"
+    }
+    if (common.c2f_b2i32(comando_eh(o, "test")) != 0) and (o.saida == none) {
+        return "forja test no alvo x86_64-linux so constroi o exe de teste: passe -o <saida>"
+    }
+    return none
+}
+
+// Filtro do forja test no wasm: o executor guarda o trecho em [832,1024) da memoria linear (rt_wasm_teste.fj); o x64 aceita 255
+const TESTE_WASM_FILTRO_MAX: int = 191
+
+// Alvo wasm32-wasip1: build, run e test (0.33.0, pelo Node); as demais combinacoes saem com X0003 e a causa diz qual.
+proc recusa_do_alvo_wasm(o: ^Opcoes) -> ?str {
+    if not backend_eh_x64(o) {
+        return "o alvo wasm32-wasip1 so existe no backend x64 (o padrao)"
+    }
+    if o.projeto {
+        return "build --projeto so gera x86_64-windows nesta versao"
+    }
+    if comando_eh(o, "test") and (o.alvo_teste != none) {
+        return "forja test <modulo> nao existe no alvo wasm32-wasip1: passe um arquivo .fj"
+    }
+    if comando_eh(o, "test") and (len(o.filtro or_else "") > TESTE_WASM_FILTRO_MAX) {
+        return "forja test --filtro no alvo wasm32-wasip1 aceita ate 191 bytes"
+    }
+    if o.perfil {
+        return "--perfil nao existe no alvo wasm32-wasip1"
+    }
+    if o.guarda_memoria {
+        return "--guarda-memoria nao existe no alvo wasm32-wasip1"
+    }
+    if o.simbolos != none {
+        return "--simbolos nao existe no alvo wasm32-wasip1"
+    }
+    return none
+}
+
+// A1.2: aarch64-linux so faz build (ELF); run/test/--modo dll/perfil/guarda/simbolos saem com X0003 e a causa
+proc recusa_do_alvo_a64(o: ^Opcoes) -> ?str {
+    if not backend_eh_x64(o) {
+        return "o alvo aarch64-linux so existe no backend x64 (o padrao)"
+    }
+    if o.projeto {
+        return "build --projeto so gera x86_64-windows nesta versao"
+    }
+    // I2: iOS faz build (Mach-O exe); run e test recusados (o simulador do CI roda o binario); --modo dll e a fatia I5
+    if alvo_eh_ios(o) {
+        if comando_eh(o, "run") or comando_eh(o, "test") {
+            return "o alvo iOS nao roda neste host (run e test recusados): rode o binario no simulador do CI"
+        }
+    }
+    if alvo_eh_android(o) and (comando_eh(o, "run") or comando_eh(o, "test")) {
+        return "o alvo aarch64-linux-android nao roda neste host (run e test recusados): gere com build -o e rode no emulador Android ou pelo APK (A5)"
+    }
+    if comando_eh(o, "run") {
+        return "forja run nao executa o alvo aarch64-linux neste host: gere com build -o e rode o ELF no qemu-aarch64 ou no emulador Android"
+    }
+    if comando_eh(o, "test") {
+        return "forja test nao roda o alvo aarch64-linux nesta versao: gere com build -o e rode o ELF no qemu-aarch64"
+    }
+    // A4.1: o android aceita --modo dll (placeholder ate o A4.2 emitir o .so); o aarch64-linux puro segue sem
+    if modo_eh_dll(o) and (not alvo_eh_android(o)) and (not alvo_eh_ios(o)) {
+        return "--modo dll nao existe no alvo aarch64-linux nesta versao (o .so chega no A4)"
+    }
+    if o.perfil {
+        return "--perfil nao existe no alvo aarch64-linux nesta versao"
+    }
+    if o.guarda_memoria {
+        return "--guarda-memoria nao existe no alvo aarch64-linux nesta versao"
+    }
+    if o.simbolos != none {
+        return "--simbolos nao existe no alvo aarch64-linux nesta versao"
+    }
+    return none
+}
+
+// C: driver/opcoes.c:493
+// --target: x86_64-windows e o padrao; x86_64-linux vale nas combinacoes de recusa_do_alvo_linux (X0003 nas outras), wasm32-wasip1 nas de recusa_do_alvo_wasm, e outro valor sai com X0002.
+proc conferir_alvo(o: ^Opcoes, sd: ^common.SaidaDiag) -> bool {
+    let alvo: str = o.target or_else ""
+    if (o.target == none) or (alvo == OPCOES_ALVO_WINDOWS) {
+        return true
+    }
+    if alvo_eh_linux(o) {
+        let recusa: ?str = recusa_do_alvo_linux(o)
+        if recusa != none {
+            relatar_sem_fonte_stderr(common.X0003, recusa or_else "", sd)
+        }
+        return recusa == none
+    }
+    if alvo_eh_wasm(o) {
+        let recusa_wasm: ?str = recusa_do_alvo_wasm(o)
+        if recusa_wasm != none {
+            relatar_sem_fonte_stderr(common.X0003, recusa_wasm or_else "", sd)
+        }
+        return recusa_wasm == none
+    }
+    if alvo_eh_a64(o) {
+        let recusa_a64: ?str = recusa_do_alvo_a64(o)
+        if recusa_a64 != none {
+            relatar_sem_fonte_stderr(common.X0003, recusa_a64 or_else "", sd)
+        }
+        return recusa_a64 == none
+    }
+    let causa = format(f"alvo desconhecido em --target: '{alvo}' (validos: x86_64-windows|x86_64-linux|wasm32-wasip1|wasm|aarch64-linux|aarch64-linux-android|aarch64-apple-ios|aarch64-apple-ios-sim)", alloc = heap)
+    defer delete(causa)
+    relatar_sem_fonte_stderr(common.X0002, cortar_causa(causa), sd)
+    return false
+}
+
+// C: driver/opcoes.c:510
+proc conferir_debug_code(o: ^Opcoes, sd: ^common.SaidaDiag) -> bool {
+    if (o.debug_code == none) or backend_eh_x64(o) {
+        return true
+    }
+    relatar_sem_fonte_stderr(common.X0003, "--debug-code so existe com --backend x64", sd)
+    return false
+}
+
+// C: driver/opcoes.c:517
+// Curto-circuito como o && do C: a 1a falha para as conferencias seguintes.
+proc opcoes_conferir_backend_alvo(o: ^Opcoes, sd: ^common.SaidaDiag) -> bool {
+    return conferir_backend(o, sd) and conferir_debug_code(o, sd) and opcoes_conferir_so_x64(o, sd) and conferir_alvo(o, sd)
+}
+
+// C: driver/opcoes.c:523
+proc validar_stdin(o: ^Opcoes) -> ?str {
+    if (not o.stdin_fonte) or (common.c2f_b2i32(comando_eh(o, "check")) != 0) {
+        return none
+    }
+    return "--stdin so vale no comando check"
+}
+
+// C: driver/opcoes.c:530
+proc validar_filtro(o: ^Opcoes) -> ?str {
+    if o.filtro == none {
+        return none
+    }
+    if not comando_eh(o, "test") {
+        return "--filtro so vale no comando test"
+    }
+    if (len((o.filtro or_else "")) as u64) > (OPCOES_FILTRO_MAX as u64) {
+        return "--filtro aceita no maximo 255 bytes"
+    }
+    return none
+}
+
+// C: driver/opcoes.c:539
+proc validar_args_programa(o: ^Opcoes) -> ?str {
+    if (o.nargs_programa > 0) and (not comando_eh(o, "run")) {
+        return "argumentos depois de -- so valem em run"
+    }
+    return none
+}
+
+// C: driver/opcoes.c:546
+proc validar_limites(o: ^Opcoes) -> ?str {
+    var limites: Limites = Limites{}
+    let tem_limite: bool = ((o.limite_tempo != none) or (o.limite_mem != none)) or (o.limite_saida != none)
+    if (not tem_limite) and (o.args_file == none) {
+        return none
+    }
+    if ((common.c2f_b2i32(tem_limite) != 0) and (not comando_eh(o, "run"))) and (not comando_eh(o, "test")) {
+        return "--limite-tempo, --limite-mem e --limite-saida so valem em run e test"
+    }
+    if (o.args_file != none) and (not comando_eh(o, "run")) {
+        return "--args-file so vale em run"
+    }
+    return limites_ler(o, &limites)
+}
+
+// C: driver/opcoes.c:558
+// Alguma opcao que so faz sentido para UM arquivo .fj (saida, modo, tempos, --suporte, ...): nenhuma delas vale no build de projeto.
+proc tem_opcao_de_arquivo(o: ^Opcoes) -> bool {
+    if (o.saida != none) or (o.modo != none) or (o.tempos != none) or (o.prova != none) or (o.debug_code != none) {
+        return true
+    }
+    if (o.max_erros != none) or (o.filtro != none) or (o.entradas != none) or (o.lib_pasta != none) {
+        return true
+    }
+    if (o.limite_tempo != none) or (o.limite_mem != none) or (o.limite_saida != none) or (o.args_file != none) {
+        return true
+    }
+    if (o.checagem != none) or (o.sem_otim != none) {
+        return true
+    }
+    return o.tipos or o.suporte or o.traco or o.rastreio or o.guarda_memoria or o.perfil or o.stdin_fonte or o.resumo or (o.nargs_programa > 0)
+}
+
+// C: driver/opcoes.c:570
+proc validar_resumo(o: ^Opcoes) -> ?str {
+    if ((((not o.resumo) or (common.c2f_b2i32(comando_eh(o, "check")) != 0)) or (common.c2f_b2i32(comando_eh(o, "build")) != 0)) or (common.c2f_b2i32(comando_eh(o, "test")) != 0)) or (common.c2f_b2i32(comando_eh(o, "run")) != 0) {
+        return none
+    }
+    return "--resumo so vale em check, build, run e test"
+}
+
+// C: driver/opcoes.c:577
+// --projeto [forja.proj] [--release] [--plano] [--tudo] [--json]: so no build; o argumento e o manifesto, nunca um .fj.
+proc validar_projeto(o: ^Opcoes) -> ?str {
+    let entrada: str = o.entrada or_else ""
+    let tam: int = len(entrada)
+    var jobs: u32 = 0
+    if not comando_eh(o, "build") {
+        return "--projeto, --plano, --tudo e --jobs so valem em build"
+    }
+    if not o.projeto {
+        return "--plano, --tudo e --jobs so valem com --projeto"
+    }
+    if (o.jobs != none) and (not opcoes_jobs_texto(o.jobs, &jobs)) {
+        return "--jobs aceita um numero inteiro de 1 a 64"
+    }
+    if tem_opcao_de_arquivo(o) {
+        return "--projeto nao aceita -o, --modo, --tempos, --suporte nem as opcoes de um arquivo .fj"
+    }
+    if (tam >= 3) and (common.c2f_stricmp(entrada[(tam - 3)..<tam], ".fj") == 0) {
+        return "--projeto recebe o forja.proj, nao um arquivo .fj"
+    }
+    return none
+}
+
+// C: driver/opcoes.c:590
+proc opcoes_validar(o: ^Opcoes) -> ?str {
+    var erro: ?str = none
+    if not comando_conhecido(o) {
+        return "comando desconhecido"
+    }
+    if ((common.c2f_b2i32(o.sem_pos) != 0) or (o.no != none)) and (not comando_eh(o, "ast")) {
+        return "--sem-pos e --no so valem no comando ast"
+    }
+    if (common.c2f_b2i32(o.canonico) != 0) and (not comando_eh(o, "check")) {
+        return "--canonico so vale no comando check"
+    }
+    if ((((common.c2f_b2i32(o.projeto) != 0) and (not comando_eh(o, "ast"))) or (common.c2f_b2i32(o.plano) != 0)) or (common.c2f_b2i32(o.tudo) != 0)) or (o.jobs != none) {
+        return validar_projeto(o)
+    }
+    erro = validar_args_programa(o)
+    if erro != none {
+        return erro
+    }
+    erro = validar_limites(o)
+    if erro != none {
+        return erro
+    }
+    erro = validar_traco(o)
+    if erro != none {
+        return erro
+    }
+    erro = validar_rastreio(o)
+    if erro != none {
+        return erro
+    }
+    erro = validar_pie(o)
+    if erro != none {
+        return erro
+    }
+    erro = validar_guarda(o)
+    if erro != none {
+        return erro
+    }
+    erro = validar_perfil(o)
+    if erro != none {
+        return erro
+    }
+    erro = validar_simbolos(o)
+    if erro != none {
+        return erro
+    }
+    erro = validar_checagem(o)
+    if erro != none {
+        return erro
+    }
+    erro = validar_sem_otim(o)
+    if erro != none {
+        return erro
+    }
+    erro = validar_resumo(o)
+    if erro != none {
+        return erro
+    }
+    erro = validar_filtro(o)
+    if erro != none {
+        return erro
+    }
+    erro = validar_stdin(o)
+    if erro != none {
+        return erro
+    }
+    erro = validar_entradas(o)
+    if erro != none {
+        return erro
+    }
+    erro = validar_max_erros(o)
+    if erro != none {
+        return erro
+    }
+    erro = validar_suporte(o)
+    if erro != none {
+        return erro
+    }
+    erro = validar_debug_code(o)
+    if erro != none {
+        return erro
+    }
+    erro = validar_backend_alvo(o)
+    if erro != none {
+        return erro
+    }
+    if comando_eh(o, "explicar") {
+        return validar_explicar(o)
+    }
+    if comando_eh(o, "build") {
+        return validar_build(o)
+    }
+    if (common.c2f_b2i32(comando_eh(o, "test")) != 0) or (common.c2f_b2i32(comando_eh(o, "run")) != 0) {
+        return validar_test_run(o)
+    }
+    return validar_check_ast(o)
+}
+
+// C: driver/opcoes.c:641
+// Nome do alvo sem ':' e '/' (vira so o nome do arquivo virtual): std:text/parse -> std_text_parse. snprintf(saida, n, "%s") e a troca ate o NUL.
+proc nome_do_alvo_saneado(alvo: ?str, saida: []u8, n: u64) {
+    _ = common.c2f_snprintf(saida[0..<(n as int)], alvo or_else "")
+    let tam: int = common.c2f_strlen_b(saida[0..<(n as int)])
+    for k in 0..<tam {
+        if (saida[k] == 58) or (saida[k] == 47) { // ':' '/'
+            saida[k] = 95 // '_'
+        }
+    }
+}
+
+// C: driver/opcoes.c:651
+// forja test <alvo> (S4 P2): raiz sintetica em memoria (import "<alvo>" as alvo_teste + proc main) e caminho virtual <pasta>\<prefixo>_<nome>.teste.fj.
+// entrada passa a apontar para o caminho virtual; alvo_teste guarda o texto do import. none = ok ou nao e alvo.
+// raiz_alvo[320] e caminho_alvo[512] do C viram texto do alocador frame (nenhum dono os libera; o limite do buffer continua o erro de uso).
+proc opcoes_preparar_alvo_do_teste(o: ^Opcoes) -> ?str {
+    if (not comando_eh(o, "test")) or (o.entrada == none) or (not entrada_eh_alvo(o.entrada)) {
+        return none
+    }
+    let entrada: str = o.entrada or_else ""
+    var pasta: str = ""
+    switch r in os.cwd(alloc = heap) {
+    case str:
+        if len(r) >= PASTA_ALVO_MAX { // _getcwd(pasta, 256) falha (ERANGE) se nao cabe com o NUL
+            delete(r)
+            return "forja test std:<modulo>: nao consegui ler a pasta atual"
+        }
+        pasta = cortar_em_frame(r, PASTA_ALVO_MAX)
+        delete(r)
+    case os.OsError:
+        return "forja test std:<modulo>: nao consegui ler a pasta atual"
+    }
+    let raiz = format(f"import \"{entrada}\" as alvo_teste\nproc main() {{\n}}\n", alloc = heap)
+    defer delete(raiz)
+    if len(raiz) >= RAIZ_ALVO_MAX {
+        return "nome do modulo longo demais para forja test"
+    }
+    var nome_buf = make([dynamic]u8, alloc = heap, len = NOME_ALVO_MAX)
+    defer delete(nome_buf)
+    nome_do_alvo_saneado(o.entrada, nome_buf[..], NOME_ALVO_MAX as u64)
+    let nome: str = from_bytes(nome_buf[0..<common.c2f_strlen_b(nome_buf[..])], alloc = frame)
+    let caminho = format(f"{pasta}\\{nome}.teste.fj", alloc = heap)
+    defer delete(caminho)
+    if len(caminho) >= CAMINHO_ALVO_MAX {
+        return "caminho da pasta atual longo demais para forja test"
+    }
+    o.raiz_alvo = cortar_em_frame(raiz, RAIZ_ALVO_MAX)
+    o.caminho_alvo = cortar_em_frame(caminho, CAMINHO_ALVO_MAX)
+    o.alvo_teste = o.entrada
+    o.entrada = o.caminho_alvo
+    return none
+}

@@ -1,0 +1,349 @@
+// semantic/sem_matematica.fj - porte de compiler/semantic/sem_matematica.c
+// sha256 de semantic/sem_matematica.c: b25968de5becbb76dc29ff3cf98c162b571020133be0b7690bc70206edef8075
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "common"
+import "frontend"
+
+// C: semantic/sem_matematica.c:18
+proc eh_numero_ou_vetor(s: ^Semantica, t: u32) -> bool {
+    var t_v: u32 = t
+    if common.c2f_s2u_32(tipo_classe_de(&s.tipos, t_v)) == (TC_ARRAY as u32) {
+        t_v = tipo_de(&s.tipos, t_v).a
+    }
+    return tipo_eh_numerico(&s.tipos, t_v)
+}
+
+// C: semantic/sem_matematica.c:25
+proc indice_do_que_manda(e: ^frontend.Expr) -> u32 {
+    for i in (0 as u32)..<e.nargs {
+        if not ((e.args or_else {})[i].valor as ^frontend.Expr).flexivel {
+            return i
+        }
+    }
+    return 0
+}
+
+// C: semantic/sem_matematica.c:34
+proc tipar_um(s: ^Semantica, valor: ?^frontend.Expr, adotado: u32) -> bool {
+    var tern_1: u32 = TIPO_VAZIO as u32
+    if common.c2f_b2i32((valor as ^frontend.Expr).flexivel) != 0 {
+        tern_1 = adotado
+    }
+    return sem_checar(s, valor, tern_1)
+}
+
+// C: semantic/sem_matematica.c:40
+proc sem_tipar_argumentos(s: ^Semantica, e: ^frontend.Expr, contexto_literal: u32) -> bool {
+    let base: u32 = indice_do_que_manda(e)
+    if not tipar_um(s, (e.args or_else {})[base].valor, contexto_literal) {
+        return false
+    }
+    let manda: u32 = ((e.args or_else {})[base].valor as ^frontend.Expr).tipo
+    var i: u32 = 0
+    while i < e.nargs {
+        if (i != base) and (not tipar_um(s, (e.args or_else {})[i].valor, manda)) {
+            return false
+        }
+        i += 1
+    }
+    return true
+}
+
+// C: semantic/sem_matematica.c:52
+proc conferir_mesmo_tipo_numerico(s: ^Semantica, e: ^frontend.Expr) -> bool {
+    let args = e.args or_else {}
+    let tipo: u32 = (args[0].valor as ^frontend.Expr).tipo
+    for i in (1 as u32)..<e.nargs {
+        let v: ^frontend.Expr = args[i].valor as ^frontend.Expr
+        if v.tipo == tipo {
+            continue
+        }
+        let a = sem_descrever_str(s, tipo)
+        defer delete(a)
+        let b = sem_descrever_str(s, v.tipo)
+        defer delete(b)
+        let quem = sem_nome_texto(s, e.nome)
+        let msg_1 = format(f"{quem} pede valores do mesmo tipo: {a} e {b}", alloc = heap)
+        defer delete(msg_1)
+        return sem_erro(s, common.E0334, v.pos, msg_1)
+    }
+    if eh_numero_ou_vetor(s, tipo) {
+        return true
+    }
+    let a = sem_descrever_str(s, tipo)
+    defer delete(a)
+    let quem = sem_nome_texto(s, e.nome)
+    let msg_2 = format(f"{quem} pede numero (inteiro, real, unidade ou [N]T deles), nao {a}", alloc = heap)
+    defer delete(msg_2)
+    return sem_erro(s, common.E0334, (args[0].valor as ^frontend.Expr).pos, msg_2)
+}
+
+// C: semantic/sem_matematica.c:69
+proc valor_constante(s: ^Semantica, e: ?^frontend.Expr, valor: ^f64) -> bool {
+    var negativo: bool = false
+    var magnitude: u64 = 0
+    let ee: ^frontend.Expr = e as ^frontend.Expr
+    if sem_inteiro_constante(s, e, &negativo, &magnitude) {
+        if negativo {
+            valor^ = -(magnitude as f64)
+        } else {
+            valor^ = magnitude as f64
+        }
+        return true
+    }
+    var numero: ^frontend.Expr = ee
+    if (ee.tipo_no == (frontend.EX_UNARIO as u8)) and (ee.op == (frontend.OP_NEGAR as u8)) {
+        numero = ee.a as ^frontend.Expr
+    }
+    if numero.tipo_no != (frontend.EX_REAL as u8) {
+        return false
+    }
+    // strtod(texto + pos_op, NULL): transmute de fatia para str nao existe (E0304), entao copia so o trecho que o strtod leria (digitos . e E + -); o resto nunca entra no numero
+    let texto: []u8 = (s.fonte as ^common.Fonte).texto
+    let ini: int = numero.pos_op as int
+    var fim_trecho: int = ini
+    while (fim_trecho < len(texto)) and ((texto[fim_trecho] >= 48 and texto[fim_trecho] <= 57) or texto[fim_trecho] == 46 or texto[fim_trecho] == 101 or texto[fim_trecho] == 69 or texto[fim_trecho] == 43 or texto[fim_trecho] == 45) {
+        fim_trecho += 1
+    }
+    let trecho = from_bytes(texto[ini..<fim_trecho], alloc = heap)
+    defer delete(trecho)
+    var fim: int = 0
+    valor^ = common.c2f_strtod(trecho, &fim)
+    if numero != ee {
+        valor^ = -valor^
+    }
+    return true
+}
+
+// C: semantic/sem_matematica.c:85
+proc conferir_intervalo(s: ^Semantica, e: ^frontend.Expr) -> bool {
+    var lo: f64 = 0.0
+    var hi: f64 = 0.0
+    let vlo: ?^frontend.Expr = (e.args or_else {})[1].valor
+    let vhi: ?^frontend.Expr = (e.args or_else {})[2].valor
+    if ((not valor_constante(s, vlo, &lo)) or (not valor_constante(s, vhi, &hi))) or (lo <= hi) {
+        return true
+    }
+    let msg_1 = format(f"clamp com lo maior que hi: o intervalo [lo, hi] fica vazio", alloc = heap)
+    defer delete(msg_1)
+    return sem_erro(s, common.E0334, (vlo as ^frontend.Expr).pos, msg_1)
+}
+
+// C: semantic/sem_matematica.c:93
+proc chamar_min_max(s: ^Semantica, e: ^frontend.Expr) -> bool {
+    if (not sem_ligar_embutido(s, e, s.params_minmax[..])) or (not sem_tipar_argumentos(s, e, TIPO_VAZIO as u32)) {
+        return false
+    }
+    if not conferir_mesmo_tipo_numerico(s, e) {
+        return false
+    }
+    e.tipo = ((e.args or_else {})[0].valor as ^frontend.Expr).tipo
+    return true
+}
+
+// C: semantic/sem_matematica.c:101
+proc chamar_clamp(s: ^Semantica, e: ^frontend.Expr) -> bool {
+    if (not sem_ligar_embutido(s, e, s.params_clamp[..])) or (not sem_tipar_argumentos(s, e, TIPO_VAZIO as u32)) {
+        return false
+    }
+    if (not conferir_mesmo_tipo_numerico(s, e)) or (not conferir_intervalo(s, e)) {
+        return false
+    }
+    e.tipo = ((e.args or_else {})[0].valor as ^frontend.Expr).tipo
+    return true
+}
+
+// C: semantic/sem_matematica.c:110
+proc chamar_abs(s: ^Semantica, e: ^frontend.Expr) -> bool {
+    if (not sem_ligar_embutido(s, e, s.params_um[..])) or (not sem_tipar_argumentos(s, e, TIPO_VAZIO as u32)) {
+        return false
+    }
+    let tipo: u32 = ((e.args or_else {})[0].valor as ^frontend.Expr).tipo
+    if sem_eh_quat(s, tipo) {
+        return sem_abs_de_quat(s, e) // v1.11 L14b: abs(q) = a norma
+    }
+    let com_sinal: bool = tipo_eh_inteiro(tipo) and (not tipo_eh_sem_sinal(tipo))
+    if (not com_sinal) and (not tipo_eh_real(&s.tipos, tipo)) {
+        let texto = sem_descrever_str(s, tipo)
+        defer delete(texto)
+        let msg_1 = format(f"abs pede inteiro com sinal ou real, nao {texto} (sem sinal nao tem abs)", alloc = heap)
+        defer delete(msg_1)
+        return sem_erro(s, common.E0334, ((e.args or_else {})[0].valor as ^frontend.Expr).pos, msg_1)
+    }
+    e.tipo = tipo
+    return true
+}
+
+// C: semantic/sem_matematica.c:126
+proc chamar_sqrt(s: ^Semantica, e: ^frontend.Expr) -> bool {
+    if (not sem_ligar_embutido(s, e, s.params_um[..])) or (not sem_tipar_argumentos(s, e, TIPO_F32 as u32)) {
+        return false
+    }
+    let tipo: u32 = ((e.args or_else {})[0].valor as ^frontend.Expr).tipo
+    if (tipo != (TIPO_F32 as u32)) and (tipo != (TIPO_F64 as u32)) {
+        let texto = sem_descrever_str(s, tipo)
+        defer delete(texto)
+        let msg_1 = format(f"sqrt pede f32 ou f64 sem unidade, nao {texto}", alloc = heap)
+        defer delete(msg_1)
+        return sem_erro(s, common.E0334, ((e.args or_else {})[0].valor as ^frontend.Expr).pos, msg_1)
+    }
+    e.tipo = tipo
+    return true
+}
+
+// G3 S5: testes dirigidos (so existem em `forja test`)
+test "sem_matematica: eh_numero_ou_vetor, indice_do_que_manda e conferir_mesmo_tipo_numerico" {
+    var pre: [1]str = {"min"}
+    var c = S5Cena{}
+    s5_cena_montar(&c, pre[..])
+    let i32t: u32 = TIPO_I32 as u32
+    expect(eh_numero_ou_vetor(&c.sv, i32t) and eh_numero_ou_vetor(&c.sv, TIPO_F32 as u32) and eh_numero_ou_vetor(&c.sv, tipo_array(&c.sv.tipos, i32t, 3)))
+    expect(not eh_numero_ou_vetor(&c.sv, TIPO_BOOL as u32) and not eh_numero_ou_vetor(&c.sv, tipo_array(&c.sv.tipos, TIPO_BOOL as u32, 3)))
+    var tres: [3]u32 = {i32t, i32t, i32t}
+    var ch = S5Chamada{}
+    s5_chamada_montar(&ch, s5_nome(&c, "min"), tres[..])
+    expect(indice_do_que_manda(&ch.e) == 0)
+    ch.folhas[0].flexivel = true
+    expect(indice_do_que_manda(&ch.e) == 1)
+    ch.folhas[1].flexivel = true
+    expect(indice_do_que_manda(&ch.e) == 2)
+    ch.folhas[2].flexivel = true
+    expect(indice_do_que_manda(&ch.e) == 0)
+    ch.folhas[0].flexivel = false
+    ch.folhas[1].flexivel = false
+    ch.folhas[2].flexivel = false
+    expect(conferir_mesmo_tipo_numerico(&c.sv, &ch.e))
+    ch.folhas[2].tipo = TIPO_INT as u32
+    expect(not conferir_mesmo_tipo_numerico(&c.sv, &ch.e))
+    expect(c.diag.codigo == common.E0334 and c.diag.off == 102 and (c.diag.causa or_else "") == "min pede valores do mesmo tipo: i32 e int")
+    ch.folhas[2].tipo = i32t
+    ch.folhas[0].tipo = TIPO_BOOL as u32
+    ch.folhas[1].tipo = TIPO_BOOL as u32
+    ch.folhas[2].tipo = TIPO_BOOL as u32
+    expect(not conferir_mesmo_tipo_numerico(&c.sv, &ch.e))
+    expect(c.diag.codigo == common.E0334 and c.diag.off == 100 and (c.diag.causa or_else "") == "min pede numero (inteiro, real, unidade ou [N]T deles), nao bool")
+    s5_chamada_liberar(&ch)
+    s5_cena_liberar(&c)
+}
+
+test "sem_matematica: valor_constante (inteiro, real, negado)" {
+    var c = S5Cena{}
+    s5_cena_montar(&c, {})
+    s5_cena_texto(&c, "2.5 1e3 7")
+    var v: f64 = 0.0
+    var lit = s5_inteiro(5, 0)
+    expect(valor_constante(&c.sv, &lit, &v) and v == 5.0)
+    var uno = s5_inteiro(3, 0)
+    var neg = frontend.Expr{tipo_no = frontend.EX_UNARIO as u8, op = frontend.OP_NEGAR as u8, a = &uno}
+    expect(valor_constante(&c.sv, &neg, &v) and v == -3.0)
+    var real = frontend.Expr{tipo_no = frontend.EX_REAL as u8, pos_op = 0}
+    expect(valor_constante(&c.sv, &real, &v) and v == 2.5)
+    real.pos_op = 4
+    expect(valor_constante(&c.sv, &real, &v) and v == 1000.0)
+    real.pos_op = 0
+    var negr = frontend.Expr{tipo_no = frontend.EX_UNARIO as u8, op = frontend.OP_NEGAR as u8, a = &real}
+    expect(valor_constante(&c.sv, &negr, &v) and v == -2.5)
+    var nome = frontend.Expr{tipo_no = frontend.EX_NOME as u8}
+    expect(not valor_constante(&c.sv, &nome, &v))
+    s5_cena_liberar(&c)
+}
+
+test "sem_matematica: chamar_min_max, chamar_clamp, chamar_abs e chamar_sqrt" {
+    var pre: [5]str = {"min", "max", "clamp", "abs", "sqrt"}
+    var c = S5Cena{}
+    s5_cena_montar(&c, pre[..])
+    s5_cena_texto(&c, "2.5 1.5 4")
+    let i32t: u32 = TIPO_I32 as u32
+    let f32t: u32 = TIPO_F32 as u32
+    var dois: [2]u32 = {i32t, i32t}
+    var ch = S5Chamada{}
+    // min/max
+    s5_chamada_montar(&ch, s5_nome(&c, "min"), dois[..])
+    expect(chamar_min_max(&c.sv, &ch.e) and ch.e.tipo == i32t)
+    expect(sem_chamar_matematica(&c.sv, &ch.e, frontend.EMB_MIN) and sem_chamar_matematica(&c.sv, &ch.e, frontend.EMB_MAX) and ch.e.tipo == i32t)
+    ch.folhas[1].tipo = f32t
+    expect(not chamar_min_max(&c.sv, &ch.e))
+    expect(c.diag.codigo == common.E0334 and c.diag.off == 101 and (c.diag.causa or_else "") == "min pede valores do mesmo tipo: i32 e f32")
+    s5_chamada_liberar(&ch)
+    // clamp: lo <= hi passa; lo > hi (constantes inteiras e reais, negado) erra no lo
+    var tres: [3]u32 = {i32t, i32t, i32t}
+    s5_chamada_montar(&ch, s5_nome(&c, "clamp"), tres[..])
+    ch.folhas[1] = s5_inteiro(2, 101)
+    ch.folhas[1].flexivel = true
+    ch.folhas[2] = s5_inteiro(5, 102)
+    ch.folhas[2].flexivel = true
+    expect(sem_chamar_matematica(&c.sv, &ch.e, frontend.EMB_CLAMP) and ch.e.tipo == i32t)
+    ch.folhas[1] = s5_inteiro(5, 101)
+    ch.folhas[1].flexivel = true
+    expect(sem_chamar_matematica(&c.sv, &ch.e, frontend.EMB_CLAMP))
+    ch.folhas[2] = s5_inteiro(2, 102)
+    ch.folhas[2].flexivel = true
+    expect(not sem_chamar_matematica(&c.sv, &ch.e, frontend.EMB_CLAMP))
+    expect(c.diag.codigo == common.E0334 and c.diag.off == 101 and (c.diag.causa or_else "") == "clamp com lo maior que hi: o intervalo [lo, hi] fica vazio")
+    // -1 > -3
+    var u1 = s5_inteiro(1, 111)
+    var u3 = s5_inteiro(3, 113)
+    u1.flexivel = true
+    u3.flexivel = true
+    var n1 = frontend.Expr{tipo_no = frontend.EX_UNARIO as u8, op = frontend.OP_NEGAR as u8, a = &u1, pos = 110, flexivel = true}
+    var n3 = frontend.Expr{tipo_no = frontend.EX_UNARIO as u8, op = frontend.OP_NEGAR as u8, a = &u3, pos = 112, flexivel = true}
+    ch.args[1].valor = &n1
+    ch.args[2].valor = &n3
+    expect(not sem_chamar_matematica(&c.sv, &ch.e, frontend.EMB_CLAMP))
+    expect(c.diag.off == 110 and (c.diag.causa or_else "") == "clamp com lo maior que hi: o intervalo [lo, hi] fica vazio")
+    ch.args[1].valor = &n3
+    ch.args[2].valor = &n1
+    expect(sem_chamar_matematica(&c.sv, &ch.e, frontend.EMB_CLAMP))
+    s5_chamada_liberar(&ch)
+    // clamp real: x f32, lo 2.5, hi 1.5
+    var tres_f: [3]u32 = {f32t, f32t, f32t}
+    s5_chamada_montar(&ch, s5_nome(&c, "clamp"), tres_f[..])
+    ch.folhas[1] = frontend.Expr{tipo_no = frontend.EX_REAL as u8, pos_op = 0, pos = 121, flexivel = true}
+    ch.folhas[2] = frontend.Expr{tipo_no = frontend.EX_REAL as u8, pos_op = 4, pos = 122, flexivel = true}
+    expect(not chamar_clamp(&c.sv, &ch.e))
+    expect(c.diag.off == 121 and (c.diag.causa or_else "") == "clamp com lo maior que hi: o intervalo [lo, hi] fica vazio")
+    ch.folhas[1].pos_op = 4
+    ch.folhas[2].pos_op = 0
+    expect(chamar_clamp(&c.sv, &ch.e) and ch.e.tipo == f32t)
+    s5_chamada_liberar(&ch)
+    // abs: com sinal e real passam; sem sinal e bool erram
+    var um: [1]u32 = {i32t}
+    s5_chamada_montar(&ch, s5_nome(&c, "abs"), um[..])
+    expect(sem_chamar_matematica(&c.sv, &ch.e, frontend.EMB_ABS) and ch.e.tipo == i32t)
+    ch.folhas[0].tipo = f32t
+    expect(chamar_abs(&c.sv, &ch.e) and ch.e.tipo == f32t)
+    ch.folhas[0].tipo = TIPO_U32 as u32
+    expect(not chamar_abs(&c.sv, &ch.e))
+    expect(c.diag.codigo == common.E0334 and c.diag.off == 100 and (c.diag.causa or_else "") == "abs pede inteiro com sinal ou real, nao u32 (sem sinal nao tem abs)")
+    ch.folhas[0].tipo = TIPO_BOOL as u32
+    expect(not chamar_abs(&c.sv, &ch.e))
+    expect((c.diag.causa or_else "") == "abs pede inteiro com sinal ou real, nao bool (sem sinal nao tem abs)")
+    s5_chamada_liberar(&ch)
+    // sqrt: f32 e f64 passam; inteiro erra
+    var uf: [1]u32 = {f32t}
+    s5_chamada_montar(&ch, s5_nome(&c, "sqrt"), uf[..])
+    expect(sem_chamar_matematica(&c.sv, &ch.e, frontend.EMB_SQRT) and ch.e.tipo == f32t)
+    ch.folhas[0].tipo = TIPO_F64 as u32
+    expect(chamar_sqrt(&c.sv, &ch.e) and ch.e.tipo == (TIPO_F64 as u32))
+    ch.folhas[0].tipo = i32t
+    expect(not chamar_sqrt(&c.sv, &ch.e))
+    expect(c.diag.codigo == common.E0334 and c.diag.off == 100 and (c.diag.causa or_else "") == "sqrt pede f32 ou f64 sem unidade, nao i32")
+    s5_chamada_liberar(&ch)
+    s5_cena_liberar(&c)
+}
+
+// C: semantic/sem_matematica.c:139
+proc sem_chamar_matematica(s: ^Semantica, e: ^frontend.Expr, embutido: i32) -> bool {
+    if (embutido == frontend.EMB_MIN) or (embutido == frontend.EMB_MAX) {
+        return chamar_min_max(s, e)
+    }
+    if embutido == frontend.EMB_CLAMP {
+        return chamar_clamp(s, e)
+    }
+    if embutido == frontend.EMB_ABS {
+        return chamar_abs(s, e)
+    }
+    return chamar_sqrt(s, e)
+}

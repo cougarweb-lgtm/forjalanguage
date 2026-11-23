@@ -1,0 +1,326 @@
+// cache/entradas_ler.fj - porte de compiler/cache/entradas_ler.c, compiler/cache/entradas_ler.h
+// sha256 de cache/entradas_ler.c: 0912c5e19f1b2e1a3eee57e5cbf6c4fa771a46d1180fc8ebf23a00f06fed9323
+// sha256 de cache/entradas_ler.h: 48f4f3ef88629b6a055e964f9e50d4238449eaa60107ee805a9d21149ebe46f6
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.2.0
+// Changelog: 0.2.0 - G3 V4-W9: corpo real. ArquivoLerInteiro devolve os bytes em [dynamic]u8 com um byte 0 no fim (sem malloc); DividirTabs vira contar_tabs + campo_de_tab (sem fatia guardada em parametro); o tipo guarda 3 bytes como o C (tipo[4]).
+
+import "std:file"
+import "common"
+
+pub struct EntradaGravada {
+    tipo: ?str
+    caminho: ?str
+    tamanho: u64
+    mtime: u64
+    hash: u64
+}
+
+const ENTRADAS_CABECALHO: str = "# forja-entradas 1\n"
+const ENTRADAS_CAMPOS: i32 = 5
+const ENTRADAS_ARQUIVO_MAX: i64 = 2147483647
+// C: tipo[4] = 3 bytes + NUL. "pasta" grava "pas" e "load" grava "loa" (bug do C, reproduzido: EntradaHashAtual nunca ve "pasta")
+const ENTRADAS_TIPO_MAX: int = 3
+// C: FILETIME de 1970-01-01 (100 ns desde 1601). O std da mtime_ns = (FILETIME - esta epoca) * 100.
+const ENTRADAS_EPOCA_FILETIME: u64 = 116444736000000000
+const ENTRADAS_TAB: u8 = 9
+const ENTRADAS_NL: u8 = 10
+
+// Bytes como str ate o 1o byte 0 (o C le assim, com strlen). Emprestado: vale enquanto dados viver.
+proc texto_c_de_bytes(dados: []u8) -> str {
+    if len(dados) == 0 {
+        return ""
+    }
+    return &dados[0] as rawptr as cstr as str
+}
+
+// C: MedirEVoltar. Arquivo que passa de ENTRADAS_ARQUIVO_MAX ou nao mede: nao cabe.
+proc arquivo_cabe_no_limite(caminho: str) -> bool {
+    switch info in file.stat(caminho) {
+    case file.FileInfo:
+        return info.size <= ENTRADAS_ARQUIVO_MAX
+    case file.FileError:
+        return false
+    }
+    return false
+}
+
+// C: ArquivoLerInteiro. Bytes crus do arquivo em dados, seguidos de 1 byte 0 (o C faz dados[tam] = '\0'); o texto e len(dados) - 1. false = passa do limite, nao existe ou nao le.
+pub proc arquivo_ler_inteiro(caminho: str, dados: ^[dynamic]u8) -> bool {
+    if not arquivo_cabe_no_limite(caminho) {
+        return false
+    }
+    var _motivo: str = ""
+    if not common.c2f_ler_arquivo(caminho, dados, &_motivo) {
+        return false
+    }
+    append(dados, item = 0)
+    return true
+}
+
+// C: ArquivoMedir. Tamanho e mtime (FILETIME, 100 ns). false = nao existe.
+pub proc arquivo_medir(caminho: str, tamanho: ^u64, mtime: ^u64) -> bool {
+    switch info in file.stat(caminho) {
+    case file.FileInfo:
+        tamanho^ = common.c2f_s2u_64(info.size)
+        mtime^ = wrapping_add(common.c2f_s2u_64(info.mtime_ns / 100), ENTRADAS_EPOCA_FILETIME)
+        return true
+    case file.FileError:
+        return false
+    }
+    return false
+}
+
+// Quantos TABs ha na linha. Cada campo e o pedaco entre dois TABs (ou o inicio/fim da linha).
+proc contar_tabs(linha: str) -> int {
+    var n: int = 0
+    for i in 0..<len(linha) {
+        if linha[i] == ENTRADAS_TAB {
+            n += 1
+        }
+    }
+    return n
+}
+
+// O campo k (0 = primeiro) da linha separada por TAB. Campo que nao existe volta vazio.
+proc campo_de_tab(linha: str, k: int) -> str {
+    var atual: int = 0
+    var inicio: int = 0
+    for i in 0..<len(linha) {
+        if linha[i] == ENTRADAS_TAB {
+            if atual == k {
+                return linha[inicio..<i]
+            }
+            atual += 1
+            inicio = i + 1
+        }
+    }
+    if atual == k {
+        return linha[inicio..<len(linha)]
+    }
+    return ""
+}
+
+// C: DividirTabs. Exatamente ENTRADAS_CAMPOS campos, isto e ENTRADAS_CAMPOS - 1 TABs.
+proc dividir_tabs(linha: str) -> bool {
+    return contar_tabs(linha) == ((ENTRADAS_CAMPOS as int) - 1)
+}
+
+// C: Numero. Inteiro sem sinal no texto todo, na base dada (strtoull: "-" nega, "0x" vale em base 16). Texto vazio = false.
+proc numero(texto: str, base: i32, valor: ^u64) -> bool {
+    if len(texto) == 0 {
+        return false
+    }
+    var fim: int = 0
+    valor^ = common.c2f_strtoull(texto, base, &fim)
+    return fim == len(texto)
+}
+
+// C: TemBomDoFj. .fj que comeca com BOM UTF-8 (EF BB BF); so o tipo "fj" tira o BOM.
+proc tem_bom_do_fj(e: ^EntradaGravada, dados: []u8, tam: int) -> bool {
+    if (e.tipo or_else "") != "fj" {
+        return false
+    }
+    if tam < 3 {
+        return false
+    }
+    return dados[0] == 0xEF and dados[1] == 0xBB and dados[2] == 0xBF
+}
+
+// C: LerLinha. Campos tipo, caminho, tamanho, mtime e hash. false = linha torta; a lista inteira e descartada por quem chamou.
+proc ler_linha(linha: str, e: ^EntradaGravada) -> bool {
+    if not dividir_tabs(linha) {
+        return false
+    }
+    let tipo_lido = campo_de_tab(linha, 0)
+    if not tipo_valido(tipo_lido) {
+        return false
+    }
+    let caminho_lido = campo_de_tab(linha, 1)
+    if len(caminho_lido) >= (PROJETO_CAMINHO_MAX as int) {
+        return false
+    }
+    var tamanho: u64 = 0
+    var mtime: u64 = 0
+    var hash: u64 = 0
+    if not numero(campo_de_tab(linha, 2), 10, &tamanho) {
+        return false
+    }
+    if not numero(campo_de_tab(linha, 3), 10, &mtime) {
+        return false
+    }
+    if not numero(campo_de_tab(linha, 4), 16, &hash) {
+        return false
+    }
+    var tipo_guardado = tipo_lido
+    if len(tipo_guardado) > ENTRADAS_TIPO_MAX {
+        tipo_guardado = tipo_lido[0..<ENTRADAS_TIPO_MAX]
+    }
+    e.tipo = format(f"{tipo_guardado}", alloc = frame)
+    e.caminho = format(f"{caminho_lido}", alloc = frame)
+    e.tamanho = tamanho
+    e.mtime = mtime
+    e.hash = hash
+    return true
+}
+
+// Indice do primeiro '\n' a partir de inicio; -1 se nao ha (o strchr do C).
+proc fim_da_linha(p: str, inicio: int) -> int {
+    for i in inicio..<len(p) {
+        if p[i] == ENTRADAS_NL {
+            return i
+        }
+    }
+    return -1
+}
+
+// C: LerLinhasDoTexto. Toda linha termina em '\n' (sem ele e torta); texto vazio = nenhuma linha.
+proc ler_linhas_do_texto(p: str, linhas: ^[dynamic]EntradaGravada) -> bool {
+    var inicio: int = 0
+    while inicio < len(p) {
+        let fim = fim_da_linha(p, inicio)
+        if fim < 0 {
+            return false
+        }
+        var e = EntradaGravada{}
+        if not ler_linha(p[inicio..<fim], &e) {
+            return false
+        }
+        append(linhas, item = e)
+        inicio = fim + 1
+    }
+    return true
+}
+
+// C: VecIniciar. Lista pronta para empurrar (heap) e vazia.
+proc lista_de_entradas_vazia(linhas: ^[dynamic]EntradaGravada) {
+    if cap(linhas) == 0 {
+        linhas^ = make([dynamic]EntradaGravada, alloc = heap)
+    }
+    clear(linhas)
+}
+
+// C: EntradasLer. Le o .entradas para linhas (lista de EntradaGravada). false = nao existe, cabecalho ausente ou linha torta; linhas fica vazia.
+pub proc entradas_ler(caminho: str, linhas: ^[dynamic]EntradaGravada) -> bool {
+    lista_de_entradas_vazia(linhas)
+    var texto = make([dynamic]u8, alloc = heap)
+    defer delete(texto)
+    if not arquivo_ler_inteiro(caminho, &texto) {
+        return false
+    }
+    let todo = texto_c_de_bytes(texto[..])
+    if not common.c2f_prefixo_igual(todo, ENTRADAS_CABECALHO, len(ENTRADAS_CABECALHO)) {
+        return false
+    }
+    let ok = ler_linhas_do_texto(todo[len(ENTRADAS_CABECALHO)..<len(todo)], linhas)
+    if not ok {
+        clear(linhas)
+    }
+    return ok
+}
+
+// C: EntradaHashAtual. Hash de hoje do arquivo da linha; com tamanho e mtime iguais aos gravados e mtime < inicio_build, devolve o gravado.
+pub proc entrada_hash_atual(e: ^EntradaGravada, inicio_build: u64, hash_c: ^u64) -> bool {
+    let caminho = e.caminho or_else ""
+    var tamanho: u64 = 0
+    var mtime: u64 = 0
+    if not arquivo_medir(caminho, &tamanho, &mtime) {
+        return false
+    }
+    if (e.tipo or_else "") == "pasta" {
+        hash_c^ = common.pasta_hash_de_hoje(caminho)
+        return true
+    }
+    if atalho_valido(e, tamanho, mtime, inicio_build) {
+        hash_c^ = e.hash
+        return true
+    }
+    var dados = make([dynamic]u8, alloc = heap)
+    defer delete(dados)
+    if not arquivo_ler_inteiro(caminho, &dados) {
+        return false
+    }
+    let tam = len(dados) - 1
+    var pula: int = 0
+    if tem_bom_do_fj(e, dados[..], tam) {
+        pula = 3
+    }
+    hash_c^ = common.hash64(dados[pula..<tam], (tam - pula) as u64, common.HASH64_SEMENTE)
+    return true
+}
+
+// C: AtalhoValido. Tamanho e mtime iguais aos gravados e mtime anterior ao inicio do build: o hash gravado vale.
+proc atalho_valido(e: ^EntradaGravada, tamanho: u64, mtime: u64, inicio_build: u64) -> bool {
+    return ((tamanho == e.tamanho) and (mtime == e.mtime)) and (mtime < inicio_build)
+}
+
+// C: TipoValido. Tipo de linha aceito: "fj", "lib", "load" ou "pasta".
+proc tipo_valido(tipo: str) -> bool {
+    return (((tipo == "fj") or (tipo == "lib")) or (tipo == "load")) or (tipo == "pasta")
+}
+
+// Testes dirigidos (C: DividirTabs, Numero, TipoValido, LerLinha, LerLinhasDoTexto, TemBomDoFj); valores conferidos a mao contra o C.
+test "entradas: campos por TAB e linha com 5 campos" {
+    expect(contar_tabs("a\tbb\tc") == 2)
+    expect(campo_de_tab("a\tbb\tc", 1) == "bb")
+    expect(campo_de_tab("a\tbb\tc", 2) == "c")
+    expect(campo_de_tab("a\tbb\tc", 3) == "")
+    expect(dividir_tabs("fj\tx\t1\t2\t3"))
+    expect(not dividir_tabs("fj\tx\t1\t2"))
+    expect(not dividir_tabs("fj\tx\t1\t2\t3\t4"))
+}
+
+test "entradas: numero como strtoull (base 10 e 16)" {
+    var v: u64 = 0
+    expect(numero("123", 10, &v))
+    expect(v == 123)
+    expect(not numero("12x", 10, &v))
+    expect(not numero("", 10, &v))
+    expect(numero("ff", 16, &v))
+    expect(v == 255)
+    expect(numero("0x1F", 16, &v))
+    expect(v == 31)
+}
+
+test "entradas: fim de linha e tipos validos" {
+    expect(fim_da_linha("ab\ncd", 0) == 2)
+    expect(fim_da_linha("ab", 0) == -1)
+    expect(tipo_valido("pasta"))
+    expect(tipo_valido("load"))
+    expect(not tipo_valido("dir"))
+}
+
+test "entradas: tipo guardado em 3 bytes como o C (tipo[4])" {
+    var e = EntradaGravada{}
+    expect(ler_linha("pasta\tC:\\p\t10\t20\t1f", &e))
+    expect((e.tipo or_else "") == "pas")
+    expect((e.caminho or_else "") == "C:\\p")
+    expect(e.tamanho == 10 and e.mtime == 20 and e.hash == 31)
+    var f = EntradaGravada{}
+    expect(ler_linha("fj\tx.fj\t1\t2\t0", &f))
+    expect((f.tipo or_else "") == "fj")
+}
+
+test "entradas: linha torta e recusada" {
+    var e = EntradaGravada{}
+    expect(not ler_linha("dir\tx\t1\t2\t3", &e))
+    expect(not ler_linha("fj\tx\t1\t2", &e))
+    expect(not ler_linha("fj\tx\tz\t2\t3", &e))
+}
+
+test "entradas: texto de linhas exige '\n' no fim de cada linha" {
+    var linhas = make([dynamic]EntradaGravada, alloc = heap)
+    defer delete(linhas)
+    expect(ler_linhas_do_texto("fj\tx.fj\t1\t2\t3\n", &linhas))
+    expect(len(linhas) == 1)
+    expect(not ler_linhas_do_texto("fj\tx.fj\t1\t2\t3", &linhas))
+}
+
+test "entradas: BOM do .fj so vale para tipo fj" {
+    var e = EntradaGravada{}
+    e.tipo = "fj"
+    var bom: [4]u8 = {0xEF, 0xBB, 0xBF, 0x41}
+    expect(tem_bom_do_fj(&e, bom[..], 4))
+    e.tipo = "lib"
+    expect(not tem_bom_do_fj(&e, bom[..], 4))
+}

@@ -1,0 +1,257 @@
+// frontend/parser_forma.fj - porte de compiler/frontend/parser_forma.c
+// sha256 de frontend/parser_forma.c: da9cdecbb05503a725fa4be5576dd275b356a2fdf779d5cbba64c14b36742c1c
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.2.0
+// Changelog: 0.2.0 - G3 P-front B: corpo real. Os char[N] do C (achado, anterior, onde, saida de cada frase) viram str: a frase e montada inteira com format e vai para o
+//            alocador frame (o Ocorrencia nao tem dono que a libere; o compilador nunca chama frame_reset). O corte do TEXTO_LOCAL (1024) nao age: o pior caso soma < 600 bytes e o
+//            DiagForma corta em 255. Cortes de precisao do C (%.130s, %.150s, PEDACO_MAX - 3) ficam explicitos. Anexar some (a frase sai pronta); abridor e str ("" = nenhum).
+
+import "common"
+
+struct Ocorrencia {
+    achado: str
+    anterior: str
+    onde: str
+    linha: u32
+    coluna_abridor: u32
+    tipo: i32
+    abridor: str // o '(' '[' ou '{' ainda aberto quando se esperava o fechamento; "" = nao se esperava fechamento ou nao achei
+}
+
+struct FechoPar {
+    esperado: str
+    abre: i32
+    fecha: i32
+    abridor: str
+}
+
+const PEDACO_MAX: i32 = 56
+const VARREDURA_MAX: i32 = 200
+const ONDE_MAX: i32 = 160
+const TEXTO_LOCAL: i32 = 1024
+
+// C2F-A0: FECHOS (parser_forma.c:27). abre/fecha sao TK_LPAREN/TK_RPAREN (40, 41), TK_LCOLCHETE/TK_RCOLCHETE (73, 74) e TK_LBRACE/TK_RBRACE (42, 43): const nao referencia const (E0301).
+const FECHOS: [3]FechoPar = {
+    FechoPar{esperado = "')'", abre = 40, fecha = 41, abridor = "("},
+    FechoPar{esperado = "']'", abre = 73, fecha = 74, abridor = "["},
+    FechoPar{esperado = "'}'", abre = 42, fecha = 43, abridor = "{"},
+}
+
+// strstr(s, ": "): o indice da 1a ocorrencia, ou -1.
+proc achar_dois_pontos(s: str) -> int {
+    var i = 0
+    while i + 1 < len(s) {
+        if s[i] == 58 and s[i + 1] == 32 { // ':' ' '
+            return i
+        }
+        i += 1
+    }
+    return -1
+}
+
+// "%.*s" do C sobre bytes de uma Fonte: no maximo n bytes, parando no 1o NUL (texto novo no frame).
+proc texto_ate_nul(f: ^common.Fonte, off: u32, n: int) -> str {
+    let ini = off as int
+    let bytes = f.texto[ini..<(ini + n)]
+    return from_bytes(bytes[0..<common.c2f_strlen_b(bytes)], alloc = frame)
+}
+
+// C: frontend/parser_forma.c:45
+// Binario: o ultimo token que comeca em off ou antes.
+proc indice_do_token(p: ^Parser, off: u32) -> u32 {
+    var ini: u32 = 0
+    var fim: u32 = len(p.toks) as u32
+    while fim - ini > 1 {
+        let meio = ini + (fim - ini) / 2
+        if p.toks[meio].off <= off {
+            ini = meio
+        } else {
+            fim = meio
+        }
+    }
+    return ini
+}
+
+// C: frontend/parser_forma.c:57
+// C2F-32: snprintf(destino, PEDACO_MAX, ...) -> a frase sai pronta (a maior, "'" + 53 bytes + "'", tem 55 bytes: cabe sem corte).
+proc token_entre_aspas(p: ^Parser, t: ^Token) -> str {
+    let tam = min(t.len_c as int, (PEDACO_MAX as int) - 3)
+    let tipo = t.tipo as i32
+    if tipo == TK_NL {
+        return "o fim da linha"
+    }
+    if tipo == TK_EOF {
+        return "o fim do arquivo"
+    }
+    let miolo = texto_ate_nul(p.fonte as ^common.Fonte, t.off, tam)
+    return format(f"'{miolo}'", alloc = frame)
+}
+
+// C: frontend/parser_forma.c:67
+// Posicao em FECHOS do fechamento esperado ("')'"), ou -1 se o esperado nao e um fechamento.
+proc indice_do_fecho(esperado: str) -> i32 {
+    for f in 0..<3 {
+        if esperado == FECHOS[f].esperado {
+            return f as i32
+        }
+    }
+    return -1
+}
+
+// C: frontend/parser_forma.c:76
+// Procura para tras, no mesmo comando, o abridor que o fechamento esperado deixaria em aberto; para em quebra de linha (menos para '}').
+proc localizar_abridor(p: ^Parser, indice: u32, esperado: str, o: ^Ocorrencia) {
+    let f = indice_do_fecho(esperado)
+    var profundidade: i32 = 0
+    if f < 0 {
+        return
+    }
+    let fecho = FECHOS[f]
+    var k: u32 = indice
+    while k > 0 and indice - k < (VARREDURA_MAX as u32) {
+        let t = &p.toks[k - 1]
+        let tipo = t.tipo as i32
+        if tipo == TK_NL and fecho.abre != TK_LBRACE {
+            return
+        }
+        if tipo == fecho.fecha {
+            profundidade += 1
+        } else if tipo == fecho.abre {
+            let era_zero = profundidade == 0 // profundidade-- == 0: testa o valor de antes
+            profundidade -= 1
+            if era_zero {
+                o.abridor = fecho.abridor
+                let pos = common.fonte_localizar_no_arquivo(p.fonte, t.off)
+                o.coluna_abridor = pos.coluna
+                return
+            }
+        }
+        k -= 1
+    }
+}
+
+// C: frontend/parser_forma.c:95
+proc ler_ocorrencia(p: ^Parser, indice: u32, o: ^Ocorrencia) {
+    o^ = Ocorrencia{}
+    let t = &p.toks[indice]
+    o.tipo = t.tipo as i32
+    o.linha = common.fonte_localizar_no_arquivo(p.fonte, t.off).linha
+    var onde: [160]u8 = {} // char onde[ONDE_MAX]
+    common.diag_descrever_onde(p.fonte, t.off, onde[..], ONDE_MAX as u64)
+    o.onde = from_bytes(onde[0..<common.c2f_strlen_b(onde[..])], alloc = frame)
+    o.achado = token_entre_aspas(p, t)
+    if indice > 0 and (p.toks[indice - 1].tipo as i32) != TK_NL {
+        o.anterior = token_entre_aspas(p, &p.toks[indice - 1])
+    }
+}
+
+// C: frontend/parser_forma.c:106
+// " depois de 'x'" ou "" no comeco do comando.
+proc depois_de(o: ^Ocorrencia) -> str {
+    if len(o.anterior) > 0 {
+        return format(f" depois de {o.anterior}", alloc = frame)
+    }
+    return ""
+}
+
+// C: frontend/parser_forma.c:112
+proc explicar_esperado(o: ^Ocorrencia, esperado: str) -> str {
+    let depois = depois_de(o)
+    var frase = ""
+    if o.tipo == TK_NL {
+        frase = format(f"Na {o.onde} o comando termina{depois}, mas o parser ainda esperava {esperado}.", alloc = frame)
+    } else if o.tipo == TK_EOF {
+        frase = format(f"O arquivo acaba na {o.onde}{depois}, mas o parser ainda esperava {esperado}.", alloc = frame)
+    } else {
+        frase = format(f"Na {o.onde} o parser esperava {esperado}{depois} e encontrou {o.achado}.", alloc = frame)
+    }
+    if len(o.abridor) > 0 {
+        return format(f"{frase} O '{o.abridor}' da coluna {o.coluna_abridor} continua aberto.", alloc = frame)
+    }
+    return frase
+}
+
+// C: frontend/parser_forma.c:124
+// O fechamento ()]} esperado: com o abridor achado, diz qual abridor fecha.
+proc forma_de_fechamento(o: ^Ocorrencia, esperado: str) -> str {
+    let depois = depois_de(o)
+    let fim = o.tipo == TK_NL or o.tipo == TK_EOF
+    if len(o.abridor) > 0 and fim {
+        return format(f"Feche o '{o.abridor}' da coluna {o.coluna_abridor} com {esperado} antes do fim da linha.", alloc = frame)
+    }
+    if len(o.abridor) > 0 {
+        return format(f"Escreva {esperado} logo{depois}, para fechar o '{o.abridor}' da coluna {o.coluna_abridor}; {o.achado} vem depois do fechamento.", alloc = frame)
+    }
+    if fim {
+        return format(f"Termine a linha com {esperado}.", alloc = frame)
+    }
+    return format(f"Escreva {esperado}{depois}, antes de {o.achado}.", alloc = frame)
+}
+
+// C: frontend/parser_forma.c:137
+proc forma_do_esperado(o: ^Ocorrencia, esperado: str) -> str {
+    let depois = depois_de(o)
+    let fim = o.tipo == TK_NL or o.tipo == TK_EOF
+    if indice_do_fecho(esperado) >= 0 {
+        return forma_de_fechamento(o, esperado)
+    }
+    if esperado == "expressao" and fim {
+        return format(f"Complete a linha com um valor, um nome ou uma conta{depois}.", alloc = frame)
+    }
+    if esperado == "expressao" {
+        return format(f"Escreva um valor, um nome ou uma conta{depois}; {o.achado} nao comeca uma expressao.", alloc = frame)
+    }
+    if esperado == "fim de linha" {
+        return format(f"Um comando por linha: quebre a linha antes de {o.achado}.", alloc = frame)
+    }
+    if o.tipo == TK_NL {
+        return format(f"Complete a linha {o.linha} com {esperado}{depois}.", alloc = frame)
+    }
+    if fim {
+        return format(f"Complete o arquivo com {esperado}{depois}.", alloc = frame)
+    }
+    return format(f"Escreva {esperado}{depois} no lugar de {o.achado}.", alloc = frame)
+}
+
+// C: frontend/parser_forma.c:153
+proc parser_forma_esperado(p: ^Parser, esperado: str) {
+    var o = Ocorrencia{}
+    let exemplo = achar_dois_pontos(esperado)
+    var n_cabeca = len(esperado)
+    if exemplo >= 0 {
+        n_cabeca = exemplo
+    }
+    // "limite da fatia: a[lo..<hi]": o exemplo fica so na causa (o parser o escreveu para um caso e a forma da ocorrencia nao carrega nome que o arquivo nao tem).
+    // snprintf(cabeca, PEDACO_MAX * 4, "%.*s", ...): no maximo 223 bytes.
+    let cabeca = esperado[0..<min(n_cabeca, (PEDACO_MAX as int) * 4 - 1)]
+    ler_ocorrencia(p, p.cur, &o)
+    localizar_abridor(p, p.cur, cabeca, &o)
+    let explicacao = explicar_esperado(&o, cabeca)
+    let forma = forma_do_esperado(&o, cabeca)
+    common.diag_forma(p.diag as ^common.Diag, explicacao, forma)
+}
+
+// C: frontend/parser_forma.c:168
+proc parser_forma_da_regra(p: ^Parser) {
+    var o = Ocorrencia{}
+    let d = p.diag as ^common.Diag
+    let causa = d.causa or_else ""
+    let regra = achar_dois_pontos(causa)
+    if not d.tem or d.codigo != common.E0101 or common.c2f_nul_em(d.explicacao or_else "", 0) != 0 {
+        return
+    }
+    ler_ocorrencia(p, indice_do_token(p, d.off), &o)
+    let depois = depois_de(&o)
+    // %.130s e %.150s: no maximo 130 e 150 bytes da causa
+    let causa_130 = causa[0..<min(len(causa), 130)]
+    let explicacao = format(f"Na {o.onde} o parser parou em {o.achado}{depois} porque a regra da Forja neste ponto e: {causa_130}.", alloc = frame)
+    var forma = ""
+    if regra >= 0 {
+        let resto = causa[(regra + 2)..<len(causa)]
+        let resto_150 = resto[0..<min(len(resto), 150)]
+        forma = format(f"Ajuste a linha {o.linha} conforme a regra: {resto_150}.", alloc = frame)
+    } else {
+        forma = format(f"Reescreva a linha {o.linha} sem {o.achado} nesse ponto, obedecendo a regra: {causa_130}.", alloc = frame)
+    }
+    common.diag_forma(d, explicacao, forma)
+}

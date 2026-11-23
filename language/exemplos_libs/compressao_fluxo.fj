@@ -1,0 +1,166 @@
+// Exemplo do std:compression 0.3.0 (API de fluxo em pedacos, zlib 1.4 estatico): comprime 200000 bytes em pedacos de 1000,
+// descomprime com saida de 3 bytes por vez e entrada de 7, nos formatos zlib e raw; trata dado corrompido e truncado;
+// e descomprime um fluxo fixo que o zlib do Python gerou (sentido inverso).
+// COMPILAR/RODAR:
+//     forja run language\exemplos_libs\compressao_fluxo.fj
+// Com dois caminhos depois de --, grava o fluxo zlib e o raw gerados (o oraculo Python le):
+//     forja run language\exemplos_libs\compressao_fluxo.fj -- <arq.zlib> <arq.raw>
+// SAIDA ESPERADA: compressao_fluxo.esperado
+
+import "vendor:compression/compression"
+import "std:os"
+import "std:file"
+
+const TAMANHO: int = 200000
+const PEDACO_ENTRADA: int = 1000
+const ENTRADA_PEQUENA: int = 7
+const SAIDA_PEQUENA: int = 3
+const TAMANHO_FIXO: int = 196
+
+proc preencher(buffer: []u8) {
+    for i in 0..<len(buffer) {
+        buffer[i] = (((i % 37) * 3 + (i / 1000) % 11) % 256) as u8
+    }
+}
+
+proc nome_formato(formato: compression.StreamFormat) -> str {
+    if formato == compression.StreamFormat.raw {
+        return "raw"
+    }
+    return "zlib"
+}
+
+// Comprime origem em destino em pedacos de entrada; devolve os bytes gravados em destino.
+proc comprimir_pedacos(formato: compression.StreamFormat, origem: []u8, destino: []u8) -> int ! compression.ZlibError {
+    var fluxo = try compression.stream_deflate(6, formato)
+    defer compression.stream_close(&fluxo)
+    var pos = 0
+    var escrito = 0
+    while pos < len(origem) {
+        let fim = min(pos + PEDACO_ENTRADA, len(origem))
+        let passo = try compression.stream_push(&fluxo, origem[pos..<fim], destino[escrito..<len(destino)], finish = false)
+        pos += passo.consumed as int
+        escrito += passo.written as int
+    }
+    var fechou = false
+    while not fechou {
+        let passo = try compression.stream_push(&fluxo, origem[len(origem)..<len(origem)], destino[escrito..<len(destino)], finish = true)
+        escrito += passo.written as int
+        fechou = passo.done
+    }
+    return escrito
+}
+
+// Descomprime origem em destino com saida de 3 bytes e entrada de 7 por chamada.
+// Devolve os bytes gravados, ou -1 se a entrada acabou sem o fluxo fechar (truncado).
+proc descomprimir_pedacos(formato: compression.StreamFormat, origem: []u8, destino: []u8) -> int ! compression.ZlibError {
+    var fluxo = try compression.stream_inflate(formato)
+    defer compression.stream_close(&fluxo)
+    var pos = 0
+    var escrito = 0
+    var fechou = false
+    while not fechou {
+        let fim = min(pos + ENTRADA_PEQUENA, len(origem))
+        let passo = try compression.stream_push(&fluxo, origem[pos..<fim], destino[escrito..<(escrito + SAIDA_PEQUENA)], finish = false)
+        pos += passo.consumed as int
+        escrito += passo.written as int
+        fechou = passo.done
+        if not fechou and pos == len(origem) and passo.consumed == 0 and passo.written == 0 {
+            return -1
+        }
+    }
+    return escrito
+}
+
+proc ida_e_volta(formato: compression.StreamFormat, original: []u8, comprimido: []u8, volta: []u8) -> int ! compression.ZlibError {
+    let comprimidos = try comprimir_pedacos(formato, original, comprimido)
+    let restaurados = try descomprimir_pedacos(formato, comprimido[0..<comprimidos], volta)
+    var iguais = restaurados == len(original)
+    for i in 0..<len(original) {
+        if volta[i] != original[i] {
+            iguais = false
+        }
+    }
+    let menor = comprimidos < len(original)
+    print(f"{nome_formato(formato)}: ida e volta igual: {iguais}, comprimido menor que o original: {menor}")
+    return comprimidos
+}
+
+// Com dois caminhos em os.args(), grava os fluxos para o oraculo Python; sem eles, nao faz nada.
+proc gravar_se_pedido(zlib_bytes: []u8, raw_bytes: []u8) {
+    let argumentos = os.args()
+    if len(argumentos) < 3 {
+        return
+    }
+    let erro_zlib = file.write_all(argumentos[1], data = zlib_bytes)
+    let erro_raw = file.write_all(argumentos[2], data = raw_bytes)
+    if erro_zlib != none or erro_raw != none {
+        print("falha ao gravar o fluxo")
+    }
+}
+
+proc testar_entradas_ruins(zlib_bytes: []u8, raw_bytes: []u8, volta: []u8) {
+    zlib_bytes[0] = 0 as u8
+    switch r in descomprimir_pedacos(compression.StreamFormat.zlib, zlib_bytes, volta) {
+    case int:
+        print("inesperado: dado corrompido aceito")
+    case compression.ZlibError:
+        print(f"erro tratado: dado corrompido ({r == compression.ZlibError.invalid_data})")
+    }
+    let metade = len(raw_bytes) / 2
+    switch r in descomprimir_pedacos(compression.StreamFormat.raw, raw_bytes[0..<metade], volta) {
+    case int:
+        print(f"erro tratado: fluxo truncado sem fim ({r == -1})")
+    case compression.ZlibError:
+        print("inesperado: erro no fluxo truncado")
+    }
+}
+
+// Confere que saida repete a frase inteira (TAMANHO_FIXO bytes).
+proc conferir_frase(saida: []u8, frase: []u8) -> bool {
+    if len(saida) != TAMANHO_FIXO {
+        return false
+    }
+    for i in 0..<len(saida) {
+        if saida[i] != frase[i % len(frase)] {
+            return false
+        }
+    }
+    return true
+}
+
+// Fluxos gerados pelo zlib do Python (zlib.compress nivel 6 e compressobj raw) sobre a frase repetida 4 vezes.
+proc testar_inverso(volta: []u8) -> ! compression.ZlibError {
+    let frase = as_bytes("Forja e zlib: ida e volta pelo fluxo em pedacos. ")
+    var fixo_zlib: [57]u8 = {0x78, 0x9C, 0x73, 0xCB, 0x2F, 0xCA, 0x4A, 0x54, 0x48, 0x55, 0xA8, 0xCA, 0xC9, 0x4C, 0xB2, 0x52, 0xC8, 0x4C, 0x01, 0xB1, 0xCB, 0xF2, 0x73, 0x4A, 0x12, 0x15, 0x0A, 0x52, 0x73, 0xF2, 0x15, 0xD2, 0x72, 0x4A, 0x2B, 0xF2, 0x15, 0x52, 0x73, 0x81, 0xBC, 0x94, 0xC4, 0xE4, 0xFC, 0x62, 0x3D, 0x05, 0xB7, 0xC1, 0xA7, 0x01, 0x00, 0x1C, 0x92, 0x43, 0xE1}
+    var fixo_raw: [51]u8 = {0x73, 0xCB, 0x2F, 0xCA, 0x4A, 0x54, 0x48, 0x55, 0xA8, 0xCA, 0xC9, 0x4C, 0xB2, 0x52, 0xC8, 0x4C, 0x01, 0xB1, 0xCB, 0xF2, 0x73, 0x4A, 0x12, 0x15, 0x0A, 0x52, 0x73, 0xF2, 0x15, 0xD2, 0x72, 0x4A, 0x2B, 0xF2, 0x15, 0x52, 0x73, 0x81, 0xBC, 0x94, 0xC4, 0xE4, 0xFC, 0x62, 0x3D, 0x05, 0xB7, 0xC1, 0xA7, 0x01, 0x00}
+    let n_zlib = try descomprimir_pedacos(compression.StreamFormat.zlib, fixo_zlib[..], volta)
+    let ok_zlib = n_zlib == TAMANHO_FIXO and conferir_frase(volta[0..<n_zlib], frase)
+    print(f"python -> forja zlib: texto igual: {ok_zlib}")
+    let n_raw = try descomprimir_pedacos(compression.StreamFormat.raw, fixo_raw[..], volta)
+    let ok_raw = n_raw == TAMANHO_FIXO and conferir_frase(volta[0..<n_raw], frase)
+    print(f"python -> forja raw: texto igual: {ok_raw}")
+}
+
+proc principal() -> ! compression.ZlibError {
+    var original: [200000]u8 = {}
+    preencher(original[..])
+    var comp_zlib: [210000]u8 = {}
+    var comp_raw: [210000]u8 = {}
+    var volta: [200016]u8 = {}
+    let n_zlib = try ida_e_volta(compression.StreamFormat.zlib, original[..], comp_zlib[..], volta[..])
+    let n_raw = try ida_e_volta(compression.StreamFormat.raw, original[..], comp_raw[..], volta[..])
+    gravar_se_pedido(comp_zlib[0..<n_zlib], comp_raw[0..<n_raw])
+    testar_entradas_ruins(comp_zlib[0..<n_zlib], comp_raw[0..<n_raw], volta[..])
+    try testar_inverso(volta[..])
+}
+
+proc main() {
+    print(f"zlib {compression.versao()}")
+    switch r in principal() {
+    case compression.ZlibError:
+        print("erro inesperado")
+    default:
+        print("ok")
+    }
+}

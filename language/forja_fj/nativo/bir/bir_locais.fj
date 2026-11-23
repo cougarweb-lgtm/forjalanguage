@@ -1,0 +1,114 @@
+// nativo/bir/bir_locais.fj - porte de compiler/nativo/bir/bir_locais.c
+// sha256 de nativo/bir/bir_locais.c: f9146923ccd8fdc584e77213fe5ebed0ba2f1bf12088c07cfd12245a43b31cab
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "common"
+import "ir"
+
+// C: nativo/bir/bir_locais.c:18
+proc casa_do_local(c: ^BirCtx, irf: ^ir.IrFuncao, id: u32, casa: ^BirLocalCasa) -> bool {
+    var tern_1: i32 = -1
+    if id < c.n_local {
+        tern_1 = (c.slot_local or_else {})[id]
+    }
+    let slot: i32 = tern_1
+    var tern_2: i32 = -1
+    if id < c.n_local {
+        tern_2 = (c.vreg_local or_else {})[id]
+    }
+    let vreg: i32 = tern_2
+    if (slot < 0) and (vreg < 0) {
+        return false
+    }
+    casa.vreg = vreg
+    casa.slot = slot
+    casa.indireto = (((slot < 0) and (id < irf.nparams)) and ((c.f as ^BirFuncao).param_tam != none)) and (((c.f as ^BirFuncao).param_tam or_else {})[id] != 0)
+    return true
+}
+
+// C: nativo/bir/bir_locais.c:31
+proc bir_retratar_locais(c: ^BirCtx, irf: ^ir.IrFuncao) {
+    if irf.nnomes_locais == 0 {
+        return
+    }
+    let f: ^BirFuncao = c.f as ^BirFuncao
+    let arena: ^common.Arena = &(c.p as ^BirPrograma).arena
+    f.casas = arena_fatia_local_casa(arena, irf.nnomes_locais as int)
+    var destino: []BirLocalCasa = f.casas or_else {}
+    for id in (0 as u32)..<irf.nnomes_locais {
+        let nome_local = (irf.nomes_locais or_else {})[id]
+        var casa: BirLocalCasa = BirLocalCasa{local_id = id, tipo = nome_local.tipo, nome = none, tipo_nome = nome_do_tipo(c, nome_local.tipo), vreg = 0, slot = 0, indireto = false}
+        if not casa_do_local(c, irf, id, &casa) {
+            f.nsem_casa += 1
+            continue
+        }
+        let texto: str = common.interner_texto((c.e as ^BirEntrada).nomes as ^common.Interner, nome_local.nome)
+        casa.nome = copia_texto_na_arena(arena, texto)
+        destino[f.ncasas] = casa
+        f.ncasas += 1
+    }
+}
+
+// Fatia zerada no tamanho exato (o C faz ArenaAlocar de nnomes_locais e so depois conta ncasas).
+proc arena_fatia_local_casa(a: ^common.Arena, n: int) -> []BirLocalCasa {
+    var l = make([dynamic]BirLocalCasa, alloc = common.arena_mem(a), cap = n)
+    for i in 0..<n {
+        append(&l, item = BirLocalCasa{})
+    }
+    return l[..]
+}
+
+// ArenaCopiarTexto do C: copia os bytes do texto para a arena (o texto do Interner nao e dono dela).
+proc copia_texto_na_arena(a: ^common.Arena, texto: str) -> str {
+    var bytes: []u8 = common.arena_fatia_u8(a, len(texto) as int)
+    for k in (0 as u32)..<(len(texto) as u32) {
+        bytes[k] = texto[k]
+    }
+    return from_bytes(bytes, alloc = common.arena_mem(a))
+}
+
+// C: nativo/bir/bir_locais.c:52
+proc imprimir_casa(k: ^BirLocalCasa, saida: ^[dynamic]u8) {
+    let txt_1 = k.nome or_else "(null)"
+    let txt_2 = k.tipo_nome or_else "(null)"
+    format(f"  local {k.local_id} {txt_1} tipo={txt_2} tid={k.tipo} casa=", into = saida)
+    if k.slot >= 0 {
+        format(f"slot{k.slot}", into = saida)
+    } else {
+        format(f"vreg{k.vreg}", into = saida)
+    }
+    var tern_1: i32 = 0
+    if common.c2f_b2i32(k.indireto) != 0 {
+        tern_1 = 1
+    }
+    format(f" indireto={tern_1}\n", into = saida)
+}
+
+// C: nativo/bir/bir_locais.c:62
+pub proc bir_imprimir_locais(programa: ^BirPrograma, saida: ^[dynamic]u8) {
+    var k: u32 = 0
+    while k < programa.nfuncoes {
+        let f: ^BirFuncao = &(programa.funcoes or_else {})[k]
+        let txt_1 = programa.simbolos[f.simbolo].nome or_else "(null)"
+        format(f"funcao {txt_1}\n", into = saida)
+        for j in (0 as u32)..<f.ncasas {
+            imprimir_casa(&(f.casas or_else {})[j], saida)
+        }
+        format(f"  sem_casa={f.nsem_casa}\n", into = saida)
+        k += 1
+    }
+}
+
+test "locais_imprimir_casa" {
+    var saida_slot: [dynamic]u8 = make([dynamic]u8, alloc = heap, cap = 128)
+    defer delete(saida_slot)
+    var vreg_casa: BirLocalCasa = BirLocalCasa{local_id = 3, tipo = 7, nome = "x", tipo_nome = "i32", vreg = 3, slot = -1, indireto = false}
+    imprimir_casa(&vreg_casa, &saida_slot)
+    expect(from_bytes(saida_slot[..], alloc = frame) == "  local 3 x tipo=i32 tid=7 casa=vreg3 indireto=0\n")
+    var saida_pilha: [dynamic]u8 = make([dynamic]u8, alloc = heap, cap = 128)
+    defer delete(saida_pilha)
+    var slot_casa: BirLocalCasa = BirLocalCasa{local_id = 0, tipo = 12, nome = "y", tipo_nome = "i64", vreg = -1, slot = 0, indireto = true}
+    imprimir_casa(&slot_casa, &saida_pilha)
+    expect(from_bytes(saida_pilha[..], alloc = frame) == "  local 0 y tipo=i64 tid=12 casa=slot0 indireto=1\n")
+}

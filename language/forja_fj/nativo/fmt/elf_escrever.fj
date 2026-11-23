@@ -1,0 +1,1274 @@
+// nativo/fmt/elf_escrever.fj - porte de compiler/nativo/fmt/elf_escrever.c
+// sha256 de nativo/fmt/elf_escrever.c: 992302ac31e074efe6a8fabd746914bbc53942e6cb06f28922da3c67029f71ac
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.2.0
+// Changelog: 0.2.0 - A4.2: ELF dinamico (Imagem.dinamico): bloco de elf_dinamico.fj no PT_LOAD RW final, PT_INTERP, PT_GNU_RELRO, .so sem entrada.
+
+import "common"
+
+struct ElfCampo {
+    nome: str
+    off: u8
+    tam: u8
+}
+
+// tabela = qual Elf64_* (ELF_TAB_*): e o que a C2F chamava de ponteiro &ELF_T_*; const da Forja nao tem endereco (E0301)
+struct ElfTabela {
+    tabela: i32
+    qtd: u32
+    tam: u32
+}
+
+struct ElfOrdem {
+    anterior: i32
+    sem_bytes: bool
+}
+
+struct ElfCursor {
+    pos: u64
+    seg_tem_bytes: bool
+    classe: i32
+    pagina: u64
+}
+
+struct ElfFaixa {
+    ini: i32
+    fim: i32
+}
+
+struct ElfExtras {
+    sim: [dynamic]u8
+    str: [dynamic]u8
+    shstr: [dynamic]u8
+    nome_sec: [13]u32
+    nome_sim: u32
+    nome_str: u32
+    nome_shstr: u32
+    off_sim: u64
+    off_str: u64
+    off_shstr: u64
+    off_sh: u64
+    nsh: u32
+    ndyn: u32
+    nome_rela: u32
+    nome_dyn: u32
+    link_str: u32
+    off_dbg: [4]u64
+    nome_dbg: [4]u32
+    ndbg: u32
+    din: [dynamic]u8 // A4.2: bytes do bloco dinamico (elf_din_montar)
+    nome_din: [6]u32 // A4.2: nomes das secoes do bloco no .shstrtab
+}
+
+struct ElfVisao {
+    d: ?[]u8
+    n: u64
+    esperado_ph: u32
+    esperado_sh: u32
+    pie: bool
+    tls: bool
+    motivo: ?str
+    maquina: u64 = 62
+    sem_entrada: bool
+}
+
+struct ElfAnterior {
+    fim_pagina_va: u64
+    fim_off: u64
+}
+
+const CLASSE_R: i32 = 0
+const CLASSE_RX: i32 = 1
+const CLASSE_RW: i32 = 2
+const CLASSE_QTD: i32 = 3
+const EH_TYPE: i32 = 0
+const EH_MACHINE: i32 = 1
+const EH_VERSION: i32 = 2
+const EH_ENTRY: i32 = 3
+const EH_PHOFF: i32 = 4
+const EH_SHOFF: i32 = 5
+const EH_FLAGS: i32 = 6
+const EH_EHSIZE: i32 = 7
+const EH_PHENTSIZE: i32 = 8
+const EH_PHNUM: i32 = 9
+const EH_SHENTSIZE: i32 = 10
+const EH_SHNUM: i32 = 11
+const EH_SHSTRNDX: i32 = 12
+const EH_QTD: i32 = 13
+const PH_TYPE: i32 = 0
+const PH_FLAGS: i32 = 1
+const PH_OFFSET: i32 = 2
+const PH_VADDR: i32 = 3
+const PH_PADDR: i32 = 4
+const PH_FILESZ: i32 = 5
+const PH_MEMSZ: i32 = 6
+const PH_ALIGN: i32 = 7
+const PH_QTD: i32 = 8
+const SH_NAME: i32 = 0
+const SH_TYPE: i32 = 1
+const SH_FLAGS: i32 = 2
+const SH_ADDR: i32 = 3
+const SH_OFFSET: i32 = 4
+const SH_SIZE: i32 = 5
+const SH_LINK: i32 = 6
+const SH_INFO: i32 = 7
+const SH_ADDRALIGN: i32 = 8
+const SH_ENTSIZE: i32 = 9
+const SH_QTD: i32 = 10
+const ST_NAME: i32 = 0
+const ST_INFO: i32 = 1
+const ST_OTHER: i32 = 2
+const ST_SHNDX: i32 = 3
+const ST_VALUE: i32 = 4
+const ST_SIZE: i32 = 5
+const ST_QTD: i32 = 6
+const ELF_TAM_EHDR: u32 = 64
+const ELF_TAM_PHDR: u32 = 56
+const ELF_TAM_SHDR: u32 = 64
+const ELF_TAM_SIM: u32 = 24
+const ELF_TAM_IDENT: u32 = 16
+const ELF_PAGINA: u32 = 4096
+const ELF_ALINHA_PILHA: u32 = 16
+const ELF_ALINHA_SECAO: u32 = 16
+const ELF_ALINHA_TABELA: u32 = 8
+const ELF_BITS_BYTE: u32 = 8
+const ELF_ET_EXEC: u32 = 2
+const ELF_ET_DYN: u32 = 3
+const ELF_EM_X86_64: u32 = 62
+const ELF_EM_AARCH64: u32 = 183
+const ELF_PAGINA_A64: u32 = 16384 // A64 (A1.2): p_align 0x4000 tambem no ELF estatico (exigencia do Android 15+)
+const ELF_EV_CURRENT: u32 = 1
+const ELF_SHT_PROGBITS: u32 = 1
+const ELF_SHT_SYMTAB: u32 = 2
+const ELF_SHT_STRTAB: u32 = 3
+const ELF_SHT_NOBITS: u32 = 8
+const ELF_SHT_RELA: u32 = 4
+const ELF_SHT_DYNAMIC: u32 = 6
+const ELF_SHF_WRITE: u32 = 1
+const ELF_SHF_ALLOC: u32 = 2
+const ELF_SHF_EXEC: u32 = 4
+const ELF_STB_GLOBAL: u32 = 1
+const ELF_STT_NOTYPE: u32 = 0
+const ELF_STT_FUNC: u32 = 2
+const ELF_PRIMEIRO_GLOBAL: u32 = 1
+const ELF_SECOES_EXTRAS: u32 = 3
+const ELF_SECOES_DINAMICAS: u32 = 2
+const ELF_PT_PHDR: u32 = 6
+const ELF_PT_DYNAMIC: u32 = 2
+const ELF_PF_RW: u32 = 6
+const ELF_R_RELATIVE: u32 = 8
+const ELF_TAM_RELA: u32 = 24
+const ELF_TAM_DT: u32 = 16
+const ELF_TAM_QUAD: u32 = 8
+const ELF_QTD_DT: u32 = 5
+const ELF_DT_NULL: u32 = 0
+const ELF_DT_RELA: u32 = 7
+const ELF_DT_RELASZ: u32 = 8
+const ELF_DT_RELAENT: u32 = 9
+const ELF_DT_FLAGS_1: u32 = 1879048187
+const ELF_DF_1_PIE: u32 = 134217728
+const ELF_PE_ESCRITA: u32 = 2147483648
+const ELF_MOTIVO_TAM: i32 = 160
+const ELF_FLAGS_SEGMENTO: [3]u32 = {4, 5, 6}
+const ELF_FLAGS_SECAO: [3]u32 = {2, 6, 3}
+// C: nativo/fmt/elf_escrever.c:84-107 - campos de Elf64_Ehdr/Phdr/Shdr/Sym na ordem do enum EH_*, PH_*, SH_*, ST_* (nome, offset, tamanho)
+const ELF_EHDR: [13]ElfCampo = {ElfCampo{nome = "e_type", off = 16, tam = 2}, ElfCampo{nome = "e_machine", off = 18, tam = 2}, ElfCampo{nome = "e_version", off = 20, tam = 4}, ElfCampo{nome = "e_entry", off = 24, tam = 8}, ElfCampo{nome = "e_phoff", off = 32, tam = 8}, ElfCampo{nome = "e_shoff", off = 40, tam = 8}, ElfCampo{nome = "e_flags", off = 48, tam = 4}, ElfCampo{nome = "e_ehsize", off = 52, tam = 2}, ElfCampo{nome = "e_phentsize", off = 54, tam = 2}, ElfCampo{nome = "e_phnum", off = 56, tam = 2}, ElfCampo{nome = "e_shentsize", off = 58, tam = 2}, ElfCampo{nome = "e_shnum", off = 60, tam = 2}, ElfCampo{nome = "e_shstrndx", off = 62, tam = 2}}
+const ELF_PHDR: [8]ElfCampo = {ElfCampo{nome = "p_type", off = 0, tam = 4}, ElfCampo{nome = "p_flags", off = 4, tam = 4}, ElfCampo{nome = "p_offset", off = 8, tam = 8}, ElfCampo{nome = "p_vaddr", off = 16, tam = 8}, ElfCampo{nome = "p_paddr", off = 24, tam = 8}, ElfCampo{nome = "p_filesz", off = 32, tam = 8}, ElfCampo{nome = "p_memsz", off = 40, tam = 8}, ElfCampo{nome = "p_align", off = 48, tam = 8}}
+const ELF_SHDR: [10]ElfCampo = {ElfCampo{nome = "sh_name", off = 0, tam = 4}, ElfCampo{nome = "sh_type", off = 4, tam = 4}, ElfCampo{nome = "sh_flags", off = 8, tam = 8}, ElfCampo{nome = "sh_addr", off = 16, tam = 8}, ElfCampo{nome = "sh_offset", off = 24, tam = 8}, ElfCampo{nome = "sh_size", off = 32, tam = 8}, ElfCampo{nome = "sh_link", off = 40, tam = 4}, ElfCampo{nome = "sh_info", off = 44, tam = 4}, ElfCampo{nome = "sh_addralign", off = 48, tam = 8}, ElfCampo{nome = "sh_entsize", off = 56, tam = 8}}
+const ELF_SYM: [6]ElfCampo = {ElfCampo{nome = "st_name", off = 0, tam = 4}, ElfCampo{nome = "st_info", off = 4, tam = 1}, ElfCampo{nome = "st_other", off = 5, tam = 1}, ElfCampo{nome = "st_shndx", off = 6, tam = 2}, ElfCampo{nome = "st_value", off = 8, tam = 8}, ElfCampo{nome = "st_size", off = 16, tam = 8}}
+const ELF_TAB_EHDR: i32 = 0
+const ELF_TAB_PHDR: i32 = 1
+const ELF_TAB_SHDR: i32 = 2
+const ELF_TAB_SYM: i32 = 3
+// qtd = EH_QTD (13), PH_QTD (8), SH_QTD (10), ST_QTD (6) do C
+const ELF_T_EHDR: ElfTabela = ElfTabela{tabela = ELF_TAB_EHDR, qtd = 13, tam = ELF_TAM_EHDR}
+const ELF_T_PHDR: ElfTabela = ElfTabela{tabela = ELF_TAB_PHDR, qtd = 8, tam = ELF_TAM_PHDR}
+const ELF_T_SHDR: ElfTabela = ElfTabela{tabela = ELF_TAB_SHDR, qtd = 10, tam = ELF_TAM_SHDR}
+const ELF_T_SYM: ElfTabela = ElfTabela{tabela = ELF_TAB_SYM, qtd = 6, tam = ELF_TAM_SIM}
+const ELF_IDENT: [16]u8 = {127, 69, 76, 70, 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0}
+const ZEROS: [4096]u8 = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
+const ELF_NOME_DBG: [4]str = {".debug_abbrev", ".debug_info", ".debug_line", ".debug_frame"}
+
+// C: nativo/fmt/elf_escrever.c:114
+proc elf_alinhar(v: u64, alinhamento: u64) -> u64 {
+    return (((v + alinhamento) - 1) / alinhamento) * alinhamento
+}
+
+// A1.2: pagina e e_machine vem da Imagem (0 = padrao x86-64: 4096 e 62; o ELF do x64 nao muda)
+proc elf_pagina_de(im: ^Imagem) -> u64 {
+    if im.pagina == 0 {
+        return ELF_PAGINA as u64
+    }
+    return im.pagina as u64
+}
+
+proc elf_maquina_de(im: ^Imagem) -> u64 {
+    if im.maquina == 0 {
+        return ELF_EM_X86_64 as u64
+    }
+    return im.maquina as u64
+}
+
+// pagina do arquivo lido de volta: o proprio e_machine decide (AArch64 = 16 KiB)
+proc elf_pagina_do_arquivo(d: []u8) -> u64 {
+    if (len(d) as u64) < (ELF_TAM_EHDR as u64) {
+        return ELF_PAGINA as u64
+    }
+    if elf_le(d, ELF_EHDR[EH_MACHINE]) == (ELF_EM_AARCH64 as u64) {
+        return ELF_PAGINA_A64 as u64
+    }
+    return ELF_PAGINA as u64
+}
+
+// C: nativo/fmt/elf_escrever.c:119
+// C2F-INDECIDIVEL: reg
+proc elf_poe(reg: []u8, c: ElfCampo, v: u64) {
+    for k in (0 as u32)..<(c.tam as u32) {
+        reg[(c.off as u32) + k] = common.c2f_trunc_u8(v >> (((k * ELF_BITS_BYTE) as u64) & 63))
+    }
+}
+
+// C: nativo/fmt/elf_escrever.c:125
+// C2F-INDECIDIVEL: reg
+proc elf_le(reg: []u8, c: ElfCampo) -> u64 {
+    var v: u64 = 0
+    var k: u32 = c.tam as u32
+    while k > 0 {
+        v = (v << 8) | (reg[((c.off as u32) + k) - 1] as u64)
+        k -= 1
+    }
+    return v
+}
+
+// C: nativo/fmt/elf_escrever.c:134
+// C2F-INDECIDIVEL: valores
+proc elf_campo_da_tabela(t: ElfTabela, k: u32) -> ElfCampo {
+    if t.tabela == ELF_TAB_EHDR {
+        return ELF_EHDR[k]
+    }
+    if t.tabela == ELF_TAB_PHDR {
+        return ELF_PHDR[k]
+    }
+    if t.tabela == ELF_TAB_SHDR {
+        return ELF_SHDR[k]
+    }
+    return ELF_SYM[k]
+}
+
+proc elf_anexar_registro(b: ^[dynamic]u8, t: ElfTabela, valores: []u64) {
+    var reg: [64]u8 = {}
+    if t.tabela == ELF_TAB_EHDR {
+        for k in (0 as u32)..<ELF_TAM_IDENT {
+            reg[k] = ELF_IDENT[k]
+        }
+    }
+    for k in (0 as u32)..<t.qtd {
+        elf_poe(reg[..], elf_campo_da_tabela(t, k), valores[k])
+    }
+    append(b, items = reg[0..<(t.tam as u64)])
+}
+
+// C: nativo/fmt/elf_escrever.c:145
+proc elf_preencher(b: ^[dynamic]u8, ate: u64) {
+    var tam: u64 = len(b^) as u64
+    while tam < ate {
+        append(b, item = 0 as u8)
+        tam += 1
+    }
+}
+
+// C: nativo/fmt/elf_escrever.c:156
+pub proc elf_inicio_dinamico(im: ?^Imagem) -> u64 {
+    var fim: u64 = 0
+    for i in (0 as u32)..<(im as ^Imagem).qtd_secoes {
+        let f: u64 = ((im as ^Imagem).secoes[i].rva + (im as ^Imagem).secoes[i].tam_virtual) as u64
+        if f > fim {
+            fim = f
+        }
+    }
+    return elf_alinhar(fim, elf_pagina_de(im as ^Imagem))
+}
+
+// C: nativo/fmt/elf_escrever.c:168
+proc elf_classe_de(s: ^PeSecao) -> i32 {
+    if (s.caracteristicas & PE_SECAO_CODIGO) != 0 {
+        return CLASSE_RX
+    }
+    var tern_1: i32 = CLASSE_R
+    if (s.caracteristicas & ELF_PE_ESCRITA) != 0 {
+        tern_1 = CLASSE_RW
+    }
+    return tern_1
+}
+
+// C: nativo/fmt/elf_escrever.c:180
+proc elf_conferir_ordem(s: ^PeSecao, o: ^ElfOrdem) -> ?str {
+    let c: i32 = elf_classe_de(s)
+    if common.c2f_s2u_32(c) < common.c2f_s2u_32(o.anterior) {
+        return "secoes fora da ordem R, RX, RW"
+    }
+    if common.c2f_s2u_32(c) != common.c2f_s2u_32(o.anterior) {
+        o.sem_bytes = false
+    }
+    if ((len(s.bytes) as u64) > 0) and (common.c2f_b2i32(o.sem_bytes) != 0) {
+        return "secao com bytes depois de secao sem bytes"
+    }
+    o.sem_bytes = (common.c2f_b2i32(o.sem_bytes) != 0) or ((len(s.bytes) as u64) == 0)
+    o.anterior = c
+    return none
+}
+
+// C: nativo/fmt/elf_escrever.c:196
+proc elf_ordenar(im: ?^Imagem) -> ?str {
+    var o: ElfOrdem = ElfOrdem{anterior = CLASSE_R, sem_bytes = false}
+    var i: u32 = 0
+    while i < (im as ^Imagem).qtd_secoes {
+        let motivo: ?str = elf_conferir_ordem(&(im as ^Imagem).secoes[i], &o)
+        if motivo != none {
+            return motivo
+        }
+        i += 1
+    }
+    return none
+}
+
+// C: nativo/fmt/elf_escrever.c:215
+proc elf_posicionar(s: ^PeSecao, cur: ^ElfCursor, off: ^u64) -> ?str {
+    let c: i32 = elf_classe_de(s)
+    if common.c2f_s2u_32(c) != common.c2f_s2u_32(cur.classe) {
+        cur.classe = c
+        cur.seg_tem_bytes = false
+    }
+    if (len(s.bytes) as u64) == 0 {
+        var tern_1: u64 = 0
+        if common.c2f_b2i32(cur.seg_tem_bytes) != 0 {
+            tern_1 = cur.pos
+        } else {
+            tern_1 = elf_alinhar(cur.pos, cur.pagina)
+        }
+        off^ = tern_1
+        cur.pos = off^
+        return none
+    }
+    if (s.rva as u64) < cur.pos {
+        return "secao sobrepoe os cabecalhos ou a secao anterior"
+    }
+    off^ = s.rva as u64
+    cur.pos = (s.rva as u64) + (len(s.bytes) as u64)
+    cur.seg_tem_bytes = true
+    return none
+}
+
+// C: nativo/fmt/elf_escrever.c:237
+proc elf_planejar_dinamico(im: ?^Imagem, p: ^ElfPlano) {
+    p.va_dyn = elf_inicio_dinamico(im)
+    p.off_dyn = elf_alinhar(p.fim_secoes, elf_pagina_de(im as ^Imagem))
+    if (im as ^Imagem).dinamico {
+        elf_din_medir(im as ^Imagem, &p.din)
+        p.tam_dyn = p.din.tam_dyn
+        p.tam_rela = p.din.tam_rela
+        p.fim_secoes = p.off_dyn + p.din.total
+        return
+    }
+    p.tam_rela = (len((im as ^Imagem).relativos) as u64) * (ELF_TAM_RELA as u64)
+    p.tam_dyn = (ELF_QTD_DT * ELF_TAM_DT) as u64
+    p.fim_secoes = (p.off_dyn + p.tam_rela) + p.tam_dyn
+}
+
+// C: nativo/fmt/elf_escrever.c:246
+proc elf_distribuir(im: ?^Imagem, p: ^ElfPlano) -> ?str {
+    var tern_1: i32 = ELF_SEGMENTOS_EXE
+    if common.c2f_b2i32((im as ^Imagem).pie) != 0 {
+        tern_1 = ELF_SEGMENTOS_PIE
+    }
+    var tern_2: u32 = 0
+    if common.c2f_b2i32((im as ^Imagem).tls) != 0 {
+        tern_2 = 1
+    }
+    var reserva: u32 = common.c2f_s2u_32(tern_1) + tern_2
+    if (im as ^Imagem).dinamico {
+        reserva += 2 // PT_INTERP e PT_GNU_RELRO
+    }
+    var cur: ElfCursor = ElfCursor{pos = (ELF_TAM_EHDR as u64) + ((ELF_TAM_PHDR as u64) * (reserva as u64)), classe = CLASSE_R, pagina = p.pagina}
+    var i: u32 = 0
+    while i < (im as ^Imagem).qtd_secoes {
+        let motivo: ?str = elf_posicionar(&(im as ^Imagem).secoes[i], &cur, &p.off_secao[i])
+        if motivo != none {
+            return motivo
+        }
+        i += 1
+    }
+    p.fim_secoes = cur.pos
+    if (im as ^Imagem).pie {
+        elf_planejar_dinamico(im, p)
+    }
+    return none
+}
+
+// C: nativo/fmt/elf_escrever.c:264
+proc elf_achar_faixas(im: ?^Imagem, faixas: ^[3]ElfFaixa) {
+    for c in (0 as i32)..<CLASSE_QTD {
+        faixas[c] = ElfFaixa{ini = -1, fim = -1}
+    }
+    var i: u32 = 0
+    while i < (im as ^Imagem).qtd_secoes {
+        let f: ^ElfFaixa = &faixas[elf_classe_de(&(im as ^Imagem).secoes[i])]
+        if f.ini < 0 {
+            f.ini = transmute(i, to = i32)
+        }
+        f.fim = transmute(i, to = i32)
+        i += 1
+    }
+}
+
+// C: nativo/fmt/elf_escrever.c:278
+proc elf_flags_do_segmento(im: ?^Imagem, c: i32) -> u32 {
+    if (common.c2f_b2i32((im as ^Imagem).pie) != 0) and (common.c2f_s2u_32(c) == (CLASSE_R as u32)) {
+        return ELF_PF_R | ELF_PF_W
+    }
+    return ELF_FLAGS_SEGMENTO[c]
+}
+
+// C: nativo/fmt/elf_escrever.c:286
+proc elf_segmento_load(im: ?^Imagem, p: ^ElfPlano, f: ElfFaixa, c: i32) -> ElfSegmento {
+    let ini: ^PeSecao = &(im as ^Imagem).secoes[f.ini]
+    let fim: ^PeSecao = &(im as ^Imagem).secoes[f.fim]
+    var tern_1: u32 = ini.rva
+    if common.c2f_s2u_32(c) == (CLASSE_R as u32) {
+        tern_1 = 0
+    }
+    let base_rva: u64 = tern_1 as u64
+    var tern_2: u64 = 0
+    if common.c2f_s2u_32(c) != (CLASSE_R as u32) {
+        tern_2 = p.off_secao[f.ini]
+    }
+    let base_off: u64 = tern_2
+    var fim_arquivo: u64 = base_off
+    for i in f.ini..=f.fim {
+        if (len((im as ^Imagem).secoes[i].bytes) as u64) > 0 {
+            fim_arquivo = p.off_secao[i] + (len((im as ^Imagem).secoes[i].bytes) as u64)
+        }
+    }
+    return ElfSegmento{tipo = ELF_PT_LOAD, flags = elf_flags_do_segmento(im, c), offset = base_off, vaddr = pe_base_da_imagem(im) + base_rva, filesz = fim_arquivo - base_off, memsz = ((fim.rva + fim.tam_virtual) as u64) - base_rva, alinhamento = elf_pagina_de(im as ^Imagem)}
+}
+
+// C: nativo/fmt/elf_escrever.c:302
+proc elf_segmentos_dinamicos(p: ^ElfPlano) {
+    var tam: u64 = p.tam_rela + p.tam_dyn
+    if p.dinamico {
+        tam = p.din.total
+    }
+    let antes_1: u32 = p.qtd
+    p.qtd += 1
+    p.seg[antes_1] = ElfSegmento{tipo = ELF_PT_LOAD, flags = ELF_PF_RW, offset = p.off_dyn, vaddr = p.va_dyn, filesz = tam, memsz = tam, alinhamento = p.pagina}
+    let antes_2: u32 = p.qtd
+    p.qtd += 1
+    p.seg[antes_2] = ElfSegmento{tipo = ELF_PT_DYNAMIC, flags = ELF_PF_RW, offset = p.off_dyn, vaddr = p.va_dyn, filesz = p.tam_dyn, memsz = p.tam_dyn, alinhamento = ELF_ALINHA_TABELA as u64}
+    if p.dinamico {
+        p.seg[p.qtd] = elf_din_segmento_relro(p)
+        p.qtd += 1
+    }
+}
+
+// C: nativo/fmt/elf_escrever.c:312
+proc elf_segmento_tls(im: ?^Imagem, p: ^ElfPlano) -> ElfSegmento {
+    let s: ^PeSecao = &(im as ^Imagem).secoes[(im as ^Imagem).tls_secao]
+    return ElfSegmento{tipo = ELF_PT_TLS, flags = ELF_PF_R | ELF_PF_W, offset = p.off_secao[(im as ^Imagem).tls_secao], vaddr = pe_base_da_imagem(im) + (s.rva as u64), filesz = len(s.bytes) as u64, memsz = s.tam_virtual as u64, alinhamento = (im as ^Imagem).tls_alinhamento as u64}
+}
+
+// C: nativo/fmt/elf_escrever.c:320
+pub proc elf_planejar(im: ?^Imagem, p: ^ElfPlano) -> ?str {
+    var faixas: [3]ElfFaixa = {}
+    p^ = ElfPlano{}
+    p.pagina = elf_pagina_de(im as ^Imagem)
+    p.maquina = elf_maquina_de(im as ^Imagem)
+    p.pie = (im as ^Imagem).pie
+    p.tls = (im as ^Imagem).tls
+    p.dinamico = (im as ^Imagem).dinamico and p.pie
+    p.sem_entrada = p.dinamico and (im as ^Imagem).dll
+    if (im as ^Imagem).qtd_secoes == 0 {
+        return "imagem sem secoes"
+    }
+    var motivo: ?str = elf_ordenar(im)
+    if motivo == none {
+        motivo = elf_distribuir(im, p)
+    }
+    if motivo != none {
+        return motivo
+    }
+    elf_achar_faixas(im, &faixas)
+    if p.pie {
+        p.seg[p.qtd] = ElfSegmento{tipo = ELF_PT_PHDR, flags = ELF_PF_R, offset = ELF_TAM_EHDR as u64, vaddr = ELF_TAM_EHDR as u64, filesz = 0, memsz = 0, alinhamento = ELF_ALINHA_TABELA as u64}
+        p.qtd += 1
+    }
+    if p.dinamico and (p.din.tam_interp > 0) {
+        p.seg[p.qtd] = elf_din_segmento_interp(p)
+        p.qtd += 1
+    }
+    for c in (0 as i32)..<CLASSE_QTD {
+        if faixas[c].ini >= 0 {
+            p.seg[p.qtd] = elf_segmento_load(im, p, faixas[c], c)
+            p.qtd += 1
+        }
+    }
+    if p.pie {
+        elf_segmentos_dinamicos(p)
+    }
+    if p.tls {
+        p.seg[p.qtd] = elf_segmento_tls(im, p)
+        p.qtd += 1
+    }
+    p.seg[p.qtd] = ElfSegmento{tipo = ELF_PT_GNU_STACK, flags = ELF_PF_R | ELF_PF_W, offset = 0, vaddr = 0, filesz = 0, memsz = 0, alinhamento = ELF_ALINHA_PILHA as u64}
+    p.qtd += 1
+    if p.pie {
+        let tam_tabela: u64 = (p.qtd as u64) * (ELF_TAM_PHDR as u64)
+        p.seg[0].filesz = tam_tabela
+        p.seg[0].memsz = tam_tabela
+    }
+    return none
+}
+
+// C: nativo/fmt/elf_escrever.c:367
+proc elf_nome_da_secao(s: ^PeSecao) -> str {
+    let sw_1 = common.c2f_s2u_32(elf_classe_de(s))
+    if sw_1 == (CLASSE_R as u32) {
+        return ".rodata"
+    } else if sw_1 == (CLASSE_RX as u32) {
+        return ".text"
+    } else {
+        var tern_1: str = ".bss"
+        if (len(s.bytes) as u64) > 0 {
+            tern_1 = ".data"
+        }
+        return tern_1
+    }
+    return ""
+}
+
+// C: nativo/fmt/elf_escrever.c:376
+proc elf_nome(tab: ^[dynamic]u8, nome: str) -> u32 {
+    let off: u32 = (len(tab^) as u64) as u32
+    append(tab, items = as_bytes(nome))
+    append(tab, item = 0 as u8)
+    return off
+}
+
+// C: nativo/fmt/elf_escrever.c:387
+proc elf_dbg_nomes(im: ^Imagem, x: ^ElfExtras) {
+    for k in (0 as u32)..<(IMAGEM_QTD_DEBUG as u32) {
+        if (len(im.dbg[k]) as u64) > 0 {
+            x.nome_dbg[k] = elf_nome(&x.shstr, ELF_NOME_DBG[k])
+        }
+    }
+}
+
+// C: nativo/fmt/elf_escrever.c:396
+proc elf_dbg_planejar(im: ^Imagem, fim: u64, x: ^ElfExtras) -> u64 {
+    var fim_v: u64 = fim
+    x.ndbg = 0
+    for k in (0 as u32)..<(IMAGEM_QTD_DEBUG as u32) {
+        if (len(im.dbg[k]) as u64) == 0 {
+            continue
+        }
+        x.off_dbg[k] = fim_v
+        fim_v += len(im.dbg[k]) as u64
+        x.ndbg += 1
+    }
+    return fim_v
+}
+
+// C: nativo/fmt/elf_escrever.c:409
+proc elf_escrever_dbg(b: ^[dynamic]u8, im: ^Imagem, x: ^ElfExtras) {
+    for k in (0 as u32)..<(IMAGEM_QTD_DEBUG as u32) {
+        if (len(im.dbg[k]) as u64) == 0 {
+            continue
+        }
+        elf_preencher(b, x.off_dbg[k])
+        append(b, items = im.dbg[k][..])
+    }
+}
+
+// C: nativo/fmt/elf_escrever.c:419
+proc elf_anexar_shdr_dbg(b: ^[dynamic]u8, im: ^Imagem, x: ^ElfExtras) {
+    for k in (0 as u32)..<(IMAGEM_QTD_DEBUG as u32) {
+        if (len(im.dbg[k]) as u64) == 0 {
+            continue
+        }
+        var sh: [SH_QTD]u64 = {}
+        sh[SH_NAME] = x.nome_dbg[k] as u64
+        sh[SH_TYPE] = ELF_SHT_PROGBITS as u64
+        sh[SH_OFFSET] = x.off_dbg[k]
+        sh[SH_SIZE] = len(im.dbg[k]) as u64
+        sh[SH_ADDRALIGN] = 1
+        elf_anexar_registro(b, ELF_T_SHDR, sh[..])
+    }
+}
+
+// C: nativo/fmt/elf_escrever.c:429
+proc elf_montar_nomes(im: ^Imagem, x: ^ElfExtras) {
+    append(&x.shstr, item = 0 as u8)
+    var i: u32 = 0
+    while i < im.qtd_secoes {
+        let arg_1: str = elf_nome_da_secao(&im.secoes[i])
+        let arg_2: ^[dynamic]u8 = &x.shstr
+        x.nome_sec[i] = elf_nome(arg_2, arg_1)
+        i += 1
+    }
+    x.nome_sim = elf_nome(&x.shstr, ".symtab")
+    x.nome_str = elf_nome(&x.shstr, ".strtab")
+    x.nome_shstr = elf_nome(&x.shstr, ".shstrtab")
+    elf_dbg_nomes(im, x)
+    if im.pie and im.dinamico {
+        elf_din_nomes(im, &x.shstr, &x.nome_din)
+    } else if im.pie {
+        x.nome_rela = elf_nome(&x.shstr, ".rela.dyn")
+        x.nome_dyn = elf_nome(&x.shstr, ".dynamic")
+    }
+}
+
+// C: nativo/fmt/elf_escrever.c:444
+proc elf_anexar_simbolo(im: ^Imagem, x: ^ElfExtras, s: ^ImagemSimbolo) {
+    let nome: str = s.nome or_else ""
+    var tipo: u32 = ELF_STT_NOTYPE
+    if elf_classe_de(&im.secoes[s.secao]) == CLASSE_RX {
+        tipo = ELF_STT_FUNC
+    }
+    var v: [ST_QTD]u64 = {}
+    v[ST_NAME] = elf_nome(&x.str, nome) as u64
+    v[ST_INFO] = ((ELF_STB_GLOBAL << 4) | tipo) as u64
+    v[ST_SHNDX] = (s.secao + 1) as u64
+    v[ST_VALUE] = pe_base_da_imagem(im) + (s.rva as u64)
+    elf_anexar_registro(&x.sim, ELF_T_SYM, v[..])
+}
+
+// C: nativo/fmt/elf_escrever.c:453
+proc elf_montar_simbolos(im: ^Imagem, x: ^ElfExtras) {
+    var nulo: [ST_QTD]u64 = {}
+    elf_anexar_registro(&x.sim, ELF_T_SYM, nulo[..])
+    append(&x.str, item = 0 as u8)
+    for k in (0 as u32)..<(len(im.simbolos) as u32) {
+        elf_anexar_simbolo(im, x, &im.simbolos[k])
+    }
+}
+
+// C: nativo/fmt/elf_escrever.c:463
+proc elf_montar_extras(im: ^Imagem, p: ^ElfPlano, x: ^ElfExtras) {
+    elf_montar_nomes(im, x)
+    elf_montar_simbolos(im, x)
+    x.off_sim = elf_alinhar(elf_dbg_planejar(im, p.fim_secoes, x), ELF_ALINHA_TABELA as u64)
+    x.off_str = x.off_sim + (len(x.sim) as u64)
+    x.off_shstr = x.off_str + (len(x.str) as u64)
+    x.off_sh = elf_alinhar(x.off_shstr + (len(x.shstr) as u64), ELF_ALINHA_TABELA as u64)
+    var tern_1: u32 = 0
+    if common.c2f_b2i32(im.pie) != 0 {
+        tern_1 = ELF_SECOES_DINAMICAS
+    }
+    x.ndyn = tern_1
+    if p.dinamico {
+        x.ndyn = p.din.nsec
+        elf_din_montar(im, p, &x.din)
+    }
+    x.link_str = ((im.qtd_secoes + 2) + x.ndyn) + x.ndbg
+    x.nsh = (((1 + im.qtd_secoes) + x.ndyn) + x.ndbg) + ELF_SECOES_EXTRAS
+}
+
+// C: nativo/fmt/elf_escrever.c:476
+proc elf_liberar_extras(x: ^ElfExtras) {
+    delete(x.sim)
+    delete(x.str)
+    delete(x.shstr)
+    delete(x.din)
+}
+
+// C: nativo/fmt/elf_escrever.c:485
+proc elf_anexar_ehdr(b: ^[dynamic]u8, im: ^Imagem, p: ^ElfPlano, x: ^ElfExtras) {
+    var v: [EH_QTD]u64 = {}
+    var tipo_arquivo: u32 = ELF_ET_EXEC
+    if im.pie {
+        tipo_arquivo = ELF_ET_DYN
+    }
+    v[EH_TYPE] = tipo_arquivo as u64
+    v[EH_MACHINE] = elf_maquina_de(im)
+    v[EH_VERSION] = ELF_EV_CURRENT as u64
+    v[EH_ENTRY] = pe_base_da_imagem(im) + (im.entrada_rva as u64)
+    v[EH_PHOFF] = ELF_TAM_EHDR as u64
+    v[EH_SHOFF] = x.off_sh
+    v[EH_EHSIZE] = ELF_TAM_EHDR as u64
+    v[EH_PHENTSIZE] = ELF_TAM_PHDR as u64
+    v[EH_PHNUM] = p.qtd as u64
+    v[EH_SHENTSIZE] = ELF_TAM_SHDR as u64
+    v[EH_SHNUM] = x.nsh as u64
+    v[EH_SHSTRNDX] = wrapping_sub(x.nsh, 1) as u64
+    elf_anexar_registro(b, ELF_T_EHDR, v[..])
+}
+
+// C: nativo/fmt/elf_escrever.c:494
+proc elf_anexar_phdr(b: ^[dynamic]u8, s: ^ElfSegmento) {
+    var v: [PH_QTD]u64 = {}
+    v[PH_TYPE] = s.tipo as u64
+    v[PH_FLAGS] = s.flags as u64
+    v[PH_OFFSET] = s.offset
+    v[PH_VADDR] = s.vaddr
+    v[PH_PADDR] = s.vaddr
+    v[PH_FILESZ] = s.filesz
+    v[PH_MEMSZ] = s.memsz
+    v[PH_ALIGN] = s.alinhamento
+    elf_anexar_registro(b, ELF_T_PHDR, v[..])
+}
+
+// C: nativo/fmt/elf_escrever.c:502
+proc elf_anexar_shdr_secao(b: ^[dynamic]u8, im: ^Imagem, p: ^ElfPlano, x: ^ElfExtras) {
+    for i in (0 as u32)..<im.qtd_secoes {
+        let s: ^PeSecao = &im.secoes[i]
+        let tem_bytes: bool = (len(s.bytes) as u64) > 0
+        var tipo_secao: u32 = ELF_SHT_NOBITS
+        var tam_secao: u64 = s.tam_virtual as u64
+        if tem_bytes {
+            tipo_secao = ELF_SHT_PROGBITS
+            tam_secao = len(s.bytes) as u64
+        }
+        var v: [SH_QTD]u64 = {}
+        v[SH_NAME] = x.nome_sec[i] as u64
+        v[SH_TYPE] = tipo_secao as u64
+        v[SH_FLAGS] = ELF_FLAGS_SECAO[elf_classe_de(s)] as u64
+        v[SH_ADDR] = pe_base_da_imagem(im) + (s.rva as u64)
+        v[SH_OFFSET] = p.off_secao[i]
+        v[SH_SIZE] = tam_secao
+        v[SH_ADDRALIGN] = ELF_ALINHA_SECAO as u64
+        elf_anexar_registro(b, ELF_T_SHDR, v[..])
+    }
+}
+
+// C: nativo/fmt/elf_escrever.c:514
+proc elf_anexar_shdr_extras(b: ^[dynamic]u8, im: ^Imagem, x: ^ElfExtras) {
+    var sim: [SH_QTD]u64 = {}
+    sim[SH_NAME] = x.nome_sim as u64
+    sim[SH_TYPE] = ELF_SHT_SYMTAB as u64
+    sim[SH_OFFSET] = x.off_sim
+    sim[SH_SIZE] = len(x.sim) as u64
+    sim[SH_LINK] = x.link_str as u64
+    sim[SH_INFO] = ELF_PRIMEIRO_GLOBAL as u64
+    sim[SH_ADDRALIGN] = ELF_ALINHA_TABELA as u64
+    sim[SH_ENTSIZE] = ELF_TAM_SIM as u64
+    var sh_strtab: [SH_QTD]u64 = {}
+    sh_strtab[SH_NAME] = x.nome_str as u64
+    sh_strtab[SH_TYPE] = ELF_SHT_STRTAB as u64
+    sh_strtab[SH_OFFSET] = x.off_str
+    sh_strtab[SH_SIZE] = len(x.str) as u64
+    sh_strtab[SH_ADDRALIGN] = 1
+    var sh_shstr: [SH_QTD]u64 = {}
+    sh_shstr[SH_NAME] = x.nome_shstr as u64
+    sh_shstr[SH_TYPE] = ELF_SHT_STRTAB as u64
+    sh_shstr[SH_OFFSET] = x.off_shstr
+    sh_shstr[SH_SIZE] = len(x.shstr) as u64
+    sh_shstr[SH_ADDRALIGN] = 1
+    elf_anexar_shdr_dbg(b, im, x)
+    elf_anexar_registro(b, ELF_T_SHDR, sim[..])
+    elf_anexar_registro(b, ELF_T_SHDR, sh_strtab[..])
+    elf_anexar_registro(b, ELF_T_SHDR, sh_shstr[..])
+}
+
+// C: nativo/fmt/elf_escrever.c:529
+proc elf_anexar_quad(b: ^[dynamic]u8, v: u64) {
+    for k in (0 as u32)..<ELF_TAM_QUAD {
+        append(b, item = common.c2f_trunc_u8(v >> (((k * ELF_BITS_BYTE) & 63) as u64)))
+    }
+}
+
+// C: nativo/fmt/elf_escrever.c:539
+proc elf_anexar_relativas(b: ^[dynamic]u8, im: ^Imagem) {
+    var k: u64 = 0
+    while k < (len(im.relativos) as u64) {
+        let r: ^ImagemRelativa = &im.relativos[k]
+        elf_anexar_quad(b, pe_base_da_imagem(im) + (r.rva as u64))
+        elf_anexar_quad(b, ELF_R_RELATIVE as u64)
+        elf_anexar_quad(b, r.valor)
+        k += 1
+    }
+}
+
+// C: nativo/fmt/elf_escrever.c:550
+proc elf_anexar_dinamico(b: ^[dynamic]u8, p: ^ElfPlano) {
+    elf_anexar_quad(b, ELF_DT_RELA as u64)
+    elf_anexar_quad(b, p.va_dyn + p.tam_dyn)
+    elf_anexar_quad(b, ELF_DT_RELASZ as u64)
+    elf_anexar_quad(b, p.tam_rela)
+    elf_anexar_quad(b, ELF_DT_RELAENT as u64)
+    elf_anexar_quad(b, ELF_TAM_RELA as u64)
+    elf_anexar_quad(b, ELF_DT_FLAGS_1 as u64)
+    elf_anexar_quad(b, ELF_DF_1_PIE as u64)
+    elf_anexar_quad(b, ELF_DT_NULL as u64)
+    elf_anexar_quad(b, 0)
+}
+
+// C: nativo/fmt/elf_escrever.c:561
+proc elf_anexar_shdr_dinamico(b: ^[dynamic]u8, p: ^ElfPlano, x: ^ElfExtras) {
+    var sh_rela: [SH_QTD]u64 = {}
+    sh_rela[SH_NAME] = x.nome_rela as u64
+    sh_rela[SH_TYPE] = ELF_SHT_RELA as u64
+    sh_rela[SH_FLAGS] = ELF_SHF_ALLOC as u64
+    sh_rela[SH_ADDR] = p.va_dyn + p.tam_dyn
+    sh_rela[SH_OFFSET] = p.off_dyn + p.tam_dyn
+    sh_rela[SH_SIZE] = p.tam_rela
+    sh_rela[SH_ADDRALIGN] = ELF_ALINHA_TABELA as u64
+    sh_rela[SH_ENTSIZE] = ELF_TAM_RELA as u64
+    var sh_dyn: [SH_QTD]u64 = {}
+    sh_dyn[SH_NAME] = x.nome_dyn as u64
+    sh_dyn[SH_TYPE] = ELF_SHT_DYNAMIC as u64
+    sh_dyn[SH_FLAGS] = (ELF_SHF_ALLOC | ELF_SHF_WRITE) as u64
+    sh_dyn[SH_LINK] = x.link_str as u64
+    sh_dyn[SH_ADDR] = p.va_dyn
+    sh_dyn[SH_OFFSET] = p.off_dyn
+    sh_dyn[SH_SIZE] = p.tam_dyn
+    sh_dyn[SH_ADDRALIGN] = ELF_ALINHA_TABELA as u64
+    sh_dyn[SH_ENTSIZE] = ELF_TAM_DT as u64
+    elf_anexar_registro(b, ELF_T_SHDR, sh_rela[..])
+    elf_anexar_registro(b, ELF_T_SHDR, sh_dyn[..])
+}
+
+// C: nativo/fmt/elf_escrever.c:573
+proc elf_escrever_tudo(im: ^Imagem, p: ^ElfPlano, x: ^ElfExtras, b: ^[dynamic]u8) {
+    var nulo: [SH_QTD]u64 = {}
+    elf_anexar_ehdr(b, im, p, x)
+    for k in (0 as u32)..<p.qtd {
+        elf_anexar_phdr(b, &p.seg[k])
+    }
+    for i in (0 as u32)..<im.qtd_secoes {
+        if (len(im.secoes[i].bytes) as u64) == 0 {
+            continue
+        }
+        elf_preencher(b, p.off_secao[i])
+        append(b, items = im.secoes[i].bytes[..])
+    }
+    if p.dinamico {
+        elf_preencher(b, p.off_dyn)
+        append(b, items = x.din[..])
+    } else if p.pie {
+        elf_preencher(b, p.off_dyn)
+        elf_anexar_dinamico(b, p)
+        elf_anexar_relativas(b, im)
+    }
+    elf_escrever_dbg(b, im, x)
+    elf_preencher(b, x.off_sim)
+    append(b, items = x.sim[..])
+    append(b, items = x.str[..])
+    append(b, items = x.shstr[..])
+    elf_preencher(b, x.off_sh)
+    elf_anexar_registro(b, ELF_T_SHDR, nulo[..])
+    elf_anexar_shdr_secao(b, im, p, x)
+    if p.dinamico {
+        elf_din_anexar_shdr(b, im, p, x.nome_din[..])
+    } else if p.pie {
+        elf_anexar_shdr_dinamico(b, p, x)
+    }
+    elf_anexar_shdr_extras(b, im, x)
+}
+
+// C: nativo/fmt/elf_escrever.c:616
+proc elf_exige(v: ^ElfVisao, cond: bool, campo: str, regra: str) -> bool {
+    if cond {
+        return true
+    }
+    if v.motivo == none {
+        let texto: str = format(f"{campo}: {regra}", alloc = frame)
+        var cortado: str = texto
+        if (len(texto) as u64) > ((ELF_MOTIVO_TAM - 1) as u64) {
+            cortado = texto[0..<((ELF_MOTIVO_TAM - 1) as u64)]
+        }
+        v.motivo = cortado
+    }
+    return false
+}
+
+// C: nativo/fmt/elf_escrever.c:623
+proc elf_conferir_ident(v: ^ElfVisao) -> bool {
+    if not elf_exige(v, v.n >= (ELF_TAM_EHDR as u64), "e_ident", "arquivo menor que o cabecalho ELF") {
+        return false
+    }
+    let d: []u8 = v.d or_else {}
+    var igual: bool = true
+    for k in (0 as u32)..<ELF_TAM_IDENT {
+        if d[k] != ELF_IDENT[k] {
+            igual = false
+        }
+    }
+    return elf_exige(v, igual, "e_ident", "diferente de 7f 45 4c 46, ELFCLASS64, LSB, EV_CURRENT, SYSV")
+}
+
+// C: nativo/fmt/elf_escrever.c:629
+proc elf_conferir_tipos(v: ^ElfVisao) -> bool {
+    let d: []u8 = v.d or_else {}
+    var tipo_certo: u64 = ELF_ET_EXEC as u64
+    var regra_tipo: str = "diferente de ET_EXEC"
+    if v.pie {
+        tipo_certo = ELF_ET_DYN as u64
+        regra_tipo = "diferente de ET_DYN"
+    }
+    return elf_exige(v, elf_le(d, ELF_EHDR[EH_TYPE]) == tipo_certo, ELF_EHDR[EH_TYPE].nome, regra_tipo) and elf_exige(v, elf_le(d, ELF_EHDR[EH_MACHINE]) == v.maquina, ELF_EHDR[EH_MACHINE].nome, "diferente da maquina do alvo") and elf_exige(v, (elf_le(d, ELF_EHDR[EH_EHSIZE]) == (ELF_TAM_EHDR as u64)) and (elf_le(d, ELF_EHDR[EH_PHENTSIZE]) == (ELF_TAM_PHDR as u64)), ELF_EHDR[EH_EHSIZE].nome, "ehsize/phentsize errados")
+}
+
+// C: nativo/fmt/elf_escrever.c:638
+proc elf_conferir_tabelas(v: ^ElfVisao) -> bool {
+    let d: []u8 = v.d or_else {}
+    let phoff: u64 = elf_le(d, ELF_EHDR[EH_PHOFF])
+    let shoff: u64 = elf_le(d, ELF_EHDR[EH_SHOFF])
+    let qtd_ph: u64 = v.esperado_ph as u64
+    let qtd_sh: u64 = v.esperado_sh as u64
+    return elf_exige(v, (phoff == (ELF_TAM_EHDR as u64)) and (elf_le(d, ELF_EHDR[EH_PHNUM]) == qtd_ph), ELF_EHDR[EH_PHOFF].nome, "diferente de 64 ou e_phnum diferente do montado") and elf_exige(v, wrapping_add(phoff, wrapping_mul(qtd_ph, ELF_TAM_PHDR as u64)) <= v.n, ELF_EHDR[EH_PHNUM].nome, "tabela de cabecalhos de programa fora do arquivo") and elf_exige(v, (elf_le(d, ELF_EHDR[EH_SHNUM]) == qtd_sh) and (wrapping_add(shoff, wrapping_mul(qtd_sh, ELF_TAM_SHDR as u64)) <= v.n), ELF_EHDR[EH_SHOFF].nome, "tabela de secoes fora do arquivo ou e_shnum diferente do montado")
+}
+
+// C: nativo/fmt/elf_escrever.c:649
+proc elf_conferir_cabecalho(v: ^ElfVisao) -> bool {
+    return ((common.c2f_b2i32(elf_conferir_ident(v)) != 0) and (common.c2f_b2i32(elf_conferir_tipos(v)) != 0)) and (common.c2f_b2i32(elf_conferir_tabelas(v)) != 0)
+}
+
+// C: nativo/fmt/elf_escrever.c:656
+// C: nativo/fmt/elf_escrever.c:656 - ph e a entrada de 56 bytes do cabecalho de programa (fatia de v.d)
+proc elf_conferir_alinhamento(v: ^ElfVisao, ph: []u8) -> bool {
+    let pagina: u64 = elf_pagina_do_arquivo(v.d or_else {})
+    return elf_exige(v, elf_le(ph, ELF_PHDR[PH_ALIGN]) == pagina, ELF_PHDR[PH_ALIGN].nome, "diferente de 0x1000") and elf_exige(v, (elf_le(ph, ELF_PHDR[PH_OFFSET]) % pagina) == (elf_le(ph, ELF_PHDR[PH_VADDR]) % pagina), ELF_PHDR[PH_OFFSET].nome, "nao e congruente a p_vaddr modulo 0x1000")
+}
+
+// C: nativo/fmt/elf_escrever.c:664
+proc elf_conferir_tamanhos(v: ^ElfVisao, ph: []u8) -> bool {
+    let offset: u64 = elf_le(ph, ELF_PHDR[PH_OFFSET])
+    let filesz: u64 = elf_le(ph, ELF_PHDR[PH_FILESZ])
+    let flags: u64 = elf_le(ph, ELF_PHDR[PH_FLAGS])
+    let escrita_exec: u64 = (ELF_PF_W | ELF_PF_X) as u64
+    return elf_exige(v, filesz <= elf_le(ph, ELF_PHDR[PH_MEMSZ]), ELF_PHDR[PH_FILESZ].nome, "maior que p_memsz") and elf_exige(v, (offset <= v.n) and (filesz <= (v.n - offset)), ELF_PHDR[PH_FILESZ].nome, "passa do fim do arquivo") and elf_exige(v, ((flags & (ELF_PF_R as u64)) != 0) and ((flags & escrita_exec) != escrita_exec), ELF_PHDR[PH_FLAGS].nome, "sem leitura ou com escrita e execucao juntas")
+}
+
+// C: nativo/fmt/elf_escrever.c:674
+proc elf_conferir_load(v: ^ElfVisao, ph: []u8, ant: ^ElfAnterior) -> bool {
+    let offset: u64 = elf_le(ph, ELF_PHDR[PH_OFFSET])
+    let vaddr: u64 = elf_le(ph, ELF_PHDR[PH_VADDR])
+    let filesz: u64 = elf_le(ph, ELF_PHDR[PH_FILESZ])
+    let memsz: u64 = elf_le(ph, ELF_PHDR[PH_MEMSZ])
+    let pagina: u64 = elf_pagina_do_arquivo(v.d or_else {})
+    let ok: bool = elf_conferir_alinhamento(v, ph) and elf_conferir_tamanhos(v, ph) and elf_exige(v, ((vaddr / pagina) * pagina) >= ant.fim_pagina_va, ELF_PHDR[PH_VADDR].nome, "PT_LOAD sobrepoe o anterior em memoria") and elf_exige(v, offset >= ant.fim_off, ELF_PHDR[PH_OFFSET].nome, "PT_LOAD sobrepoe o anterior no arquivo")
+    ant.fim_pagina_va = elf_alinhar(wrapping_add(vaddr, memsz), pagina)
+    ant.fim_off = wrapping_add(offset, filesz)
+    return ok
+}
+
+// C: nativo/fmt/elf_escrever.c:689
+proc elf_conferir_tls(v: ^ElfVisao, ph: []u8) -> bool {
+    let align: u64 = elf_le(ph, ELF_PHDR[PH_ALIGN])
+    let filesz: u64 = elf_le(ph, ELF_PHDR[PH_FILESZ])
+    let memsz: u64 = elf_le(ph, ELF_PHDR[PH_MEMSZ])
+    return elf_exige(v, (align != 0) and ((align & (align - 1)) == 0), ELF_PHDR[PH_ALIGN].nome, "PT_TLS com alinhamento que nao e potencia de 2") and elf_exige(v, (memsz > 0) and (filesz <= memsz), ELF_PHDR[PH_MEMSZ].nome, "PT_TLS com memsz zero ou menor que filesz")
+}
+
+// C: nativo/fmt/elf_escrever.c:699
+proc elf_tipo_admitido(v: ^ElfVisao, tipo: u64) -> bool {
+    if (tipo == (ELF_PT_LOAD as u64)) or (tipo == (ELF_PT_GNU_STACK as u64)) {
+        return true
+    }
+    if (common.c2f_b2i32(v.pie) != 0) and ((tipo == (ELF_PT_PHDR as u64)) or (tipo == (ELF_PT_DYNAMIC as u64))) {
+        return true
+    }
+    if v.pie and ((tipo == (ELF_PT_INTERP as u64)) or (tipo == (ELF_PT_GNU_RELRO as u64))) {
+        return true // A4.2: so o ELF dinamico os monta
+    }
+    return (common.c2f_b2i32(v.tls) != 0) and (tipo == (ELF_PT_TLS as u64))
+}
+
+// C: nativo/fmt/elf_escrever.c:709
+// C: nativo/fmt/elf_escrever.c:698-706 (tipos admitidos) e 709-729 (um PT_LOAD confere a faixa; um PT_TLS confere o bloco)
+proc elf_conferir_segmentos(v: ^ElfVisao) -> bool {
+    var ant: ElfAnterior = ElfAnterior{fim_pagina_va = 0, fim_off = 0}
+    var loads: u32 = 0
+    var dinamicos: u32 = 0
+    var tlses: u32 = 0
+    let d: []u8 = v.d or_else {}
+    for k in (0 as u32)..<v.esperado_ph {
+        let ph: []u8 = elf_fatia_phdr(d, k)
+        let tipo: u64 = elf_le(ph, ELF_PHDR[PH_TYPE])
+        if not elf_exige(v, elf_tipo_admitido(v, tipo), ELF_PHDR[PH_TYPE].nome, "tipo fora do que o escritor monta (PT_LOAD, PT_GNU_STACK, no pie PT_PHDR e PT_DYNAMIC, com TLS PT_TLS)") {
+            return false
+        }
+        if (tipo == (ELF_PT_LOAD as u64)) and (not elf_conferir_load(v, ph, &ant)) {
+            return false
+        }
+        if (tipo == (ELF_PT_TLS as u64)) and (not elf_conferir_tls(v, ph)) {
+            return false
+        }
+        if tipo == (ELF_PT_LOAD as u64) {
+            loads += 1
+        }
+        if tipo == (ELF_PT_DYNAMIC as u64) {
+            dinamicos += 1
+        }
+        if tipo == (ELF_PT_TLS as u64) {
+            tlses += 1
+        }
+    }
+    var tls_esperado: u32 = 0
+    if v.tls {
+        tls_esperado = 1
+    }
+    return elf_exige(v, loads > 0, ELF_PHDR[PH_TYPE].nome, "nenhum PT_LOAD") and elf_exige(v, (not v.pie) or (dinamicos == 1), ELF_PHDR[PH_TYPE].nome, "pie sem exatamente um PT_DYNAMIC") and elf_exige(v, tlses == tls_esperado, ELF_PHDR[PH_TYPE].nome, "PT_TLS faltando ou sobrando em relacao ao plano")
+}
+
+// C: nativo/fmt/elf_escrever.c:715 (ph = v->d + ELF_TAM_EHDR + k * ELF_TAM_PHDR)
+proc elf_fatia_phdr(d: []u8, k: u32) -> []u8 {
+    let inicio: u64 = (ELF_TAM_EHDR as u64) + ((k as u64) * (ELF_TAM_PHDR as u64))
+    return d[inicio..<(inicio + (ELF_TAM_PHDR as u64))]
+}
+
+// C: nativo/fmt/elf_escrever.c:731
+proc elf_executa_entrada(ph: []u8, entrada: u64) -> bool {
+    let vaddr: u64 = elf_le(ph, ELF_PHDR[PH_VADDR])
+    return (elf_le(ph, ELF_PHDR[PH_TYPE]) == (ELF_PT_LOAD as u64)) and ((elf_le(ph, ELF_PHDR[PH_FLAGS]) & (ELF_PF_X as u64)) != 0) and (entrada >= vaddr) and ((entrada - vaddr) < elf_le(ph, ELF_PHDR[PH_FILESZ]))
+}
+
+// C: nativo/fmt/elf_escrever.c:740
+proc elf_conferir_entrada(v: ^ElfVisao) -> bool {
+    if v.sem_entrada {
+        return true // .so dinamico: e_entry = 0
+    }
+    let d: []u8 = v.d or_else {}
+    let entrada: u64 = elf_le(d, ELF_EHDR[EH_ENTRY])
+    for k in (0 as u32)..<v.esperado_ph {
+        if elf_executa_entrada(elf_fatia_phdr(d, k), entrada) {
+            return true
+        }
+    }
+    return elf_exige(v, false, ELF_EHDR[EH_ENTRY].nome, "fora de qualquer PT_LOAD executavel")
+}
+
+// C: nativo/fmt/elf_escrever.c:752
+proc elf_conferir_secoes(v: ^ElfVisao) -> bool {
+    let d: []u8 = v.d or_else {}
+    let shoff: u64 = elf_le(d, ELF_EHDR[EH_SHOFF])
+    for k in (1 as u32)..<v.esperado_sh {
+        let inicio: u64 = shoff + ((k as u64) * (ELF_TAM_SHDR as u64))
+        let sh: []u8 = d[inicio..<(inicio + (ELF_TAM_SHDR as u64))]
+        let off: u64 = elf_le(sh, ELF_SHDR[SH_OFFSET])
+        let tam: u64 = elf_le(sh, ELF_SHDR[SH_SIZE])
+        let nobits: bool = elf_le(sh, ELF_SHDR[SH_TYPE]) == (ELF_SHT_NOBITS as u64)
+        if not elf_exige(v, nobits or ((off <= v.n) and (tam <= (v.n - off))), ELF_SHDR[SH_SIZE].nome, "secao passa do fim do arquivo") {
+            return false
+        }
+    }
+    return elf_exige(v, elf_le(d, ELF_EHDR[EH_SHSTRNDX]) == (wrapping_sub(v.esperado_sh, 1) as u64), ELF_EHDR[EH_SHSTRNDX].nome, "diferente do ultimo cabecalho de secao")
+}
+
+// C: nativo/fmt/elf_escrever.c:766
+proc elf_autoconferir(saida: ^[dynamic]u8, p: ^ElfPlano, qtd_sh: u32, erro: ^common.Diag) -> bool {
+    var v: ElfVisao = ElfVisao{d = saida^[..], n = (len(saida^) as u64), esperado_ph = p.qtd, esperado_sh = qtd_sh, pie = p.pie, tls = p.tls, motivo = none, maquina = p.maquina, sem_entrada = p.sem_entrada}
+    let ok: bool = elf_conferir_ident(&v) and elf_conferir_cabecalho(&v) and elf_conferir_segmentos(&v) and elf_conferir_entrada(&v) and elf_conferir_secoes(&v)
+    if ok {
+        return true
+    }
+    let texto: str = v.motivo or_else ""
+    let msg: str = format(f"autoconferencia do ELF: {texto}", alloc = frame)
+    return common.diag_relatar(erro, common.X0905, 0, msg)
+}
+
+// C: nativo/fmt/elf_escrever.c:776
+pub proc elf_escrever(im: ^Imagem, saida: ^[dynamic]u8, erro: ^common.Diag) -> bool {
+    if len(saida^) != 0 {
+        common.falha_interna("elf: ElfEscrever recebeu uma saida que nao esta vazia")
+    }
+    if im.formato != IMAGEM_ELF {
+        return common.diag_relatar(erro, common.X0905, 0, "autoconferencia do ELF: a imagem nao e do formato ELF")
+    }
+    var plano: ElfPlano = ElfPlano{}
+    let motivo: ?str = elf_planejar(im, &plano)
+    if motivo != none {
+        let texto: str = motivo or_else ""
+        let msg: str = format(f"autoconferencia do ELF: {texto}", alloc = frame)
+        return common.diag_relatar(erro, common.X0905, 0, msg)
+    }
+    var x: ElfExtras = ElfExtras{}
+    x.sim = make([dynamic]u8, alloc = heap)
+    x.str = make([dynamic]u8, alloc = heap)
+    x.shstr = make([dynamic]u8, alloc = heap)
+    x.din = make([dynamic]u8, alloc = heap)
+    elf_montar_extras(im, &plano, &x)
+    elf_escrever_tudo(im, &plano, &x, saida)
+    let ok: bool = elf_autoconferir(saida, &plano, x.nsh, erro)
+    elf_liberar_extras(&x)
+    return ok
+}
+
+test "elf_escrever_tabelas" {
+    expect(ELF_EHDR[EH_SHSTRNDX].off == 62 and ELF_EHDR[EH_SHSTRNDX].tam == 2)
+    expect(ELF_EHDR[EH_ENTRY].nome == "e_entry")
+    expect(ELF_PHDR[PH_ALIGN].off == 48 and ELF_PHDR[PH_ALIGN].tam == 8)
+    expect(ELF_SHDR[SH_ENTSIZE].off == 56 and ELF_SHDR[SH_ENTSIZE].tam == 8)
+    expect(ELF_SYM[ST_VALUE].off == 8 and ELF_SYM[ST_SIZE].off == 16)
+    expect(ELF_T_EHDR.qtd == 13 and ELF_T_EHDR.tam == 64)
+    expect(ELF_T_PHDR.qtd == 8 and ELF_T_PHDR.tam == 56)
+    expect(ELF_T_SHDR.qtd == 10 and ELF_T_SHDR.tam == 64)
+    expect(ELF_T_SYM.qtd == 6 and ELF_T_SYM.tam == 24)
+}
+
+test "elf_escrever_alinhar_poe_le" {
+    expect(elf_alinhar(0, 4096) == 0)
+    expect(elf_alinhar(1, 4096) == 4096)
+    expect(elf_alinhar(4096, 4096) == 4096)
+    expect(elf_alinhar(4097, 4096) == 8192)
+    var reg: [64]u8 = {}
+    elf_poe(reg[..], ELF_EHDR[EH_ENTRY], 0x0102030405060708)
+    expect(reg[24] == 8 and reg[25] == 7 and reg[31] == 1)
+    expect(elf_le(reg[..], ELF_EHDR[EH_ENTRY]) == 0x0102030405060708)
+}
+
+test "elf_escrever_registros" {
+    var b: [dynamic]u8 = make([dynamic]u8, alloc = frame)
+    var v: [EH_QTD]u64 = {}
+    v[EH_TYPE] = 2
+    v[EH_MACHINE] = 62
+    v[EH_PHNUM] = 3
+    elf_anexar_registro(&b, ELF_T_EHDR, v[..])
+    expect(len(b) == 64)
+    expect(b[0] == 127 and b[1] == 69 and b[2] == 76 and b[3] == 70 and b[4] == 2 and b[5] == 1 and b[6] == 1)
+    expect(b[16] == 2 and b[18] == 62 and b[56] == 3)
+    var p: [PH_QTD]u64 = {}
+    p[PH_TYPE] = 1
+    p[PH_OFFSET] = 4096
+    elf_anexar_registro(&b, ELF_T_PHDR, p[..])
+    expect(len(b) == 120 and b[64] == 1 and b[72] == 0 and b[73] == 16)
+    var s: [ST_QTD]u64 = {}
+    s[ST_INFO] = 18
+    elf_anexar_registro(&b, ELF_T_SYM, s[..])
+    expect(len(b) == 144 and b[124] == 18)
+}
+
+test "elf_escrever_preencher_quad_dinamico" {
+    var b: [dynamic]u8 = make([dynamic]u8, alloc = frame)
+    append(&b, item = 9)
+    append(&b, item = 9)
+    append(&b, item = 9)
+    elf_preencher(&b, 10)
+    expect(len(b) == 10 and b[2] == 9 and b[3] == 0 and b[9] == 0)
+    elf_anexar_quad(&b, 0x0102030405060708)
+    expect(len(b) == 18 and b[10] == 8 and b[17] == 1)
+    var p: ElfPlano = ElfPlano{}
+    p.va_dyn = 4096
+    p.tam_dyn = 80
+    p.tam_rela = 24
+    var d: [dynamic]u8 = make([dynamic]u8, alloc = frame)
+    elf_anexar_dinamico(&d, &p)
+    expect(len(d) == 80 and d[0] == 7 and d[16] == 8 and d[24] == 24 and d[32] == 9 and d[48] == 251 and d[59] == 8)
+}
+
+test "elf_escrever_classe_nome" {
+    var s: PeSecao = PeSecao{nome = "t", caracteristicas = 0, rva = 0, tam_virtual = 0}
+    expect(elf_classe_de(&s) == CLASSE_R and elf_nome_da_secao(&s) == ".rodata")
+    s.caracteristicas = PE_SECAO_CODIGO
+    expect(elf_classe_de(&s) == CLASSE_RX and elf_nome_da_secao(&s) == ".text")
+    s.caracteristicas = ELF_PE_ESCRITA
+    expect(elf_classe_de(&s) == CLASSE_RW and elf_nome_da_secao(&s) == ".bss")
+    s.bytes = make([dynamic]u8, alloc = frame)
+    append(&s.bytes, item = 1)
+    expect(elf_nome_da_secao(&s) == ".data")
+}
+
+test "elf_escrever_exige_motivo" {
+    var v: ElfVisao = ElfVisao{}
+    expect(elf_exige(&v, true, "e_type", "x") == true and v.motivo == none)
+    expect(elf_exige(&v, false, "e_type", "diferente de ET_EXEC") == false)
+    let m1: str = v.motivo or_else ""
+    expect(m1 == "e_type: diferente de ET_EXEC")
+    expect(elf_exige(&v, false, "p_type", "outra") == false)
+    let m2: str = v.motivo or_else ""
+    expect(m2 == "e_type: diferente de ET_EXEC")
+}
+
+test "elf_escrever_motivo_corte" {
+    var v: ElfVisao = ElfVisao{}
+    let campo: str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    let regra: str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    expect(elf_exige(&v, false, campo, regra) == false)
+    let m: str = v.motivo or_else ""
+    expect(len(m) == 159 and m[0..<3] == "aaa")
+}
+
+test "elf_escrever_ident" {
+    var buf: [64]u8 = {}
+    buf[0] = 127
+    buf[1] = 69
+    buf[2] = 76
+    buf[3] = 70
+    buf[4] = 2
+    buf[5] = 1
+    buf[6] = 1
+    var v: ElfVisao = ElfVisao{d = buf[..], n = 64}
+    expect(elf_conferir_ident(&v) == true)
+    buf[4] = 1
+    expect(elf_conferir_ident(&v) == false)
+    let m: str = v.motivo or_else ""
+    expect(m == "e_ident: diferente de 7f 45 4c 46, ELFCLASS64, LSB, EV_CURRENT, SYSV")
+    var curto: ElfVisao = ElfVisao{d = buf[..], n = 10}
+    expect(elf_conferir_ident(&curto) == false)
+}
+
+test "elf_escrever_tipos_admitidos" {
+    var v: ElfVisao = ElfVisao{}
+    expect(elf_tipo_admitido(&v, 1) and elf_tipo_admitido(&v, 1685382481))
+    expect((not elf_tipo_admitido(&v, 6)) and (not elf_tipo_admitido(&v, 7)))
+    v.pie = true
+    expect(elf_tipo_admitido(&v, 6) and elf_tipo_admitido(&v, 2) and (not elf_tipo_admitido(&v, 7)))
+    v.tls = true
+    expect(elf_tipo_admitido(&v, 7))
+}
+
+test "elf_escrever_ph_load_alinhamento" {
+    var ph: [56]u8 = {}
+    elf_poe(ph[..], ELF_PHDR[PH_TYPE], 1)
+    elf_poe(ph[..], ELF_PHDR[PH_FLAGS], 5)
+    elf_poe(ph[..], ELF_PHDR[PH_VADDR], 4194304)
+    elf_poe(ph[..], ELF_PHDR[PH_FILESZ], 256)
+    elf_poe(ph[..], ELF_PHDR[PH_OFFSET], 4096)
+    elf_poe(ph[..], ELF_PHDR[PH_ALIGN], 4096)
+    expect(elf_executa_entrada(ph[..], 4194320))
+    expect(not elf_executa_entrada(ph[..], 4194560))
+    var v: ElfVisao = ElfVisao{}
+    expect(elf_conferir_alinhamento(&v, ph[..]) == true)
+    elf_poe(ph[..], ELF_PHDR[PH_OFFSET], 4097)
+    expect(elf_conferir_alinhamento(&v, ph[..]) == false)
+    let m: str = v.motivo or_else ""
+    expect(m == "p_offset: nao e congruente a p_vaddr modulo 0x1000")
+}
+
+test "elf_escrever_ponta_a_ponta" {
+    var im: Imagem = Imagem{}
+    im.formato = IMAGEM_ELF
+    im.qtd_secoes = 1
+    im.entrada_rva = 4096
+    im.secoes[0].nome = ".text"
+    im.secoes[0].caracteristicas = PE_SECAO_CODIGO
+    im.secoes[0].rva = 4096
+    im.secoes[0].tam_virtual = 16
+    im.secoes[0].bytes = make([dynamic]u8, alloc = frame)
+    for k in (0 as u32)..<16 {
+        append(&im.secoes[0].bytes, item = 144 as u8)
+    }
+    var saida: [dynamic]u8 = make([dynamic]u8, alloc = frame)
+    var erro: common.Diag = common.Diag{}
+    expect(elf_escrever(&im, &saida, &erro) == true)
+    expect(len(saida) > 64 and saida[0] == 127 and saida[1] == 69 and saida[16] == 2)
+}
+
+test "elf_escrever_nome_nul" {
+    var tab: [dynamic]u8 = make([dynamic]u8, alloc = frame)
+    expect(elf_nome(&tab, ".text") == 0)
+    expect(elf_nome(&tab, "ab") == 6)
+    expect(len(tab) == 9 and tab[0] == 46 and tab[5] == 0 and tab[6] == 97 and tab[8] == 0)
+}
+
+test "elf_escrever_tls_alinhamento" {
+    var ph: [56]u8 = {}
+    elf_poe(ph[..], ELF_PHDR[PH_ALIGN], 3)
+    elf_poe(ph[..], ELF_PHDR[PH_MEMSZ], 8)
+    var v: ElfVisao = ElfVisao{}
+    expect(elf_conferir_tls(&v, ph[..]) == false)
+    let m: str = v.motivo or_else ""
+    expect(m == "p_align: PT_TLS com alinhamento que nao e potencia de 2")
+    elf_poe(ph[..], ELF_PHDR[PH_ALIGN], 8)
+    var w: ElfVisao = ElfVisao{}
+    expect(elf_conferir_tls(&w, ph[..]) == true)
+}

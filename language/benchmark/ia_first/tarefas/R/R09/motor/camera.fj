@@ -1,0 +1,108 @@
+// camera.fj 0.1.0 (10/11/2026) - camera do mundo grande: view so com rotacao, projecao de profundidade invertida com far infinito, matriz modelo relativa a camera e o conteudo do CBV b1
+// (constantes do quadro) - G14 da Fase 2. Matematica pura: sem GPU. Usa engine:matriz.
+// Uso: import "motor/camera" as cam
+// Fluxo: let c = cam.Camera{posicao = ..., yaw = ..., pitch = ...} ; let q = cam.cam_montar_quadro(&c, p = cam.ParamsQuadro{...}) ; cam.cam_escrever_quadro(destino, &q) ;
+//        por desenho: cam.cam_matriz_modelo(&c, pos_objeto, rotacao = ...) (a view e a projecao ja estao no quadro).
+//
+// ===== CONVENCOES (D-F2-6: este e o UNICO lugar; os outros arquivos apontam para ca) =====
+//  - Mundo DESTRO, centrado no planeta; +Y = eixo de rotacao; a camera olha para -Z local e o +Y local e o "para cima".
+//  - Clip do D3D: z em [0, 1], NDC y para cima, viewport com origem no canto superior esquerdo (Vulkan, no futuro, usa viewport de altura negativa, sem mexer na projecao).
+//  - PROFUNDIDADE INVERTIDA + FAR INFINITO: D32_FLOAT, limpa com 0.0, comparacao GREATER. Com f = 1/tan(fov_y/2):
+//      p00 = f/aspecto, p11 = f, p23 = perto, p32 = -1, o resto 0  =>  z_ndc = perto/distancia (1 no plano perto, tende a 0 no infinito).
+//  - Matriz guardada por COLUNA na Forja = column_major padrao do HLSL; no HLSL, mul(M, v) com vetor coluna; dxc sem -Zpr.
+//  - cbuffer / StructuredBuffer so com campos de 16 bytes (matrix[4, 4]f32, [4]f32, [4]u32, [4]i32): o layout C da Forja e o empacotamento do HLSL.
+//  - D-F2-7 (mundo grande): posicao em [3]f64 na CPU; por desenho (pos_objeto - pos_camera) em f64 e SO ENTAO f32; a view tem so rotacao (camera na origem); a GPU nunca ve coordenada absoluta.
+//  - Orientacao: yaw gira em Y, pitch em X (angulos destros em radianos, f32; yaw+ olha para a esquerda, pitch+ olha para cima); camera->mundo = Ry(yaw) * Rx(pitch); view = a transposta.
+//
+// ===== LAYOUT DE DadosQuadro (conteudo do CBV b1; 256 bytes = 16 x float4; espelho em shaders\forja_raiz.hlsli) =====
+//   offset   0  view            matrix[4, 4]f32  64 B   rotacao do mundo para a camera (sem translacao)
+//   offset  64  proj            matrix[4, 4]f32  64 B   projecao invertida de far infinito
+//   offset 128  view_proj       matrix[4, 4]f32  64 B   proj * view
+//   offset 192  parametros      [4]f32           16 B   largura, altura, perto, tempo_simulado
+//   offset 208  reservado       [12]f32          48 B   zeros (3 x float4 livres para o proximo passo; tamanho fixo do b1 provisorio)
+// O deslocamento de cada campo e conferido em runtime pelo teste_camera (sem size_of/offset_of na copia 0.18.0).
+// Changelog: 0.1.0 - G14 da Fase 2 (contrato_graphics_f2.txt).
+// Verificar: python C:\ENGINE_GAME3D\testes_graficos\f2_camera\verificar_camera.py
+import "motor/matriz" as mat
+
+pub const CAM_BYTES_QUADRO: u64 = 256
+pub const CAM_OFFSET_VIEW: u64 = 0
+pub const CAM_OFFSET_PROJ: u64 = 64
+pub const CAM_OFFSET_VIEW_PROJ: u64 = 128
+pub const CAM_OFFSET_PARAMETROS: u64 = 192
+pub const CAM_OFFSET_RESERVADO: u64 = 208
+
+// posicao de mundo em f64 (metros); yaw/pitch em radianos; fov_y vertical em radianos (padrao 90 graus); aspecto = largura/altura (padrao 16/9); perto em metros.
+pub struct Camera {
+    posicao: [3]f64
+    yaw: f32
+    pitch: f32
+    fov_y: f32 = 1.5707964
+    aspecto: f32 = 1.7777778
+    perto: f32 = 0.1
+}
+
+// Dados de tela e tempo que entram no quadro (parametros do DadosQuadro).
+pub struct ParamsQuadro {
+    largura: f32
+    altura: f32
+    tempo_simulado: f32
+}
+
+// Conteudo do CBV b1. Todos os campos multiplos de 16 bytes.
+pub struct DadosQuadro {
+    view: matrix[4, 4]f32
+    proj: matrix[4, 4]f32
+    view_proj: matrix[4, 4]f32
+    parametros: [4]f32
+    reservado: [12]f32
+}
+
+// Rotacao camera -> mundo: Ry(yaw) * Rx(pitch).
+pub proc cam_orientacao(c: ^Camera) -> matrix[4, 4]f32 {
+    return mat.mat_multiplicar(mat.mat_rotacao_y(c.yaw), b = mat.mat_rotacao_x(c.pitch))
+}
+
+// View so com rotacao (camera na origem): a transposta da orientacao.
+pub proc cam_matriz_view(c: ^Camera) -> matrix[4, 4]f32 {
+    return mat.mat_transposta(cam_orientacao(c))
+}
+
+// Projecao de profundidade invertida com far infinito (ver convencoes).
+pub proc cam_matriz_projecao(c: ^Camera) -> matrix[4, 4]f32 {
+    let f = (1.0 / mat.mat_tangente((c.fov_y as f64) * 0.5)) as f32
+    var m: matrix[4, 4]f32 = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0}
+    m[0, 0] = f / c.aspecto
+    m[1, 1] = f
+    m[2, 3] = c.perto
+    m[3, 2] = 0.0 - 1.0
+    return m
+}
+
+// (pos_objeto - pos_camera) em f64 e so depois f32 (D-F2-7): e o que a GPU pode ver de posicao.
+pub proc cam_deslocamento(c: ^Camera, pos_objeto: [3]f64) -> [3]f32 {
+    return mat.mat_v3_para_f32(mat.mat_v3_diferenca(pos_objeto, b = c.posicao))
+}
+
+// Matriz modelo relativa a camera: translacao(deslocamento) * rotacao do objeto.
+pub proc cam_matriz_modelo(c: ^Camera, pos_objeto: [3]f64, rotacao: matrix[4, 4]f32) -> matrix[4, 4]f32 {
+    return mat.mat_multiplicar(mat.mat_translacao(cam_deslocamento(c, pos_objeto = pos_objeto)), b = rotacao)
+}
+
+// Monta o conteudo do quadro: view, proj, view_proj = proj * view e os parametros. reservado fica zerado.
+pub proc cam_montar_quadro(c: ^Camera, p: ParamsQuadro) -> DadosQuadro {
+    let v = cam_matriz_view(c)
+    let pr = cam_matriz_projecao(c)
+    var q = DadosQuadro{view = v, proj = pr, view_proj = mat.mat_multiplicar(pr, b = v)}
+    q.parametros[0] = p.largura
+    q.parametros[1] = p.altura
+    q.parametros[2] = c.perto
+    q.parametros[3] = p.tempo_simulado
+    return q
+}
+
+// Escreve o quadro em `destino` (anel de upload, memoria mapeada) com o layout acima: CAM_BYTES_QUADRO bytes a partir de `destino`. Efeito: escreve na memoria apontada.
+pub proc cam_escrever_quadro(destino: rawptr, dados: ^DadosQuadro) {
+    let alvo = destino as ^DadosQuadro
+    alvo^ = dados^
+}

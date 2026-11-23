@@ -1,0 +1,276 @@
+// nativo/optimizer/slp.fj - porte de compiler/nativo/optimizer/slp.c, compiler/nativo/optimizer/slp.h
+// sha256 de nativo/optimizer/slp.c: a1ffae37ff14b452409cf39f4ca1e55ab4f1aaeda21dce7ac0d142629d55ddfd
+// sha256 de nativo/optimizer/slp.h: 534c22a84a2b515d236a16e350fcf7327aa748beda6419c51ec061ccdf035347
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "common"
+import "nativo/bir"
+
+struct Loja {
+    pos: u32
+    classe: u8
+    chave: SlpChave
+    desloc: i64
+}
+
+struct Tentada {
+    tipo: u8
+    id: u32
+    desloc: i64
+}
+
+struct Tentadas {
+    v: [64]Tentada
+    n: u32
+}
+
+const LOJAS_MAX: u32 = 256
+const BLOCO_MAX: u32 = 4000
+const TENTADAS_MAX: u32 = 64
+
+// C: nativo/optimizer/slp.c:27
+proc classe_de_lane(classe: u8) -> bool {
+    return (classe == (bir.BC_F32 as u8)) or (classe == (bir.BC_F64 as u8))
+}
+
+// C: nativo/optimizer/slp.c:32
+proc bloco_tem_semente(b: ^bir.BirBloco) -> bool {
+    var f32: u32 = 0
+    var f64: u32 = 0
+    if (common.c2f_b2i32(b.frio) != 0) or (b.n > BLOCO_MAX) {
+        return false
+    }
+    for k in (0 as u32)..<b.n {
+        var tern_1: u32 = 0
+        if (b.instrs[k].op == (bir.BIR_GRAVA as u8)) and (b.instrs[k].b.classe == (bir.BC_F32 as u8)) {
+            tern_1 = 1
+        }
+        f32 += tern_1
+        var tern_2: u32 = 0
+        if (b.instrs[k].op == (bir.BIR_GRAVA as u8)) and (b.instrs[k].b.classe == (bir.BC_F64 as u8)) {
+            tern_2 = 1
+        }
+        f64 += tern_2
+    }
+    return (f32 >= 4) or (f64 >= 2)
+}
+
+// C: nativo/optimizer/slp.c:45
+// C2F-INDECIDIVEL: lojas
+proc coletar_lojas(c: ^SlpCtx, lojas: []Loja) -> u32 {
+    let b: ^bir.BirBloco = &(c.f as ^bir.BirFuncao).blocos[c.bloco]
+    var n: u32 = 0
+    var k: u32 = 0
+    while (k < b.n) and (n < LOJAS_MAX) {
+        let i: ^bir.BirInstr = &b.instrs[k]
+        if (((((i.op != (bir.BIR_GRAVA as u8)) or (not classe_de_lane(i.b.classe))) or (i.b.tipo != (bir.BO_VREG as u8))) or (i.a.tipo != (bir.BO_VREG as u8))) or (i.a.tam != 0)) or (i.b.tam != 0) {
+            k += 1
+            continue
+        }
+        let chave: SlpChave = slp_chave_base(c, i.a.id, k)
+        let desloc: i64 = (i.desloc as i64) + (chave.off as i64)
+        if desloc != (common.c2f_trunc_i32(common.c2f_s2u_64(desloc)) as i64) {
+            k += 1
+            continue
+        }
+        let antes_1: u32 = n
+        n += 1
+        lojas[antes_1] = Loja{pos = k, classe = i.b.classe, chave = chave, desloc = desloc}
+        k += 1
+    }
+    return n
+}
+
+// C: nativo/optimizer/slp.c:66
+// C2F-13: lojas fundido em n (len)
+proc unica_no_deslocamento(lojas: []Loja, modelo: ^Loja, desloc: i64) -> u32 {
+    var achada: u32 = SLP_SEM
+    for j in (0 as u32)..<(len(lojas) as u32) {
+        if (((lojas[j].classe as i32) != (modelo.classe as i32)) or (lojas[j].desloc != desloc)) or (not slp_mesma_chave(&lojas[j].chave, &modelo.chave)) {
+            continue
+        }
+        if achada != SLP_SEM {
+            return SLP_SEM
+        }
+        achada = j
+    }
+    return achada
+}
+
+// C: nativo/optimizer/slp.c:80
+// C2F-13: lojas fundido em n (len)
+proc quantas_na_mesma_base(lojas: []Loja, modelo: ^Loja) -> u32 {
+    var q: u32 = 0
+    for j in (0 as u32)..<(len(lojas) as u32) {
+        var tern_1: u32 = 0
+        if ((lojas[j].classe as i32) == (modelo.classe as i32)) and (common.c2f_b2i32(slp_mesma_chave(&lojas[j].chave, &modelo.chave)) != 0) {
+            tern_1 = 1
+        }
+        q += tern_1
+    }
+    return q
+}
+
+// C: nativo/optimizer/slp.c:90
+// C2F-13: lojas fundido em n (len)
+proc montar_grupo(lojas: []Loja, i0: u32, pl: ^SlpPlano) -> bool {
+    var m: Loja = lojas[i0]
+    var passo: i64 = 8
+    if m.classe == (bir.BC_F32 as u8) {
+        passo = 4
+    }
+    pl^ = SlpPlano{}
+    pl.classe = m.classe
+    pl.lanes = 2
+    if m.classe == (bir.BC_F32 as u8) {
+        pl.lanes = 4
+    }
+    var l: u32 = 0
+    while l < pl.lanes {
+        let j: u32 = unica_no_deslocamento(lojas, &m, m.desloc + (passo * (l as i64)))
+        if j == SLP_SEM {
+            pl.motivo = "lanes_nao_contiguas"
+            return false
+        }
+        pl.loja[l] = lojas[j].pos
+        l += 1
+    }
+    if m.chave.tipo == (SB_VREG as u8) {
+        pl.pend[pl.npend] = SlpPendente{vreg = m.chave.id, def = m.chave.def}
+        pl.npend += 1
+    }
+    return true
+}
+
+// C: nativo/optimizer/slp.c:112
+proc ja_tentada(t: ^Tentadas, m: ^Loja) -> bool {
+    for k in (0 as u32)..<t.n {
+        if (((t.v[k].tipo as i32) == (m.chave.tipo as i32)) and (t.v[k].id == m.chave.id)) and (t.v[k].desloc == m.desloc) {
+            return true
+        }
+    }
+    return false
+}
+
+// C: nativo/optimizer/slp.c:121
+proc marcar_tentada(t: ^Tentadas, m: ^Loja) {
+    if t.n < TENTADAS_MAX {
+        let antes_1: u32 = t.n
+        t.n += 1
+        t.v[antes_1] = Tentada{tipo = m.chave.tipo, id = m.chave.id, desloc = m.desloc}
+    }
+}
+
+// C: nativo/optimizer/slp.c:127
+proc recusar(c: ^SlpCtx, relato: ^[dynamic]u8, pl: ^SlpPlano) {
+    let motivo: str = pl.motivo or_else "forma"
+    let p: ^bir.BirPrograma = c.p as ^bir.BirPrograma
+    let nome: str = p.simbolos[(c.f as ^bir.BirFuncao).simbolo].nome or_else "(null)"
+    format(f"slp recusou: {motivo} ({nome} b{c.bloco})\n", into = relato)
+}
+
+// Tabelas do SlpCtx sobre o dono `tab` (de slp_funcao): zeradas e recontadas a cada chamada, como o calloc + SlpContar do C; nvregs cresce a cada grupo aplicado.
+proc slp_tabelas(c: ^SlpCtx, tab: ^[dynamic]u32) {
+    let f: ^bir.BirFuncao = c.f as ^bir.BirFuncao
+    let n: u32 = f.nvregs + 1
+    delete(tab^)
+    tab^ = make([dynamic]u32, alloc = heap, cap = (4 * n) as int)
+    var k: u32 = 0
+    while k < 4 * n {
+        append(tab, item = 0)
+        k += 1
+    }
+    let w: []u32 = tab^[..]
+    let m: int = n as int
+    c.ndefs = w[0..<m]
+    c.nleit = w[m..<(2 * m)]
+    c.def_b = w[(2 * m)..<(3 * m)]
+    c.def_k = w[(3 * m)..<(4 * m)]
+    slp_contar(c)
+}
+
+// C: nativo/optimizer/slp.c:134
+// Apos aplicar um grupo recontagem das tabelas (SlpContar do C), feita aqui por slp_tabelas.
+proc tentar_um_grupo(c: ^SlpCtx, relato: ^[dynamic]u8, tentadas: ^Tentadas, tab: ^[dynamic]u32) -> bool {
+    var lojas: [256]Loja = {}
+    var pl = SlpPlano{}
+    let n: u32 = coletar_lojas(c, lojas[..])
+    let vistas: []Loja = lojas[0..<(n as int)]
+    for i0 in (0 as u32)..<n {
+        if ja_tentada(tentadas, &vistas[i0]) {
+            continue
+        }
+        if not montar_grupo(vistas, i0, &pl) {
+            if quantas_na_mesma_base(vistas, &vistas[i0]) >= pl.lanes {
+                recusar(c, relato, &pl)
+                marcar_tentada(tentadas, &vistas[i0])
+            }
+            continue
+        }
+        if slp_slot_escalarizavel(c, &vistas[i0].chave) {
+            pl.motivo = "slot_escalarizavel"
+            recusar(c, relato, &pl)
+            marcar_tentada(tentadas, &vistas[i0])
+            continue
+        }
+        if slp_montar_arvore(c, &pl) and slp_conferir_plano(c, &pl) {
+            slp_aplicar_plano(c, &pl)
+            slp_tabelas(c, tab)
+            return true
+        }
+        recusar(c, relato, &pl)
+        marcar_tentada(tentadas, &vistas[i0])
+    }
+    return false
+}
+
+// C: nativo/optimizer/slp.c:167
+proc slp_funcao(p: ^bir.BirPrograma, f: ^bir.BirFuncao, relato: ^[dynamic]u8) {
+    var c = SlpCtx{p = p, f = f}
+    var grupos: u32 = 0
+    if p.simbolos_dbg {
+        return
+    }
+    var tab = make([dynamic]u32, alloc = heap, cap = 1)
+    var esc = make([dynamic]bool, alloc = heap, cap = 1)
+    var preparado = false
+    var b: u32 = 0
+    while b < f.nblocos {
+        var tentadas = Tentadas{}
+        if bloco_tem_semente(&f.blocos[b]) {
+            c.bloco = b
+            if not preparado {
+                delete(esc)
+                esc = make([dynamic]bool, alloc = heap, cap = (f.nslots as int) + 1)
+                var k: u32 = 0
+                while k <= f.nslots {
+                    append(&esc, item = false)
+                    k += 1
+                }
+                c.escalariza = esc[..]
+                otim_sroa_veredito(p, f, esc[..])
+                slp_tabelas(&c, &tab)
+                preparado = true
+            }
+            while tentar_um_grupo(&c, relato, &tentadas, &tab) {
+                grupos += 1
+            }
+        }
+        b += 1
+    }
+    slp_liberar(&c)
+    delete(esc)
+    delete(tab)
+    if grupos > 0 {
+        let nome_funcao: str = p.simbolos[f.simbolo].nome or_else "(null)"
+        format(f"slp {nome_funcao}: {grupos} grupos vetorizados\n", into = relato)
+    }
+}
+
+// C: nativo/optimizer/slp.c:197
+proc otim_slp_aplicar(programa: ^bir.BirPrograma, relato: ^[dynamic]u8) {
+    for i in (0 as u32)..<programa.nfuncoes {
+        slp_funcao(programa, &(programa.funcoes or_else {})[i], relato)
+    }
+}

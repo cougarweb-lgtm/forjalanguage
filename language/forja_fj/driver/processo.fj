@@ -1,0 +1,292 @@
+// driver/processo.fj - porte de compiler/driver/processo.c, compiler/driver/processo.h
+// sha256 de driver/processo.c: a430e3253e40a433a8802181f53063b78d56711c58680917650ab6e827ff607e
+// sha256 de driver/processo.h: 1ecfb31172318177b9fa8098068bed42cb54062167df24a86bb5997f41e4b1f1
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.2.0
+// Changelog: 0.2.0 - G3 V5-P1: corpo real. _spawnvp(_P_WAIT) -> std:process (spawn com os 3 canais herdados + wait); a citacao do argv (Linha2, CitarEm, RepetirBarra,
+//            LinhaAdicionar, LinhaLiberar, ExecutarLinha) sai: o std:process monta a linha com a mesma regra do CommandLineToArgvW. getenv/_getpid/_fullpath/_mkdir/_rmdir/remove -> std:os e std:file.
+
+import "std:os"
+import "std:file"
+import "std:process"
+import "common"
+
+const PROC_CAMINHO_MAX: i32 = 600
+const PROC_NOME_MAX: i32 = 64
+
+// C: driver/processo.c:124
+// C2F-13: args fundido em nargs (len)
+// Roda 'programa' (busca no PATH) com os argumentos, herdando stdin/stdout/stderr, e devolve o exit code em 'codigo'. false = nao iniciou.
+proc proc_executar_com_argumentos(programa: ?str, args: ?[]str, codigo: ^i32) -> bool {
+    let cmd = process.Command{program = programa or_else "", args = args or_else {}, env = {}, cwd = "", timeout_ms = 0, stdin = process.Stdio.inherit, stdout = process.Stdio.inherit, stderr = process.Stdio.inherit}
+    switch p in process.spawn(cmd) {
+    case process.Process:
+        while not process.wait(p, timeout_ms = 1000) {
+            continue
+        }
+        codigo^ = common.c2f_trunc_i32(common.c2f_s2u_64(process.exit_code(p) as i64))
+        process.close(p)
+        return true
+    case process.ProcessError:
+        return false
+    }
+    return false
+}
+
+// C: driver/processo.c:139
+proc proc_arquivo_temporario(destino: []u8, tam: u64, extensao: str) -> bool {
+    let pasta: str = pasta_temporaria_2() or_else "."
+    let texto_1 = format(f"{pasta}\\forja_{os.pid()}{extensao}", alloc = heap)
+    defer delete(texto_1)
+    let n: i32 = common.c2f_snprintf(destino[0..<(tam as int)], texto_1)
+    return (n > 0) and ((n as u64) < tam)
+}
+
+// C: driver/processo.c:151
+// Pasta temporaria do usuario (%TEMP%, ou a atual).
+proc pasta_temporaria_2() -> ?str {
+    let pasta: ?str = os.env("TEMP")
+    if (pasta != none) and (len(pasta or_else "") > 0) {
+        return pasta
+    }
+    return "."
+}
+
+// C: driver/processo.c:159
+// Caminho absoluto de 'caminho' em 'destino'; se nao resolver (ou nao couber), o proprio texto (o hash so precisa de um valor estavel).
+proc caminho_absoluto(destino: []u8, tam: u64, caminho: ?str) {
+    let c: str = caminho or_else ""
+    let alvo: []u8 = destino[0..<(tam as int)]
+    switch absoluto in os.abs_path(c, alloc = heap) {
+    case str:
+        if (len(absoluto) + 1) <= (tam as int) {
+            _ = common.c2f_snprintf(alvo, absoluto)
+        } else {
+            _ = common.c2f_snprintf(alvo, c)
+        }
+        delete(absoluto)
+    case os.OsError:
+        _ = common.c2f_snprintf(alvo, c)
+    }
+}
+
+// C: driver/processo.c:166
+// "a\b\prog.fj" -> "prog" (nome do arquivo sem a extensao .fj), no maximo 60 bytes.
+proc nome_do_fonte(destino: []u8, tam: u64, fonte: ?str) {
+    let f: str = fonte or_else ""
+    var ini: int = 0
+    for i in 0..<len(f) {
+        if (f[i] == 92) or (f[i] == 47) { // '\\' '/'
+            ini = i + 1
+        }
+    }
+    var n: int = len(f) - ini
+    if (n > 3) and (common.c2f_stricmp(f[(ini + n - 3)..<(ini + n)], ".fj") == 0) {
+        n -= 3
+    }
+    if n >= (tam as int) {
+        n = (tam as int) - 1
+    }
+    for k in 0..<n {
+        destino[k] = f[ini + k]
+    }
+    destino[n] = 0
+}
+
+// C: driver/processo.c:185
+// Cria a pasta (existir ja e ok).
+proc criar_pasta(pasta: str) -> bool {
+    if file.make_dir(pasta) == none {
+        return true
+    }
+    return file.exists(pasta)
+}
+
+// 16 digitos hexadecimais minusculos (%016llx).
+proc hex16_minusculo(h: u64) -> str {
+    let digitos: str = "0123456789abcdef"
+    var saida: [16]u8 = {}
+    for k in 0..<16 {
+        saida[15 - k] = digitos[((h >> ((k as u64) * 4)) & 15) as int]
+    }
+    return from_bytes(saida[..], alloc = heap)
+}
+
+// C: driver/processo.c:190
+proc proc_exe_do_run(destino: []u8, tam: u64, fonte: ?str, variante: str) -> bool {
+    var absoluto: [600]u8 = {}
+    var nome: [64]u8 = {}
+    caminho_absoluto(absoluto[..], PROC_CAMINHO_MAX as u64, fonte)
+    var h: u64 = common.hash64(absoluto[..], common.c2f_strlen_b(absoluto[..]) as u64, common.HASH64_SEMENTE)
+    h = common.hash64(as_bytes(variante), len(variante) as u64, h)
+    nome_do_fonte(nome[..], PROC_NOME_MAX as u64, fonte)
+    let nome_txt = from_bytes(nome[0..<common.c2f_strlen_b(nome[..])], alloc = heap)
+    defer delete(nome_txt)
+    let hex = hex16_minusculo(h)
+    defer delete(hex)
+    let tmp: str = pasta_temporaria_2() or_else "."
+    let raiz = format(f"{tmp}\\forja_run", alloc = heap)
+    defer delete(raiz)
+    let pasta = format(f"{raiz}\\{hex}", alloc = heap)
+    defer delete(pasta)
+    if (len(pasta) >= (PROC_CAMINHO_MAX as int)) or (not criar_pasta(raiz)) or (not criar_pasta(pasta)) {
+        return false
+    }
+    let exe = format(f"{pasta}\\{nome_txt}.exe", alloc = heap)
+    defer delete(exe)
+    let n: i32 = common.c2f_snprintf(destino[0..<(tam as int)], exe)
+    return (n > 0) and ((n as u64) < tam)
+}
+
+// C: driver/processo.c:208
+// Apaga o exe de proc_exe_do_run e a pasta do hash, se ficou vazia.
+proc proc_apagar_exe_do_run(arq_exe: str) {
+    _ = file.remove_file(arq_exe)
+    var corte: int = -1
+    for i in 0..<len(arq_exe) {
+        if arq_exe[i] == 92 { // '\\'
+            corte = i
+        }
+    }
+    if corte < 0 {
+        return
+    }
+    _ = file.remove_dir(arq_exe[0..<corte])
+}
+
+// 0.33.0: apaga o script do executor wasm, gravado ao lado do .wasm temporario (chamar antes de proc_apagar_exe_do_run: a pasta so some vazia)
+proc proc_apagar_arquivo_do_run(arquivo: str) {
+    _ = file.remove_file(arquivo)
+}
+
+// ---------------------------------------------------------------- testes (G3 V5-P1)
+
+// bytes ate o 1o NUL do buffer, como texto de heap (quem chama faz delete)
+proc pr_texto_do_buffer(b: []u8) -> str {
+    return from_bytes(b[0..<common.c2f_strlen_b(b)], alloc = heap)
+}
+
+test "hex16_minusculo: 16 digitos minusculos com zeros a esquerda" {
+    let a = hex16_minusculo(0xcbf29ce484222325)
+    expect(a == "cbf29ce484222325")
+    delete(a)
+    let b = hex16_minusculo(171)
+    expect(b == "00000000000000ab")
+    delete(b)
+    let c = hex16_minusculo(0)
+    expect(c == "0000000000000000")
+    delete(c)
+}
+
+test "nome_do_fonte: base sem .fj, barra e contrabarra, corte em tam - 1" {
+    var d: [64]u8 = {}
+    nome_do_fonte(d[..], 64, "a\\b\\prog.fj")
+    let n1 = pr_texto_do_buffer(d[..])
+    expect(n1 == "prog")
+    delete(n1)
+    nome_do_fonte(d[..], 64, "a/b\\c/Prog.FJ")
+    let n2 = pr_texto_do_buffer(d[..])
+    expect(n2 == "Prog")
+    delete(n2)
+    nome_do_fonte(d[..], 64, "x.fj.txt")
+    let n3 = pr_texto_do_buffer(d[..])
+    expect(n3 == "x.fj.txt")
+    delete(n3)
+    nome_do_fonte(d[..], 64, ".fj")
+    let n4 = pr_texto_do_buffer(d[..])
+    expect(n4 == ".fj")
+    delete(n4)
+    nome_do_fonte(d[..], 64, "semcaminho")
+    let n5 = pr_texto_do_buffer(d[..])
+    expect(n5 == "semcaminho")
+    delete(n5)
+    nome_do_fonte(d[..], 4, "abcdefg.fj")
+    let n6 = pr_texto_do_buffer(d[..])
+    expect(n6 == "abc")
+    delete(n6)
+    nome_do_fonte(d[..], 64, "a\\")
+    let n7 = pr_texto_do_buffer(d[..])
+    expect(n7 == "")
+    delete(n7)
+}
+
+test "caminho_absoluto: resolve . e .. e cai no proprio texto se nao cabe" {
+    var d: [600]u8 = {}
+    caminho_absoluto(d[..], 600, "C:/a/./b/../c.fj")
+    let a = pr_texto_do_buffer(d[..])
+    expect(a == "C:\\a\\c.fj")
+    delete(a)
+    caminho_absoluto(d[..], 6, "C:/a/./b/../c.fj")
+    let b = pr_texto_do_buffer(d[..])
+    expect(b == "C:/a/")
+    delete(b)
+}
+
+test "proc_arquivo_temporario: %TEMP%\\forja_<pid><ext> e false se nao cabe" {
+    var d: [600]u8 = {}
+    expect(proc_arquivo_temporario(d[..], 600, ".c"))
+    let t = pr_texto_do_buffer(d[..])
+    let pasta: str = pasta_temporaria_2() or_else "."
+    let esperado = format(f"{pasta}\\forja_{os.pid()}.c", alloc = heap)
+    expect(t == esperado)
+    delete(t)
+    delete(esperado)
+    var pequeno: [8]u8 = {}
+    expect(not proc_arquivo_temporario(pequeno[..], 8, ".c"))
+}
+
+test "proc_exe_do_run e proc_apagar_exe_do_run: pasta pelo hash, estavel, apaga o exe e a pasta" {
+    var d: [600]u8 = {}
+    var e: [600]u8 = {}
+    expect(proc_exe_do_run(d[..], 600, "C:\\x_forja_teste\\prog.fj", "run/x64/0"))
+    expect(proc_exe_do_run(e[..], 600, "C:\\x_forja_teste\\prog.fj", "run/x64/0"))
+    let exe = pr_texto_do_buffer(d[..])
+    let exe2 = pr_texto_do_buffer(e[..])
+    expect(exe == exe2)
+    var h: u64 = common.hash64(as_bytes("C:\\x_forja_teste\\prog.fj"), 24, common.HASH64_SEMENTE)
+    h = common.hash64(as_bytes("run/x64/0"), 9, h)
+    let hex = hex16_minusculo(h)
+    let pasta: str = pasta_temporaria_2() or_else "."
+    let pasta_hash = format(f"{pasta}\\forja_run\\{hex}", alloc = heap)
+    let exe_esperado = format_sufixo(pasta_hash)
+    expect(exe == exe_esperado)
+    delete(exe_esperado)
+    expect(file.is_dir(pasta_hash))
+    expect(file.write_all(exe, as_bytes("x")) == none)
+    proc_apagar_exe_do_run(exe)
+    expect(not file.exists(exe))
+    expect(not file.exists(pasta_hash))
+    // variante diferente = pasta diferente
+    expect(proc_exe_do_run(e[..], 600, "C:\\x_forja_teste\\prog.fj", "test/x64/0"))
+    let exe3 = pr_texto_do_buffer(e[..])
+    expect(exe3 != exe)
+    proc_apagar_exe_do_run(exe3)
+    // nao cabe em tam
+    expect(not proc_exe_do_run(d[..], 10, "C:\\x_forja_teste\\prog.fj", "run/x64/0"))
+    delete(exe)
+    delete(exe2)
+    delete(exe3)
+    delete(hex)
+    delete(pasta_hash)
+}
+
+// pasta + \\prog.exe (o texto esperado do exe de prog.fj)
+proc format_sufixo(pasta_hash: str) -> str {
+    return format(f"{pasta_hash}\\prog.exe", alloc = heap)
+}
+
+test "proc_executar_com_argumentos: exit code do filho, argumentos com espaco, aspas, vazio e barra final; programa inexistente" {
+    var codigo: i32 = -1
+    var a1: [2]str = {"/c", "exit /b 5"}
+    expect(proc_executar_com_argumentos("cmd.exe", a1[..], &codigo))
+    expect(codigo == 5)
+    var a2: [5]str = {"-c", "import sys; sys.exit(7 if sys.argv[1:] == ['a \"b', '', 'x\\\\', 'c d'] else 1)", "a \"b", "", "x\\"}
+    expect(proc_executar_com_argumentos("python", a2[..], &codigo))
+    expect(codigo == 1)
+    var a3: [6]str = {"-c", "import sys; sys.exit(7 if sys.argv[1:] == ['a \"b', '', 'x\\\\', 'c d'] else 1)", "a \"b", "", "x\\", "c d"}
+    expect(proc_executar_com_argumentos("python", a3[..], &codigo))
+    expect(codigo == 7)
+    codigo = -1
+    expect(not proc_executar_com_argumentos("C:\\nao_existe_forja\\x.exe", {}, &codigo))
+    expect(codigo == -1)
+}

@@ -1,0 +1,129 @@
+CENSO M6d (P92a) - versao 0.1.0 - 16/11/2026
+Changelog: 0.1.0 - primeira versao: b1..b9 medidos por CodeGraph (cg_search/cg_definition) e Grep/Read; b5 PARADO (contradiz D-M6d-3); b8 com contagem por Grep.
+Escopo: so leitura. Nada de compiler\, runtime\, std\ nem vendor\ foi editado.
+
+b1 - PROGRAMA COM LINK DE .A ESTATICA USA SEMPRE A VARIANTE RtNativoWinCrt?  VEREDITO: SIM (nao ha escape).
+  Prova:
+  - nativo_biblioteca.c:231-240 NativoUsaRuntimeCrt = pedido->dll OU algum bir->simbolos[k].tipo == BS_IMPORT.
+  - nativo_biblioteca.c:309 (NbColetar...): a ligacao de .a so olha simbolos BS_IMPORT (`if (tipo != BS_IMPORT) continue`). Sem BS_IMPORT, nenhum 'link' estatico e resolvido.
+  - BS_IMPORT nasce so de foreign de fora: bir_base.c:297-300 (BirSimboloImport) e bir_construir_chamada.c:14.
+  - nativo.c:322 (RuntimeDoAlvo, PE: crt = NativoUsaRuntimeCrt) e nativo.c:326 (RtNativoWinCrt(...)); nativo.c:319-327.
+  - rt_embutido.c:377 RtNativoWinCrt; rt_embutido.h:40.
+  Consequencia: qualquer .a linkado tem BS_IMPORT -> variante CRT. R-M6d-6 mitigado; o P92c roda todos os exemplos_libs (ver P92c).
+
+b2 - INDEFINIDO EM SECAO NAO ALCANCADA NAO DA X0903 (PE e ELF)?  VEREDITO: SIM.
+  Prova:
+  - ligar_alcance.c (compiler\nativo\obj\ligar_alcance.c):131-141 AlcanceResolver: simbolo sem secao e nao achado em outro objeto vira ALVO_IMPORT ou ALVO_NENHUM.
+  - ligar_alcance.c:162-179 AlcanceSeguir: so age sobre relocacoes de secao VIVA (AlcanceDrenar 182 esvazia a pilha de secoes vivas). ALVO_NENHUM grava a->indefinido (linha 175-176) so se o simbolo nao e fraco e nao e do ligador ELF.
+  - ligar_alcance.c:234-260 raizes (AlcanceMarcarRaiz / AlcanceMarcarInitArray): o alcance parte das raizes; secao morta nunca chega a AlcanceSeguir.
+  - ligar.c:208 AlcanceCalcular (caminho comum a PE e ELF; o ELF nao tem alcance proprio).
+  - ligar.c:222-229 LigarConferirAlcance: so aqui X0903 ("simbolo indefinido"), lido de L->alcance.indefinido. ligar.c:675 chama LigarConferirAlcance no encadeamento.
+  Consequencia: a relocacao de um membro morto com malloc indefinido nao gera X0903. Relevante para o redirecionamento: o P92c so redireciona relocacao de secao que sera contada (secao viva, ja que o ligador so ve alcance depois do uniao).
+
+b3 - RUNTIME DEV WINDOWS E LINUX COM -ffunction-sections? ABI DO RUNTIME LINUX? COMO forja_handle_nasce E DECLARADO?  VEREDITO: SIM nos 3 pontos; involucro C precisa de RT_ABI_SYSV (nao e PARA).
+  Prova:
+  - -ffunction-sections -fdata-sections: construir.bat:44 (FLAGS_RT, Windows: `-ffunction-sections -fdata-sections`).
+  - Linux: construir.bat:88 `set FLAGS_RTL=!FLAGS_RT:-DRT_ALVO_WIN=-DRT_ALVO_LINUX! -fno-asynchronous-unwind-tables -fno-unwind-tables` (herda os -ffunction-sections). Linhas 90-118 compilam rt_linux_*.c com !FLAGS_RTL!.
+  - ABI do runtime Linux: construir.bat:87 ("o mesmo gcc, a convencao Win64 por dentro (D-M5-2)"): o runtime Linux e COFF do MinGW (Win64 por padrao, ms_abi), depois o ligador Forja faz o ELF.
+  - ABI do C de lib no Linux e SysV. Precedente que resolve a ponte: rt_compat.h:22 `#define RT_ABI_SYSV __attribute__((sysv_abi))`; rt_linux_entrada_libc.c:26-37 declara fwrite/fflush/exit/fwrite-ponteiros com RT_ABI_SYSV para falar com libc.a do musl; rt_thread_linux.c:11 idem.
+  - Consequencia: cada involucro malloc/calloc/realloc/free/strdup do runtime Linux deve ser `RT_ABI_SYSV` (e tambem quem chama o malloc real). No Windows RT_ABI_SYSV deve ficar vazio (o rt_compat.h atual define sempre; no Windows o runtime usa so Win64: confirmar no P92c que o atributo nao muda nada no PE - o sysv_abi do MinGW e aceito).
+  - forja_handle_nasce: forja_rt_nativo.h:156 (prototipo plano, Win64 interno); definicao forja_rt.h:1399 (static inline, backend C) e rt_handles.c:116 (runtime). Sem atributo de ABI (o codigo gerado chama em Win64 interno).
+
+b4 - COMO LER O FIO DA THREAD SEM CRIAR NEM MORRER?  VEREDITO: SIM (as duas plataformas tem leitura pura).
+  Prova Windows:
+  - rt_fio.h:73-81 rt_fio_slot(indice): le o TEB por `movq %%gs:(...)` (RT_FIO_TEB_SLOTS_DESLOCAMENTO 0x1480, rt_fio.h:65) ou sys_tls_ler acima de 64 slots. So leitura.
+  - rt_fio.h:84-89 rt_fio(): `rt_fio_indice == 0 ? NULL : slot` e, se NULL, chama rt_fio_sem_slot (o que cria/morre).
+  - rt_fio.c:60-69 rt_fio_sem_slot: chama rt_fio_iniciar e, se o slot for NULL, rt_fio_morrer(rt_fio_sem_ponte) (exit 101). Por isso rt_fio() nao serve no involucro de thread de fora.
+  - rt_fio.c:30-42 rt_fio_iniciar: so grava rt_fio_principal no slot da thread que chama PRIMEIRO (rt_fio_indice == 0); thread de fora nao passa por aqui com indice != 0.
+  - Plano rt_fio_ou_nulo (Windows): `return rt_fio_indice == 0 ? NULL : rt_fio_slot(rt_fio_indice - 1u);` (sem rt_fio_sem_slot).
+  Prova Linux, variante libc:
+  - rt_fio.h:112-120 rt_fio(): `rt_fio_obter == NULL ? &rt_fio_principal : rt_fio_obter()`, e NULL -> rt_fio_sem_slot.
+  - rt_linux_entrada_libc.c:62-69 ObterFioDaThread = pthread_getspecific(rt_fio_chave): so leitura, NULL se a thread nao tem valor. Gancho ligado em rt_linux_entrada_libc.c:88 (rt_fio_obter = ObterFioDaThread).
+  - rt_fio_linux.c:52-55 rt_fio_sem_slot: rt_fio_morrer(rt_fio_sem_ponte) direto (exit 101).
+  - Plano rt_fio_ou_nulo (Linux): `return rt_fio_obter == NULL ? &rt_fio_principal : rt_fio_obter();` (sem sem_slot). Variante crua (sem threads): rt_fio_obter == NULL, principal global.
+  Consequencia: rt_fio_ou_nulo e a funcao nova em rt_fio.h (cabecalho, nos 2 ramos), como D-M6d-6 pede.
+
+b5 - ONDE BibliotecasResolvidas GUARDA O NOME DO 'link' x EstaticaArquivo (ORDEM), E A libc.a DA SEMENTE / BIBS_COBERTAS?  VEREDITO: PARADO - CONTRADIZ D-M6d-3 (nao e de conserto trivial).
+  Prova do que existe:
+  - bibliotecas.h:52-65 BibliotecasResolvidas: NAO tem lista de EstaticaArquivo nem nome de link por arquivo. Tem: tabelas (DLL), link_falho, lidas (BibliotecaLida = caminho+hash, sem link), tem_estaticas, selecao (EstaticaSelecao), celulas, provedores_usados.
+  - bibliotecas.c:59 Resolucao.estaticas (Vec de EstaticaArquivo) mora so no resolvedor; BibliotecasResolver (bibliotecas.c:746) o descarta ao sair.
+  - estatica.h:19-23 EstaticaArquivo = {nome = CAMINHO, bytes, n}. Nao tem link.
+  - bibliotecas.c:299-307 BibsAdicionarEstatica(r, link, achada): o link so vira `r->ultima_estatica = link` (bibliotecas.c:303, usado so em erro: bibliotecas.c:567, :586). O vetor recebe so o caminho.
+  - bibliotecas.c:315 chama BibsAdicionarEstatica por 'link' estatico; a ordem do vetor = ordem dos 'link' ESTATICOS + as /DEFAULTLIB dos membros (adicionadas depois). Um 'link' de DLL NAO entra em r->estaticas.
+  - bibliotecas.c:286-297 BibsReaproveitarEstatica: link repetido reaproveita os bytes, mas bibliotecas.c:306 VECEMPURRAR de novo: a ordem continua 1 por entrada.
+  - bibliotecas.c:579 EstaticaPedido.arquivos = r->estaticas.dados (a unica referencia de indice).
+  CONTRADICAO: D-M6d-3 supoe "arquivo = indice da .a na ordem dos 'link'". Isso vale so se todo 'link' for estatico. Com 'link' de DLL intercalado o indice do vetor deixa de ser o indice do 'link' (o caso exato depende de quais 'link' sao estatica; NAO verificado item a item neste censo - o P92c confere com um fixture que misture DLL e estatica antes de fechar o mapeamento). Mapear slot -> nome do link exige um campo novo em BibliotecasResolvidas preenchido em bibliotecas.c (772 linhas, teto: NAO cresce) ou em nativo_biblioteca.c via lista paralela dos 'link' estaticos (pedido->links so tem a ordem do fonte, sem a informacao de qual e DLL).
+  - libc.a da semente: caminho = NbSemente(...) + "\\libc.a": nativo_biblioteca.c:86 SEMENTE_SUBPASTA "\\..\\third\\musl\\x86_64", :89 SEMENTE_LIBC, :187 NbSemente, :208 .semente = NbSemente(c). Identificavel pelo CAMINHO do EstaticaArquivo (termina em third\musl\x86_64\libc.a), nao pelo link.
+  - BIBS_COBERTAS: bibliotecas_nomes.c:15 (c, m, msvcrt, ucrt, ucrtbase, kernel32, mingw32, mingwex, gcc, moldname, moldname-msvcrt), checagem bibliotecas_nomes.c:52-53 sobre o NOME do link. Como o arquivo nao guarda o link, a exclusao por BIBS_COBERTAS precisa do mesmo campo novo.
+  Ação: item PARADO. Decisao do main: (a) campo novo "link" por EstaticaArquivo ou em BibliotecasResolvidas, preenchido em BibsAdicionarEstatica (exige crescer bibliotecas.c, acima do teto de 772 do D-M6d-3) ou (b) lista paralela de nomes de links estaticos em nativo_biblioteca.c. Pergunta ao main antes do P92c.
+
+b6 - TABELA nm -u DA FAMILIA POR .A (Windows e vendor\linux).  VEREDITO: OK (medido).
+  Comando (MinGW nm, por .a): `nm -u <lib>.a | awk '{print $NF}' | grep -E '^(__imp_)?(_?malloc|_?calloc|_?realloc|_?free|_?strdup|_aligned_malloc|_aligned_free|HeapAlloc|HeapFree|HeapReAlloc)$|__imp__?(_?strdup|...)$' | sort | uniq -c`.
+  Windows (vendor\*.a), contagem de linhas nm -u (uma por membro que referencia):
+    libcjson.a      : malloc 1, realloc 1, free 1
+    libsqlite3.a    : malloc 1, realloc 1, free 1; HeapAlloc 1, HeapFree 1, HeapReAlloc 1 (tabela de syscalls do os_win; FORA da familia: o M6d nao redireciona Heap*)
+    libz.a          : malloc 4, free 4
+    libcurl.a       : malloc 1, calloc 1, realloc 1, free 2, _strdup 1, __imp__strdup 1
+    libcgltf.a      : malloc 1, free 1
+    libminiaudio.a  : malloc 1, calloc 1, realloc 1, free 1
+    libraylib.a     : malloc 6, calloc 5, realloc 5, free 7
+    libbox2d.a      : SO __imp__aligned_malloc 1, __imp__aligned_free 1 (FORA: alinhado nao entra no M6d)
+  vendor\linux (ELF, mesmo nm):
+    libcjson.a malloc 1 realloc 1 free 1; libsqlite3.a malloc 1 realloc 1 free 1; libz.a malloc 4 free 4; libcgltf.a malloc 1 free 1.
+  libteste (nossas, P92a): COFF libteste_a.a = __imp__strdup 1, __imp__wcsdup 1 (CRT, fora), calloc 1, free 1, malloc 1, realloc 1. ELF linux\libteste_a.a = calloc, free, malloc, realloc, strdup (1 cada).
+  Observacao: a contagem e de linhas nm -u (uma por ocorrencia no .a), nao de simbolos distintos; so serve para saber QUAIS simbolos aparecem.
+
+b7 - PROGRAMAS QUE LIGAM CADA .A ESTATICA (candidatos a R0009 lib no P92g); MARCAR CONGELADOS.  VEREDITO: lista PARCIAL (varredura por link direto e por import de vendor; sem fecho transitivo).
+  Comando: Grep `\blink\s+"[^"]*"` em *.fj (C:\ENGINE_GAME3D) e Grep `import\s+"vendor:(json/cjson|db/sqlite3|compression/zlib|gltf/cgltf|audio/miniaudio|raylib|physics2d/box2d|net/curl|...)"` em *.fj.
+  Link direto de estatica (nome que casa com um .a de vendor):
+    tools\visualizador_glb\visualizador_glb.fj:52 link "raylib" (+ :35 "m", :43 "msvcrt" - DLL/CRT); ponte_raylib.fj:660 idem (wrapper, nao programa).
+    language\interop_lab\raylib\ponte_raylib.fj:651 link "raylib".
+    language\vendor\*: wrappers (db, json, compression, gltf, audio, physics2d, net\curl_ponte) - nao sao programas; sao puxados por import.
+  Programas que importam wrappers de estatica (21 arquivos, por Grep import vendor:):
+    language\tests\nativo\m6c\handle\sqlite_esquecido.fj, cjson_takes.fj, sqlite_ok.fj; tests\nativo\m6c\clong\zlib_crc.fj, gzheader_layout.fj
+    language\exemplos_libs\fisica2d_basico.fj, audio_basico.fj, gltf_basico.fj, db_e_json.fj, banco_basico.fj, json_*.fj (ver grep)
+    language\benchmark\ia_first\tarefas\P\P01\prog.fj, demos\fisica2d_demo.fj; fixtures_l3c2\*, fixtures_l3c\*, fixtures_migrar\* (benchmark: nao e corpus dourado/gerado)
+  CONGELADOS entre eles: NENHUM importa vendor de estatica (tests\dourado, examples, benchmark\corpus\dourado|gerado e tests\lowering nao aparecem no grep de import vendor:). Confirmado: Grep de "examples" nao trouxe nenhum uso (pasta fica em C:\ENGINE_GAME3D\examples).
+  Gap: nao foi feito fecho transitivo (vendor\db\db.fj importa sqlite3; quem importa db.fj herda). O P92g refaz a varredura com o numero (regra do contrato).
+
+b8 - USOS DE std:file open() SEM close, E read_all/read_dir/write_all, EM tests/examples/std (CONGELADOS MARCADOS).  VEREDITO: 1 caso de open sem close em CONGELADO, que NAO dispara em runtime.
+  Comando: Grep `\b(fs|file)\.open\(` e `\b(fs|file)\.close\(` (count por arquivo) em C:\ENGINE_GAME3D *.fj.
+    open: tests\nativo\linux\es\handle.fj 11; tests\semantica\ok_l11c_file_handle.fj 2; tests\nativo\linux\threads\threads_es.fj 1; tests\lowering\375_fs_consulta_exe.fj 1 (CONGELADO).
+    close: handle.fj 12; ok_l11c_file_handle.fj 2; threads_es.fj 1; 375_fs_consulta_exe.fj 0.
+  Caso 375_fs_consulta_exe.fj:22-27: `switch r in fs.open("", mode = fs.OpenMode.read) { case fs.File: print("aberto") case fs.FileError: ... }`. A rama `case fs.File` nao fecha, MAS open("") falha em runtime (nao ha handle) -> R0009 handle NAO dispara. Congelado: nao editar. Anotado; sem PARA (nao vira R0009 em runtime).
+  read_all / read_dir / write_all (nao geram handle; a lista do read_all e DONA e tem delete, E0317 ja cobre): Grep count em tests\: 46 ocorrencias em 20 arquivos (ex.: tests\receitas\file.fj 3, tests\nativo\linux\prova\arquivo.fj 3, tests\nativo\m5\arquivo\*.fj). examples\: 0 usos de fs.open/file.open.
+  Candidatos a R0009 handle (P92f) NAO congelados: nenhum com open sem close (handle.fj e ok_l11c balanceados). Fixture de falha a criar em tests\nativo\m6d\file\ (file_aberto).
+
+b9 - FOLGA DE LINHAS DOS ARQUIVOS A TOCAR E sizeof(Decl).  VEREDITO: medido. Teto 800 (D-M6d-, REGRAS COMUNS).
+  Comando: wc -l <arquivo> (C:\ENGINE_GAME3D\language\...). Folga = 800 - linhas.
+    compiler\frontend\ast.h            339  folga 461  (sizeof(Decl)==240: _Static_assert ast.h:335; enum PosseClausula ast.h:283)
+    compiler\frontend\parser_decl.c    525  folga 275
+    compiler\frontend\ast_json_decl.c  378  folga 422
+    compiler\driver\consultar_json.c   246  folga 554
+    compiler\semantic\sem_posse_c.c     35  folga 765
+    compiler\semantic\sem_posse_handle.c 152 folga 648
+    compiler\common\diag.c             736  folga 64   (texto do E0912 entra aqui: APERTADO)
+    compiler\common\diag.h             184  folga 616
+    compiler\ir\ir.h                   500  folga 300
+    compiler\ir\lower_handle.c          48  folga 752
+    compiler\nativo\bir\bir_construir_handle.c 56 folga 744; bir_regras.c 206; bir_interno.h 403
+    compiler\nativo\obj\terceiros.c    464  folga 336  (cresce <= 25 linhas; OK)
+    compiler\nativo\obj\terceiros.h     41
+    compiler\nativo\obj\coff_membro.c  731  folga 69 (NAO e tocado)
+    compiler\nativo\obj\ligar.c        761  folga 39 (NAO e tocado)
+    compiler\nativo\nativo.c           797  folga 3    (APERTADO: so o inicializador de ped, 2 linhas que ja existem; se nao couber, extrair MontarTerceiros antes)
+    compiler\nativo\nativo_biblioteca.c 491 folga 309
+    compiler\nativo\obj\bibliotecas.c  772  folga 28   (NAO cresce: D-M6d-3)
+    compiler\nativo\obj\bibliotecas.h   72
+    compiler\nativo\fmt\pe_escrever.c  799  folga 1    (NAO e tocado)
+    compiler\backend\emit_c_rastreio.c  99
+    compiler\backend\emit_c_instr.c   1316  (divida ja registrada; NAO e tocado)
+    compiler\driver\rcode_runtime.c    178  folga 622
+    runtime\nativo\rt_rastreio.c       662  folga 138
+    runtime\nativo\rt_handles.c        212
+    runtime\nativo\forja_rt_nativo.h   260
+    runtime\nativo\rt_fio.h            134; rt_fio.c 89; rt_fio_linux.c 74
+  sizeof(Decl): ast.h:335 `_Static_assert(sizeof(Decl) == 240, ...)` (M6c P85). Intacto ate o P92b (POSSE_ENCERRA cabe no padding; a prova e o proprio _Static_assert).
+  Observacao: os caminhos do contrato "frontend\", "semantic\", "driver\" estao sob compiler\ (o CLAUDE do projeto manda `language\compiler\`).
+
+FIM DO CENSO. Itens parados: b5 (contradicao de ordem link x arquivo; decisao do main). Itens com ressalva: b7 (lista parcial), b8 (1 open sem close em congelado, sem disparo).

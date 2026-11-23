@@ -1,0 +1,435 @@
+// driver/editar_geo.fj - porte de compiler/driver/editar_geo.c
+// sha256 de driver/editar_geo.c: 2e71031299cd8f4dc42d183dfd63ddf86f527727d4685675f911aac224331b10
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "common"
+import "frontend"
+import "semantic"
+
+struct Janela {
+    t: []u8
+    piso: u32
+    teto: u32
+}
+
+// C: driver/editar_geo.c:17
+// A janela de um arquivo (trecho da Fonte; sem trechos, o texto todo). O modulo de pasta tem um trecho por arquivo: as linhas e o fim valem por arquivo.
+proc janela_do_arquivo(q: ^Consulta, arquivo: u32) -> Janela {
+    let f: ^common.Fonte = &(q.c as ^Compilacao).fonte
+    var j: Janela = Janela{t = f.texto, piso = 0, teto = f.tam as u32}
+    if f.ntrechos > 0 {
+        let tr: ^common.FonteTrecho = &(f.trechos or_else {})[arquivo]
+        j.piso = tr.inicio
+        j.teto = tr.fim
+    }
+    return j
+}
+
+// C: driver/editar_geo.c:29
+proc editar_modulo_do_offset(q: ^Consulta, off: u32) -> u8 {
+    return consulta_modulo_do_offset(q, off)
+}
+
+// C: driver/editar_geo.c:34
+proc editar_arquivo_do_offset(q: ^Consulta, off: u32) -> u32 {
+    return consulta_trecho_do_offset(q, off)
+}
+
+// C: driver/editar_geo.c:39
+proc janela_do_offset(q: ^Consulta, off: u32) -> Janela {
+    return janela_do_arquivo(q, consulta_trecho_do_offset(q, off))
+}
+
+// C: driver/editar_geo.c:46
+proc editar_token(q: ^Consulta, i: u32) -> ^frontend.Token {
+    return &q.fim.toks[i as u64]
+}
+
+// C: driver/editar_geo.c:51
+proc editar_token_exato(q: ^Consulta, off: u32) -> u32 {
+    var lo: u32 = 0
+    var hi: u32 = (len(q.fim.toks) as u64) as u32
+    while lo < hi {
+        let meio: u32 = lo + ((hi - lo) / 2)
+        if editar_token(q, meio).off < off {
+            lo = meio + 1
+        } else {
+            hi = meio
+        }
+    }
+    var tern_1: u32 = TOKEN_AUSENTE as u32
+    if ((lo as u64) < (len(q.fim.toks) as u64)) and (editar_token(q, lo).off == off) {
+        tern_1 = lo
+    }
+    return tern_1
+}
+
+// C: driver/editar_geo.c:64
+proc editar_token_do_nome(q: ^Consulta, u: ^semantic.IndUso) -> u32 {
+    var i: u32 = editar_token_exato(q, u.pos_nome)
+    let n: u32 = (len(q.fim.toks) as u64) as u32
+    if i == (TOKEN_AUSENTE as u32) {
+        return i
+    }
+    while (((editar_token(q, i).sym != (u.alvo as ^frontend.Decl).nome) and ((i + 2) < n)) and (editar_token(q, i + 1).tipo == (frontend.TK_DOT as u8))) and (editar_token(q, i + 2).tipo == (frontend.TK_IDENT as u8)) {
+        i += 2
+    }
+    var tern_1: u32 = TOKEN_AUSENTE as u32
+    if editar_token(q, i).sym == (u.alvo as ^frontend.Decl).nome {
+        tern_1 = i
+    }
+    return tern_1
+}
+
+// C: driver/editar_geo.c:75
+proc editar_inicio_da_linha(q: ^Consulta, off: u32) -> u32 {
+    var off_v: u32 = off
+    let j: Janela = janela_do_offset(q, off_v)
+    while (off_v > j.piso) and (j.t[off_v - 1] != 10) { // '\n'
+        off_v -= 1
+    }
+    return off_v
+}
+
+// C: driver/editar_geo.c:83
+proc editar_fim_da_linha(q: ^Consulta, off: u32) -> u32 {
+    var off_v: u32 = off
+    let j: Janela = janela_do_offset(q, off_v)
+    while (off_v < j.teto) and (j.t[off_v] != 10) { // '\n'
+        off_v += 1
+    }
+    if ((off_v < j.teto) and (off_v > j.piso)) and (j.t[off_v - 1] == 13) { // '\r'
+        off_v -= 1
+    }
+    return off_v
+}
+
+// C: driver/editar_geo.c:92
+proc editar_proxima_linha(q: ^Consulta, off: u32) -> u32 {
+    var off_v: u32 = off
+    let j: Janela = janela_do_offset(q, off_v)
+    while (off_v < j.teto) and (j.t[off_v] != 10) { // '\n'
+        off_v += 1
+    }
+    var tern_1: u32 = j.teto
+    if off_v < j.teto {
+        tern_1 = off_v + 1
+    }
+    return tern_1
+}
+
+// C: driver/editar_geo.c:101
+proc linha_em_branco(q: ^Consulta, ini: u32) -> bool {
+    let t: []u8 = (q.c as ^Compilacao).fonte.texto
+    let fim: u32 = editar_fim_da_linha(q, ini)
+    for k in ini..<fim {
+        if (t[k] != 32) and (t[k] != 9) { // ' ' '\t'
+            return false
+        }
+    }
+    return true
+}
+
+// C: driver/editar_geo.c:113
+proc linha_de_comentario_2(q: ^Consulta, ini: u32) -> bool {
+    var ini_v: u32 = ini
+    let t: []u8 = (q.c as ^Compilacao).fonte.texto
+    let fim: u32 = editar_fim_da_linha(q, ini_v)
+    while (ini_v < fim) and ((t[ini_v] == 32) or (t[ini_v] == 9)) { // ' ' '\t'
+        ini_v += 1
+    }
+    return (((fim - ini_v) >= 2) and (t[ini_v] == 47)) and (t[ini_v + 1] == 47) // '/' '/'
+}
+
+// C: driver/editar_geo.c:122
+proc editar_linha_tem_texto(q: ^Consulta, off: u32) -> bool {
+    return not linha_em_branco(q, editar_inicio_da_linha(q, off))
+}
+
+// C: driver/editar_geo.c:127
+proc editar_linha_seguinte(q: ^Consulta, off: u32, ini: ^u32, em_branco: ^bool) -> bool {
+    let prox: u32 = editar_proxima_linha(q, off)
+    if prox >= janela_do_offset(q, off).teto {
+        return false
+    }
+    ini^ = prox
+    em_branco^ = linha_em_branco(q, prox)
+    return true
+}
+
+// C: driver/editar_geo.c:137
+proc editar_fim_do_conteudo(q: ^Consulta, arquivo: u32) -> u32 {
+    let j: Janela = janela_do_arquivo(q, arquivo)
+    var achado: u32 = j.piso
+    var ini: u32 = j.piso
+    while ini < j.teto {
+        if not linha_em_branco(q, ini) {
+            achado = editar_fim_da_linha(q, ini)
+        }
+        ini = editar_proxima_linha(q, ini)
+    }
+    return achado
+}
+
+// C: driver/editar_geo.c:148
+proc editar_ponto_sem_imports(q: ^Consulta, arquivo: u32, onde: ^u32, apos_cabecalho: ^bool) -> bool {
+    let j: Janela = janela_do_arquivo(q, arquivo)
+    var ini: u32 = j.piso
+    var ultima: u32 = j.piso
+    while (ini < j.teto) and (common.c2f_b2i32(linha_de_comentario_2(q, ini)) != 0) {
+        ultima = ini
+        ini = editar_proxima_linha(q, ini)
+    }
+    onde^ = j.piso
+    apos_cabecalho^ = false
+    if ((ini == j.piso) or (ini >= j.teto)) or (not linha_em_branco(q, ini)) {
+        return (j.teto > j.piso) and (ini < j.teto)
+    }
+    onde^ = editar_fim_da_linha(q, ultima)
+    apos_cabecalho^ = true
+    return editar_proxima_linha(q, ini) < j.teto
+}
+
+// C: driver/editar_geo.c:167
+proc caminho_do_arquivo(q: ^Consulta, arquivo: u32) -> ?str {
+    let f: ^common.Fonte = &(q.c as ^Compilacao).fonte
+    var tern_1: ?str = f.caminho
+    if f.ntrechos > 0 {
+        tern_1 = (f.trechos or_else {})[arquivo].caminho
+    }
+    return tern_1
+}
+
+// C: driver/editar_geo.c:174
+proc editar_trocar_no_arquivo(p: ^Plano, ini: u32, fim: u32, novo: ?str) -> bool {
+    let piso: u32 = consulta_inicio_do_arquivo(p.q as ^Consulta, ini)
+    let arg_1: u32 = consulta_trecho_do_offset(p.q as ^Consulta, ini)
+    let arg_2: ^Consulta = p.q as ^Consulta
+    return plano_trocar_locais(p, caminho_do_arquivo(arg_2, arg_1), ini - piso, fim - piso, novo)
+}
+
+// C: driver/editar_geo.c:181
+proc editar_modulo_editavel(p: ^Plano, modulo: u8) -> bool {
+    let m: ^frontend.Modulo = &((p.q as ^Consulta).c as ^Compilacao).modulos.itens[modulo]
+    if (m.origem == (frontend.MOD_RAIZ as u8)) or (m.origem == (frontend.MOD_ARQUIVO as u8)) {
+        return true
+    }
+    let msg_1 = format(f"o modulo \"{common.interner_texto(&((p.q as ^Consulta).c as ^Compilacao).nomes, m.caminho)[0..<transmute(common.interner_tam(&((p.q as ^Consulta).c as ^Compilacao).nomes, m.caminho), to = i32)]}\" e da biblioteca padrao, de vendor ou da engine: nao se edita", alloc = heap)
+    defer delete(msg_1)
+    return plano_erro(p, msg_1)
+}
+
+// C: driver/editar_geo.c:191
+// 'texto' sem o ".fj" do fim, com barras normais. Como o snprintf do C, cabe em tam - 1 bytes (o NUL nao conta). Devolve texto novo (heap): quem chama faz delete.
+proc sem_extensao(texto: str, tam: u64) -> str {
+    var bytes = make([dynamic]u8, alloc = heap)
+    defer delete(bytes)
+    let origem: []u8 = as_bytes(texto)
+    let lim: int = (tam as int) - 1
+    var i: int = 0
+    while (i < len(origem)) and (i < lim) {
+        if origem[i] == 92 { // '\\' vira '/'
+            append(&bytes, item = 47) // '/'
+        } else {
+            append(&bytes, item = origem[i])
+        }
+        i += 1
+    }
+    let n: int = len(bytes)
+    var fim: int = n
+    // _stricmp(saida + n - 3, ".fj") == 0: o fim e ".fj" sem diferenca de caixa
+    if (n > 3) and (bytes[n - 3] == 46) and ((bytes[n - 2] == 102) or (bytes[n - 2] == 70)) and ((bytes[n - 1] == 106) or (bytes[n - 1] == 74)) { // '.' 'f' 'F' 'j' 'J'
+        fim = n - 3
+    }
+    return from_bytes(bytes[0..<fim], alloc = heap)
+}
+
+// C: driver/editar_geo.c:191 (uso do buffer de EditarCaminhoRelativo): o texto ate o NUL do buffer; heap, quem chama faz delete
+proc caminho_relativo_texto(p: ^Plano, caminho: ?str) -> str {
+    var buf: [600]u8 = {} // EDITAR_CAMINHO_MAX
+    editar_caminho_relativo(p, caminho, buf[..], 600)
+    return from_bytes(buf[0..<common.c2f_strlen_b(buf[..])], alloc = heap)
+}
+
+// C: driver/editar_geo.c:204
+// O arquivo (trecho da Fonte) cujo caminho relativo a pasta da raiz, sem o ".fj", e 'normal'; -1 se nenhum.
+proc arquivo_pelo_caminho(p: ^Plano, normal: str) -> i32 {
+    let q: ^Consulta = p.q as ^Consulta
+    let f: ^common.Fonte = &(q.c as ^Compilacao).fonte
+    var nt: u32 = 1
+    if f.ntrechos > 0 {
+        nt = f.ntrechos
+    }
+    for t in (0 as u32)..<nt {
+        let rel: str = caminho_relativo_texto(p, caminho_do_arquivo(q, t))
+        let rel_sem: str = sem_extensao(rel, 600)
+        let igual: bool = common.c2f_stricmp(rel_sem, normal) == 0
+        delete(rel)
+        delete(rel_sem)
+        if igual {
+            return t as i32
+        }
+    }
+    return -1
+}
+
+// C: driver/editar_geo.c:217
+// Modulo que o texto designa: pelo caminho do import, ou pelo arquivo (.fj relativo a pasta da raiz). -1 = nenhum (erro em p->erro).
+proc editar_achar_modulo(p: ^Plano, texto: ?str) -> i32 {
+    let q: ^Consulta = p.q as ^Consulta
+    let txt: str = texto or_else ""
+    let m: i32 = consulta_achar_modulo(q, texto)
+    if m >= 0 {
+        return m
+    }
+    let normal: str = sem_extensao(txt, 600)
+    defer delete(normal)
+    let m_normal: i32 = consulta_achar_modulo(q, normal)
+    if m_normal >= 0 {
+        return m_normal
+    }
+    let arquivo: i32 = arquivo_pelo_caminho(p, normal)
+    if arquivo >= 0 {
+        return frontend.modulos_pacote_do_arquivo(&(q.c as ^Compilacao).modulos, arquivo as u32) as i32
+    }
+    let msg = format(f"'{txt}' nao e modulo do projeto (use o caminho do import, ex.: geo/vetor, ou o arquivo .fj relativo a pasta da raiz)", alloc = heap)
+    defer delete(msg)
+    _ = plano_erro(p, msg)
+    return -1
+}
+
+// C: driver/editar_geo.c:231
+// Igual, e grava em *arquivo o arquivo (trecho da Fonte) onde a edicao cai: o 1o (e unico) do modulo, ou o que o texto nomeia. Pacote de 2+ arquivos nomeado so pelo modulo = erro em p->erro.
+proc editar_achar_modulo_e_arquivo(p: ^Plano, texto: ?str, arquivo: ^u32) -> i32 {
+    let q: ^Consulta = p.q as ^Consulta
+    let txt: str = texto or_else ""
+    let m: i32 = editar_achar_modulo(p, texto)
+    if m < 0 {
+        return -1
+    }
+    let normal: str = sem_extensao(txt, 600)
+    defer delete(normal)
+    let nomeado: i32 = arquivo_pelo_caminho(p, normal)
+    if (nomeado >= 0) and ((frontend.modulos_pacote_do_arquivo(&(q.c as ^Compilacao).modulos, nomeado as u32) as i32) == m) {
+        arquivo^ = nomeado as u32
+        return m
+    }
+    var primeiro: u32 = 0
+    let n: u32 = frontend.modulos_trechos_do_pacote(&(q.c as ^Compilacao).modulos, (q.c as ^Compilacao).fonte.ntrechos, m as u8, &primeiro)
+    if n > 1 {
+        let rel: str = caminho_relativo_texto(p, caminho_do_arquivo(q, primeiro))
+        defer delete(rel)
+        let msg = format(f"o modulo '{txt}' e uma pasta com {n} arquivos: diga em qual entra com \"arquivo\" (o .fj relativo a pasta da raiz, ex.: \"{rel}\")", alloc = heap)
+        defer delete(msg)
+        _ = plano_erro(p, msg)
+        return -1
+    }
+    arquivo^ = primeiro
+    return m
+}
+
+// C: driver/editar_geo.c:257
+proc resto_da_linha_livre(q: ^Consulta, fim: u32, fim_linha: u32) -> bool {
+    var fim_v: u32 = fim
+    let t: []u8 = (q.c as ^Compilacao).fonte.texto
+    while (fim_v < fim_linha) and ((t[fim_v] == 32) or (t[fim_v] == 9)) { // ' ' '\t'
+        fim_v += 1
+    }
+    return (fim_v == fim_linha) or ((((fim_linha - fim_v) >= 2) and (t[fim_v] == 47)) and (t[fim_v + 1] == 47)) // '/' '/'
+}
+
+// C: driver/editar_geo.c:266
+proc fim_do_conteudo_antes(q: ^Consulta, ini: u32, piso: u32) -> u32 {
+    var ini_v: u32 = ini
+    while ini_v > piso {
+        let anterior: u32 = editar_inicio_da_linha(q, ini_v - 1)
+        if not linha_em_branco(q, anterior) {
+            return editar_fim_da_linha(q, anterior)
+        }
+        ini_v = anterior
+    }
+    return piso
+}
+
+// C: driver/editar_geo.c:278
+proc ha_texto_depois(q: ^Consulta, ini: u32, teto: u32) -> bool {
+    var ini_v: u32 = ini
+    while ini_v < teto {
+        if not linha_em_branco(q, ini_v) {
+            return true
+        }
+        ini_v = editar_proxima_linha(q, ini_v)
+    }
+    return false
+}
+
+// C: driver/editar_geo.c:287
+proc so_cabecalho_antes(q: ^Consulta, piso: u32, ini: u32) -> bool {
+    var l: u32 = piso
+    while l < ini {
+        if (not linha_em_branco(q, l)) and (not linha_de_comentario_2(q, l)) {
+            return false
+        }
+        l = editar_proxima_linha(q, l)
+    }
+    return true
+}
+
+// C: driver/editar_geo.c:297
+proc faixa_de_remocao(q: ^Consulta, piso: u32, teto: u32, f: ^FaixaDecl) {
+    let prox: u32 = editar_proxima_linha(q, f.fim_texto)
+    var primeira: u32 = f.ini_texto
+    let branco_depois: bool = (prox < teto) and (common.c2f_b2i32(linha_em_branco(q, prox)) != 0)
+    let branco_antes: bool = (f.ini_texto > piso) and (common.c2f_b2i32(linha_em_branco(q, editar_inicio_da_linha(q, f.ini_texto - 1))) != 0)
+    f.fim_remocao = f.fim_texto
+    if not ha_texto_depois(q, prox, teto) {
+        f.ini_remocao = fim_do_conteudo_antes(q, f.ini_texto, piso)
+        return
+    }
+    if ((common.c2f_b2i32(branco_antes) != 0) and (common.c2f_b2i32(branco_depois) != 0)) and (not so_cabecalho_antes(q, piso, f.ini_texto)) {
+        primeira = editar_inicio_da_linha(q, f.ini_texto - 1)
+    }
+    if ((common.c2f_b2i32(branco_antes) != 0) and (common.c2f_b2i32(branco_depois) != 0)) and (primeira == f.ini_texto) {
+        f.ini_remocao = f.ini_texto
+        f.fim_remocao = editar_proxima_linha(q, prox)
+        return
+    }
+    if primeira > piso {
+        f.ini_remocao = editar_fim_da_linha(q, editar_inicio_da_linha(q, primeira - 1))
+        return
+    }
+    f.ini_remocao = piso
+    var tern_1: u32 = prox
+    if common.c2f_b2i32(branco_depois) != 0 {
+        tern_1 = editar_proxima_linha(q, prox)
+    }
+    f.fim_remocao = tern_1
+}
+
+// C: driver/editar_geo.c:323
+proc editar_faixa_da_decl(p: ^Plano, d: ?^frontend.Decl, f: ^FaixaDecl) -> bool {
+    let q: ?^Consulta = p.q
+    let inicio: u32 = consulta_inicio_decl(q as ^Consulta, d)
+    let fim: u32 = frontend.ast_fim_decl(&(q as ^Consulta).fim, d)
+    let j: Janela = janela_do_offset(q as ^Consulta, (d as ^frontend.Decl).pos)
+    let t: []u8 = j.t
+    if editar_inicio_da_linha(q as ^Consulta, inicio) != inicio {
+        for k in editar_inicio_da_linha(q as ^Consulta, inicio)..<inicio {
+            if (t[k] != 32) and (t[k] != 9) { // ' ' '\t'
+                let msg_1 = format(f"a declaracao nao comeca no inicio da linha dela: nao se separa do que vem antes", alloc = heap)
+                defer delete(msg_1)
+                return plano_erro(p, msg_1)
+            }
+        }
+    }
+    f.fim_texto = editar_fim_da_linha(q as ^Consulta, fim - 1)
+    if not resto_da_linha_livre(q as ^Consulta, fim, f.fim_texto) {
+        let msg_2 = format(f"ha mais codigo na linha em que a declaracao termina: nao se separa", alloc = heap)
+        defer delete(msg_2)
+        return plano_erro(p, msg_2)
+    }
+    f.ini_texto = consulta_inicio_comentario(q as ^Consulta, d)
+    faixa_de_remocao(q as ^Consulta, j.piso, j.teto, f)
+    return true
+}

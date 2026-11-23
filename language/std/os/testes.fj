@@ -1,0 +1,240 @@
+// std:os - testes do modulo (S4 P7). Anexados ao texto de std:os SO em forja test std:os (o build normal nao os ve).
+// Versao: 0.7.0. Changelog: 0.7.0 - I9-S1: error_text com local = true (idioma da maquina) e padrao em ingles. 0.6.0 - D-G3-L2b: os mesmos testes de mem_available, pid_alive e error_text no Linux (sysinfo, kill(pid, 0), error_text = ""). 0.5.0 - D-G3-L2a bloco A: mem_available, pid_alive, error_text e write_stdout/flush_stdout (testes deterministicos). 0.4.0 - M8 K1 (D-M8-8): pid e cpu_count (pid > 0 e estavel; cpu_count entre 1 e 4096). 0.3.0 - M5 P28b-2b: write_stderr, print_stderr e peak_memory. 0.2.0 - A52: set_env, unset_env, nome invalido, temp_dir (com TMP) e random_bytes. 0.1.0 - S4 P7: TARGET e ARCH do alvo padrao (contrato da fixture 220), args com ao menos o nome do exe e env de variavel que nao existe (none). Sem sleep, tempo nem stdin: nao sao deterministicos (fixtures 212 e 374 seguem na lowering).
+// Sem import e sem proc main: o pedaco fica dentro do modulo, entao chama as procs dele SEM prefixo (args, env).
+
+test "TARGET e ARCH do alvo padrao" {
+    expect(TARGET == "x86_64-windows")
+    expect(ARCH == "x86_64")
+    expect(len(TARGET) == 14)
+}
+
+test "args tem ao menos o nome do exe" {
+    let a = args()
+    expect(len(a) >= 1)
+    expect(len(a[0]) > 0)
+}
+
+test "env de variavel que nao existe e none" {
+    expect(env("S4_STD_OS_NAO_EXISTE_P7") == none)
+}
+
+test "pid e positivo e duas leituras sao iguais" {
+    let p = pid()
+    expect(p > 0)
+    expect(pid() == p)
+}
+
+test "cpu_count fica entre 1 e 4096" {
+    let n = cpu_count()
+    expect(n >= 1)
+    expect(n <= 4096)
+}
+
+// A52: set_env, unset_env, temp_dir e random_bytes. abs_path, cwd, exe_path e make_temp_* ficam em std\file\testes.fj (aqui o modulo nao enxerga std:path nem std:file).
+
+// O erro e exatamente o esperado?
+proc erro_e(r: ?OsError, esperado: OsError) -> bool {
+    var ok = false
+    switch x in r {
+    case OsError:
+        ok = x == esperado
+    case none:
+        ok = false
+    }
+    return ok
+}
+
+test "set_env grava e env le o mesmo valor, inclusive vazio" {
+    expect(set_env("FORJA_T_A52", "x=1 é") == none)
+    expect((env("FORJA_T_A52") or_else "?") == "x=1 é")
+    expect(set_env("FORJA_T_A52", "") == none)
+    expect(env("FORJA_T_A52") != none)
+    expect((env("FORJA_T_A52") or_else "?") == "")
+    expect(unset_env("FORJA_T_A52") == none)
+}
+
+test "unset_env remove e remover o que nao existe nao e erro" {
+    expect(set_env("FORJA_T_A52_U", "v") == none)
+    expect(unset_env("FORJA_T_A52_U") == none)
+    expect(env("FORJA_T_A52_U") == none)
+    expect(unset_env("FORJA_T_A52_U") == none)
+}
+
+test "nome de variavel vazio ou com igual e invalid_input" {
+    expect(erro_e(set_env("A=B", "v"), OsError.invalid_input))
+    expect(erro_e(set_env("", "v"), OsError.invalid_input))
+    expect(erro_e(unset_env("A=B"), OsError.invalid_input))
+    expect(erro_e(unset_env(""), OsError.invalid_input))
+}
+
+test "temp_dir segue o TMP e vem sem a barra final" {
+    let antigo = env("TMP")
+    switch c in cwd(alloc = heap) {
+    case str:
+        defer delete(c)
+        let alvo = format(f"{c}\\t_tmp", alloc = heap)
+        defer delete(alvo)
+        expect(set_env("TMP", alvo) == none)
+        switch t in temp_dir(alloc = heap) {
+        case str:
+            expect(t == alvo)
+            delete(t)
+        case OsError:
+            expect(false)
+        }
+    case OsError:
+        expect(false)
+    }
+    switch velho in antigo {
+    case str:
+        expect(set_env("TMP", velho) == none)
+    case none:
+        expect(unset_env("TMP") == none)
+    }
+}
+
+test "write_stderr e print_stderr: lista vazia, bytes e texto nao derrubam nada" {
+    var nada: [1]u8 = {0}
+    write_stderr(nada[0..<0])
+    var bytes: [3]u8 = {111, 107, 10}
+    write_stderr(bytes[..])
+    print_stderr("teste de print_stderr (sai no stderr do forja test)")
+    expect(true)
+}
+
+test "peak_memory: positivo e nao cai depois de tocar 8 MiB" {
+    let antes = peak_memory() or_else 0
+    expect(antes > 0)
+    var bloco = make([dynamic]u8, alloc = heap, len = 8388608)
+    for i in 0..<8388608 {
+        bloco[i] = (i % 251) as u8
+    }
+    let depois = peak_memory() or_else 0
+    expect(depois >= antes)
+    expect(bloco[8388607] == 187)
+    delete(bloco)
+}
+
+test "random_bytes: fatia vazia, duas chamadas diferentes e diversidade" {
+    var nada: [1]u8 = {}
+    expect(random_bytes(nada[0..<0]) == none)
+    var a: [64]u8 = {}
+    var b: [64]u8 = {}
+    expect(random_bytes(a[..]) == none)
+    expect(random_bytes(b[..]) == none)
+    var iguais = 0
+    for i in 0..<64 {
+        if a[i] == b[i] {
+            iguais += 1
+        }
+    }
+    expect(iguais < 64)
+    var grande: [4096]u8 = {}
+    var vistos: [256]bool = {}
+    var distintos = 0
+    expect(random_bytes(grande[..]) == none)
+    for i in 0..<4096 {
+        let k = grande[i] as int
+        if not vistos[k] {
+            vistos[k] = true
+            distintos += 1
+        }
+    }
+    expect(distintos > 200)
+}
+
+// D-G3-L2a bloco A: memoria livre, viveza de pid, texto do erro do sistema e stdout cru.
+
+// Os 3 testes abaixo so valem no Windows: no Linux as procs sao stub de falha ate o L2b (syscall real).
+test "mem_available: RAM livre entre 0 e 2^48 bytes" {
+    if TARGET == "x86_64-windows" {
+        let livre = mem_available() or_else 0
+        expect(livre > 0)
+        expect(livre < 281474976710656)
+    }
+}
+
+test "pid_alive: o proprio processo e vivo; pid 4 (System) e vivo; 0 e -1 nao" {
+    if TARGET == "x86_64-windows" {
+        expect(pid_alive(pid()))
+        expect(pid_alive(4))
+        expect(not pid_alive(0))
+        expect(not pid_alive(-1))
+    }
+}
+
+test "error_text: codigo 2 tem texto sem CR/LF no fim; codigo sem texto e vazio" {
+    if TARGET == "x86_64-windows" {
+        let t = error_text(2, alloc = heap)
+        defer delete(t)
+        expect(len(t) > 0)
+        expect(t[len(t) - 1] != 10)
+        expect(t[len(t) - 1] != 13)
+        let v = error_text(0x7FFFFFF0, alloc = heap)
+        defer delete(v)
+        expect(v == "")
+    }
+}
+
+// I9-S1: local = true usa o idioma da maquina (so exige texto nao vazio e sem CR/LF, vale em qualquer idioma); o padrao segue em ingles.
+test "error_text: padrao em ingles; local = true tem texto no idioma da maquina" {
+    if TARGET == "x86_64-windows" {
+        let ing = error_text(2, alloc = heap)
+        defer delete(ing)
+        expect(ing == "The system cannot find the file specified.")
+        let loc = error_text(2, local = true, alloc = heap)
+        defer delete(loc)
+        expect(len(loc) > 0)
+        expect(loc[len(loc) - 1] != 10)
+        expect(loc[len(loc) - 1] != 13)
+        let sem = error_text(0x7FFFFFF0, local = true, alloc = heap)
+        defer delete(sem)
+        expect(sem == "")
+    }
+}
+
+// D-G3-L2b: o Linux. mem_available = sysinfo (freeram * mem_unit, NAO o MemAvailable do /proc); pid_alive = kill(pid, 0); error_text = texto do errno (musl, ingles) desde a forja 0.44.0.
+test "Linux mem_available: RAM livre entre 0 e 2^48 bytes (sysinfo)" {
+    if TARGET == "x86_64-linux" {
+        let livre = mem_available() or_else 0
+        expect(livre > 0)
+        expect(livre < 281474976710656)
+    }
+}
+
+test "Linux pid_alive: o proprio processo e o init (pid 1) sao vivos; 0 e -1 nao" {
+    if TARGET == "x86_64-linux" {
+        expect(pid_alive(pid()))
+        expect(pid_alive(1))
+        expect(not pid_alive(0))
+        expect(not pid_alive(-1))
+    }
+}
+
+// forja 0.44.0: o Linux devolve o texto do musl em ingles (o mesmo do Rust Linux estatico); 0 e codigo sem texto = "", e local nao muda nada.
+test "Linux error_text devolve o texto do errno (musl); 0 e codigo sem texto sao vazios" {
+    if TARGET == "x86_64-linux" {
+        let t2 = error_text(2, alloc = heap)
+        defer delete(t2)
+        expect(t2 == "No such file or directory")
+        let t13 = error_text(13, alloc = heap)
+        defer delete(t13)
+        expect(t13 == "Permission denied")
+        let t21 = error_text(21, local = true, alloc = heap)
+        defer delete(t21)
+        expect(t21 == "Is a directory")
+        let zero = error_text(0, alloc = heap)
+        defer delete(zero)
+        expect(zero == "")
+        let v = error_text(0x7FFFFFF0, alloc = heap)
+        defer delete(v)
+        expect(v == "")
+    }
+}
+
+test "write_stdout de 0 bytes e flush_stdout nao quebram" {
+    var nada: [1]u8 = {0}
+    write_stdout(nada[0..<0])
+    flush_stdout()
+    expect(true)
+}

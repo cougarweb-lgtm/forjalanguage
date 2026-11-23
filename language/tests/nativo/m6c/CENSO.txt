@@ -1,0 +1,200 @@
+CENSO M6c - P81 (16/11/2026). PISTA L: nada de compiler\ nem runtime\ nem tools\ foi tocado; so arquivos NOVOS em tests\.
+Oraculo: %TEMP%\forja_p80.exe = 4.460.032 B, cmp igual a compiler\forja.exe (forja 0.19.3).
+Medicoes: rg/grep (ripgrep), gcc 16.1 MinGW (sizeof/offsetof), gcc do alpine-build por WSL (lote unico, timeout).
+
+=== (b) COMPILADOR: onde a Semantica nasce, onde o lowering emite o foreign, sem_posse, Decl ===
+
+b1. Semantica por comando (um so ponto de criacao)
+    comando: rg -n "SemanticaIniciar|AnalisarSemantica" compiler/driver
+    - driver\main.c:387 SemanticaIniciar(&c->sem), dentro de AnalisarSemantica (main.c:375). Unico ponto de criacao.
+    - chamadores: cmd_ast.c:40 e :65 (ast); cmd_consultar.c:185 (consultar); main.c:423 (GerarC: build --modo c / --backend c);
+      main.c:518 (BaixarIrMedido: build exe); main.c:533 (LowerPrograma: build); main.c:660 (RodarAnalise = check); migrar_analise.c:158 (migrar).
+    - cmd_corrigir.c nao chama AnalisarSemantica (rg vazio). cmd_fmt*.c nao analisa.
+    - alvo: AlvoEhLinux (driver\opcoes.c:192). O padrao ja existe em main.c:235 (c->opcoes != NULL && AlvoEhLinux(c->opcoes)).
+      Proposta P82: 1 linha em AnalisarSemantica (main.c 771 -> 772; teto 800).
+b2. Lowering da chamada foreign
+    comando: rg -n "IR_CHAMADA" compiler/ir/lower_call.c
+    - ir\lower_call.c:302 IrInstr *i = LwNovaInstr(c, IR_CHAMADA, e->pos_op) (ref REF_PROC; proc = c->procs[ref_id]).
+      Foreign e proc comum usam o mesmo IR_CHAMADA; o externo fica em IrPrograma.externos (ir\ir.h:480, IrExterno).
+    - IR_CHAMADA_IND em lower_call.c:318 (chamada por valor de tipo proc).
+b3. Consumidores (BIR e emit_c)
+    comando: rg -n "foreign|IR_CHAMADA" compiler/nativo/bir compiler/backend
+    - BIR: nativo\bir\bir_regras.c:99-101 (SUPORTADO IR_CHAMADA "proc"/"foreign"/"callback"); bir_construir_chamada.c:206 SimboloDaChamada,
+      :377 BirRegraChamada.
+    - emit C: backend\emit_c_instr.c:1175 [IR_CHAMADA] = EmitOpChamada (:409); backend\emit_c_externo.c:42 EmitChamadaExterno, :110 EmitExterno;
+      backend\emit_c_funcao.c:62 (case IR_CHAMADA).
+b4. sem_posse.c (heap x handle)
+    comando: rg -n "LocalRastreado|SemConferirSaidaLenta|SemConferirFimDoBloco" compiler/semantic
+    - LocalRastreado (semantic\sem_interno.h:318): local_id, nome, pos, origem, estado, de_chamada. origem = ALOC_* (frontend\ast.h:124).
+      estados POSSE_VIVO / POSSE_ENTREGUE / POSSE_LIBERADO.
+    - SEM FLUXO. SemConferirSaidaLenta (sem_posse.c:159) percorre s->rastreados a partir da marca e acusa E0317 em todo heap/ALOC_PARAM
+      VIVO no return/break/continue. O if nao bifurca: vale o estado da ordem do texto no momento da saida. Fim de bloco:
+      SemConferirFimDoBloco (sem_posse.c:174), chamado de sem_stmt.c:448. Return: sem_fluxo.c via SemConferirPosse(PONTO_SAIDA).
+      Consequencia para o P87: a guarda do `if h == none` nao e fluxo; e a pilha de guardas no then direto (D-M6c-5 (4)).
+    - E0317 de heap: textos em sem_posse.c:105-183 (sem_posse.c 232 linhas).
+b5. sizeof(Decl) e folga de bits (frontend\ast.h:297)
+    comando: gcc -I compiler -I compiler/common (programa de medicao em %TEMP%\p81_sizeof\medir_off.c)
+    - sizeof(Decl) = 240 bytes (x64, gcc 16.1 MinGW). NAO existe _Static_assert para Decl (so TipoRef 32 em ast.h:153, Expr 56 em :223, Stmt 128 em :271).
+    - Buracos de padding: byte 3 (1 B); bytes 177..183 (7 B, entre tem_retorno@176 e retornos@184); bytes 218..219 (2 B, entre com_erro@217 e chave@220).
+    - Os campos do D-M6c-4 cabem SEM crescer: posse_c (u8) @177, posse_param (i16) @178, pos_posse (u32) @180. sizeof continua 240.
+    - O PARA "sizeof(Decl) sem folga" NAO disparou. Sugestao para o P85: _Static_assert(sizeof(Decl) == 240, "...") (o contrato supunha que ja existisse).
+b6. Folga de linhas (wc -l) dos arquivos que os passos tocam
+    main.c 771 (29) | opcoes.c 593 (207) | semantic\sem_posse.c 232 | sem_interno.h 508 | semantic.h 228 | sem_tipo.c 469 (331) | sem_call.c 601 (199) |
+    sem_fluxo.c 134 | sem_stmt.c 452 | frontend\ast.h 331 | parser_decl.c 493 (307) | ast_json_decl.c 370 | ir\lower_call.c 384 (416) | ir\ir.h 491 |
+    bir_construir_chamada.c 512 (288) | bir_regras.c 204 | emit_c_externo.c 241 | common\diag.c 732 (68) | diag_forma_tab.c 419 |
+    nativo\nativo.c 797 (3) | nativo\fmt\pe_escrever.c 799 (1) | backend\emit_c_instr.c 1313 (ACIMA de 800; divida pre-existente, nao cresce) |
+    runtime\forja_rt.h 2735 (ACIMA de 800, pre-existente; P88 o toca) | runtime\nativo\rt_handles.c 162 | tools\forja_ligar\forja_ligar.py 2245 (ACIMA de 800, pre-existente; P82/P84/P89 tocam).
+
+=== (c) LEVANTAMENTO DOS .fj ===
+
+c1. Procs foreign que casam a heuristica do D-M6c-9 (forma ENTRE PROTOTIPO, sem alias)
+    comandos (ripgrep, multilinha nao; uma linha por proc; "proc sem corpo" = linha sem '{'):
+      creator retorno : rg -n -i -P '^\s*(pub\s+)?proc\s+\w*(open|create|new|init|load|parse|dup|alloc)\w*\s*\(.*\)\s*->\s*(\?\^|\^|rawptr|\?rawptr)[^{]*$' <pasta>
+      creator T** saida: rg -n -i -P '^\s*(pub\s+)?proc\s+\w*(open|create|new|init|load|parse|dup|alloc)\w*\s*\(.*:\s*(\^\?\^|\?\^\?\^|\^\^|\?\^\^)\w+.*\)[^{]*$' <pasta>
+      destroyer       : rg -c -i -P '^\s*(pub\s+)?proc\s+\w*(close|destroy|free|delete|release|unload|finalize)\w*\s*\(\s*\w+\s*:\s*(\?\^|\^|rawptr)[^{]*$' <pasta>
+    Por lib (vendor, std, exemplos_libs, interop_lab):
+    | lib (arquivo)                 | creator retorno | creator T** saida | destroyer 1o param handle | observacao |
+    | vendor\db\sqlite3.fj           | 8  (malloc, malloc64, realloc, realloc64, value_dup, mutex_alloc, str_new, backup_init) | 4 (open, open16, open_v2, blob_open) | 11 | create_function* (4) casam so por callback ?^?^: falso; prepare* (6) NAO casam (nome sem palavra criadora): a mao |
+    | vendor\json\cjson.fj           | 22 (Parse 4, Create* 16, Duplicate, cJSON_malloc) | 0 | 5 | cJSON_DeleteItemFrom* (3) casam mas removem item, nao destroem o objeto: falso |
+    | vendor\compression\zlib.fj     | 3 (gzopen, gzopen_w, gzdopen) | 0 | 3 (gzclose, _r, _w) | - |
+    | vendor\db_server\libpq.fj      | 3 (PQconninfoParse, PQcancelCreate, PQresultAlloc rawptr) | 0 | 8 | PQclosePrepared/Portal, PQsendClosePrepared/Portal, lo_close: falso (fecham stmt/portal/fd, nao a conexao); PQfreemem ok |
+    | vendor\db_server\mariadb.fj    | 1 (mysql_init) | 0 | 2 (mysql_close, mysql_free_result) | - |
+    | vendor\gltf\cgltf.fj           | 0 | 2 (cgltf_parse, cgltf_parse_file) | 1 (cgltf_free) | - |
+    | vendor\physics2d\box2d.fj      | 5 (4 reais: b2CreateDynamicTree, b2CreateRecording, b2CreateRecordingFromFile, b2CreateReplay; 1 falso: b2SetAllocator) | 0 | 4 | b2DestroyTreeProxy: falso (destroi proxy, nao a arvore). b2Destroy{World,Body,Shape,Chain,Joint} usam B2*Id struct: fora da heuristica |
+    | vendor\audio\miniaudio.fj      | 0 | 0 | 0 | 4 nomes casam (ma_*_init) mas devolvem i32 com T* (nao T**) |
+    | vendor\net\curl_ponte.fj       | 0 | 0 | 0 | - |
+    | vendor\raylib\raylib.fj (FORA, D0648) | 13 | 0 | 12 | tabela propria |
+    | std\*.fj (Forja com corpo)     | 0 | 0 | 0 | as hits de std (close/delete/free) sao proc Forja com '{' |
+    | interop_lab\* (laboratorio)    | sdl3 57 (+3 saida), raylib 13, glfw 3, win32 2+1, wndproc 1 | 0 | sdl3 34, raylib 12, glfw 4, win32 3, wndproc 1, vulkan 1, nuklear 2 | so contagem |
+    | TOTAL vendor (sem raylib)      | 8+22+3+3+1+5 (+1 json.fj alias) = 43 | 4+2 = 6 | 11+5+3+8+2+4+1 = 34 | ver c4 para alias |
+c2. Alias: a heuristica acima NAO ve a forma `proc nome = "simbolo"(...)` (o nome nao vem antes do '('). Contagem em alias:
+    comando: rg -c -P '^\s*(pub\s+)?proc\s+\w+\s*=\s*"[^"]+"\s*\(' vendor std exemplos_libs interop_lab --glob '*.fj'
+    - vendor\json\json.fj: 7 alias (creator: json_c_fopen -> ?^JsonArquivoC; json_c_malloc -> rawptr | destroyer: json_c_fclose, json_c_free).
+    - vendor\net\net.fj: 6 alias (creator: rede_c_fopen -> ?^ArquivoRede | destroyer: rede_c_fclose).
+    - std\math.fj: 42 alias (libm: sem handle). exemplos_libs\baixar_https.fj: 5 (nao casam).
+    PARA DECIDIR no P89/P90: o --propor (P89) precisa ler a forma alias; e json.fj parse_file (json_c_fopen local, fechado por json_c_fclose)
+    vira E0317 falso se alguem puser creates so no fopen. Ver Q4.
+c3. Programas que abrem handle de sqlite3/cJSON e NAO fecham (viram R0009 no P90)
+    comandos: rg -l -e 'sqlite3_open|sqlite3_prepare|cJSON_Parse|cJSON_Create|cJSON_Duplicate' --glob '*.fj' .   (abridores)
+              rg -c -e '\bdb\.open\(|\bjson\.parse\w*\(|\bdb\.prepare\(' <arq>  e  rg -c -e '\bdb\.close\(|\bdb\.finalize\(|\bjson\.close\(' <arq>  (usuarios)
+    - abridores diretos (nome C): so vendor\db\db.fj, vendor\db\sqlite3.fj, vendor\json\json.fj, vendor\json\cjson.fj e benchmark\...\P01 (copia).
+    - usuarios (programas): exemplos_libs\banco_basico (3/3), db_e_json (3/4), json_basico (1/2), json_e_net (1/1, defer json.close), json_manifesto (2/1: parse_file em switch,
+      o close esta no ramo de sucesso: OK), teste_json (18/18), tests\interop\estatica\banco_basico (3/3), json_basico (1/2), tests\nativo\m3\estatica\banco_basico (3/3), json_basico (1/2).
+      std_wip\json\teste.fj: import "json" = std:json em Forja pura ("sem foreign e sem cJSON", std_wip\json\json.fj): NAO e candidato.
+    - R0009 novo previsto no P90 em programas de teste/exemplo nao congelados: 0.
+    - benchmark\ia_first: 24 arquivos (fixtures_l3c2, fixtures_l3c3, fixtures_migrar, tarefas\P\P01) usam db/json e nao fecham. Nao sao rodados por esta suite;
+      conferir no P90 se o benchmark roda com build/run (se rodar, viram R0009).
+    - congelados (tests\dourado, examples\, benchmark\corpus\gerado|dourado): nenhum abridor. Lista congelada sem R0009 novo.
+c4. Padrao R-M6c-3 (handle local passado a proc Forja que o fecha) em vendor/std
+    comandos: rg -n "let\s+\w+\s*=\s*(sq\.|cj\.|db\.|json_c_)?(sqlite3_open|cJSON_Parse|json_c_fopen)" vendor std ; leitura de cada uso.
+    - vendor\db\db.fj: open(): `var aberto` -> sqlite3_open(pp_db = &aberto) -> sqlite3_close(aberto) (foreign, nao proc Forja) no erro; sucesso: Db{no = aberto} (campo).
+      prepare(): mesmo padrao com Query. close/finalize recebem Db/Query (struct por valor) e fecham por foreign. 0 casos.
+    - vendor\json\json.fj: parse(): `let lido = cj.cJSON_Parse(text)` -> Json{no = r} (campo). parse_file(): `let aberto = json_c_fopen(...)` fechado por json_c_fclose
+      (foreign SEM clausula: nao rastreado). 0 casos hoje.
+    - PARA "fachada guarda handle em local e o fecha em proc Forja": NAO disparou. Caveat: se o P90 puser creates em json_c_fopen, parse_file vira E0317.
+c5. Outros: fopen em .fj: 0 chamadas diretas (rg '\bfopen\('); std\file.fj nao tem foreign de fopen (so procs Forja).
+
+=== (d) long/unsigned long nos headers vendorizados x .fj gerados ===
+
+comando: rg -c -P '(?<!long )\blong\b(?! long)' <header>     (long puro; long long fica de fora)
+| header-fonte (gerou o .fj)                 | long puro | linhas de codigo com long | .fj gerado            | P84 muda o .fj? |
+| vendor\compression\zlib\zlib.h             | 8 (inflateMark, inflateCodesUsed, comentarios) | ~5 em codigo | vendor\compression\zlib.fj | SIM (uLong -> u32 em 23 lugares; contrato) |
+| vendor\db\sqlite\sqlite3.h                 | 29 | 3 em codigo (sqlite3_win32_set_directory8/16: unsigned long type) | vendor\db\sqlite3.fj | SIM (3 procs, so win32) |
+| vendor\db_server\mariadb\mariadb_min.h     | 4 (mysql_fetch_lengths, mysql_real_escape_string, mysql_get_client_version, mysql_connect clientflag) | 4 | vendor\db_server\mariadb.fj | SIM |
+| vendor\net\curl_ponte.h                    | 2 (curlf_opt_inteiro valor; curlf_info_inteiro *saida) | 2 | vendor\net\curl_ponte.fj | SIM |
+| vendor\audio\miniaudio_reduzido.h          | 0 | 0 | vendor\audio\miniaudio.fj | nao (a fonte e o reduzido, sem long) |
+| vendor\json\cjson\cJSON.h                  | 0 | 0 | vendor\json\cjson.fj | nao |
+| vendor\db_server\libpq\include\libpq-fe.h  | 0 | 0 | vendor\db_server\libpq.fj | nao |
+| vendor\gltf\cgltf_reduzido.h               | 0 | 0 | vendor\gltf\cgltf.fj | nao (cgltf\cgltf.h tem 1, nao e a fonte) |
+| box2d.h / raylib.h                         | fontes NAO encontradas em vendor (find) | - | box2d.fj, raylib.fj | nao medido: confirmar a fonte no P84 |
+- forja_ligar.py:333 `K.INT:"i32", K.UINT:"u32", K.LONG:"i32", K.ULONG:"u32", K.LONGLONG:"i64", K.ULONGLONG:"u64"` (P84 troca LONG/ULONG por c_long/c_ulong).
+- Ajustes a mao nos cabecalhos dos .fj gerados (rg -n "a mao|ajuste|tirad" vendor/*.fj): so vendor\compression\zlib.fj:3 (IA1-L3c3: o `proc compress` foi
+  tirado; refazer no P84, pois compression.fj exporta compress). Os demais tem so a linha 1 padrao ('nao edite a mao').
+
+=== (e) FIXTURES NOVAS (44 + 2 controles) E O QUE ELAS FAZEM HOJE ===
+
+Criadas (todas NOVAS, em tests\):
+  tests\sintaxe: ok_foreign_creates, ok_foreign_creates_saida, ok_foreign_destroys, ok_foreign_takes (.fj); err_foreign_clausula_desconhecida, err_foreign_duas_clausulas (.fj + .esperado.jsonl E0912)
+  tests\semantica: ok_clong_fronteira (.fj); err_clong_{mistura,conta,proc_forja,export,array} (.fj + .esperado.jsonl E0342);
+                  err_E0912_{param_inexistente,tipo_nao_handle,creates_p_sem_ptr,destroys_sem_nome,creates_sem_retorno,clausula_cstr} (.fj + .esperado.jsonl E0912);
+                  ok_handle_{defer,saida,none,emprestimo,entrega_campo,takes,struct_valor} (.fj); err_handle_{esquecido,copia,return_vivo,saida_sem_local,proc_forja_fecha} (.fj + .esperado.jsonl)
+  tests\nativo\m6c\clong: labs_alvo, tamanho_alvo, strtoul_grande (P82); gzheader_layout, zlib_crc (P84) (.fj + .esperado, JSON por alvo)
+  tests\nativo\m6c\handle: handle_esquecido, handle_ok, handle_fopen_none, handle_desconhecido, handle_threads, handle_release (P88); sqlite_esquecido, sqlite_ok, cjson_takes (P90) (.fj + .esperado)
+  tests\nativo\m6c\verificar_m6c.py (0.1.0) e este CENSO.txt.
+
+Numeros gravados nos .esperado (medidos, nao suposicoes):
+  gzheader_layout: windows size 72 / offset(time) 4 / offset(xflags) 8 (gcc MinGW); linux size 80 / 8 / 16 (gcc alpine-build, WSL).
+  uLong: 4 bytes windows, 8 bytes linux (gcc). strtoul("4294967296") -> 4294967295 windows / 4294967296 linux (contrato; LLP64/LP64).
+  crc32("abc") = 891568578 = 0x352441C2 (conta feita a mao, confere com o valor do contrato).
+
+TABELA: o que cada fixture faz HOJE (oraculo forja 0.19.3; "esperado" = o que o contrato pede)
+| fixture                                  | hoje                                   | esperado (passo) |
+| sintaxe ok_foreign_creates               | ast E0101 (exit 1)                     | ast exit 0 (P85) |
+| sintaxe ok_foreign_creates_saida         | ast E0101                              | ast exit 0 (P85) |
+| sintaxe ok_foreign_destroys              | ast E0101                              | ast exit 0 (P85) |
+| sintaxe ok_foreign_takes                 | ast E0101                              | ast exit 0 (P85) |
+| sintaxe err_foreign_clausula_desconhecida| ast E0101 (linha/coluna nao anotadas)  | E0912 linha 5 col 36 (P85) — ver Q2 |
+| sintaxe err_foreign_duas_clausulas       | ast E0101 (linha/coluna nao anotadas)  | E0912 linha 5 col 73 (P85) — ver Q2 |
+| semantica ok_clong_fronteira             | build exit 1, E0201 (c_long desconhecido) | sem erro nos 2 alvos (P83) |
+| semantica err_clong_mistura              | E0201 linha 4 col 18                   | E0342 linha 9 col 18 (P83) |
+| semantica err_clong_conta                | E0201 linha 4 col 18                   | E0342 linha 5 col 5 (P83) |
+| semantica err_clong_proc_forja           | E0201 linha 3 col 15                   | E0342 linha 3 col 15 (P83) |
+| semantica err_clong_export               | E0201 linha 3 col 26                   | E0342 linha 3 col 26 (P83) |
+| semantica err_clong_array                | E0201 linha 4 col 15                   | E0342 linha 4 col 15 (P83) |
+| semantica err_E0912_param_inexistente    | E0101 linha 5 col 36                   | E0912 linha 5 col 44 (P85) |
+| semantica err_E0912_tipo_nao_handle      | E0101 linha 4 col 37                   | E0912 linha 4 col 45 (P85) |
+| semantica err_E0912_creates_p_sem_ptr    | E0101 linha 4 col 40                   | E0912 linha 4 col 48 (P85) |
+| semantica err_E0912_destroys_sem_nome    | E0101 linha 5 col 42                   | E0912 linha 5 col 42 (P85) |
+| semantica err_E0912_creates_sem_retorno  | E0101 linha 5 col 42                   | E0912 linha 5 col 42 (P85) |
+| semantica err_E0912_clausula_cstr        | E0101 linha 4 col 38                   | E0912 linha 4 col 44 (P85) |
+| semantica ok_handle_* (7)                | build exit 1 (E0101 da clausula)       | sem erro (P87) |
+| semantica err_handle_esquecido           | E0101 linha 5 col 54                   | E0317 linha 10 col 9 (P87) |
+| semantica err_handle_copia               | E0101 linha 5 col 54                   | E0317 linha 12 col 13 (P87) |
+| semantica err_handle_return_vivo         | E0101 linha 5 col 54                   | E0317 linha 12 col 9 (P87) |
+| semantica err_handle_saida_sem_local     | E0101 linha 5 col 56                   | E0912 linha 15 col 35 (P87) |
+| semantica err_handle_proc_forja_fecha    | E0101 linha 5 col 54                   | E0317 linha 14 col 9 (P87) |
+| nativo clong labs_alvo                   | build E0201 (c_long), win e linux      | stdout 7 (P82) |
+| nativo clong tamanho_alvo                | build E0201                            | 4 / 8 (P82) |
+| nativo clong strtoul_grande              | build E0201                            | 4294967295 / 4294967296 (P82) |
+| nativo clong gzheader_layout             | build E1001 (vendor:compression/zlib nao importavel) | 72/4/8 e 80/8/16 (P84) — ver Q1 |
+| nativo clong zlib_crc                    | build E1001 (idem)                     | 891568578/3/97 (P84) — ver Q1 |
+| nativo handle handle_esquecido           | build E0101 (creates)                  | exit 101, R0009 handle malloc [abrir_recurso, main] (P88) |
+| nativo handle handle_ok / fopen_none / desconhecido / threads / release | build E0101 | exit 0 (P88) |
+| nativo handle sqlite_esquecido / sqlite_ok / cjson_takes | build E1001 (vendor interno)  | P90 — ver Q1 |
+  O verificador (--grupo tudo --release-igual --alvo ambos, lista ANTIGA de 9 do --release-igual): PASSOU 0 / FALHOU 62 (salida em %TEMP%\p81_sizeof\falha_hoje.txt). Com a lista nova de 6 (sem os vendor), espera-se 59 FALHOU. Todas FALHAM do jeito previsto
+  (E0101/E0201/E1001 de hoje; nenhum PASSA por acaso), exceto os 2 controles abaixo.
+
+CONTROLES que DEVEM passar hoje (confirmados):
+  - tests\sintaxe\ok_foreign.fj e ok_foreign_alias.fj: ast exit 0 (passam).
+  - fonte handle SEM clausulas (o gêmeo de --release-igual, gerado por TirarClausulas): handle_ok, handle_esquecido, handle_fopen_none, handle_desconhecido, handle_release
+    -> build exit 0 hoje; handle_ok roda: stdout 5, exit 0.
+
+PADRAO DE TESTE do verificador (decisoes desta passada):
+  - --selftest PASSOU: 51 de 51 (regex de clausula, extracao de JSON com lixo antes, comparacao, presenca dos arquivos das listas). Rodado sem python -I.
+  - semantica: verificar_m6c usa `forja build` (windows e --target x86_64-linux), nao `check`: check nao aceita --target (driver\opcoes.c:303-308). Primeiro diagnostico JSON comparado com .esperado.jsonl.
+  - --release-igual: fonte gemea gravada em pastas separadas (com\ e sem\), mesmo nome; so os fontes com a clausula no proprio .fj (vendor fica de fora, Q3).
+
+=== PERGUNTAS / PONTOS PARA O MAIN (nenhum parou o P81; cada um muda um passo) ===
+
+Q1 [BLOQUEIO P84/P90] Import de vendor interno: `import "vendor:compression/zlib"`, `"vendor:db/sqlite3"`, `"vendor:json/cjson"` dao E1001 (modulo ausente).
+   So o modulo-pacote e importavel: `vendor:db/db`, `vendor:json/json`, `vendor:compression/compression` (dependencia.json: "importar"). Afetados: gzheader_layout,
+   zlib_crc, sqlite_esquecido, sqlite_ok, cjson_takes. Opcoes: (a) reescrever essas fixtures com o pacote (perde o teste direto do D0655(b) do layout do GzHeaderS, que
+   e do zlib.fj); (b) o forja aceitar import de vendor interno (muda o compilador: fora da PISTA L); (c) declarar o foreign localmente com a mesma assinatura (nao prova o
+   vendor). Recomendo decidir antes do P84.
+Q2 [P85] tests\sintaxe\verificar_sintaxe.py 1.3.0 so trata E0001/E0101/E0110 como erro de sintaxe; para os outros codigos exige `forja ast` exit 0. As 2 fixtures
+   err_foreign_clausula_desconhecida e err_foreign_duas_clausulas (E0912 do parser) quebrariam esse verificador. Opcoes: (a) mover para tests\semantica (verificar_semantica
+   aceita qualquer codigo); (b) estender verificar_sintaxe (fora da PISTA L). Recomendo (a).
+Q3 [P90] --release-igual nao cobre sqlite_*/cjson_takes: a clausula esta no vendor, nao no .fj da fixture. Precisa de um gemeo com o vendor regenerado (ou sem a clausula).
+Q4 [P89/P90] Heuristica do --propor nao le a forma alias `proc x = "sym"(...)`. Afetados: json.fj (json_c_fopen, json_c_fclose, json_c_malloc, json_c_free), net.fj
+   (rede_c_fopen, rede_c_fclose). json.fj parse_file ficaria com E0317 falso se json_c_fopen ganhar creates sem json_c_fclose ganhar destroys (mesma regra do c4).
+Q5 [P87] err_handle_copia: esperei UM E0317 (no `let g = f`) porque o defer ja cobre f. Se o desenho produzir um 2o E0317 no fim do bloco, o .esperado vira lista — confirmar.
+   Tambem: err_handle_return_vivo e err_handle_proc_forja_fecha assumem UM diagnostico cada.
+Q6 [P88] Fixtures de handle usam malloc/free/fopen SEM `link` (libc padrao dos 2 alvos, como ok_foreign.fj). Se o msvcrt/musl nao linkar sem link, a saida e o
+   molde de VARIANTES do verificar_mem (arquivo por alvo) — decidir no P88.
+Q7 [P88/P84] Acima de 800 linhas JA ANTES do M6c: runtime\forja_rt.h (2735), tools\forja_ligar\forja_ligar.py (2245), backend\emit_c_instr.c (1313). A regra de
+   "C tocado <= 800" nao se cumpre por eles; decidir se o P88 pode tocar forja_rt.h (divida pre-existente) ou se o passo sai como excecao.
+Q8 [P85] Contrato assumiu _Static_assert(sizeof(Decl)); nao existe. Sugestao: criar no P85 (sizeof 240 hoje; 3 campos cabem nos buracos).
+Q9 [P83/P84] ok_clong_fronteira passa `&u` como ^c_ulong a um foreign sem corpo real (get_ul): so `build` verifica; se o linker reclamar, trocar por outro foreign real.
+Q10 [P87] cJSON_AddItemToObject devolve i32 em vendor\json\cjson.fj:79 (o exemplo do contrato dizia bool): so exemplo, nao altera fixture.
+
+Sem processo em background. Nenhum id de shell ativo (todos os comandos rodaram em primeiro plano; timeout 600 s no verificador).

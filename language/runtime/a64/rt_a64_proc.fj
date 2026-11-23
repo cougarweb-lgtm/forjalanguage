@@ -1,0 +1,627 @@
+// runtime/a64/rt_a64_proc.fj - procs de runtime do alvo aarch64-linux em Forja (A3.3g, separado em J1a): modulo std:a64_proc
+// Versao: 0.4.1
+// Changelog: 0.4.1 - K1: A64_EST_STDIN_PEND de 1088 para 1152 (colidia com ALOC_SLOT_TABELA do alocador).
+//            0.4.0 - J1d: os_last_error (errno gravado por std:file, slot 1184).
+//                    0.3.0 - J1b: proc_bytes_aleatorios (random_bytes do std:os: getrandom 278, fallback /dev/urandom), exigido pelo pasta/os.
+//                    0.2.0 - J1b: overlay de ambiente (proc_definir_ambiente = set_env/unset_env do std:os); proc_ambiente consulta o overlay antes do envp da pilha.
+//                    0.1.0 - J1a: separado de rt_a64.fj (teto de 800 linhas): conversoes real -> inteiro (A3.3b), relogio e dormir (A3.3a), faixa/faixa_u64 (R0001),
+//                    str_de_cstr, proc_ambiente, stdin_ler/stdin_ler_linha, os_pid, proc_escrever_erro, proc_pico_memoria e main_erro. Mesmos procs e semantica.
+// Os helpers de erro, falha, estado e texto ficam em std:a64_rt (alias host); as constantes A64_ aqui sao copias das de rt_a64.fj (mesmos valores e slots).
+// Contrato: cada proc pub X atende o simbolo de runtime forja_X (ponte em nativo/a64/a64_alcance.fj, prefixo a64_).
+
+import "std:a64_rt" as host
+import "std:wasm_rt" as wasm_rt
+
+foreign {
+    proc sys_chamar = "forja_rt_syscall"(num: int, a0: int, a1: int, a2: int, a3: int, a4: int, a5: int) -> int
+    proc rt_modo_dev = "forja_rt_modo_dev"() -> bool
+    proc rt_trunc_i64 = "forja_rt_trunc_i64"(v: f64) -> int
+    proc forja_fmt_f64_curto(v: f64, fmt: u32)
+}
+
+const A64_SYS_WRITE: int = 64
+const A64_SYS_READ: int = 63
+const A64_SYS_NANOSLEEP: int = 101
+const A64_SYS_CLOCK_GETTIME: int = 113
+const A64_CLOCK_REALTIME: int = 0
+const A64_CLOCK_MONOTONIC: int = 1
+const A64_SYS_GETRUSAGE: int = 165
+const A64_SYS_GETPID: int = 172
+const A64_FD_STDERR: int = 2
+const A64_FD_STDIN: int = 0
+const A64_SAIDA_ERRO_MAIN: int = 1
+const A64_RUSAGE_SELF: int = 0
+const A64_RUSAGE_MAXRSS: int = 4
+const A64_BYTES_POR_KIB: int = 1024
+const A64_ERRO_OUTRO_OS: int = 3
+const A64_STDIN_ERRO: int = -1
+const A64_STDIN_EOF: int = -2
+const A64_CHAR_LF: u8 = 10
+const A64_CHAR_CR: u8 = 13
+const A64_CHAR_IGUAL: u8 = 61
+const A64_PALAVRA_BYTES: uint = 8
+// envp fica a 16 B do sp + 8 B por argumento: argc (8) e o NULL do fim de argv (8)
+const A64_PILHA_ENVP: uint = 16
+const A64_EST_FMT_PTR: uint = 800
+const A64_EST_FMT_LEN: uint = 808
+const A64_EST_ARGS_SP: uint = 1040
+const A64_EST_STR_PTR: uint = 1072
+const A64_EST_STR_LEN: uint = 1080
+// K1: era 1088 = o mesmo slot de ALOC_SLOT_TABELA (rt_a64_mem.fj); agora 1152 (mapa unico de slots no topo do estado em rt_a64.fj)
+const A64_EST_STDIN_PEND: uint = 1152
+// overlay de set_env/unset_env (J1b): ponteiro do vetor de textos, quantidade e capacidade
+const A64_EST_AMB_PTR: uint = 1160
+const A64_EST_AMB_QTD: uint = 1168
+const A64_EST_AMB_CAP: uint = 1176
+const A64_AMB_CAP_INICIAL: uint = 16
+const A64_AMB_SEM_MEMORIA: i32 = 3
+// errno da ultima falha de std:file (gravado por rt_os_erro_gravar do std:a64_rt): lido por std:os.last_error (J1d)
+const A64_EST_ULTIMO_ERRO: uint = 1184
+// bytes aleatorios (J1b): numeros do aarch64-linux (getrandom 278, openat 56, close 57); fatia = RT_OS_FATIA_ALEATORIA do x64
+const A64_SYS_OPENAT: int = 56
+const A64_SYS_CLOSE: int = 57
+const A64_SYS_GETRANDOM: int = 278
+const A64_AT_FDCWD: int = -100
+const A64_O_LER_CLOEXEC: int = 524288
+const A64_ENOSYS: int = 38
+const A64_EPERM: int = 1
+const A64_RET_EINTR: int = -4
+const A64_FATIA_ALEATORIA: int = 1048576
+
+// ---- real -> inteiro (A3.3b): a regra e a do rt_wasm (dev: faixa aberta e R0002; release: satura, NaN vira 0); a R0002 traz o f64 original, como o x64 ----
+
+// texto do f64 (Display curto, como o print) para stderr: usa o buffer de formatacao (FMT_PTR/FMT_LEN) zerado antes
+proc rt_erro_real(v: f64) {
+    host.rt_escrever_u64(A64_EST_FMT_LEN, 0)
+    forja_fmt_f64_curto(v, 0)
+    let base: uint = host.rt_ler_u64(A64_EST_FMT_PTR)
+    let tamanho: uint = host.rt_ler_u64(A64_EST_FMT_LEN)
+    _ = sys_chamar(A64_SYS_WRITE, A64_FD_STDERR, base as int, tamanho as int, 0, 0, 0)
+}
+
+proc rt_falha_conversao_real(v: f64, alvo: str, arquivo: int, linha: i32) {
+    host.rt_falha_cabeca("R0002", arquivo, linha)
+    host.rt_erro_str("conversao 'as' de ")
+    rt_erro_real(v)
+    host.rt_erro_str(" para ")
+    host.rt_erro_str(alvo)
+    host.rt_erro_str(" fora da faixa")
+    host.rt_falha_fim()
+}
+
+// faixa [minimo, maximo] de inteiro de ate 32 bits; dev: faixa aberta (minimo-1, maximo+1); release: satura e NaN vira 0
+proc rt_real_na_faixa(v: f64, minimo: int, maximo: int, alvo: str, arquivo: int, linha: i32) -> int {
+    let piso: f64 = minimo as f64
+    let teto: f64 = maximo as f64
+    if rt_modo_dev() {
+        if not ((v > (piso - 1.0)) and (v < (teto + 1.0))) {
+            rt_falha_conversao_real(v, alvo, arquivo, linha)
+        }
+        return rt_trunc_i64(v)
+    }
+    if v > teto {
+        return maximo
+    }
+    if v >= piso {
+        return rt_trunc_i64(v)
+    }
+    if v < piso {
+        return minimo
+    }
+    return 0
+}
+
+pub proc as_i8_de_f64(v: f64, arquivo: int, linha: i32) -> i8 {
+    return rt_real_na_faixa(v, -128, 127, "i8", arquivo, linha) as i8
+}
+
+pub proc as_i16_de_f64(v: f64, arquivo: int, linha: i32) -> i16 {
+    return rt_real_na_faixa(v, -32768, 32767, "i16", arquivo, linha) as i16
+}
+
+pub proc as_i32_de_f64(v: f64, arquivo: int, linha: i32) -> i32 {
+    return rt_real_na_faixa(v, -2147483648, 2147483647, "i32", arquivo, linha) as i32
+}
+
+pub proc as_u8_de_f64(v: f64, arquivo: int, linha: i32) -> u8 {
+    return rt_real_na_faixa(v, 0, 255, "u8", arquivo, linha) as u8
+}
+
+pub proc as_u16_de_f64(v: f64, arquivo: int, linha: i32) -> u16 {
+    return rt_real_na_faixa(v, 0, 65535, "u16", arquivo, linha) as u16
+}
+
+pub proc as_u32_de_f64(v: f64, arquivo: int, linha: i32) -> u32 {
+    return rt_real_na_faixa(v, 0, 4294967295, "u32", arquivo, linha) as u32
+}
+
+// i64: faixa [-2^63, 2^63); o trunc_sat do release ja satura e devolve 0 para NaN
+pub proc as_i64_de_f64(v: f64, arquivo: int, linha: i32) -> int {
+    if rt_modo_dev() {
+        if not ((v >= -9223372036854775808.0) and (v < 9223372036854775808.0)) {
+            rt_falha_conversao_real(v, "i64", arquivo, linha)
+        }
+    }
+    return rt_trunc_i64(v)
+}
+
+// u64: faixa (-1, 2^64); a metade alta (>= 2^63) trunca v - 2^63 e soma 2^63 de volta
+pub proc as_u64_de_f64(v: f64, arquivo: int, linha: i32) -> uint {
+    let metade: uint = (1 as uint) << 63
+    if rt_modo_dev() {
+        if not ((v > -1.0) and (v < 18446744073709551616.0)) {
+            rt_falha_conversao_real(v, "u64", arquivo, linha)
+        }
+    }
+    if v >= 18446744073709551616.0 {
+        return ~(0 as uint)
+    }
+    if v >= 9223372036854775808.0 {
+        return (rt_trunc_i64(v - 9223372036854775808.0) as uint) + metade
+    }
+    if v >= 0.0 {
+        return rt_trunc_i64(v) as uint
+    }
+    return 0
+}
+
+// clock_gettime(relogio) em ns (segundos x 1e9 + nanossegundos); 0 se o kernel recusar
+proc rt_relogio_ns(relogio: int) -> int {
+    var ts: [2]int = {}
+    let base: int = transmute(&ts as rawptr, to = int)
+    if sys_chamar(A64_SYS_CLOCK_GETTIME, relogio, base, 0, 0, 0, 0) != 0 {
+        return 0
+    }
+    return ts[0] * 1000000000 + ts[1]
+}
+
+// forja_proc_tempo_ns: relogio monotonico (CLOCK_MONOTONIC)
+pub proc proc_tempo_ns() -> int {
+    return rt_relogio_ns(A64_CLOCK_MONOTONIC)
+}
+
+// forja_proc_hora_ns: hora de parede desde 1970 UTC (CLOCK_REALTIME)
+pub proc proc_hora_ns() -> int {
+    return rt_relogio_ns(A64_CLOCK_REALTIME)
+}
+
+// forja_proc_dormir_ms(ms): nanosleep ate o fim; ms <= 0 nao dorme (como o runtime nativo)
+pub proc proc_dormir_ms(ms: int) {
+    if ms <= 0 {
+        return
+    }
+    var pedido: [2]int = {}
+    pedido[0] = ms / 1000
+    pedido[1] = (ms % 1000) * 1000000
+    let base: int = transmute(&pedido as rawptr, to = int)
+    _ = sys_chamar(A64_SYS_NANOSLEEP, base, 0, 0, 0, 0, 0)
+}
+
+// ---- A3.3g: procs de runtime restantes (X0001 no a64) ----
+
+// causa "valor V fora da faixa LO..=HI do campo 'C'" (R0001), com ..< quando exclusiva; igual ao rt_faixa_falha do x64
+proc rt_faixa_causa_int(valor: int, lo: int, hi: int, exclusiva: bool, campo: int) {
+    host.rt_erro_str("valor ")
+    host.rt_erro_int(valor)
+    host.rt_erro_str(" fora da faixa ")
+    host.rt_erro_int(lo)
+    if exclusiva {
+        host.rt_erro_str("..<")
+    } else {
+        host.rt_erro_str("..=")
+    }
+    host.rt_erro_int(hi)
+    host.rt_erro_str(" do campo '")
+    host.rt_erro_json(campo)
+    host.rt_erro_str("'")
+}
+
+proc rt_faixa_causa_u64(valor: uint, lo: uint, hi: uint, exclusiva: bool, campo: int) {
+    host.rt_erro_str("valor ")
+    host.rt_erro_uint(valor as u64)
+    host.rt_erro_str(" fora da faixa ")
+    host.rt_erro_uint(lo as u64)
+    if exclusiva {
+        host.rt_erro_str("..<")
+    } else {
+        host.rt_erro_str("..=")
+    }
+    host.rt_erro_uint(hi as u64)
+    host.rt_erro_str(" do campo '")
+    host.rt_erro_json(campo)
+    host.rt_erro_str("'")
+}
+
+// forja_faixa(valor, lo, hi, exclusiva, campo, arquivo, linha): R0001 e exit 101 quando fora da faixa, senao devolve valor
+// LIMITE: 7 parametros posicionais, o contrato da chamada da BIR (forja_faixa do x64); sem nome, como nos demais procs de falha
+pub proc faixa(valor: int, lo: int, hi: int, exclusiva: bool, campo: int, arquivo: int, linha: i32) -> int {
+    var fora: bool = valor < lo
+    if exclusiva {
+        fora = fora or (valor >= hi)
+    } else {
+        fora = fora or (valor > hi)
+    }
+    if fora {
+        host.rt_falha_cabeca("R0001", arquivo, linha)
+        rt_faixa_causa_int(valor, lo, hi, exclusiva, campo)
+        host.rt_falha_fim()
+    }
+    return valor
+}
+
+// forja_faixa_u64: a mesma regra sobre uint (valor, lo e hi sem sinal)
+// LIMITE: 7 parametros posicionais, mesmo contrato de faixa
+pub proc faixa_u64(valor: uint, lo: uint, hi: uint, exclusiva: bool, campo: int, arquivo: int, linha: i32) -> uint {
+    var fora: bool = valor < lo
+    if exclusiva {
+        fora = fora or (valor >= hi)
+    } else {
+        fora = fora or (valor > hi)
+    }
+    if fora {
+        host.rt_falha_cabeca("R0001", arquivo, linha)
+        rt_faixa_causa_u64(valor, lo, hi, exclusiva, campo)
+        host.rt_falha_fim()
+    }
+    return valor
+}
+
+// R0005 com "<oque>: ponteiro nulo" (oque e um texto Forja, nao um cstr)
+proc rt_falha_nulo_texto(oque: str, arquivo: int, linha: i32) {
+    host.rt_falha_cabeca("R0005", arquivo, linha)
+    host.rt_erro_str(oque)
+    host.rt_erro_str(": ponteiro nulo")
+    host.rt_falha_fim()
+}
+
+// forja_str_de_cstr(c, arquivo, linha) = 'c as str' (strlen). A ponte de agregado maior que registrador recebe o ENDERECO
+// de 16 B (ptr, len) em x0 (a64_chamar_ponte): o par vai para a memoria de estado e devolve-se o endereco real dele.
+// `cstr as str` aqui chamaria este proc de novo. Dev com NULL = R0005; release = str vazia (como o x64)
+pub proc str_de_cstr(c: uint, arquivo: int, linha: i32) -> uint {
+    var ptr: uint = c
+    var tamanho: uint = 0
+    if c == 0 {
+        if rt_modo_dev() {
+            rt_falha_nulo_texto("conversao 'as' de cstr para str", arquivo, linha)
+        }
+        ptr = 0
+    } else {
+        tamanho = host.rt_texto_tamanho(c)
+    }
+    host.rt_escrever_u64(A64_EST_STR_PTR, ptr)
+    host.rt_escrever_u64(A64_EST_STR_LEN, tamanho)
+    return host.rt_endereco_de(host.rt_ponteiro_de(A64_EST_STR_PTR))
+}
+
+// 1 = o nome do envp (antes do '=') e igual a `nome`; devolve o indice do '=' ou -1
+proc rt_env_igual_em(entrada: uint, nome: uint) -> int {
+    var k: uint = 0
+    while host.rt_ler_u8(nome + k) != 0 {
+        if host.rt_ler_u8(entrada + k) != host.rt_ler_u8(nome + k) {
+            return -1
+        }
+        k += 1
+    }
+    if host.rt_ler_u8(entrada + k) == A64_CHAR_IGUAL {
+        return k as int
+    }
+    return -1
+}
+
+// 1 = o texto `entrada` ("NOME=..." ou "NOME" sem '=') tem o nome `nome`: devolve o tamanho do nome; -1 se nao
+proc rt_amb_mesmo_nome(entrada: uint, nome: uint) -> int {
+    var k: uint = 0
+    while host.rt_ler_u8(nome + k) != 0 {
+        if host.rt_ler_u8(entrada + k) != host.rt_ler_u8(nome + k) {
+            return -1
+        }
+        k += 1
+    }
+    let fim: u8 = host.rt_ler_u8(entrada + k)
+    if (fim == A64_CHAR_IGUAL) or (fim == 0) {
+        return k as int
+    }
+    return -1
+}
+
+// Byte que fecha o nome na ultima entrada do overlay com esse nome ('=' ou NUL = remocao); 0 se o overlay nao tem o nome
+proc rt_amb_entrada(nome: uint) -> uint {
+    let vetor: uint = host.rt_ler_u64(A64_EST_AMB_PTR)
+    var i: uint = host.rt_ler_u64(A64_EST_AMB_QTD)
+    while i > 0 {
+        i -= 1
+        let texto: uint = host.rt_ler_u64(vetor + i * A64_PALAVRA_BYTES)
+        let k: int = rt_amb_mesmo_nome(texto, nome)
+        if k >= 0 {
+            return texto + (k as uint)
+        }
+    }
+    return 0
+}
+
+// Dobra a capacidade do overlay (os textos antigos ficam onde estao). false = sem memoria
+proc rt_amb_crescer() -> bool {
+    let cap: uint = host.rt_ler_u64(A64_EST_AMB_CAP)
+    var nova_cap: uint = cap * 2
+    if cap == 0 {
+        nova_cap = A64_AMB_CAP_INICIAL
+    }
+    let novo: uint = wasm_rt.heap_alocar(nova_cap * A64_PALAVRA_BYTES)
+    if novo == 0 {
+        return false
+    }
+    let vetor: uint = host.rt_ler_u64(A64_EST_AMB_PTR)
+    let qtd: uint = host.rt_ler_u64(A64_EST_AMB_QTD)
+    for i in (0 as uint)..<qtd {
+        host.rt_escrever_u64(novo + i * A64_PALAVRA_BYTES, host.rt_ler_u64(vetor + i * A64_PALAVRA_BYTES))
+    }
+    host.rt_escrever_u64(A64_EST_AMB_PTR, novo)
+    host.rt_escrever_u64(A64_EST_AMB_CAP, nova_cap)
+    return true
+}
+
+// Guarda `texto` no overlay: troca a entrada do mesmo nome, senao acrescenta no fim. false = sem memoria
+proc rt_amb_guardar(texto: uint, nome: uint) -> bool {
+    let vetor: uint = host.rt_ler_u64(A64_EST_AMB_PTR)
+    let qtd: uint = host.rt_ler_u64(A64_EST_AMB_QTD)
+    var i: uint = qtd
+    while i > 0 {
+        i -= 1
+        if rt_amb_mesmo_nome(host.rt_ler_u64(vetor + i * A64_PALAVRA_BYTES), nome) >= 0 {
+            host.rt_escrever_u64(vetor + i * A64_PALAVRA_BYTES, texto)
+            return true
+        }
+    }
+    if qtd == host.rt_ler_u64(A64_EST_AMB_CAP) {
+        if not rt_amb_crescer() {
+            return false
+        }
+    }
+    let atual: uint = host.rt_ler_u64(A64_EST_AMB_PTR)
+    host.rt_escrever_u64(atual + qtd * A64_PALAVRA_BYTES, texto)
+    host.rt_escrever_u64(A64_EST_AMB_QTD, qtd + 1)
+    return true
+}
+
+// Texto "NOME=VALOR" no heap, com NUL; valor 0 (none) gera "NOME" = remocao. 0 = sem memoria
+proc rt_amb_montar(nome: uint, valor: uint) -> uint {
+    let n: uint = host.rt_texto_tamanho(nome)
+    var v: uint = 0
+    var sep: uint = 0
+    if valor != 0 {
+        v = host.rt_texto_tamanho(valor)
+        sep = 1
+    }
+    let texto: uint = wasm_rt.heap_alocar(n + sep + v + 1)
+    if texto == 0 {
+        return 0
+    }
+    for k in (0 as uint)..<n {
+        host.rt_escrever_u8(texto + k, host.rt_ler_u8(nome + k))
+    }
+    var cursor: uint = texto + n
+    if valor != 0 {
+        host.rt_escrever_u8(cursor, A64_CHAR_IGUAL)
+        cursor += 1
+        for k in (0 as uint)..<v {
+            host.rt_escrever_u8(cursor + k, host.rt_ler_u8(valor + k))
+        }
+        cursor += v
+    }
+    host.rt_escrever_u8(cursor, 0)
+    return texto
+}
+
+// forja_proc_definir_ambiente(nome, valor) = set_env (valor) e unset_env (valor 0 = none): grava so no overlay, o envp da pilha fica intacto.
+// Devolve 0 ou 3 (sem memoria, como o x64)
+pub proc proc_definir_ambiente(nome: uint, valor: uint) -> i32 {
+    let texto: uint = rt_amb_montar(nome, valor)
+    if texto == 0 {
+        return A64_AMB_SEM_MEMORIA
+    }
+    if not rt_amb_guardar(texto, nome) {
+        return A64_AMB_SEM_MEMORIA
+    }
+    return 0
+}
+
+// forja_proc_ambiente(nome): aponta para o valor de `nome` no overlay (set_env) ou no envp da pilha (vive ate o fim); 0 = none
+// sem a variavel, removida pelo unset_env, ou sem o sp da entrada (.so, que nao tem envp)
+pub proc proc_ambiente(nome: uint) -> uint {
+    let marca: uint = rt_amb_entrada(nome)
+    if marca != 0 {
+        if host.rt_ler_u8(marca) == A64_CHAR_IGUAL {
+            return marca + 1
+        }
+        return 0
+    }
+    let sp: uint = host.rt_ler_u64(A64_EST_ARGS_SP)
+    if sp == 0 {
+        return 0
+    }
+    let argc: uint = host.rt_ler_u64(sp)
+    var p: uint = sp + A64_PILHA_ENVP + (A64_PALAVRA_BYTES * argc)
+    var entrada: uint = host.rt_ler_u64(p)
+    while entrada != 0 {
+        let igual: int = rt_env_igual_em(entrada, nome)
+        if igual >= 0 {
+            return entrada + (igual as uint) + 1
+        }
+        p += A64_PALAVRA_BYTES
+        entrada = host.rt_ler_u64(p)
+    }
+    return 0
+}
+
+// 1 byte de stdin: o byte devolvido por stdin_ler_linha antes, senao read(0, 1 B); -1 erro, -2 fim
+proc rt_stdin_byte() -> int {
+    let pend: uint = host.rt_ler_u64(A64_EST_STDIN_PEND)
+    if pend != 0 {
+        host.rt_escrever_u64(A64_EST_STDIN_PEND, 0)
+        return (pend - 1) as int
+    }
+    var um: [8]u8 = {}
+    let base: int = transmute(&um as rawptr, to = int)
+    let r: int = sys_chamar(A64_SYS_READ, A64_FD_STDIN, base, 1, 0, 0, 0)
+    if r < 0 {
+        return A64_STDIN_ERRO
+    }
+    if r == 0 {
+        return A64_STDIN_EOF
+    }
+    return um[0] as int
+}
+
+// forja_stdin_ler(destino, n): read(0) direto, sem buffer; 0 = fim, -1 = erro ou n <= 0 (como o x64)
+pub proc stdin_ler(destino: uint, n: int) -> int {
+    if n <= 0 {
+        return A64_STDIN_ERRO
+    }
+    let pend: uint = host.rt_ler_u64(A64_EST_STDIN_PEND)
+    if pend != 0 {
+        host.rt_escrever_u8(destino, (pend - 1) as u8)
+        host.rt_escrever_u64(A64_EST_STDIN_PEND, 0)
+        return 1
+    }
+    let r: int = sys_chamar(A64_SYS_READ, A64_FD_STDIN, destino as int, n, 0, 0, 0)
+    if r < 0 {
+        return A64_STDIN_ERRO
+    }
+    return r
+}
+
+// forja_stdin_ler_linha(destino, n, achou_lf): linha sem LF nem CR antes do LF; linha maior que n vem em partes
+// (achou_lf 0); o byte que nao cabe volta por rt_stdin_byte. -1 erro (tambem n < 2)
+pub proc stdin_ler_linha(destino: uint, n: int, achou_lf: ^i32) -> int {
+    achou_lf^ = 0
+    if n < 2 {
+        return A64_STDIN_ERRO
+    }
+    let cheio: uint = n as uint
+    var k: uint = 0
+    while true {
+        let c: int = rt_stdin_byte()
+        if c == A64_STDIN_ERRO {
+            return A64_STDIN_ERRO
+        }
+        if c == A64_STDIN_EOF {
+            return k as int
+        }
+        if c == (A64_CHAR_LF as int) {
+            if (k > 0) and (host.rt_ler_u8(destino + k - 1) == A64_CHAR_CR) {
+                k -= 1
+            }
+            achou_lf^ = 1
+            return k as int
+        }
+        if k == cheio {
+            host.rt_escrever_u64(A64_EST_STDIN_PEND, (c + 1) as uint)
+            return k as int
+        }
+        host.rt_escrever_u8(destino + k, c as u8)
+        k += 1
+    }
+    return k as int
+}
+
+// Uma leitura de bytes aleatorios: read do fd de /dev/urandom, ou getrandom (fd < 0); repete no EINTR. Devolve o retorno da syscall
+proc rt_aleatorio_ler(fd: int, destino: uint, fatia: int) -> int {
+    while true {
+        var r: int = 0
+        if fd >= 0 {
+            r = sys_chamar(A64_SYS_READ, fd, destino as int, fatia, 0, 0, 0)
+        } else {
+            r = sys_chamar(A64_SYS_GETRANDOM, destino as int, fatia, 0, 0, 0, 0)
+        }
+        if r != A64_RET_EINTR {
+            return r
+        }
+    }
+    return 0
+}
+
+// Fallback do getrandom: /dev/urandom por openat(AT_FDCWD, ..., O_RDONLY | O_CLOEXEC). fd >= 0 ou -1
+proc rt_abrir_urandom() -> int {
+    let caminho: cstr = "/dev/urandom"
+    let fd: int = sys_chamar(A64_SYS_OPENAT, A64_AT_FDCWD, transmute(caminho as rawptr, to = int), A64_O_LER_CLOEXEC, 0, 0, 0)
+    if fd < 0 {
+        return -1
+    }
+    return fd
+}
+
+// forja_proc_bytes_aleatorios(destino, n): enche n bytes com getrandom em fatias (ENOSYS/EPERM trocam para /dev/urandom). 0 = ok, 3 = outro erro (como o x64)
+pub proc proc_bytes_aleatorios(destino: ^u8, n: i64) -> i32 {
+    let base: uint = transmute(destino as rawptr, to = uint)
+    var fd: int = -1
+    var restante: int = n as int
+    var atual: uint = base
+    while restante > 0 {
+        var fatia: int = restante
+        if fatia > A64_FATIA_ALEATORIA {
+            fatia = A64_FATIA_ALEATORIA
+        }
+        let r: int = rt_aleatorio_ler(fd, atual, fatia)
+        if (fd < 0) and ((r == (0 - A64_ENOSYS)) or (r == (0 - A64_EPERM))) {
+            fd = rt_abrir_urandom()
+            if fd < 0 {
+                return A64_ERRO_OUTRO_OS as i32
+            }
+            continue
+        }
+        if r <= 0 {
+            break
+        }
+        atual += r as uint
+        restante -= r
+    }
+    if fd >= 0 {
+        _ = sys_chamar(A64_SYS_CLOSE, fd, 0, 0, 0, 0, 0)
+    }
+    if restante > 0 {
+        return A64_ERRO_OUTRO_OS as i32
+    }
+    return 0
+}
+
+// forja_os_last_error(): errno positivo da ultima falha de std:file (0 = nenhuma); o x64 devolve rt_os_ultimo_erro
+pub proc os_last_error() -> i64 {
+    return host.rt_ler_u64(A64_EST_ULTIMO_ERRO) as i64
+}
+
+// forja_os_pid(): getpid
+pub proc os_pid() -> int {
+    return sys_chamar(A64_SYS_GETPID, 0, 0, 0, 0, 0, 0)
+}
+
+// forja_proc_escrever_erro(dados, n): write(2) em laco ate n bytes; erro do kernel para sem relatar (como sys_escrever do x64)
+pub proc proc_escrever_erro(dados: uint, n: int) {
+    var feito: int = 0
+    while feito < n {
+        let r: int = sys_chamar(A64_SYS_WRITE, A64_FD_STDERR, (dados as int) + feito, n - feito, 0, 0, 0)
+        if r <= 0 {
+            return
+        }
+        feito += r
+    }
+}
+
+// forja_proc_pico_memoria(): ru_maxrss de getrusage (KiB no kernel) em bytes; < 0 = -3 (outro erro, como o x64)
+pub proc proc_pico_memoria() -> int {
+    var uso: [18]int = {}
+    let base: int = transmute(&uso as rawptr, to = int)
+    let r: int = sys_chamar(A64_SYS_GETRUSAGE, A64_RUSAGE_SELF, base, 0, 0, 0, 0)
+    if r < 0 {
+        return -A64_ERRO_OUTRO_OS
+    }
+    return uso[A64_RUSAGE_MAXRSS] * A64_BYTES_POR_KIB
+}
+
+// forja_main_erro(arquivo, erro): R0004 em stderr e sai 1 direto. Sem passar por fim: o x64 nao relata vazamento aqui (rt_sem_relatorio)
+pub proc main_erro(arquivo: int, erro: i32) {
+    host.rt_falha_cabeca("R0004", arquivo, 0)
+    host.rt_erro_str("main devolveu o erro de indice ")
+    host.rt_erro_int(erro as int)
+    host.rt_erro_str("\"}\n")
+    host.rt_sair(A64_SAIDA_ERRO_MAIN)
+}

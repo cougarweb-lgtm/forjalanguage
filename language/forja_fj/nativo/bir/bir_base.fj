@@ -1,0 +1,389 @@
+// nativo/bir/bir_base.fj - porte de compiler/nativo/bir/bir_base.c
+// sha256 de nativo/bir/bir_base.c: 980f222fd43eb1c4e1ee2f67defc5e7e3561b7d2a8badc7e55d17f102d795386
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "common"
+import "ir"
+
+const HASH_INICIAL: u32 = 64
+const BLOCO_INSTRS_INICIAL: u32 = 8
+const BLOCOS_INICIAL: u32 = 8
+const VREGS_INICIAL: u32 = 16
+const SIMBOLOS_INICIAL: u32 = 32
+const LACOS_INICIAL: u32 = 8
+const IMPORT_PREFIXO: str = "__imp_"
+const IMPORT_TAM_PREFIXO: u32 = 6
+
+// C: nativo/bir/bir_base.c:23
+// C2F-VOID: antigo, retorno
+proc realocar(antigo: rawptr, bytes: u64) -> rawptr {
+    common.falha_interna("bir: realocar nao existe na Forja; listas crescem por append e fatias novas na arena")
+    let nada: ?^u8 = none
+    return nada as rawptr
+}
+
+// C: nativo/bir/bir_base.c:32
+proc bir_novo_bloco(c: ^BirCtx, frio: bool) -> u32 {
+    let f: ^BirFuncao = c.f as ^BirFuncao
+    let indice: u32 = f.nblocos
+    append(&f.blocos, item = BirBloco{frio = frio})
+    let bloco: ^BirBloco = &f.blocos[indice]
+    bloco.instrs = make([dynamic]BirInstr, alloc = heap, cap = BLOCO_INSTRS_INICIAL as int)
+    f.nblocos += 1
+    f.cap_blocos = (cap(f.blocos) as u64) as u32
+    return indice
+}
+
+// C: nativo/bir/bir_base.c:44
+proc bir_novo_vreg(c: ^BirCtx, classe: u8) -> u32 {
+    let f: ^BirFuncao = c.f as ^BirFuncao
+    let indice: u32 = f.nvregs
+    if indice == c.cap_vregs {
+        var novo_cap: u32 = VREGS_INICIAL
+        if c.cap_vregs != 0 {
+            novo_cap = c.cap_vregs * 2
+        }
+        c.cap_vregs = novo_cap
+        let nova: []u8 = common.arena_fatia_u8(&(c.p as ^BirPrograma).arena, novo_cap as int)
+        let velha: []u8 = f.classe_vreg or_else {}
+        for k in (0 as u32)..<indice {
+            nova[k] = velha[k]
+        }
+        f.classe_vreg = nova
+    }
+    let vregs: []u8 = f.classe_vreg or_else {}
+    vregs[indice] = classe
+    f.nvregs += 1
+    return indice
+}
+
+// C: nativo/bir/bir_base.c:56
+proc bir_novo_slot(c: ^BirCtx, tam: u32, alinhamento: u32) -> u32 {
+    let f: ^BirFuncao = c.f as ^BirFuncao
+    let indice: u32 = f.nslots
+    append(&f.slots, item = BirSlot{tam = tam, alinhamento = alinhamento})
+    f.nslots += 1
+    f.cap_slots = (cap(f.slots) as u64) as u32
+    return indice
+}
+
+// C: nativo/bir/bir_base.c:69
+proc bir_emitir(c: ^BirCtx, op: i32, classe: u8) -> ^BirInstr {
+    if c.cur == BIR_SEM_BLOCO {
+        c.cur = bir_novo_bloco(c, false)
+    }
+    let f: ^BirFuncao = c.f as ^BirFuncao
+    let b: ^BirBloco = &f.blocos[c.cur]
+    let posicao: u32 = b.n
+    append(&b.instrs, item = BirInstr{})
+    b.n += 1
+    b.cap = (cap(b.instrs) as u64) as u32
+    var pos_atual: u32 = BIR_SEM_POS
+    if c.atual != none {
+        pos_atual = (c.atual as ^ir.IrInstr).pos
+    }
+    let i: ^BirInstr = &b.instrs[posicao]
+    i.op = op as u8
+    i.classe = classe
+    i.dst = BIR_SEM_VREG
+    i.simbolo = BIR_SEM_SIMBOLO
+    i.alvo[0] = BIR_SEM_BLOCO
+    i.alvo[1] = BIR_SEM_BLOCO
+    i.pos = pos_atual
+    i.ir = c.atual
+    return i
+}
+
+// C: nativo/bir/bir_base.c:87
+proc bir_emitir_pedido(c: ^BirCtx, pedido: BirPedido) -> ^BirInstr {
+    let i: ^BirInstr = bir_emitir(c, pedido.op as i32, ((c.f as ^BirFuncao).classe_vreg or_else {})[pedido.dst])
+    i.aux = pedido.aux
+    i.dst = pedido.dst
+    i.a = pedido.a
+    i.b = pedido.b
+    return i
+}
+
+// C: nativo/bir/bir_base.c:98
+proc bir_conta_nova(c: ^BirCtx, classe: u8, pedido: BirPedido) -> u32 {
+    var pedido_v: BirPedido = pedido
+    pedido_v.dst = bir_novo_vreg(c, classe)
+    _ = bir_emitir_pedido(c, pedido_v)
+    return pedido_v.dst
+}
+
+// C: nativo/bir/bir_base.c:105
+proc bir_mover(c: ^BirCtx, dst: u32, origem: BirOperando) {
+    var tern_1: i32 = BIR_COPIA
+    if origem.tipo == (BO_IMED as u8) {
+        tern_1 = BIR_CONST
+    }
+    _ = bir_emitir_pedido(c, BirPedido{op = tern_1 as u8, dst = dst, a = origem})
+}
+
+// C: nativo/bir/bir_base.c:110
+proc bir_salta(c: ^BirCtx, alvo: u32) {
+    let i: ^BirInstr = bir_emitir(c, BIR_SALTA, BC_NADA as u8)
+    i.alvo[0] = alvo
+    c.cur = BIR_SEM_BLOCO
+}
+
+// C: nativo/bir/bir_base.c:118
+proc bir_desvia(c: ^BirCtx, cond: BirOperando, verdade: u32, falso: u32) {
+    let i: ^BirInstr = bir_emitir(c, BIR_DESVIA, BC_NADA as u8)
+    i.a = cond
+    i.alvo[0] = verdade
+    i.alvo[1] = falso
+    c.cur = BIR_SEM_BLOCO
+}
+
+// C: nativo/bir/bir_base.c:128
+proc bir_retorna(c: ^BirCtx, valor: ?^BirOperando) {
+    var tern_1: i32 = BC_NADA
+    if valor != none {
+        tern_1 = (valor as ^BirOperando).classe as i32
+    }
+    let i: ^BirInstr = bir_emitir(c, BIR_RETORNA, tern_1 as u8)
+    if valor != none {
+        i.a = (valor as ^BirOperando)^
+    }
+    c.cur = BIR_SEM_BLOCO
+}
+
+// C: nativo/bir/bir_base.c:137
+// Fatia de n operandos na arena (n = 0: vazia, como o NULL do C, sem escrita). Devolver ^ ao 1o elemento perderia os demais para o chamador.
+proc bir_args(c: ^BirCtx, n: u32) -> []BirOperando {
+    return arena_fatia_bir_operando(&(c.p as ^BirPrograma).arena, n as int)
+}
+
+test "bir_args" {
+    var prog: BirPrograma = BirPrograma{}
+    defer common.arena_liberar(&prog.arena)
+    var c: BirCtx = BirCtx{p = &prog}
+    expect(len(bir_args(&c, 0)) == 0)
+    let fatia: []BirOperando = bir_args(&c, 3)
+    expect(len(fatia) == 3)
+    fatia[2] = op_imed(7, BC_I32 as u8)
+    expect(fatia[2].imed == 7)
+}
+
+// C: nativo/bir/bir_base.c:142
+// C2F-13: args fundido em nargs (len)
+proc bir_armadilha(c: ^BirCtx, simbolo: u32, args: []BirOperando) {
+    let n: u32 = (len(args) as u64) as u32
+    var copia: ?[]BirOperando = none
+    if n > 0 {
+        let fatia: []BirOperando = arena_fatia_bir_operando(&(c.p as ^BirPrograma).arena, n as int)
+        for k in (0 as u32)..<n {
+            fatia[k] = args[k]
+        }
+        copia = fatia
+    }
+    let i: ^BirInstr = bir_emitir(c, BIR_ARMADILHA, BC_NADA as u8)
+    i.simbolo = simbolo
+    i.args = copia
+    i.nargs = n
+    c.cur = BIR_SEM_BLOCO
+}
+
+// C: nativo/bir/bir_base.c:156
+proc bir_rotulo_alvo(c: ^BirCtx, r: ^BirRotulo) -> u32 {
+    if r.bloco == BIR_SEM_BLOCO {
+        r.bloco = bir_novo_bloco(c, false)
+    }
+    return r.bloco
+}
+
+// C: nativo/bir/bir_base.c:163
+proc bir_rotulo_salta(c: ^BirCtx, r: ^BirRotulo) {
+    if c.cur != BIR_SEM_BLOCO {
+        bir_salta(c, bir_rotulo_alvo(c, r))
+    }
+}
+
+// C: nativo/bir/bir_base.c:169
+proc bir_rotulo_coloca(c: ^BirCtx, r: ^BirRotulo) {
+    c.cur = r.bloco
+}
+
+// C: nativo/bir/bir_base.c:174
+proc bir_entrar_laco(c: ^BirCtx, continua: ^BirRotulo, pare: ^BirRotulo) {
+    let laco: BirLaco = BirLaco{continua = continua, pare = pare}
+    if (c.nlacos as u64) < (len(c.lacos) as u64) {
+        c.lacos[c.nlacos] = laco
+    } else {
+        append(&c.lacos, item = laco)
+    }
+    c.nlacos += 1
+    c.cap_lacos = (cap(c.lacos) as u64) as u32
+}
+
+// C: nativo/bir/bir_base.c:183
+proc bir_sair_laco(c: ^BirCtx) {
+    c.nlacos -= 1
+}
+
+// C: nativo/bir/bir_base.c:190
+proc hash_simbolo(tipo: u8, bytes: ?str, tam: u32) -> u32 {
+    var h: u32 = 2166136261 ~ (tipo as u32)
+    for k in (0 as u32)..<tam {
+        h = wrapping_mul(h ~ ((bytes or_else "")[k] as u32), 16777619)
+    }
+    return h
+}
+
+// C: nativo/bir/bir_base.c:199
+proc chave_do_simbolo(s: ^BirSimbolo) -> ?str {
+    var tern_1: ?str = s.nome
+    if (s.tipo == (BS_TEXTO as u8)) or (s.tipo == (BS_DADO as u8)) {
+        tern_1 = s.bytes
+    }
+    return tern_1
+}
+
+// C: nativo/bir/bir_base.c:204
+proc simbolo_igual(s: ^BirSimbolo, tipo: u8, bytes: ?str, tam: u32) -> bool {
+    if (s.tipo != tipo) or (s.tam != tam) {
+        return false
+    }
+    let chave: str = chave_do_simbolo(s) or_else ""
+    let entrada: str = bytes or_else ""
+    for k in (0 as u32)..<tam {
+        if chave[k] != entrada[k] {
+            return false
+        }
+    }
+    return true
+}
+
+// C: nativo/bir/bir_base.c:209
+proc inserir_no_hash(c: ^BirCtx, indice: u32) {
+    let s: ^BirSimbolo = &(c.p as ^BirPrograma).simbolos[indice]
+    let arg_1: u32 = s.tam
+    let arg_2: ?str = chave_do_simbolo(s)
+    let arg_3: u8 = s.tipo
+    var pos: u32 = hash_simbolo(arg_3, arg_2, arg_1) & (c.cap_hash - 1)
+    while c.hash[pos] != 0 {
+        pos = (pos + 1) & (c.cap_hash - 1)
+    }
+    c.hash[pos] = indice + 1
+}
+
+// C: nativo/bir/bir_base.c:219
+proc crescer_hash(c: ^BirCtx) {
+    delete(c.hash)
+    if c.cap_hash == 0 {
+        c.cap_hash = HASH_INICIAL
+    } else {
+        c.cap_hash = c.cap_hash * 2
+    }
+    c.hash = make([dynamic]u32, alloc = heap, cap = c.cap_hash as int)
+    for k in (0 as u32)..<c.cap_hash {
+        append(&c.hash, item = 0)
+    }
+    let p: ^BirPrograma = c.p as ^BirPrograma
+    for k in (0 as u32)..<p.nsimbolos {
+        inserir_no_hash(c, k)
+    }
+}
+
+// C: nativo/bir/bir_base.c:230
+proc achar_simbolo(c: ^BirCtx, tipo: u8, bytes: ?str, tam: u32) -> u32 {
+    var pos: u32 = 0
+    if c.cap_hash == 0 {
+        return BIR_SEM_SIMBOLO
+    }
+    pos = hash_simbolo(tipo, bytes, tam) & (c.cap_hash - 1)
+    while c.hash[pos] != 0 {
+        if simbolo_igual(&(c.p as ^BirPrograma).simbolos[c.hash[pos] - 1], tipo, bytes, tam) {
+            return c.hash[pos] - 1
+        }
+        pos = (pos + 1) & (c.cap_hash - 1)
+    }
+    return BIR_SEM_SIMBOLO
+}
+
+// C: nativo/bir/bir_base.c:244
+proc novo_simbolo(c: ^BirCtx, novo: BirSimbolo) -> u32 {
+    let p: ^BirPrograma = c.p as ^BirPrograma
+    let indice: u32 = p.nsimbolos
+    append(&p.simbolos, item = novo)
+    p.cap_simbolos = (cap(p.simbolos) as u64) as u32
+    if ((c.n_hash as u64) + 1) * 2 > (c.cap_hash as u64) {
+        crescer_hash(c)
+    }
+    inserir_no_hash(c, indice)
+    c.n_hash += 1
+    p.nsimbolos += 1
+    return indice
+}
+
+// C: nativo/bir/bir_base.c:261
+proc bir_simbolo_funcao(c: ^BirCtx, nome_sem_prefixo: str) -> u32 {
+    let nome: str = format(f"fj_{nome_sem_prefixo}", alloc = common.arena_mem(&(c.p as ^BirPrograma).arena))
+    return novo_simbolo(c, BirSimbolo{nome = nome, tipo = BS_FUNCAO as u8, tam = (len(nome) as u64) as u32})
+}
+
+// C: nativo/bir/bir_base.c:272
+proc bir_simbolo_global(c: ^BirCtx, nome: str) -> u32 {
+    return novo_simbolo(c, BirSimbolo{nome = nome, tipo = BS_FUNCAO as u8, tam = (len(nome) as u64) as u32})
+}
+
+// C: nativo/bir/bir_base.c:278
+proc bir_simbolo_runtime(c: ^BirCtx, nome: ?str) -> u32 {
+    let tam: u32 = (len((nome or_else "")) as u64) as u32
+    let achado: u32 = achar_simbolo(c, BS_RUNTIME as u8, nome, tam)
+    if achado != BIR_SEM_SIMBOLO {
+        return achado
+    }
+    return novo_simbolo(c, BirSimbolo{nome = nome, tipo = BS_RUNTIME as u8, tam = tam})
+}
+
+// C: nativo/bir/bir_base.c:289
+proc bir_simbolo_import(c: ^BirCtx, simbolo: str, pos: u32) -> u32 {
+    let nome: str = format(f"{IMPORT_PREFIXO}{simbolo}", alloc = common.arena_mem(&(c.p as ^BirPrograma).arena))
+    let tam: u32 = (len(nome) as u64) as u32
+    let achado: u32 = achar_simbolo(c, BS_IMPORT as u8, nome, tam)
+    if achado != BIR_SEM_SIMBOLO {
+        return achado
+    }
+    return novo_simbolo(c, BirSimbolo{nome = nome, tipo = BS_IMPORT as u8, tam = tam, pos = pos})
+}
+
+// C: nativo/bir/bir_base.c:304
+proc bir_simbolo_texto(c: ^BirCtx, bytes: ?str, tam: u32) -> u32 {
+    let achado: u32 = achar_simbolo(c, BS_TEXTO as u8, bytes, tam)
+    if achado != BIR_SEM_SIMBOLO {
+        return achado
+    }
+    let copia: str = from_bytes(as_bytes(bytes or_else "")[0..<tam], alloc = common.arena_mem(&(c.p as ^BirPrograma).arena))
+    let ordem: u32 = c.n_texto
+    c.n_texto += 1
+    return novo_simbolo(c, BirSimbolo{bytes = copia, tipo = BS_TEXTO as u8, tam = tam, ordem = ordem})
+}
+
+// C: nativo/bir/bir_base.c:315
+proc bir_simbolo_dado(c: ^BirCtx, bytes: str, tam: u32, alinhamento: u32) -> u32 {
+    let p: ^BirPrograma = c.p as ^BirPrograma
+    let achado: u32 = achar_simbolo(c, BS_DADO as u8, bytes, tam)
+    if achado == BIR_SEM_SIMBOLO {
+        let copia: str = from_bytes(as_bytes(bytes)[0..<tam], alloc = common.arena_mem(&p.arena))
+        let ordem: u32 = c.n_dado
+        c.n_dado += 1
+        return novo_simbolo(c, BirSimbolo{bytes = copia, tipo = BS_DADO as u8, tam = tam, ordem = ordem, alinhamento = alinhamento})
+    }
+    if alinhamento > p.simbolos[achado].alinhamento {
+        p.simbolos[achado].alinhamento = alinhamento
+    }
+    return achado
+}
+
+// Valores conferidos com a HashSimbolo do C (bir_base.c:190), gcc -O0
+test "hash_simbolo" {
+    expect(hash_simbolo(0, "abc", 3) == 440920331)
+    expect(hash_simbolo(3, "abc", 3) == 1472174866)
+    expect(hash_simbolo(1, "fj_main", 7) == 2386594788)
+    expect(hash_simbolo(2, "", 0) == 2166136263)
+    expect(hash_simbolo(5, "__imp_ExitProcess", 17) == 2276645138)
+}

@@ -1,0 +1,177 @@
+// nativo/x64/x64_alocar.fj - porte de compiler/nativo/x64/x64_alocar.c
+// sha256 de nativo/x64/x64_alocar.c: e10337e852b9d145d429fb0981aa5401fc902d20e8d456900c2a8df2c0650220
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "common"
+import "nativo/bir"
+
+// C: nativo/x64/x64_alocar.c:22
+proc aloc_bits(classe: u8) -> u8 {
+    let sw_1 = classe as i32
+    if sw_1 == bir.BC_I8 {
+        return 8
+    } else if sw_1 == bir.BC_I16 {
+        return 16
+    } else if sw_1 == bir.BC_I32 {
+        return 32
+    } else if sw_1 == bir.BC_I64 {
+        return 64
+    } else if sw_1 == bir.BC_F32 {
+        return 32
+    } else if sw_1 == bir.BC_F64 {
+        return 64
+    } else if sw_1 == bir.BC_V128 {
+        return 128
+    } else {
+        return 0
+    }
+    return 0
+}
+
+// C: nativo/x64/x64_alocar.c:37
+proc aloc_bytes_empurrados(f: ?^bir.BirFuncao) -> u32 {
+    var n: u32 = 0
+    var mascara: u32 = (f as ^bir.BirFuncao).regs_salvos
+    while mascara != 0 {
+        n += mascara & 1
+        mascara = mascara >> 1
+    }
+    return X64_SLOT_BYTES * n
+}
+
+// C: nativo/x64/x64_alocar.c:47
+proc aloc_bytes_slots_escalares(f: ?^bir.BirFuncao) -> u32 {
+    return (X64_SLOT_BYTES * (((f as ^bir.BirFuncao).nvregs - (f as ^bir.BirFuncao).nparams) + abi_win_ordem_em_bytes(f, (f as ^bir.BirFuncao).nparams))) + aloc_bytes_empurrados(f)
+}
+
+// C: nativo/x64/x64_alocar.c:53
+proc aloc_vetores_ate(f: ?^bir.BirFuncao, ate: u32) -> u32 {
+    var n: u32 = 0
+    for k in (0 as u32)..<ate {
+        n += common.c2f_b2u32(((f as ^bir.BirFuncao).classe_vreg or_else {})[k] == (bir.BC_V128 as u8))
+    }
+    return n
+}
+
+// C: nativo/x64/x64_alocar.c:62
+proc aloc_deslocamento(f: ?^bir.BirFuncao, vreg: u32) -> i32 {
+    let empurrados: i32 = transmute(aloc_bytes_empurrados(f), to = i32)
+    if (vreg < (f as ^bir.BirFuncao).nvregs) and (((f as ^bir.BirFuncao).classe_vreg or_else {})[vreg] == (bir.BC_V128 as u8)) {
+        return -transmute(aloc_bytes_slots_escalares(f) + (X64_VETOR_BYTES * (aloc_vetores_ate(f, vreg) + 1)), to = i32)
+    }
+    if (vreg < (f as ^bir.BirFuncao).nparams) and (common.c2f_b2i32(abi_win_param_em_bytes(f, vreg)) != 0) {
+        return (-transmute(X64_SLOT_BYTES * ((((f as ^bir.BirFuncao).nvregs - (f as ^bir.BirFuncao).nparams) + abi_win_ordem_em_bytes(f, vreg)) + 1), to = i32)) - empurrados
+    }
+    if vreg < (f as ^bir.BirFuncao).nparams {
+        return abi_win_param_rbp(vreg + abi_win_oculto(f))
+    }
+    return (-transmute(X64_SLOT_BYTES * ((vreg - (f as ^bir.BirFuncao).nparams) + 1), to = i32)) - empurrados
+}
+
+// C: nativo/x64/x64_alocar.c:75
+proc aloc_operando_de(f: ?^bir.BirFuncao, vreg: u32, largura: u8) -> AlocOperando {
+    var o: AlocOperando = AlocOperando{em_reg = false, reg = X64_RAX, desloc = aloc_deslocamento(f, vreg), largura = largura}
+    if ((f as ^bir.BirFuncao).reg_vreg != none) and (((f as ^bir.BirFuncao).reg_vreg or_else {})[vreg] != (bir.BIR_SEM_REG as u8)) {
+        o.em_reg = true
+        o.reg = ((f as ^bir.BirFuncao).reg_vreg or_else {})[vreg] as i32
+    }
+    return o
+}
+
+// C: nativo/x64/x64_alocar.c:87
+proc aloc_memoria(o: ^AlocOperando) -> MOperando {
+    return m_mem(X64_RBP, o.desloc, o.largura)
+}
+
+// C: nativo/x64/x64_alocar.c:93
+proc aloc_home_do_parametro(f: ?^bir.BirFuncao, k: u32, largura: u8) -> MOperando {
+    return m_mem(X64_RBP, abi_win_param_rbp(k + abi_win_oculto(f)), largura)
+}
+
+// C: nativo/x64/x64_alocar.c:100
+proc aloc_carregar_de_registrador(c: ^X64Ctx, forma: u16, destino: MOperando, o: ^AlocOperando) -> bool {
+    let fonte: MOperando = m_reg(o.reg, 64)
+    let destino32: MOperando = m_reg(destino.base, 32)
+    let sw_1 = forma as i32
+    if sw_1 == FX_MOVSS_XM or sw_1 == FX_MOVSD_XM {
+        return x64_emitir(c, mi2(FX_MOVAPS_XX as u16, destino, m_xmm(o.reg as u8)))
+    } else if sw_1 == FX_MOVUPS_XM {
+        return x64_emitir(c, mi2(FX_MOVAPS_XX as u16, destino, m_xmm(o.reg as u8)))
+    } else if sw_1 == FX_MOV64_RM {
+        return x64_emitir(c, mi2(FX_MOV64_RR as u16, destino, fonte))
+    } else if sw_1 == FX_MOV32_RM or sw_1 == FX_MOVZX32_RM8 or sw_1 == FX_MOVZX32_RM16 {
+        return x64_emitir(c, mi2(FX_MOV32_RR as u16, destino, m_reg(o.reg, 32)))
+    } else if sw_1 == FX_MOVSX64_RM8 {
+        return (common.c2f_b2i32(x64_emitir(c, mi2(FX_MOVSX32_RR8 as u16, destino32, m_reg(o.reg, 8)))) != 0) and (common.c2f_b2i32(x64_emitir(c, mi2(FX_MOVSXD64_RR32 as u16, destino, destino32))) != 0)
+    } else if sw_1 == FX_MOVSX64_RM16 {
+        return (common.c2f_b2i32(x64_emitir(c, mi2(FX_MOVSX32_RR16 as u16, destino32, m_reg(o.reg, 16)))) != 0) and (common.c2f_b2i32(x64_emitir(c, mi2(FX_MOVSXD64_RR32 as u16, destino, destino32))) != 0)
+    } else {
+        return x64_sem_regra(c, "vreg", "forma de leitura sem versao em registrador")
+    }
+    return false
+}
+
+// C: nativo/x64/x64_alocar.c:127
+proc aloc_gravar_em_registrador(c: ^X64Ctx, forma: u16, o: ^AlocOperando, origem: MOperando) -> bool {
+    let sw_1 = forma as i32
+    if sw_1 == FX_MOVSS_MX or sw_1 == FX_MOVSD_MX {
+        return x64_emitir(c, mi2(FX_MOVAPS_XX as u16, m_xmm(o.reg as u8), origem))
+    } else if sw_1 == FX_MOVUPS_MX {
+        return x64_emitir(c, mi2(FX_MOVAPS_XX as u16, m_xmm(o.reg as u8), origem))
+    } else if sw_1 == FX_MOV64_MR {
+        return x64_emitir(c, mi2(FX_MOV64_RR as u16, m_reg(o.reg, 64), origem))
+    } else if sw_1 == FX_MOV32_MR {
+        return x64_emitir(c, mi2(FX_MOV32_RR as u16, m_reg(o.reg, 32), origem))
+    } else if sw_1 == FX_MOV16_MR {
+        return x64_emitir(c, mi2(FX_MOVZX32_RR16 as u16, m_reg(o.reg, 32), origem))
+    } else if sw_1 == FX_MOV8_MR {
+        return x64_emitir(c, mi2(FX_MOVZX32_RR8 as u16, m_reg(o.reg, 32), origem))
+    } else {
+        return x64_sem_regra(c, "vreg", "forma de escrita sem versao em registrador")
+    }
+    return false
+}
+
+// C: nativo/x64/x64_alocar.c:148
+proc aloc_carregar(c: ^X64Ctx, forma: u16, destino: MOperando, o: ^AlocOperando) -> bool {
+    if o.em_reg {
+        return aloc_carregar_de_registrador(c, forma, destino, o)
+    }
+    return x64_emitir(c, mi2(forma, destino, aloc_memoria(o)))
+}
+
+// C: nativo/x64/x64_alocar.c:155
+proc aloc_gravar(c: ^X64Ctx, forma: u16, o: ^AlocOperando, origem: MOperando) -> bool {
+    if o.em_reg {
+        return aloc_gravar_em_registrador(c, forma, o, origem)
+    }
+    return x64_emitir(c, mi2(forma, aloc_memoria(o), origem))
+}
+
+// C: nativo/x64/x64_alocar.c:163
+proc aloc_regs_salvos(f: ^bir.BirFuncao) -> u32 {
+    return f.regs_salvos
+}
+
+// C: nativo/x64/x64_alocar.c:169
+proc aloc_regs_salvos_xmm(f: ^bir.BirFuncao) -> u32 {
+    return f.regs_salvos_xmm
+}
+
+// C: nativo/x64/x64_alocar.c:174
+proc aloc_bytes_slots(f: ^bir.BirFuncao) -> u32 {
+    return aloc_bytes_slots_escalares(f) + (X64_VETOR_BYTES * aloc_vetores_ate(f, f.nvregs))
+}
+
+// C: nativo/x64/x64_alocar.c:179
+proc aloc_classes_suportadas(c: ^X64Ctx) -> bool {
+    var k: u32 = 0
+    while k < (c.f as ^bir.BirFuncao).nvregs {
+        if aloc_bits(((c.f as ^bir.BirFuncao).classe_vreg or_else {})[k]) == 0 {
+            return x64_sem_regra(c, "vreg", "classe de vreg fora do M2 (so i8, i16, i32, i64, f32, f64 e v128)")
+        }
+        k += 1
+    }
+    return true
+}

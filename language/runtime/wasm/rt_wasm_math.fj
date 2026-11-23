@@ -1,0 +1,326 @@
+// runtime/wasm/rt_wasm_math.fj - std:math do alvo wasm32-wasip1, grupo 1 (arredondamento, copysign, fmod, hypot, cbrt), porte para Forja pura da libm do musl 1.2.6
+// Versao: 0.3.0 (0.40.0: math_floor/ceil/trunc/round (f64 e f32) saem deste modulo e viram opcode ou sequencia inline em wasm_intr.fj; 0.2.1: math_floor = opcode f64.floor; 0.2.0: grupo math completo em f64 e f32: copysign, trunc, floor, ceil, round, fmod, hypot, cbrt; sufixo f = f32)
+// Funcoes publicas: math_copysign, math_fmod, math_hypot, math_cbrt (+ math_<n>f). floor/ceil/trunc/round nao estao aqui: a CHAMA sai inline (wasm_intr.fj).
+// Privadas: hypot_sq (split de Dekker usado por math_hypot).
+// Contrato: o simbolo forja_math_X do std:math e atendido pelo proc pub math_X deste modulo (f32: math_Xf); o driver injeta o modulo so no alvo wasm.
+// Fonte C (mesma fonte do x64 = bits iguais): third/musl_math/*.c, compilada no x64 por runtime/forja_rt_math.h com -ffp-contract=off.
+// Verificacao: python language/tests/nativo/wasm/verificar_wasm.py --filtro math_ (a fixture imprime os bits e o x64 e o oraculo).
+// Regra do modulo: sem alocacao, sem estado; hex-float do C vira u64 + transmute; unsigned do C que volta a dar a volta usa wrapping_*.
+
+// Sinal de y com o modulo de x (musl copysign.c)
+pub proc math_copysign(x: f64, y: f64) -> f64 {
+    let ux: u64 = transmute(x, to = u64)
+    let uy: u64 = transmute(y, to = u64)
+    let bits: u64 = (ux & 0x7fffffffffffffff) | (uy & 0x8000000000000000)
+    return transmute(bits, to = f64)
+}
+
+// Sinal de y com o modulo de x, f32 (musl copysignf.c)
+pub proc math_copysignf(x: f32, y: f32) -> f32 {
+    let ux: u32 = transmute(x, to = u32)
+    let uy: u32 = transmute(y, to = u32)
+    let bits: u32 = (ux & 0x7fffffff) | (uy & 0x80000000)
+    return transmute(bits, to = f32)
+}
+
+// Resto de x / y com o sinal de x, por bits: normaliza as mantissas e subtrai ate sobrar o resto (musl fmod.c)
+// LIMITE: ~85 linhas; a normalizacao e o laco de subtracao ficam no mesmo proc para nao espalhar o estado (ex, uxi, uy)
+pub proc math_fmod(x: f64, y: f64) -> f64 {
+    let ux: u64 = transmute(x, to = u64)
+    let uy0: u64 = transmute(y, to = u64)
+    var ex: int = ((ux >> 52) & 0x7ff) as int
+    var ey: int = ((uy0 >> 52) & 0x7ff) as int
+    let sx: u64 = ux >> 63
+    var uxi: u64 = ux
+    var uy: u64 = uy0
+    var i: u64 = 0
+    if (uy0 << 1) == 0 or y != y or ex == 0x7ff {
+        return (x * y) / (x * y)
+    }
+    if (uxi << 1) <= (uy0 << 1) {
+        if (uxi << 1) == (uy0 << 1) {
+            return 0.0 * x
+        }
+        return x
+    }
+    if ex == 0 {
+        i = uxi << 12
+        while (i >> 63) == 0 {
+            ex -= 1
+            i = i << 1
+        }
+        uxi = uxi << ((1 - ex) as u64)
+    } else {
+        uxi = uxi & 0x000fffffffffffff
+        uxi = uxi | 0x0010000000000000
+    }
+    if ey == 0 {
+        i = uy0 << 12
+        while (i >> 63) == 0 {
+            ey -= 1
+            i = i << 1
+        }
+        uy = uy0 << ((1 - ey) as u64)
+    } else {
+        uy = uy0 & 0x000fffffffffffff
+        uy = uy | 0x0010000000000000
+    }
+    while ex > ey {
+        i = wrapping_sub(uxi, uy)
+        if (i >> 63) == 0 {
+            if i == 0 {
+                return 0.0 * x
+            }
+            uxi = i
+        }
+        uxi = uxi << 1
+        ex -= 1
+    }
+    i = wrapping_sub(uxi, uy)
+    if (i >> 63) == 0 {
+        if i == 0 {
+            return 0.0 * x
+        }
+        uxi = i
+    }
+    while (uxi >> 52) == 0 {
+        uxi = uxi << 1
+        ex -= 1
+    }
+    if ex > 0 {
+        uxi = uxi - 0x0010000000000000
+        uxi = uxi | ((ex as u64) << 52)
+    } else {
+        uxi = uxi >> ((1 - ex) as u64)
+    }
+    uxi = uxi | (sx << 63)
+    return transmute(uxi, to = f64)
+}
+
+// Resto de x / y com o sinal de x, f32 (musl fmodf.c, mesma logica com 23 bits de mantissa)
+// LIMITE: ~85 linhas, pelo mesmo motivo de math_fmod (o estado (ex, uxi, uy) nao se divide)
+pub proc math_fmodf(x: f32, y: f32) -> f32 {
+    let ux: u32 = transmute(x, to = u32)
+    let uy0: u32 = transmute(y, to = u32)
+    var ex: int = ((ux >> 23) & 0xff) as int
+    var ey: int = ((uy0 >> 23) & 0xff) as int
+    let sx: u32 = ux & 0x80000000
+    var uxi: u32 = ux
+    var uy: u32 = uy0
+    var i: u32 = 0
+    if (uy0 << 1) == 0 or y != y or ex == 0xff {
+        return (x * y) / (x * y)
+    }
+    if (uxi << 1) <= (uy0 << 1) {
+        if (uxi << 1) == (uy0 << 1) {
+            return 0.0 * x
+        }
+        return x
+    }
+    if ex == 0 {
+        i = uxi << 9
+        while (i >> 31) == 0 {
+            ex -= 1
+            i = i << 1
+        }
+        uxi = uxi << ((1 - ex) as u32)
+    } else {
+        uxi = uxi & 0x007fffff
+        uxi = uxi | 0x00800000
+    }
+    if ey == 0 {
+        i = uy0 << 9
+        while (i >> 31) == 0 {
+            ey -= 1
+            i = i << 1
+        }
+        uy = uy0 << ((1 - ey) as u32)
+    } else {
+        uy = uy0 & 0x007fffff
+        uy = uy | 0x00800000
+    }
+    while ex > ey {
+        i = wrapping_sub(uxi, uy)
+        if (i >> 31) == 0 {
+            if i == 0 {
+                return 0.0 * x
+            }
+            uxi = i
+        }
+        uxi = uxi << 1
+        ex -= 1
+    }
+    i = wrapping_sub(uxi, uy)
+    if (i >> 31) == 0 {
+        if i == 0 {
+            return 0.0 * x
+        }
+        uxi = i
+    }
+    while (uxi >> 23) == 0 {
+        uxi = uxi << 1
+        ex -= 1
+    }
+    if ex > 0 {
+        uxi = uxi - 0x00800000
+        uxi = uxi | ((ex as u32) << 23)
+    } else {
+        uxi = uxi >> ((1 - ex) as u32)
+    }
+    uxi = uxi | sx
+    return transmute(uxi, to = f32)
+}
+
+// Produto x*x como par (hi, lo) exato: split de Dekker com 2^27 + 1, usado 2x por math_hypot (musl hypot.c sq)
+proc hypot_sq(x: f64) -> (hi: f64, lo: f64) {
+    let split: f64 = 134217729.0
+    let xc: f64 = x * split
+    let xh: f64 = x - xc + xc
+    let xl: f64 = x - xh
+    let quadrado: f64 = x * x
+    let resto: f64 = xh * xh - quadrado + 2.0 * xh * xl + xl * xl
+    return quadrado, resto
+}
+
+// Hipotenusa sqrt(x*x + y*y) sem estouro nem subfluxo, com a soma exata em (hi, lo) (musl hypot.c)
+pub proc math_hypot(x: f64, y: f64) -> f64 {
+    var ux: u64 = transmute(x, to = u64) & 0x7fffffffffffffff
+    var uy: u64 = transmute(y, to = u64) & 0x7fffffffffffffff
+    if ux < uy {
+        let troca: u64 = ux
+        ux = uy
+        uy = troca
+    }
+    var ax: f64 = transmute(ux, to = f64)
+    var ay: f64 = transmute(uy, to = f64)
+    let ex: int = (ux >> 52) as int
+    let ey: int = (uy >> 52) as int
+    if ey == 0x7ff {
+        return ay
+    }
+    if ex == 0x7ff or uy == 0 {
+        return ax
+    }
+    if ex - ey > 64 {
+        return ax + ay
+    }
+    var z: f64 = 1.0
+    let grande: u64 = 0x6bb0000000000000
+    let pequena: u64 = 0x1430000000000000
+    if ex > 0x3ff + 510 {
+        z = transmute(grande, to = f64)
+        ax = ax * transmute(pequena, to = f64)
+        ay = ay * transmute(pequena, to = f64)
+    } else if ey < 0x3ff - 450 {
+        z = transmute(pequena, to = f64)
+        ax = ax * transmute(grande, to = f64)
+        ay = ay * transmute(grande, to = f64)
+    }
+    let hx, lx = hypot_sq(ax)
+    let hy, ly = hypot_sq(ay)
+    return z * sqrt(ly + lx + hy + hx)
+}
+
+// Hipotenusa em f32: a soma dos quadrados vai em f64 e so a raiz volta a f32 (musl hypotf.c)
+pub proc math_hypotf(x: f32, y: f32) -> f32 {
+    var ux: u32 = transmute(x, to = u32) & 0x7fffffff
+    var uy: u32 = transmute(y, to = u32) & 0x7fffffff
+    if ux < uy {
+        let troca: u32 = ux
+        ux = uy
+        uy = troca
+    }
+    var ax: f32 = transmute(ux, to = f32)
+    var ay: f32 = transmute(uy, to = f32)
+    if uy == 0x7f800000 {
+        return ay
+    }
+    if ux >= 0x7f800000 or uy == 0 or (ux - uy) >= 0x0c800000 {
+        return ax + ay
+    }
+    var z: f32 = 1.0
+    let grande: u32 = 0x6c800000
+    let pequena: u32 = 0x12800000
+    if ux >= 0x5d800000 {
+        z = transmute(grande, to = f32)
+        ax = ax * transmute(pequena, to = f32)
+        ay = ay * transmute(pequena, to = f32)
+    } else if uy < 0x21800000 {
+        z = transmute(pequena, to = f32)
+        ax = ax * transmute(grande, to = f32)
+        ay = ay * transmute(grande, to = f32)
+    }
+    let soma: f64 = (ax as f64) * (ax as f64) + (ay as f64) * (ay as f64)
+    return z * sqrt(soma as f32)
+}
+
+// Bits de P0..P4 do cbrt.c (gerados por tests/nativo/wasm/math_bits/tabelas/gerar_tabelas_math.py)
+const CBRT_P_BITS: [5]u64 = {0x3ffe03e60f61e692, 0xbffe28e092f02420, 0x3ff9f1604a49d6c2, 0xbfe844cbbee751d9, 0x3fc2b000d4e4edd7}
+
+// Raiz cubica: estimativa por bits da exponencial, polinomio de grau 4 e um passo de Newton (musl cbrt.c)
+pub proc math_cbrt(x: f64) -> f64 {
+    var ui: u64 = transmute(x, to = u64)
+    var hx: u32 = ((ui >> 32) & 0x7fffffff) as u32
+    if hx >= 0x7ff00000 {
+        return x + x
+    }
+    let b1: u32 = 715094163
+    let b2: u32 = 696219795
+    if hx < 0x00100000 {
+        ui = transmute(x * 18014398509481984.0, to = u64)
+        hx = ((ui >> 32) & 0x7fffffff) as u32
+        if hx == 0 {
+            return x
+        }
+        hx = hx / 3 + b2
+    } else {
+        hx = hx / 3 + b1
+    }
+    ui = (ui & 0x8000000000000000) | ((hx as u64) << 32)
+    var t: f64 = transmute(ui, to = f64)
+    let p0: f64 = transmute(CBRT_P_BITS[0], to = f64)
+    let p1: f64 = transmute(CBRT_P_BITS[1], to = f64)
+    let p2: f64 = transmute(CBRT_P_BITS[2], to = f64)
+    let p3: f64 = transmute(CBRT_P_BITS[3], to = f64)
+    let p4: f64 = transmute(CBRT_P_BITS[4], to = f64)
+    var r: f64 = (t * t) * (t / x)
+    t = t * ((p0 + r * (p1 + r * p2)) + ((r * r) * r) * (p3 + r * p4))
+    ui = transmute(t, to = u64)
+    ui = (ui + 0x0000000080000000) & 0xffffffffc0000000
+    t = transmute(ui, to = f64)
+    let s: f64 = t * t
+    r = x / s
+    let w: f64 = t + t
+    r = (r - t) / (w + r)
+    t = t + t * r
+    return t
+}
+
+// Raiz cubica em f32: mesma estimativa por bits, com dois passos de Newton em f64 (musl cbrtf.c)
+pub proc math_cbrtf(x: f32) -> f32 {
+    var ui: u32 = transmute(x, to = u32)
+    var hx: u32 = ui & 0x7fffffff
+    if hx >= 0x7f800000 {
+        return x + x
+    }
+    let b1: u32 = 709958130
+    let b2: u32 = 642849266
+    if hx < 0x00800000 {
+        if hx == 0 {
+            return x
+        }
+        ui = transmute(x * 16777216.0, to = u32)
+        hx = ui & 0x7fffffff
+        hx = hx / 3 + b2
+    } else {
+        hx = hx / 3 + b1
+    }
+    ui = (ui & 0x80000000) | hx
+    var t: f64 = transmute(ui, to = f32) as f64
+    let xd: f64 = x as f64
+    var r: f64 = t * t * t
+    t = t * (xd + xd + r) / (xd + r + r)
+    r = t * t * t
+    t = t * (xd + xd + r) / (xd + r + r)
+    return t as f32
+}

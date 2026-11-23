@@ -1,0 +1,672 @@
+// semantic/sem_stmt.fj - porte de compiler/semantic/sem_stmt.c
+// sha256 de semantic/sem_stmt.c: 80787a07fe90e7093cc460cc41b1a5ff7450a1f5fc58f1c5eab265e5b34824db
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "common"
+import "frontend"
+
+// C2F:? tabela COMANDOS_2 (const ChecaComando[14]): folha nao escalar {'txt': '[ ST_LET_MULTIPLO ] = ComandoLe
+
+pub const CHECA_COMANDO_SEM_RETURN: u16 = 1
+pub const CHECA_COMANDO_SEM_LACO_CONTROLE: u16 = 2
+pub const CHECA_COMANDO_SEM_DEFER: u16 = 3
+pub const CHECA_COMANDO_SEM_EXPECT: u16 = 4
+pub const CHECA_COMANDO_COMANDO_LET_VAR: u16 = 5
+pub const CHECA_COMANDO_COMANDO_ATRIBUICAO: u16 = 6
+pub const CHECA_COMANDO_COMANDO_IF: u16 = 7
+pub const CHECA_COMANDO_COMANDO_WHILE: u16 = 8
+pub const CHECA_COMANDO_COMANDO_FOR: u16 = 9
+pub const CHECA_COMANDO_COMANDO_CHAMADA: u16 = 10
+pub const CHECA_COMANDO_COMANDO_LET_MULTIPLO: u16 = 11
+pub const CHECA_COMANDO_SEM_SWITCH: u16 = 12
+pub proc chamar_checa_comando(tag: u16, s: ^Semantica, st: ^frontend.Stmt) -> bool {
+    if tag == 1 {
+        return sem_return(s, st)
+    }
+    if tag == 2 {
+        return sem_laco_controle(s, st)
+    }
+    if tag == 3 {
+        return sem_defer(s, st)
+    }
+    if tag == 4 {
+        return sem_expect(s, st)
+    }
+    if tag == 5 {
+        return comando_let_var(s, st)
+    }
+    if tag == 6 {
+        return comando_atribuicao(s, st)
+    }
+    if tag == 7 {
+        return comando_if(s, st)
+    }
+    if tag == 8 {
+        return comando_while(s, st)
+    }
+    if tag == 9 {
+        return comando_for(s, st)
+    }
+    if tag == 10 {
+        return comando_chamada(s, st)
+    }
+    if tag == 11 {
+        return comando_let_multiplo(s, st)
+    }
+    if tag == 12 {
+        return sem_switch(s, st)
+    }
+    panic("C2F-80: tag sem alvo em chamar_checa_comando (ponteiro NULL no C)")
+    return false
+}
+
+// C: semantic/sem_stmt.c:46
+proc valor_guardavel(s: ^Semantica, e: ?^frontend.Expr) -> bool {
+    if (e as ^frontend.Expr).tipo == (TIPO_VAZIO as u32) {
+        let msg_1 = format(f"a expressao nao tem valor", alloc = heap)
+        defer delete(msg_1)
+        return sem_erro(s, common.E0301, (e as ^frontend.Expr).pos, msg_1)
+    }
+    return true
+}
+
+// C: semantic/sem_stmt.c:53
+proc tupla_nao_vai_para_variavel(s: ^Semantica, e: ?^frontend.Expr) -> bool {
+    if common.c2f_s2u_32(tipo_classe_de(&s.tipos, (e as ^frontend.Expr).tipo)) != (TC_TUPLA as u32) {
+        return true
+    }
+    let nome: str = sem_nome_texto(s, (e as ^frontend.Expr).nome)
+    let msg_1 = format(f"'{nome}' devolve {tipo_tupla_qtd(&s.tipos, (e as ^frontend.Expr).tipo)} valores: use let a, b = {nome}(...)", alloc = heap)
+    defer delete(msg_1)
+    return sem_erro(s, common.E0314, (e as ^frontend.Expr).pos, msg_1)
+}
+
+// C: semantic/sem_stmt.c:60
+proc comando_let_var(s: ^Semantica, st: ^frontend.Stmt) -> bool {
+    var querido: u32 = TIPO_VAZIO as u32
+    if st.tem_tipo {
+        if not sem_resolver_tipo_ref(s, &st.tipo) {
+            return false
+        }
+        querido = st.tipo.tipo
+    }
+    s.let_em_analise = st.expr
+    let valor_ok: bool = sem_expr(s, st.expr, querido)
+    s.let_em_analise = none
+    if not valor_ok {
+        return false
+    }
+    s.ctx_tipo = ContextoDoTipo{onde = CTX_DECLARACAO as u8, valor = st.expr, nome = st.nome, dono = -1}
+    if st.tem_tipo and (not sem_coagir(s, st.expr, querido, (st.expr as ^frontend.Expr).pos)) {
+        return false
+    }
+    if (not valor_guardavel(s, st.expr)) or (not tupla_nao_vai_para_variavel(s, st.expr)) {
+        return false
+    }
+    if not sem_conferir_movimento(s, st.expr) {
+        sem_sugerir_emprestimo(s, st.expr)
+        return false
+    }
+    if not sem_conferir_posse(s, st.expr, PONTO_COPIA) {
+        return false
+    }
+    st.tipo_local = (st.expr as ^frontend.Expr).tipo // a coercao ^T -> ?^T guarda o tipo declarado
+    if st.tem_tipo {
+        st.tipo_local = querido
+    }
+    var natureza: i32 = LOC_VAR
+    if st.tipo_no == (frontend.ST_LET as u8) {
+        natureza = LOC_LET
+    }
+    var novo: NovoLocal = NovoLocal{nome = st.nome, pos = sem_pos_depois_da_palavra(s, st.pos), tipo = st.tipo_local, natureza = natureza as u8, origem = sem_origem_do_valor(st.expr)}
+    if not sem_declarar_local(s, &novo, &st.local_id) {
+        return false
+    }
+    if s.tem_externo and sem_let_cria_handle(s, st) { // M6c P87: proc foreign 'creates'
+        return sem_rastrear_local(s, st, ALOC_HANDLE as u8)
+    }
+    if (novo.origem != (frontend.ALOC_HEAP as u8)) and (novo.origem != (frontend.ALOC_ESCOPO as u8)) and (novo.origem != (frontend.ALOC_PARAM as u8)) {
+        return true
+    }
+    if novo.origem == (frontend.ALOC_ESCOPO as u8) {
+        sem_defer_do_escopo(s, st)
+    }
+    return sem_rastrear_local(s, st, novo.origem)
+}
+
+// C: semantic/sem_stmt.c:91
+proc sem_raiz_da_cadeia(s: ^Semantica, x: ?^frontend.Expr) -> ?^frontend.Expr {
+    var x_v: ?^frontend.Expr = x
+    var forma: i32 = 0
+    while true {
+        if ((x_v as ^frontend.Expr).tipo_no == (frontend.EX_FATIA as u8)) or (((x_v as ^frontend.Expr).tipo_no == (frontend.EX_UNARIO as u8)) and ((x_v as ^frontend.Expr).op == (frontend.OP_DEREF as u8))) {
+            return none
+        }
+        if ((x_v as ^frontend.Expr).tipo_no == (frontend.EX_CAMPO as u8)) and (common.c2f_s2u_32(tipo_classe_de(&s.tipos, ((x_v as ^frontend.Expr).a as ^frontend.Expr).tipo)) == (TC_PONTEIRO as u32)) {
+            return none
+        }
+        if (x_v as ^frontend.Expr).tipo_no == (frontend.EX_INDICE as u8) {
+            _ = sem_elemento_de(s, ((x_v as ^frontend.Expr).a as ^frontend.Expr).tipo, &forma)
+            if ((common.c2f_s2u_32(forma) == (FORMA_FATIA as u32)) or (common.c2f_s2u_32(forma) == (FORMA_PONTEIRO_ARRAY as u32))) or (common.c2f_s2u_32(forma) == (FORMA_PONTEIRO_DINAMICO as u32)) {
+                return none
+            }
+        }
+        if ((x_v as ^frontend.Expr).tipo_no == (frontend.EX_CAMPO as u8)) and ((x_v as ^frontend.Expr).ref == (frontend.REF_COMPONENTE as u8)) {
+            return x_v
+        }
+        if ((x_v as ^frontend.Expr).tipo_no != (frontend.EX_CAMPO as u8)) and ((x_v as ^frontend.Expr).tipo_no != (frontend.EX_INDICE as u8)) {
+            return x_v
+        }
+        x_v = (x_v as ^frontend.Expr).a
+    }
+    return none
+}
+
+// C: semantic/sem_stmt.c:109
+proc sem_lvalor_mutavel_de(s: ^Semantica, alvo: ?^frontend.Expr, motivo: ?str) -> bool {
+    if ((alvo as ^frontend.Expr).tipo_no == (frontend.EX_INDICE as u8)) and ((((alvo as ^frontend.Expr).a) as ^frontend.Expr).tipo == (TIPO_TEXTO as u32)) {
+        return sem_erro(s, common.E0705, (alvo as ^frontend.Expr).pos, "os bytes de um str nao se alteram (s[i] so le): monte um texto novo com format(f\"...\", alloc = heap)")
+    }
+    sem_higiene_alterar(s, alvo)
+    let raiz: ?^frontend.Expr = sem_raiz_da_cadeia(s, alvo)
+    if raiz == none {
+        return true
+    }
+    if (raiz as ^frontend.Expr).tipo_no == (frontend.EX_CAMPO as u8) {
+        let msg_1 = format(f"'.{sem_nome_texto(s, (raiz as ^frontend.Expr).nome)}' monta um array novo: gravar varias letras nao existe, grave uma letra por vez (v.x = ..)", alloc = heap)
+        defer delete(msg_1)
+        return sem_erro(s, common.E0332, (raiz as ^frontend.Expr).pos_op, msg_1)
+    }
+    if (raiz as ^frontend.Expr).tipo_no != (frontend.EX_NOME as u8) {
+        return sem_erro(s, common.E0705, (alvo as ^frontend.Expr).pos, "este valor nao aceita atribuicao")
+    }
+    let local: ?^LocalInfo = escopo_buscar(&s.escopo, (raiz as ^frontend.Expr).nome)
+    if (raiz as ^frontend.Expr).ref == (frontend.REF_CONST as u8) {
+        return sem_erro(s, common.E0301, (raiz as ^frontend.Expr).pos, "constante nao recebe atribuicao")
+    }
+    if local == none {
+        return sem_erro(s, common.E0705, (alvo as ^frontend.Expr).pos, "este valor nao aceita atribuicao")
+    }
+    if (local as ^LocalInfo).natureza == (LOC_VAR as u8) {
+        return true
+    }
+    if ((local as ^LocalInfo).natureza == (LOC_LIGACAO as u8)) and sem_tipo_eh_dono(s, (local as ^LocalInfo).tipo) { // L-01: a ligacao de 'T ! E' recebe o dono; delete e append valem nela
+        return true
+    }
+    let nome_raiz: str = sem_nome_texto(s, (raiz as ^frontend.Expr).nome)
+    if motivo != none {
+        let motivo_txt: str = motivo or_else ""
+        let msg_2 = format(f"'{nome_raiz}' e imutavel: {motivo_txt}", alloc = heap)
+        defer delete(msg_2)
+        return sem_erro(s, common.E0705, (alvo as ^frontend.Expr).pos, msg_2)
+    }
+    let msg_3 = format(f"'{nome_raiz}' e imutavel (declarado com let, parametro, for ou switch); use var", alloc = heap)
+    defer delete(msg_3)
+    return sem_erro(s, common.E0705, (alvo as ^frontend.Expr).pos, msg_3)
+}
+
+// C: semantic/sem_stmt.c:131
+proc sem_lvalor_mutavel(s: ^Semantica, alvo: ?^frontend.Expr) -> bool {
+    return sem_lvalor_mutavel_de(s, alvo, none)
+}
+
+// C: semantic/sem_stmt.c:138
+proc eh_descarte(s: ^Semantica, st: ^frontend.Stmt) -> bool {
+    return (((st.op == 0) and ((st.alvo as ^frontend.Expr).tipo_no == (frontend.EX_NOME as u8))) and ((st.alvo as ^frontend.Expr).modulo == 0)) and ((st.alvo as ^frontend.Expr).nome == s.nome_descarte)
+}
+
+// C: semantic/sem_stmt.c:146
+proc comando_descarte(s: ^Semantica, st: ^frontend.Stmt) -> bool {
+    let valor: ?^frontend.Expr = st.expr
+    if not sem_expr(s, st.expr, TIPO_VAZIO as u32) {
+        return false
+    }
+    let causa: ?str = causa_do_descarte(valor)
+    if causa != none {
+        return sem_erro(s, common.E0310, (valor as ^frontend.Expr).pos_op, causa or_else "")
+    }
+    if tipo_classe_de(&s.tipos, (valor as ^frontend.Expr).tipo) == TC_RESULTADO {
+        let texto = texto_do_tipo(s, (valor as ^frontend.Expr).tipo, 96)
+        defer delete(texto)
+        let msg_1 = format(f"o resultado {texto} nao se descarta com '_ =': use _ = try f(), try, or_else, switch ou let", alloc = heap)
+        defer delete(msg_1)
+        return sem_erro(s, common.E0601, (valor as ^frontend.Expr).pos, msg_1)
+    }
+    var chamada: ?^frontend.Expr = valor
+    if (valor as ^frontend.Expr).tipo_no == (frontend.EX_TRY as u8) {
+        chamada = (valor as ^frontend.Expr).a
+    }
+    if ((chamada as ^frontend.Expr).tipo_no != (frontend.EX_CHAMADA as u8)) or ((valor as ^frontend.Expr).tipo == (TIPO_VAZIO as u32)) {
+        if sem_higiene_propor(s, common.E0709, st.pos, "'_ =' so descarta o valor devolvido por uma chamada que devolve valor") {
+            sem_higiene_sugerir_descarte_inutil(s, st.pos, (chamada as ^frontend.Expr).tipo_no == (frontend.EX_CHAMADA as u8))
+        }
+        return true
+    }
+    st.tipo_no = frontend.ST_CHAMADA as u8
+    st.alvo = none
+    return true
+}
+
+// C: semantic/sem_stmt.c:170
+proc origem_da_reatribuicao(s: ^Semantica, st: ^frontend.Stmt) -> bool {
+    if (((st.op != 0) or ((st.alvo as ^frontend.Expr).tipo_no != (frontend.EX_NOME as u8))) or ((st.alvo as ^frontend.Expr).ref != (frontend.REF_LOCAL as u8))) or ((st.alvo as ^frontend.Expr).modulo != 0) {
+        return true
+    }
+    let local: ?^LocalInfo = escopo_buscar_mut(&s.escopo, (st.alvo as ^frontend.Expr).nome)
+    if (local == none) or (((local as ^LocalInfo).origem != (frontend.ALOC_HEAP as u8)) and ((local as ^LocalInfo).origem != (frontend.ALOC_NENHUM as u8))) {
+        return true
+    }
+    let ptr_1: ^LocalInfo = local as ^LocalInfo
+    ptr_1.origem = sem_origem_do_valor(st.expr)
+    return true
+}
+
+// C: semantic/sem_stmt.c:179
+proc comando_atribuicao(s: ^Semantica, st: ^frontend.Stmt) -> bool {
+    if eh_descarte(s, st) {
+        return comando_descarte(s, st)
+    }
+    let lida_antes: bool = sem_higiene_raiz_lida(s, st.alvo)
+    if (not sem_expr(s, st.alvo, TIPO_VAZIO as u32)) or (not sem_lvalor_mutavel(s, st.alvo)) {
+        return false
+    }
+    if st.op == 0 {
+        sem_higiene_escrita(s, st.alvo, lida_antes)
+    }
+    let querido: u32 = (st.alvo as ^frontend.Expr).tipo
+    let alvo_nomeado: bool = ((st.alvo as ^frontend.Expr).tipo_no == (frontend.EX_NOME as u8)) or ((st.alvo as ^frontend.Expr).tipo_no == (frontend.EX_CAMPO as u8))
+    if not sem_expr(s, st.expr, querido) {
+        return false
+    }
+    var nome_alvo: i32 = -1
+    if alvo_nomeado {
+        nome_alvo = (st.alvo as ^frontend.Expr).nome
+    }
+    s.ctx_tipo = ContextoDoTipo{onde = CTX_ATRIBUICAO as u8, valor = st.expr, nome = nome_alvo, dono = -1}
+    if not sem_coagir(s, st.expr, querido, (st.expr as ^frontend.Expr).pos) {
+        return false
+    }
+    if (st.op != 0) and (tipo_classe_de(&s.tipos, querido) == TC_ARRAY) {
+        return sem_composta_vetor(s, st) // v1.11 L12a: [N]T += [N]T
+    }
+    if (st.op != 0) and (not tipo_eh_numerico(&s.tipos, querido)) {
+        return sem_erro(s, common.E0301, (st.expr as ^frontend.Expr).pos, "'+=' e '-=' pedem numero")
+    }
+    if st.op != 0 {
+        return true
+    }
+    var ponto: i32 = PONTO_GUARDA
+    if (st.alvo as ^frontend.Expr).tipo_no == (frontend.EX_NOME as u8) {
+        ponto = PONTO_COPIA
+    }
+    return sem_conferir_reatribuicao(s, st) and sem_conferir_movimento(s, st.expr) and sem_conferir_posse(s, st.expr, ponto) and origem_da_reatribuicao(s, st)
+}
+
+// C: semantic/sem_stmt.c:201
+proc condicao_recuperando(s: ^Semantica, cond: ?^frontend.Expr) -> bool {
+    return (common.c2f_b2i32(sem_condicao(s, cond)) != 0) or (common.c2f_b2i32(sem_recuperar(s)) != 0)
+}
+
+// C: semantic/sem_stmt.c:206
+proc comando_if(s: ^Semantica, st: ^frontend.Stmt) -> bool {
+    if not condicao_recuperando(s, st.expr) {
+        return false
+    }
+    var tern_1: i32 = 0
+    if (len(s.rastreados) as u64) == 0 {
+        tern_1 = -1
+    } else {
+        tern_1 = sem_guarda_none_abrir(s, st.expr)
+    }
+    let guarda: i32 = tern_1
+    let then_ok: bool = sem_bloco(s, st.corpo)
+    if guarda >= 0 {
+        sem_guarda_none_fechar(s, guarda)
+    }
+    return (common.c2f_b2i32(then_ok) != 0) and (common.c2f_b2i32(sem_bloco(s, st.senao)) != 0)
+}
+
+// C: semantic/sem_stmt.c:216
+proc corpo_de_laco(s: ^Semantica, corpo: ?^frontend.Stmt) -> bool {
+    let marca_anterior: u32 = s.marca_laco
+    s.marca_laco = (len(s.rastreados) as u64) as u32
+    s.prof_laco += 1
+    let ok: bool = sem_bloco(s, corpo)
+    s.prof_laco -= 1
+    s.marca_laco = marca_anterior
+    return ok
+}
+
+// C: semantic/sem_stmt.c:227
+proc comando_while(s: ^Semantica, st: ^frontend.Stmt) -> bool {
+    return (common.c2f_b2i32(condicao_recuperando(s, st.expr)) != 0) and (common.c2f_b2i32(corpo_de_laco(s, st.corpo)) != 0)
+}
+
+// C: semantic/sem_stmt.c:233
+proc limites_do_for(s: ^Semantica, st: ^frontend.Stmt) -> bool {
+    let a: ?^frontend.Expr = st.expr
+    let b: ?^frontend.Expr = st.expr2
+    sem_marcar_flexivel(a)
+    sem_marcar_flexivel(b)
+    if (common.c2f_b2i32((a as ^frontend.Expr).flexivel) != 0) and (not (b as ^frontend.Expr).flexivel) {
+        if (not sem_checar(s, b, TIPO_VAZIO as u32)) or (not sem_checar(s, a, (b as ^frontend.Expr).tipo)) {
+            return false
+        }
+    } else if (not sem_checar(s, a, TIPO_VAZIO as u32)) or (not sem_checar(s, b, (a as ^frontend.Expr).tipo)) {
+        return false
+    }
+    if not tipo_eh_inteiro((a as ^frontend.Expr).tipo) {
+        return sem_erro_do_inteiro(s, a, "o limite do laco")
+    }
+    st.tipo_local = (a as ^frontend.Expr).tipo
+    return ((a as ^frontend.Expr).tipo == (b as ^frontend.Expr).tipo) or (common.c2f_b2i32(sem_compativel(s, (a as ^frontend.Expr).tipo, (b as ^frontend.Expr).tipo, (b as ^frontend.Expr).pos)) != 0)
+}
+
+// C: semantic/sem_stmt.c:249
+proc comando_for_colecao(s: ^Semantica, st: ^frontend.Stmt) -> bool {
+    var forma: i32 = 0
+    if not sem_expr(s, st.expr, TIPO_VAZIO as u32) {
+        return false
+    }
+    let elemento: u32 = sem_elemento_de(s, (st.expr as ^frontend.Expr).tipo, &forma)
+    if forma == FORMA_NENHUMA {
+        if sem_eh_tipo_v19(s, (st.expr as ^frontend.Expr).tipo) {
+            return sem_for_v19(s, st)
+        }
+        let tipo = texto_do_tipo(s, (st.expr as ^frontend.Expr).tipo, 96)
+        defer delete(tipo)
+        let msg_1 = format(f"for de item percorre array, fatia ou ^[N]T (tipo {tipo}); para contar use for i in 0..<n", alloc = heap)
+        defer delete(msg_1)
+        return sem_erro(s, common.E0308, (st.expr as ^frontend.Expr).pos, msg_1)
+    }
+    if st.item_ref and ((forma == FORMA_ARRAY) or (forma == FORMA_DINAMICO)) and (not sem_lvalor_mutavel_de(s, st.expr, "'for &item' altera os elementos: declare a lista com var")) {
+        return false
+    }
+    if (not st.item_ref) and sem_tipo_eh_dono(s, elemento) {
+        _ = sem_erro(s, common.E0311, sem_pos_depois_da_palavra(s, st.pos), "'for item' copiaria cada lista: use 'for &item in ...'")
+        sem_forma_do_dono(s, DONO_FOR, sem_pos_depois_da_palavra(s, st.pos), TIPO_VAZIO as u32)
+        return false
+    }
+    let altura: u32 = escopo_altura(&s.escopo)
+    let pos: u32 = sem_pos_depois_da_palavra(s, st.pos)
+    var indice: NovoLocal = NovoLocal{nome = st.nome_indice, pos = pos, tipo = TIPO_INT as u32, natureza = LOC_FOR as u8, origem = 0}
+    st.tipo_local = elemento
+    if st.item_ref {
+        st.tipo_local = tipo_ponteiro(&s.tipos, elemento)
+    }
+    var item: NovoLocal = NovoLocal{nome = st.nome, pos = pos, tipo = st.tipo_local, natureza = LOC_FOR as u8, origem = 0}
+    let ok: bool = ((st.nome_indice < 0) or sem_declarar_local(s, &indice, &st.local_indice)) and sem_declarar_local(s, &item, &st.local_id) and corpo_de_laco(s, st.corpo)
+    escopo_recuar(&s.escopo, altura)
+    return ok
+}
+
+// C: semantic/sem_stmt.c:280
+proc comando_for(s: ^Semantica, st: ^frontend.Stmt) -> bool {
+    if st.expr2 == none {
+        return comando_for_colecao(s, st)
+    }
+    if not limites_do_for(s, st) {
+        return false
+    }
+    let altura: u32 = escopo_altura(&s.escopo)
+    var novo: NovoLocal = NovoLocal{nome = st.nome, pos = sem_pos_depois_da_palavra(s, st.pos), tipo = st.tipo_local, natureza = LOC_FOR as u8, origem = 0}
+    if not sem_declarar_local(s, &novo, &st.local_id) {
+        return false
+    }
+    let ok: bool = corpo_de_laco(s, st.corpo)
+    escopo_recuar(&s.escopo, altura)
+    return ok
+}
+
+// C: semantic/sem_stmt.c:293
+proc causa_do_descarte(e: ?^frontend.Expr) -> ?str {
+    if ((e as ^frontend.Expr).tipo_no != (frontend.EX_CHAMADA as u8)) or ((e as ^frontend.Expr).ref != (frontend.REF_EMBUTIDO as u8)) {
+        return none
+    }
+    if ((e as ^frontend.Expr).ref_id == frontend.EMB_NEW) or ((e as ^frontend.Expr).ref_id == frontend.EMB_MAKE) {
+        return "o resultado de new/make precisa ser guardado: let p = new(...); senao a memoria se perde"
+    }
+    if (e as ^frontend.Expr).ref_id == frontend.EMB_CLONE {
+        return "o resultado de clone precisa ser guardado: let c = clone(l, alloc = heap); senao a lista se perde"
+    }
+    if ((e as ^frontend.Expr).ref_id == frontend.EMB_REVERSE) and ((e as ^frontend.Expr).tipo == (TIPO_STR as u32)) {
+        return "o resultado de reverse de str precisa ser guardado: let r = reverse(s, alloc = heap); senao a memoria se perde"
+    }
+    if (((e as ^frontend.Expr).ref_id == frontend.EMB_KEYS) or ((e as ^frontend.Expr).ref_id == frontend.EMB_VALUES)) or ((e as ^frontend.Expr).ref_id == frontend.EMB_FROM_BYTES) {
+        return "o resultado de keys, values e from_bytes precisa ser guardado: let k = keys(m, alloc = heap); senao a memoria se perde"
+    }
+    if (e as ^frontend.Expr).ref_id == frontend.EMB_TO_STR {
+        return "o resultado de to_str precisa ser guardado: let s = to_str(&buf); senao a memoria se perde"
+    }
+    if (((e as ^frontend.Expr).ref_id == frontend.EMB_FORMAT) and ((e as ^frontend.Expr).tipo != (TIPO_VAZIO as u32))) or ((e as ^frontend.Expr).ref_id == frontend.EMB_FORMAT_C) {
+        return "o resultado de format/format_c precisa ser guardado: let s = format(...); senao a memoria se perde"
+    }
+    return none
+}
+
+// C: semantic/sem_stmt.c:312
+proc comando_chamada(s: ^Semantica, st: ^frontend.Stmt) -> bool {
+    if not sem_expr(s, st.expr, TIPO_VAZIO as u32) {
+        return false
+    }
+    let causa: ?str = causa_do_descarte(st.expr)
+    if causa != none {
+        return sem_erro(s, common.E0310, (st.expr as ^frontend.Expr).pos_op, causa or_else "")
+    }
+    if tipo_classe_de(&s.tipos, (st.expr as ^frontend.Expr).tipo) != TC_RESULTADO {
+        sem_higiene_retorno_descartado(s, st.expr)
+        return true
+    }
+    let texto = texto_do_tipo(s, (st.expr as ^frontend.Expr).tipo, 96)
+    defer delete(texto)
+    let nome: str = sem_nome_texto(s, (st.expr as ^frontend.Expr).nome)
+    if s.em_defer {
+        let msg_1 = format(f"o defer de '{nome}' descartaria o erro do resultado {texto}; adie uma chamada sem resultado", alloc = heap)
+        defer delete(msg_1)
+        return sem_erro(s, common.E0702, (st.expr as ^frontend.Expr).pos, msg_1)
+    }
+    let msg_2 = format(f"o resultado de '{nome}' ({texto}) foi ignorado: use try, or_else, switch ou let", alloc = heap)
+    defer delete(msg_2)
+    return sem_erro(s, common.E0601, (st.expr as ^frontend.Expr).pos, msg_2)
+}
+
+// C: semantic/sem_stmt.c:332
+proc marcar_grupo_da_var(s: ^Semantica, n: ^frontend.NomeLet, grupo: i32) -> i32 {
+    var grupo_v: i32 = grupo
+    if grupo_v == 0 {
+        grupo_v = n.local_id + 1
+    }
+    let p_1: ^LocalInfo = escopo_buscar_mut(&s.escopo, n.nome) as ^LocalInfo
+    p_1.grupo = grupo_v
+    return grupo_v
+}
+
+// C: semantic/sem_stmt.c:340
+proc declarar_nomes_do_let(s: ^Semantica, st: ^frontend.Stmt) -> bool {
+    let tupla: u32 = (st.expr as ^frontend.Expr).tipo
+    var grupo: i32 = 0
+    var k: u32 = 0
+    while k < st.ncasos {
+        let n: ^frontend.NomeLet = &(st.nomes or_else {})[k]
+        n.tipo = tipo_tupla_elemento(&s.tipos, tupla, k)
+        n.local_id = -1
+        if n.nome == s.nome_descarte {
+            k += 1
+            continue
+        }
+        var tern_1: i32 = LOC_LET
+        if (st.op as i32) != 0 {
+            tern_1 = LOC_VAR
+        }
+        var novo: NovoLocal = NovoLocal{nome = n.nome, pos = n.pos, tipo = n.tipo, natureza = tern_1 as u8, origem = 0}
+        if not sem_declarar_local(s, &novo, &n.local_id) {
+            return false
+        }
+        if st.op != 0 {
+            grupo = marcar_grupo_da_var(s, n, grupo)
+        }
+        k += 1
+    }
+    return true
+}
+
+// C: semantic/sem_stmt.c:357
+proc comando_let_multiplo(s: ^Semantica, st: ^frontend.Stmt) -> bool {
+    if not sem_expr(s, st.expr, TIPO_VAZIO as u32) {
+        return false
+    }
+    if tipo_classe_de(&s.tipos, (st.expr as ^frontend.Expr).tipo) != TC_TUPLA {
+        let texto = texto_do_tipo(s, (st.expr as ^frontend.Expr).tipo, 96)
+        defer delete(texto)
+        let msg_1 = format(f"let a, b = ... pede um proc com retorno multiplo; recebeu {texto}", alloc = heap)
+        defer delete(msg_1)
+        return sem_erro(s, common.E0314, (st.expr as ^frontend.Expr).pos, msg_1)
+    }
+    let qtd: u32 = tipo_tupla_qtd(&s.tipos, (st.expr as ^frontend.Expr).tipo)
+    if qtd != st.ncasos {
+        let msg_2 = format(f"'{sem_nome_texto(s, (st.expr as ^frontend.Expr).nome)}' devolve {qtd} valores e o let tem {st.ncasos} nomes", alloc = heap)
+        defer delete(msg_2)
+        return sem_erro(s, common.E0314, (st.expr as ^frontend.Expr).pos, msg_2)
+    }
+    return declarar_nomes_do_let(s, st)
+}
+
+// C2F-A0/N2: a tabela COMANDOS[ST_LET_MULTIPLO + 1] do C (ponteiro de funcao) vira a tag de chamar_checa_comando, por tipo_no do Stmt
+const COMANDOS_2: [14]u16 = {5, 5, 6, 7, 8, 9, 1, 10, 2, 2, 3, 12, 4, 11}
+
+// C: semantic/sem_stmt.c:380
+proc sem_comando(s: ^Semantica, st: ?^frontend.Stmt) -> bool {
+    return chamar_checa_comando(COMANDOS_2[(st as ^frontend.Stmt).tipo_no as int], s, st as ^frontend.Stmt)
+}
+
+// C: semantic/sem_stmt.c:385
+proc eh_saida(st: ?^frontend.Stmt) -> bool {
+    return (((st as ^frontend.Stmt).tipo_no == (frontend.ST_RETURN as u8)) or ((st as ^frontend.Stmt).tipo_no == (frontend.ST_BREAK as u8))) or ((st as ^frontend.Stmt).tipo_no == (frontend.ST_CONTINUE as u8))
+}
+
+// C: semantic/sem_stmt.c:390
+proc sem_recuperar(s: ^Semantica) -> bool {
+    s.corpo_com_erro = true
+    if not (s.diag as ^common.Diag).tem {
+        return not s.lista.cortado
+    }
+    return sem_guardar_erro(s, s.modulo_atual)
+}
+
+// C: semantic/sem_stmt.c:399
+proc declarar_nome_do_comando_que_falhou(s: ^Semantica, novo: ^NovoLocal) {
+    if ((novo.nome < 0) or (novo.nome == s.nome_descarte)) or (escopo_buscar(&s.escopo, novo.nome) != none) {
+        return
+    }
+    sem_gravar_nome_local(s, novo.nome, novo.tipo, novo.pos)
+    let antes_1: i32 = s.prox_local
+    s.prox_local += 1
+    var local: LocalInfo = LocalInfo{nome = novo.nome, tipo = novo.tipo, natureza = novo.natureza, origem = 0, id = antes_1, anterior = 0, pos = novo.pos, usos = common.c2f_trunc_u8(common.c2f_s2u_64(common.c2f_ou_i32(LOCAL_LIDO, LOCAL_ALTERADO) as i64)), grupo = 0}
+    escopo_empurrar(&s.escopo, &local)
+}
+
+// C: semantic/sem_stmt.c:407
+proc declarar_veneno_do_comando(s: ^Semantica, st: ?^frontend.Stmt) {
+    if (st as ^frontend.Stmt).tipo_no == (frontend.ST_LET_MULTIPLO as u8) {
+        for k in (0 as u32)..<(st as ^frontend.Stmt).ncasos {
+            var natureza_k: i32 = LOC_LET
+            if (st as ^frontend.Stmt).op != 0 {
+                natureza_k = LOC_VAR
+            }
+            let nome_k: ^frontend.NomeLet = &((st as ^frontend.Stmt).nomes or_else {})[k]
+            var novo_k: NovoLocal = NovoLocal{nome = nome_k.nome, pos = nome_k.pos, tipo = TIPO_VENENO as u32, natureza = natureza_k as u8, origem = 0}
+            declarar_nome_do_comando_que_falhou(s, &novo_k)
+        }
+        return
+    }
+    if ((st as ^frontend.Stmt).tipo_no != (frontend.ST_LET as u8)) and ((st as ^frontend.Stmt).tipo_no != (frontend.ST_VAR as u8)) {
+        return
+    }
+    var tipo: u32 = TIPO_VENENO as u32
+    if (st as ^frontend.Stmt).tem_tipo and ((st as ^frontend.Stmt).tipo.tipo > (TIPO_VAZIO as u32)) {
+        tipo = (st as ^frontend.Stmt).tipo.tipo
+    }
+    var natureza: i32 = LOC_VAR
+    if (st as ^frontend.Stmt).tipo_no == (frontend.ST_LET as u8) {
+        natureza = LOC_LET
+    }
+    var novo: NovoLocal = NovoLocal{nome = (st as ^frontend.Stmt).nome, pos = sem_pos_depois_da_palavra(s, (st as ^frontend.Stmt).pos), tipo = tipo, natureza = natureza as u8, origem = 0}
+    declarar_nome_do_comando_que_falhou(s, &novo)
+}
+
+// C: semantic/sem_stmt.c:424
+proc comando_recuperando(s: ^Semantica, st: ?^frontend.Stmt) -> bool {
+    let altura: u32 = escopo_altura(&s.escopo)
+    let veneno_antes: bool = s.tocou_veneno
+    s.tocou_veneno = false
+    var ok: bool = sem_comando(s, st)
+    if not ok {
+        escopo_recuar(&s.escopo, altura)
+        ok = sem_recuperar(s)
+        if ok {
+            declarar_veneno_do_comando(s, st)
+        }
+    }
+    s.tocou_veneno = (common.c2f_b2i32(s.tocou_veneno) != 0) or (common.c2f_b2i32(veneno_antes) != 0)
+    return ok
+}
+
+// C: semantic/sem_stmt.c:439
+proc sem_bloco(s: ^Semantica, primeiro: ?^frontend.Stmt) -> bool {
+    let altura: u32 = escopo_altura(&s.escopo)
+    let marca: u32 = (len(s.rastreados) as u64) as u32
+    var anterior: ?^frontend.Stmt = none
+    var st: ?^frontend.Stmt = primeiro
+    while st != none {
+        if (anterior != none) and eh_saida(anterior) {
+            _ = sem_erro(s, common.E0704, (st as ^frontend.Stmt).pos, "comando depois de return, break ou continue nunca executa")
+            if not sem_recuperar(s) {
+                return false
+            }
+            break // o codigo morto nao e analisado
+        }
+        if not comando_recuperando(s, st) {
+            return false
+        }
+        anterior = st
+        st = (st as ^frontend.Stmt).prox
+    }
+    if s.corpo_com_erro {
+        truncate(&s.rastreados, marca as int) // a posse de um corpo com erro esta meio contada: o vazamento seria cascata
+    } else if ((len(s.rastreados) as u64) != (marca as u64)) and (not sem_conferir_fim_do_bloco(s, marca)) {
+        return false
+    }
+    sem_higiene_fechar(s, altura)
+    escopo_recuar(&s.escopo, altura)
+    return true
+}
+
+// Valores esperados lidos do C (sem_stmt.c:293..312, 385..388).
+test "sem_stmt: eh_saida e causa_do_descarte" {
+    var ret = frontend.Stmt{tipo_no = frontend.ST_RETURN as u8}
+    var brk = frontend.Stmt{tipo_no = frontend.ST_BREAK as u8}
+    var cont = frontend.Stmt{tipo_no = frontend.ST_CONTINUE as u8}
+    var lp = frontend.Stmt{tipo_no = frontend.ST_WHILE as u8}
+    expect(eh_saida(&ret) and eh_saida(&brk) and eh_saida(&cont) and not eh_saida(&lp))
+    var nome = frontend.Expr{tipo_no = frontend.EX_NOME as u8}
+    expect(causa_do_descarte(&nome) == none)
+    var nao_embutido = frontend.Expr{tipo_no = frontend.EX_CHAMADA as u8, ref = frontend.REF_LOCAL as u8, ref_id = frontend.EMB_NEW}
+    expect(causa_do_descarte(&nao_embutido) == none)
+    var novo = frontend.Expr{tipo_no = frontend.EX_CHAMADA as u8, ref = frontend.REF_EMBUTIDO as u8, ref_id = frontend.EMB_NEW}
+    expect((causa_do_descarte(&novo) or_else "") == "o resultado de new/make precisa ser guardado: let p = new(...); senao a memoria se perde")
+    var clone_e = frontend.Expr{tipo_no = frontend.EX_CHAMADA as u8, ref = frontend.REF_EMBUTIDO as u8, ref_id = frontend.EMB_CLONE}
+    expect((causa_do_descarte(&clone_e) or_else "") == "o resultado de clone precisa ser guardado: let c = clone(l, alloc = heap); senao a lista se perde")
+    var rev_str = frontend.Expr{tipo_no = frontend.EX_CHAMADA as u8, ref = frontend.REF_EMBUTIDO as u8, ref_id = frontend.EMB_REVERSE, tipo = TIPO_STR as u32}
+    expect((causa_do_descarte(&rev_str) or_else "") == "o resultado de reverse de str precisa ser guardado: let r = reverse(s, alloc = heap); senao a memoria se perde")
+    var rev_lista = frontend.Expr{tipo_no = frontend.EX_CHAMADA as u8, ref = frontend.REF_EMBUTIDO as u8, ref_id = frontend.EMB_REVERSE, tipo = TIPO_INT as u32}
+    expect(causa_do_descarte(&rev_lista) == none) // reverse in-place de lista: instrucao
+    var chaves = frontend.Expr{tipo_no = frontend.EX_CHAMADA as u8, ref = frontend.REF_EMBUTIDO as u8, ref_id = frontend.EMB_KEYS}
+    expect((causa_do_descarte(&chaves) or_else "") == "o resultado de keys, values e from_bytes precisa ser guardado: let k = keys(m, alloc = heap); senao a memoria se perde")
+    var to_s = frontend.Expr{tipo_no = frontend.EX_CHAMADA as u8, ref = frontend.REF_EMBUTIDO as u8, ref_id = frontend.EMB_TO_STR}
+    expect((causa_do_descarte(&to_s) or_else "") == "o resultado de to_str precisa ser guardado: let s = to_str(&buf); senao a memoria se perde")
+    var fmt_c = frontend.Expr{tipo_no = frontend.EX_CHAMADA as u8, ref = frontend.REF_EMBUTIDO as u8, ref_id = frontend.EMB_FORMAT_C}
+    expect((causa_do_descarte(&fmt_c) or_else "") == "o resultado de format/format_c precisa ser guardado: let s = format(...); senao a memoria se perde")
+    var fmt_into = frontend.Expr{tipo_no = frontend.EX_CHAMADA as u8, ref = frontend.REF_EMBUTIDO as u8, ref_id = frontend.EMB_FORMAT, tipo = TIPO_VAZIO as u32}
+    expect(causa_do_descarte(&fmt_into) == none) // format(into =) e instrucao
+}

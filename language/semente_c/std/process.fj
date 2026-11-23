@@ -1,0 +1,358 @@
+// std:process - rodar outro programa e juntar a saida dele (POS-Z A51, parecer do Opus 14/11/2026). API em ingles (ADR-39); o corpo chama o runtime direto (forja_rt_processo.h).
+// Versao: 0.5.0. Changelog: 0.5.0 - D-G3-L2b: pid, wait_any, peak_memory, cpu_times e Stdio funcionam no Linux (so comentarios: limite de 8 filhos; peak_memory e cpu_times so depois do fim). 0.4.0 - D-G3-L2a bloco C: Stdio (null, pipe, inherit, file) e os campos stdin, stdout, stderr, stdout_path e stderr_path do Command, por forja_process_spawn (forja_processo_iniciar fica so no runtime, como envoltorio). 0.3.0 - D-G3-L2a bloco B: pid, wait_any, peak_memory e CpuTimes/cpu_times (so Windows por ora; o Linux devolve falha ate o L2b). 0.2.0 - M5 P28b-2b: Command.mem_limit_bytes. 0.1.0 - primeira versao: run, spawn, read_available, wait, exit_code, kill, close.
+// O grupo/arvore do filho e SEMPRE morto por kill, close e timeout, nos dois sistemas (Windows: o Job com KILL_ON_JOB_CLOSE; Linux: setpgid(0,0) no filho e kill(-pid)).
+// mem_limit_bytes (default 0 = sem limite): teto de memoria do filho e de quem ele cria. Linux: setrlimit RLIMIT_AS no filho antes do execve (espaco de enderecos). Windows: JOB_OBJECT_LIMIT_PROCESS_MEMORY no Job (memoria COMMIT por processo). Estourar nao derruba o pai: o filho recebe alocacao negada e sai com o codigo do proprio programa (diferente de 0 se ele nao trata a falha).
+// Sem shell: o programa e os argumentos viajam como argv (a linha de comando e montada com as aspas do Windows). O stdin do filho e o NUL (Command.stdin muda; ver Stdio). Arquivo .bat e .cmd e recusado (InvalidInput): chame o interpretador como programa.
+// env: cada item "NOME=valor"; quando existe, SUBSTITUI o ambiente do pai; vazio herda. cwd vazio = a pasta do pai. timeout_ms = 0 = sem limite.
+// Posse: o Output devolvido e DONO de stdout e stderr, do alocador que o chamador passou: quem recebe faz delete(out.stdout) e delete(out.stderr). Spawn nao aloca para quem chama; todo Process aberto precisa de close.
+// Timeout: run mata o filho e tudo que ele criou, devolve o que ja saiu e marca timed_out = true. Windows: o filho roda dentro de um Job com KILL_ON_JOB_CLOSE.
+import "std:os"
+import "std:text"
+
+foreign {
+    proc forja_process_spawn(linha: cstr, ambiente: cstr, pasta: cstr, erro: ^i32, limite_memoria: u64, canais: i32, saida: cstr, saida_erro: cstr) -> u64
+    proc forja_processo_ler(h: u64, canal: i32, destino: ^u8, n: i64) -> i64
+    proc forja_processo_esperar(h: u64, ms: i64) -> i32
+    proc forja_processo_codigo(h: u64) -> i64
+    proc forja_processo_matar(h: u64) -> i32
+    proc forja_processo_fechar(h: u64)
+    proc forja_process_pid(h: u64) -> i64
+    proc forja_process_wait_any(ids: ^u64, n: i64, ms: i64) -> i64
+    proc forja_process_peak_memory(h: u64) -> i64
+    proc forja_process_cpu_times(h: u64, saida: ^i64) -> i32
+}
+
+pub enum ProcessError { not_found, permission_denied, invalid_input, timeout, io }
+
+// Destino de um canal do filho: null = NUL; pipe = lido por read_available (so stdout e stderr); inherit = o canal do pai; file = arquivo criado/zerado em stdout_path ou stderr_path (so stdout e stderr).
+pub enum Stdio { null, pipe, inherit, file }
+
+pub struct Command {
+    program: str
+    args: []str
+    env: []str
+    cwd: str
+    timeout_ms: int
+    mem_limit_bytes: u64 = 0
+    stdin: Stdio = Stdio.null
+    stdout: Stdio = Stdio.pipe
+    stderr: Stdio = Stdio.pipe
+    stdout_path: str = ""
+    stderr_path: str = ""
+}
+
+pub struct Output {
+    code: int
+    stdout: [dynamic]u8
+    stderr: [dynamic]u8
+    timed_out: bool
+}
+
+// Handle do filho (0 = fechado).
+pub struct Process {
+    id: u64
+}
+
+// Tempos do filho em ns: CPU de usuario e de sistema; inicio e fim desde 1970 (end_ns = 0 enquanto o filho roda).
+pub struct CpuTimes {
+    user_ns: int
+    system_ns: int
+    start_ns: int
+    end_ns: int
+}
+
+// Codigos neutros do runtime (forja_rt_processo.h: FORJA_PRC_ERR_*).
+const PROCESSO_NAO_ACHOU: i32 = 1
+const PROCESSO_SEM_PERMISSAO: i32 = 2
+const PROCESSO_ENTRADA: i32 = 4
+const ESPERA_MAXIMA_FILHOS: int = 64
+const ESPERA_ENTRADA_INVALIDA: i64 = -2
+const CANAL_STDOUT: i32 = 0
+const CANAL_STDERR: i32 = 1
+const BLOCO_LEITURA: i64 = 16384
+const PASSO_MS: i64 = 2
+const ESPERA_APOS_MATAR_MS: i64 = 2000
+const NS_POR_MS: int = 1000000
+const BYTE_ESPACO: u8 = 32
+const BYTE_TABULACAO: u8 = 9
+const BYTE_FIM_DE_LINHA: u8 = 10
+const BYTE_ASPAS: u8 = 34
+const BYTE_BARRA: u8 = 92
+const BYTE_IGUAL: u8 = 61
+
+proc erro_do_runtime(codigo: i32) -> ProcessError {
+    if codigo == PROCESSO_NAO_ACHOU {
+        return ProcessError.not_found
+    }
+    if codigo == PROCESSO_SEM_PERMISSAO {
+        return ProcessError.permission_denied
+    }
+    if codigo == PROCESSO_ENTRADA {
+        return ProcessError.invalid_input
+    }
+    return ProcessError.io
+}
+
+// true se o texto tem um byte 0 (nao cabe numa linha de comando nem num ambiente).
+proc tem_nul(s: str) -> bool {
+    for i in 0..<len(s) {
+        if s[i] == 0 {
+            return true
+        }
+    }
+    return false
+}
+
+// Escreve n barras invertidas.
+proc anexar_barras(linha: ^[dynamic]u8, n: int) {
+    for _k in 0..<n {
+        append(linha, item = BYTE_BARRA)
+    }
+}
+
+// Vazio, com espaco, tabulacao, quebra de linha ou aspas: o argumento precisa de aspas.
+proc precisa_aspas(arg: str) -> bool {
+    if len(arg) == 0 {
+        return true
+    }
+    for i in 0..<len(arg) {
+        let b = arg[i]
+        if b == BYTE_ESPACO or b == BYTE_TABULACAO or b == BYTE_FIM_DE_LINHA or b == BYTE_ASPAS {
+            return true
+        }
+    }
+    return false
+}
+
+// Argumento com as regras do CommandLineToArgvW: entre aspas quando preciso; barras antes de aspas dobram e a aspas ganha uma barra; barras no fim dobram.
+proc anexar_argumento(linha: ^[dynamic]u8, arg: str) {
+    if not precisa_aspas(arg) {
+        for i in 0..<len(arg) {
+            append(linha, item = arg[i])
+        }
+        return
+    }
+    append(linha, item = BYTE_ASPAS)
+    var barras = 0
+    for i in 0..<len(arg) {
+        let b = arg[i]
+        if b == BYTE_BARRA {
+            barras += 1
+        } else {
+            if b == BYTE_ASPAS {
+                anexar_barras(linha, n = barras + barras + 1)
+            } else {
+                anexar_barras(linha, n = barras)
+            }
+            barras = 0
+            append(linha, item = b)
+        }
+    }
+    anexar_barras(linha, n = barras + barras)
+    append(linha, item = BYTE_ASPAS)
+}
+
+// .bat e .cmd passam pelo cmd.exe e reabrem a injecao por argumento: recusados.
+proc e_script_de_shell(programa: str) -> bool {
+    let n = len(programa)
+    if n < 4 {
+        return false
+    }
+    let fim = programa[n - 4..<n]
+    return text.equal_fold(fim, ".bat") or text.equal_fold(fim, ".cmd")
+}
+
+// Linha de comando: programa e argumentos separados por espaco. false = entrada invalida (programa vazio, script de shell ou byte 0).
+proc montar_linha(cmd: Command, linha: ^[dynamic]u8) -> bool {
+    if len(cmd.program) == 0 or e_script_de_shell(cmd.program) or tem_nul(cmd.program) {
+        return false
+    }
+    anexar_argumento(linha, arg = cmd.program)
+    for i in 0..<len(cmd.args) {
+        if tem_nul(cmd.args[i]) {
+            return false
+        }
+        append(linha, item = BYTE_ESPACO)
+        anexar_argumento(linha, arg = cmd.args[i])
+    }
+    return true
+}
+
+// Ambiente: itens "NOME=valor" separados por LF. false = item sem '=', com LF ou com byte 0.
+proc montar_ambiente(env: []str, bloco: ^[dynamic]u8) -> bool {
+    for i in 0..<len(env) {
+        let item = env[i]
+        if len(item) == 0 or tem_nul(item) {
+            return false
+        }
+        var tem_igual = false
+        for k in 0..<len(item) {
+            if item[k] == BYTE_FIM_DE_LINHA {
+                return false
+            }
+            if item[k] == BYTE_IGUAL {
+                tem_igual = true
+            }
+            append(bloco, item = item[k])
+        }
+        if not tem_igual {
+            return false
+        }
+        append(bloco, item = BYTE_FIM_DE_LINHA)
+    }
+    return true
+}
+
+// Canais do runtime: stdin | stdout << 4 | stderr << 8, cada um 0 null, 1 pipe, 2 inherit, 3 file (a ordem de Stdio).
+proc canais_do_comando(cmd: Command) -> i32 {
+    let bits = codigo_do_canal(cmd.stdin) | (codigo_do_canal(cmd.stdout) << 4) | (codigo_do_canal(cmd.stderr) << 8)
+    return bits as i32
+}
+
+proc codigo_do_canal(s: Stdio) -> u32 {
+    var codigo: u32 = 0
+    switch s {
+    case Stdio.null:
+        codigo = 0
+    case Stdio.pipe:
+        codigo = 1
+    case Stdio.inherit:
+        codigo = 2
+    case Stdio.file:
+        codigo = 3
+    }
+    return codigo
+}
+
+// Inicia o programa sem esperar. Quem recebe o Process fecha com close (defer close(p)). stdin so aceita null e inherit; arquivo sem caminho, caminho com byte 0 ou canal que o Stdio nao permite = invalid_input.
+pub proc spawn(cmd: Command) -> Process ! ProcessError {
+    var linha = make([dynamic]u8, alloc = heap)
+    defer delete(linha)
+    var ambiente = make([dynamic]u8, alloc = heap)
+    defer delete(ambiente)
+    if tem_nul(cmd.cwd) or tem_nul(cmd.stdout_path) or tem_nul(cmd.stderr_path) or not montar_linha(cmd, linha = &linha) or not montar_ambiente(cmd.env, bloco = &ambiente) {
+        return ProcessError.invalid_input
+    }
+    append(&linha, item = 0)
+    append(&ambiente, item = 0)
+    let pasta = format_c(f"{cmd.cwd}", alloc = heap)
+    defer delete(pasta)
+    let saida = format_c(f"{cmd.stdout_path}", alloc = heap)
+    defer delete(saida)
+    let saida_erro = format_c(f"{cmd.stderr_path}", alloc = heap)
+    defer delete(saida_erro)
+    var codigo: i32 = 0
+    let id = forja_process_spawn(&linha[0] as rawptr as cstr, ambiente = &ambiente[0] as rawptr as cstr, pasta = pasta, erro = &codigo, limite_memoria = cmd.mem_limit_bytes, canais = canais_do_comando(cmd), saida = saida, saida_erro = saida_erro)
+    if id == 0 {
+        return erro_do_runtime(codigo)
+    }
+    return Process{id = id}
+}
+
+// Anexa a destino o que o canal ja tem (sem esperar mais); devolve quantos bytes entraram.
+proc coletar_canal(p: Process, canal: i32, destino: ^[dynamic]u8) -> int {
+    var bloco: [16384]u8 = {}
+    var total = 0
+    var lidos: i64 = 1
+    while lidos > 0 {
+        lidos = forja_processo_ler(p.id, canal, destino = &bloco[0], n = BLOCO_LEITURA)
+        if lidos > 0 {
+            append(destino, items = bloco[0..<lidos])
+            total += lidos as int
+        }
+    }
+    return total
+}
+
+// Anexa a out e err o que o filho ja escreveu em stdout e stderr, sem bloquear; devolve quantos bytes entraram (0 = nada novo agora).
+pub proc read_available(p: Process, out: ^[dynamic]u8, err: ^[dynamic]u8) -> int {
+    return coletar_canal(p, canal = CANAL_STDOUT, destino = out) + coletar_canal(p, canal = CANAL_STDERR, destino = err)
+}
+
+// Espera ate timeout_ms (0 = so consulta): true se o filho ja terminou.
+pub proc wait(p: Process, timeout_ms: int) -> bool {
+    return forja_processo_esperar(p.id, timeout_ms as i64) == 1
+}
+
+// Codigo de saida; so vale depois de wait devolver true.
+pub proc exit_code(p: Process) -> int {
+    return forja_processo_codigo(p.id) as int
+}
+
+// Pid do sistema do filho (-1 se o Process ja foi fechado).
+pub proc pid(p: Process) -> int {
+    return forja_process_pid(p.id) as int
+}
+
+// Espera o PRIMEIRO dos filhos terminar (1 a 64): devolve o indice em ps, ou -1 se timeout_ms passou (timeout_ms < 0 = sem prazo). Lista vazia, com mais de 64 ou com Process fechado = invalid_input.
+// Linux: o limite de filhos abertos e 8 (nao 64): lista com mais de 8 = invalid_input. Espera por polling de 1 ms (wait4 WNOHANG).
+pub proc wait_any(ps: []Process, timeout_ms: int) -> int ! ProcessError {
+    if len(ps) == 0 or len(ps) > ESPERA_MAXIMA_FILHOS {
+        return ProcessError.invalid_input
+    }
+    var ids: [64]u64 = {}
+    for i in 0..<len(ps) {
+        ids[i] = ps[i].id
+    }
+    let r = forja_process_wait_any(&ids[0], n = len(ps) as i64, ms = timeout_ms as i64)
+    if r >= -1 {
+        return r as int
+    }
+    if r == ESPERA_ENTRADA_INVALIDA {
+        return ProcessError.invalid_input
+    }
+    return ProcessError.io
+}
+
+// Pico de memoria COMMIT do filho e de quem ele criou (o Job), em bytes; vale ate depois de o filho sair, enquanto o Process nao for fechado.
+// Linux: o RSS maximo (ru_maxrss do wait4) do filho e dos descendentes que ele colheu, e SO vale depois do fim do filho (wait ja devolveu true); antes do fim devolve 0.
+pub proc peak_memory(p: Process) -> u64 ! ProcessError {
+    let r = forja_process_peak_memory(p.id)
+    if r < 0 {
+        return erro_do_runtime((0 - r) as i32)
+    }
+    return r as u64
+}
+
+// Tempos de CPU e de relogio do filho; ver CpuTimes.
+// Linux: user_ns e system_ns (rusage do wait4) SO valem depois do fim do filho; antes saem 0 (start_ns ja vale e end_ns = 0). end_ns = o instante em que o pai colheu o filho (wait/wait_any/exit_code), nao o do exit.
+pub proc cpu_times(p: Process) -> CpuTimes ! ProcessError {
+    var v: [4]i64 = {}
+    let codigo = forja_process_cpu_times(p.id, &v[0])
+    if codigo != 0 {
+        return erro_do_runtime(codigo)
+    }
+    return CpuTimes{user_ns = v[0] as int, system_ns = v[1] as int, start_ns = v[2] as int, end_ns = v[3] as int}
+}
+
+// Termina o filho e tudo que ele criou.
+pub proc kill(p: Process) {
+    _ = forja_processo_matar(p.id)
+}
+
+// Fecha os canais e o handle; o que sobrou do filho morre junto. Fechar de novo e inofensivo.
+pub proc close(p: Process) {
+    forja_processo_fechar(p.id)
+}
+
+// Roda o programa ate o fim e devolve codigo, stdout e stderr. O stdin do filho e vazio. Estourou timeout_ms: mata o filho, devolve o que ja saiu e timed_out = true.
+pub proc run(cmd: Command, alloc: Allocator) -> Output ! ProcessError {
+    let p = try spawn(cmd)
+    defer close(p)
+    var res = Output{code = 0, stdout = make([dynamic]u8, alloc = alloc), stderr = make([dynamic]u8, alloc = alloc), timed_out = false}
+    let inicio = os.time_ns()
+    var terminou = false
+    while not terminou and not res.timed_out {
+        if read_available(p, out = &res.stdout, err = &res.stderr) == 0 {
+            terminou = wait(p, timeout_ms = PASSO_MS as int)
+        }
+        res.timed_out = not terminou and cmd.timeout_ms > 0 and (os.time_ns() - inicio) / NS_POR_MS >= cmd.timeout_ms
+    }
+    if res.timed_out {
+        kill(p)
+        _ = wait(p, timeout_ms = ESPERA_APOS_MATAR_MS as int)
+    }
+    _ = read_available(p, out = &res.stdout, err = &res.stderr)
+    res.code = exit_code(p)
+    return res
+}

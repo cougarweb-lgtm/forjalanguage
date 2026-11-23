@@ -1,0 +1,281 @@
+// linalg 0.1.0 (A14) - vetores 2/3/4 e Mat4 em f32, em Forja pura: igual nos 2 backends. Sem GPU, so calculo.
+// Uso: import "linalg"; m = linalg.mat4_translate(linalg.Vec3{x = 1.0, y = 2.0, z = 3.0}).
+// Convencao (a mesma de engine\forja\matriz.fj): colunas (vetor coluna, transformacao = M * v); Mat4.elementos e coluna a coluna: elemento (linha r, coluna c) esta em elementos[c * 4 + r]; translacao em elementos[12..14]; em a * b, o b e aplicado primeiro.
+// Rotacoes destras, angulos em radianos. perspective usa profundidade [0, 1] (DX12) e look_at olha para -Z (sistema destro).
+// mat4_transform_point e mat4_inverse sao AFIM: a ultima linha (0, 0, 0, 1) e assumida, nao conferida.
+// Changelog: 0.1.0 - A14 (plano_std_completa.txt, PARTE 4): dot, cross, length, normalize, mat4 basica e look_at/perspective.
+import "std:math" as math
+
+pub struct Vec2 {
+    x: f32
+    y: f32
+}
+
+pub struct Vec3 {
+    x: f32
+    y: f32
+    z: f32
+}
+
+pub struct Vec4 {
+    x: f32
+    y: f32
+    z: f32
+    w: f32
+}
+
+// Matriz 4x4 coluna a coluna: elementos[c * 4 + r] e a linha r, coluna c.
+pub struct Mat4 {
+    elementos: [16]f32
+}
+
+pub proc vec2_add(a: Vec2, b: Vec2) -> Vec2 {
+    return Vec2{x = a.x + b.x, y = a.y + b.y}
+}
+
+pub proc vec2_sub(a: Vec2, b: Vec2) -> Vec2 {
+    return Vec2{x = a.x - b.x, y = a.y - b.y}
+}
+
+pub proc vec2_scale(a: Vec2, k: f32) -> Vec2 {
+    return Vec2{x = a.x * k, y = a.y * k}
+}
+
+pub proc vec2_dot(a: Vec2, b: Vec2) -> f32 {
+    return a.x * b.x + a.y * b.y
+}
+
+pub proc vec2_length(a: Vec2) -> f32 {
+    return sqrt(vec2_dot(a, a))
+}
+
+// Vetor de mesmo sentido e comprimento 1; o zero devolve zero (nao tem direcao).
+pub proc vec2_normalize(a: Vec2) -> Vec2 {
+    let comprimento = vec2_length(a)
+    if comprimento == 0.0 {
+        return Vec2{x = 0.0, y = 0.0}
+    }
+    return vec2_scale(a, 1.0 / comprimento)
+}
+
+pub proc vec3_add(a: Vec3, b: Vec3) -> Vec3 {
+    return Vec3{x = a.x + b.x, y = a.y + b.y, z = a.z + b.z}
+}
+
+pub proc vec3_sub(a: Vec3, b: Vec3) -> Vec3 {
+    return Vec3{x = a.x - b.x, y = a.y - b.y, z = a.z - b.z}
+}
+
+pub proc vec3_scale(a: Vec3, k: f32) -> Vec3 {
+    return Vec3{x = a.x * k, y = a.y * k, z = a.z * k}
+}
+
+pub proc vec3_dot(a: Vec3, b: Vec3) -> f32 {
+    return a.x * b.x + a.y * b.y + a.z * b.z
+}
+
+// Produto vetorial a x b, na regra da mao direita.
+pub proc vec3_cross(a: Vec3, b: Vec3) -> Vec3 {
+    return Vec3{x = a.y * b.z - a.z * b.y, y = a.z * b.x - a.x * b.z, z = a.x * b.y - a.y * b.x}
+}
+
+pub proc vec3_length(a: Vec3) -> f32 {
+    return sqrt(vec3_dot(a, a))
+}
+
+// Vetor de mesmo sentido e comprimento 1; o zero devolve zero (nao tem direcao).
+pub proc vec3_normalize(a: Vec3) -> Vec3 {
+    let comprimento = vec3_length(a)
+    if comprimento == 0.0 {
+        return Vec3{x = 0.0, y = 0.0, z = 0.0}
+    }
+    return vec3_scale(a, 1.0 / comprimento)
+}
+
+pub proc vec4_add(a: Vec4, b: Vec4) -> Vec4 {
+    return Vec4{x = a.x + b.x, y = a.y + b.y, z = a.z + b.z, w = a.w + b.w}
+}
+
+pub proc vec4_sub(a: Vec4, b: Vec4) -> Vec4 {
+    return Vec4{x = a.x - b.x, y = a.y - b.y, z = a.z - b.z, w = a.w - b.w}
+}
+
+pub proc vec4_scale(a: Vec4, k: f32) -> Vec4 {
+    return Vec4{x = a.x * k, y = a.y * k, z = a.z * k, w = a.w * k}
+}
+
+pub proc vec4_dot(a: Vec4, b: Vec4) -> f32 {
+    return a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w
+}
+
+pub proc vec4_length(a: Vec4) -> f32 {
+    return sqrt(vec4_dot(a, a))
+}
+
+// Vetor de mesmo sentido e comprimento 1; o zero devolve zero (nao tem direcao).
+pub proc vec4_normalize(a: Vec4) -> Vec4 {
+    let comprimento = vec4_length(a)
+    if comprimento == 0.0 {
+        return Vec4{x = 0.0, y = 0.0, z = 0.0, w = 0.0}
+    }
+    return vec4_scale(a, 1.0 / comprimento)
+}
+
+// Identidade 4x4.
+pub proc mat4_identity() -> Mat4 {
+    var elementos: [16]f32 = {}
+    elementos[0] = 1.0
+    elementos[5] = 1.0
+    elementos[10] = 1.0
+    elementos[15] = 1.0
+    return Mat4{elementos = elementos}
+}
+
+// a * b (b e aplicado primeiro): o elemento (r, c) e a linha r de a vezes a coluna c de b.
+pub proc mat4_mul(a: Mat4, b: Mat4) -> Mat4 {
+    var elementos: [16]f32 = {}
+    for coluna in 0..<4 {
+        for linha in 0..<4 {
+            var soma: f32 = 0.0
+            for k in 0..<4 {
+                soma += a.elementos[k * 4 + linha] * b.elementos[coluna * 4 + k]
+            }
+            elementos[coluna * 4 + linha] = soma
+        }
+    }
+    return Mat4{elementos = elementos}
+}
+
+// Transposta: troca linhas por colunas (a inversa de uma rotacao pura).
+pub proc mat4_transpose(a: Mat4) -> Mat4 {
+    var elementos: [16]f32 = {}
+    for coluna in 0..<4 {
+        for linha in 0..<4 {
+            elementos[linha * 4 + coluna] = a.elementos[coluna * 4 + linha]
+        }
+    }
+    return Mat4{elementos = elementos}
+}
+
+// Translacao por t, na coluna 3.
+pub proc mat4_translate(t: Vec3) -> Mat4 {
+    var m = mat4_identity()
+    m.elementos[12] = t.x
+    m.elementos[13] = t.y
+    m.elementos[14] = t.z
+    return m
+}
+
+// Escala por eixo (diagonal).
+pub proc mat4_scale(s: Vec3) -> Mat4 {
+    var m = mat4_identity()
+    m.elementos[0] = s.x
+    m.elementos[5] = s.y
+    m.elementos[10] = s.z
+    return m
+}
+
+// Rotacao de angulo (radianos) em volta do eixo, pela formula de Rodrigues; o eixo e normalizado aqui. Destra: +angulo leva X para Y em torno de Z.
+pub proc mat4_rotate_axis(eixo: Vec3, angulo: f32) -> Mat4 {
+    let u = vec3_normalize(eixo)
+    let c = math.cos(angulo)
+    let s = math.sin(angulo)
+    let t = 1.0 - c
+    var m = mat4_identity()
+    m.elementos[0] = t * u.x * u.x + c
+    m.elementos[1] = t * u.x * u.y + s * u.z
+    m.elementos[2] = t * u.x * u.z - s * u.y
+    m.elementos[4] = t * u.x * u.y - s * u.z
+    m.elementos[5] = t * u.y * u.y + c
+    m.elementos[6] = t * u.y * u.z + s * u.x
+    m.elementos[8] = t * u.x * u.z + s * u.y
+    m.elementos[9] = t * u.y * u.z - s * u.x
+    m.elementos[10] = t * u.z * u.z + c
+    return m
+}
+
+// Projecao perspectiva (camera olhando para -Z): fovy em radianos, aspecto = largura / altura, perto e longe > 0. Profundidade vai a [0, 1].
+pub proc mat4_perspective(fovy: f32, aspecto: f32, perto: f32, longe: f32) -> Mat4 {
+    let f = 1.0 / math.tan(fovy / 2.0)
+    var elementos: [16]f32 = {}
+    elementos[0] = f / aspecto
+    elementos[5] = f
+    elementos[10] = longe / (perto - longe)
+    elementos[11] = -1.0
+    elementos[14] = perto * longe / (perto - longe)
+    return Mat4{elementos = elementos}
+}
+
+// Matriz de visao: a camera em olho olha para alvo com a direcao "cima" de referencia. Leva o mundo para o espaco da camera.
+pub proc mat4_look_at(olho: Vec3, alvo: Vec3, cima: Vec3) -> Mat4 {
+    let f = vec3_normalize(vec3_sub(alvo, olho))
+    let s = vec3_normalize(vec3_cross(f, cima))
+    let u = vec3_cross(s, f)
+    var elementos: [16]f32 = {}
+    elementos[0] = s.x
+    elementos[1] = u.x
+    elementos[2] = -f.x
+    elementos[4] = s.y
+    elementos[5] = u.y
+    elementos[6] = -f.y
+    elementos[8] = s.z
+    elementos[9] = u.z
+    elementos[10] = -f.z
+    elementos[12] = -vec3_dot(s, olho)
+    elementos[13] = -vec3_dot(u, olho)
+    elementos[14] = vec3_dot(f, olho)
+    elementos[15] = 1.0
+    return Mat4{elementos = elementos}
+}
+
+// Aplica a matriz afim ao ponto p (w = 1): a linha 4 nao entra.
+pub proc mat4_transform_point(a: Mat4, p: Vec3) -> Vec3 {
+    let valores = a.elementos
+    return Vec3{x = valores[0] * p.x + valores[4] * p.y + valores[8] * p.z + valores[12], y = valores[1] * p.x + valores[5] * p.y + valores[9] * p.z + valores[13], z = valores[2] * p.x + valores[6] * p.y + valores[10] * p.z + valores[14]}
+}
+
+// Inversa de matriz afim (3x3 da parte linear por cofatores, translacao por -A^-1 * t). none quando o determinante e zero (nao tem inversa).
+pub proc mat4_inverse(a: Mat4) -> ?Mat4 {
+    let valores = a.elementos
+    let a00 = valores[0]
+    let a10 = valores[1]
+    let a20 = valores[2]
+    let a01 = valores[4]
+    let a11 = valores[5]
+    let a21 = valores[6]
+    let a02 = valores[8]
+    let a12 = valores[9]
+    let a22 = valores[10]
+    let det = a00 * (a11 * a22 - a12 * a21) - a01 * (a10 * a22 - a12 * a20) + a02 * (a10 * a21 - a11 * a20)
+    if det == 0.0 {
+        return none
+    }
+    let k = 1.0 / det
+    let inv00 = (a11 * a22 - a12 * a21) * k
+    let inv01 = (a02 * a21 - a01 * a22) * k
+    let inv02 = (a01 * a12 - a02 * a11) * k
+    let inv10 = (a12 * a20 - a10 * a22) * k
+    let inv11 = (a00 * a22 - a02 * a20) * k
+    let inv12 = (a02 * a10 - a00 * a12) * k
+    let inv20 = (a10 * a21 - a11 * a20) * k
+    let inv21 = (a01 * a20 - a00 * a21) * k
+    let inv22 = (a00 * a11 - a01 * a10) * k
+    let tx = valores[12]
+    let ty = valores[13]
+    let tz = valores[14]
+    var elementos: [16]f32 = {}
+    elementos[0] = inv00
+    elementos[1] = inv10
+    elementos[2] = inv20
+    elementos[4] = inv01
+    elementos[5] = inv11
+    elementos[6] = inv21
+    elementos[8] = inv02
+    elementos[9] = inv12
+    elementos[10] = inv22
+    elementos[12] = -(inv00 * tx + inv01 * ty + inv02 * tz)
+    elementos[13] = -(inv10 * tx + inv11 * ty + inv12 * tz)
+    elementos[14] = -(inv20 * tx + inv21 * ty + inv22 * tz)
+    elementos[15] = 1.0
+    return Mat4{elementos = elementos}
+}

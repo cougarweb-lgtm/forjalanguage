@@ -1,0 +1,1205 @@
+// nativo/obj/coff_membro.fj - porte de compiler/nativo/obj/coff_membro.c, compiler/nativo/obj/coff_membro.h
+// sha256 de nativo/obj/coff_membro.c: 0d6c8dd955976c084462d86672b136f47ad9cc8685aaad9e6c9171d3d10c26fd
+// sha256 de nativo/obj/coff_membro.h: 63c48cf1e58f59da5963f69c6a2cffbaa5fdd590683a4635e045d9ece98cad99
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "common"
+
+struct CoffDiretiva {
+    tipo: i32
+    nome: ?str
+    valor: u32
+}
+
+struct CoffComdat {
+    simbolo: u32
+    secao: u32
+    tam: u32
+    selecao: u8
+}
+
+struct CoffAssociada {
+    pai: u32
+    filho: u32
+}
+
+struct CoffComum {
+    simbolo: u32
+    tam: u32
+}
+
+struct CoffFraco {
+    simbolo: u32
+    padrao: u32
+}
+
+struct CoffUniao {
+    o: ?^Objeto
+    comdats: [dynamic]CoffComdat
+    comuns: [dynamic]CoffComum
+    fracos: [dynamic]CoffFraco
+    alinhamentos: [dynamic]CoffDiretiva
+    bibliotecas: [dynamic]str
+    exportados: [dynamic]str
+    anuladas: [dynamic]u32
+    associadas: [dynamic]CoffAssociada
+    membros: u32
+    ignoradas: u32
+    primeira_ignorada: ?str
+}
+
+struct CoffMembroEntrada {
+    dados: ?^u8
+    tam: u64
+    nome: ?str
+}
+
+struct CmSecao {
+    idx: i32
+    carac: u32
+    par: u32
+    simbolo: u32
+    assoc: u16
+    selecao: u8
+    anulada: bool
+    tem_lider: bool
+    promovida: bool
+    conferir: bool
+}
+
+struct CmMembro {
+    u: ?^CoffUniao
+    l: CoffLeitor
+    membro: ?str
+    secoes: [dynamic]CmSecao
+    fracos_ini: u64
+}
+
+struct CmSim {
+    i: u32
+    nome: ?str
+    sec: i16
+    valor: u32
+    classe: u8
+    e: []u8
+}
+
+const CM_SEL_NENHUMA: i32 = 0
+const CM_SEL_NODUP: i32 = 1
+const CM_SEL_QUALQUER: i32 = 2
+const CM_SEL_MESMO_TAMANHO: i32 = 3
+const CM_SEL_EXATO: i32 = 4
+const CM_SEL_ASSOCIATIVA: i32 = 5
+const CM_SEL_MAIOR: i32 = 6
+const DIRETIVA_BIBLIOTECA: i32 = 0
+const DIRETIVA_EXPORTA: i32 = 1
+const DIRETIVA_ALINHA_COMUM: i32 = 2
+const DIRETIVA_IGNORADA: i32 = 3
+const CM_CARAC_COMDAT: u32 = 4096
+const CM_CARAC_DESCARTAVEL: u32 = 33554432
+const CM_CARAC_REMOVER: u32 = 2048
+const CM_CARAC_RELOCS_EXTRAS: u32 = 16777216
+const CM_OFF_AUX_NUMERO: u32 = 12
+const CM_OFF_AUX_SELECAO: u32 = 14
+const CM_NOME_DIRETIVA: str = ".drectve"
+const CM_NOME_TLS: str = ".tls"
+const CM_TAM_NOME_TLS: u32 = 4
+const CM_PREFIXO_FRACO: str = ".weak."
+const CM_TAM_PREFIXO_FRACO: u32 = 6
+const CM_TAM_NOME_LOCAL: i32 = 40
+const CM_RELOC_ABSOLUTA: u32 = 0
+const CM_SEM_SECAO: i32 = -1
+
+pub const CM_VISITA_CM_COLETAR_SELECAO: u16 = 1
+pub const CM_VISITA_CM_LER_SIMBOLO: u16 = 2
+pub proc chamar_cm_visita(tag: u16, m: ^CmMembro, i: u32, e: []u8) -> bool {
+    if tag == 1 {
+        return cm_coletar_selecao(m, i, e)
+    }
+    if tag == 2 {
+        return cm_ler_simbolo(m, i, e)
+    }
+    common.falha_interna("coff_membro: tag de visita desconhecida")
+    return false
+}
+
+// C: nativo/obj/coff_membro.c:70
+proc cm_sec(m: ^CmMembro, i: u32) -> ^CmSecao {
+    return &m.secoes[i as u64]
+}
+
+// C: nativo/obj/coff_membro.c:75
+proc cm_mapear(m: ^CmMembro, i: u32, idx: u32) {
+    m.l.mapa[i as u64] = idx
+}
+
+// C: nativo/obj/coff_membro.c:80
+proc cm_tamanho(m: ^CmMembro, idx: i32) -> u32 {
+    let s: ^ObjSecao = &(m.l.o as ^Objeto).secoes[common.c2f_s2u_64(idx as i64)]
+    var tern_1: u32 = (len(s.bytes) as u64) as u32
+    if common.c2f_s2u_32(s.tipo) == (OS_BSS as u32) {
+        tern_1 = s.tam_bss
+    }
+    return tern_1
+}
+
+// C: nativo/obj/coff_membro.c:89
+proc cm_anotar_diretivas(u: ^CoffUniao, itens: ^[dynamic]CoffDiretiva) {
+    var k: u64 = 0
+    while k < (len(itens^) as u64) {
+        let d: ^CoffDiretiva = &itens[k]
+        let sw_1 = common.c2f_s2u_32(d.tipo)
+        if sw_1 == (DIRETIVA_BIBLIOTECA as u32) {
+            append(&u.bibliotecas, item = "")
+            u.bibliotecas[len(u.bibliotecas) - 1] = (d.nome or_else "")
+        } else if sw_1 == (DIRETIVA_EXPORTA as u32) {
+            append(&u.exportados, item = "")
+            u.exportados[len(u.exportados) - 1] = (d.nome or_else "")
+        } else if sw_1 == (DIRETIVA_ALINHA_COMUM as u32) {
+            append(&u.alinhamentos, item = CoffDiretiva{})
+            u.alinhamentos[len(u.alinhamentos) - 1] = d^
+        } else if sw_1 == (DIRETIVA_IGNORADA as u32) {
+            let antes_1: u32 = u.ignoradas
+            u.ignoradas += 1
+            if antes_1 == 0 {
+                u.primeira_ignorada = d.nome
+            }
+        }
+        k += 1
+    }
+}
+
+// C: nativo/obj/coff_membro.c:112
+proc cm_diretiva(m: ^CmMembro, h: []u8) -> bool {
+    let ptr: u64 = common.c2f_ler_u32_le(h, COFF_OFF_SEC_PTR as int) as u64
+    let raw: u64 = common.c2f_ler_u32_le(h, COFF_OFF_SEC_RAW as int) as u64
+    if not coff_cabe(m.l.n, ptr, raw) {
+        return coff_falha(m.l.erro as ^common.Diag, "dados da secao .drectve fora do arquivo")
+    }
+    var itens: [dynamic]CoffDiretiva = make([dynamic]CoffDiretiva, alloc = heap)
+    let arena: ^common.Arena = &(m.l.o as ^Objeto).nomes
+    let bytes: []u8 = m.l.b or_else {}
+    coff_diretivas_ler(bytes[(ptr as int)..<((ptr + raw) as int)], raw, arena, &itens)
+    cm_anotar_diretivas(m.u as ^CoffUniao, &itens)
+    delete(itens)
+    return true
+}
+
+// C: nativo/obj/coff_membro.c:128
+// C2F-33: o nome e fatia sem NUL; ".tls" seguido do fim do nome ou de '$'
+proc cm_eh_tls(nome: []u8) -> bool {
+    let tls: []u8 = as_bytes(CM_NOME_TLS)
+    let tam_tls: int = CM_TAM_NOME_TLS as int
+    if len(nome) < tam_tls {
+        return false
+    }
+    var k: int = 0
+    while k < tam_tls {
+        if nome[k] != tls[k] {
+            return false
+        }
+        k += 1
+    }
+    if len(nome) == tam_tls {
+        return true
+    }
+    return nome[tam_tls] == 36 // '$'
+}
+
+// C: nativo/obj/coff_membro.c:133
+proc cm_abrir_secao(m: ^CmMembro, i: u32) -> bool {
+    let h: []u8 = coff_cabecalho_secao(&m.l, i)
+    let arena: ^common.Arena = &(m.l.o as ^Objeto).nomes
+    let nome: ?str = coff_nome_secao(&m.l, h[0..<(COFF_TAM_NOME as int)], arena)
+    let carac: u32 = common.c2f_ler_u32_le(h, COFF_OFF_SEC_CARAC as int)
+    let s: ^CmSecao = cm_sec(m, i)
+    s^ = CmSecao{idx = CM_SEM_SECAO, carac = carac}
+    if nome == none {
+        return coff_falha(m.l.erro as ^common.Diag, "nome de secao fora da tabela de strings")
+    }
+    let txt: str = nome or_else ""
+    if common.c2f_strcmp(txt, CM_NOME_DIRETIVA) == 0 {
+        return cm_diretiva(m, h)
+    }
+    if (carac & (CM_CARAC_DESCARTAVEL | CM_CARAC_REMOVER)) != 0 {
+        return true
+    }
+    if cm_eh_tls(as_bytes(txt)) {
+        let txt_1 = m.membro or_else "(null)"
+        let msg_1 = format(f"COFF: membro '{txt_1}', secao '{txt}' (dado thread_local): o ligador nativo nao monta o diretorio TLS do PE", alloc = heap)
+        defer delete(msg_1)
+        return common.diag_relatar(m.l.erro as ^common.Diag, common.X0107, 0, msg_1)
+    }
+    if (carac & CM_CARAC_RELOCS_EXTRAS) != 0 {
+        let txt_2 = m.membro or_else "(null)"
+        let msg_2 = format(f"COFF: membro '{txt_2}', secao '{txt}' com contagem de relocacoes estendida (mais de 65535)", alloc = heap)
+        defer delete(msg_2)
+        return common.diag_relatar(m.l.erro as ^common.Diag, common.X0903, 0, msg_2)
+    }
+    s.idx = obj_secao_abrir(m.l.o as ^Objeto, nome, coff_tipo(nome, carac), coff_alinhamento(carac)) as i32
+    return coff_preencher_secao(&m.l, s.idx as u32, h)
+}
+
+// C: nativo/obj/coff_membro.c:156
+proc cm_ler_secoes(m: ^CmMembro) -> bool {
+    for _i in (0 as u32)..<m.l.nsec {
+        append(&m.secoes, item = CmSecao{})
+    }
+    var i: u32 = 0
+    while i < m.l.nsec {
+        if not cm_abrir_secao(m, i) {
+            return false
+        }
+        i += 1
+    }
+    return true
+}
+
+// C: nativo/obj/coff_membro.c:171
+proc cm_preparar_simbolos(m: ^CmMembro) -> bool {
+    let l: ^CoffLeitor = &m.l
+    if not coff_cabe(l.n, l.ini_simbolos, (l.nsim as u64) * (COFF_TAM_SIMBOLO as u64)) {
+        return coff_falha(l.erro as ^common.Diag, "tabela de simbolos fora do arquivo")
+    }
+    var i: u32 = 0
+    while i < l.nsim {
+        append(&l.mapa, item = 0)
+        l.mapa[len(l.mapa) - 1] = COFF_SIMBOLO_NAO_MAPEADO
+        i += 1
+    }
+    return true
+}
+
+// C: nativo/obj/coff_membro.c:182
+// C2F-INDECIDIVEL: e vira fatia que inclui os auxiliares (18 * (1 + aux) bytes), pois as visitas leem e + 18
+proc cm_percorrer(m: ^CmMembro, visita: u16) -> bool {
+    let bytes: []u8 = m.l.b or_else {}
+    var i: u32 = 0
+    while i < m.l.nsim {
+        let ini: int = (m.l.ini_simbolos + ((i as u64) * (COFF_TAM_SIMBOLO as u64))) as int
+        let aux: u32 = bytes[ini + (COFF_OFF_SIM_AUX as int)] as u32
+        if ((i as u64) + 1 + (aux as u64)) > (m.l.nsim as u64) {
+            return coff_falha(m.l.erro as ^common.Diag, "simbolo auxiliar passa do fim da tabela")
+        }
+        let fim: int = ini + ((COFF_TAM_SIMBOLO as int) * (1 + (aux as int)))
+        if not chamar_cm_visita(visita, m, i, bytes[ini..<fim]) {
+            return false
+        }
+        i += 1 + aux
+    }
+    return true
+}
+
+// C: nativo/obj/coff_membro.c:199
+proc cm_forma_de_def_secao(e: []u8) -> bool {
+    return ((e[COFF_OFF_SIM_CLASSE as u64] as u32) == COFF_CLASSE_ESTATICA) and (e[COFF_OFF_SIM_AUX as u64] == 1) and (common.c2f_ler_u16_le(e, COFF_OFF_SIM_TIPO as int) == 0) and (common.c2f_ler_u32_le(e, COFF_OFF_SIM_VALOR as int) == 0)
+}
+
+// C: nativo/obj/coff_membro.c:205
+proc cm_secao_comdat(m: ^CmMembro, sec: i16) -> bool {
+    return (((sec as i32) > 0) and (common.c2f_s2u_32(sec as i32) <= m.l.nsec)) and ((cm_sec(m, common.c2f_s2u_32(sec as i32) - 1).carac & CM_CARAC_COMDAT) != 0)
+}
+
+// C: nativo/obj/coff_membro.c:210
+proc cm_coletar_selecao(m: ^CmMembro, i: u32, e: []u8) -> bool {
+    let sec: i16 = common.c2f_trunc_i16(common.c2f_ler_u16_le(e, COFF_OFF_SIM_SECAO as int) as u64)
+    let ini_aux: int = COFF_TAM_SIMBOLO as int
+    if (not cm_forma_de_def_secao(e)) or (not cm_secao_comdat(m, sec)) {
+        return true
+    }
+    let s: ^CmSecao = cm_sec(m, common.c2f_s2u_32(sec as i32) - 1)
+    s.assoc = common.c2f_ler_u16_le(e, ini_aux + (CM_OFF_AUX_NUMERO as int))
+    s.selecao = e[ini_aux + (CM_OFF_AUX_SELECAO as int)]
+    return true
+}
+
+// C: nativo/obj/coff_membro.c:225
+proc cm_achar_comdat(u: ^CoffUniao, simbolo: u32) -> ?^CoffComdat {
+    for k in (0 as u64)..<(len(u.comdats) as u64) {
+        let c: ^CoffComdat = &u.comdats[k]
+        if c.simbolo == simbolo {
+            return c
+        }
+    }
+    return none
+}
+
+// C: nativo/obj/coff_membro.c:237
+proc cm_conteudo_igual(m: ^CmMembro, a: i32, b: i32) -> bool {
+    let sa: ^ObjSecao = &(m.l.o as ^Objeto).secoes[common.c2f_s2u_64(a as i64)]
+    let sb: ^ObjSecao = &(m.l.o as ^Objeto).secoes[common.c2f_s2u_64(b as i64)]
+    if (common.c2f_s2u_32(sa.tipo) != common.c2f_s2u_32(sb.tipo)) or (cm_tamanho(m, a) != cm_tamanho(m, b)) {
+        return false
+    }
+    if (sa.tipo == OS_BSS) or (len(sa.bytes) == 0) {
+        return true
+    }
+    // tamanhos iguais e nao BSS: sb.bytes tem o mesmo len de sa.bytes
+    var k: u64 = 0
+    while k < (len(sa.bytes) as u64) {
+        if sa.bytes[k] != sb.bytes[k] {
+            return false
+        }
+        k += 1
+    }
+    return true
+}
+
+// C: nativo/obj/coff_membro.c:247
+proc cm_secao_igual(m: ^CmMembro, a: i32, b: i32) -> bool {
+    let sa: ^ObjSecao = &(m.l.o as ^Objeto).secoes[common.c2f_s2u_64(a as i64)]
+    let sb: ^ObjSecao = &(m.l.o as ^Objeto).secoes[common.c2f_s2u_64(b as i64)]
+    return (((sa.nome or_else "") == (sb.nome or_else "")) and (common.c2f_s2u_32(sa.tipo) == common.c2f_s2u_32(sb.tipo))) and (cm_tamanho(m, a) == cm_tamanho(m, b))
+}
+
+// C: nativo/obj/coff_membro.c:255
+proc cm_local_definido(s: ^ObjSimbolo) -> bool {
+    return ((s.nome or_else "")[0] == 46) and (s.secao >= 0) // '.'
+}
+
+// C: nativo/obj/coff_membro.c:261
+proc cm_alvo_equivalente(m: ^CmMembro, a: u32, b: u32) -> bool {
+    let x: ^ObjSimbolo = &(m.l.o as ^Objeto).simbolos[a as u64]
+    let y: ^ObjSimbolo = &(m.l.o as ^Objeto).simbolos[b as u64]
+    if a == b {
+        return true
+    }
+    return (((common.c2f_b2i32(cm_local_definido(x)) != 0) and (common.c2f_b2i32(cm_local_definido(y)) != 0)) and (x.off == y.off)) and (common.c2f_b2i32(cm_secao_igual(m, x.secao, y.secao)) != 0)
+}
+
+// C: nativo/obj/coff_membro.c:272
+proc cm_proxima_reloc(o: ^Objeto, k: ^u64, secao: u32) -> ?^ObjReloc {
+    while k^ < (len(o.relocs) as u64) {
+        let antes_1: u64 = k^
+        k^ += 1
+        let r: ^ObjReloc = &o.relocs[antes_1]
+        if r.alvo.secao == secao {
+            return r
+        }
+    }
+    return none
+}
+
+// C: nativo/obj/coff_membro.c:283
+proc cm_reloc_igual(m: ^CmMembro, x: ?^ObjReloc, y: ?^ObjReloc) -> bool {
+    return ((((x as ^ObjReloc).alvo.off == (y as ^ObjReloc).alvo.off) and (common.c2f_s2u_32((x as ^ObjReloc).correcao.tipo) == common.c2f_s2u_32((y as ^ObjReloc).correcao.tipo))) and ((x as ^ObjReloc).correcao.adendo == (y as ^ObjReloc).correcao.adendo)) and (common.c2f_b2i32(cm_alvo_equivalente(m, (x as ^ObjReloc).correcao.simbolo, (y as ^ObjReloc).correcao.simbolo)) != 0)
+}
+
+// C: nativo/obj/coff_membro.c:289
+proc cm_relocs_iguais(m: ^CmMembro, a: u32, b: u32) -> bool {
+    var ka: u64 = 0
+    var kb: u64 = 0
+    while true {
+        let x: ?^ObjReloc = cm_proxima_reloc(m.l.o as ^Objeto, &ka, a)
+        let y: ?^ObjReloc = cm_proxima_reloc(m.l.o as ^Objeto, &kb, b)
+        if (x == none) or (y == none) {
+            return (x == none) and (y == none)
+        }
+        if not cm_reloc_igual(m, x, y) {
+            return false
+        }
+    }
+    return true
+}
+
+// C: nativo/obj/coff_membro.c:305
+proc cm_comdat_difere(m: ^CmMembro, nome: ?str, selecao: str) -> bool {
+    let txt_1 = nome or_else "(null)"
+    let txt_2 = m.membro or_else "(null)"
+    let msg_1 = format(f"COFF: simbolo '{txt_1}' COMDAT {selecao} difere entre os membros (o segundo e '{txt_2}')", alloc = heap)
+    defer delete(msg_1)
+    return common.diag_relatar(m.l.erro as ^common.Diag, common.X0903, 0, msg_1)
+}
+
+// C: nativo/obj/coff_membro.c:311
+proc cm_conferir_exatos(m: ^CmMembro) -> bool {
+    var i: u32 = 0
+    while i < m.l.nsec {
+        let s: ^CmSecao = cm_sec(m, i)
+        var lider: ?^ObjSimbolo = none
+        if not s.conferir {
+            i += 1
+            continue
+        }
+        if (common.c2f_b2i32(cm_conteudo_igual(m, transmute(s.par, to = i32), s.idx)) != 0) and (common.c2f_b2i32(cm_relocs_iguais(m, s.par, common.c2f_s2u_32(s.idx))) != 0) {
+            i += 1
+            continue
+        }
+        lider = &(m.l.o as ^Objeto).simbolos[s.simbolo as u64]
+        return cm_comdat_difere(m, (lider as ^ObjSimbolo).nome, "EXACT_MATCH")
+    }
+    return true
+}
+
+// C: nativo/obj/coff_membro.c:328
+proc cm_conferir_tamanho(m: ^CmMembro, s: ^CmSim, sec: ^CmSecao, c: ?^CoffComdat) -> bool {
+    if cm_tamanho(m, transmute((c as ^CoffComdat).secao, to = i32)) != cm_tamanho(m, sec.idx) {
+        var tern_1: str = "SAME_SIZE"
+        if sec.selecao == (CM_SEL_EXATO as u8) {
+            tern_1 = "EXACT_MATCH"
+        }
+        return cm_comdat_difere(m, s.nome, tern_1)
+    }
+    sec.conferir = sec.selecao == (CM_SEL_EXATO as u8)
+    sec.par = (c as ^CoffComdat).secao
+    sec.simbolo = (c as ^CoffComdat).simbolo
+    return true
+}
+
+// C: nativo/obj/coff_membro.c:339
+proc cm_anular_com_associadas(u: ^CoffUniao, secao: u32) {
+    append(&u.anuladas, item = 0)
+    u.anuladas[len(u.anuladas) - 1] = secao
+    var k: u64 = 0
+    while k < (len(u.associadas) as u64) {
+        let a: ^CoffAssociada = &u.associadas[k]
+        if a.pai != secao {
+            k += 1
+            continue
+        }
+        a.pai = 4294967295
+        cm_anular_com_associadas(u, a.filho)
+        k += 1
+    }
+}
+
+// C: nativo/obj/coff_membro.c:353
+proc cm_promover(m: ^CmMembro, c: ?^CoffComdat, s: ^CmSim, sec: ^CmSecao) {
+    let sim: ^ObjSimbolo = &(m.l.o as ^Objeto).simbolos[(c as ^CoffComdat).simbolo as u64]
+    cm_anular_com_associadas(m.u as ^CoffUniao, (c as ^CoffComdat).secao)
+    sim.secao = sec.idx
+    sim.off = s.valor
+    sec.promovida = true
+    sec.par = (c as ^CoffComdat).secao
+    let ptr_1: ^CoffComdat = c as ^CoffComdat
+    ptr_1.secao = common.c2f_s2u_32(sec.idx)
+    let ptr_2: ^CoffComdat = c as ^CoffComdat
+    ptr_2.tam = cm_tamanho(m, sec.idx)
+}
+
+// C: nativo/obj/coff_membro.c:366
+proc cm_comdat_duplicado(m: ^CmMembro, s: ^CmSim, sec: ^CmSecao, c: ?^CoffComdat) -> bool {
+    let sw_1 = sec.selecao as i32
+    if sw_1 == CM_SEL_NODUP {
+        let txt_1 = s.nome or_else "(null)"
+        let txt_2 = m.membro or_else "(null)"
+        let msg_1 = format(f"COFF: simbolo '{txt_1}' definido em dois membros e a secao e COMDAT NODUPLICATES (o segundo e '{txt_2}')", alloc = heap)
+        defer delete(msg_1)
+        return common.diag_relatar(m.l.erro as ^common.Diag, common.X0106, 0, msg_1)
+    } else if sw_1 == CM_SEL_MESMO_TAMANHO or sw_1 == CM_SEL_EXATO {
+        if not cm_conferir_tamanho(m, s, sec, c) {
+            return false
+        }
+    } else if sw_1 == CM_SEL_MAIOR {
+        if cm_tamanho(m, sec.idx) > (c as ^CoffComdat).tam {
+            cm_promover(m, c, s, sec)
+            return true
+        }
+    } else {
+    }
+    sec.anulada = true
+    return true
+}
+
+// C: nativo/obj/coff_membro.c:391
+proc cm_definir_global(m: ^CmMembro, s: ^CmSim, secao: i32) -> bool {
+    let idx: u32 = obj_simbolo_referir(m.l.o as ^Objeto, s.nome)
+    let sim: ^ObjSimbolo = &(m.l.o as ^Objeto).simbolos[idx as u64]
+    if sim.secao != OBJ_SECAO_INDEFINIDA {
+        let txt_1 = s.nome or_else "(null)"
+        let txt_2 = m.membro or_else "(null)"
+        let msg_1 = format(f"COFF: simbolo '{txt_1}' definido em dois membros (o segundo e '{txt_2}')", alloc = heap)
+        defer delete(msg_1)
+        return common.diag_relatar(m.l.erro as ^common.Diag, common.X0106, 0, msg_1)
+    }
+    _ = obj_simbolo_definir(m.l.o as ^Objeto, s.nome, secao, s.valor)
+    cm_mapear(m, s.i, idx)
+    return true
+}
+
+// C: nativo/obj/coff_membro.c:403
+proc cm_lider_comdat(m: ^CmMembro, s: ^CmSim, sec: ^CmSecao) -> bool {
+    let u: ?^CoffUniao = m.u
+    let idx: u32 = obj_simbolo_referir(m.l.o as ^Objeto, s.nome)
+    let c: ?^CoffComdat = cm_achar_comdat(u as ^CoffUniao, idx)
+    sec.tem_lider = true
+    if c != none {
+        cm_mapear(m, s.i, idx)
+        return cm_comdat_duplicado(m, s, sec, c)
+    }
+    if not cm_definir_global(m, s, sec.idx) {
+        return false
+    }
+    let ptr_1: ^CoffUniao = u as ^CoffUniao
+    append(&ptr_1.comdats, item = CoffComdat{})
+    ptr_1.comdats[len(ptr_1.comdats) - 1] = CoffComdat{simbolo = idx, secao = common.c2f_s2u_32(sec.idx), tam = cm_tamanho(m, sec.idx), selecao = sec.selecao}
+    return true
+}
+
+// C: nativo/obj/coff_membro.c:421
+proc cm_definir_local(m: ^CmMembro, s: ^CmSim, secao: i32) -> bool {
+    let membros: u32 = (m.u as ^CoffUniao).membros
+    let nome = format(f".{membros}.{s.i}", alloc = heap)
+    defer delete(nome)
+    let idx: u32 = obj_simbolo_referir(m.l.o as ^Objeto, nome)
+    _ = obj_simbolo_definir(m.l.o as ^Objeto, nome, secao, s.valor)
+    cm_mapear(m, s.i, idx)
+    return true
+}
+
+// C: nativo/obj/coff_membro.c:433
+proc cm_compartilhado(s: ^CmSim) -> bool {
+    return (s.classe == (COFF_CLASSE_EXTERNA as u8)) and (not common.c2f_prefixo_igual((s.nome or_else ""), CM_PREFIXO_FRACO, 6))
+}
+
+// C: nativo/obj/coff_membro.c:438
+proc cm_eh_comdat_de_lider(sec: ^CmSecao) -> bool {
+    return (((sec.carac & CM_CARAC_COMDAT) != 0) and (sec.selecao != (CM_SEL_NENHUMA as u8))) and (sec.selecao != (CM_SEL_ASSOCIATIVA as u8))
+}
+
+// C: nativo/obj/coff_membro.c:445
+proc cm_definir_de_comdat(m: ^CmMembro, s: ^CmSim, sec: ^CmSecao) -> bool {
+    let idx: u32 = obj_simbolo_referir(m.l.o as ^Objeto, s.nome)
+    let sim: ^ObjSimbolo = &(m.l.o as ^Objeto).simbolos[idx as u64]
+    if sec.anulada {
+        cm_mapear(m, s.i, idx)
+        return true
+    }
+    if (common.c2f_b2i32(sec.promovida) != 0) and (sim.secao == transmute(sec.par, to = i32)) {
+        sim.secao = sec.idx
+        sim.off = s.valor
+        cm_mapear(m, s.i, idx)
+        return true
+    }
+    return cm_definir_global(m, s, sec.idx)
+}
+
+// C: nativo/obj/coff_membro.c:463
+proc cm_definir(m: ^CmMembro, s: ^CmSim) -> bool {
+    var sec: ?^CmSecao = none
+    if common.c2f_s2u_32(s.sec as i32) > m.l.nsec {
+        let txt_1 = s.nome or_else "(null)"
+        let msg_1 = format(f"COFF: simbolo '{txt_1}' aponta para a secao {s.sec as i32}, que nao existe", alloc = heap)
+        defer delete(msg_1)
+        return common.diag_relatar(m.l.erro as ^common.Diag, common.X0903, 0, msg_1)
+    }
+    sec = cm_sec(m, common.c2f_s2u_32(s.sec as i32) - 1)
+    if (sec as ^CmSecao).idx == CM_SEM_SECAO {
+        return true
+    }
+    if not cm_compartilhado(s) {
+        return cm_definir_local(m, s, (sec as ^CmSecao).idx)
+    }
+    if cm_eh_comdat_de_lider(sec as ^CmSecao) {
+        var tern_1: i32 = 0
+        if common.c2f_b2i32((sec as ^CmSecao).tem_lider) != 0 {
+            tern_1 = common.c2f_b2i32(cm_definir_de_comdat(m, s, sec as ^CmSecao))
+        } else {
+            tern_1 = common.c2f_b2i32(cm_lider_comdat(m, s, sec as ^CmSecao))
+        }
+        return tern_1 != 0
+    }
+    return cm_definir_global(m, s, (sec as ^CmSecao).idx)
+}
+
+// C: nativo/obj/coff_membro.c:479
+proc cm_registrar_fraco(m: ^CmMembro, s: ^CmSim) -> bool {
+    let idx: u32 = obj_simbolo_referir(m.l.o as ^Objeto, s.nome)
+    var padrao: u32 = COFF_SIMBOLO_NAO_MAPEADO
+    if s.e[COFF_OFF_SIM_AUX as u64] >= 1 {
+        padrao = common.c2f_ler_u32_le(s.e, COFF_TAM_SIMBOLO as int)
+    }
+    let u: ^CoffUniao = m.u as ^CoffUniao
+    append(&u.fracos, item = CoffFraco{simbolo = idx, padrao = padrao})
+    cm_mapear(m, s.i, idx)
+    return true
+}
+
+// C: nativo/obj/coff_membro.c:491
+proc cm_achar_comum(u: ^CoffUniao, simbolo: u32) -> ?^CoffComum {
+    for k in (0 as u64)..<(len(u.comuns) as u64) {
+        let c: ^CoffComum = &u.comuns[k]
+        if c.simbolo == simbolo {
+            return c
+        }
+    }
+    return none
+}
+
+// C: nativo/obj/coff_membro.c:503
+proc cm_registrar_comum(m: ^CmMembro, s: ^CmSim) -> bool {
+    let idx: u32 = obj_simbolo_referir(m.l.o as ^Objeto, s.nome)
+    let c: ?^CoffComum = cm_achar_comum(m.u as ^CoffUniao, idx)
+    if c == none {
+        let ptr_1: ^CoffUniao = m.u as ^CoffUniao
+        append(&ptr_1.comuns, item = CoffComum{})
+        ptr_1.comuns[len(ptr_1.comuns) - 1] = CoffComum{simbolo = idx, tam = s.valor}
+    } else if s.valor > (c as ^CoffComum).tam {
+        let ptr_2: ^CoffComum = c as ^CoffComum
+        ptr_2.tam = s.valor
+    }
+    cm_mapear(m, s.i, idx)
+    return true
+}
+
+// C: nativo/obj/coff_membro.c:517
+proc cm_sem_secao(m: ^CmMembro, s: ^CmSim) -> bool {
+    if s.classe == (COFF_CLASSE_FRACA as u8) {
+        return cm_registrar_fraco(m, s)
+    }
+    if s.classe != (COFF_CLASSE_EXTERNA as u8) {
+        return true
+    }
+    if s.valor > 0 {
+        return cm_registrar_comum(m, s)
+    }
+    let arg_1: u32 = obj_simbolo_referir(m.l.o as ^Objeto, s.nome)
+    let arg_2: u32 = s.i
+    let arg_3: ^CmMembro = m
+    cm_mapear(arg_3, arg_2, arg_1)
+    return true
+}
+
+// C: nativo/obj/coff_membro.c:529
+proc cm_ler_simbolo(m: ^CmMembro, i: u32, e: []u8) -> bool {
+    let arena: ^common.Arena = &(m.l.o as ^Objeto).nomes
+    let nome: ?str = coff_nome_simbolo(&m.l, e, arena)
+    var s = CmSim{i = i, nome = nome, sec = common.c2f_trunc_i16(common.c2f_ler_u16_le(e, COFF_OFF_SIM_SECAO as int) as u64), valor = common.c2f_ler_u32_le(e, COFF_OFF_SIM_VALOR as int), classe = e[COFF_OFF_SIM_CLASSE as u64], e = e}
+    if nome == none {
+        return coff_falha(m.l.erro as ^common.Diag, "nome de simbolo fora da tabela de strings")
+    }
+    if (s.sec as i32) == COFF_SEC_NENHUMA {
+        return cm_sem_secao(m, &s)
+    }
+    if s.sec < 0 {
+        return true
+    }
+    return cm_definir(m, &s)
+}
+
+// C: nativo/obj/coff_membro.c:545
+proc cm_resolver_fracos(m: ^CmMembro) {
+    var k: u64 = m.fracos_ini
+    while k < (len((m.u as ^CoffUniao).fracos) as u64) {
+        let f: ^CoffFraco = &(m.u as ^CoffUniao).fracos[k]
+        var tern_1: u32 = COFF_SIMBOLO_NAO_MAPEADO
+        if f.padrao < m.l.nsim {
+            tern_1 = m.l.mapa[f.padrao as u64]
+        }
+        f.padrao = tern_1
+        k += 1
+    }
+}
+
+// C: nativo/obj/coff_membro.c:556
+proc cm_associada_anulada(m: ^CmMembro, i: u32) -> bool {
+    let s: ^CmSecao = cm_sec(m, i)
+    if (((common.c2f_b2i32(s.anulada) != 0) or (s.selecao != (CM_SEL_ASSOCIATIVA as u8))) or (s.assoc == 0)) or ((s.assoc as u32) > m.l.nsec) {
+        return false
+    }
+    if not cm_sec(m, (s.assoc as u32) - 1).anulada {
+        return false
+    }
+    s.anulada = true
+    return true
+}
+
+// C: nativo/obj/coff_membro.c:569
+proc cm_propagar_anuladas(m: ^CmMembro) {
+    var mudou: bool = true
+    while mudou {
+        mudou = false
+        var i: u32 = 0
+        while i < m.l.nsec {
+            mudou = (common.c2f_b2i32(cm_associada_anulada(m, i)) != 0) or (common.c2f_b2i32(mudou) != 0)
+            i += 1
+        }
+    }
+}
+
+// C: nativo/obj/coff_membro.c:581
+proc cm_pai_vivo(m: ^CmMembro, s: ^CmSecao) -> ?^CmSecao {
+    var pai: ?^CmSecao = none
+    if (((s.selecao != (CM_SEL_ASSOCIATIVA as u8)) or (s.idx == CM_SEM_SECAO)) or (s.assoc == 0)) or ((s.assoc as u32) > m.l.nsec) {
+        return none
+    }
+    pai = cm_sec(m, (s.assoc as u32) - 1)
+    var tern_1: ?^CmSecao = pai
+    if (pai as ^CmSecao).idx == CM_SEM_SECAO {
+        tern_1 = none
+    }
+    return tern_1
+}
+
+// C: nativo/obj/coff_membro.c:592
+proc cm_registrar_associadas(m: ^CmMembro) {
+    var i: u32 = 0
+    while i < m.l.nsec {
+        let s: ^CmSecao = cm_sec(m, i)
+        var tern_1: ?^CmSecao = none
+        if common.c2f_b2i32(s.anulada) != 0 {
+            tern_1 = none
+        } else {
+            tern_1 = cm_pai_vivo(m, s)
+        }
+        let pai: ?^CmSecao = tern_1
+        if pai != none {
+            let ptr_1: ^CoffUniao = m.u as ^CoffUniao
+            append(&ptr_1.associadas, item = CoffAssociada{})
+            ptr_1.associadas[len(ptr_1.associadas) - 1] = CoffAssociada{pai = common.c2f_s2u_32((pai as ^CmSecao).idx), filho = common.c2f_s2u_32(s.idx)}
+        }
+        i += 1
+    }
+}
+
+// C: nativo/obj/coff_membro.c:603
+proc cm_registrar_anuladas(m: ^CmMembro) {
+    var i: u32 = 0
+    while i < m.l.nsec {
+        let s: ^CmSecao = cm_sec(m, i)
+        if (common.c2f_b2i32(s.anulada) != 0) and (s.idx != CM_SEM_SECAO) {
+            let ptr_1: ^CoffUniao = m.u as ^CoffUniao
+            append(&ptr_1.anuladas, item = 0)
+            ptr_1.anuladas[len(ptr_1.anuladas) - 1] = common.c2f_s2u_32(s.idx)
+        }
+        i += 1
+    }
+}
+
+// C: nativo/obj/coff_membro.c:615
+proc cm_alvo_da_reloc(m: ^CmMembro, simb: u32, alvo: ^u32) -> bool {
+    if (simb as u64) >= (len(m.l.mapa) as u64) {
+        return false
+    }
+    alvo^ = m.l.mapa[simb as u64]
+    return alvo^ != COFF_SIMBOLO_NAO_MAPEADO
+}
+
+// C: nativo/obj/coff_membro.c:623
+proc cm_reloc(m: ^CmMembro, idx: u32, r: []u8) -> bool {
+    let va: u32 = common.c2f_ler_u32_le(r, 0)
+    let simb: u32 = common.c2f_ler_u32_le(r, COFF_TAM_CAMPO as int)
+    let codigo: u16 = common.c2f_ler_u16_le(r, 2 * (COFF_TAM_CAMPO as int))
+    let s: ^ObjSecao = &(m.l.o as ^Objeto).secoes[idx as u64]
+    var tipo: CoffRelocSuportada = CoffRelocSuportada{}
+    var alvo: u32 = 0
+    let membro_txt = m.membro or_else "(null)"
+    let secao_txt = s.nome or_else "(null)"
+    if (codigo as u32) == CM_RELOC_ABSOLUTA {
+        return true
+    }
+    if not coff_tipo_reloc(codigo, &tipo) {
+        let msg_1 = format(f"COFF: relocacao de tipo 0x{codigo:x} na secao '{secao_txt}' do membro '{membro_txt}' (aceitas: ADDR64, ADDR32NB, REL32, REL32_1..5, SECTION, SECREL)", alloc = heap)
+        defer delete(msg_1)
+        return common.diag_relatar(m.l.erro as ^common.Diag, common.X0903, 0, msg_1)
+    }
+    if not cm_alvo_da_reloc(m, simb, &alvo) {
+        let msg_2 = format(f"COFF: membro '{membro_txt}', relocacao na secao '{secao_txt}' aponta para o simbolo {simb}, que nao entrou no objeto", alloc = heap)
+        defer delete(msg_2)
+        return common.diag_relatar(m.l.erro as ^common.Diag, common.X0903, 0, msg_2)
+    }
+    if (s.tipo == OS_BSS) or (not coff_cabe(len(s.bytes) as u64, va as u64, tipo.tam as u64)) {
+        let msg_3 = format(f"COFF: membro '{membro_txt}', relocacao em 0x{va:x} fora dos bytes da secao '{secao_txt}'", alloc = heap)
+        defer delete(msg_3)
+        return common.diag_relatar(m.l.erro as ^common.Diag, common.X0903, 0, msg_3)
+    }
+    let ini_campo: int = va as int
+    let fim_campo: int = ((va as u64) + (tipo.tam as u64)) as int
+    let adendo: i64 = wrapping_add(coff_adendo(s.bytes[ini_campo..<fim_campo]), tipo.delta as i64)
+    obj_relocar(m.l.o as ^Objeto, ObjAlvoReloc{secao = idx, off = va}, ObjCorrecao{tipo = tipo.tipo, simbolo = alvo, adendo = adendo})
+    for k in (0 as u64)..<(tipo.tam as u64) {
+        s.bytes[(va as u64) + k] = 0
+    }
+    return true
+}
+
+// C: nativo/obj/coff_membro.c:645
+proc cm_relocs_da_secao(m: ^CmMembro, i: u32) -> bool {
+    let h: []u8 = coff_cabecalho_secao(&m.l, i)
+    let ptr: u64 = common.c2f_ler_u32_le(h, COFF_OFF_SEC_PTR_RELOC as int) as u64
+    let qtd: u32 = common.c2f_ler_u16_le(h, COFF_OFF_SEC_QTD_RELOC as int) as u32
+    if not coff_cabe(m.l.n, ptr, (qtd as u64) * (COFF_TAM_RELOC as u64)) {
+        return coff_falha(m.l.erro as ^common.Diag, "tabela de relocacoes fora do arquivo")
+    }
+    let bytes: []u8 = m.l.b or_else {}
+    var k: u32 = 0
+    while k < qtd {
+        let ini_reloc: int = (ptr + ((k as u64) * (COFF_TAM_RELOC as u64))) as int
+        if not cm_reloc(m, common.c2f_s2u_32(cm_sec(m, i).idx), bytes[ini_reloc..<(ini_reloc + (COFF_TAM_RELOC as int))]) {
+            return false
+        }
+        k += 1
+    }
+    return true
+}
+
+// C: nativo/obj/coff_membro.c:660
+proc cm_ler_relocacoes(m: ^CmMembro) -> bool {
+    var i: u32 = 0
+    while i < m.l.nsec {
+        if (cm_sec(m, i).idx != CM_SEM_SECAO) and (not cm_relocs_da_secao(m, i)) {
+            return false
+        }
+        i += 1
+    }
+    return true
+}
+
+// C: nativo/obj/coff_membro.c:672
+proc cm_ler_secoes_e_simbolos(m: ^CmMembro) -> bool {
+    return cm_ler_secoes(m) and cm_preparar_simbolos(m) and cm_percorrer(m, CM_VISITA_CM_COLETAR_SELECAO) and cm_percorrer(m, CM_VISITA_CM_LER_SIMBOLO)
+}
+
+// C: nativo/obj/coff_membro.c:677
+proc cm_ler_membro(m: ^CmMembro) -> bool {
+    if not coff_ler_cabecalho(&m.l) {
+        return false
+    }
+    coff_ler_tabela_strings(&m.l)
+    if not cm_ler_secoes_e_simbolos(m) {
+        return false
+    }
+    cm_resolver_fracos(m)
+    cm_propagar_anuladas(m)
+    cm_registrar_associadas(m)
+    if (not cm_ler_relocacoes(m)) or (not cm_conferir_exatos(m)) {
+        return false
+    }
+    cm_registrar_anuladas(m)
+    return true
+}
+
+// C: nativo/obj/coff_membro.c:693
+// C2F-70: CmMembro local; secoes e mapa (vetores) sao liberados em todo retorno
+proc coff_uniao_ler_membro(u: ^CoffUniao, membro: ^CoffMembroEntrada, erro: ^common.Diag) -> bool {
+    var bytes: ?[]u8 = none
+    if membro.dados != none {
+        bytes = slice_from(membro.dados as ^u8, len = membro.tam as int)
+    }
+    var m = CmMembro{u = u, l = CoffLeitor{b = bytes, n = membro.tam, o = u.o, erro = erro, mapa = make([dynamic]u32, alloc = heap)}, membro = membro.nome, secoes = make([dynamic]CmSecao, alloc = heap), fracos_ini = len(u.fracos) as u64}
+    let ok: bool = cm_ler_membro(&m)
+    u.membros += 1
+    delete(m.secoes)
+    delete(m.l.mapa)
+    return ok
+}
+
+// C: nativo/obj/coff_membro.c:707
+proc coff_uniao_iniciar(u: ^CoffUniao, o: ^Objeto) {
+    u^ = CoffUniao{o = o, comdats = make([dynamic]CoffComdat, alloc = heap), comuns = make([dynamic]CoffComum, alloc = heap), fracos = make([dynamic]CoffFraco, alloc = heap), alinhamentos = make([dynamic]CoffDiretiva, alloc = heap), bibliotecas = make([dynamic]str, alloc = heap), exportados = make([dynamic]str, alloc = heap), anuladas = make([dynamic]u32, alloc = heap), associadas = make([dynamic]CoffAssociada, alloc = heap)}
+}
+
+// C: nativo/obj/coff_membro.c:721
+proc coff_uniao_liberar(u: ^CoffUniao) {
+    delete(u.comdats)
+    delete(u.comuns)
+    delete(u.fracos)
+    delete(u.alinhamentos)
+    delete(u.bibliotecas)
+    delete(u.exportados)
+    delete(u.anuladas)
+    delete(u.associadas)
+}
+
+// ---------- testes dirigidos (COFF montado em memoria) ----------
+
+proc cmt_zerar(b: ^[dynamic]u8, tam: u64) {
+    for _k in (0 as u64)..<tam {
+        append(b, item = 0)
+    }
+}
+
+proc cmt_u(b: ^[dynamic]u8, off: u64, v: u64, n: u64) {
+    for k in (0 as u64)..<n {
+        b[off + k] = ((v >> (k * 8)) & 255) as u8
+    }
+}
+
+proc cmt_txt(b: ^[dynamic]u8, off: u64, s: str) {
+    let t: []u8 = as_bytes(s)
+    for k in (0 as int)..<len(s) {
+        b[(off as int) + k] = t[k]
+    }
+}
+
+proc cmt_cabecalho(b: ^[dynamic]u8, nsec: u64, ptr_sim: u64, nsim: u64) {
+    cmt_u(b, 0, 34404, 2)
+    cmt_u(b, 2, nsec, 2)
+    cmt_u(b, 8, ptr_sim, 4)
+    cmt_u(b, 12, nsim, 4)
+}
+
+proc cmt_secao(b: ^[dynamic]u8, k: u64, nome: str, raw: u64, ptr: u64, ptr_rel: u64, nrel: u64, carac: u64) {
+    let base: u64 = 20 + (40 * k)
+    cmt_txt(b, base, nome)
+    cmt_u(b, base + 16, raw, 4)
+    cmt_u(b, base + 20, ptr, 4)
+    cmt_u(b, base + 24, ptr_rel, 4)
+    cmt_u(b, base + 32, nrel, 2)
+    cmt_u(b, base + 36, carac, 4)
+}
+
+proc cmt_simbolo(b: ^[dynamic]u8, off: u64, nome: str, valor: u64, sec: u64, classe: u64, aux: u64) {
+    cmt_txt(b, off, nome)
+    cmt_u(b, off + 8, valor, 4)
+    cmt_u(b, off + 12, sec, 2)
+    cmt_u(b, off + 16, classe, 1)
+    cmt_u(b, off + 17, aux, 1)
+}
+
+proc cmt_ler(u: ^CoffUniao, b: ^[dynamic]u8, nome: str, erro: ^common.Diag) -> bool {
+    var e = CoffMembroEntrada{dados = &b[0], tam = len(b) as u64, nome = nome}
+    return coff_uniao_ler_membro(u, &e, erro)
+}
+
+// 1 secao ".text$x" COMDAT de `dados` bytes + simbolo da secao (aux com a selecao) + externo "dup"
+proc cmt_comdat(b: ^[dynamic]u8, dados: u64, selecao: u64) {
+    let sim: u64 = 60 + dados
+    cmt_zerar(b, sim + 54 + 4)
+    cmt_cabecalho(b, 1, sim, 3)
+    cmt_secao(b, 0, ".text$x", dados, 60, 0, 0, 4128)
+    cmt_simbolo(b, sim, ".text$x", 0, 1, 3, 1)
+    cmt_u(b, sim + 18 + 14, selecao, 1)
+    cmt_simbolo(b, sim + 36, "dup", 0, 1, 2, 0)
+    cmt_u(b, sim + 54, 4, 4)
+}
+
+test "cm_eh_tls e forma de def de secao" {
+    expect(cm_eh_tls(as_bytes(".tls")))
+    expect(cm_eh_tls(as_bytes(".tls$abc")))
+    expect(not cm_eh_tls(as_bytes(".tlsx")))
+    expect(not cm_eh_tls(as_bytes(".tl")))
+    expect(not cm_eh_tls(as_bytes(".text")))
+    var b = make([dynamic]u8, alloc = heap)
+    defer delete(b)
+    cmt_zerar(&b, 36)
+    cmt_simbolo(&b, 0, "s", 0, 1, 3, 1)
+    expect(cm_forma_de_def_secao(b[0..<36]))
+    cmt_u(&b, 8, 1, 4)
+    expect(not cm_forma_de_def_secao(b[0..<36]))
+    cmt_u(&b, 8, 0, 4)
+    cmt_u(&b, 14, 32, 2)
+    expect(not cm_forma_de_def_secao(b[0..<36]))
+    cmt_u(&b, 14, 0, 2)
+    cmt_u(&b, 16, 2, 1)
+    expect(not cm_forma_de_def_secao(b[0..<36]))
+    cmt_u(&b, 16, 3, 1)
+    cmt_u(&b, 17, 0, 1)
+    expect(not cm_forma_de_def_secao(b[0..<36]))
+}
+
+test "coff_uniao_ler_membro: secao, simbolos e relocacao" {
+    var o = Objeto{}
+    obj_iniciar(&o)
+    defer obj_liberar(&o)
+    var u = CoffUniao{}
+    coff_uniao_iniciar(&u, &o)
+    defer coff_uniao_liberar(&u)
+    var d = common.Diag{}
+    var b = make([dynamic]u8, alloc = heap)
+    defer delete(b)
+    cmt_zerar(&b, 118)
+    cmt_cabecalho(&b, 1, 78, 2)
+    cmt_secao(&b, 0, ".text", 8, 60, 68, 1, 32)
+    cmt_u(&b, 60, 16, 4)
+    cmt_u(&b, 68, 0, 4)
+    cmt_u(&b, 72, 1, 4)
+    cmt_u(&b, 76, 4, 2)
+    cmt_simbolo(&b, 78, "f", 0, 1, 2, 0)
+    cmt_simbolo(&b, 96, "g", 0, 0, 2, 0)
+    cmt_u(&b, 114, 4, 4)
+    expect(cmt_ler(&u, &b, "a.o", &d))
+    expect(u.membros == 1)
+    expect(len(o.secoes) == 1)
+    expect((o.secoes[0].nome or_else "") == ".text")
+    expect(o.secoes[0].tipo == OS_TEXTO)
+    expect(len(o.secoes[0].bytes) == 8)
+    expect(o.secoes[0].bytes[0] == 0)
+    expect(len(o.relocs) == 1)
+    expect(o.relocs[0].correcao.adendo == 16)
+    expect(o.relocs[0].correcao.simbolo == 1)
+    expect(o.relocs[0].correcao.tipo == OR_REL32)
+    expect(len(o.simbolos) == 2)
+    expect((o.simbolos[0].nome or_else "") == "f")
+    expect(o.simbolos[0].secao == 0)
+    expect((o.simbolos[1].nome or_else "") == "g")
+    expect(o.simbolos[1].secao == OBJ_SECAO_INDEFINIDA)
+    // mesmo membro de novo: "f" definido em dois membros
+    var b2 = make([dynamic]u8, alloc = heap)
+    defer delete(b2)
+    cmt_zerar(&b2, 118)
+    cmt_cabecalho(&b2, 1, 78, 2)
+    cmt_secao(&b2, 0, ".text", 8, 60, 68, 1, 32)
+    cmt_u(&b2, 72, 1, 4)
+    cmt_u(&b2, 76, 4, 2)
+    cmt_simbolo(&b2, 78, "f", 0, 1, 2, 0)
+    cmt_simbolo(&b2, 96, "g", 0, 0, 2, 0)
+    cmt_u(&b2, 114, 4, 4)
+    expect(not cmt_ler(&u, &b2, "b.o", &d))
+    expect(d.codigo == common.X0106)
+    expect((d.causa or_else "") == "COFF: simbolo 'f' definido em dois membros (o segundo e 'b.o')")
+    expect(u.membros == 2)
+}
+
+test "coff_uniao_ler_membro: relocacao de tipo desconhecido" {
+    var o = Objeto{}
+    obj_iniciar(&o)
+    defer obj_liberar(&o)
+    var u = CoffUniao{}
+    coff_uniao_iniciar(&u, &o)
+    defer coff_uniao_liberar(&u)
+    var d = common.Diag{}
+    var b = make([dynamic]u8, alloc = heap)
+    defer delete(b)
+    cmt_zerar(&b, 118)
+    cmt_cabecalho(&b, 1, 78, 2)
+    cmt_secao(&b, 0, ".text", 8, 60, 68, 1, 32)
+    cmt_u(&b, 72, 1, 4)
+    cmt_u(&b, 76, 2, 2)
+    cmt_simbolo(&b, 78, "f", 0, 1, 2, 0)
+    cmt_simbolo(&b, 96, "g", 0, 0, 2, 0)
+    cmt_u(&b, 114, 4, 4)
+    expect(not cmt_ler(&u, &b, "a.o", &d))
+    expect(d.codigo == common.X0903)
+    expect((d.causa or_else "") == "COFF: relocacao de tipo 0x2 na secao '.text' do membro 'a.o' (aceitas: ADDR64, ADDR32NB, REL32, REL32_1..5, SECTION, SECREL)")
+}
+
+test "coff_uniao_ler_membro: static, fraco, comum, indefinido e diretivas" {
+    var o = Objeto{}
+    obj_iniciar(&o)
+    defer obj_liberar(&o)
+    var u = CoffUniao{}
+    coff_uniao_iniciar(&u, &o)
+    defer coff_uniao_liberar(&u)
+    var d = common.Diag{}
+    var b = make([dynamic]u8, alloc = heap)
+    defer delete(b)
+    cmt_zerar(&b, 262)
+    cmt_cabecalho(&b, 2, 132, 7)
+    cmt_secao(&b, 0, ".text", 4, 100, 0, 0, 32)
+    cmt_secao(&b, 1, ".drectve", 28, 104, 0, 0, 1049088)
+    cmt_txt(&b, 104, "-defaultlib:foo -export:bar ")
+    cmt_simbolo(&b, 132, "st", 2, 1, 3, 0)
+    cmt_simbolo(&b, 150, "wk", 0, 0, 105, 1)
+    cmt_simbolo(&b, 186, "cm", 16, 0, 2, 0)
+    cmt_simbolo(&b, 204, "ex", 0, 0, 2, 0)
+    cmt_simbolo(&b, 222, "gl", 4, 1, 2, 0)
+    cmt_u(&b, 258, 4, 4)
+    expect(cmt_ler(&u, &b, "a.o", &d))
+    expect(len(o.secoes) == 1)
+    expect(len(o.simbolos) == 5)
+    expect((o.simbolos[0].nome or_else "") == ".0.0")
+    expect(o.simbolos[0].secao == 0)
+    expect(o.simbolos[0].off == 2)
+    expect((o.simbolos[1].nome or_else "") == "wk")
+    expect((o.simbolos[4].nome or_else "") == "gl")
+    expect(o.simbolos[4].off == 4)
+    expect(len(u.fracos) == 1)
+    expect(u.fracos[0].simbolo == 1)
+    expect(u.fracos[0].padrao == 0)
+    expect(len(u.comuns) == 1)
+    expect(u.comuns[0].simbolo == 2)
+    expect(u.comuns[0].tam == 16)
+    expect(len(u.bibliotecas) == 1)
+    expect(u.bibliotecas[0] == "foo")
+    expect(len(u.exportados) == 1)
+    expect(u.exportados[0] == "bar")
+}
+
+test "coff_uniao_ler_membro: secao .tls e auxiliar fora da tabela" {
+    var o = Objeto{}
+    obj_iniciar(&o)
+    defer obj_liberar(&o)
+    var u = CoffUniao{}
+    coff_uniao_iniciar(&u, &o)
+    defer coff_uniao_liberar(&u)
+    var d = common.Diag{}
+    var b = make([dynamic]u8, alloc = heap)
+    defer delete(b)
+    cmt_zerar(&b, 86)
+    cmt_cabecalho(&b, 1, 64, 1)
+    cmt_secao(&b, 0, ".tls$x", 4, 60, 0, 0, 32)
+    cmt_u(&b, 82, 4, 4)
+    expect(not cmt_ler(&u, &b, "m.o", &d))
+    expect(d.codigo == common.X0107)
+    expect((d.causa or_else "") == "COFF: membro 'm.o', secao '.tls$x' (dado thread_local): o ligador nativo nao monta o diretorio TLS do PE")
+    var b2 = make([dynamic]u8, alloc = heap)
+    defer delete(b2)
+    cmt_zerar(&b2, 86)
+    cmt_cabecalho(&b2, 1, 64, 1)
+    cmt_secao(&b2, 0, ".text", 4, 60, 0, 0, 32)
+    cmt_simbolo(&b2, 64, "s", 0, 1, 2, 5)
+    cmt_u(&b2, 82, 4, 4)
+    expect(not cmt_ler(&u, &b2, "m.o", &d))
+    expect((d.causa or_else "") == "COFF: simbolo auxiliar passa do fim da tabela")
+}
+
+test "coff_uniao_ler_membro: COMDAT NODUPLICATES e ANY" {
+    var o = Objeto{}
+    obj_iniciar(&o)
+    defer obj_liberar(&o)
+    var u = CoffUniao{}
+    coff_uniao_iniciar(&u, &o)
+    defer coff_uniao_liberar(&u)
+    var d = common.Diag{}
+    var a = make([dynamic]u8, alloc = heap)
+    defer delete(a)
+    cmt_comdat(&a, 4, 2)
+    var b = make([dynamic]u8, alloc = heap)
+    defer delete(b)
+    cmt_comdat(&b, 4, 2)
+    expect(cmt_ler(&u, &a, "a.o", &d))
+    expect(len(u.comdats) == 1)
+    expect(cmt_ler(&u, &b, "b.o", &d))
+    expect(len(u.comdats) == 1)
+    expect(len(o.simbolos) == 3)
+    expect(len(u.anuladas) == 1)
+    expect(u.anuladas[0] == 1)
+    var n = make([dynamic]u8, alloc = heap)
+    defer delete(n)
+    cmt_comdat(&n, 4, 1)
+    expect(not cmt_ler(&u, &n, "c.o", &d))
+    expect(d.codigo == common.X0106)
+    expect((d.causa or_else "") == "COFF: simbolo 'dup' definido em dois membros e a secao e COMDAT NODUPLICATES (o segundo e 'c.o')")
+}
+
+test "coff_uniao_ler_membro: COMDAT LARGEST promove e SAME_SIZE confere" {
+    var o = Objeto{}
+    obj_iniciar(&o)
+    defer obj_liberar(&o)
+    var u = CoffUniao{}
+    coff_uniao_iniciar(&u, &o)
+    defer coff_uniao_liberar(&u)
+    var d = common.Diag{}
+    var a = make([dynamic]u8, alloc = heap)
+    defer delete(a)
+    cmt_comdat(&a, 4, 6)
+    var b = make([dynamic]u8, alloc = heap)
+    defer delete(b)
+    cmt_comdat(&b, 8, 6)
+    expect(cmt_ler(&u, &a, "a.o", &d))
+    expect(cmt_ler(&u, &b, "b.o", &d))
+    expect(len(u.comdats) == 1)
+    expect(u.comdats[0].secao == 1)
+    expect(u.comdats[0].tam == 8)
+    expect(len(u.anuladas) == 1)
+    expect(u.anuladas[0] == 0)
+    expect(o.simbolos[1].secao == 1)
+    var o2 = Objeto{}
+    obj_iniciar(&o2)
+    defer obj_liberar(&o2)
+    var u2 = CoffUniao{}
+    coff_uniao_iniciar(&u2, &o2)
+    defer coff_uniao_liberar(&u2)
+    var a2 = make([dynamic]u8, alloc = heap)
+    defer delete(a2)
+    cmt_comdat(&a2, 4, 3)
+    var b2 = make([dynamic]u8, alloc = heap)
+    defer delete(b2)
+    cmt_comdat(&b2, 8, 3)
+    expect(cmt_ler(&u2, &a2, "a.o", &d))
+    expect(not cmt_ler(&u2, &b2, "b.o", &d))
+    expect(d.codigo == common.X0903)
+    expect((d.causa or_else "") == "COFF: simbolo 'dup' COMDAT SAME_SIZE difere entre os membros (o segundo e 'b.o')")
+}

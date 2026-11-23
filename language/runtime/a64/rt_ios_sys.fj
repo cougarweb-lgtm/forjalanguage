@@ -1,0 +1,422 @@
+// runtime/a64/rt_ios_sys.fj - ponte syscall do alvo aarch64-apple-ios(-sim): modulo std:a64_ios (I3)
+// Versao: 0.3.0
+// Changelog: 0.3.0 - I4f: fstat/newfstatat (79, 80) caiam no corte `num <= 82` e davam -ENOSYS (std:file.stat falhava no simulador): agora vao a ios_sys_sistema;
+//                    fflush(NULL) da libSystem antes de todo write em fd 1/2 (o puts de foreign ficava em buffer e saia depois dos writes da Forja).
+//            0.2.0 - I4: getdents64 via __getdirentries64 (dirent Darwin -> dirent64 Linux); so sysinfo segue -ENOSYS.
+//            0.1.0 - I3: o runtime a64 chama forja_rt_syscall(num Linux aarch64, a0..a5); no iOS o compilador NAO emite `svc` (o Darwin nao documenta syscall) e a chamada
+//                    vira um BL para rt_syscall deste modulo, que despacha o numero Linux para a libSystem (foreign por GOT/bind do Mach-O). Assim o resto do
+//                    runtime (rt_a64*.fj) segue intacto e fala o contrato Linux (flags, AT_FDCWD=-100, struct stat de 128 B, retorno -errno Linux).
+// Traducoes: flags de open e mmap (Linux -> Darwin); AT_FDCWD -100 -> -2; AT_SYMLINK_NOFOLLOW 0x100 -> 0x20; AT_REMOVEDIR 0x200 -> 0x80; struct stat Darwin (144 B) -> Linux
+//            (128 B, so mode/nlink/size/tempos/ino/dev/uid/gid/blksize/blocks); ru_maxrss de bytes para KiB; getrandom -> getentropy (lotes de 256); exit_group -> exit;
+//            clock MONOTONIC 1 -> 6; erro = -1 + errno de __error() convertido para o numero Linux (musl) e devolvido como -errno.
+// Variadicas (ABI Darwin: argumento anonimo vai na PILHA): openat(fd, caminho, flags, ...) e declarado com 9 parametros (os 5 de enchimento ocupam x3..x7 e o 9o `modo` cai
+//            em [sp], exatamente o 1o slot anonimo da pilha); a linguagem nao muda.
+// Nao implementado (-ENOSYS 38, divergencia aceita nomeada): sysinfo (os.mem_available). getdents64 vai por __getdirentries64 (0.2.0).
+
+import "std:a64_rt" as host
+
+foreign {
+    link "c"
+    proc c_fflush = "fflush"(f: int) -> i32
+    proc c_write = "write"(fd: i32, buf: int, n: int) -> int
+    proc c_read = "read"(fd: i32, buf: int, n: int) -> int
+    proc c_close = "close"(fd: i32) -> i32
+    proc c_openat = "openat"(dirfd: i32, caminho: int, flags: i32, r3: int, r4: int, r5: int, r6: int, r7: int, modo: int) -> i32
+    proc c_lseek = "lseek"(fd: i32, desloc: int, origem: i32) -> int
+    proc c_fsync = "fsync"(fd: i32) -> i32
+    proc c_flock = "flock"(fd: i32, op: i32) -> i32
+    proc c_mkdirat = "mkdirat"(dirfd: i32, caminho: int, modo: i32) -> i32
+    proc c_unlinkat = "unlinkat"(dirfd: i32, caminho: int, flags: i32) -> i32
+    proc c_renameat = "renameat"(fd1: i32, c1: int, fd2: i32, c2: int) -> i32
+    proc c_getcwd = "getcwd"(buf: int, n: int) -> int
+    proc c_fstat = "fstat"(fd: i32, buf: int) -> i32
+    proc c_fstatat = "fstatat"(dirfd: i32, caminho: int, buf: int, flags: i32) -> i32
+    proc c_nanosleep = "nanosleep"(pedido: int, resto: int) -> i32
+    proc c_clock_gettime = "clock_gettime"(relogio: i32, ts: int) -> i32
+    proc c_getrusage = "getrusage"(quem: i32, uso: int) -> i32
+    proc c_getpid = "getpid"() -> i32
+    proc c_getentropy = "getentropy"(buf: int, n: int) -> i32
+    proc c_sysconf = "sysconf"(nome: i32) -> int
+    proc c_mmap = "mmap"(endereco: int, n: int, prot: i32, flags: i32, fd: i32, desloc: int) -> int
+    proc c_exit = "exit"(codigo: i32)
+    proc c_errno_ptr = "__error"() -> int
+    proc c_getdirentries = "__getdirentries64"(fd: i32, buf: int, n: int, basep: int) -> int
+}
+
+// numeros Linux aarch64 (asm-generic/unistd.h)
+const IOS_SYS_GETCWD: int = 17
+const IOS_SYS_FLOCK: int = 32
+const IOS_SYS_MKDIRAT: int = 34
+const IOS_SYS_UNLINKAT: int = 35
+const IOS_SYS_RENAMEAT: int = 38
+const IOS_SYS_OPENAT: int = 56
+const IOS_SYS_CLOSE: int = 57
+const IOS_SYS_GETDENTS64: int = 61
+const IOS_SYS_LSEEK: int = 62
+const IOS_SYS_READ: int = 63
+const IOS_SYS_WRITE: int = 64
+const IOS_SYS_NEWFSTATAT: int = 79
+const IOS_SYS_FSTAT: int = 80
+const IOS_SYS_FSYNC: int = 82
+const IOS_SYS_EXIT_GROUP: int = 94
+const IOS_SYS_NANOSLEEP: int = 101
+const IOS_SYS_CLOCK_GETTIME: int = 113
+const IOS_SYS_SCHED_GETAFFINITY: int = 123
+const IOS_SYS_GETRUSAGE: int = 165
+const IOS_SYS_GETPID: int = 172
+const IOS_SYS_SYSINFO: int = 179
+const IOS_SYS_MMAP: int = 222
+const IOS_SYS_GETRANDOM: int = 278
+
+const IOS_ENOSYS: int = 38
+const IOS_EEXIST: int = 17
+const IOS_EIO: int = 5
+const IOS_AT_FDCWD_LINUX: int = -100
+const IOS_AT_FDCWD_DARWIN: int = -2
+const IOS_MMAP_FIXO_SEM_SUBSTITUIR: int = 1048576
+const IOS_LOTE_ENTROPIA: int = 256
+const IOS_SC_NPROCESSORS_ONLN: int = 58
+const IOS_CLOCK_MONOTONIC_LINUX: int = 1
+const IOS_CLOCK_MONOTONIC_DARWIN: int = 6
+const IOS_OFF_MAXRSS: uint = 32
+const IOS_BYTES_POR_KIB: uint = 1024
+
+// numero de errno do Darwin para o do Linux (musl): 1..34 iguais salvo EDEADLK(11); os demais usados pelo runtime tem par; o resto vira EIO
+proc ios_erro_linux(d: int) -> int {
+    if d == 11 {
+        return 35
+    }
+    if d == 35 {
+        return 11
+    }
+    if d == 45 {
+        return 95
+    }
+    if d == 62 {
+        return 40
+    }
+    if d == 63 {
+        return 36
+    }
+    if d == 66 {
+        return 39
+    }
+    if d == 78 {
+        return IOS_ENOSYS
+    }
+    if d > 34 {
+        return IOS_EIO
+    }
+    return d
+}
+
+// -errno Linux da ultima falha da libSystem (errno por __error())
+proc ios_errno() -> int {
+    let p = transmute(c_errno_ptr(), to = rawptr) as ^i32
+    let d: i32 = p^
+    return -ios_erro_linux(d as int)
+}
+
+proc ios_r(r: int) -> int {
+    if r == -1 {
+        return ios_errno()
+    }
+    return r
+}
+
+proc ios_r32(r: i32) -> int {
+    if r < 0 {
+        return ios_errno()
+    }
+    return r as int
+}
+
+proc ios_dirfd(fd: int) -> i32 {
+    if fd == IOS_AT_FDCWD_LINUX {
+        return IOS_AT_FDCWD_DARWIN as i32
+    }
+    return fd as i32
+}
+
+// operadores de bits so valem em sem sinal: ios_e = a & b, ios_ou = a | b (em int, mesmos bits)
+proc ios_e(a: int, b: int) -> int {
+    return ((a as uint) & (b as uint)) as int
+}
+
+proc ios_ou(a: int, b: int) -> int {
+    return ((a as uint) | (b as uint)) as int
+}
+
+proc ios_bit(f: int, linux: int, darwin: int) -> int {
+    if ios_e(f, linux) != 0 {
+        return darwin
+    }
+    return 0
+}
+
+// flags de open: Linux aarch64 -> Darwin (modo de acesso nos 2 bits baixos; CREAT, EXCL, TRUNC, APPEND, NONBLOCK, DIRECTORY, NOFOLLOW, CLOEXEC)
+proc ios_flags_abrir(f: int) -> int {
+    let a: int = ios_ou(ios_e(f, 3), ios_ou(ios_bit(f, 64, 512), ios_ou(ios_bit(f, 128, 2048), ios_bit(f, 512, 1024))))
+    let b: int = ios_ou(ios_bit(f, 1024, 8), ios_ou(ios_bit(f, 2048, 4), ios_bit(f, 16384, 1048576)))
+    let c: int = ios_ou(ios_bit(f, 32768, 256), ios_bit(f, 524288, 16777216))
+    return ios_ou(a, ios_ou(b, c))
+}
+
+// Darwin stat (arm64, 144 B, em `d`) -> Linux stat (128 B em `destino`): mode/nlink/size/tempos/ino/dev/uid/gid/blksize/blocks
+proc ios_stat_traduzir(d: ^[18]int, destino: uint) {
+    let w0: uint = d^[0] as uint
+    let w2: uint = d^[2] as uint
+    let w14: uint = d^[14] as uint
+    host.rt_escrever_u64(destino, w0 & 4294967295)
+    host.rt_escrever_u64(destino + 8, d^[1] as uint)
+    host.rt_escrever_u64(destino + 16, ((w0 >> 32) & 65535) | (((w0 >> 48) & 65535) << 32))
+    host.rt_escrever_u64(destino + 24, (w2 & 4294967295) | ((w2 >> 32) << 32))
+    host.rt_escrever_u64(destino + 32, d^[3] as uint)
+    host.rt_escrever_u64(destino + 40, 0)
+    host.rt_escrever_u64(destino + 48, d^[12] as uint)
+    host.rt_escrever_u64(destino + 56, w14 & 4294967295)
+    host.rt_escrever_u64(destino + 64, d^[13] as uint)
+    for k in (0 as uint)..<6 {
+        host.rt_escrever_u64(destino + 72 + (k * 8), d^[4 + (k as int)] as uint)
+    }
+    host.rt_escrever_u64(destino + 120, 0)
+}
+
+// fstat/fstatat Darwin num scratch local e copia traduzida para `destino`
+proc ios_fstat(fd: int, caminho: int, destino: int, flags: int, por_caminho: bool) -> int {
+    var d: [18]int = {}
+    let base: int = transmute(&d as rawptr, to = int)
+    var r: i32 = 0
+    if por_caminho {
+        r = c_fstatat(ios_dirfd(fd), caminho, base, (ios_bit(flags, 256, 32)) as i32)
+    } else {
+        r = c_fstat(fd as i32, base)
+    }
+    if r < 0 {
+        return ios_errno()
+    }
+    ios_stat_traduzir(&d, destino as uint)
+    return 0
+}
+
+// getrandom -> getentropy em lotes de 256 B (o limite da libSystem)
+proc ios_getrandom(buf: int, n: int) -> int {
+    var feito: int = 0
+    while feito < n {
+        var lote: int = n - feito
+        if lote > IOS_LOTE_ENTROPIA {
+            lote = IOS_LOTE_ENTROPIA
+        }
+        if c_getentropy(buf + feito, lote) != 0 {
+            return ios_errno()
+        }
+        feito += lote
+    }
+    return n
+}
+
+// sched_getaffinity: mascara de 1 palavra com os n primeiros bits (n = nucleos online); devolve 8 (bytes escritos)
+proc ios_afinidade(tamanho: int, mascara: int) -> int {
+    if tamanho < 8 {
+        return -22
+    }
+    var n: int = c_sysconf(IOS_SC_NPROCESSORS_ONLN as i32)
+    if n < 1 {
+        n = 1
+    }
+    var bits: uint = 18446744073709551615
+    if n < 64 {
+        bits = ((1 as uint) << (n as uint)) - 1
+    }
+    host.rt_escrever_u64(mascara as uint, bits)
+    return 8
+}
+
+// mmap: Linux -> Darwin (ANON 0x20 -> 0x1000; PRIVATE/SHARED/FIXED iguais). MAP_FIXED_NOREPLACE nao existe no Darwin: -EEXIST e o runtime cai na janela alta
+proc ios_mmap(a: int, n: int, prot: int, flags: int, fd: int, desloc: int) -> int {
+    if ios_e(flags, IOS_MMAP_FIXO_SEM_SUBSTITUIR) != 0 {
+        return -IOS_EEXIST
+    }
+    let f: int = ios_ou(ios_e(flags, 19), ios_bit(flags, 32, 4096))
+    return ios_r(c_mmap(a, n, prot as i32, f as i32, fd as i32, desloc))
+}
+
+proc ios_getcwd(buf: int, n: int) -> int {
+    if c_getcwd(buf, n) == 0 {
+        return ios_errno()
+    }
+    return (host.rt_texto_tamanho(buf as uint) as int) + 1
+}
+
+proc ios_relogio(relogio: int, ts: int) -> int {
+    var r: int = relogio
+    if r == IOS_CLOCK_MONOTONIC_LINUX {
+        r = IOS_CLOCK_MONOTONIC_DARWIN
+    }
+    return ios_r32(c_clock_gettime(r as i32, ts))
+}
+
+// ru_maxrss: bytes no Darwin, KiB no Linux
+proc ios_rusage(quem: int, uso: int) -> int {
+    let r: int = ios_r32(c_getrusage(quem as i32, uso))
+    if r == 0 {
+        let p: uint = (uso as uint) + IOS_OFF_MAXRSS
+        host.rt_escrever_u64(p, host.rt_ler_u64(p) / IOS_BYTES_POR_KIB)
+    }
+    return r
+}
+
+// u16 little endian em `p`
+proc ios_ler_u16(p: uint) -> uint {
+    return (host.rt_ler_u8(p) as uint) | ((host.rt_ler_u8(p + 1) as uint) << 8)
+}
+
+// Um registro Darwin (d_ino u64, d_seekoff u64, d_reclen u16, d_namlen u16, d_type u8, d_name em 21) em `rec` -> registro Linux dirent64
+// (d_ino u64, d_off i64, d_reclen u16, d_type u8, d_name NUL em 19, tamanho alinhado a 8) em `dst`; devolve o tamanho do registro Linux
+proc ios_dirent_registro(rec: uint, dst: uint) -> uint {
+    let namlen: uint = ios_ler_u16(rec + 18)
+    let tamanho: uint = (19 + namlen + 1 + 7) & 18446744073709551608
+    host.rt_escrever_u64(dst, host.rt_ler_u64(rec))
+    host.rt_escrever_u64(dst + 8, host.rt_ler_u64(rec + 8))
+    host.rt_escrever_u8(dst + 16, (tamanho & 255) as u8)
+    host.rt_escrever_u8(dst + 17, (tamanho >> 8) as u8)
+    host.rt_escrever_u8(dst + 18, host.rt_ler_u8(rec + 20))
+    for j in (0 as uint)..<(tamanho - 19) {
+        var b: u8 = 0
+        if j < namlen {
+            b = host.rt_ler_u8(rec + 21 + j)
+        }
+        host.rt_escrever_u8(dst + 19 + j, b)
+    }
+    return tamanho
+}
+
+// Converte `total` bytes de registros Darwin em `base` para registros Linux em `destino` (pula d_ino 0 = entrada apagada); -EIO se reclen 0
+proc ios_dirent_converter(base: uint, total: uint, destino: uint) -> int {
+    var i: uint = 0
+    var o: uint = 0
+    while i < total {
+        let reclen: uint = ios_ler_u16(base + i + 16)
+        if reclen == 0 {
+            return -IOS_EIO
+        }
+        if host.rt_ler_u64(base + i) != 0 {
+            o += ios_dirent_registro(base + i, destino + o)
+        }
+        i += reclen
+    }
+    return o as int
+}
+
+// getdents64 -> __getdirentries64 num scratch de 16 KiB (a saida Linux cabe nos 32 KiB do chamador: registro Linux <= Darwin + 8 B, minimo 24 B)
+proc ios_getdents(fd: int, destino: int) -> int {
+    var d: [2048]int = {}
+    var pos: [1]int = {}
+    let base: int = transmute(&d as rawptr, to = int)
+    let basep: int = transmute(&pos as rawptr, to = int)
+    while true {
+        let r: int = c_getdirentries(fd as i32, base, 16384, basep)
+        if r < 0 {
+            return ios_errno()
+        }
+        if r == 0 {
+            return 0
+        }
+        let o: int = ios_dirent_converter(base as uint, r as uint, destino as uint)
+        if o != 0 {
+            return o
+        }
+    }
+    return 0
+}
+
+// syscalls de arquivo e pasta (numeros 17..82)
+proc ios_sys_arquivo(num: int, a0: int, a1: int, a2: int, a3: int) -> int {
+    if num == IOS_SYS_WRITE {
+        if a0 == 1 or a0 == 2 {
+            _ = c_fflush(0)
+        }
+        return ios_r(c_write(a0 as i32, a1, a2))
+    }
+    if num == IOS_SYS_READ {
+        return ios_r(c_read(a0 as i32, a1, a2))
+    }
+    if num == IOS_SYS_OPENAT {
+        return ios_r32(c_openat(ios_dirfd(a0), a1, ios_flags_abrir(a2) as i32, 0, 0, 0, 0, 0, a3))
+    }
+    if num == IOS_SYS_CLOSE {
+        return ios_r32(c_close(a0 as i32))
+    }
+    if num == IOS_SYS_LSEEK {
+        return ios_r(c_lseek(a0 as i32, a1, a2 as i32))
+    }
+    if num == IOS_SYS_FSYNC {
+        return ios_r32(c_fsync(a0 as i32))
+    }
+    if num == IOS_SYS_FLOCK {
+        return ios_r32(c_flock(a0 as i32, a1 as i32))
+    }
+    if num == IOS_SYS_MKDIRAT {
+        return ios_r32(c_mkdirat(ios_dirfd(a0), a1, a2 as i32))
+    }
+    if num == IOS_SYS_UNLINKAT {
+        return ios_r32(c_unlinkat(ios_dirfd(a0), a1, (ios_bit(a2, 512, 128)) as i32))
+    }
+    if num == IOS_SYS_RENAMEAT {
+        return ios_r32(c_renameat(ios_dirfd(a0), a1, ios_dirfd(a2), a3))
+    }
+    if num == IOS_SYS_GETCWD {
+        return ios_getcwd(a0, a1)
+    }
+    if num == IOS_SYS_GETDENTS64 {
+        return ios_getdents(a0, a1)
+    }
+    return -IOS_ENOSYS
+}
+
+// demais syscalls (stat, tempo, processo, memoria, entropia)
+proc ios_sys_sistema(num: int, a0: int, a1: int, a2: int, a3: int, a4: int, a5: int) -> int {
+    if num == IOS_SYS_FSTAT {
+        return ios_fstat(a0, 0, a1, 0, false)
+    }
+    if num == IOS_SYS_NEWFSTATAT {
+        return ios_fstat(a0, a1, a2, a3, true)
+    }
+    if num == IOS_SYS_MMAP {
+        return ios_mmap(a0, a1, a2, a3, a4, a5)
+    }
+    if num == IOS_SYS_CLOCK_GETTIME {
+        return ios_relogio(a0, a1)
+    }
+    if num == IOS_SYS_NANOSLEEP {
+        return ios_r32(c_nanosleep(a0, a1))
+    }
+    if num == IOS_SYS_GETRUSAGE {
+        return ios_rusage(a0, a1)
+    }
+    if num == IOS_SYS_GETPID {
+        return c_getpid() as int
+    }
+    if num == IOS_SYS_GETRANDOM {
+        return ios_getrandom(a0, a1)
+    }
+    if num == IOS_SYS_SCHED_GETAFFINITY {
+        return ios_afinidade(a1, a2)
+    }
+    return -IOS_ENOSYS
+}
+
+// forja_rt_syscall no iOS: o compilador chama este proc no lugar do `svc #0` (a64_intr.fj). exit_group sai por exit(); getdents64 e sysinfo = -ENOSYS
+pub proc rt_syscall(num: int, a0: int, a1: int, a2: int, a3: int, a4: int, a5: int) -> int {
+    if num == IOS_SYS_EXIT_GROUP {
+        c_exit(a0 as i32)
+        return 0
+    }
+    if (num == IOS_SYS_NEWFSTATAT) or (num == IOS_SYS_FSTAT) {
+        return ios_sys_sistema(num, a0, a1, a2, a3, a4, a5)
+    }
+    if num <= IOS_SYS_FSYNC {
+        return ios_sys_arquivo(num, a0, a1, a2, a3)
+    }
+    return ios_sys_sistema(num, a0, a1, a2, a3, a4, a5)
+}

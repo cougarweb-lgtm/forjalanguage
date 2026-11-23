@@ -1,0 +1,597 @@
+// nativo/x64/x64_isel_otim_div.fj - porte de compiler/nativo/x64/x64_isel_otim_div.c
+// sha256 de nativo/x64/x64_isel_otim_div.c: bd509069ed993b03f18547b9cf4cf1434060f4a6c990e3812bd50e495dfbfd5c
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "common"
+import "nativo/bir"
+
+struct DivCtx {
+    c: ?^X64Ctx
+    plano: DivMagicaPlano
+    resto: bool
+    w: u8
+    src: i32
+    n: i32
+    res: i32
+    trab: i32
+}
+
+const RAX: i32 = 0
+const RCX: i32 = 1
+const RDX: i32 = 2
+const BITS_DA_CLASSE: [5]u8 = {0, 8, 16, 32, 64}
+const FORMA: [2][2]u16 = {{79, 80}, {118, 119}}
+
+// C: nativo/x64/x64_isel_otim_div.c:38
+proc mover(c: ^X64Ctx, d: i32, s: i32, w: u8) -> bool {
+    if common.c2f_s2u_32(d) == common.c2f_s2u_32(s) {
+        return true
+    }
+    var tern_1: i32 = FX_MOV32_RR
+    if w == 64 {
+        tern_1 = FX_MOV64_RR
+    }
+    let arg_1: MOperando = m_reg(s, w)
+    let arg_2: MOperando = m_reg(d, w)
+    let arg_3: u16 = tern_1 as u16
+    return x64_emitir(c, mi2(arg_3, arg_2, arg_1))
+}
+
+// C: nativo/x64/x64_isel_otim_div.c:46
+proc carregar_constante(c: ^X64Ctx, d: i32, v: u64) -> bool {
+    if v <= 4294967295 {
+        let arg_1: MOperando = m_imed(transmute(v as u32, to = i32) as i64)
+        let arg_2: MOperando = m_reg(d, 32)
+        return x64_emitir(c, mi2(FX_MOV32_RI as u16, arg_2, arg_1))
+    }
+    let arg_3: MOperando = m_imed(transmute(v, to = i64))
+    let arg_4: MOperando = m_reg(d, 64)
+    return x64_emitir(c, mi2(FX_MOV64_RI as u16, arg_4, arg_3))
+}
+
+// C: nativo/x64/x64_isel_otim_div.c:54
+proc deslocar_2(c: ^X64Ctx, r: i32, w: u8, aritmetico: bool, n: u32) -> bool {
+    if n == 0 {
+        return true
+    }
+    var linha: i32 = 0
+    if aritmetico {
+        linha = 1
+    }
+    var coluna: i32 = 0
+    if w == 64 {
+        coluna = 1
+    }
+    return x64_emitir(c, mi2(FORMA[linha][coluna], m_reg(r, w), m_imed(n as i64)))
+}
+
+// C: nativo/x64/x64_isel_otim_div.c:61
+proc somar(c: ^X64Ctx, d: i32, s: i32, w: u8) -> bool {
+    var tern_1: i32 = FX_ADD32_RR
+    if w == 64 {
+        tern_1 = FX_ADD64_RR
+    }
+    let arg_1: MOperando = m_reg(s, w)
+    let arg_2: MOperando = m_reg(d, w)
+    let arg_3: u16 = tern_1 as u16
+    return x64_emitir(c, mi2(arg_3, arg_2, arg_1))
+}
+
+// C: nativo/x64/x64_isel_otim_div.c:66
+proc negar(c: ^X64Ctx, r: i32, w: u8) -> bool {
+    var tern_1: i32 = FX_NEG32_R
+    if w == 64 {
+        tern_1 = FX_NEG64_R
+    }
+    return x64_emitir(c, mi1(tern_1 as u16, m_reg(r, w)))
+}
+
+// C: nativo/x64/x64_isel_otim_div.c:73
+proc imul_constante(c: ^X64Ctx, d: i32, s: i32, w: u8, imm: i64) -> bool {
+    var rri: u16 = FX_IMUL32_RRI as u16
+    var rr: u16 = FX_IMUL32_RR as u16
+    if w == 64 {
+        rri = FX_IMUL64_RRI as u16
+        rr = FX_IMUL64_RR as u16
+    }
+    var constante: i32 = d
+    if d == s {
+        constante = RCX
+    }
+    let cabe_imm32: bool = (imm >= -2147483648) and (imm <= 2147483647)
+    let colide: bool = (imm >= (IMED_COLIDE_MIN as i64)) and (imm <= (IMED_COLIDE_MAX as i64))
+    if cabe_imm32 and (not colide) {
+        return x64_emitir(c, mi3(rri, m_reg(d, w), m_reg(s, w), m_imed(imm)))
+    }
+    // w de 32 bits: o imediato entra como 32 bits sem sinal (uint32_t do C)
+    var valor: u64 = transmute(imm, to = u64)
+    if w != 64 {
+        valor = valor & 4294967295
+    }
+    if not carregar_constante(c, constante, valor) {
+        return false
+    }
+    var origem: i32 = s
+    if d == s {
+        origem = constante
+    }
+    return x64_emitir(c, mi2(rr, m_reg(d, w), m_reg(origem, w)))
+}
+
+// C: nativo/x64/x64_isel_otim_div.c:88
+proc carregar_dividendo(k: ^DivCtx, i: ^bir.BirInstr) -> bool {
+    let reg: i32 = isel_otim_reg_int(k.c as ^X64Ctx, &i.a)
+    if reg >= 0 {
+        k.src = reg
+        return true
+    }
+    k.src = X64_R11
+    return isel_carregar(k.c as ^X64Ctx, X64_R11, &i.a, bir.BE_NENHUMA as u8)
+}
+
+// C: nativo/x64/x64_isel_otim_div.c:101
+proc preparar_dividendo_com_sinal(k: ^DivCtx) -> bool {
+    let c: ?^X64Ctx = k.c
+    let bits: u32 = k.plano.bits
+    if (bits == 64) or ((bits == 32) and (not k.plano.produto_64)) {
+        k.n = k.src
+        return true
+    }
+    k.n = X64_R11
+    if bits == 32 {
+        let arg_1: MOperando = m_reg(k.src, 32)
+        let arg_2: MOperando = m_reg(X64_R11, 64)
+        return x64_emitir(c as ^X64Ctx, mi2(FX_MOVSXD64_RR32 as u16, arg_2, arg_1))
+    }
+    var tern_1: i32 = FX_MOVSX32_RR8
+    if bits == 16 {
+        tern_1 = FX_MOVSX32_RR16
+    }
+    let arg_3: MOperando = m_reg(k.src, bits as u8)
+    let arg_4: MOperando = m_reg(X64_R11, 32)
+    let arg_5: u16 = tern_1 as u16
+    return x64_emitir(c as ^X64Ctx, mi2(arg_5, arg_4, arg_3))
+}
+
+// C: nativo/x64/x64_isel_otim_div.c:118
+proc quociente_pot2_sem_sinal(k: ^DivCtx) -> bool {
+    k.res = k.trab
+    return (common.c2f_b2i32(mover(k.c as ^X64Ctx, k.trab, k.src, k.w)) != 0) and (common.c2f_b2i32(deslocar_2(k.c as ^X64Ctx, k.trab, k.w, false, k.plano.shift)) != 0)
+}
+
+// C: nativo/x64/x64_isel_otim_div.c:124
+proc quociente_pot2_com_sinal(k: ^DivCtx) -> bool {
+    let c: ?^X64Ctx = k.c
+    let w: u8 = k.w
+    let s: u32 = k.plano.shift
+    let t: i32 = k.trab
+    k.res = t
+    if (not preparar_dividendo_com_sinal(k)) or (not mover(c as ^X64Ctx, t, k.n, w)) {
+        return false
+    }
+    return (((common.c2f_b2i32(deslocar_2(c as ^X64Ctx, t, w, true, (w as u32) - 1)) != 0) and (common.c2f_b2i32(deslocar_2(c as ^X64Ctx, t, w, false, (w as u32) - s)) != 0)) and (common.c2f_b2i32(somar(c as ^X64Ctx, t, k.n, w)) != 0)) and (common.c2f_b2i32(deslocar_2(c as ^X64Ctx, t, w, true, s)) != 0)
+}
+
+// C: nativo/x64/x64_isel_otim_div.c:137
+proc quociente_lemire(k: ^DivCtx) -> bool {
+    k.res = RDX
+    if not carregar_constante(k.c as ^X64Ctx, RAX, k.plano.magic) {
+        return false
+    }
+    return x64_emitir(k.c as ^X64Ctx, mi1(FX_MUL64_R as u16, m_reg(k.src, 64)))
+}
+
+// C: nativo/x64/x64_isel_otim_div.c:143
+proc quociente_sem_sinal64(k: ^DivCtx) -> bool {
+    let c: ^X64Ctx = k.c as ^X64Ctx
+    let t: i32 = k.trab
+    k.res = t
+    if not carregar_constante(c, RAX, k.plano.magic) {
+        return false
+    }
+    if not x64_emitir(c, mi1(FX_MUL64_R as u16, m_reg(k.src, 64))) {
+        return false
+    }
+    if not mover(c, t, k.src, 64) {
+        return false
+    }
+    if not x64_emitir(c, mi2(FX_SUB64_RR as u16, m_reg(t, 64), m_reg(RDX, 64))) {
+        return false
+    }
+    if not deslocar_2(c, t, 64, false, 1) {
+        return false
+    }
+    if not somar(c, t, RDX, 64) {
+        return false
+    }
+    return deslocar_2(c, t, 64, false, k.plano.shift - 1)
+}
+
+// C: nativo/x64/x64_isel_otim_div.c:157
+proc quociente_comparacao(k: ^DivCtx, cond: i32) -> bool {
+    let c: ^X64Ctx = k.c as ^X64Ctx
+    let d: u64 = k.plano.divisor
+    k.res = k.trab
+    if not x64_emitir(c, mi2(FX_XOR32_RR as u16, m_reg(k.trab, 32), m_reg(k.trab, 32))) {
+        return false
+    }
+    if k.plano.bits == 64 {
+        if not carregar_constante(c, RCX, d) {
+            return false
+        }
+        if not x64_emitir(c, mi2(FX_CMP64_RR as u16, m_reg(k.src, 64), m_reg(RCX, 64))) {
+            return false
+        }
+    } else if not x64_emitir(c, mi2(FX_CMP32_RI as u16, m_reg(k.src, 32), m_imed(transmute(d as u32, to = i32) as i64))) {
+        return false
+    }
+    return x64_emitir(c, mi_cc(FX_SETCC8_R as u16, cond, m_reg(k.trab, 8)))
+}
+
+// C: nativo/x64/x64_isel_otim_div.c:175
+proc quociente_sinal_mul(k: ^DivCtx) -> bool {
+    let c: ?^X64Ctx = k.c
+    let p: ^DivMagicaPlano = &k.plano
+    var tern_1: i32 = 32
+    if common.c2f_b2i32(p.produto_64) != 0 {
+        tern_1 = 64
+    }
+    let wm: u8 = tern_1 as u8
+    var tern_2: i64 = common.c2f_trunc_i32(p.magic) as i64
+    if common.c2f_b2i32(p.produto_64) != 0 {
+        tern_2 = transmute(p.magic, to = i64)
+    }
+    let magic: i64 = tern_2
+    let t: i32 = k.trab
+    k.res = t
+    if ((not preparar_dividendo_com_sinal(k)) or (not imul_constante(c as ^X64Ctx, t, k.n, wm, magic))) or (not deslocar_2(c as ^X64Ctx, t, wm, true, p.shift)) {
+        return false
+    }
+    if not p.soma_bit_sinal {
+        let arg_1: MOperando = m_reg(t, 32)
+        let arg_2: MOperando = m_reg(t, 32)
+        return x64_emitir(c as ^X64Ctx, mi2(FX_MOV32_RR as u16, arg_2, arg_1))
+    }
+    var tern_3: u32 = common.c2f_s2u_32(k.n)
+    if p.bits == 32 {
+        tern_3 = common.c2f_s2u_32(k.src)
+    }
+    return ((common.c2f_b2i32(mover(c as ^X64Ctx, RCX, transmute(tern_3, to = i32), 32)) != 0) and (common.c2f_b2i32(deslocar_2(c as ^X64Ctx, RCX, 32, false, 31)) != 0)) and (common.c2f_b2i32(somar(c as ^X64Ctx, t, RCX, 32)) != 0)
+}
+
+// C: nativo/x64/x64_isel_otim_div.c:194
+proc quociente_sinal64_2(k: ^DivCtx) -> bool {
+    let c: ?^X64Ctx = k.c
+    let p: ^DivMagicaPlano = &k.plano
+    k.res = RDX
+    if (not carregar_constante(c as ^X64Ctx, RAX, p.magic)) or (not x64_emitir(c as ^X64Ctx, mi1(FX_IMUL64_R as u16, m_reg(k.src, 64)))) {
+        return false
+    }
+    if ((common.c2f_b2i32(p.soma_a) != 0) and (not somar(c as ^X64Ctx, RDX, k.src, 64))) or (not deslocar_2(c as ^X64Ctx, RDX, 64, true, p.shift)) {
+        return false
+    }
+    if not p.soma_bit_sinal {
+        return true
+    }
+    k.res = k.trab
+    return ((common.c2f_b2i32(mover(c as ^X64Ctx, k.trab, k.src, 64)) != 0) and (common.c2f_b2i32(deslocar_2(c as ^X64Ctx, k.trab, 64, false, 63)) != 0)) and (common.c2f_b2i32(somar(c as ^X64Ctx, k.trab, RDX, 64)) != 0)
+}
+
+// C: nativo/x64/x64_isel_otim_div.c:210
+proc quociente(k: ^DivCtx) -> bool {
+    let sw_1 = common.c2f_s2u_32(k.plano.estrategia)
+    if sw_1 == (DIV_MAGICA_UM as u32) {
+        k.res = k.src
+        return true
+    } else if sw_1 == (DIV_MAGICA_POT2 as u32) {
+        return quociente_pot2_sem_sinal(k)
+    } else if sw_1 == (DIV_MAGICA_POT2_SINAL as u32) {
+        return quociente_pot2_com_sinal(k)
+    } else if sw_1 == (DIV_MAGICA_LEMIRE as u32) {
+        return quociente_lemire(k)
+    } else if sw_1 == (DIV_MAGICA_SEM_SINAL_64 as u32) {
+        return quociente_sem_sinal64(k)
+    } else if sw_1 == (DIV_MAGICA_MAIOR_SEM_SINAL as u32) {
+        return quociente_comparacao(k, X64_CC_AE)
+    } else if sw_1 == (DIV_MAGICA_SINAL_MUL as u32) {
+        return quociente_sinal_mul(k)
+    } else if sw_1 == (DIV_MAGICA_SINAL_64 as u32) {
+        return quociente_sinal64_2(k)
+    } else if sw_1 == (DIV_MAGICA_SINAL_MIN as u32) {
+        return quociente_comparacao(k, X64_CC_E)
+    } else {
+        return false
+    }
+    return false
+}
+
+// C: nativo/x64/x64_isel_otim_div.c:229
+proc negar_quociente(k: ^DivCtx) -> bool {
+    if not k.plano.negar {
+        return true
+    }
+    if common.c2f_s2u_32(k.res) == common.c2f_s2u_32(k.src) {
+        if not mover(k.c as ^X64Ctx, k.trab, k.src, k.w) {
+            return false
+        }
+        k.res = k.trab
+    }
+    return negar(k.c as ^X64Ctx, k.res, k.w)
+}
+
+// C: nativo/x64/x64_isel_otim_div.c:242
+proc valor_do_divisor(p: ^DivMagicaPlano, w: u8) -> i64 {
+    let sobra: u32 = 64 - p.bits
+    var tern_1: i64 = transmute(p.divisor, to = i64)
+    if common.c2f_b2i32(p.com_sinal) != 0 {
+        tern_1 = common.c2f_sar_i64(transmute(p.divisor << ((sobra as u64) & 63), to = i64), sobra)
+    }
+    let v: i64 = tern_1
+    var tern_2: i64 = v
+    if w == 32 {
+        tern_2 = common.c2f_trunc_i32(common.c2f_s2u_64(v)) as i64
+    }
+    return tern_2
+}
+
+// C: nativo/x64/x64_isel_otim_div.c:251
+proc resto_do_quociente(k: ^DivCtx) -> bool {
+    let c: ?^X64Ctx = k.c
+    let r: i32 = k.trab
+    if common.c2f_s2u_32(k.plano.estrategia) == (DIV_MAGICA_UM as u32) {
+        k.res = r
+        let arg_1: MOperando = m_reg(r, 32)
+        let arg_2: MOperando = m_reg(r, 32)
+        return x64_emitir(c as ^X64Ctx, mi2(FX_XOR32_RR as u16, arg_2, arg_1))
+    }
+    let arg_3: i64 = valor_do_divisor(&k.plano, k.w)
+    let arg_4: u8 = k.w
+    let arg_5: i32 = k.res
+    let arg_6: ^X64Ctx = c as ^X64Ctx
+    if (not imul_constante(arg_6, RCX, arg_5, arg_4, arg_3)) or (not mover(c as ^X64Ctx, r, k.src, k.w)) {
+        return false
+    }
+    k.res = r
+    var tern_1: i32 = FX_SUB32_RR
+    if k.w == 64 {
+        tern_1 = FX_SUB64_RR
+    }
+    let arg_7: MOperando = m_reg(RCX, k.w)
+    let arg_8: MOperando = m_reg(r, k.w)
+    let arg_9: u16 = tern_1 as u16
+    return x64_emitir(c as ^X64Ctx, mi2(arg_9, arg_8, arg_7))
+}
+
+// C: nativo/x64/x64_isel_otim_div.c:267
+proc modulo_do_divisor_2(p: ^DivMagicaPlano) -> i64 {
+    let d: i64 = valor_do_divisor(p, 64)
+    var tern_1: i64 = d
+    if d < 0 {
+        tern_1 = -d
+    }
+    return tern_1
+}
+
+// C: nativo/x64/x64_isel_otim_div.c:275
+proc and_constante(c: ^X64Ctx, r: i32, w: u8, imm: i64) -> bool {
+    if (imm >= -2147483648) and (imm <= 2147483647) {
+        var forma_and: i32 = FX_AND32_RI
+        if w == 64 {
+            forma_and = FX_AND64_RI
+        }
+        return x64_emitir(c, mi2(forma_and as u16, m_reg(r, w), m_imed(imm)))
+    }
+    if not carregar_constante(c, RCX, transmute(imm, to = u64)) {
+        return false
+    }
+    return x64_emitir(c, mi2(FX_AND64_RR as u16, m_reg(r, 64), m_reg(RCX, 64)))
+}
+
+// C: nativo/x64/x64_isel_otim_div.c:283
+proc corrigir_dividendo_negativo(k: ^DivCtx, sg: i32, w: u8, mag: i64) -> bool {
+    let c: ?^X64Ctx = k.c
+    let t: i32 = k.trab
+    return ((((common.c2f_b2i32(mover(c as ^X64Ctx, t, sg, w)) != 0) and (common.c2f_b2i32(deslocar_2(c as ^X64Ctx, t, w, true, (w as u32) - 1)) != 0)) and (common.c2f_b2i32(and_constante(c as ^X64Ctx, t, w, mag)) != 0)) and (common.c2f_b2i32(negar(c as ^X64Ctx, t, w)) != 0)) and (common.c2f_b2i32(somar(c as ^X64Ctx, t, sg, w)) != 0)
+}
+
+// C: nativo/x64/x64_isel_otim_div.c:292
+proc fechar_resto_com_sinal(k: ^DivCtx, w: u8, mag: i64) -> bool {
+    k.res = k.trab
+    if not imul_constante(k.c as ^X64Ctx, RDX, RDX, w, mag) {
+        return false
+    }
+    var forma_sub: i32 = FX_SUB32_RR
+    if w == 64 {
+        forma_sub = FX_SUB64_RR
+    }
+    return x64_emitir(k.c as ^X64Ctx, mi2(forma_sub as u16, m_reg(k.trab, w), m_reg(RDX, w)))
+}
+
+// C: nativo/x64/x64_isel_otim_div.c:299
+proc resto_sinal64(k: ^DivCtx) -> bool {
+    let c: ?^X64Ctx = k.c
+    let p: ^DivMagicaPlano = &k.plano
+    let mag: i64 = modulo_do_divisor_2(p)
+    if (not carregar_constante(c as ^X64Ctx, RAX, p.magic)) or (not x64_emitir(c as ^X64Ctx, mi1(FX_IMUL64_R as u16, m_reg(k.src, 64)))) {
+        return false
+    }
+    if ((common.c2f_b2i32(p.soma_a) != 0) and (not somar(c as ^X64Ctx, RDX, k.src, 64))) or (not deslocar_2(c as ^X64Ctx, RDX, 64, true, p.shift)) {
+        return false
+    }
+    return (common.c2f_b2i32(corrigir_dividendo_negativo(k, k.src, 64, mag)) != 0) and (common.c2f_b2i32(fechar_resto_com_sinal(k, 64, mag)) != 0)
+}
+
+// C: nativo/x64/x64_isel_otim_div.c:313
+proc resto_sinal_mul(k: ^DivCtx) -> bool {
+    let p: ^DivMagicaPlano = &k.plano
+    var tern_1: i32 = 32
+    if common.c2f_b2i32(p.produto_64) != 0 {
+        tern_1 = 64
+    }
+    let wm: u8 = tern_1 as u8
+    var tern_2: i64 = common.c2f_trunc_i32(p.magic) as i64
+    if common.c2f_b2i32(p.produto_64) != 0 {
+        tern_2 = transmute(p.magic, to = i64)
+    }
+    let magic: i64 = tern_2
+    let mag: i64 = modulo_do_divisor_2(p)
+    if ((not preparar_dividendo_com_sinal(k)) or (not imul_constante(k.c as ^X64Ctx, RDX, k.n, wm, magic))) or (not deslocar_2(k.c as ^X64Ctx, RDX, wm, true, p.shift)) {
+        return false
+    }
+    var tern_3: u32 = common.c2f_s2u_32(k.n)
+    if p.bits == 32 {
+        tern_3 = common.c2f_s2u_32(k.src)
+    }
+    return (common.c2f_b2i32(corrigir_dividendo_negativo(k, transmute(tern_3, to = i32), 32, mag)) != 0) and (common.c2f_b2i32(fechar_resto_com_sinal(k, 32, mag)) != 0)
+}
+
+// C: nativo/x64/x64_isel_otim_div.c:327
+proc resto_pot2_com_sinal(k: ^DivCtx) -> bool {
+    let c: ?^X64Ctx = k.c
+    let w: u8 = k.w
+    let s: u32 = k.plano.shift
+    let r: i32 = k.trab
+    if (((not preparar_dividendo_com_sinal(k)) or (not mover(c as ^X64Ctx, RDX, k.n, w))) or (not deslocar_2(c as ^X64Ctx, RDX, w, true, (w as u32) - 1))) or (not deslocar_2(c as ^X64Ctx, RDX, w, false, (w as u32) - s)) {
+        return false
+    }
+    if ((not mover(c as ^X64Ctx, r, k.n, w)) or (not somar(c as ^X64Ctx, r, RDX, w))) or (not and_constante(c as ^X64Ctx, r, w, transmute(((1 as u64) << ((s as u64) & 63)) - 1, to = i64))) {
+        return false
+    }
+    k.res = r
+    var tern_1: i32 = FX_SUB32_RR
+    if w == 64 {
+        tern_1 = FX_SUB64_RR
+    }
+    let arg_1: MOperando = m_reg(RDX, w)
+    let arg_2: MOperando = m_reg(r, w)
+    let arg_3: u16 = tern_1 as u16
+    return x64_emitir(c as ^X64Ctx, mi2(arg_3, arg_2, arg_1))
+}
+
+// C: nativo/x64/x64_isel_otim_div.c:343
+proc resto_pot2_sem_sinal(k: ^DivCtx) -> bool {
+    let mascara_pot2: i64 = transmute(((1 as u64) << ((k.plano.shift as u64) & 63)) - 1, to = i64)
+    k.res = k.trab
+    if not mover(k.c as ^X64Ctx, k.trab, k.src, 32) {
+        return false
+    }
+    return x64_emitir(k.c as ^X64Ctx, mi2(FX_AND32_RI as u16, m_reg(k.trab, 32), m_imed(mascara_pot2)))
+}
+
+// C: nativo/x64/x64_isel_otim_div.c:352
+proc finalizar(k: ^DivCtx, alvo: i32) -> bool {
+    let c: ?^X64Ctx = k.c
+    let r: i32 = k.res
+    if (common.c2f_s2u_32(r) == common.c2f_s2u_32(alvo)) and ((common.c2f_s2u_32(r) == common.c2f_s2u_32(k.src)) or (k.plano.bits >= 32)) {
+        return true
+    }
+    let sw_1 = k.plano.bits
+    if sw_1 == 64 {
+        return mover(c as ^X64Ctx, alvo, r, 64)
+    } else if sw_1 == 32 {
+        let arg_1: MOperando = m_reg(r, 32)
+        let arg_2: MOperando = m_reg(alvo, 32)
+        return x64_emitir(c as ^X64Ctx, mi2(FX_MOV32_RR as u16, arg_2, arg_1))
+    } else if sw_1 == 16 {
+        let arg_3: MOperando = m_reg(r, 16)
+        let arg_4: MOperando = m_reg(alvo, 32)
+        return x64_emitir(c as ^X64Ctx, mi2(FX_MOVZX32_RR16 as u16, arg_4, arg_3))
+    } else {
+        let arg_5: MOperando = m_reg(r, 8)
+        let arg_6: MOperando = m_reg(alvo, 32)
+        return x64_emitir(c as ^X64Ctx, mi2(FX_MOVZX32_RR8 as u16, arg_6, arg_5))
+    }
+    return false
+}
+
+// C: nativo/x64/x64_isel_otim_div.c:368
+proc emitir_resto(k: ^DivCtx) -> bool {
+    let e: i32 = k.plano.estrategia
+    if (not k.plano.com_sinal) and (common.c2f_s2u_32(e) == (DIV_MAGICA_POT2 as u32)) {
+        return resto_pot2_sem_sinal(k)
+    }
+    if common.c2f_s2u_32(e) == (DIV_MAGICA_SINAL_64 as u32) {
+        return resto_sinal64(k)
+    }
+    if common.c2f_s2u_32(e) == (DIV_MAGICA_SINAL_MUL as u32) {
+        return resto_sinal_mul(k)
+    }
+    if common.c2f_s2u_32(e) == (DIV_MAGICA_POT2_SINAL as u32) {
+        return resto_pot2_com_sinal(k)
+    }
+    return ((common.c2f_b2i32(quociente(k)) != 0) and (common.c2f_b2i32(negar_quociente(k)) != 0)) and (common.c2f_b2i32(resto_do_quociente(k)) != 0)
+}
+
+// C: nativo/x64/x64_isel_otim_div.c:383
+proc emitir_conta(k: ^DivCtx, alvo: i32) -> bool {
+    if k.resto {
+        return (common.c2f_b2i32(emitir_resto(k)) != 0) and (common.c2f_b2i32(finalizar(k, alvo)) != 0)
+    }
+    return ((common.c2f_b2i32(quociente(k)) != 0) and (common.c2f_b2i32(negar_quociente(k)) != 0)) and (common.c2f_b2i32(finalizar(k, alvo)) != 0)
+}
+
+// C: nativo/x64/x64_isel_otim_div.c:391
+proc planejar_conta(k: ^DivCtx, i: ^bir.BirInstr) -> bool {
+    var e: i32 = 0
+    if (((((i.classe as i32) < bir.BC_I8) or ((i.classe as i32) > bir.BC_I64)) or ((i.a.classe as i32) != (i.classe as i32))) or ((i.b.classe as i32) != (i.classe as i32))) or (i.a.tipo != (bir.BO_VREG as u8)) {
+        return false
+    }
+    var tern_1: i32 = 32
+    if i.classe == (bir.BC_I64 as u8) {
+        tern_1 = 64
+    }
+    k.w = tern_1 as u8
+    if not div_magica_planejar(BITS_DA_CLASSE[i.classe] as u32, i.aux == (bir.BIR_SINAL as u8), common.c2f_s2u_64(i.b.imed), &k.plano) {
+        return false
+    }
+    e = k.plano.estrategia
+    return not (((not k.plano.com_sinal) and ((common.c2f_s2u_32(e) == (DIV_MAGICA_POT2 as u32)) or (common.c2f_s2u_32(e) == (DIV_MAGICA_UM as u32)))) and (k.plano.bits >= 32))
+}
+
+// C: nativo/x64/x64_isel_otim_div.c:405
+proc isel_otim_div_const(c: ^X64Ctx, i: ^bir.BirInstr) -> i32 {
+    var k: DivCtx = DivCtx{c = c, resto = i.op == (bir.BIR_REM as u8)}
+    let destino: i32 = isel_otim_reg_destino(c, i.dst)
+    var tern_1: u32 = RAX as u32
+    if destino >= 0 {
+        tern_1 = common.c2f_s2u_32(destino)
+    }
+    let alvo: i32 = transmute(tern_1, to = i32)
+    if not planejar_conta(&k, i) {
+        return 0
+    }
+    if not carregar_dividendo(&k, i) {
+        return -1
+    }
+    var tern_2: u32 = RAX as u32
+    if common.c2f_s2u_32(alvo) != common.c2f_s2u_32(k.src) {
+        tern_2 = common.c2f_s2u_32(alvo)
+    }
+    k.trab = transmute(tern_2, to = i32)
+    if not emitir_conta(&k, alvo) {
+        return -1
+    }
+    if (destino < 0) and (not isel_guardar(c, i.dst, RAX)) {
+        return -1
+    }
+    return 1
+}
+
+// C: nativo/x64/x64_isel_otim_div.c:424
+pub proc x64_div_const_marcar(programa: ^bir.BirPrograma, funcao: ^bir.BirFuncao) {
+    funcao.div_const = true
+}
+
+// as contas do isel (emissor x64_emitir) ainda sao stub nesta copia: so as funcoes puras ganham teste aqui
+test "x64_isel_otim_div: valor_do_divisor e modulo_do_divisor_2 seguem o sinal e a largura da conta" {
+    var p = DivMagicaPlano{bits = 8, com_sinal = true, divisor = 254}
+    expect(valor_do_divisor(&p, 32) == -2)
+    expect(valor_do_divisor(&p, 64) == -2)
+    expect(modulo_do_divisor_2(&p) == 2)
+    p.com_sinal = false
+    expect(valor_do_divisor(&p, 32) == 254)
+    p = DivMagicaPlano{bits = 16, com_sinal = true, divisor = 65535}
+    expect(valor_do_divisor(&p, 64) == -1)
+    expect(modulo_do_divisor_2(&p) == 1)
+}

@@ -1,0 +1,256 @@
+// semantic/sem_naocopia.fj - porte de compiler/semantic/sem_naocopia.c
+// sha256 de semantic/sem_naocopia.c: dd16b900ee18416432e19355b1eb17ee58dd001abddd4087ee2a1fe6bb484dfd
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "common"
+import "frontend"
+
+const PROFUNDIDADE_NAO_COPIAVEL_MAX: i32 = 32
+const NOMES_NAO_COPIAVEIS: [6]str = {"Mutex", "Cond", "AtomicI32", "AtomicI64", "AtomicU64", "AtomicPtr"}
+
+// C: semantic/sem_naocopia.c:17
+proc eh_struct_marcada_da_std(s: ^Semantica, d: ?^frontend.Decl) -> bool {
+    let dd: ^frontend.Decl = d as ^frontend.Decl
+    if modulos_da_sem(s).itens[dd.modulo].origem != (frontend.MOD_STD as u8) {
+        return false
+    }
+    let nome: str = sem_nome_texto(s, dd.nome)
+    for k in 0..<len(NOMES_NAO_COPIAVEIS) { // sizeof NOMES_NAO_COPIAVEIS / sizeof [0]
+        if nome == NOMES_NAO_COPIAVEIS[k] {
+            return true
+        }
+    }
+    return false
+}
+
+// C: semantic/sem_naocopia.c:31
+proc struct_nao_copiavel(s: ^Semantica, t: u32, profundidade: i32) -> bool {
+    let d: ?^frontend.Decl = (s.globais or_else {})[tipo_de(&s.tipos, t).a].decl
+    if eh_struct_marcada_da_std(s, d) {
+        return true
+    }
+    var i: u32 = 0
+    while i < (d as ^frontend.Decl).ncampos {
+        if tipo_nao_copiavel_ate(s, ((d as ^frontend.Decl).campos or_else {})[i].tipo.tipo, profundidade + 1) {
+            return true
+        }
+        i += 1
+    }
+    return false
+}
+
+// C: semantic/sem_naocopia.c:41
+proc tipo_nao_copiavel_ate(s: ^Semantica, t: u32, profundidade: i32) -> bool {
+    var c: i32 = 0
+    if profundidade > PROFUNDIDADE_NAO_COPIAVEL_MAX {
+        return false
+    }
+    c = tipo_classe_de(&s.tipos, t)
+    if common.c2f_s2u_32(c) == (TC_STRUCT as u32) {
+        return struct_nao_copiavel(s, t, profundidade)
+    }
+    if ((common.c2f_s2u_32(c) == (TC_ARRAY as u32)) or (common.c2f_s2u_32(c) == (TC_RESULTADO as u32))) or (common.c2f_s2u_32(c) == (TC_OPCIONAL as u32)) {
+        return tipo_nao_copiavel_ate(s, tipo_de(&s.tipos, t).a, profundidade + 1)
+    }
+    return false
+}
+
+// C: semantic/sem_naocopia.c:54
+proc sem_registrar_nao_copiavel(s: ^Semantica, d: ^frontend.Decl) {
+    if eh_struct_marcada_da_std(s, d) {
+        s.tem_nao_copiavel = true
+    }
+}
+
+// C: semantic/sem_naocopia.c:59
+proc sem_tipo_eh_nao_copiavel(s: ^Semantica, t: u32) -> bool {
+    return (common.c2f_b2i32(s.tem_nao_copiavel) != 0) and (common.c2f_b2i32(tipo_nao_copiavel_ate(s, t, 0)) != 0)
+}
+
+// C: semantic/sem_naocopia.c:65
+proc erro_nao_copiavel(s: ^Semantica, t: u32, pos: u32, motivo: str) -> bool {
+    var buf: [96]u8 = {}
+    sem_descrever(s, t, buf[..], 96)
+    let texto: str = str_do_buffer(buf[..]) // char texto[96]
+    let msg_1 = format(f"{texto} nao se copia: {motivo}", alloc = heap)
+    defer delete(msg_1)
+    _ = sem_erro(s, common.E0339, pos, msg_1)
+    let dg: ^common.Diag = s.diag as ^common.Diag
+    if dg.tem and (dg.codigo == common.E0339) {
+        let forma = format(f"passe ^{texto}", alloc = heap) // char forma[128]: cabe (7 + 95)
+        defer delete(forma)
+        common.diag_forma(dg, none, forma)
+    }
+    return false
+}
+
+// C: semantic/sem_naocopia.c:78
+proc sem_conferir_nao_copiavel(s: ^Semantica, e: ?^frontend.Expr) -> bool {
+    if (e as ^frontend.Expr).tipo_no == (frontend.EX_EMBRULHA as u8) {
+        return true
+    }
+    if not sem_tipo_eh_nao_copiavel(s, (e as ^frontend.Expr).tipo) {
+        return true
+    }
+    if (e as ^frontend.Expr).tipo_no == (frontend.EX_OR_ELSE as u8) {
+        return sem_conferir_nao_copiavel(s, (e as ^frontend.Expr).b)
+    }
+    if ((((e as ^frontend.Expr).tipo_no == (frontend.EX_NOME as u8)) or ((e as ^frontend.Expr).tipo_no == (frontend.EX_CAMPO as u8))) or ((e as ^frontend.Expr).tipo_no == (frontend.EX_INDICE as u8))) or (((e as ^frontend.Expr).tipo_no == (frontend.EX_UNARIO as u8)) and ((e as ^frontend.Expr).op == (frontend.OP_DEREF as u8))) {
+        return erro_nao_copiavel(s, (e as ^frontend.Expr).tipo, (e as ^frontend.Expr).pos, "copiar um lvalor cria outro dono do mesmo estado (use ^T e &x)")
+    }
+    return true
+}
+
+// C: semantic/sem_naocopia.c:91
+proc sem_exige_copiavel(s: ^Semantica, t: u32, pos: u32, motivo: str) -> bool {
+    if not sem_tipo_eh_nao_copiavel(s, t) {
+        return true
+    }
+    return erro_nao_copiavel(s, t, pos, motivo)
+}
+
+// G3 S7: marca da std, heranca por campo/array/opcional/resultado, limite de profundidade, E0339 e a forma 'passe ^T' (estado montado a mao)
+test "sem_naocopia: marca, heranca e E0339" {
+    var arena: common.Arena = common.Arena{}
+    var nomes: common.Interner = common.Interner{}
+    var dims: DimTabela = DimTabela{}
+    var dg: common.Diag = common.Diag{}
+    var sv: Semantica = Semantica{}
+    common.interner_iniciar(&nomes, &arena)
+    dim_iniciar(&dims)
+    sv.nomes = slice_from(&nomes, len = 1)
+    sv.arena = &arena
+    sv.diag = &dg
+    tipos_iniciar(&sv.tipos, &nomes, &dims)
+    let n_mutex = common.internar(&nomes, "Mutex", 5)
+    let n_cond = common.internar(&nomes, "Cond", 4)
+    let n_outro = common.internar(&nomes, "Outro", 5)
+    let n_foo = common.internar(&nomes, "Foo", 3)
+    let n_bar = common.internar(&nomes, "Bar", 3)
+    let n_rec = common.internar(&nomes, "Rec", 3)
+    let n_c = common.internar(&nomes, "c", 1)
+    expect(len(nomes.nomes) < 120)
+    var gl = make([dynamic]Simbolo, alloc = heap)
+    defer delete(gl)
+    for _k in 0..<128 {
+        append(&gl, item = Simbolo{})
+    }
+    sv.globais = gl[0..<len(gl)]
+    sv.qtd_nomes = 128
+    var f1: common.Fonte = sem_allocator_teste_fonte("0123456789")
+    defer delete(f1.dono_texto)
+    sv.fonte = &f1
+    var mods = make([dynamic]frontend.Modulos, alloc = heap)
+    defer delete(mods)
+    append(&mods, item = frontend.Modulos{})
+    mods[0].itens[1].origem = frontend.MOD_STD as u8
+    sv.modulos = mods[0..<1]
+    let ti: u32 = TIPO_INT as u32
+    let t_mutex: u32 = tipo_struct(&sv.tipos, n_mutex)
+    let t_cond: u32 = tipo_struct(&sv.tipos, n_cond)
+    let t_outro: u32 = tipo_struct(&sv.tipos, n_outro)
+    let t_foo: u32 = tipo_struct(&sv.tipos, n_foo)
+    let t_bar: u32 = tipo_struct(&sv.tipos, n_bar)
+    let t_rec: u32 = tipo_struct(&sv.tipos, n_rec)
+    let d_mutex: ^frontend.Decl = s4_novo_decl(&sv)
+    let d_cond: ^frontend.Decl = s4_novo_decl(&sv)
+    let d_outro: ^frontend.Decl = s4_novo_decl(&sv)
+    let d_foo: ^frontend.Decl = s4_novo_decl(&sv)
+    let d_bar: ^frontend.Decl = s4_novo_decl(&sv)
+    let d_rec: ^frontend.Decl = s4_novo_decl(&sv)
+    d_mutex.modulo = 1
+    d_mutex.nome = n_mutex
+    d_cond.modulo = 0 // nome marcado, mas fora da std
+    d_cond.nome = n_cond
+    d_outro.modulo = 1 // na std, mas fora da lista
+    d_outro.nome = n_outro
+    d_foo.nome = n_foo
+    let c_foo = s4_arena_fatia_campo(&sv, 2)
+    c_foo[0].nome = n_c
+    c_foo[0].tipo.tipo = ti
+    c_foo[1].nome = n_c
+    c_foo[1].tipo.tipo = t_mutex
+    d_foo.campos = c_foo
+    d_foo.ncampos = 2
+    d_bar.nome = n_bar
+    let c_bar = s4_arena_fatia_campo(&sv, 1)
+    c_bar[0].nome = n_c
+    c_bar[0].tipo.tipo = ti
+    d_bar.campos = c_bar
+    d_bar.ncampos = 1
+    d_rec.nome = n_rec
+    let c_rec = s4_arena_fatia_campo(&sv, 1)
+    c_rec[0].nome = n_c
+    c_rec[0].tipo.tipo = tipo_array(&sv.tipos, t_rec, 4) // aponta para ela mesma: so o limite de profundidade para
+    d_rec.campos = c_rec
+    d_rec.ncampos = 1
+    let globais = sv.globais or_else {}
+    globais[n_mutex] = Simbolo{categoria = SIM_STRUCT as u8, indice = 0, decl = d_mutex, tipo = t_mutex, envenenado = 0}
+    globais[n_cond] = Simbolo{categoria = SIM_STRUCT as u8, indice = 1, decl = d_cond, tipo = t_cond, envenenado = 0}
+    globais[n_outro] = Simbolo{categoria = SIM_STRUCT as u8, indice = 2, decl = d_outro, tipo = t_outro, envenenado = 0}
+    globais[n_foo] = Simbolo{categoria = SIM_STRUCT as u8, indice = 3, decl = d_foo, tipo = t_foo, envenenado = 0}
+    globais[n_bar] = Simbolo{categoria = SIM_STRUCT as u8, indice = 4, decl = d_bar, tipo = t_bar, envenenado = 0}
+    globais[n_rec] = Simbolo{categoria = SIM_STRUCT as u8, indice = 5, decl = d_rec, tipo = t_rec, envenenado = 0}
+    // marca da std
+    expect(eh_struct_marcada_da_std(&sv, d_mutex) and not eh_struct_marcada_da_std(&sv, d_cond) and not eh_struct_marcada_da_std(&sv, d_outro) and not eh_struct_marcada_da_std(&sv, d_foo))
+    let n_atomic = common.internar(&nomes, "AtomicPtr", 9)
+    d_outro.nome = n_atomic
+    expect(eh_struct_marcada_da_std(&sv, d_outro))
+    d_outro.nome = n_outro
+    // registro liga a conferencia
+    expect(not sv.tem_nao_copiavel and not sem_tipo_eh_nao_copiavel(&sv, t_mutex))
+    sem_registrar_nao_copiavel(&sv, d_bar)
+    expect(not sv.tem_nao_copiavel)
+    sem_registrar_nao_copiavel(&sv, d_mutex)
+    expect(sv.tem_nao_copiavel)
+    // heranca
+    expect(sem_tipo_eh_nao_copiavel(&sv, t_mutex) and sem_tipo_eh_nao_copiavel(&sv, t_foo))
+    expect(not sem_tipo_eh_nao_copiavel(&sv, t_cond) and not sem_tipo_eh_nao_copiavel(&sv, t_outro) and not sem_tipo_eh_nao_copiavel(&sv, t_bar) and not sem_tipo_eh_nao_copiavel(&sv, ti))
+    expect(sem_tipo_eh_nao_copiavel(&sv, tipo_array(&sv.tipos, t_foo, 3)) and sem_tipo_eh_nao_copiavel(&sv, tipo_opcional(&sv.tipos, t_mutex)) and sem_tipo_eh_nao_copiavel(&sv, tipo_resultado(&sv.tipos, t_mutex, ti)))
+    expect(not sem_tipo_eh_nao_copiavel(&sv, tipo_resultado(&sv.tipos, ti, t_mutex)) and not sem_tipo_eh_nao_copiavel(&sv, tipo_ponteiro(&sv.tipos, t_mutex)) and not sem_tipo_eh_nao_copiavel(&sv, tipo_fatia(&sv.tipos, t_mutex)))
+    expect(not sem_tipo_eh_nao_copiavel(&sv, t_rec)) // recursao limitada em 32
+    expect(not tipo_nao_copiavel_ate(&sv, t_mutex, 33) and tipo_nao_copiavel_ate(&sv, t_mutex, 32))
+    // E0339
+    expect(sem_exige_copiavel(&sv, t_bar, 3, "motivo X") and not dg.tem)
+    expect(not sem_exige_copiavel(&sv, t_mutex, 3, "motivo X") and dg.tem and dg.codigo == common.E0339 and dg.off == 3 and (dg.causa or_else "") == "Mutex nao se copia: motivo X" and (dg.forma or_else "") == "passe ^Mutex")
+    expect((dg.explicacao or_else "") == "") // diag_forma(NULL, forma) nao escreve explicacao (a do catalogo entra so na hora de imprimir)
+    dg = common.Diag{}
+    let tipo_foo_dois: u32 = tipo_array(&sv.tipos, t_foo, 2)
+    expect(not sem_exige_copiavel(&sv, tipo_foo_dois, 4, "outro") and (dg.causa or_else "") == "[2]Foo nao se copia: outro" and (dg.forma or_else "") == "passe ^[2]Foo")
+    dg = common.Diag{}
+    // copia de lvalor
+    var e: frontend.Expr = frontend.Expr{tipo_no = frontend.EX_NOME as u8, tipo = t_mutex, pos = 7}
+    expect(not sem_conferir_nao_copiavel(&sv, &e) and sem_export_teste_diag(&dg, common.E0339, 7, "Mutex nao se copia: copiar um lvalor cria outro dono do mesmo estado (use ^T e &x)") and (dg.forma or_else "") == "passe ^Mutex")
+    dg = common.Diag{}
+    e.tipo_no = frontend.EX_EMBRULHA as u8
+    expect(sem_conferir_nao_copiavel(&sv, &e) and not dg.tem)
+    e.tipo_no = frontend.EX_NOME as u8
+    e.tipo = ti
+    expect(sem_conferir_nao_copiavel(&sv, &e) and not dg.tem)
+    e.tipo = t_mutex
+    e.tipo_no = frontend.EX_CHAMADA as u8
+    expect(sem_conferir_nao_copiavel(&sv, &e) and not dg.tem)
+    e.tipo_no = frontend.EX_CAMPO as u8
+    expect(not sem_conferir_nao_copiavel(&sv, &e) and dg.tem)
+    dg = common.Diag{}
+    e.tipo_no = frontend.EX_INDICE as u8
+    expect(not sem_conferir_nao_copiavel(&sv, &e) and dg.tem)
+    dg = common.Diag{}
+    e.tipo_no = frontend.EX_UNARIO as u8
+    e.op = frontend.OP_DEREF as u8
+    expect(not sem_conferir_nao_copiavel(&sv, &e) and dg.tem)
+    dg = common.Diag{}
+    e.op = frontend.OP_NEGAR as u8
+    expect(sem_conferir_nao_copiavel(&sv, &e) and not dg.tem)
+    var rhs: frontend.Expr = frontend.Expr{tipo_no = frontend.EX_NOME as u8, tipo = t_mutex, pos = 9}
+    var ou: frontend.Expr = frontend.Expr{tipo_no = frontend.EX_OR_ELSE as u8, tipo = t_mutex, pos = 5, b = &rhs}
+    expect(not sem_conferir_nao_copiavel(&sv, &ou) and dg.tem and dg.off == 9)
+    dg = common.Diag{}
+    rhs.tipo_no = frontend.EX_CHAMADA as u8
+    expect(sem_conferir_nao_copiavel(&sv, &ou) and not dg.tem)
+    tipos_liberar(&sv.tipos)
+    dim_liberar(&dims)
+    common.interner_liberar(&nomes)
+    common.arena_liberar(&arena)
+}

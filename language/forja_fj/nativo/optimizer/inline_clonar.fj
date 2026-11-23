@@ -1,0 +1,718 @@
+// nativo/optimizer/inline_clonar.fj - porte de compiler/nativo/optimizer/inline_clonar.c
+// sha256 de nativo/optimizer/inline_clonar.c: 7def0ae8eee9ba0d9c3a338cf01e3e97a6ac9203a5014276e6b0470e6f287c0d
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.2.0
+// Changelog 0.2.0: listas de blocos sem move de dono (E0311): a montagem escreve direto em um vetor de blocos
+//   pre-alocado (cur/np/ne sao indices); a copia do corpo e elemento a elemento; ListaBlocos e empurrar_bloco saem.
+
+import "common"
+import "nativo/bir"
+
+// Montagem de um chamador: indices no lugar de ponteiros (o vetor de blocos novo nunca cresce depois de pre-alocado).
+struct Montagem {
+    p: ^bir.BirPrograma
+    chamador: u32
+    sitios: ?[]SitioInline
+    nsitios: u32
+    proximo: u32
+    corpo: ?^bir.BirFuncao
+    mapa: [dynamic]u32
+    nprincipal: u32
+    total: u32
+    np: u32
+    ne: u32
+    cur: u32
+    vregs: u32
+    slots: u32
+    vregs_mais: u32
+}
+
+// Um sitio em curso: a chamada, a folha e onde cada coisa da folha cai no chamador.
+struct Sitio {
+    g: ?^bir.BirFuncao
+    chama: ?^bir.BirInstr
+    vbase: u32
+    sbase: u32
+    bpos: u32
+    cmap: [12]u32
+    add: u32
+}
+
+const BLOCO_INSTRS_INICIAL: u32 = 8
+
+// C: nativo/optimizer/inline_clonar.c:50
+// C2F-VOID: antigo, retorno
+proc realocar(antigo: rawptr, bytes: u64) -> rawptr {
+    common.falha_interna("inline: realocar nao existe na Forja; listas crescem por append e fatias novas na arena")
+    let nada: ?^u8 = none
+    return nada as rawptr
+}
+
+// C: nativo/optimizer/inline_clonar.c:60
+proc reservar_instr(b: ^bir.BirBloco) -> ^bir.BirInstr {
+    let posicao: u32 = b.n
+    append(&b.instrs, item = bir.BirInstr{})
+    b.n += 1
+    b.cap = (cap(b.instrs) as u64) as u32
+    return &b.instrs[posicao]
+}
+
+// C: nativo/optimizer/inline_clonar.c:69
+proc acrescentar(b: ^bir.BirBloco, i: ^bir.BirInstr) {
+    let dst: ^bir.BirInstr = reservar_instr(b)
+    dst^ = i^
+}
+
+// C: nativo/optimizer/inline_clonar.c:75
+// Bloco vazio com espaco para capacidade instrucoes (acrescentar ainda cresce se faltar).
+proc bloco_com_capacidade(frio: bool, capacidade: u32) -> bir.BirBloco {
+    var b = bir.BirBloco{frio = frio}
+    b.instrs = make([dynamic]bir.BirInstr, alloc = heap, cap = capacidade as int)
+    b.cap = capacidade
+    return b
+}
+
+// C: nativo/optimizer/inline_clonar.c:92
+proc blocos_nao_frios(g: ^bir.BirFuncao) -> u32 {
+    var n: u32 = 0
+    for b in (0 as u32)..<g.nblocos {
+        var tern_1: i32 = 1
+        if common.c2f_b2i32(g.blocos[b].frio) != 0 {
+            tern_1 = 0
+        }
+        n += common.c2f_s2u_32(tern_1)
+    }
+    return n
+}
+
+// C: nativo/optimizer/inline_clonar.c:101
+proc nova_instr(op: u8, classe: u8, origem: ^bir.BirInstr) -> bir.BirInstr {
+    var i = bir.BirInstr{op = op, classe = classe, dst = bir.BIR_SEM_VREG, simbolo = bir.BIR_SEM_SIMBOLO, pos = origem.pos, ir = origem.ir}
+    i.alvo[0] = bir.BIR_SEM_BLOCO
+    i.alvo[1] = bir.BIR_SEM_BLOCO
+    return i
+}
+
+// C: nativo/optimizer/inline_clonar.c:107
+proc limpo(o: bir.BirOperando) -> bir.BirOperando {
+    var o_v: bir.BirOperando = o
+    o_v.extensao = bir.BE_NENHUMA as u8
+    o_v.tam = 0
+    o_v.sysv = none
+    return o_v
+}
+
+// C: nativo/optimizer/inline_clonar.c:115
+proc remap_operando(o: ^bir.BirOperando, vbase: u32) {
+    if o.tipo == (bir.BO_VREG as u8) {
+        o.id += vbase
+    }
+}
+
+// C: nativo/optimizer/inline_clonar.c:121
+proc eh_ov(op: u8) -> bool {
+    return (((op == (bir.BIR_ADD_OV as u8)) or (op == (bir.BIR_SUB_OV as u8))) or (op == (bir.BIR_MUL_OV as u8))) or (op == (bir.BIR_NEG_OV as u8))
+}
+
+// C: nativo/optimizer/inline_clonar.c:126
+// C2F-INDECIDIVEL: mapa
+proc remap_alvos(i: ^bir.BirInstr, mapa: []u32) {
+    if (i.op == (bir.BIR_SALTA as u8)) or (common.c2f_b2i32(eh_ov(i.op)) != 0) {
+        i.alvo[0] = mapa[i.alvo[0]]
+    } else if i.op == (bir.BIR_DESVIA as u8) {
+        i.alvo[0] = mapa[i.alvo[0]]
+        i.alvo[1] = mapa[i.alvo[1]]
+    }
+}
+
+// C: nativo/optimizer/inline_clonar.c:137
+// O corpo a clonar: a folha, ou a copia do proprio chamador quando o sitio e recursivo.
+proc corpo_do_sitio(m: ^Montagem, s: ^SitioInline) -> ^bir.BirFuncao {
+    if (m.corpo != none) and (s.folha == m.chamador) {
+        return m.corpo as ^bir.BirFuncao
+    }
+    return &(m.p.funcoes or_else {})[s.folha]
+}
+
+// C: nativo/optimizer/inline_clonar.c:143 (campos escalares e visoes; blocos, slots e classe ficam com copiar_corpo)
+proc copiar_campos_corpo(f: ^bir.BirFuncao, c: ^bir.BirFuncao) {
+    c.simbolo = f.simbolo
+    c.retorno = f.retorno
+    c.nparams = f.nparams
+    c.nvregs = f.nvregs
+    c.nblocos = f.nblocos
+    c.cap_blocos = f.cap_blocos
+    c.pos = f.pos
+    c.sintetica = f.sintetica
+    c.nslots = f.nslots
+    c.cap_slots = f.cap_slots
+    c.param_tam = f.param_tam
+    c.retorno_tam = f.retorno_tam
+    c.casas = f.casas
+    c.ncasas = f.ncasas
+    c.nsem_casa = f.nsem_casa
+    c.reg_vreg = f.reg_vreg
+    c.regs_salvos = f.regs_salvos
+    c.regs_salvos_xmm = f.regs_salvos_xmm
+    c.isel_otim = f.isel_otim
+    c.div_const = f.div_const
+}
+
+// C: nativo/optimizer/inline_clonar.c:143
+// Copia funda de blocos, classes de vreg e slots. A classe de vreg sai da arena (LIMITE: liberar_corpo nao a devolve).
+proc copiar_corpo(a: ^common.Arena, f: ^bir.BirFuncao, c: ^bir.BirFuncao) {
+    copiar_campos_corpo(f, c)
+    c.blocos = make([dynamic]bir.BirBloco, alloc = heap, cap = (f.nblocos as int) + 1)
+    var b: u32 = 0
+    while b < f.nblocos {
+        append(&c.blocos, item = bir.BirBloco{frio = f.blocos[b].frio})
+        let origem: ^bir.BirBloco = &f.blocos[b]
+        let dst: ^bir.BirBloco = &c.blocos[b]
+        dst.instrs = make([dynamic]bir.BirInstr, alloc = heap, cap = (origem.n as int) + 1)
+        var j: u32 = 0
+        while j < origem.n {
+            append(&dst.instrs, item = origem.instrs[j])
+            j += 1
+        }
+        dst.n = origem.n
+        dst.cap = (cap(dst.instrs) as u64) as u32
+        b += 1
+    }
+    let velha: []u8 = f.classe_vreg or_else {}
+    let nova: []u8 = common.arena_fatia_u8(a, (f.nvregs as int) + 1)
+    var k: u32 = 0
+    while k < f.nvregs {
+        nova[k] = velha[k]
+        k += 1
+    }
+    c.classe_vreg = nova
+    c.slots = make([dynamic]bir.BirSlot, alloc = heap, cap = (f.nslots as int) + 1)
+    k = 0
+    while k < f.nslots {
+        append(&c.slots, item = f.slots[k])
+        k += 1
+    }
+}
+
+// C: nativo/optimizer/inline_clonar.c:159
+proc liberar_corpo(c: ^bir.BirFuncao) {
+    var b: u32 = 0
+    while b < c.nblocos {
+        if cap(c.blocos[b].instrs) > 0 {
+            delete(c.blocos[b].instrs)
+        }
+        b += 1
+    }
+    delete(c.blocos)
+    delete(c.slots)
+}
+
+// C: nativo/optimizer/inline_clonar.c:171
+// Ids dos blocos antigos e o total de blocos (principais + extras que os clones pedem); soma vregs que os clones pedem.
+proc preparar_2(m: ^Montagem) {
+    var id: u32 = 0
+    var si: u32 = 0
+    var extras: u32 = 0
+    let f: ^bir.BirFuncao = &(m.p.funcoes or_else {})[m.chamador]
+    m.mapa = make([dynamic]u32, alloc = heap, cap = (f.nblocos as int) + 1)
+    var b: u32 = 0
+    while b < f.nblocos {
+        append(&m.mapa, item = id)
+        id += 1
+        while (si < m.nsitios) and ((m.sitios or_else {})[si].bloco == b) {
+            let g: ^bir.BirFuncao = corpo_do_sitio(m, &(m.sitios or_else {})[si])
+            let nao_frios: u32 = blocos_nao_frios(g)
+            id += nao_frios + 1
+            m.vregs_mais += g.nvregs
+            extras += g.nblocos - nao_frios
+            si += 1
+        }
+        b += 1
+    }
+    m.nprincipal = id
+    m.total = id + extras
+}
+
+// C: nativo/optimizer/inline_clonar.c:189
+// Vregs do chamador crescem para nvregs + vregs_mais + 1 (classe nova na arena; o antigo fica como estava).
+proc crescer_chamador(m: ^Montagem) {
+    let f: ^bir.BirFuncao = &(m.p.funcoes or_else {})[m.chamador]
+    m.vregs = f.nvregs
+    m.slots = f.nslots
+    let velha: []u8 = f.classe_vreg or_else {}
+    let nova: []u8 = common.arena_fatia_u8(&m.p.arena, ((f.nvregs + m.vregs_mais) as int) + 1)
+    var k: u32 = 0
+    while k < f.nvregs {
+        nova[k] = velha[k]
+        k += 1
+    }
+    f.classe_vreg = nova
+    if cap(f.slots) == 0 {
+        f.slots = make([dynamic]bir.BirSlot, alloc = heap, cap = (f.nslots as int) + 1)
+    }
+}
+
+// C: nativo/optimizer/inline_clonar.c:204
+// Os slots do sitio entram no fim de f.slots (sbase = len anterior); os blocos da folha tomam as posicoes ja contadas em cmap.
+proc iniciar_sitio(m: ^Montagem, s: ^SitioInline, k: ^Sitio) {
+    let f: ^bir.BirFuncao = &(m.p.funcoes or_else {})[m.chamador]
+    var q: u32 = m.np
+    var extra: u32 = m.nprincipal + m.ne
+    k.g = corpo_do_sitio(m, s)
+    k.chama = &f.blocos[s.bloco].instrs[s.instr]
+    k.vbase = m.vregs
+    k.sbase = m.slots
+    k.add = 0
+    let g: ^bir.BirFuncao = k.g as ^bir.BirFuncao
+    var b: u32 = 0
+    while b < g.nblocos {
+        if g.blocos[b].frio {
+            k.cmap[b] = extra
+            extra += 1
+        } else {
+            k.cmap[b] = q
+            q += 1
+        }
+        b += 1
+    }
+    k.bpos = q
+    m.np = q
+    m.ne = extra - m.nprincipal
+    let destino: []u8 = f.classe_vreg or_else {}
+    let origem: []u8 = g.classe_vreg or_else {}
+    var v: u32 = 0
+    while v < g.nvregs {
+        destino[k.vbase + v] = origem[v]
+        v += 1
+    }
+    var t: u32 = 0
+    while t < g.nslots {
+        append(&f.slots, item = g.slots[t])
+        t += 1
+    }
+    m.vregs += g.nvregs
+    m.slots += g.nslots
+}
+
+// C: nativo/optimizer/inline_clonar.c:224
+// Cada parametro vira um vreg novo com o valor do argumento (a folha pode regravar o parametro; resolve x = f(x)).
+proc emitir_parametros(m: ^Montagem, novo: []bir.BirBloco, k: ^Sitio) {
+    let g: ^bir.BirFuncao = k.g as ^bir.BirFuncao
+    let chama: ^bir.BirInstr = k.chama as ^bir.BirInstr
+    var p: u32 = 0
+    while p < g.nparams {
+        let arg: bir.BirOperando = limpo((chama.args or_else {})[p])
+        let classe: u8 = (g.classe_vreg or_else {})[p]
+        var op: i32 = bir.BIR_COPIA
+        if arg.tipo == (bir.BO_IMED as u8) {
+            op = bir.BIR_CONST
+        } else if arg.tipo == (bir.BO_SIMBOLO as u8) {
+            op = bir.BIR_END_SIMBOLO
+        }
+        var i: bir.BirInstr = nova_instr(op as u8, classe, chama)
+        i.dst = k.vbase + p
+        i.a = arg
+        acrescentar(&novo[m.cur], &i)
+        k.add += 1
+        p += 1
+    }
+}
+
+// C: nativo/optimizer/inline_clonar.c:239
+// RETORNA vira COPIA/CONST/COPIA_MEM no destino da chamada + SALTA para B_pos.
+proc emitir_retorno(m: ^Montagem, k: ^Sitio, ret: ^bir.BirInstr, saida: ^bir.BirBloco) {
+    let chama: ^bir.BirInstr = k.chama as ^bir.BirInstr
+    let g: ^bir.BirFuncao = k.g as ^bir.BirFuncao
+    let f: ^bir.BirFuncao = &(m.p.funcoes or_else {})[m.chamador]
+    var i: bir.BirInstr = bir.BirInstr{}
+    if g.retorno_tam > 0 {
+        i = nova_instr(bir.BIR_COPIA_MEM as u8, bir.BC_NADA as u8, ret)
+        i.a = limpo(chama.a)
+        i.b = limpo(ret.a)
+        remap_operando(&i.b, k.vbase)
+        i.desloc = g.retorno_tam as i32
+        acrescentar(saida, &i)
+    } else if chama.dst != bir.BIR_SEM_VREG {
+        var op: i32 = bir.BIR_COPIA
+        if ret.a.tipo == (bir.BO_IMED as u8) {
+            op = bir.BIR_CONST
+        }
+        i = nova_instr(op as u8, (f.classe_vreg or_else {})[chama.dst], ret)
+        i.dst = chama.dst
+        i.a = limpo(ret.a)
+        remap_operando(&i.a, k.vbase)
+        acrescentar(saida, &i)
+    }
+    i = nova_instr(bir.BIR_SALTA as u8, bir.BC_NADA as u8, ret)
+    i.alvo[0] = k.bpos
+    acrescentar(saida, &i)
+}
+
+// C: nativo/optimizer/inline_clonar.c:263
+// Copia uma instrucao da folha para o chamador: vregs, slots e alvos remapeados; args na arena.
+proc clonar_instr(m: ^Montagem, k: ^Sitio, src: ^bir.BirInstr, i: ^bir.BirInstr) {
+    i^ = src^
+    if i.dst != bir.BIR_SEM_VREG {
+        i.dst += k.vbase
+    }
+    remap_operando(&i.a, k.vbase)
+    remap_operando(&i.b, k.vbase)
+    if i.op == (bir.BIR_END_SLOT as u8) {
+        i.a.imed += (k.sbase as i64)
+    }
+    if i.nargs > 0 {
+        let args: []bir.BirOperando = bir.arena_fatia_bir_operando(&m.p.arena, i.nargs as int)
+        let origem: []bir.BirOperando = src.args or_else {}
+        var q: u32 = 0
+        while q < i.nargs {
+            args[q] = origem[q]
+            remap_operando(&args[q], k.vbase)
+            q += 1
+        }
+        i.args = args
+    }
+    remap_alvos(i, k.cmap[..])
+}
+
+// C: nativo/optimizer/inline_clonar.c:281
+// Bloco b da folha vai para a posicao que iniciar_sitio reservou em cmap.
+proc clonar_bloco(m: ^Montagem, novo: []bir.BirBloco, k: ^Sitio, b: u32) {
+    let g: ^bir.BirFuncao = k.g as ^bir.BirFuncao
+    let src: ^bir.BirBloco = &g.blocos[b]
+    let dst: ^bir.BirBloco = &novo[k.cmap[b]]
+    dst^ = bloco_com_capacidade(src.frio, src.n + 1)
+    var j: u32 = 0
+    while j < src.n {
+        let si: ^bir.BirInstr = &src.instrs[j]
+        if si.op == (bir.BIR_RETORNA as u8) {
+            emitir_retorno(m, k, si, dst)
+        } else {
+            clonar_instr(m, k, si, reservar_instr(dst))
+        }
+        j += 1
+    }
+    k.add += dst.n
+}
+
+// C: nativo/optimizer/inline_clonar.c:299
+// Fecha o segmento atual com o salto para a folha, clona os blocos da folha e deixa o B_pos como proximo segmento (montar_bloco).
+proc emitir_sitio(m: ^Montagem, novo: []bir.BirBloco, s: ^SitioInline) {
+    var k = Sitio{}
+    iniciar_sitio(m, s, &k)
+    emitir_parametros(m, novo, &k)
+    let g: ^bir.BirFuncao = k.g as ^bir.BirFuncao
+    var salto: bir.BirInstr = nova_instr(bir.BIR_SALTA as u8, bir.BC_NADA as u8, k.chama as ^bir.BirInstr)
+    salto.alvo[0] = k.cmap[0]
+    acrescentar(&novo[m.cur], &salto)
+    var b: u32 = 0
+    while b < g.nblocos {
+        clonar_bloco(m, novo, &k, b)
+        b += 1
+    }
+    s.instr_add = k.add
+}
+
+// C: nativo/optimizer/inline_clonar.c:318
+proc proximo_fim_de_segmento(m: ^Montagem, b: u32, n: u32) -> u32 {
+    let outro: bool = (m.proximo < m.nsitios) and ((m.sitios or_else {})[m.proximo].bloco == b)
+    var tern_1: u32 = n
+    if common.c2f_b2i32(outro) != 0 {
+        tern_1 = (m.sitios or_else {})[m.proximo].instr
+    }
+    return tern_1 + 1
+}
+
+// Proxima posicao da parte principal do vetor novo (segmentos abertos; np anda em ordem).
+proc reservar_principal(m: ^Montagem) -> u32 {
+    let idx: u32 = m.np
+    m.np += 1
+    return idx
+}
+
+// C: nativo/optimizer/inline_clonar.c:325
+// Bloco antigo b: sem chamada trocada muda de lugar (copia com alvos remapeados); com chamada, vira segmentos + sitios.
+proc montar_bloco(m: ^Montagem, novo: []bir.BirBloco, b: u32) {
+    let f: ^bir.BirFuncao = &(m.p.funcoes or_else {})[m.chamador]
+    let antigo: ^bir.BirBloco = &f.blocos[b]
+    let tem_sitio: bool = (m.proximo < m.nsitios) and ((m.sitios or_else {})[m.proximo].bloco == b)
+    if not tem_sitio {
+        let idx: u32 = reservar_principal(m)
+        let dst: ^bir.BirBloco = &novo[idx]
+        dst^ = bloco_com_capacidade(antigo.frio, antigo.n)
+        var j: u32 = 0
+        while j < antigo.n {
+            let i: ^bir.BirInstr = reservar_instr(dst)
+            i^ = antigo.instrs[j]
+            remap_alvos(i, m.mapa[..])
+            j += 1
+        }
+        if cap(antigo.instrs) > 0 {
+            delete(antigo.instrs)
+        }
+        return
+    }
+    m.cur = reservar_principal(m)
+    novo[m.cur] = bloco_com_capacidade(antigo.frio, proximo_fim_de_segmento(m, b, antigo.n))
+    var j: u32 = 0
+    while j < antigo.n {
+        if (m.proximo < m.nsitios) and ((m.sitios or_else {})[m.proximo].bloco == b) and ((m.sitios or_else {})[m.proximo].instr == j) {
+            let s: ^SitioInline = &(m.sitios or_else {})[m.proximo]
+            m.proximo += 1
+            emitir_sitio(m, novo, s)
+            m.cur = reservar_principal(m)
+            novo[m.cur] = bloco_com_capacidade(antigo.frio, proximo_fim_de_segmento(m, b, antigo.n) - j)
+        } else {
+            let i: ^bir.BirInstr = reservar_instr(&novo[m.cur])
+            i^ = antigo.instrs[j]
+            remap_alvos(i, m.mapa[..])
+        }
+        j += 1
+    }
+    if cap(antigo.instrs) > 0 {
+        delete(antigo.instrs)
+    }
+}
+
+// C: nativo/optimizer/inline_clonar.c:359
+// Monta todos os blocos num vetor pre-alocado (principal + extras, nessa ordem de id) e devolve o vetor; o antigo sai aqui.
+proc concluir(m: ^Montagem) -> [dynamic]bir.BirBloco {
+    var novo = make([dynamic]bir.BirBloco, alloc = heap, cap = (m.total as int) + 1)
+    var k: u32 = 0
+    while k < m.total {
+        append(&novo, item = bir.BirBloco{})
+        k += 1
+    }
+    let vista: []bir.BirBloco = novo[..]
+    let f: ^bir.BirFuncao = &(m.p.funcoes or_else {})[m.chamador]
+    var b: u32 = 0
+    while b < f.nblocos {
+        montar_bloco(m, vista, b)
+        b += 1
+    }
+    delete(f.blocos)
+    return novo
+}
+
+// C: nativo/optimizer/inline_clonar.c:380
+// corpo: copia do corpo original do chamador (NONE se nao ha sitio recursivo); os sitios que apontam para o chamador usam esta copia.
+proc inline_clonar(programa: ^bir.BirPrograma, chamador: u32, sitios: []SitioInline, corpo: ?^bir.BirFuncao) {
+    var m = Montagem{p = programa, chamador = chamador, sitios = sitios, nsitios = len(sitios) as u32, corpo = corpo}
+    defer delete(m.mapa)
+    preparar_2(&m)
+    crescer_chamador(&m)
+    let f: ^bir.BirFuncao = &(programa.funcoes or_else {})[chamador]
+    f.blocos = concluir(&m)
+    if (m.np != m.nprincipal) or (m.ne != (m.total - m.nprincipal)) {
+        common.falha_interna("inline: contagem de blocos da montagem nao bate com o previsto")
+    }
+    f.nblocos = m.total
+    f.cap_blocos = (cap(f.blocos) as u64) as u32
+    f.nvregs = m.vregs
+    f.nslots = m.slots
+}
+
+// C: nativo/optimizer/inline_clonar.c:398
+// Bloco novo no fim do vetor (o vetor cresce: quem guarda ponteiro para bloco nao pode atravessar esta chamada).
+proc novo_bloco(f: ^bir.BirFuncao, frio: bool) -> u32 {
+    let id: u32 = f.nblocos
+    append(&f.blocos, item = bloco_com_capacidade(frio, BLOCO_INSTRS_INICIAL))
+    f.nblocos = id + 1
+    f.cap_blocos = (cap(f.blocos) as u64) as u32
+    return id
+}
+
+// C: nativo/optimizer/inline_clonar.c:409
+// Vreg novo da funcao: so a classe e nova. A arena da funcao cresce em blocos (dobro + 16), como bir_novo_vreg.
+proc novo_vreg(a: ^common.Arena, f: ^bir.BirFuncao, classe: u8) -> u32 {
+    let v: u32 = f.nvregs
+    f.nvregs += 1
+    let velha: []u8 = f.classe_vreg or_else {}
+    if ((v + 1) as int) > len(velha) {
+        let nova: []u8 = common.arena_fatia_u8(a, (len(velha) * 2) + 16)
+        var k: u32 = 0
+        while k < v {
+            nova[k] = velha[k]
+            k += 1
+        }
+        f.classe_vreg = nova
+    }
+    let vregs: []u8 = f.classe_vreg or_else {}
+    vregs[v] = classe
+    return v
+}
+
+// C: nativo/optimizer/inline_clonar.c:418
+proc saltar_para(b: ^bir.BirBloco, origem: ^bir.BirInstr, alvo: u32) {
+    var i: bir.BirInstr = nova_instr(bir.BIR_SALTA as u8, bir.BC_NADA as u8, origem)
+    i.alvo[0] = alvo
+    acrescentar(b, &i)
+}
+
+// C: nativo/optimizer/inline_clonar.c:427
+// O valor que a folha devolve, no destino da chamada: COPIA do argumento do parametro, ou CONST do imediato. Sem destino (resultado descartado): nada.
+proc escrever_valor_da_folha(f: ^bir.BirFuncao, gr: ^GuardaRetorno, chama: ^bir.BirInstr, folha: u32) {
+    var i: bir.BirInstr = bir.BirInstr{}
+    if chama.dst == bir.BIR_SEM_VREG {
+        return
+    }
+    var tern_1: i32 = bir.BIR_COPIA
+    if gr.devolvido.tipo == (bir.BO_IMED as u8) {
+        tern_1 = bir.BIR_CONST
+    }
+    i = nova_instr(tern_1 as u8, (f.classe_vreg or_else {})[chama.dst], chama)
+    i.dst = chama.dst
+    var tern_2: bir.BirOperando = gr.devolvido
+    if gr.devolvido.tipo == (bir.BO_VREG as u8) {
+        tern_2 = (chama.args or_else {})[gr.param]
+    }
+    i.a = limpo(tern_2)
+    acrescentar(&f.blocos[folha], &i)
+}
+
+// Auxiliar sem equivalente no C: o C so baixa a contagem (antes->n = s->instr); a Forja refaz a lista com os que ficam, pois lista dona nao encolhe no lugar.
+proc truncar_bloco(b: ^bir.BirBloco, n: u32) {
+    var ficam = make([dynamic]bir.BirInstr, alloc = heap, cap = (n as int) + 1)
+    defer delete(ficam)
+    var j: u32 = 0
+    while j < n {
+        append(&ficam, item = b.instrs[j])
+        j += 1
+    }
+    delete(b.instrs)
+    b.instrs = make([dynamic]bir.BirInstr, alloc = heap, cap = (n as int) + 1)
+    j = 0
+    while j < n {
+        append(&b.instrs, item = ficam[j])
+        j += 1
+    }
+    b.n = n
+    b.cap = (cap(b.instrs) as u64) as u32
+}
+
+// C: nativo/optimizer/inline_clonar.c:439
+proc inline_guardar(programa: ^bir.BirPrograma, s: ^SitioGuarda) -> u32 {
+    let f: ^bir.BirFuncao = &(programa.funcoes or_else {})[s.chamador]
+    let gr: ^GuardaRetorno = &s.gr
+    var chama: bir.BirInstr = f.blocos[s.bloco].instrs[s.instr]
+    let cond: u32 = novo_vreg(&programa.arena, f, bir.BC_I8 as u8)
+    let folha: u32 = novo_bloco(f, false)
+    let lenta: u32 = novo_bloco(f, false)
+    let resto: u32 = novo_bloco(f, false)
+    let antes: ^bir.BirBloco = &f.blocos[s.bloco]
+    var i: bir.BirInstr = bir.BirInstr{}
+    for j in (s.instr + 1)..<antes.n {
+        acrescentar(&f.blocos[resto], &antes.instrs[j])
+    }
+    truncar_bloco(antes, s.instr)
+    i = nova_instr(bir.BIR_CMP as u8, bir.BC_I8 as u8, &chama)
+    i.aux = gr.aux
+    i.dst = cond
+    i.a = limpo((chama.args or_else {})[gr.param])
+    i.b = limpo(gr.limite)
+    acrescentar(antes, &i)
+    i = nova_instr(bir.BIR_DESVIA as u8, bir.BC_NADA as u8, &chama)
+    i.a = bir.BirOperando{tipo = bir.BO_VREG as u8, classe = bir.BC_I8 as u8, id = cond}
+    var tern_1: u32 = lenta
+    if common.c2f_b2i32(gr.folha_verdadeira) != 0 {
+        tern_1 = folha
+    }
+    i.alvo[0] = tern_1
+    var tern_2: u32 = folha
+    if common.c2f_b2i32(gr.folha_verdadeira) != 0 {
+        tern_2 = lenta
+    }
+    i.alvo[1] = tern_2
+    acrescentar(antes, &i)
+    escrever_valor_da_folha(f, gr, &chama, folha)
+    saltar_para(&f.blocos[folha], &chama, resto)
+    acrescentar(&f.blocos[lenta], &chama)
+    saltar_para(&f.blocos[lenta], &chama, resto)
+    return resto
+}
+
+// Testes: corpos montados a mao (chamador com 1 bloco: CHAMA + RETORNA; folha com 1 bloco: RETORNA).
+proc inline_clonar_teste_bloco(f: ^bir.BirFuncao, i: bir.BirInstr) {
+    let id: u32 = f.nblocos
+    if cap(f.blocos) == 0 {
+        f.blocos = make([dynamic]bir.BirBloco, alloc = heap, cap = 4)
+    }
+    append(&f.blocos, item = bir.BirBloco{})
+    f.nblocos = id + 1
+    let b: ^bir.BirBloco = &f.blocos[id]
+    b.instrs = make([dynamic]bir.BirInstr, alloc = heap, cap = 2)
+    append(&b.instrs, item = i)
+    b.n = 1
+}
+
+proc inline_clonar_teste_chamador() -> bir.BirFuncao {
+    var f = bir.BirFuncao{}
+    let chamada = bir.BirInstr{op = bir.BIR_CHAMA as u8, dst = bir.BIR_SEM_VREG}
+    inline_clonar_teste_bloco(&f, chamada)
+    var ret = bir.BirInstr{op = bir.BIR_RETORNA as u8}
+    ret.a = bir.BirOperando{tipo = bir.BO_IMED as u8, imed = 7}
+    append(&f.blocos[0].instrs, item = ret)
+    f.blocos[0].n += 1
+    return f
+}
+
+proc inline_clonar_teste_folha() -> bir.BirFuncao {
+    var f = bir.BirFuncao{}
+    var ret = bir.BirInstr{op = bir.BIR_RETORNA as u8}
+    ret.a = bir.BirOperando{tipo = bir.BO_IMED as u8, imed = 9}
+    inline_clonar_teste_bloco(&f, ret)
+    return f
+}
+
+test "inline_clonar_sitio_troca_chamada_por_saltos" {
+    var fs = make([dynamic]bir.BirFuncao, alloc = heap, cap = 2)
+    append(&fs, item = inline_clonar_teste_folha())
+    append(&fs, item = inline_clonar_teste_chamador())
+    var p = bir.BirPrograma{}
+    p.funcoes = fs[..]
+    var sitios = make([dynamic]SitioInline, alloc = heap, cap = 1)
+    append(&sitios, item = SitioInline{bloco = 0, instr = 0, folha = 0})
+    inline_clonar(&p, 1, sitios[..], none)
+    let f: ^bir.BirFuncao = &(p.funcoes or_else {})[1]
+    expect(f.nblocos == 3)
+    expect(f.blocos[0].n == 1)
+    expect(f.blocos[0].instrs[0].op == (bir.BIR_SALTA as u8))
+    expect(f.blocos[0].instrs[0].alvo[0] == 1)
+    expect(f.blocos[1].instrs[0].op == (bir.BIR_SALTA as u8))
+    expect(f.blocos[1].instrs[0].alvo[0] == 2)
+    expect(f.blocos[2].instrs[0].op == (bir.BIR_RETORNA as u8))
+    expect(f.blocos[2].instrs[0].a.imed == 7)
+    liberar_corpo(&fs[0])
+    liberar_corpo(&fs[1])
+    delete(fs)
+    delete(sitios)
+    common.arena_liberar(&p.arena)
+}
+
+test "inline_clonar_copiar_corpo_e_liberar" {
+    var p = bir.BirPrograma{}
+    var orig = inline_clonar_teste_chamador()
+    var copia = bir.BirFuncao{}
+    copiar_corpo(&p.arena, &orig, &copia)
+    expect(copia.nblocos == 1)
+    expect(copia.blocos[0].n == 2)
+    expect(copia.blocos[0].instrs[0].op == (bir.BIR_CHAMA as u8))
+    expect(copia.blocos[0].instrs[1].a.imed == 7)
+    liberar_corpo(&copia)
+    liberar_corpo(&orig)
+    common.arena_liberar(&p.arena)
+}
+
+test "inline_clonar_novo_vreg_cresce_na_arena" {
+    var p = bir.BirPrograma{}
+    var f = bir.BirFuncao{}
+    var k: u32 = 0
+    while k < 40 {
+        let v: u32 = novo_vreg(&p.arena, &f, 3)
+        expect(v == k)
+        k += 1
+    }
+    expect(f.nvregs == 40)
+    let cls: []u8 = f.classe_vreg or_else {}
+    expect(cls[39] == 3)
+    common.arena_liberar(&p.arena)
+}

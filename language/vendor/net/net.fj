@@ -1,0 +1,567 @@
+// vendor:net/net 0.3.0 - cliente HTTP/HTTPS (http_request e atalhos) e download para arquivo, por cima do libcurl 8.23.0 (licenca curl) em vendor\libcurl.a.
+// 0.3.0 (R10d, R0009 no dev Linux): shutdown() chama curl_global_cleanup; o programa o chama no fim do main, depois das threads.
+// 0.2.0 (marco rede, R4): Method, Header, Request, Response, http_request, http_get/post/put/patch/delete e header_get; NetError ganha send_failed e recv_failed ao FIM do enum; download_file inalterado.
+// 0.1.1 (M6c P84): curl_ponte.fj regenerado com long -> c_long; timeout_s vai com `as c_long` e o codigo HTTP sai por `var http: c_long` + `as i32`.
+//
+// COMO USAR (o .fj raiz precisa de vendor\ ao lado: libcurl.a, net\net.fj, net\curl_ponte.fj; ver MEM-FORJA-GUIA-10):
+//     import "vendor:net/net"   (o caminho antigo vendor:rede/rede e o qualificador rede. dao E0110: rode forja migrar)
+//     let http = try net.download_file("https://www.sqlite.org/robots.txt", dst = "robots.txt", timeout_s = 30)   // http = 200
+//     let a = mem.arena_create()                       // a resposta inteira vive no alloc que voce passa: Arena libera de uma vez
+//     let resp = try net.http_get("http://127.0.0.1:8080/eco", alloc = a)   // resp.status, resp.body (bytes crus), net.header_get(&resp, "content-type")
+// HTTP: 4xx/5xx NAO sao erro de http_request (voltam em Response.status); NetError so para falha de transporte, e redirecionamento alem de
+// max_redirects vira NetError.other. Com alloc = heap o chamador da delete em body, em name/value de cada cabecalho e na lista de cabecalhos.
+// Varias threads: chame os.multithread_on() antes de criar a primeira; cada http_request usa o seu proprio handle do curl (curl_global_init roda uma vez so).
+// Nome ou valor de cabecalho com CR ou LF (injecao de cabecalho) e recusado com NetError.other. Nao existe opcao para desligar a verificacao de TLS.
+// Os nomes em portugues (baixar_arquivo, ErroRede, destino/tempo_s = ...) dao E0110: rode forja migrar (tabela compiler\common\renomeados.c).
+//
+// TLS e do proprio Windows (Schannel): usa o repositorio de certificados do sistema, sem OpenSSL e sem arquivo de certificados.
+// Segue redirecionamentos (ate 10). Resposta HTTP 4xx/5xx = erro http_error e o arquivo de destino NAO fica no disco.
+// Erro de qualquer tipo apaga o arquivo parcial. `timeout_s` limita a conexao e tambem a transferencia inteira.
+// O .exe final importa so DLLs do Windows (kernel32, ws2_32, crypt32, bcrypt, advapi32, secur32, iphlpapi, api-ms-win-crt-*).
+//
+// VERIFICAR: forja run language\exemplos_libs\rede_https.fj      (precisa de internet; por isso fora do verificar_libs.py)
+
+import "vendor:net/curl_ponte" as cu
+import "std:text"
+
+pub enum NetError {
+    invalid_url
+    cannot_resolve
+    cannot_connect
+    timeout
+    tls
+    http_error
+    file
+    out_of_memory
+    other
+    send_failed
+    recv_failed
+}
+
+foreign {
+    link "ws2_32"
+    link "crypt32"
+    link "bcrypt"
+    link "advapi32"
+    link "secur32"
+    link "iphlpapi"
+    link "msvcrt"
+    opaque ArquivoRede
+    proc rede_c_fopen = "fopen"(caminho: cstr, modo: cstr) -> ?^ArquivoRede
+    proc rede_c_fclose = "fclose"(arquivo: ?^ArquivoRede) -> i32
+    proc rede_c_fwrite = "fwrite"(dados: rawptr, tamanho: u64, quantidade: u64, arquivo: ?^ArquivoRede) -> u64
+    proc rede_c_remove = "remove"(caminho: cstr) -> i32
+    proc rede_c_fseek = "fseek"(arquivo: ?^ArquivoRede, deslocamento: i32, origem: i32) -> i32
+    proc rede_c_ftell = "ftell"(arquivo: ?^ArquivoRede) -> i32
+}
+
+// Tamanho em bytes do arquivo, ou -1 se nao abrir. Existe aqui porque a Forja nao deixa dois modulos darem alias ao mesmo
+// simbolo C (E0202): quem importa std:rede usa estes dois e nao redeclara fopen/remove.
+pub proc file_size(caminho: cstr) -> i32 {
+    let aberto = rede_c_fopen(caminho, modo = "rb")
+    switch a in aberto {
+    case ^ArquivoRede:
+        _ = rede_c_fseek(a, deslocamento = 0, origem = 2)
+        let tamanho = rede_c_ftell(a)
+        _ = rede_c_fclose(a)
+        return tamanho
+    case none:
+        return -1
+    }
+    return -1
+}
+
+// Apaga o arquivo (0 = apagou).
+pub proc remove_file(caminho: cstr) -> i32 {
+    return rede_c_remove(caminho)
+}
+
+// Versao do libcurl embutido, p.ex. "libcurl/8.23.0 Schannel ...".
+pub proc versao() -> cstr {
+    return cu.curlf_versao() or_else "?"
+}
+
+// Libera o estado global do libcurl (Mbed TLS/PSA) para o runtime do dev nao contar como R0009.
+// Chamar so depois que TODAS as threads que usam net terminaram; usar net de novo depois e valido (curl_easy_init reinicia sozinho).
+pub proc shutdown() {
+    cu.curl_global_cleanup()
+}
+
+// Chamado pelo libcurl a cada pedaco recebido; grava no FILE* do msvcrt (o mesmo CRT do fopen da Forja).
+// Devolver menos que tamanho*quantidade faz o libcurl abortar com WRITE_ERROR.
+proc escrever_no_arquivo(dados: rawptr, tamanho: u64, quantidade: u64, usuario: rawptr) -> u64 {
+    let arquivo = usuario as ^ArquivoRede
+    return rede_c_fwrite(dados, tamanho = tamanho, quantidade = quantidade, arquivo = arquivo)
+}
+
+// Traduz o CURLcode para o enum da Forja.
+proc traduzir_erro(codigo: i32) -> NetError {
+    if codigo == cu.CURLF_E_URL_MALFORMAT or codigo == cu.CURLF_E_UNSUPPORTED_PROTOCOL {
+        return NetError.invalid_url
+    }
+    if codigo == cu.CURLF_E_COULDNT_RESOLVE_HOST {
+        return NetError.cannot_resolve
+    }
+    if codigo == cu.CURLF_E_COULDNT_CONNECT {
+        return NetError.cannot_connect
+    }
+    if codigo == cu.CURLF_E_OPERATION_TIMEDOUT {
+        return NetError.timeout
+    }
+    if codigo == cu.CURLF_E_SSL_CONNECT_ERROR or codigo == cu.CURLF_E_PEER_FAILED_VERIFICATION {
+        return NetError.tls
+    }
+    if codigo == cu.CURLF_E_HTTP_RETURNED_ERROR {
+        return NetError.http_error
+    }
+    if codigo == cu.CURLF_E_WRITE_ERROR {
+        return NetError.file
+    }
+    if codigo == cu.CURLF_E_SEND_ERROR {
+        return NetError.send_failed
+    }
+    if codigo == cu.CURLF_E_RECV_ERROR or codigo == cu.CURLF_E_GOT_NOTHING or codigo == cu.CURLF_E_WEIRD_SERVER_REPLY {
+        return NetError.recv_failed
+    }
+    return NetError.other
+}
+
+// Opcoes de pedido (URL, redirecionamento, tempos). Devolve o primeiro CURLcode diferente de zero, ou 0.
+proc configurar_pedido(maneja: ^cu.CurlfManeja, url: cstr, timeout_s: i32) -> i32 {
+    var codigo = cu.curlf_opt_texto(maneja, opcao = cu.CURLF_OPT_URL, valor = url)
+    if codigo != 0 {
+        return codigo
+    }
+    codigo = cu.curlf_opt_texto(maneja, opcao = cu.CURLF_OPT_USERAGENT, valor = "forja-rede/0.1")
+    if codigo != 0 {
+        return codigo
+    }
+    codigo = cu.curlf_opt_inteiro(maneja, opcao = cu.CURLF_OPT_FOLLOWLOCATION, valor = 1)
+    if codigo != 0 {
+        return codigo
+    }
+    codigo = cu.curlf_opt_inteiro(maneja, opcao = cu.CURLF_OPT_MAXREDIRS, valor = 10)
+    if codigo != 0 {
+        return codigo
+    }
+    codigo = cu.curlf_opt_inteiro(maneja, opcao = cu.CURLF_OPT_FAILONERROR, valor = 1)
+    if codigo != 0 {
+        return codigo
+    }
+    codigo = cu.curlf_opt_inteiro(maneja, opcao = cu.CURLF_OPT_NOSIGNAL, valor = 1)
+    if codigo != 0 {
+        return codigo
+    }
+    codigo = cu.curlf_opt_inteiro(maneja, opcao = cu.CURLF_OPT_CONNECTTIMEOUT, valor = timeout_s as c_long)
+    if codigo != 0 {
+        return codigo
+    }
+    return cu.curlf_opt_inteiro(maneja, opcao = cu.CURLF_OPT_TIMEOUT, valor = timeout_s as c_long)
+}
+
+// Liga o corpo da resposta ao arquivo aberto. Devolve o primeiro CURLcode diferente de zero, ou 0.
+proc configurar_destino(maneja: ^cu.CurlfManeja, arquivo: ^ArquivoRede) -> i32 {
+    let codigo = cu.curlf_opt_ponteiro(maneja, opcao = cu.CURLF_OPT_WRITEDATA, valor = arquivo as rawptr)
+    if codigo != 0 {
+        return codigo
+    }
+    return cu.curlf_opt_escrita(maneja, opcao = cu.CURLF_OPT_WRITEFUNCTION, retorno = escrever_no_arquivo)
+}
+
+// Faz a transferencia com a maneja pronta. Devolve o codigo HTTP final (200...) ou o erro.
+proc transferir(maneja: ^cu.CurlfManeja, arquivo: ^ArquivoRede, url: cstr, timeout_s: i32) -> i32 ! NetError {
+    var codigo = configurar_pedido(maneja, url = url, timeout_s = timeout_s)
+    if codigo == 0 {
+        codigo = configurar_destino(maneja, arquivo = arquivo)
+    }
+    if codigo == 0 {
+        codigo = cu.curlf_executar(maneja)
+    }
+    if codigo != 0 {
+        return traduzir_erro(codigo)
+    }
+    var http: c_long = 0
+    _ = cu.curlf_info_inteiro(maneja, informacao = cu.CURLF_INFO_RESPONSE_CODE, saida = &http)
+    return http as i32
+}
+
+// Cria a maneja, transfere e a libera. O arquivo ja esta aberto.
+proc transferir_com_maneja(arquivo: ^ArquivoRede, url: cstr, timeout_s: i32) -> i32 ! NetError {
+    let criada = cu.curlf_iniciar()
+    switch m in criada {
+    case ^cu.CurlfManeja:
+        let resultado = transferir(m, arquivo = arquivo, url = url, timeout_s = timeout_s)
+        cu.curlf_fechar(m)
+        return resultado
+    case none:
+        return NetError.out_of_memory
+    }
+    return NetError.out_of_memory
+}
+
+// Baixa `url` (http:// ou https://) para o arquivo `dst` (criado/sobrescrito). Devolve o codigo HTTP (200).
+// Erros: invalid_url, cannot_resolve, cannot_connect, timeout, tls, http_error (4xx/5xx), file, out_of_memory, other.
+pub proc download_file(url: cstr, dst: cstr, timeout_s: i32) -> i32 ! NetError {
+    let aberto = rede_c_fopen(dst, modo = "wb")
+    switch arquivo in aberto {
+    case ^ArquivoRede:
+        let resultado = transferir_com_maneja(arquivo, url = url, timeout_s = timeout_s)
+        _ = rede_c_fclose(arquivo)
+        switch r in resultado {
+        case i32:
+            return r
+        case NetError:
+            _ = rede_c_remove(dst)
+            return r
+        }
+        return NetError.other
+    case none:
+        return NetError.file
+    }
+    return NetError.file
+}
+
+// ---- Cliente HTTP (0.2.0) ----
+
+// Verbo do pedido.
+pub enum Method {
+    get
+    post
+    put
+    patch
+    delete
+    head
+}
+
+// Um cabecalho: name sem o ":" e value sem espacos nas pontas.
+pub struct Header {
+    name: str
+    value: str
+}
+
+// Pedido HTTP. body so vai em post/put/patch/delete (get e head ignoram). timeout_ms limita a conexao e tambem a transferencia inteira.
+// ca_file = arquivo PEM de autoridade certificadora (vazio = repositorio do sistema); com ele o curl nao consulta a revogacao (CA de teste nao tem CRL).
+pub struct Request {
+    method: Method
+    url: str
+    headers: []Header
+    body: []u8
+    timeout_ms: int = 30000
+    follow_redirects: bool = true
+    max_redirects: int = 10
+    ca_file: str = ""
+    user_agent: str = "forja"
+}
+
+// Resposta HTTP final (so os cabecalhos da ultima resposta, depois de seguir redirecionamentos). body e o corpo em bytes crus (pode ter byte 0).
+// Tudo vive no alloc que o chamador passou a http_request.
+pub struct Response {
+    status: int
+    headers: [dynamic]Header
+    body: str
+}
+
+// Estado que os callbacks do curl enchem durante a transferencia: corpo no alloc do chamador, cabecalhos crus num temporario no heap.
+struct Coletor {
+    corpo: [dynamic]u8
+    cabecalhos: [dynamic]u8
+}
+
+const BYTE_H: u8 = 72
+const BYTE_T: u8 = 84
+const BYTE_P: u8 = 80
+const BYTE_BARRA: u8 = 47
+
+// Chamado pelo libcurl a cada pedaco do corpo; devolver menos que tamanho*quantidade aborta com WRITE_ERROR.
+proc coletar_corpo(dados: rawptr, tamanho: u64, quantidade: u64, usuario: rawptr) -> u64 {
+    let coletor = usuario as ^Coletor
+    let total = tamanho * quantidade
+    if total > 0 {
+        append(&coletor.corpo, items = slice_from(dados as ^u8, len = total as int))
+    }
+    return total
+}
+
+// true se a linha de cabecalho e uma linha de status ("HTTP/1.1 200 OK").
+proc eh_linha_de_status(linha: []u8) -> bool {
+    if len(linha) < 5 {
+        return false
+    }
+    return linha[0] == BYTE_H and linha[1] == BYTE_T and linha[2] == BYTE_T and linha[3] == BYTE_P and linha[4] == BYTE_BARRA
+}
+
+// Chamado pelo libcurl a cada linha de cabecalho (inclusive a de status e a vazia do fim). Uma linha de status nova zera o que ja veio:
+// com redirecionamento sobram so os cabecalhos da resposta final.
+proc coletar_cabecalho(dados: rawptr, tamanho: u64, quantidade: u64, usuario: rawptr) -> u64 {
+    let coletor = usuario as ^Coletor
+    let total = tamanho * quantidade
+    if total > 0 {
+        let linha = slice_from(dados as ^u8, len = total as int)
+        if eh_linha_de_status(linha) {
+            clear(&coletor.cabecalhos)
+        }
+        append(&coletor.cabecalhos, items = linha)
+    }
+    return total
+}
+
+// Define uma opcao de texto do curl (o curl copia o texto) a partir de um str.
+proc definir_texto(maneja: ^cu.CurlfManeja, opcao: i32, valor: str) -> i32 {
+    let c = format_c(f"{valor}", alloc = heap)
+    let codigo = cu.curlf_opt_texto(maneja, opcao = opcao, valor = c)
+    delete(c)
+    return codigo
+}
+
+// true se nenhum cabecalho tem nome vazio nem CR/LF no nome ou no valor.
+proc cabecalhos_validos(headers: []Header) -> bool {
+    for h in headers {
+        if len(h.name) == 0 or text.index_any(h.name, "\r\n") != none or text.index_any(h.value, "\r\n") != none {
+            return false
+        }
+    }
+    return true
+}
+
+// Lista do curl com "Nome: valor" de cada cabecalho (none se nao ha). O curl NAO copia a lista: so liberar depois da transferencia.
+proc montar_lista_cabecalhos(headers: []Header) -> ?^cu.CurlfLista {
+    var lista: ?^cu.CurlfLista = none
+    for h in headers {
+        let linha = format_c(f"{h.name}: {h.value}", alloc = heap)
+        lista = cu.curlf_lista_acrescentar(lista, texto = linha)
+        delete(linha)
+    }
+    return lista
+}
+
+// Redirecionamento: segue ate max_redirects, ou nao segue.
+proc configurar_redirecionamento(maneja: ^cu.CurlfManeja, req: ^Request) -> i32 {
+    if not req.follow_redirects {
+        return cu.curlf_opt_inteiro(maneja, opcao = cu.CURLF_OPT_FOLLOWLOCATION, valor = 0)
+    }
+    let codigo = cu.curlf_opt_inteiro(maneja, opcao = cu.CURLF_OPT_FOLLOWLOCATION, valor = 1)
+    if codigo != 0 {
+        return codigo
+    }
+    return cu.curlf_opt_inteiro(maneja, opcao = cu.CURLF_OPT_MAXREDIRS, valor = req.max_redirects as c_long)
+}
+
+// CA propria (PEM): o Schannel aceita PEM, e a CA de teste nao tem lista de revogacao, entao so aqui o curl para de consultar a revogacao.
+proc configurar_ca(maneja: ^cu.CurlfManeja, ca_file: str) -> i32 {
+    let codigo = definir_texto(maneja, opcao = cu.CURLF_OPT_CAINFO, valor = ca_file)
+    if codigo != 0 {
+        return codigo
+    }
+    return cu.curlf_opt_inteiro(maneja, opcao = cu.CURLF_OPT_SSL_OPTIONS, valor = cu.CURLF_SSLOPT_NO_REVOKE as c_long)
+}
+
+// URL, user agent, tempos, redirecionamento e CA. Devolve o primeiro CURLcode diferente de zero, ou 0.
+proc configurar_basico(maneja: ^cu.CurlfManeja, req: ^Request) -> i32 {
+    var codigo = definir_texto(maneja, opcao = cu.CURLF_OPT_URL, valor = req.url)
+    if codigo == 0 {
+        codigo = definir_texto(maneja, opcao = cu.CURLF_OPT_USERAGENT, valor = req.user_agent)
+    }
+    if codigo == 0 {
+        codigo = cu.curlf_opt_inteiro(maneja, opcao = cu.CURLF_OPT_NOSIGNAL, valor = 1)
+    }
+    if codigo == 0 {
+        codigo = cu.curlf_opt_inteiro(maneja, opcao = cu.CURLF_OPT_CONNECTTIMEOUT_MS, valor = req.timeout_ms as c_long)
+    }
+    if codigo == 0 {
+        codigo = cu.curlf_opt_inteiro(maneja, opcao = cu.CURLF_OPT_TIMEOUT_MS, valor = req.timeout_ms as c_long)
+    }
+    if codigo == 0 {
+        codigo = configurar_redirecionamento(maneja, req = req)
+    }
+    if codigo == 0 and len(req.ca_file) > 0 {
+        codigo = configurar_ca(maneja, ca_file = req.ca_file)
+    }
+    return codigo
+}
+
+// Corpo do pedido: o curl copia os bytes (tamanho explicito, entao byte 0 passa). Corpo vazio vai como "" de tamanho 0 (Content-Length: 0).
+proc configurar_corpo(maneja: ^cu.CurlfManeja, body: []u8) -> i32 {
+    let codigo = cu.curlf_opt_inteiro64(maneja, opcao = cu.CURLF_OPT_POSTFIELDSIZE_LARGE, valor = len(body) as i64)
+    if codigo != 0 {
+        return codigo
+    }
+    if len(body) == 0 {
+        return definir_texto(maneja, opcao = cu.CURLF_OPT_COPYPOSTFIELDS, valor = "")
+    }
+    return cu.curlf_opt_ponteiro(maneja, opcao = cu.CURLF_OPT_COPYPOSTFIELDS, valor = &body[0] as rawptr)
+}
+
+// Verbo escrito por extenso (PUT, PATCH, DELETE) mais o corpo.
+proc configurar_verbo_com_corpo(maneja: ^cu.CurlfManeja, verbo: str, body: []u8) -> i32 {
+    let codigo = definir_texto(maneja, opcao = cu.CURLF_OPT_CUSTOMREQUEST, valor = verbo)
+    if codigo != 0 {
+        return codigo
+    }
+    return configurar_corpo(maneja, body = body)
+}
+
+// Verbo e corpo conforme req.method. get e head ignoram o corpo; delete so manda corpo se ele existe.
+proc configurar_metodo(maneja: ^cu.CurlfManeja, req: ^Request) -> i32 {
+    switch req.method {
+    case Method.get:
+        return cu.curlf_opt_inteiro(maneja, opcao = cu.CURLF_OPT_HTTPGET, valor = 1)
+    case Method.head:
+        return cu.curlf_opt_inteiro(maneja, opcao = cu.CURLF_OPT_NOBODY, valor = 1)
+    case Method.post:
+        return configurar_corpo(maneja, body = req.body)
+    case Method.put:
+        return configurar_verbo_com_corpo(maneja, verbo = "PUT", body = req.body)
+    case Method.patch:
+        return configurar_verbo_com_corpo(maneja, verbo = "PATCH", body = req.body)
+    case Method.delete:
+        if len(req.body) == 0 {
+            return definir_texto(maneja, opcao = cu.CURLF_OPT_CUSTOMREQUEST, valor = "DELETE")
+        }
+        return configurar_verbo_com_corpo(maneja, verbo = "DELETE", body = req.body)
+    }
+    return 0
+}
+
+// Liga a lista de cabecalhos do pedido e os callbacks de corpo e de cabecalho da resposta ao coletor.
+proc configurar_saida(maneja: ^cu.CurlfManeja, coletor: ^Coletor, lista: ?^cu.CurlfLista) -> i32 {
+    var codigo = cu.curlf_opt_lista(maneja, opcao = cu.CURLF_OPT_HTTPHEADER, lista = lista)
+    if codigo == 0 {
+        codigo = cu.curlf_opt_ponteiro(maneja, opcao = cu.CURLF_OPT_WRITEDATA, valor = coletor as rawptr)
+    }
+    if codigo == 0 {
+        codigo = cu.curlf_opt_escrita(maneja, opcao = cu.CURLF_OPT_WRITEFUNCTION, retorno = coletar_corpo)
+    }
+    if codigo == 0 {
+        codigo = cu.curlf_opt_ponteiro(maneja, opcao = cu.CURLF_OPT_HEADERDATA, valor = coletor as rawptr)
+    }
+    if codigo == 0 {
+        codigo = cu.curlf_opt_cabecalho(maneja, opcao = cu.CURLF_OPT_HEADERFUNCTION, retorno = coletar_cabecalho)
+    }
+    return codigo
+}
+
+// Configura tudo e roda a transferencia. Devolve o primeiro CURLcode diferente de zero, ou 0.
+proc configurar_e_executar(maneja: ^cu.CurlfManeja, req: ^Request, coletor: ^Coletor, lista: ?^cu.CurlfLista) -> i32 {
+    var codigo = configurar_basico(maneja, req = req)
+    if codigo == 0 {
+        codigo = configurar_metodo(maneja, req = req)
+    }
+    if codigo == 0 {
+        codigo = configurar_saida(maneja, coletor = coletor, lista = lista)
+    }
+    if codigo == 0 {
+        codigo = cu.curlf_executar(maneja)
+    }
+    return codigo
+}
+
+// Uma linha "Nome: valor" vira Header copiado no alloc; linha sem ":" (status, linha vazia) e ignorada.
+proc acrescentar_cabecalho(destino: ^[dynamic]Header, linha: str, alloc: Allocator) {
+    let antes, depois, achou = text.cut(linha, ":")
+    let nome = text.trim(antes)
+    if not achou or len(nome) == 0 {
+        return
+    }
+    append(destino, item = Header{name = format(f"{nome}", alloc = alloc), value = format(f"{text.trim(depois)}", alloc = alloc)})
+}
+
+// Todas as linhas dos cabecalhos crus viram Header no alloc.
+proc extrair_cabecalhos(bruto: str, destino: ^[dynamic]Header, alloc: Allocator) {
+    var resto = bruto
+    var linha = text.next_line(&resto)
+    while linha != none {
+        acrescentar_cabecalho(destino, linha = linha or_else "", alloc = alloc)
+        linha = text.next_line(&resto)
+    }
+}
+
+// Status HTTP final + cabecalhos + corpo, tudo no alloc. Consome o conteudo do coletor.
+proc montar_resposta(maneja: ^cu.CurlfManeja, coletor: ^Coletor, alloc: Allocator) -> Response {
+    var http: c_long = 0
+    _ = cu.curlf_info_inteiro(maneja, informacao = cu.CURLF_INFO_RESPONSE_CODE, saida = &http)
+    let bruto = to_str(&coletor.cabecalhos)
+    var resposta = Response{status = http as int, headers = make([dynamic]Header, alloc = alloc), body = to_str(&coletor.corpo)}
+    extrair_cabecalhos(bruto, destino = &resposta.headers, alloc = alloc)
+    delete(bruto)
+    return resposta
+}
+
+// Faz o pedido com a maneja pronta; libera a lista de cabecalhos e o temporario dos cabecalhos crus.
+proc executar_pedido(maneja: ^cu.CurlfManeja, req: ^Request, alloc: Allocator) -> Response ! NetError {
+    if not cabecalhos_validos(req.headers) {
+        return NetError.other
+    }
+    var coletor = Coletor{corpo = make([dynamic]u8, alloc = alloc), cabecalhos = make([dynamic]u8, alloc = heap)}
+    let lista = montar_lista_cabecalhos(req.headers)
+    let codigo = configurar_e_executar(maneja, req = req, coletor = &coletor, lista = lista)
+    cu.curlf_lista_liberar(lista)
+    if codigo != 0 {
+        delete(coletor.corpo)
+        delete(coletor.cabecalhos)
+        return traduzir_erro(codigo)
+    }
+    return montar_resposta(maneja, coletor = &coletor, alloc = alloc)
+}
+
+// Faz o pedido HTTP/HTTPS e devolve a resposta no alloc. Cada chamada cria e fecha o seu proprio handle do curl (seguro entre threads).
+// Erros: invalid_url, cannot_resolve, cannot_connect, timeout, tls, send_failed, recv_failed, out_of_memory, other (inclui cabecalho com CR/LF e excesso de redirecionamentos).
+pub proc http_request(req: ^Request, alloc: Allocator) -> Response ! NetError {
+    let criada = cu.curlf_iniciar()
+    switch m in criada {
+    case ^cu.CurlfManeja:
+        let resultado = executar_pedido(m, req = req, alloc = alloc)
+        cu.curlf_fechar(m)
+        return resultado
+    case none:
+        return NetError.out_of_memory
+    }
+    return NetError.out_of_memory
+}
+
+// GET simples.
+pub proc http_get(url: str, alloc: Allocator) -> Response ! NetError {
+    var sem_cabecalhos: [1]Header = {}
+    var sem_corpo: [1]u8 = {}
+    var req = Request{method = Method.get, url = url, headers = sem_cabecalhos[0..<0], body = sem_corpo[0..<0]}
+    return http_request(&req, alloc = alloc)
+}
+
+// DELETE sem corpo.
+pub proc http_delete(url: str, alloc: Allocator) -> Response ! NetError {
+    var sem_cabecalhos: [1]Header = {}
+    var sem_corpo: [1]u8 = {}
+    var req = Request{method = Method.delete, url = url, headers = sem_cabecalhos[0..<0], body = sem_corpo[0..<0]}
+    return http_request(&req, alloc = alloc)
+}
+
+// Pedido com corpo e Content-Type (post, put ou patch).
+proc enviar_com_corpo(metodo: Method, url: str, body: []u8, content_type: str, alloc: Allocator) -> Response ! NetError {
+    var cabecalhos: [1]Header = {Header{name = "Content-Type", value = content_type}}
+    var req = Request{method = metodo, url = url, headers = cabecalhos[..], body = body}
+    return http_request(&req, alloc = alloc)
+}
+
+// POST com corpo e Content-Type.
+pub proc http_post(url: str, body: []u8, content_type: str, alloc: Allocator) -> Response ! NetError {
+    return enviar_com_corpo(Method.post, url = url, body = body, content_type = content_type, alloc = alloc)
+}
+
+// PUT com corpo e Content-Type.
+pub proc http_put(url: str, body: []u8, content_type: str, alloc: Allocator) -> Response ! NetError {
+    return enviar_com_corpo(Method.put, url = url, body = body, content_type = content_type, alloc = alloc)
+}
+
+// PATCH com corpo e Content-Type.
+pub proc http_patch(url: str, body: []u8, content_type: str, alloc: Allocator) -> Response ! NetError {
+    return enviar_com_corpo(Method.patch, url = url, body = body, content_type = content_type, alloc = alloc)
+}
+
+// Valor do cabecalho `name` da resposta (sem diferenciar caixa, ja sem espacos nas pontas); none se nao veio. Vista: vale enquanto a resposta viver.
+pub proc header_get(resp: ^Response, name: str) -> ?str {
+    for h in resp.headers {
+        if text.equal_fold(h.name, name) {
+            return h.value
+        }
+    }
+    return none
+}

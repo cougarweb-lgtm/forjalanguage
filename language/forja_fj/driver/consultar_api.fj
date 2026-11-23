@@ -1,0 +1,274 @@
+// driver/consultar_api.fj - porte de compiler/driver/consultar_api.c
+// sha256 de driver/consultar_api.c: 5643041d02f3dccc894f8d9529b07789d23d1961e27dc538ce94e35b921427d8
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "common"
+import "frontend"
+import "semantic"
+
+// C: driver/consultar_api.c:13
+proc consulta_eh_api(d: ?^frontend.Decl) -> bool {
+    return (common.c2f_b2i32((d as ^frontend.Decl).publico) != 0) and (common.c2f_b2i32(consulta_eh_simbolo(d)) != 0)
+}
+
+// C: driver/consultar_api.c:20
+proc inicio_da_linha(texto: []u8, piso: u32, off: u32) -> u32 {
+    var off_v: u32 = off
+    while (off_v > piso) and (texto[off_v - 1] != 10) { // '\n'
+        off_v -= 1
+    }
+    return off_v
+}
+
+// C: driver/consultar_api.c:27
+proc linha_de_comentario(texto: []u8, ini: u32, fim: u32) -> bool {
+    var ini_v: u32 = ini
+    while (ini_v < fim) and ((texto[ini_v] == 32) or (texto[ini_v] == 9)) { // ' ' '\t'
+        ini_v += 1
+    }
+    return (((fim - ini_v) >= 2) and (texto[ini_v] == 47)) and (texto[ini_v + 1] == 47) // '/' '/'
+}
+
+// C: driver/consultar_api.c:34
+proc inicio_do_bloco(texto: []u8, piso: u32, linha_decl: u32) -> u32 {
+    var linha: u32 = linha_decl
+    while linha > piso {
+        let fim: u32 = linha - 1 // o LF da linha de cima
+        let ini: u32 = inicio_da_linha(texto, piso, fim)
+        if not linha_de_comentario(texto, ini, fim) {
+            break
+        }
+        linha = ini
+    }
+    return linha
+}
+
+// C: driver/consultar_api.c:47
+proc consulta_inicio_comentario(q: ^Consulta, d: ?^frontend.Decl) -> u32 {
+    let texto: []u8 = (q.c as ^Compilacao).fonte.texto
+    let piso: u32 = consulta_inicio_do_arquivo(q, (d as ^frontend.Decl).pos)
+    let linha_decl: u32 = inicio_da_linha(texto, piso, consulta_inicio_decl(q, d))
+    return inicio_do_bloco(texto, piso, linha_decl)
+}
+
+// C: driver/consultar_api.c:56
+proc anexar_linha_de_comentario(saida: ^[dynamic]u8, texto: []u8, ini: u32, fim: u32) {
+    var ini_v: u32 = ini
+    var fim_v: u32 = fim
+    while texto[ini_v] != 47 { // '/'
+        ini_v += 1
+    }
+    ini_v += 2
+    if (ini_v < fim_v) and (texto[ini_v] == 32) { // ' '
+        ini_v += 1
+    }
+    while (fim_v > ini_v) and ((texto[fim_v - 1] == 13) or (texto[fim_v - 1] == 32) or (texto[fim_v - 1] == 9)) {
+        fim_v -= 1
+    }
+    append(saida, items = texto[ini_v..<fim_v])
+}
+
+// C: driver/consultar_api.c:65
+proc consulta_comentario_acima(q: ^Consulta, d: ?^frontend.Decl, saida: ^[dynamic]u8) {
+    let texto: []u8 = (q.c as ^Compilacao).fonte.texto
+    let piso: u32 = consulta_inicio_do_arquivo(q, (d as ^frontend.Decl).pos)
+    let linha_decl: u32 = inicio_da_linha(texto, piso, consulta_inicio_decl(q, d))
+    var linha: u32 = inicio_do_bloco(texto, piso, linha_decl)
+    while linha < linha_decl {
+        var fim: u32 = linha
+        while texto[fim] != 10 { // '\n'
+            fim += 1
+        }
+        if len(saida^) > 0 {
+            append(saida, item = "\n")
+        }
+        anexar_linha_de_comentario(saida, texto, linha, fim)
+        linha = fim + 1
+    }
+}
+
+// C: driver/consultar_api.c:83
+proc consulta_assinatura_da_api(q: ^Consulta, d: ?^frontend.Decl, saida: ^[dynamic]u8) {
+    let nomes: ^common.Interner = &(q.c as ^Compilacao).nomes
+    if (d as ^frontend.Decl).tipo_no == (frontend.D_PROC as u8) {
+        consulta_assinatura_texto(q, d, saida)
+        return
+    }
+    if (d as ^frontend.Decl).tipo_no == (frontend.D_CONST as u8) {
+        format(f"const {common.interner_texto(nomes, (d as ^frontend.Decl).nome)[0..<transmute(common.interner_tam(nomes, (d as ^frontend.Decl).nome), to = i32)]}: ", into = saida)
+        semantic.tipo_anexar_texto(&(q.c as ^Compilacao).sem.tipos, (d as ^frontend.Decl).tipo.tipo, saida)
+        return
+    }
+    format(f"{semantic.indice_categoria(d)} {common.interner_texto(nomes, (d as ^frontend.Decl).nome)[0..<transmute(common.interner_tam(nomes, (d as ^frontend.Decl).nome), to = i32)]}", into = saida)
+}
+
+// C: driver/consultar_api.c:99
+proc consulta_api_item_json(q: ^Consulta, d: ?^frontend.Decl) {
+    let dec: ^frontend.Decl = d as ^frontend.Decl
+    let categoria: str = semantic.indice_categoria(d)
+    var comentario = make([dynamic]u8, alloc = heap)
+    defer delete(comentario)
+    var assinatura = make([dynamic]u8, alloc = heap)
+    defer delete(assinatura)
+    consulta_comentario_acima(q, d, &comentario)
+    consulta_assinatura_da_api(q, d, &assinatura)
+    consulta_abrir_obj(q)
+    consulta_chave_nome(q, "nome", dec.nome)
+    consulta_chave_texto(q, "categoria", categoria, len(categoria) as u64)
+    consulta_chave_id(q, "id", d)
+    consulta_chave_bool(q, "exportado", dec.exportado)
+    consulta_chave_arquivo_se_pacote(q, dec.pos)
+    consulta_chave_pos(q, "pos", consulta_inicio_decl(q, d))
+    let assinatura_txt = to_str(&assinatura)
+    defer delete(assinatura_txt)
+    consulta_chave_texto(q, "assinatura", assinatura_txt, len(assinatura_txt) as u64)
+    if len(comentario) == 0 {
+        consulta_chave_texto(q, "comentario", none, 0)
+    } else {
+        let comentario_txt = to_str(&comentario)
+        defer delete(comentario_txt)
+        consulta_chave_texto(q, "comentario", comentario_txt, len(comentario_txt) as u64)
+    }
+    consulta_fechar_obj(q)
+}
+
+// C: driver/consultar_api.c:120
+proc consulta_api_do_modulo_json(q: ^Consulta, modulo: u8) -> i32 {
+    var total: i32 = 0
+    consulta_abrir_lista(q, "api")
+    var d: ?^frontend.Decl = ((q.c as ^Compilacao).sem.programa as ^frontend.Programa).primeira
+    while d != none {
+        if (((d as ^frontend.Decl).modulo as i32) != (modulo as i32)) or (not consulta_eh_api(d)) {
+            d = (d as ^frontend.Decl).prox
+            continue
+        }
+        consulta_api_item_json(q, d)
+        total += 1
+        d = (d as ^frontend.Decl).prox
+    }
+    consulta_fechar_lista(q)
+    return total
+}
+
+// C: driver/consultar_api.c:134
+proc consultar_api(q: ^Consulta, p: ^PedidoConsulta) -> i32 {
+    let modulo: i32 = consulta_achar_modulo(q, p.arg)
+    var total: i32 = 0
+    if modulo < 0 {
+        return consulta_uso_errado("api", p.arg, "nao e modulo do projeto (use o caminho do import, ex.: std:mem)")
+    }
+    consulta_abrir(q, "api")
+    consulta_chave_modulo(q, "modulo", modulo as u8)
+    consulta_chave_arquivo(q, consulta_offset_do_modulo(q, modulo as u8))
+    consulta_chave_arquivos(q, modulo as u8)
+    total = consulta_api_do_modulo_json(q, modulo as u8)
+    consulta_chave_int(q, "total", total as i64)
+    consulta_fechar(q)
+    return CONSULTAR_OK
+}
+
+// C: driver/consultar_api.c:152
+proc consulta_teste_json(q: ^Consulta, d: ?^frontend.Decl) {
+    consulta_abrir_obj(q)
+    consulta_chave_nome(q, "nome", (d as ^frontend.Decl).nome)
+    consulta_chave_id(q, "id", d)
+    consulta_chave_modulo(q, "modulo", (d as ^frontend.Decl).modulo)
+    consulta_chave_arquivo(q, (d as ^frontend.Decl).pos)
+    consulta_chave_pos(q, "pos", (d as ^frontend.Decl).pos)
+    consulta_chave_pos(q, "fim", frontend.ast_fim_decl(&q.fim, d))
+    consulta_fechar_obj(q)
+}
+
+// C: driver/consultar_api.c:165
+proc consulta_eh_teste_do_projeto(q: ^Consulta, d: ?^frontend.Decl) -> bool {
+    return ((d as ^frontend.Decl).tipo_no == (frontend.D_TEST as u8)) and ((q.c as ^Compilacao).modulos.itens[(d as ^frontend.Decl).modulo].origem != (frontend.MOD_STD as u8))
+}
+
+// C: driver/consultar_api.c:170
+proc consultar_testes(q: ^Consulta, p: ^PedidoConsulta) -> i32 {
+    var total: i64 = 0
+    consulta_abrir(q, "testes")
+    consulta_abrir_lista(q, "testes")
+    var d: ?^frontend.Decl = ((q.c as ^Compilacao).sem.programa as ^frontend.Programa).primeira
+    while d != none {
+        if not consulta_eh_teste_do_projeto(q, d) {
+            d = (d as ^frontend.Decl).prox
+            continue
+        }
+        consulta_teste_json(q, d)
+        total += 1
+        d = (d as ^frontend.Decl).prox
+    }
+    consulta_fechar_lista(q)
+    consulta_chave_int(q, "total", total)
+    consulta_fechar(q)
+    return CONSULTAR_OK
+}
+
+// C: driver/consultar_api.c:188
+proc consulta_entrada_json(q: ^Consulta, d: ?^frontend.Decl, entrada: ?str) {
+    let dec: ^frontend.Decl = d as ^frontend.Decl
+    let entrada_txt: str = entrada or_else ""
+    var assinatura = make([dynamic]u8, alloc = heap)
+    defer delete(assinatura)
+    consulta_assinatura_texto(q, d, &assinatura)
+    consulta_abrir_obj(q)
+    consulta_chave_nome(q, "nome", dec.nome)
+    consulta_chave_texto(q, "entrada", entrada_txt, len(entrada_txt) as u64)
+    consulta_chave_id(q, "id", d)
+    consulta_chave_modulo(q, "modulo", dec.modulo)
+    consulta_chave_arquivo(q, dec.pos)
+    consulta_chave_pos(q, "pos", consulta_inicio_decl(q, d))
+    let assinatura_txt = to_str(&assinatura)
+    defer delete(assinatura_txt)
+    consulta_chave_texto(q, "assinatura", assinatura_txt, len(assinatura_txt) as u64)
+    consulta_fechar_obj(q)
+}
+
+// C: driver/consultar_api.c:205
+proc consultar_entrada(q: ^Consulta, p: ^PedidoConsulta) -> i32 {
+    var total: i64 = 0
+    consulta_abrir(q, "entrada")
+    consulta_abrir_lista(q, "entradas")
+    var d: ?^frontend.Decl = ((q.c as ^Compilacao).sem.programa as ^frontend.Programa).primeira
+    while d != none {
+        let entrada: ?str = consulta_entrada_de(q, d)
+        if entrada == none {
+            d = (d as ^frontend.Decl).prox
+            continue
+        }
+        consulta_entrada_json(q, d, entrada)
+        total += 1
+        d = (d as ^frontend.Decl).prox
+    }
+    consulta_fechar_lista(q)
+    consulta_chave_int(q, "total", total)
+    consulta_fechar(q)
+    return CONSULTAR_OK
+}
+
+// Texto de teste: "x\n// b\n  // c\nfn" (bytes 0..15)
+test "consultar_api: inicio_da_linha, linha_de_comentario e inicio_do_bloco" {
+    var t: [16]u8 = {120, 10, 47, 47, 32, 98, 10, 32, 32, 47, 47, 32, 99, 10, 102, 110}
+    expect(inicio_da_linha(t[..], 0, 15) == 14)
+    expect(inicio_da_linha(t[..], 0, 13) == 7)
+    expect(inicio_da_linha(t[..], 0, 1) == 0)
+    expect(linha_de_comentario(t[..], 7, 13))
+    expect(not linha_de_comentario(t[..], 0, 1))
+    expect(inicio_do_bloco(t[..], 0, 14) == 2)
+    expect(inicio_do_bloco(t[..], 2, 14) == 2)
+    expect(inicio_do_bloco(t[..], 0, 1) == 1)
+}
+
+test "consultar_api: anexar_linha_de_comentario tira o recuo, o '//' e o espaco" {
+    var t: [16]u8 = {120, 10, 47, 47, 32, 98, 10, 32, 32, 47, 47, 32, 99, 10, 102, 110}
+    var saida = make([dynamic]u8, alloc = heap)
+    defer delete(saida)
+    anexar_linha_de_comentario(&saida, t[..], 2, 6)
+    expect(len(saida) == 1)
+    expect(saida[0] == 98)
+    anexar_linha_de_comentario(&saida, t[..], 7, 13)
+    expect(len(saida) == 2)
+    expect(saida[1] == 99)
+}

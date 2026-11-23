@@ -1,0 +1,168 @@
+// driver/carga_pacote.fj - porte de compiler/driver/carga_pacote.c, compiler/driver/carga_pacote.h
+// sha256 de driver/carga_pacote.c: 655e89092ed0084606c17b95e04e17c62572235090bd58d802e8a8352cce7cf9
+// sha256 de driver/carga_pacote.h: 6595cbb02ec83654cc5e914edbbd7eba16e355111e883814d246977e12e8f325
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.2.0
+// Changelog: 0.2.0 - G3 P-driver DA: corpo real. GetFileAttributesA -> std:file (stat); _fullpath -> os.abs_path; PastaListarFj, PastaHashNomes e o registro de NativoPacote
+//            (Compilacao.pastas_carregadas) como no C. O mapa trecho -> pacote (Modulos.pacotes) e preenchido por analisar_modulo (main.fj), que chama
+//            modulos_registrar_arquivo depois de cada anexar_arquivo, como no C.
+
+import "std:file"
+import "std:os"
+import "common"
+import "frontend"
+import "nativo"
+
+const CAMINHO_MAX: i32 = 1300
+const CARGA_SEGUE_ARQUIVO: i32 = 0
+const CARGA_PACOTE_CARREGADO: i32 = 1
+const CARGA_FALHA: i32 = 2
+
+// C: driver/carga_pacote.c:18
+// GetFileAttributesA com FILE_ATTRIBUTE_DIRECTORY -> file.is_dir (link e juncao de pasta nao contam como pasta aqui: o stat nao segue link; o C contava)
+proc eh_pasta(caminho: str) -> bool {
+    return file.is_dir(caminho)
+}
+
+// C: driver/carga_pacote.c:24
+// existe e nao e pasta (link conta como arquivo)
+proc eh_arquivo(caminho: str) -> bool {
+    switch info in file.stat(caminho) {
+    case file.FileInfo:
+        return info.kind != file.FileKind.dir
+    case file.FileError:
+        return false
+    }
+    return false
+}
+
+// _fullpath(..., CAMINHO_MAX) falha (NULL) se o resultado nao cabe no buffer de CAMINHO_MAX bytes (com o NUL)
+proc absoluto_cabe_na_carga(absoluto: str) -> bool {
+    return len(absoluto) < (CAMINHO_MAX as int)
+}
+
+// segunda metade de mesmo_arquivo: o absoluto de a ja existe; falha de _fullpath em b = false
+proc igual_ao_absoluto(absoluto_a: str, b: str) -> bool {
+    switch absoluto_b in os.abs_path(b, alloc = heap) {
+    case str:
+        let igual: bool = absoluto_cabe_na_carga(absoluto_b) and (common.c2f_stricmp(absoluto_a, absoluto_b) == 0)
+        delete(absoluto_b)
+        return igual
+    case os.OsError:
+        return false
+    }
+    return false
+}
+
+// C: driver/carga_pacote.c:30
+proc mesmo_arquivo(a: ?str, b: str) -> bool {
+    switch absoluto_a in os.abs_path(a or_else "", alloc = heap) {
+    case str:
+        let igual: bool = absoluto_cabe_na_carga(absoluto_a) and igual_ao_absoluto(absoluto_a, b)
+        delete(absoluto_a)
+        return igual
+    case os.OsError:
+        return false
+    }
+    return false
+}
+
+// C: driver/carga_pacote.c:37
+proc carga_ja_entrou(c: ?^Compilacao, caminho: str) -> bool {
+    let f: ^common.Fonte = &(c as ^Compilacao).fonte
+    if f.ntrechos == 0 {
+        return mesmo_arquivo(f.caminho, caminho)
+    }
+    var k: u32 = 0
+    while k < f.ntrechos {
+        if mesmo_arquivo((f.trechos or_else {})[k].caminho, caminho) {
+            return true
+        }
+        k += 1
+    }
+    return false
+}
+
+// C: driver/carga_pacote.c:48
+proc carga_relatar_repetido(c: ?^Compilacao, mod: ^frontend.Modulo, caminho: str) -> bool {
+    let msg_1 = format(f"o arquivo '{caminho}' entraria duas vezes no programa (o import \"{common.interner_texto(&(c as ^Compilacao).nomes, mod.caminho)}\" e outro import trazem o mesmo arquivo); importe a pasta ou o arquivo, nao os dois", alloc = heap)
+    defer delete(msg_1)
+    return common.diag_relatar(&(c as ^Compilacao).diag, common.E1008, mod.pos_import, msg_1)
+}
+
+// C: driver/carga_pacote.c:56
+// Anexa o arquivo da pasta como trecho e o analisa (lexico e parser) como parte do modulo k. false = diagnostico em c.diag.
+proc carregar_arquivo_da_pasta(c: ?^Compilacao, k: u32, caminho: str) -> bool {
+    let mod: ^frontend.Modulo = &(c as ^Compilacao).modulos.itens[k]
+    if carga_ja_entrou(c, caminho) {
+        return carga_relatar_repetido(c, mod, caminho)
+    }
+    if not common.fonte_anexar_arquivo(&(c as ^Compilacao).fonte, caminho) {
+        let msg_1 = format(f"o arquivo '{caminho}' da pasta nao pode ser lido", alloc = heap)
+        defer delete(msg_1)
+        return common.diag_relatar(&(c as ^Compilacao).diag, common.E1001, mod.pos_import, msg_1)
+    }
+    return analisar_modulo(c as ^Compilacao, k)
+}
+
+// C: driver/carga_pacote.c:67
+proc carregar_pasta(c: ?^Compilacao, k: u32, caminhos: ^[dynamic]str) -> bool {
+    var i: u64 = 0
+    while i < (len(caminhos^) as u64) {
+        if not carregar_arquivo_da_pasta(c, k, caminhos[i]) {
+            return false
+        }
+        i += 1
+    }
+    return true
+}
+
+// C: driver/carga_pacote.c:76
+// Guarda a pasta carregada (caminho absoluto e hash da lista de nomes): vai ao .entradas do build, para um .fj que entra na pasta ou sai dela invalidar o cache.
+proc guardar_pasta(c: ?^Compilacao, pasta: str, caminhos: ^[dynamic]str) {
+    let cc: ^Compilacao = c as ^Compilacao
+    switch absoluto in os.abs_path(pasta, alloc = heap) {
+    case str:
+        if absoluto_cabe_na_carga(absoluto) {
+            append(&cc.pastas_carregadas, item = nativo.NativoPacote{caminho = from_bytes(as_bytes(absoluto), alloc = common.arena_mem(&cc.arena)), hash = common.pasta_hash_nomes(caminhos)})
+        }
+        delete(absoluto)
+    case os.OsError:
+        return
+    }
+}
+
+// C: driver/carga_pacote.c:87
+// caminho_fj = <pasta>.fj; a pasta e o texto sem o ".fj" (CARGA_SEGUE_ARQUIVO se nao ha pasta com esse nome ou o caminho nao cabe)
+proc carga_pacote(c: ?^Compilacao, k: u32, caminho_fj: str) -> i32 {
+    let mod: ^frontend.Modulo = &(c as ^Compilacao).modulos.itens[k]
+    // strlen(caminho_fj) - 3 em size_t: texto de menos de 3 bytes da a volta e nao cabe no buffer
+    if (len(caminho_fj) < 3) or ((len(caminho_fj) - 3) >= (CAMINHO_MAX as int)) {
+        return CARGA_SEGUE_ARQUIVO
+    }
+    let pasta: str = caminho_fj[0..<(len(caminho_fj) - 3)]
+    if not eh_pasta(pasta) {
+        return CARGA_SEGUE_ARQUIVO
+    }
+    var caminhos = make([dynamic]str, alloc = heap)
+    defer delete(caminhos)
+    common.pasta_listar_fj(&(c as ^Compilacao).arena, pasta, &caminhos)
+    var r: i32 = CARGA_FALHA
+    if eh_arquivo(caminho_fj) {
+        if len(caminhos) == 0 {
+            r = CARGA_SEGUE_ARQUIVO
+        } else {
+            let msg_1 = format(f"conflito de caminho: existem o arquivo '{caminho_fj}' e a pasta '{pasta}' com .fj; o import \"{common.interner_texto(&(c as ^Compilacao).nomes, mod.caminho)}\" nao sabe qual vale (renomeie um dos dois)", alloc = heap)
+            defer delete(msg_1)
+            _ = common.diag_relatar(&(c as ^Compilacao).diag, common.E1008, mod.pos_import, msg_1)
+        }
+    } else if len(caminhos) == 0 {
+        let msg_2 = format(f"a pasta '{pasta}' do import \"{common.interner_texto(&(c as ^Compilacao).nomes, mod.caminho)}\" esta sem nenhum .fj", alloc = heap)
+        defer delete(msg_2)
+        _ = common.diag_relatar(&(c as ^Compilacao).diag, common.E1001, mod.pos_import, msg_2)
+    } else if carregar_pasta(c, k, &caminhos) {
+        guardar_pasta(c, pasta, &caminhos)
+        r = CARGA_PACOTE_CARREGADO
+    }
+    return r
+}

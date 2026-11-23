@@ -1,0 +1,711 @@
+// nativo/wasm/wasm_gerar.fj - gerador WebAssembly (alvo wasm32-wasip1): BIR -> modulo .wasm
+// Versao: 0.1.0 (W1.d: funcoes de 1 bloco com COPIA, CHAMA direta de funcao e RETORNA; o resto sai X0001)
+// Contrato: wasm_gerar le a BIR ja otimizada (sem slp/alocador/isel/divconst) e acrescenta o modulo inteiro em `saida`.
+
+import "common"
+import "nativo/bir"
+import "nativo/fmt" as pefmt
+
+const SEM_FUNCAO: u32 = 4294967295
+const IMPORTS_DO_MODULO: u32 = 2 // proc_exit (indice 0) e fd_write (indice 1) da WASI; as funcoes da BIR comecam em 2
+const INDICE_FD_WRITE: u32 = 1
+const IMPORTS_DE_ARGS: u32 = 2 // 0.34.0: args_sizes_get (indice 2) e args_get (indice 3), so quando uma funcao viva usa os argumentos (wasm_alcance.fj)
+// Mapa da memoria linear: [0,1024) nulo + runtime (wasm_rt.fj); [PILHA_BASE, PILHA_TOPO) pilha sombra (cresce para baixo, 1 MiB,
+// o `$sp` e o global i64 de indice 0); [BASE_DADOS, ...) textos (BS_TEXTO) e, no W2, dados e heap
+const PILHA_BASE: u32 = 1024
+const PILHA_TOPO: u32 = 1049600
+const BASE_DADOS: u32 = 1049600
+const OP_END: u8 = 0x0B
+const OP_RETURN: u8 = 0x0F
+const OP_CALL: u8 = 0x10
+const OP_CALL_INDIRECT: u8 = 0x11
+const OP_DROP: u8 = 0x1A
+const OP_LOCAL_GET: u8 = 0x20
+const OP_LOCAL_SET: u8 = 0x21
+const OP_I32_CONST: u8 = 0x41
+const OP_I64_CONST: u8 = 0x42
+
+// valtype wasm de uma classe de vreg da BIR (0 = sem equivalente no W1.d)
+proc wasm_valtype(classe: u8) -> u8 {
+    let c = classe as i32
+    if (c == bir.BC_I8) or (c == bir.BC_I16) or (c == bir.BC_I32) {
+        return pefmt.WASM_I32
+    }
+    if c == bir.BC_I64 {
+        return pefmt.WASM_I64
+    }
+    if c == bir.BC_F32 {
+        return pefmt.WASM_F32
+    }
+    if c == bir.BC_F64 {
+        return pefmt.WASM_F64
+    }
+    return 0
+}
+
+proc wasm_nao_suportado(erro: ^common.Diag, pos: u32, o_que: str) -> bool {
+    let causa = format(f"{o_que} ainda nao suportado no alvo wasm32-wasip1", alloc = heap)
+    defer delete(causa)
+    return common.diag_relatar(erro, common.X0001, pos, causa)
+}
+
+// Empilha um operando: vreg = local.get; imediato inteiro = i32.const / i64.const (real fica para a W1.e3)
+proc wasm_empilhar(op: bir.BirOperando, corpo: ^[dynamic]u8) -> bool {
+    if (op.tipo as i32) == bir.BO_VREG {
+        append(corpo, item = OP_LOCAL_GET)
+        pefmt.wasm_leb_u32(corpo, op.id)
+        return true
+    }
+    if (op.tipo as i32) == bir.BO_IMED {
+        if wasm_classe_real(op.classe) {
+            return wasm_real_empilhar(op, corpo) // f32.const / f64.const com os bits do imediato (wasm_real.fj)
+        }
+        let valtype = wasm_valtype(op.classe)
+        if valtype == pefmt.WASM_I64 {
+            append(corpo, item = OP_I64_CONST)
+            pefmt.wasm_leb_s64(corpo, op.imed)
+            return true
+        }
+        if valtype == pefmt.WASM_I32 {
+            append(corpo, item = OP_I32_CONST)
+            pefmt.wasm_leb_s32(corpo, op.imed as i32)
+            return true
+        }
+    }
+    return false
+}
+
+proc wasm_emitir_copia(ins: ^bir.BirInstr, corpo: ^[dynamic]u8, erro: ^common.Diag) -> bool {
+    if not wasm_empilhar(ins.a, corpo) {
+        return wasm_nao_suportado(erro, ins.pos, "copia de operando que nao e vreg")
+    }
+    append(corpo, item = OP_LOCAL_SET)
+    pefmt.wasm_leb_u32(corpo, ins.dst)
+    return true
+}
+
+proc wasm_emitir_retorno(ins: ^bir.BirInstr, corpo: ^[dynamic]u8, erro: ^common.Diag) -> bool {
+    if (ins.a.tipo as i32) != bir.BO_NADA {
+        if not wasm_empilhar(ins.a, corpo) {
+            return wasm_nao_suportado(erro, ins.pos, "retorna com operando real (W1.e3)")
+        }
+    }
+    append(corpo, item = OP_RETURN)
+    return true
+}
+
+// Primeira funcao de falha (forja_falha_*) na ordem do runtime (wasm_rt.fj); as anteriores sao print_* e auxiliares
+const RT_PRIMEIRA_FALHA: u32 = 10
+
+// Argumento estreito que o runtime (funcao k) recebe em i64: o parametro unico i64 dos print_*, ou o operando com extensao nas falhas
+proc wasm_arg_vira_i64(k: u32, arg: bir.BirOperando) -> bool {
+    if wasm_classe_i64(arg.classe) {
+        return false
+    }
+    if wasm_rt_param_i64(k) {
+        return true
+    }
+    let extensao: i32 = arg.extensao as i32
+    return (k >= RT_PRIMEIRA_FALHA) and ((extensao == bir.BE_SINAL) or (extensao == bir.BE_ZERO))
+}
+
+// O parametro k da funcao `indice` da BIR (proc de runtime em Forja) e i64? Decide se o argumento estreito e alargado na chamada
+proc wasm_param_do_callee_i64(prog: ^bir.BirPrograma, indice: u32, k: u32) -> bool {
+    let funcoes: []bir.BirFuncao = prog.funcoes or_else {}
+    if indice >= prog.nfuncoes {
+        return false
+    }
+    let f: ^bir.BirFuncao = &funcoes[indice]
+    let classes: []u8 = f.classe_vreg or_else {}
+    if k >= f.nparams {
+        return false
+    }
+    return wasm_classe_i64(classes[k])
+}
+
+proc wasm_emitir_chamada(prog: ^bir.BirPrograma, ins: ^bir.BirInstr, tabela: []u32, corpo: ^[dynamic]u8, erro: ^common.Diag) -> bool {
+    let tipo_simbolo: i32 = prog.simbolos[ins.simbolo].tipo as i32
+    if (tipo_simbolo != bir.BS_FUNCAO) and (tipo_simbolo != bir.BS_RUNTIME) {
+        return wasm_nao_suportado(erro, ins.pos, "chamada a import (foreign)")
+    }
+    let nome_simbolo: str = prog.simbolos[ins.simbolo].nome or_else ""
+    if (tipo_simbolo == bir.BS_RUNTIME) and ((nome_simbolo == "memory.copy") or (nome_simbolo == "memory.fill")) {
+        return wasm_emitir_chamada_memoria(ins, nome_simbolo == "memory.fill", corpo, erro)
+    }
+    if (tipo_simbolo == bir.BS_RUNTIME) and wasm_eh_intrinseco(nome_simbolo) {
+        return wasm_emitir_intrinseco(prog, ins, nome_simbolo, corpo, erro)
+    }
+    if (tipo_simbolo == bir.BS_RUNTIME) and wasm_eh_as_real_direto(prog, ins, nome_simbolo) {
+        return wasm_emitir_as_real_direto(ins, nome_simbolo, corpo, erro)
+    }
+    if tabela[ins.simbolo] == SEM_FUNCAO {
+        let nome_rt: str = prog.simbolos[ins.simbolo].nome or_else ""
+        let causa = format(f"runtime {nome_rt}", alloc = heap)
+        defer delete(causa)
+        return wasm_nao_suportado(erro, ins.pos, causa)
+    }
+    // runtime: o indice vem depois das funcoes da BIR; k = posicao em wasm_rt_nome
+    let primeiro_rt: u32 = IMPORTS_DO_MODULO + prog.nfuncoes
+    let eh_runtime: bool = tabela[ins.simbolo] >= primeiro_rt
+    // retorno agregado: a = endereco do destino (vreg i64) com a.tam = bytes; o destino fica na pilha embaixo dos argumentos
+    let agregado: bool = ((ins.a.tipo as i32) == bir.BO_VREG) and (ins.a.tam != 0)
+    if ((ins.a.tipo as i32) != bir.BO_NADA) and (not agregado) {
+        return wasm_nao_suportado(erro, ins.pos, "chamada com retorno agregado sem tamanho")
+    }
+    if agregado and (not wasm_mem_empilhar_base(ins.a, corpo)) {
+        return wasm_nao_suportado(erro, ins.pos, "chamada com destino de retorno agregado invalido")
+    }
+    let args: []bir.BirOperando = ins.args or_else {}
+    for k in (0 as u32)..<ins.nargs {
+        if not (wasm_operando_inteiro(args[k]) or wasm_classe_real(args[k].classe)) {
+            return wasm_nao_suportado(erro, ins.pos, "chamada com argumento vetor")
+        }
+        var ok: bool = false
+        if (args[k].extensao as i32) == bir.BE_SINAL {
+            ok = wasm_empilhar_ext(args[k], corpo, true)
+        } else if (args[k].extensao as i32) == bir.BE_ZERO {
+            ok = wasm_empilhar_ext(args[k], corpo, false)
+        } else {
+            ok = wasm_empilhar(args[k], corpo)
+        }
+        if not ok {
+            return wasm_nao_suportado(erro, ins.pos, "argumento de chamada invalido")
+        }
+        // o runtime fixa o tipo do parametro: i32 estreito vira i64 pela extensao do argumento
+        // proc de runtime escrito em Forja (simbolo BS_RUNTIME ligado a uma funcao da BIR): o operando com extensao e o alargamento ao parametro i64 (fmt_i64, fmt_u64)
+        var alarga: bool = false
+        if eh_runtime {
+            alarga = wasm_arg_vira_i64(tabela[ins.simbolo] - primeiro_rt, args[k])
+        } else if (tipo_simbolo == bir.BS_RUNTIME) and (not wasm_classe_i64(args[k].classe)) and (not wasm_classe_real(args[k].classe)) {
+            alarga = wasm_param_do_callee_i64(prog, tabela[ins.simbolo] - IMPORTS_DO_MODULO, k)
+        }
+        if alarga {
+            if (args[k].extensao as i32) == bir.BE_ZERO {
+                append(corpo, item = OP_I64_EXTEND_I32_U)
+            } else {
+                append(corpo, item = OP_I64_EXTEND_I32_S)
+            }
+        }
+    }
+    append(corpo, item = OP_CALL)
+    pefmt.wasm_leb_u32(corpo, wasm_indice_final(prog, tabela, tabela[ins.simbolo]))
+    if agregado {
+        wasm_mem_copiar_retorno(ins.a.tam, corpo)
+    } else if (ins.classe as i32) != bir.BC_NADA {
+        append(corpo, item = OP_LOCAL_SET)
+        pefmt.wasm_leb_u32(corpo, ins.dst)
+    }
+    return true
+}
+
+// END_SIMBOLO de texto: endereco do cstr (tabela[simbolo] guarda o endereco nos simbolos BS_TEXTO), como i64
+// END_SIMBOLO de funcao (0.32.0, proc como valor): o indice final da funcao no modulo, que e tambem a sua entrada na tabela de funcref
+proc wasm_emitir_endereco_simbolo(prog: ^bir.BirPrograma, ins: ^bir.BirInstr, tabela: []u32, corpo: ^[dynamic]u8, erro: ^common.Diag) -> bool {
+    if (ins.a.tipo as i32) != bir.BO_SIMBOLO {
+        return wasm_nao_suportado(erro, ins.pos, "endereco de simbolo invalido")
+    }
+    let tipo_simbolo: i32 = prog.simbolos[ins.a.id].tipo as i32
+    var endereco: u32 = 0
+    if tipo_simbolo == bir.BS_FUNCAO {
+        endereco = wasm_indice_final(prog, tabela, tabela[ins.a.id])
+    } else if (tipo_simbolo == bir.BS_TEXTO) or (tipo_simbolo == bir.BS_DADO) {
+        endereco = tabela[ins.a.id]
+    } else {
+        return wasm_nao_suportado(erro, ins.pos, "endereco de simbolo que nao e texto, dado nem funcao")
+    }
+    append(corpo, item = OP_I64_CONST)
+    pefmt.wasm_leb_s64(corpo, endereco as i64)
+    append(corpo, item = OP_LOCAL_SET)
+    pefmt.wasm_leb_u32(corpo, ins.dst)
+    return true
+}
+
+// Empilha um argumento de chamada com a extensao do operando (a mesma da chamada direta)
+proc wasm_empilhar_arg(op: bir.BirOperando, corpo: ^[dynamic]u8) -> bool {
+    if (op.extensao as i32) == bir.BE_SINAL {
+        return wasm_empilhar_ext(op, corpo, true)
+    }
+    if (op.extensao as i32) == bir.BE_ZERO {
+        return wasm_empilhar_ext(op, corpo, false)
+    }
+    return wasm_empilhar(op, corpo)
+}
+
+// BIR_CHAMA_IND (0.32.0, proc como valor): argumentos, o endereco (i64) vira i32 e `call_indirect` pelo tipo montado dos operandos
+// (os mesmos tipos que a funcao chamada declara; assinatura diferente = trap em tempo de execucao); sem destino, o resultado e descartado
+proc wasm_emitir_chamada_ind(fx: ^WasmFluxo, ins: ^bir.BirInstr) -> bool {
+    if (ins.a.tipo as i32) != bir.BO_NADA {
+        return wasm_nao_suportado(fx.erro, ins.pos, "chamada por proc valor com retorno agregado")
+    }
+    var params = make([dynamic]u8, alloc = heap)
+    defer delete(params)
+    var resultados = make([dynamic]u8, alloc = heap)
+    defer delete(resultados)
+    let args: []bir.BirOperando = ins.args or_else {}
+    for k in (0 as u32)..<ins.nargs {
+        if not (wasm_operando_inteiro(args[k]) or wasm_classe_real(args[k].classe)) {
+            return wasm_nao_suportado(fx.erro, ins.pos, "chamada por proc valor com argumento vetor")
+        }
+        if not wasm_empilhar_arg(args[k], fx.corpo) {
+            return wasm_nao_suportado(fx.erro, ins.pos, "argumento de chamada invalido")
+        }
+        append(&params, item = wasm_valtype(args[k].classe))
+    }
+    if (ins.classe as i32) != bir.BC_NADA {
+        append(&resultados, item = wasm_valtype(ins.classe))
+    }
+    if not wasm_empilhar(ins.b, fx.corpo) {
+        return wasm_nao_suportado(fx.erro, ins.pos, "endereco de proc valor invalido")
+    }
+    append(fx.corpo, item = OP_I32_WRAP_I64)
+    append(fx.corpo, item = OP_CALL_INDIRECT)
+    pefmt.wasm_leb_u32(fx.corpo, pefmt.wasm_tipo(fx.m, params = params[..], results = resultados[..]))
+    append(fx.corpo, item = 0) // tabela 0
+    if not fx.m.tem_tabela {
+        pefmt.wasm_tabela(fx.m, 0) // 0.35.0: chamada indireta dentro do runtime (comparador do sort_by) sem nenhum proc tomado como valor: a tabela existe vazia
+    }
+    if (ins.classe as i32) != bir.BC_NADA {
+        if ins.dst == bir.BIR_SEM_VREG {
+            append(fx.corpo, item = OP_DROP)
+        } else {
+            append(fx.corpo, item = OP_LOCAL_SET)
+            pefmt.wasm_leb_u32(fx.corpo, ins.dst)
+        }
+    }
+    return true
+}
+
+proc wasm_emitir_instr(fx: ^WasmFluxo, ins: ^bir.BirInstr) -> bool {
+    let op = ins.op as i32
+    if op == bir.BIR_COPIA {
+        return wasm_emitir_copia(ins, fx.corpo, fx.erro)
+    }
+    if op == bir.BIR_CHAMA_IND {
+        return wasm_emitir_chamada_ind(fx, ins)
+    }
+    if op == bir.BIR_CHAMA {
+        return wasm_emitir_chamada(fx.prog, ins, fx.tabela, fx.corpo, fx.erro)
+    }
+    if op == bir.BIR_RETORNA {
+        return wasm_emitir_retorno(ins, fx.corpo, fx.erro)
+    }
+    if op == bir.BIR_END_SIMBOLO {
+        return wasm_emitir_endereco_simbolo(fx.prog, ins, fx.tabela, fx.corpo, fx.erro)
+    }
+    if op == bir.BIR_END_SLOT {
+        return wasm_emitir_end_slot(fx, ins)
+    }
+    return wasm_emitir_op(ins, fx.corpo, fx.erro)
+}
+
+// Vetor de locais do corpo: um grupo de 1 local por vreg que nao e parametro, mais (com slots) o local i64 `quadro`
+// de indice nvregs: o endereco-base do quadro na pilha sombra
+proc wasm_declarar_locais(f: ^bir.BirFuncao, corpo: ^[dynamic]u8) {
+    var extras: u32 = 0
+    if f.nslots > 0 {
+        extras = 1
+    }
+    pefmt.wasm_leb_u32(corpo, (f.nvregs - f.nparams) + extras)
+    if f.nvregs > f.nparams {
+        let classes: []u8 = f.classe_vreg or_else {}
+        for k in f.nparams..<f.nvregs {
+            pefmt.wasm_leb_u32(corpo, 1)
+            append(corpo, item = wasm_valtype(classes[k]))
+        }
+    }
+    if extras == 1 {
+        pefmt.wasm_leb_u32(corpo, 1)
+        append(corpo, item = pefmt.WASM_I64)
+    }
+}
+
+// Corpo completo (locais + instrucoes + end) de uma funcao de 1 bloco
+// LIMITE: parametros 6 (contexto de emissao; ver wasm_emitir_fluxo)
+proc wasm_corpo_da_funcao(prog: ^bir.BirPrograma, f: ^bir.BirFuncao, tabela: []u32, corpo: ^[dynamic]u8, erro: ^common.Diag, m: ^pefmt.WasmModulo) -> bool {
+    wasm_declarar_locais(f, corpo)
+    if not wasm_emitir_fluxo(prog, f, tabela, corpo, erro, m) {
+        return false
+    }
+    append(corpo, item = OP_END)
+    return true
+}
+
+// Assinatura wasm da funcao: parametros = vregs 0..nparams-1 (bir_validar.fj), resultado = retorno
+proc wasm_tipo_da_funcao(m: ^pefmt.WasmModulo, f: ^bir.BirFuncao) -> u32 {
+    var params = make([dynamic]u8, alloc = heap)
+    defer delete(params)
+    var resultados = make([dynamic]u8, alloc = heap)
+    defer delete(resultados)
+    if f.nparams > 0 {
+        let classes: []u8 = f.classe_vreg or_else {}
+        for k in (0 as u32)..<f.nparams {
+            append(&params, item = wasm_valtype(classes[k]))
+        }
+    }
+    if (f.retorno as i32) != bir.BC_NADA {
+        append(&resultados, item = wasm_valtype(f.retorno))
+    }
+    return pefmt.wasm_tipo(m, params = params[..], results = resultados[..])
+}
+
+// tabela[simbolo]: indice da funcao wasm (imports vem antes; o runtime depois das funcoes da BIR) em BS_FUNCAO e BS_RUNTIME
+// conhecido; endereco na memoria linear em BS_TEXTO (os bytes + NUL vao em `dados`, a partir de BASE_DADOS); SEM_FUNCAO no resto
+// 0.33.0: forja_panic, forja_assert e forja_expect pedem procs de nome diferente (panic, assert e expect sao embutidos da linguagem e nao se redeclaram)
+proc wasm_proc_do_simbolo_de_runtime(procedimento: str) -> str {
+    if procedimento == "panic" {
+        return "panico"
+    }
+    if procedimento == "assert" {
+        return "afirmar"
+    }
+    if procedimento == "expect" {
+        return "esperar"
+    }
+    return procedimento
+}
+
+// Simbolo de runtime forja_X sem bytecode: atende-o o proc X do modulo std:wasm_rt (runtime\wasm\rt_wasm.fj), de simbolo fj_7wasm_rt_X
+proc wasm_ligar_runtime_em_forja(prog: ^bir.BirPrograma, funcoes: []bir.BirFuncao, nome: str, simbolo: u64, tabela: ^[dynamic]u32) {
+    if (len(nome) <= 6) or (nome[0..<6] != "forja_") {
+        return
+    }
+    let procedimento: str = wasm_proc_do_simbolo_de_runtime(nome[6..<len(nome)])
+    for k in (0 as u32)..<prog.nfuncoes {
+        let nome_funcao: str = wasm_nome_da_funcao(prog, &funcoes[k])
+        if wasm_eh_proc_de_runtime(nome_funcao, procedimento) {
+            tabela[simbolo] = IMPORTS_DO_MODULO + k
+        }
+    }
+}
+
+// nome_funcao = "fj_<tamanho>wasm_<modulo>_<proc>" (std:wasm_rt, wasm_real da 0.30.0, wasm_math/trig/atan/exp/pow da 0.31.0): o
+// modulo tem <tamanho> caracteres e comeca por "wasm_"; devolve true quando o proc e `procedimento`
+proc wasm_eh_proc_de_runtime(nome_funcao: str, procedimento: str) -> bool {
+    if (len(nome_funcao) < 4) or (nome_funcao[0..<3] != "fj_") {
+        return false
+    }
+    var k: int = 3
+    var tamanho_modulo: int = 0
+    while (k < len(nome_funcao)) and (nome_funcao[k] >= 48) and (nome_funcao[k] <= 57) {
+        tamanho_modulo = (tamanho_modulo * 10) + ((nome_funcao[k] as int) - 48)
+        k += 1
+    }
+    let fim_modulo: int = k + tamanho_modulo
+    if (k == 3) or (tamanho_modulo < 5) or (len(nome_funcao) < (fim_modulo + 1)) {
+        return false
+    }
+    if (nome_funcao[k..<(k + 5)] != "wasm_") or (nome_funcao[fim_modulo] != 95) {
+        return false
+    }
+    return nome_funcao[(fim_modulo + 1)..<len(nome_funcao)] == procedimento
+}
+
+// 0.32.0: o END_SIMBOLO de proc valor aponta um simbolo `fjt_<proc>` criado a parte do simbolo da funcao-trampolim (mesmo nome, outro id; o ligador do x64 casa por nome):
+// liga esse simbolo a funcao de mesmo nome. So os `fjt_`, que sao raros, entao a busca linear custa pouco.
+proc wasm_ligar_trampolim_por_nome(prog: ^bir.BirPrograma, funcoes: []bir.BirFuncao, nome: str, s: u64, tabela: ^[dynamic]u32) {
+    if (len(nome) < 4) or (nome[0..<4] != "fjt_") {
+        return
+    }
+    for k in (0 as u32)..<prog.nfuncoes {
+        if wasm_nome_da_funcao(prog, &funcoes[k]) == nome {
+            tabela[s] = IMPORTS_DO_MODULO + k
+            return
+        }
+    }
+}
+
+proc wasm_tabela_de_funcoes(prog: ^bir.BirPrograma, funcoes: []bir.BirFuncao, tabela: ^[dynamic]u32) {
+    for _s in (0 as u64)..<(len(prog.simbolos) as u64) {
+        append(tabela, item = SEM_FUNCAO)
+    }
+    for k in (0 as u32)..<prog.nfuncoes {
+        tabela[funcoes[k].simbolo] = IMPORTS_DO_MODULO + k
+    }
+    let primeiro_rt: u32 = IMPORTS_DO_MODULO + prog.nfuncoes
+    for s in (0 as u64)..<(len(prog.simbolos) as u64) {
+        let tipo: i32 = prog.simbolos[s].tipo as i32
+        let nome: str = prog.simbolos[s].nome or_else ""
+        if (tipo == bir.BS_FUNCAO) and (tabela[s] == SEM_FUNCAO) {
+            wasm_ligar_trampolim_por_nome(prog, funcoes, nome, s, tabela)
+        }
+        if tipo == bir.BS_RUNTIME {
+            for j in (1 as u32)..<WASM_RT_QTD {
+                if wasm_rt_nome(j) == nome {
+                    tabela[s] = primeiro_rt + j
+                }
+            }
+            if tabela[s] == SEM_FUNCAO {
+                wasm_ligar_runtime_em_forja(prog, funcoes, nome, s, tabela)
+            }
+        }
+    }
+}
+
+// Coloca na memoria linear (a partir de BASE_DADOS) so os textos e dados que uma funcao viva usa (`usados`, do wasm_alcance): tabela[s] = endereco.
+// Os bytes ficam em BirSimbolo.bytes (tam bytes, sem NUL); o cstr do runtime pede o NUL, o dado de const de array (BS_DADO) nao.
+proc wasm_posicionar_dados(prog: ^bir.BirPrograma, tabela: ^[dynamic]u32, usados: []bool, dados: ^[dynamic]u8) {
+    for s in (0 as u64)..<(len(prog.simbolos) as u64) {
+        let tipo: i32 = prog.simbolos[s].tipo as i32
+        if ((tipo != bir.BS_TEXTO) and (tipo != bir.BS_DADO)) or (not usados[s]) {
+            continue
+        }
+        let alinhamento: u64 = max(prog.simbolos[s].alinhamento as u64, 1)
+        while (len(dados^) as u64) % alinhamento != 0 {
+            append(dados, item = 0)
+        }
+        tabela[s] = BASE_DADOS + (len(dados^) as u32)
+        let bytes: []u8 = as_bytes(prog.simbolos[s].bytes or_else "")
+        for b in 0..<len(bytes) {
+            append(dados, item = bytes[b])
+        }
+        if tipo == bir.BS_TEXTO {
+            append(dados, item = 0)
+        }
+    }
+}
+
+proc wasm_nome_da_funcao(prog: ^bir.BirPrograma, f: ^bir.BirFuncao) -> str {
+    return prog.simbolos[f.simbolo].nome or_else ""
+}
+
+// Funcao `_start` do WASI: forja_programa devolve o codigo de saida e proc_exit o entrega ao host
+// 0.36.0: com `indice_fim` (fim_programa do runtime, so em dev e so se o programa aloca no heap) o codigo passa antes por ele, que relata o R0009
+proc wasm_funcao_start(m: ^pefmt.WasmModulo, indice_programa: u32, indice_fim: u32) -> u32 {
+    var corpo = make([dynamic]u8, alloc = heap)
+    defer delete(corpo)
+    append(&corpo, item = 0)
+    append(&corpo, item = OP_CALL)
+    pefmt.wasm_leb_u32(&corpo, indice_programa)
+    if indice_fim != SEM_FUNCAO {
+        append(&corpo, item = OP_CALL)
+        pefmt.wasm_leb_u32(&corpo, indice_fim)
+    }
+    append(&corpo, item = OP_CALL)
+    pefmt.wasm_leb_u32(&corpo, 0)
+    append(&corpo, item = OP_END)
+    var vazio = make([dynamic]u8, alloc = heap)
+    defer delete(vazio)
+    let tipo = pefmt.wasm_tipo(m, params = vazio[..], results = vazio[..])
+    return pefmt.wasm_funcao(m, tipo = tipo, nome = "_start", corpo = corpo[..])
+}
+
+proc wasm_indice_do_programa(prog: ^bir.BirPrograma, funcoes: []bir.BirFuncao) -> u32 {
+    for k in (0 as u32)..<prog.nfuncoes {
+        if wasm_nome_da_funcao(prog, &funcoes[k]) == "forja_programa" {
+            return IMPORTS_DO_MODULO + k
+        }
+    }
+    return SEM_FUNCAO
+}
+
+// Importa proc_exit (i32) -> () da WASI preview1
+proc wasm_importar_proc_exit(m: ^pefmt.WasmModulo) {
+    var params: [1]u8 = {pefmt.WASM_I32}
+    var vazio = make([dynamic]u8, alloc = heap)
+    defer delete(vazio)
+    let tipo = pefmt.wasm_tipo(m, params = params[..], results = vazio[..])
+    _ = pefmt.wasm_importar_funcao(m, modulo = "wasi_snapshot_preview1", nome = "proc_exit", tipo = tipo)
+}
+
+// Importa fd_write (fd, iovs, iovs_len, nwritten) -> errno da WASI preview1 (indice INDICE_FD_WRITE)
+proc wasm_importar_fd_write(m: ^pefmt.WasmModulo) {
+    var params: [4]u8 = {pefmt.WASM_I32, pefmt.WASM_I32, pefmt.WASM_I32, pefmt.WASM_I32}
+    var resultado: [1]u8 = {pefmt.WASM_I32}
+    let tipo = pefmt.wasm_tipo(m, params = params[..], results = resultado[..])
+    _ = pefmt.wasm_importar_funcao(m, modulo = "wasi_snapshot_preview1", nome = "fd_write", tipo = tipo)
+}
+
+// Importa args_sizes_get (argc*, buf_size*) -> errno (indice 2) e args_get (argv*, buf*) -> errno (indice 3) da WASI preview1, nessa ordem
+proc wasm_importar_args(m: ^pefmt.WasmModulo) {
+    var params: [2]u8 = {pefmt.WASM_I32, pefmt.WASM_I32}
+    var resultado: [1]u8 = {pefmt.WASM_I32}
+    let tipo = pefmt.wasm_tipo(m, params = params[..], results = resultado[..])
+    _ = pefmt.wasm_importar_funcao(m, modulo = "wasi_snapshot_preview1", nome = "args_sizes_get", tipo = tipo)
+    _ = pefmt.wasm_importar_funcao(m, modulo = "wasi_snapshot_preview1", nome = "args_get", tipo = tipo)
+}
+
+// Define todas as funcoes da BIR; falso ao primeiro recurso nao suportado (erro ja relatado)
+proc wasm_definir_funcoes(prog: ^bir.BirPrograma, funcoes: []bir.BirFuncao, tabela: []u32, m: ^pefmt.WasmModulo, erro: ^common.Diag) -> bool {
+    for k in (0 as u32)..<prog.nfuncoes {
+        if not wasm_funcao_viva(prog, tabela, k) {
+            continue
+        }
+        let f: ^bir.BirFuncao = &funcoes[k]
+        var corpo = make([dynamic]u8, alloc = heap)
+        defer delete(corpo)
+        if not wasm_corpo_da_funcao(prog, f, tabela, &corpo, erro, m) {
+            return false
+        }
+        let tipo = wasm_tipo_da_funcao(m, f)
+        _ = pefmt.wasm_funcao(m, tipo = tipo, nome = wasm_nome_da_funcao(prog, f), corpo = corpo[..])
+    }
+    return true
+}
+
+// Procs tomados como valor (END_SIMBOLO de BS_FUNCAO numa funcao viva): tabela 0 de funcref com cada um na entrada igual ao seu indice final
+proc wasm_definir_tabela(prog: ^bir.BirPrograma, tabela: []u32, usados: []bool, m: ^pefmt.WasmModulo) {
+    var maximo: u32 = 0
+    var qtd: u32 = 0
+    for s in (0 as u64)..<(len(prog.simbolos) as u64) {
+        if ((prog.simbolos[s].tipo as i32) != bir.BS_FUNCAO) or (not usados[s]) or (tabela[s] == SEM_FUNCAO) {
+            continue
+        }
+        let indice: u32 = wasm_indice_final(prog, tabela, tabela[s])
+        pefmt.wasm_elemento(m, indice, indice)
+        maximo = max(maximo, indice)
+        qtd += 1
+    }
+    if qtd > 0 {
+        pefmt.wasm_tabela(m, maximo + 1)
+    }
+}
+
+// Reactor (--modo dll): o modulo nao tem _start; cada proc `export` vira export wasm pelo nome nu (a ponte da BIR, com ponteiro i32), e o host
+// chama depois de instanciar. struct por valor na fronteira a ponte da BIR ja embrulhou em i32 (0.41.0, bir_construir_fronteira.fj); o que sobra aqui
+// com agregado (param_tam/retorno_tam != 0) e o que nao se embrulha: union, tupla, ?T nao-nicho, T ! E, str, fatia.
+proc wasm_exportar_procs(prog: ^bir.BirPrograma, funcoes: []bir.BirFuncao, tabela: []u32, m: ^pefmt.WasmModulo, erro: ^common.Diag) -> bool {
+    let nomes: []str = prog.exportados or_else {}
+    for e in (0 as u32)..<prog.nexportados {
+        if (nomes[e] == "memory") or (nomes[e] == "_start") or (nomes[e] == "_initialize") {
+            return wasm_nao_suportado(erro, 0, "proc export com nome reservado do modulo wasm (memory, _start, _initialize)")
+        }
+        for k in (0 as u32)..<prog.nfuncoes {
+            if wasm_nome_da_funcao(prog, &funcoes[k]) != nomes[e] {
+                continue
+            }
+            if (funcoes[k].param_tam != none) or (funcoes[k].retorno_tam != 0) {
+                // 0.37.0: a causa ja diz o caminho (a forma_certa generica do X0001 manda "reduzir o trecho")
+                return common.diag_relatar(erro, common.X0001, 0, "proc export com tipo agregado nao suportado na fronteira wasm32-wasip1: so struct passa por valor (offset i32 do bloco; retorno por sret i32 inicial); union, tupla, ?T, T ! E, str e fatia nao: receba ^T (offset i32 na memoria linear) ou os campos soltos, e devolva por ^T ou campo a campo")
+            }
+            pefmt.wasm_exportar(m, nome = nomes[e], tipo = pefmt.WASM_EXP_FUNC, indice = wasm_indice_final(prog, tabela, IMPORTS_DO_MODULO + k))
+        }
+    }
+    return true
+}
+
+// Raizes da poda tardia (posicoes em `funcoes`): `forja_programa` no exe; os procs `export` no reactor
+proc wasm_raizes_do_alcance(programa: ^bir.BirPrograma, funcoes: []bir.BirFuncao, reactor: bool, raizes: ^[dynamic]u32) {
+    let nomes: []str = programa.exportados or_else {}
+    for k in (0 as u32)..<programa.nfuncoes {
+        let nome: str = wasm_nome_da_funcao(programa, &funcoes[k])
+        if (not reactor) and (nome == "forja_programa") {
+            append(raizes, item = k)
+        }
+        if reactor {
+            for e in (0 as u32)..<programa.nexportados {
+                if nomes[e] == nome {
+                    append(raizes, item = k)
+                }
+            }
+        }
+    }
+}
+
+// 0.36.0: o programa chama algum runtime que aloca no heap com rastro (new, make/append, format/to_str)? Superconjunto de proposito: so decide se o `_start`
+// leva o gancho do R0009; programa que nao aloca sai igual ao de antes
+proc wasm_programa_aloca_no_heap(programa: ^bir.BirPrograma) -> bool {
+    for s in 0..<len(programa.simbolos) {
+        if (programa.simbolos[s].tipo as i32) != bir.BS_RUNTIME {
+            continue
+        }
+        let nome: str = programa.simbolos[s].nome or_else ""
+        if (nome == "forja_mem_alocar") or (nome == "forja_lista_criar") or (nome == "forja_lista_crescer") or (nome == "forja_fmt_cstr_final") or (nome == "forja_fmt_str_final") {
+            return true
+        }
+    }
+    return false
+}
+
+// 0.36.0: posicao em `funcoes` do proc fim_programa do runtime em Forja, quando o `_start` deve chama-lo (dev, exe, programa que aloca no heap); SEM_FUNCAO se nao
+proc wasm_posicao_do_fim(programa: ^bir.BirPrograma, funcoes: []bir.BirFuncao, reactor: bool) -> u32 {
+    if reactor or ((programa.modo as i32) == (bir.BM_RELEASE as i32)) or (not wasm_programa_aloca_no_heap(programa)) {
+        return SEM_FUNCAO
+    }
+    for k in (0 as u32)..<programa.nfuncoes {
+        if wasm_eh_proc_de_runtime(wasm_nome_da_funcao(programa, &funcoes[k]), "fim_programa") {
+            return k
+        }
+    }
+    return SEM_FUNCAO
+}
+
+// 0.38.0: o export forja_relatar_vazamentos (so dev) so fica se o programa aloca no heap; senao sai da lista e a poda tardia leva a funcao embora
+proc wasm_tirar_relatar_sem_heap(programa: ^bir.BirPrograma) {
+    if (programa.nexportados == 0) or wasm_programa_aloca_no_heap(programa) {
+        return
+    }
+    let nomes: []str = programa.exportados or_else {}
+    var destino: u32 = 0
+    for e in (0 as u32)..<programa.nexportados {
+        if nomes[e] != "forja_relatar_vazamentos" {
+            nomes[destino] = nomes[e]
+            destino += 1
+        }
+    }
+    programa.nexportados = destino
+}
+
+pub proc wasm_gerar(programa: ^bir.BirPrograma, saida: ^[dynamic]u8, erro: ^common.Diag) -> bool {
+    if programa.nfuncoes == 0 {
+        return wasm_nao_suportado(erro, 0, "programa sem funcoes")
+    }
+    wasm_tirar_relatar_sem_heap(programa)
+    let funcoes: []bir.BirFuncao = programa.funcoes or_else {}
+    var tabela = make([dynamic]u32, alloc = heap)
+    defer delete(tabela)
+    var dados = make([dynamic]u8, alloc = heap)
+    defer delete(dados)
+    wasm_tabela_de_funcoes(programa, funcoes, &tabela)
+    let reactor: bool = programa.nexportados > 0 // so o --modo dll enche exportados
+    var raizes = make([dynamic]u32, alloc = heap)
+    defer delete(raizes)
+    wasm_raizes_do_alcance(programa, funcoes, reactor, &raizes)
+    let posicao_fim: u32 = wasm_posicao_do_fim(programa, funcoes, reactor)
+    if posicao_fim != SEM_FUNCAO {
+        append(&raizes, item = posicao_fim)
+    }
+    var usados = make([dynamic]bool, alloc = heap)
+    defer delete(usados)
+    let nvivas: u32 = wasm_alcance_aplicar(programa, funcoes, &tabela, raizes[..], &usados)
+    wasm_posicionar_dados(programa, &tabela, usados[..], &dados)
+    var m = pefmt.wasm_modulo_iniciar()
+    defer pefmt.wasm_modulo_liberar(&m)
+    wasm_importar_proc_exit(&m)
+    wasm_importar_fd_write(&m)
+    let nimports: u32 = wasm_nimports(programa, tabela[..])
+    if nimports > IMPORTS_DO_MODULO {
+        wasm_importar_args(&m)
+    }
+    _ = pefmt.wasm_global_i64(&m, true, PILHA_TOPO as i64) // $sp = global 0
+    // global 1 = primeiro endereco livre depois dos dados, alinhado a 16 (forja_rt_heap_base do runtime em Forja)
+    let fim_dados: u32 = BASE_DADOS + (len(dados) as u32)
+    _ = pefmt.wasm_global_i64(&m, false, ((fim_dados + 15) / 16 * 16) as i64)
+    if not wasm_definir_funcoes(programa, funcoes, tabela[..], &m, erro) {
+        return false
+    }
+    wasm_rt_definir(&m, INDICE_FD_WRITE, nimports + nvivas)
+    wasm_definir_tabela(programa, tabela[..], usados[..], &m)
+    var inicio: u32 = SEM_FUNCAO
+    if not reactor {
+        var indice_fim: u32 = SEM_FUNCAO
+        if posicao_fim != SEM_FUNCAO {
+            indice_fim = wasm_indice_final(programa, tabela[..], IMPORTS_DO_MODULO + posicao_fim)
+        }
+        inicio = wasm_funcao_start(&m, wasm_indice_final(programa, tabela[..], wasm_indice_do_programa(programa, funcoes)), indice_fim)
+    }
+    if len(dados) > 0 {
+        pefmt.wasm_dados(&m, BASE_DADOS, dados[..])
+    }
+    let paginas: u32 = ((BASE_DADOS + (len(dados) as u32)) / 65536) + 1
+    pefmt.wasm_memoria(&m, paginas)
+    pefmt.wasm_exportar(&m, nome = "memory", tipo = pefmt.WASM_EXP_MEM, indice = 0)
+    if reactor {
+        if not wasm_exportar_procs(programa, funcoes, tabela[..], &m, erro) {
+            return false
+        }
+    } else {
+        pefmt.wasm_exportar(&m, nome = "_start", tipo = pefmt.WASM_EXP_FUNC, indice = inicio)
+    }
+    pefmt.wasm_serializar(&m, saida)
+    return true
+}

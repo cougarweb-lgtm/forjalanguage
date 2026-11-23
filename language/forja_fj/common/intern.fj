@@ -1,0 +1,160 @@
+// common/intern.fj - porte de compiler/common/intern.c, compiler/common/intern.h
+// sha256 de common/intern.c: 49d2aa76f4de8ed58e79cb4815327c0c70c7e20960977440961c920879024363
+// sha256 de common/intern.h: 1b4aeec4bc5ca4d120e728a3516c5e0e90483525f2057e1abadec9399e12874e
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+struct Nome {
+    texto: ?str
+    tam: u32
+    hash: u32
+}
+
+struct InternSlot {
+    idx: i32
+    hash: u32
+}
+
+pub struct Interner {
+    arena: ?^Arena
+    nomes: [dynamic]Nome
+    tabela: [dynamic]InternSlot
+    tabela_cap: u32
+}
+
+const INTERN_TABELA_INICIAL: i32 = 1024
+
+// C: common/intern.c:13
+proc hash_bytes(s: ?str, tam: u32) -> u32 {
+    var h: u32 = 2166136261
+    for i in (0 as u32)..<tam {
+        h = wrapping_mul(h ~ ((s or_else "")[i] as u32), 16777619)
+    }
+    return h
+}
+
+// C: common/intern.c:20
+proc cresce_tabela(in_c: ^Interner) {
+    var cap: u32 = INTERN_TABELA_INICIAL as u32
+    if in_c.tabela_cap != 0 {
+        cap = in_c.tabela_cap * 2
+    }
+    // C2F: a tabela nova do C (malloc + free da velha) vira a mesma lista refeita no lugar (lista de dono unico nao muda de dono: E0311)
+    clear(&in_c.tabela)
+    reserve(&in_c.tabela, cap as int)
+    // memset(tabela, 0xFF): idx = -1 (vazio) e hash = 0xFFFFFFFF
+    for i in (0 as u32)..<cap {
+        append(&in_c.tabela, item = InternSlot{idx = -1, hash = 4294967295})
+    }
+    for i in (0 as u64)..<(len(in_c.nomes) as u64) {
+        let hash_n: u32 = in_c.nomes[i].hash
+        var slot: u32 = hash_n & (cap - 1)
+        while in_c.tabela[slot].idx >= 0 {
+            slot = (slot + 1) & (cap - 1)
+        }
+        in_c.tabela[slot].idx = i as i32
+        in_c.tabela[slot].hash = hash_n
+    }
+    in_c.tabela_cap = cap
+}
+
+// C: common/intern.c:38
+// C2F-14: VecIniciar -> make; tabela = NULL -> lista vazia (tabela_cap 0)
+pub proc interner_iniciar(in_c: ^Interner, arena: ^Arena) {
+    in_c.arena = arena
+    in_c.nomes = make([dynamic]Nome, alloc = heap)
+    in_c.tabela = make([dynamic]InternSlot, alloc = heap)
+    in_c.tabela_cap = 0
+}
+
+// C: common/intern.c:46
+// C2F-20: ArenaCopiarTexto -> from_bytes na arena do dono
+proc novo_nome(in_c: ^Interner, slot: ^InternSlot, s: ?str, tam: u32, hash_c: u32) -> i32 {
+    let copia: str = from_bytes(as_bytes(s or_else "")[0..<tam], alloc = arena_mem(in_c.arena as ^Arena))
+    append(&in_c.nomes, item = Nome{texto = copia, tam = tam, hash = hash_c})
+    slot.idx = (len(in_c.nomes) - 1) as i32
+    slot.hash = hash_c
+    return slot.idx
+}
+
+// C: common/intern.c:57
+pub proc internar(in_c: ^Interner, s: ?str, tam: u32) -> i32 {
+    let st: str = s or_else ""
+    let hash_c: u32 = hash_bytes(s, tam)
+    if ((len(in_c.nomes) as u64) + 1) * 2 > (in_c.tabela_cap as u64) {
+        cresce_tabela(in_c)
+    }
+    var slot: u32 = hash_c & (in_c.tabela_cap - 1)
+    while in_c.tabela[slot].idx >= 0 {
+        if in_c.tabela[slot].hash == hash_c {
+            let idx: i32 = in_c.tabela[slot].idx
+            let nome: ^Nome = &in_c.nomes[c2f_s2u_64(idx as i64)]
+            if (nome.tam == tam) and ((nome.texto or_else "") == st[0..<tam]) {
+                return idx
+            }
+        }
+        slot = (slot + 1) & (in_c.tabela_cap - 1)
+    }
+    return novo_nome(in_c, &in_c.tabela[slot], s, tam, hash_c)
+}
+
+// C: common/intern.c:72
+pub proc interner_achar(in_c: ^Interner, s: ?str, tam: u32) -> i32 {
+    if in_c.tabela_cap == 0 {
+        return -1
+    }
+    let st: str = s or_else ""
+    let hash_c: u32 = hash_bytes(s, tam)
+    var slot: u32 = hash_c & (in_c.tabela_cap - 1)
+    while in_c.tabela[slot].idx >= 0 {
+        if in_c.tabela[slot].hash == hash_c {
+            let idx: i32 = in_c.tabela[slot].idx
+            let nome: ^Nome = &in_c.nomes[c2f_s2u_64(idx as i64)]
+            if (nome.tam == tam) and ((nome.texto or_else "") == st[0..<tam]) {
+                return idx
+            }
+        }
+        slot = (slot + 1) & (in_c.tabela_cap - 1)
+    }
+    return -1
+}
+
+// C: common/intern.c:87
+pub proc interner_texto(in_c: ^Interner, id: i32) -> str {
+    return (in_c.nomes[c2f_s2u_64(id as i64)].texto or_else "")
+}
+
+// C: common/intern.c:92
+pub proc interner_tam(in_c: ^Interner, id: i32) -> u32 {
+    return in_c.nomes[c2f_s2u_64(id as i64)].tam
+}
+
+// C: common/intern.c:97
+pub proc interner_liberar(in_c: ^Interner) {
+    delete(in_c.nomes)
+    delete(in_c.tabela)
+    in_c.tabela_cap = 0
+}
+
+// Do TestaIntern do teste_common.c, mais o InternerAchar (busca sem criar)
+test "intern" {
+    var a: Arena = Arena{}
+    var ti: Interner = Interner{}
+    interner_iniciar(&ti, &a)
+    expect(interner_achar(&ti, "proc", 4) == -1)
+    let id_proc: i32 = internar(&ti, "proc", 4)
+    let id_main: i32 = internar(&ti, "main", 4)
+    expect(id_proc == 0 and id_main == 1 and internar(&ti, "proc", 4) == id_proc)
+    expect(interner_texto(&ti, id_main) == "main" and interner_tam(&ti, id_main) == 4)
+    for i in 0..<5000 {
+        let nome: str = format(f"v{i}", alloc = heap)
+        _ = internar(&ti, nome, len(nome) as u32)
+        delete(nome)
+    }
+    expect(len(ti.nomes) == 5002)
+    expect(internar(&ti, "v4999", 5) == 5001 and internar(&ti, "main", 4) == id_main)
+    expect(interner_achar(&ti, "v4999", 5) == 5001 and interner_achar(&ti, "v5000", 5) == -1)
+    expect(interner_achar(&ti, "mainx", 4) == id_main) // so os 4 primeiros bytes contam
+    interner_liberar(&ti)
+    arena_liberar(&a)
+}

@@ -1,0 +1,261 @@
+// nativo/a64/a64_isel_agregado.fj - agregados, enderecos de simbolo e chamada indireta do A64 (contrato_a64 §3.1, §3.2, §4)
+// Versao: 0.3.0
+// Changelog: 0.3.0 - A2.2(b): a64_chamar_simbolo (BL para um simbolo qualquer; a ponte do runtime usa-o).
+//            0.2.0 - A1.3(iii): a64_carregar_argumento recebe a posicao (A64Posicao); retorno real via a64_resultado_real.
+//            0.1.0 - A1.3(ii): COPIA_MEM/ZERA_MEM (desenrolado ate 128 B, laco acima disso), END_SIMBOLO (adrp + add com
+//                    OR_A64_ADR_PAGE e OR_A64_ADD_LO12), CHAMA_IND (alvo em x17, blr), agregado por valor de 1/2/4/8 B em registrador
+//                    (ponteiro para os maiores), retorno maior que um registrador: buffer em x8, copiado pelo chamado, x8 guardado no quadro.
+//                    A BIR so emite COPIA/ZERA_MEM ate 64 B; acima disso ela chama o runtime (X0001 ate o A2.2).
+
+import "nativo/bir"
+import "nativo/obj"
+
+// LDR e STR sem sinal por tamanho do agregado de registrador (1, 2, 4, 8 B): indice = log2(tam)
+const A64_FORMA_LER_TAM: [4]u32 = {55, 59, 63, 66}
+const A64_FORMA_GRAVAR_TAM: [4]u32 = {54, 58, 62, 65}
+const A64_BLOCO16: u32 = 16
+const A64_BLOCO_DESENROLADO: u32 = 128
+const A64_REG_SRET: u32 = 8
+
+// agregado que cabe num registrador (1, 2, 4 ou 8 B): passa e devolve por valor; os demais por ponteiro (ou buffer em x8)
+proc a64_tam_registrador(tam: u32) -> bool {
+    return (tam == 1) or (tam == 2) or (tam == 4) or (tam == 8)
+}
+
+// log2 do tamanho de registrador (0..3); -1 se o tamanho nao e de registrador
+proc a64_indice_tam(tam: u32) -> int {
+    if tam == 1 {
+        return 0
+    }
+    if tam == 2 {
+        return 1
+    }
+    if tam == 4 {
+        return 2
+    }
+    if tam == 8 {
+        return 3
+    }
+    return -1
+}
+
+// rd = rn + n (ADD imediato se couber em 12 bits; senao n em x16 e ADD registrador)
+proc a64_somar(c: ^A64Ctx, rd: u32, rn: u32, n: u32) {
+    if n <= A64_MAX_IMM12 {
+        a64_op(c, A64F_ADD_IMM, true, A64Ops{rd = rd, rn = rn, imm = n})
+        return
+    }
+    a64_const(c, R_TA, n as u64, true)
+    a64_op(c, A64F_ADD_REG, true, A64Ops{rd = rd, rn = rn, rm = R_TA})
+}
+
+// um bloco de 16 B de [x10] para [x9] (ou zeros em [x9]), avancando os dois ponteiros
+proc a64_bloco16(c: ^A64Ctx, zera: bool) {
+    if zera {
+        a64_op(c, A64F_STP_X, true, A64Ops{rd = R_XZR, rn = R_T0, rm = R_XZR})
+    } else {
+        a64_op(c, A64F_LDP_X, true, A64Ops{rd = R_TA, rn = R_T1, rm = R_TB})
+        a64_op(c, A64F_STP_X, true, A64Ops{rd = R_TA, rn = R_T0, rm = R_TB})
+        a64_somar(c, R_T1, R_T1, A64_BLOCO16)
+    }
+    a64_somar(c, R_T0, R_T0, A64_BLOCO16)
+}
+
+// cauda de `tam` bytes (8, 4, 2 ou 1) no fim da copia ou do zeramento, avancando os ponteiros
+proc a64_cauda_passo(c: ^A64Ctx, tam: u32, zera: bool) {
+    let k = a64_indice_tam(tam) as int
+    if zera {
+        a64_acesso(c, A64_FORMA_GRAVAR_TAM[k], R_XZR, R_T0, 0)
+    } else {
+        a64_acesso(c, A64_FORMA_LER_TAM[k], R_TA, R_T1, 0)
+        a64_acesso(c, A64_FORMA_GRAVAR_TAM[k], R_TA, R_T0, 0)
+        a64_somar(c, R_T1, R_T1, tam)
+    }
+    a64_somar(c, R_T0, R_T0, tam)
+}
+
+// resto de n (menor que 16) em passos de 8, 4, 2 e 1 bytes
+proc a64_mover_cauda(c: ^A64Ctx, resto: u32, zera: bool) {
+    var passo: u32 = 8
+    while passo >= 1 {
+        if (resto & passo) != 0 {
+            a64_cauda_passo(c, passo, zera)
+        }
+        passo = passo / 2
+    }
+}
+
+// imm19 (palavras, complemento de dois) de um B.cond/CBNZ para tras, ate `alvo`, a partir da instrucao atual
+proc a64_imm19_para(c: ^A64Ctx, alvo: u32) -> u32 {
+    let delta: i64 = (alvo as i64 - a64_offset(c) as i64) / 4
+    return ((transmute(delta, to = u64)) & 524287) as u32
+}
+
+// n bytes de [x10] para [x9] (ou zeros em [x9]): ate 128 B desenrolado; acima, laco com contador em x11
+proc a64_mover_bloco(c: ^A64Ctx, n: u32, zera: bool) {
+    let blocos = n / A64_BLOCO16
+    if n <= A64_BLOCO_DESENROLADO {
+        var k: u32 = 0
+        while k < blocos {
+            a64_bloco16(c, zera)
+            k += 1
+        }
+    } else {
+        a64_const(c, R_T2, blocos as u64, true)
+        let inicio = a64_offset(c)
+        a64_bloco16(c, zera)
+        a64_op(c, A64F_SUB_IMM, true, A64Ops{rd = R_T2, rn = R_T2, imm = 1})
+        a64_op(c, A64F_CBNZ, true, A64Ops{rd = R_T2, imm = a64_imm19_para(c, inicio)})
+    }
+    a64_mover_cauda(c, n % A64_BLOCO16, zera)
+}
+
+// COPIA_MEM: destino em a, origem em b, n bytes (desloc)
+proc a64_isel_copia_mem(c: ^A64Ctx, ins: ^bir.BirInstr) -> bool {
+    if (not a64_operando(c, R_T0, &ins.a)) or (not a64_operando(c, R_T1, &ins.b)) {
+        return false
+    }
+    a64_mover_bloco(c, ins.desloc as u32, false)
+    return true
+}
+
+// ZERA_MEM: destino em a, n bytes (desloc)
+proc a64_isel_zera_mem(c: ^A64Ctx, ins: ^bir.BirInstr) -> bool {
+    if not a64_operando(c, R_T0, &ins.a) {
+        return false
+    }
+    a64_mover_bloco(c, ins.desloc as u32, true)
+    return true
+}
+
+// END_SIMBOLO: endereco de funcao, texto ou dado = adrp dst,S ; add dst,dst,:lo12:S (relocs ADR_PAGE e ADD_LO12)
+proc a64_isel_end_simbolo(c: ^A64Ctx, ins: ^bir.BirInstr) -> bool {
+    let sim = a64_simbolo(c, ins.a.id)
+    let off_adrp = a64_offset(c)
+    a64_palavra(c, a64_cod_adr(A64F_ADRP, 0 as i64, R_T0))
+    obj.obj_relocar(c.o, obj.ObjAlvoReloc{secao = c.texto, off = off_adrp}, obj.ObjCorrecao{tipo = obj.OR_A64_ADR_PAGE, simbolo = sim, adendo = 0})
+    let off_add = a64_offset(c)
+    a64_op(c, A64F_ADD_IMM, true, A64Ops{rd = R_T0, rn = R_T0, imm = 0})
+    obj.obj_relocar(c.o, obj.ObjAlvoReloc{secao = c.texto, off = off_add}, obj.ObjCorrecao{tipo = obj.OR_A64_ADD_LO12, simbolo = sim, adendo = 0})
+    a64_resultado(c, ins, R_T0)
+    return true
+}
+
+// antes do BL/BLR: retorno maior que um registrador recebe em x8 o endereco do buffer (a BIR pos o buffer em a)
+proc a64_preparar_retorno(c: ^A64Ctx, ins: ^bir.BirInstr) -> bool {
+    if (ins.a.tam == 0) or a64_tam_registrador(ins.a.tam) {
+        return true
+    }
+    return a64_operando(c, A64_REG_SRET, &ins.a)
+}
+
+// depois do BL/BLR: retorno de registrador vai de x0 para o buffer; escalar cai no destino da BIR
+proc a64_recebe_retorno(c: ^A64Ctx, ins: ^bir.BirInstr) -> bool {
+    if ins.a.tam == 0 {
+        if a64_classe_real(ins.classe) {
+            a64_resultado_real(c, ins, 0)
+        } else {
+            a64_resultado(c, ins, 0)
+        }
+        return true
+    }
+    if a64_tam_registrador(ins.a.tam) {
+        if not a64_operando(c, R_T0, &ins.a) {
+            return false
+        }
+        a64_acesso(c, A64_FORMA_GRAVAR_TAM[a64_indice_tam(ins.a.tam) as int], 0, R_T0, 0)
+    }
+    return true
+}
+
+// argumento k: agregado de registrador vai como valor (lido do seu endereco); o resto (escalar ou ponteiro) como esta
+proc a64_carregar_argumento(c: ^A64Ctx, pos: A64Posicao, arg: ^bir.BirOperando) -> bool {
+    if pos.real and (not pos.pilha) {
+        return a64_carregar_real(c, pos.reg, arg)
+    }
+    var destino: u32 = R_T0
+    if not pos.pilha {
+        destino = pos.reg
+    }
+    if (arg.tam != 0) and a64_tam_registrador(arg.tam) {
+        if not a64_operando(c, R_T1, arg) {
+            return false
+        }
+        a64_acesso(c, A64_FORMA_LER_TAM[a64_indice_tam(arg.tam) as int], destino, R_T1, 0)
+        return true
+    }
+    return a64_operando(c, destino, arg)
+}
+
+// CHAMA de funcao Forja: argumentos, buffer de retorno, BL (CALL26) e resultado
+proc a64_chamar_funcao(c: ^A64Ctx, ins: ^bir.BirInstr) -> bool {
+    return a64_chamar_simbolo(c, ins, ins.simbolo)
+}
+
+// CHAMA com o BL para o simbolo `alvo` da BIR (a propria funcao, ou o proc da ponte de um runtime forja_X)
+proc a64_chamar_simbolo(c: ^A64Ctx, ins: ^bir.BirInstr, alvo: u32) -> bool {
+    if not a64_passar_argumentos(c, ins) {
+        return false
+    }
+    if not a64_preparar_retorno(c, ins) {
+        return false
+    }
+    a64_bl_simbolo(c, alvo)
+    return a64_recebe_retorno(c, ins)
+}
+
+// CHAMA_IND: argumentos; o alvo vai para x17 por ultimo; blr x17
+proc a64_isel_chama_ind(c: ^A64Ctx, ins: ^bir.BirInstr) -> bool {
+    if not a64_passar_argumentos(c, ins) {
+        return false
+    }
+    if not a64_preparar_retorno(c, ins) {
+        return false
+    }
+    if not a64_operando(c, R_TB, &ins.b) {
+        return false
+    }
+    a64_op(c, A64F_BLR, false, A64Ops{rn = R_TB})
+    return a64_recebe_retorno(c, ins)
+}
+
+// RETORNA de agregado: tamanho de registrador vai para x0; maior copia para o buffer guardado em x8 e devolve o buffer em x0
+proc a64_retorna_agregado(c: ^A64Ctx, ins: ^bir.BirInstr) -> bool {
+    let tam = c.f.retorno_tam
+    if not a64_operando(c, R_T1, &ins.a) {
+        return false
+    }
+    if a64_tam_registrador(tam) {
+        a64_acesso(c, A64_FORMA_LER_TAM[a64_indice_tam(tam) as int], 0, R_T1, 0)
+    } else {
+        a64_acesso(c, A64F_LDR_X, R_T0, R_FP, a64_slot_sret(c) as i64)
+        a64_mover_bloco(c, tam, false)
+        a64_acesso(c, A64F_LDR_X, 0, R_FP, a64_slot_sret(c) as i64)
+    }
+    a64_epilogo(c)
+    return true
+}
+
+// parametro agregado de registrador: tem slot proprio no quadro (a64_slot_param) e o vreg passa a ser o endereco dele
+proc a64_param_em_registrador(c: ^A64Ctx, k: u32) -> bool {
+    if c.f.param_tam == none {
+        return false
+    }
+    let tams: []u32 = c.f.param_tam or_else {}
+    return a64_tam_registrador(tams[k])
+}
+
+// despacho das ops de agregado e de chamada indireta (ver a64_isel.fj)
+proc a64_selecionar_agregado(c: ^A64Ctx, ins: ^bir.BirInstr) -> bool {
+    let op = ins.op as i32
+    if op == bir.BIR_END_SIMBOLO {
+        return a64_isel_end_simbolo(c, ins)
+    }
+    if op == bir.BIR_COPIA_MEM {
+        return a64_isel_copia_mem(c, ins)
+    }
+    if op == bir.BIR_ZERA_MEM {
+        return a64_isel_zera_mem(c, ins)
+    }
+    return a64_isel_chama_ind(c, ins)
+}

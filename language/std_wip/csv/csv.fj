@@ -1,0 +1,222 @@
+// csv 0.1.0 (V01, RFC 4180) - leitor por cursor e escritor de registros CSV em Forja pura (sem foreign): igual nos 2 backends.
+// Uso: import "csv"; r = csv.reader_new(texto, sep = csv.VIRGULA); enquanto csv.next_record(&r, fields = &campos) ...; no fim csv.reader_delete(&r) e delete(campos).
+// Leitor: texto e emprestado. campos sao visoes do texto ou copias donas do reader (so com aspa dobrada) e valem ate a proxima chamada de next_record. Falha vira r.erro != none e next_record devolve false.
+// Escritor: write_record cita o campo so quando tem separador, aspa, CR ou LF; writer_texto devolve o CSV inteiro dono do alloc que o chamador passou (delete so se heap).
+// Changelog: 0.1.0 - V01 (plano_std_completa.txt, PARTE 3): reader por cursor, writer e erros explicitos (aspas nao fechadas, aspas fora do lugar, separador invalido).
+import "std:text"
+
+pub const VIRGULA: str = ","
+pub const PONTO_VIRGULA: str = ";"
+
+const ASPAS_BYTE: int = 34
+const BYTE_CR: int = 13
+const BYTE_LF: int = 10
+
+pub enum CsvError { aspas_nao_fechadas, aspas_mal_posicionadas, separador_invalido }
+
+// Cursor do leitor: pos e o proximo byte; sep e o separador (um byte); erro fica preenchido quando next_record devolve false por falha; dono guarda os campos copiados (aspa dobrada) ate a proxima chamada.
+pub struct Reader {
+    texto: str
+    pos: int
+    sep: str
+    erro: ?CsvError
+    dono: [dynamic]str
+}
+
+// Escritor: partes e uma linha dona por registro escrito; sep e o separador usado ao citar e juntar.
+pub struct Writer {
+    sep: str
+    partes: [dynamic]str
+}
+
+// Byte na posicao pos de texto como int, ou -1 fora do texto: o -1 nunca e byte real, entao o teste de fim vira uma comparacao so.
+proc byte_em(texto: str, pos: int) -> int {
+    if pos < 0 or pos >= len(texto) {
+        return -1
+    }
+    return texto[pos] as int
+}
+
+// Separador nao pode ser aspa nem quebra de linha: quebraria o formato.
+proc separador_proibido(c: int) -> bool {
+    return c == ASPAS_BYTE or c == BYTE_CR or c == BYTE_LF
+}
+
+// Cursor sobre texto com separador sep (um byte: csv.VIRGULA, csv.PONTO_VIRGULA ou outro). Separador de tamanho diferente de 1, ou aspa/quebra, deixa r.erro = separador_invalido e next_record devolve false.
+pub proc reader_new(texto: str, sep: str) -> Reader {
+    var r = Reader{texto = texto, pos = 0, sep = sep, erro = none, dono = make([dynamic]str, alloc = heap)}
+    if len(sep) != 1 or separador_proibido(byte_em(sep, 0)) {
+        r.erro = CsvError.separador_invalido
+    }
+    return r
+}
+
+// Libera as copias do registro anterior: os campos devolvidos por next_record deixam de valer.
+proc esvaziar(r: ^Reader) {
+    for copia in r.dono {
+        delete(copia)
+    }
+    clear(&r.dono)
+}
+
+// Libera o cursor e as copias que ele guardava.
+pub proc reader_delete(r: ^Reader) {
+    esvaziar(r)
+    delete(r.dono)
+}
+
+// True enquanto o byte em r.pos ainda faz parte de um campo sem aspas (nao e separador, CR, LF nem fim).
+proc campo_sem_aspas_continua(r: ^Reader) -> bool {
+    let c = byte_em(r.texto, r.pos)
+    if c < 0 or c == byte_em(r.sep, 0) or c == BYTE_CR or c == BYTE_LF {
+        return false
+    }
+    return true
+}
+
+// Campo com aspas: "" vira uma aspa e quebras entram como estao. Sem aspa dobrada o campo e visao do texto; com ela, copia dona do reader.
+proc ler_campo_citado(r: ^Reader) -> str {
+    r.pos += 1
+    var partes = make([dynamic]str, alloc = heap)
+    defer delete(partes)
+    var inicio = r.pos
+    var fechou = false
+    while not fechou {
+        let c = byte_em(r.texto, r.pos)
+        if c < 0 {
+            r.erro = CsvError.aspas_nao_fechadas
+            return ""
+        }
+        if c != ASPAS_BYTE {
+            r.pos += 1
+        } else if byte_em(r.texto, r.pos + 1) == ASPAS_BYTE {
+            append(&partes, item = r.texto[inicio..<r.pos])
+            append(&partes, item = "\"")
+            r.pos += 2
+            inicio = r.pos
+        } else {
+            append(&partes, item = r.texto[inicio..<r.pos])
+            r.pos += 1
+            fechou = true
+        }
+    }
+    // Depois da aspa de fechamento so cabe separador, quebra ou fim: "a"b seria ambiguo.
+    let depois = byte_em(r.texto, r.pos)
+    if depois >= 0 and depois != byte_em(r.sep, 0) and depois != BYTE_CR and depois != BYTE_LF {
+        r.erro = CsvError.aspas_mal_posicionadas
+        return ""
+    }
+    if len(partes) == 1 {
+        return partes[0]
+    }
+    let junto = text.concat(partes[..], alloc = heap)
+    append(&r.dono, item = junto)
+    return r.dono[len(r.dono) - 1]
+}
+
+// Le um campo a partir de r.pos: sem aspas vai ate separador ou quebra; com aspas, ate a aspa de fechamento.
+proc ler_campo(r: ^Reader) -> str {
+    if byte_em(r.texto, r.pos) == ASPAS_BYTE {
+        return ler_campo_citado(r)
+    }
+    let inicio = r.pos
+    while campo_sem_aspas_continua(r) {
+        r.pos += 1
+    }
+    return r.texto[inicio..<r.pos]
+}
+
+// Consome o separador ou o fim do registro depois de um campo. True = o registro acabou.
+proc fechar_campo(r: ^Reader) -> bool {
+    let c = byte_em(r.texto, r.pos)
+    if c < 0 {
+        return true
+    }
+    if c == byte_em(r.sep, 0) {
+        r.pos += 1
+        return false
+    }
+    if c == BYTE_CR {
+        r.pos += 1
+        if byte_em(r.texto, r.pos) == BYTE_LF {
+            r.pos += 1
+        }
+        return true
+    }
+    // Sobra so LF: campo sem aspas para em separador, CR, LF ou fim, e campo com aspas ja foi conferido.
+    r.pos += 1
+    return true
+}
+
+// Le o proximo registro para fields (zerado antes). True = registro lido; False = fim do texto ou falha (ver r.erro).
+pub proc next_record(r: ^Reader, fields: ^[dynamic]str) -> bool {
+    esvaziar(r)
+    clear(fields)
+    if r.erro != none or r.pos >= len(r.texto) {
+        return false
+    }
+    var fim_do_registro = false
+    while not fim_do_registro {
+        let campo = ler_campo(r)
+        if r.erro != none {
+            return false
+        }
+        append(fields, item = campo)
+        fim_do_registro = fechar_campo(r)
+    }
+    return true
+}
+
+// Escritor vazio com o separador sep (csv.VIRGULA, csv.PONTO_VIRGULA ou outro de um byte).
+pub proc writer_new(sep: str) -> Writer {
+    return Writer{sep = sep, partes = make([dynamic]str, alloc = heap)}
+}
+
+// Libera as linhas escritas e a lista do escritor.
+pub proc writer_delete(w: ^Writer) {
+    for linha in w.partes {
+        delete(linha)
+    }
+    delete(w.partes)
+}
+
+// Campo precisa de aspas quando tem separador, aspa, CR ou LF (RFC 4180, secao 2, item 6).
+proc precisa_citar(campo: str, sep: str) -> bool {
+    return text.str_contains(campo, sep) or text.str_contains(campo, "\"") or text.str_contains(campo, "\n") or text.str_contains(campo, "\r")
+}
+
+// Campo citado: aspas em volta e cada aspa interna dobrada. Dono do heap: quem chama libera.
+proc citar_campo(campo: str) -> str {
+    let dobrado = text.replace(campo, "\"", "\"\"", alloc = heap)
+    defer delete(dobrado)
+    return format(f"\"{dobrado}\"", alloc = heap)
+}
+
+// Acrescenta um registro com os campos (cada um citado so se precisa) e a quebra LF.
+pub proc write_record(w: ^Writer, fields: []str) {
+    var pedacos = make([dynamic]str, alloc = heap)
+    var temporarios = make([dynamic]str, alloc = heap)
+    for i, campo in fields {
+        if i > 0 {
+            append(&pedacos, item = w.sep)
+        }
+        if precisa_citar(campo, w.sep) {
+            append(&temporarios, item = citar_campo(campo))
+            append(&pedacos, item = temporarios[len(temporarios) - 1])
+        } else {
+            append(&pedacos, item = campo)
+        }
+    }
+    append(&pedacos, item = "\n")
+    append(&w.partes, item = text.concat(pedacos[..], alloc = heap))
+    for copia in temporarios {
+        delete(copia)
+    }
+    delete(temporarios)
+    delete(pedacos)
+}
+
+// O CSV inteiro escrito ate agora, dono do alloc que o chamador passou (delete so se heap).
+pub proc writer_texto(w: ^Writer, alloc: Allocator) -> str {
+    return text.concat(w.partes[..], alloc = alloc)
+}

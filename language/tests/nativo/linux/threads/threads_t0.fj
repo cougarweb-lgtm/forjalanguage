@@ -1,0 +1,52 @@
+// threads_t0.fj (Linux) - M5c-b P57: o threads_t0 do P44 portado. 8 threads criadas por foreign pthread_create do musl (callback proc com fjt_ SysV na fronteira), cada uma com 10 mil voltas
+// de new/delete no heap + new no frame + format + print de uma linha f"..." inteira. Saida esperada: 80 mil linhas "L tNN iNNNNN vNNNNN qNNNNN sNN" (nenhuma intercalada), uma por (thread, volta),
+// e R0009 = 0 (nada vazado; roda em dev). Verificacao: python -I verificar_threads_linux.py --forja <forja.exe>
+import "std:os"
+
+foreign {
+    link "c"
+    proc pthread_create(tid: rawptr, atributos: u64, rotina: proc(p: rawptr) -> rawptr, parametro: rawptr) -> i32
+    proc pthread_join(tid: u64, retorno: u64) -> i32
+}
+
+const FIOS: int = 8
+const VOLTAS: int = 10000
+
+struct Carga {
+    id: int
+}
+
+proc rotina(p: rawptr) -> rawptr {
+    let c = p as ^Carga
+    for i in 0..<VOLTAS {
+        let v = new(int, alloc = heap)
+        v^ = i
+        let q = new(int, alloc = frame)
+        q^ = i
+        let s = format(f"x{c.id:02}-{i:05}-{v^:05}", alloc = heap)
+        print(f"L t{c.id:02} i{i:05} v{v^:05} q{q^:05} s{len(s):02}")
+        delete(s)
+        delete(v)
+        frame_reset()
+    }
+    return p
+}
+
+proc main() {
+    var cargas = make([dynamic]^Carga, alloc = heap)
+    var fios = make([dynamic]u64, alloc = heap)
+    os.multithread_on()
+    for k in 0..<FIOS {
+        let c = new(Carga, alloc = heap)
+        c.id = k
+        append(&cargas, item = c)
+        append(&fios, item = 0)
+        _ = pthread_create(&fios[k] as rawptr, atributos = 0, rotina = rotina, parametro = c as rawptr)
+    }
+    for k in 0..<FIOS {
+        _ = pthread_join(fios[k], retorno = 0)
+        delete(cargas[k])
+    }
+    delete(cargas)
+    delete(fios)
+}

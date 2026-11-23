@@ -1,0 +1,154 @@
+// std:file no Linux (M5 P28b-1) - sistema de arquivos: make_dir, stat, exists, copy_file, rename, remove_file, remove_dir e o erro tipado de cada situacao. Roda na pasta de trabalho ($D, em /tmp)
+// com caminhos relativos, o mesmo programa roda no Windows (erros tipados IGUAIS ao do Windows; so a data, o separador e as permissoes diferem e nao sao impressos).
+import "std:file" as fs
+
+proc erro_texto(e: fs.FileError) -> str {
+    var t: str = "other"
+    switch e {
+    case fs.FileError.not_found:
+        t = "not_found"
+    case fs.FileError.no_permission:
+        t = "no_permission"
+    case fs.FileError.other:
+        t = "other"
+    case fs.FileError.already_exists:
+        t = "already_exists"
+    case fs.FileError.is_directory:
+        t = "is_directory"
+    case fs.FileError.not_directory:
+        t = "not_directory"
+    case fs.FileError.not_empty:
+        t = "not_empty"
+    case fs.FileError.closed:
+        t = "closed"
+    case fs.FileError.unsupported:
+        t = "unsupported"
+    case fs.FileError.locked:
+        t = "locked"
+    }
+    return t
+}
+
+// Imprime o rotulo e o resultado (ok ou o erro tipado) de uma operacao.
+proc passo(rotulo: str, erro: ?fs.FileError) {
+    switch e in erro {
+    case fs.FileError:
+        print(f"{rotulo} {erro_texto(e)}")
+    case none:
+        print(f"{rotulo} ok")
+    }
+}
+
+proc kind_texto(k: fs.FileKind) -> str {
+    var t: str = "other"
+    switch k {
+    case fs.FileKind.file:
+        t = "file"
+    case fs.FileKind.dir:
+        t = "dir"
+    case fs.FileKind.link:
+        t = "link"
+    case fs.FileKind.other:
+        t = "other"
+    }
+    return t
+}
+
+proc mostrar_stat(rotulo: str, caminho: str) {
+    switch r in fs.stat(caminho) {
+    case fs.FileInfo:
+        let recente = r.mtime_ns > 1000000000
+        print(f"{rotulo} size={r.size} kind={kind_texto(r.kind)} mtime_recente={recente}")
+    case fs.FileError:
+        print(f"{rotulo} {erro_texto(r)}")
+    }
+}
+
+proc mostrar_conteudo(rotulo: str, caminho: str) {
+    switch d in fs.read_all(caminho, alloc = heap) {
+    case [dynamic]u8:
+        var soma: int = 0
+        for b in d[..] {
+            soma += b as int
+        }
+        print(f"{rotulo} len={len(d)} soma={soma}")
+        delete(d)
+    case fs.FileError:
+        print(f"{rotulo} {erro_texto(d)}")
+    }
+}
+
+proc mostrar_existencia(rotulo: str, caminho: str) {
+    let e = fs.exists(caminho)
+    let f = fs.is_file(caminho)
+    let d = fs.is_dir(caminho)
+    print(f"{rotulo} exists={e} is_file={f} is_dir={d}")
+}
+
+// Arquivo de 200000 bytes (varios blocos de 64 KiB do copy_file) com o padrao i % 251.
+proc gravar_grande(caminho: str) {
+    var dados = make([dynamic]u8, alloc = heap, len = 200000)
+    defer delete(dados)
+    for i in 0..<200000 {
+        dados[i] = (i % 251) as u8
+    }
+    passo("grande", fs.write_all(caminho, data = dados[..]))
+}
+
+proc criar_e_copiar() {
+    passo("mkdir d1", fs.make_dir("d1"))
+    passo("mkdir d1 de novo", fs.make_dir("d1"))
+    passo("mkdir pai inexistente", fs.make_dir("nao_existe/sub"))
+    passo("mkdir vazio", fs.make_dir(""))
+    passo("write d1/a.txt", fs.write_all("d1/a.txt", data = as_bytes("hello")))
+    passo("mkdir sob arquivo", fs.make_dir("d1/a.txt/x"))
+    mostrar_stat("stat arquivo", "d1/a.txt")
+    mostrar_stat("stat pasta", "d1")
+    mostrar_stat("stat ausente", "d1/zz")
+    mostrar_stat("stat sob arquivo", "d1/a.txt/x")
+    mostrar_stat("stat vazio", "")
+    mostrar_existencia("d1/a.txt", "d1/a.txt")
+    mostrar_existencia("d1", "d1")
+    mostrar_existencia("zz", "zz")
+    passo("copy a->b", fs.copy_file("d1/a.txt", "d1/b.txt"))
+    mostrar_conteudo("b", "d1/b.txt")
+    passo("copy origem ausente", fs.copy_file("d1/zz", "d1/c.txt"))
+    passo("copy origem pasta", fs.copy_file("d1", "d1/c.txt"))
+    passo("copy destino pasta", fs.copy_file("d1/a.txt", "d1"))
+    passo("copy destino em pasta inexistente", fs.copy_file("d1/a.txt", "naoexiste/x"))
+    passo("copy sobrescreve", fs.copy_file("d1/a.txt", "d1/b.txt"))
+    gravar_grande("grande.bin")
+    passo("copy grande", fs.copy_file("grande.bin", "grande2.bin"))
+    mostrar_conteudo("grande", "grande.bin")
+    mostrar_conteudo("grande2", "grande2.bin")
+}
+
+proc renomear_e_remover() {
+    passo("rename b->c", fs.rename("d1/b.txt", "d1/c.txt"))
+    mostrar_existencia("d1/b.txt", "d1/b.txt")
+    passo("rename origem ausente", fs.rename("d1/b.txt", "d1/d.txt"))
+    passo("rename sobrescreve", fs.rename("d1/c.txt", "d1/a.txt"))
+    passo("mkdir d2", fs.make_dir("d2"))
+    passo("rename pasta d2->d3", fs.rename("d2", "d3"))
+    passo("remove_file pasta", fs.remove_file("d1"))
+    passo("remove_file ausente", fs.remove_file("d1/zz"))
+    passo("remove_file vazio", fs.remove_file(""))
+    passo("remove_dir arquivo", fs.remove_dir("d1/a.txt"))
+    passo("remove_dir cheia", fs.remove_dir("d1"))
+    passo("remove_dir ausente", fs.remove_dir("zz"))
+    passo("remove_file a.txt", fs.remove_file("d1/a.txt"))
+    passo("remove_file de novo", fs.remove_file("d1/a.txt"))
+    passo("remove_dir d1", fs.remove_dir("d1"))
+    passo("remove_dir d3", fs.remove_dir("d3"))
+    passo("remove_file grande", fs.remove_file("grande.bin"))
+    passo("remove_file grande2", fs.remove_file("grande2.bin"))
+}
+
+proc main() {
+    criar_e_copiar()
+    renomear_e_remover()
+    passo("mkdir all", fs.make_dir("p/q/r", all = true))
+    mostrar_existencia("p/q/r", "p/q/r")
+    passo("remove_dir all", fs.remove_dir("p", all = true))
+    mostrar_existencia("p", "p")
+}

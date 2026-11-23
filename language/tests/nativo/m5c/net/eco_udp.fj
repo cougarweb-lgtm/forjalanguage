@@ -1,0 +1,98 @@
+// Fixture do std:net UDP (M5 P53): eco de 1200 bytes em 127.0.0.1 porta 0. Cliente manda, servidor recebe (com o remetente em texto), responde, cliente confere. Saida esperada: "eco 1200 OK".
+import "std:net" as net
+
+proc abrir(addr: str) -> net.UdpSocket {
+    switch r in net.udp_bind(addr) {
+    case net.UdpSocket:
+        return r
+    case net.NetError:
+        return net.UdpSocket{h = 0}
+    }
+    return net.UdpSocket{h = 0}
+}
+
+proc preencher(q: []u8) {
+    for i in 0..<len(q) {
+        q[i] = (i % 251) as u8
+    }
+}
+
+proc iguais(a: []u8, b: []u8) -> bool {
+    if len(a) != len(b) {
+        return false
+    }
+    for i in 0..<len(a) {
+        if a[i] != b[i] {
+            return false
+        }
+    }
+    return true
+}
+
+// Ida pelo cliente ate o servidor, resposta do servidor ao remetente e volta ao cliente. destino = endereco do servidor (emprestado).
+proc rodar_eco(servidor: ^net.UdpSocket, cliente: ^net.UdpSocket, destino: str) {
+    var ida: [1200]u8 = {}
+    preencher(ida[..])
+    switch n in net.udp_send_to(cliente, destino, ida[..]) {
+    case int:
+        if n != 1200 {
+            print("FALHA envio")
+            return
+        }
+    case net.NetError:
+        print("FALHA envio erro")
+        return
+    }
+    var recebido: [1200]u8 = {}
+    switch r in net.udp_recv_from(servidor, recebido[..], 1000, heap) {
+    case net.UdpRecebido:
+        defer delete(r.de)
+        if r.quantos != 1200 or not iguais(recebido[..], ida[..]) {
+            print("FALHA ida")
+            return
+        }
+        switch n in net.udp_send_to(servidor, r.de, recebido[..]) {
+        case int:
+            if n != 1200 {
+                print("FALHA resposta")
+                return
+            }
+        case net.NetError:
+            print("FALHA resposta erro")
+            return
+        }
+    case net.NetError:
+        print("FALHA recebimento")
+        return
+    }
+    var volta: [1200]u8 = {}
+    switch r in net.udp_recv_from(cliente, volta[..], 1000, heap) {
+    case net.UdpRecebido:
+        defer delete(r.de)
+        if r.quantos == 1200 and iguais(volta[..], ida[..]) {
+            print("eco 1200 OK")
+        } else {
+            print("FALHA volta")
+        }
+    case net.NetError:
+        print("FALHA volta erro")
+    }
+}
+
+proc main() {
+    var servidor = abrir("127.0.0.1:0")
+    var cliente = abrir("127.0.0.1:0")
+    if servidor.h == 0 or cliente.h == 0 {
+        print("FALHA abrir")
+        return
+    }
+    switch ende in net.udp_local_addr(&servidor, heap) {
+    case str:
+        rodar_eco(&servidor, &cliente, ende)
+        delete(ende)
+    case net.NetError:
+        print("FALHA endereco local")
+    }
+    _ = net.udp_close(&cliente)
+    _ = net.udp_close(&servidor)
+}

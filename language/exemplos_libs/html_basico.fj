@@ -1,0 +1,122 @@
+// html_basico - exemplo do vendor html (lexbor 3.0.0): arvore HTML, seletores CSS e folha CSS.
+// Saida deterministica (3 secoes): compare com html_basico.esperado. O oraculo oraculos\html.py gera a mesma saida pelo html5lib, bs4+soupsieve e tinycss2.
+// Atributos saem na ordem do documento (o html5lib .dat ordena por nome: divergencia registrada no oraculo).
+import "vendor:html/html"
+
+// Recuo de 2 espacos por nivel (tabela literal: a Forja nao tem += em str).
+const RECUOS: [12]str = {"", "  ", "    ", "      ", "        ", "          ", "            ", "              ", "                ", "                  ", "                    ", "                      "}
+
+const DOCUMENTOS: [5]str = {
+    "<!DOCTYPE html><title>T</title><div id=a class='x y'>Hi<!--c--><p>Ola &amp; tchau</p><svg><circle r=2/></svg></div>",
+    "<table><tr><td>1<td>2</table>",
+    "<p>um<p>dois<b>negrito<i>ambos</b>it</i>",
+    "<math><mi>x</mi></math><p>&lt;&#x41;&copy;&nbsp;&bogus;</p>",
+    "<!--x--><html><body onload=f()><select><option>a</select><p>fim",
+}
+
+const SELETORES: [18]str = {
+    "div", "#a", ".x", "div p", "div > p", "p ~ svg", "p + svg", "[id]",
+    "[id^=a]", "[class$=y]", "[class*=x]", "div :first-child", "p:nth-child(2n+1)", "div:not(p)",
+    ":is(p, svg)", "p:empty", "svg circle", "div:has(p)",
+}
+
+const FOLHA: str = "p { color: red }\n#a { margin: 0 auto }\n.x.y { padding: 1px 2px !important }\ndiv > p { font-size: 12px; line-height: 1.5 }\na, b.c > d { color: red !important; margin: 0 }\nul li:first-child { display: none }\n[href^=http] { text-decoration: underline }\nh1 + h2 ~ span { top: 0 }\n@media print { p { x: y } }\n@font-face { font-family: F }\ndiv { background: url(a.png) }\n.a { width: calc(100% - 10px) }\n#b .c .d { border: 1px solid #fff }\np:not(.z) { content: 'x' }\ntable tr:nth-child(2n+1) { color: blue }\n* { box-sizing: border-box }\nbody { font-family: 'Arial', sans-serif }\nspan[title] { color: green !important }\nq { quotes: none }\nem { margin: -1px }"
+
+// Prefixo do namespace: svg e math aparecem como o html5lib escreve (<svg circle>).
+proc prefixo_ns(doc: html.Document, no: i32) -> str {
+    let ns = html.namespace(doc, no)
+    if ns == 3 {
+        return "svg "
+    }
+    if ns == 2 {
+        return "math "
+    }
+    return ""
+}
+
+proc imprime_atributos(doc: html.Document, no: i32, prof: i32) {
+    var k: i32 = 0
+    while k < html.attr_count(doc, no) {
+        print(f"| {RECUOS[prof + 1]}{html.attr_name(doc, no, k)}=\"{html.attr_value(doc, no, k)}\"")
+        k += 1
+    }
+}
+
+proc imprime_no(doc: html.Document, no: i32, prof: i32) {
+    let recuo = RECUOS[prof]
+    switch html.kind(doc, no) {
+    case html.NodeKind.element:
+        print(f"| {recuo}<{prefixo_ns(doc, no)}{html.tag(doc, no)}>")
+        imprime_atributos(doc, no, prof)
+    case html.NodeKind.text:
+        print(f"| {recuo}\"{html.text(doc, no)}\"")
+    case html.NodeKind.comment:
+        print(f"| {recuo}<!-- {html.text(doc, no)} -->")
+    case html.NodeKind.doctype:
+        print(f"| {recuo}<!DOCTYPE {html.tag(doc, no)}>")
+    case html.NodeKind.document:
+        print(f"| {recuo}#document")
+    case html.NodeKind.other:
+        print(f"| {recuo}?")
+    }
+    var filho = html.first_child(doc, no)
+    while filho >= 0 {
+        imprime_no(doc, filho, prof + 1)
+        filho = html.next_sibling(doc, filho)
+    }
+}
+
+proc imprime_arvores() -> ! html.HtmlError {
+    for i, fonte in DOCUMENTOS {
+        print(f"== arvore {i}")
+        let doc = try html.parse(fonte)
+        defer html.close(doc)
+        imprime_no(doc, html.root(doc), 0)
+    }
+    return
+}
+
+proc imprime_seletores() -> ! html.HtmlError {
+    print("== seletores")
+    let doc = try html.parse(DOCUMENTOS[0])
+    defer html.close(doc)
+    for sel in SELETORES {
+        var achados = try html.find_all(doc, html.root(doc), sel, alloc = heap)
+        defer delete(achados)
+        if len(achados) == 0 {
+            print(f"{sel} -")
+        }
+        for k in achados {
+            print(f"{sel} {k}")
+        }
+    }
+    return
+}
+
+proc imprime_css() -> ! html.HtmlError {
+    print("== css")
+    let folha = try html.css_parse(FOLHA)
+    defer html.css_close(folha)
+    print(f"regras={html.rule_count(folha)} atrules={html.atrule_count(folha)}")
+    var r: i32 = 0
+    while r < html.rule_count(folha) {
+        let v = html.rule_specificity(folha, r) as u32
+        let a = ((v >> 18) & 511) as i32
+        let b = ((v >> 9) & 511) as i32
+        let c = (v & 511) as i32
+        print(f"regra {r} {html.rule_selector(folha, r)} spec={a},{b},{c} decls={html.decl_count(folha, r)}")
+        var k: i32 = 0
+        while k < html.decl_count(folha, r) {
+            print(f"  {html.decl_name(folha, r, k)}={html.decl_value(folha, r, k)} imp={html.decl_important(folha, r, k)}")
+            k += 1
+        }
+        r += 1
+    }
+    return
+}
+
+proc main() -> ! html.HtmlError {
+    try imprime_arvores()
+    try imprime_seletores()
+    try imprime_css()
+}

@@ -1,0 +1,586 @@
+// std:file - testes do modulo (S4 P7). Anexados ao texto de std:file SO em forja test std:file (o build normal nao os ve).
+// Versao: 0.5.0. Changelog: 0.5.0 - forja 0.44.0: teste Linux de read_all/write_all gravando o errno em os.last_error (pasta = 21, inexistente = 2). 0.4.0 - D-G3-L2b: os testes de lock e de os.last_error tambem rodam no Linux (flock + unlink no close; errno 2 depois de open inexistente). 0.3.0 - D-G3-L2a bloco D: lock (2o lock = locked, close apaga, pasta inexistente = not_found) e os.last_error depois de open (so Windows). 0.2.0 - A52: abs_path, exe_path, make_temp_file e make_temp_dir. 0.1.0 - S4 P7: handle (open, read, write_str, seek, tell, flush, close, append_str), read_all/write_all/read_lines, sistema de arquivos (exists, is_file, is_dir, stat, copy_file, rename, remove_file, make_dir, remove_dir, read_dir ordenado) e os membros de FileError; contrato das fixtures 375 e das semanticas l11c, l11d e l3c.
+// Sem import e sem proc main: o pedaco fica dentro do modulo, entao chama as procs dele SEM prefixo (open, read, stat...).
+// Regras: cada teste cria tudo numa pasta propria s4_std_file_<assunto> no diretorio corrente e a remove no fim (defer). Nada fora dessa pasta; sem datas nem permissoes.
+
+// Apaga a pasta de teste inteira. Ignora o erro de proposito: pode nao existir.
+proc teste_limpar(pasta: str) {
+    let _apagou = remove_dir(pasta, all = true)
+}
+
+// Grava o texto num arquivo novo e fecha. Verdadeiro so se abrir, gravar, descarregar e fechar sem erro.
+proc teste_gravar(caminho: str, texto: str) -> bool {
+    var ok = false
+    switch r1 in open(caminho, mode = OpenMode.write) {
+    case File:
+        var f = r1
+        let erro = write_str(&f, texto)
+        let descarga = flush(&f)
+        close(&f)
+        ok = (erro == none) and (descarga == none)
+    case FileError:
+        ok = false
+    }
+    return ok
+}
+
+// Le o arquivo inteiro para o destino dado (abre, le, fecha). Devolve os bytes lidos ou -1.
+proc teste_ler(caminho: str, into: []u8) -> int {
+    var total = -1
+    switch r1 in open(caminho, mode = OpenMode.read) {
+    case File:
+        var f = r1
+        switch r2 in read(&f, into = into) {
+        case int: total = r2
+        case FileError: total = -1
+        }
+        close(&f)
+    case FileError:
+        total = -1
+    }
+    return total
+}
+
+// Tamanho em bytes do caminho, ou -1 se nao existir.
+proc teste_tamanho(caminho: str) -> i64 {
+    var total: i64 = -1
+    switch r1 in stat(caminho) {
+    case FileInfo: total = r1.size
+    case FileError: total = -1
+    }
+    return total
+}
+
+// Seek a partir do handle aberto. Devolve a nova posicao ou -1 no erro.
+proc teste_seek(f: ^File, offset: i64, from: SeekFrom) -> i64 {
+    var pos: i64 = -1
+    switch r1 in seek(f, offset, from = from) {
+    case i64: pos = r1
+    case FileError: pos = -1
+    }
+    return pos
+}
+
+// Le 1 byte na posicao atual. Devolve o valor do byte ou -1.
+proc teste_ler_um(f: ^File) -> int {
+    var bloco: [1]u8 = {0}
+    var lidos = -1
+    switch r1 in read(f, into = bloco[..]) {
+    case int: lidos = r1
+    case FileError: lidos = -1
+    }
+    if lidos != 1 {
+        return -1
+    }
+    return bloco[0] as int
+}
+
+test "handle escreve e le bytes" {
+    let pasta = "s4_std_file_handle"
+    teste_limpar(pasta)
+    defer teste_limpar(pasta)
+    expect(make_dir(pasta, all = true) == none)
+    let caminho = "s4_std_file_handle/a.bin"
+    expect(teste_gravar(caminho, "abcdef"))
+    var bloco: [4]u8 = {0, 0, 0, 0}
+    expect(teste_ler(caminho, bloco[..]) == 4)
+    expect(bloco[0] as int == 97)
+    expect(bloco[3] as int == 100)
+}
+
+test "seek e tell na posicao" {
+    let pasta = "s4_std_file_seek"
+    teste_limpar(pasta)
+    defer teste_limpar(pasta)
+    expect(make_dir(pasta, all = true) == none)
+    let caminho = "s4_std_file_seek/a.bin"
+    expect(teste_gravar(caminho, "abcdef"))
+    switch r1 in open(caminho, mode = OpenMode.read) {
+    case File:
+        var f = r1
+        expect(teste_seek(&f, 2, from = SeekFrom.start) == 2)
+        switch r2 in tell(&f) {
+        case i64: expect(r2 == 2)
+        case FileError: expect(false)
+        }
+        expect(teste_ler_um(&f) == 99)
+        switch r3 in tell(&f) {
+        case i64: expect(r3 == 3)
+        case FileError: expect(false)
+        }
+        expect(teste_seek(&f, -1, from = SeekFrom.end) == 5)
+        expect(teste_ler_um(&f) == 102)
+        close(&f)
+    case FileError:
+        expect(false)
+    }
+}
+
+test "append_str acrescenta ao fim" {
+    let pasta = "s4_std_file_append"
+    teste_limpar(pasta)
+    defer teste_limpar(pasta)
+    expect(make_dir(pasta, all = true) == none)
+    let caminho = "s4_std_file_append/a.txt"
+    expect(teste_gravar(caminho, "ab"))
+    expect(append_str(caminho, "cd") == none)
+    expect(teste_tamanho(caminho) == 4)
+}
+
+test "write_all e read_all ida e volta" {
+    let pasta = "s4_std_file_bytes"
+    teste_limpar(pasta)
+    defer teste_limpar(pasta)
+    expect(make_dir(pasta, all = true) == none)
+    let caminho = "s4_std_file_bytes/a.bin"
+    var entrada: [3]u8 = {7, 8, 9}
+    expect(write_all(caminho, entrada[..]) == none)
+    var ok = false
+    switch r1 in read_all(caminho, alloc = heap) {
+    case [dynamic]u8:
+        ok = len(r1) == 3 and r1[0] as int == 7 and r1[2] as int == 9
+        delete(r1)
+    case FileError:
+        ok = false
+    }
+    expect(ok)
+}
+
+test "read_lines separa as linhas" {
+    let pasta = "s4_std_file_linhas"
+    teste_limpar(pasta)
+    defer teste_limpar(pasta)
+    expect(make_dir(pasta, all = true) == none)
+    let caminho = "s4_std_file_linhas/a.txt"
+    expect(teste_gravar(caminho, "um\ndois"))
+    var ok = false
+    switch r1 in read_lines(caminho, alloc = heap) {
+    case Lines:
+        ok = len(r1.items) == 2 and r1.items[1] == "dois"
+        delete(r1.items)
+        delete(r1.data)
+    case FileError:
+        ok = false
+    }
+    expect(ok)
+}
+
+test "exists is_file e is_dir" {
+    let pasta = "s4_std_file_consulta"
+    teste_limpar(pasta)
+    defer teste_limpar(pasta)
+    expect(make_dir(pasta, all = true) == none)
+    let caminho = "s4_std_file_consulta/a.txt"
+    expect(teste_gravar(caminho, "x"))
+    expect(exists(pasta))
+    expect(is_dir(pasta))
+    expect(not is_file(pasta))
+    expect(exists(caminho))
+    expect(is_file(caminho))
+    expect(not is_dir(caminho))
+    expect(not exists("s4_std_file_consulta/nao_existe.txt"))
+}
+
+test "stat tamanho e tipo" {
+    let pasta = "s4_std_file_stat"
+    teste_limpar(pasta)
+    defer teste_limpar(pasta)
+    expect(make_dir(pasta, all = true) == none)
+    let caminho = "s4_std_file_stat/a.txt"
+    expect(teste_gravar(caminho, "abcdef"))
+    expect(teste_tamanho(caminho) == 6)
+    var tipo_ok = false
+    switch r1 in stat(caminho) {
+    case FileInfo: tipo_ok = r1.kind == FileKind.file
+    case FileError: tipo_ok = false
+    }
+    expect(tipo_ok)
+}
+
+test "stat de caminho que nao existe" {
+    var erro_ok = false
+    switch r1 in stat("s4_std_file_stat_nada/x.txt") {
+    case FileInfo: erro_ok = false
+    case FileError: erro_ok = r1 == FileError.not_found
+    }
+    expect(erro_ok)
+}
+
+test "copy_file e rename" {
+    let pasta = "s4_std_file_copia"
+    teste_limpar(pasta)
+    defer teste_limpar(pasta)
+    expect(make_dir(pasta, all = true) == none)
+    let origem = "s4_std_file_copia/a.bin"
+    let copia = "s4_std_file_copia/b.bin"
+    let novo = "s4_std_file_copia/c.bin"
+    expect(teste_gravar(origem, "abc"))
+    expect(copy_file(origem, copia) == none)
+    expect(exists(origem))
+    expect(rename(copia, novo) == none)
+    expect(not exists(copia))
+    expect(teste_tamanho(novo) == 3)
+}
+
+test "remove_file apaga e erra depois" {
+    let pasta = "s4_std_file_remover"
+    teste_limpar(pasta)
+    defer teste_limpar(pasta)
+    expect(make_dir(pasta, all = true) == none)
+    let caminho = "s4_std_file_remover/a.txt"
+    expect(teste_gravar(caminho, "x"))
+    expect(remove_file(caminho) == none)
+    expect(not exists(caminho))
+    expect(remove_file(caminho) != none)
+}
+
+test "make_dir all e remove_dir all" {
+    let pasta = "s4_std_file_pastas"
+    teste_limpar(pasta)
+    defer teste_limpar(pasta)
+    let fundo = "s4_std_file_pastas/a/b"
+    expect(make_dir(fundo, all = true) == none)
+    expect(is_dir(fundo))
+    expect(teste_gravar("s4_std_file_pastas/a/b/x.txt", "x"))
+    expect(remove_dir(pasta, all = true) == none)
+    expect(not exists(pasta))
+}
+
+test "make_dir em pasta existente" {
+    let pasta = "s4_std_file_existe"
+    teste_limpar(pasta)
+    defer teste_limpar(pasta)
+    expect(make_dir(pasta, all = true) == none)
+    var erro_ok = false
+    switch r1 in make_dir(pasta) {
+    case FileError: erro_ok = r1 == FileError.already_exists
+    case none: erro_ok = false
+    }
+    expect(erro_ok)
+}
+
+test "remove_dir de pasta nao vazia" {
+    let pasta = "s4_std_file_nao_vazia"
+    teste_limpar(pasta)
+    defer teste_limpar(pasta)
+    expect(make_dir(pasta, all = true) == none)
+    expect(teste_gravar("s4_std_file_nao_vazia/a.txt", "x"))
+    var erro_ok = false
+    switch r1 in remove_dir(pasta) {
+    case FileError: erro_ok = r1 == FileError.not_empty
+    case none: erro_ok = false
+    }
+    expect(erro_ok)
+    expect(is_dir(pasta))
+}
+
+test "read_dir ordena pelos bytes do nome" {
+    let pasta = "s4_std_file_ordem"
+    teste_limpar(pasta)
+    defer teste_limpar(pasta)
+    expect(make_dir(pasta, all = true) == none)
+    expect(teste_gravar("s4_std_file_ordem/c.txt", "x"))
+    expect(teste_gravar("s4_std_file_ordem/a.txt", "x"))
+    expect(teste_gravar("s4_std_file_ordem/b.txt", "x"))
+    var ok = false
+    switch r1 in read_dir(pasta, alloc = heap) {
+    case DirList:
+        ok = len(r1.items) == 3 and r1.items[0].name == "a.txt" and r1.items[2].name == "c.txt"
+        ok = ok and r1.items[1].kind == FileKind.file
+        delete(r1.items)
+        delete(r1.data)
+    case FileError:
+        ok = false
+    }
+    expect(ok)
+}
+
+test "open create em arquivo existente" {
+    let pasta = "s4_std_file_criar"
+    teste_limpar(pasta)
+    defer teste_limpar(pasta)
+    expect(make_dir(pasta, all = true) == none)
+    let caminho = "s4_std_file_criar/a.bin"
+    var criou = false
+    switch r1 in open(caminho, mode = OpenMode.create) {
+    case File:
+        var f = r1
+        criou = true
+        close(&f)
+    case FileError:
+        criou = false
+    }
+    expect(criou)
+    var repetiu = false
+    switch r2 in open(caminho, mode = OpenMode.create) {
+    case File:
+        var g = r2
+        close(&g)
+    case FileError:
+        repetiu = r2 == FileError.already_exists
+    }
+    expect(repetiu)
+}
+
+test "handle fechado devolve closed" {
+    let pasta = "s4_std_file_fechado"
+    teste_limpar(pasta)
+    defer teste_limpar(pasta)
+    expect(make_dir(pasta, all = true) == none)
+    let caminho = "s4_std_file_fechado/a.bin"
+    expect(teste_gravar(caminho, "abc"))
+    var ok = false
+    switch r1 in open(caminho, mode = OpenMode.read) {
+    case File:
+        var f = r1
+        close(&f)
+        var bloco: [1]u8 = {0}
+        switch r2 in read(&f, into = bloco[..]) {
+        case int: ok = false
+        case FileError: ok = r2 == FileError.closed
+        }
+    case FileError:
+        ok = false
+    }
+    expect(ok)
+}
+
+test "open em caminho inexistente" {
+    var erro_ok = false
+    switch r1 in open("s4_std_file_inexistente/a.bin", mode = OpenMode.read) {
+    case File: erro_ok = false
+    case FileError: erro_ok = r1 == FileError.not_found
+    }
+    expect(erro_ok)
+}
+
+test "make_dir sem all em pai que falta" {
+    expect(make_dir("s4_std_file_pai_falta/filho") != none)
+    expect(not exists("s4_std_file_pai_falta"))
+}
+
+// A52: cwd, abs_path, exe_path (std:os) e make_temp_file / make_temp_dir. Os testes de set_env, temp_dir e random_bytes estao em std\os\testes.fj.
+
+test "abs_path resolve relativo e ponto-ponto, e e idempotente" {
+    switch c in os.cwd(alloc = heap) {
+    case str:
+        defer delete(c)
+        expect(pastas.is_abs(c))
+        let esperado = pastas.join2(c, "a\\c", alloc = heap)
+        defer delete(esperado)
+        switch r in os.abs_path("a\\b\\..\\c", alloc = heap) {
+        case str:
+            expect(r == esperado)
+            delete(r)
+        case os.OsError:
+            expect(false)
+        }
+        switch r2 in os.abs_path(c, alloc = heap) {
+        case str:
+            expect(r2 == c)
+            delete(r2)
+        case os.OsError:
+            expect(false)
+        }
+    case os.OsError:
+        expect(false)
+    }
+}
+
+test "abs_path de caminho vazio e invalid_input" {
+    switch r in os.abs_path("", alloc = heap) {
+    case str:
+        expect(false)
+        delete(r)
+    case os.OsError:
+        expect(r == os.OsError.invalid_input)
+    }
+}
+
+test "exe_path e absoluto, arquivo e termina em .exe" {
+    switch r in os.exe_path(alloc = heap) {
+    case str:
+        expect(pastas.is_abs(r))
+        expect(is_file(r))
+        expect(pastas.ext(r) == ".exe")
+        delete(r)
+    case os.OsError:
+        expect(false)
+    }
+}
+
+// Cria 2 arquivos temporarios (na pasta dada, ou na do sistema se vazia) e confere nome, pasta e exclusividade; apaga o que criou.
+proc teste_temp_arquivos(tmp: str, in_dir: str) -> bool {
+    var ok = false
+    switch a in make_temp_file("a52", in_dir = in_dir, alloc = heap) {
+    case str:
+        ok = teste_temp_par(a, tmp, in_dir)
+        ok = ok and (remove_file(a) == none)
+        delete(a)
+    case FileError:
+        ok = false
+    }
+    return ok
+}
+
+// Cria o 2o arquivo e confere o par (a ja existe): nomes diferentes, pasta, tamanho e prefixo do nome, existencia e exclusividade; apaga o 2o.
+proc teste_temp_par(a: str, tmp: str, in_dir: str) -> bool {
+    var ok = false
+    switch b in make_temp_file("a52", in_dir = in_dir, alloc = heap) {
+    case str:
+        ok = a != b
+        ok = ok and (pastas.dir(a) == tmp) and (pastas.dir(b) == tmp)
+        ok = ok and (len(pastas.base(a)) == 20) and (pastas.base(a)[0..<4] == "a52-")
+        ok = ok and is_file(a) and is_file(b) and teste_ja_existe(a)
+        ok = ok and (remove_file(b) == none)
+        delete(b)
+    case FileError:
+        ok = false
+    }
+    return ok
+}
+
+// open(create) num caminho que ja existe da already_exists.
+proc teste_ja_existe(caminho: str) -> bool {
+    var ok = false
+    switch r in open(caminho, mode = OpenMode.create) {
+    case File:
+        var f = r
+        close(&f)
+        ok = false
+    case FileError:
+        ok = r == FileError.already_exists
+    }
+    return ok
+}
+
+test "make_temp_file da caminhos novos dentro da pasta temporaria" {
+    switch tmp in os.temp_dir(alloc = heap) {
+    case str:
+        defer delete(tmp)
+        expect(teste_temp_arquivos(tmp, ""))
+        expect(teste_temp_arquivos(tmp, tmp))
+    case os.OsError:
+        expect(false)
+    }
+}
+
+test "make_temp_dir cria pasta nova e vazia" {
+    switch d in make_temp_dir("a52d", alloc = heap) {
+    case str:
+        expect(is_dir(d))
+        expect(make_dir(d) != none)
+        expect(len(pastas.base(d)) == 21)
+        expect(remove_dir(d) == none)
+        expect(not exists(d))
+        delete(d)
+    case FileError:
+        expect(false)
+    }
+}
+
+test "prefixo com separador e unsupported" {
+    switch r in make_temp_file("a\\b", alloc = heap) {
+    case str:
+        expect(false)
+        delete(r)
+    case FileError:
+        expect(r == FileError.unsupported)
+    }
+    switch r2 in make_temp_dir("a/b", alloc = heap) {
+    case str:
+        expect(false)
+        delete(r2)
+    case FileError:
+        expect(r2 == FileError.unsupported)
+    }
+}
+
+// D-G3-L2a bloco D: lock e os.last_error. So no Windows (no Linux o runtime devolve other ate o L2b, entao o corpo nao roda).
+
+// true se lock(caminho) falha com exatamente o erro esperado; se destravar por engano, fecha o handle.
+proc lock_falha_com(caminho: str, esperado: FileError) -> bool {
+    var falhou = false
+    switch r in lock(caminho) {
+    case File:
+        var f = r
+        close(&f)
+    case FileError:
+        falhou = r == esperado
+    }
+    return falhou
+}
+
+test "lock: 2o lock no mesmo processo e locked; close apaga e um novo lock funciona" {
+    if os.TARGET == "x86_64-windows" or os.TARGET == "x86_64-linux" {
+        let pasta = "s4_std_file_lock"
+        teste_limpar(pasta)
+        defer teste_limpar(pasta)
+        expect(make_dir(pasta, all = true) == none)
+        let caminho = "s4_std_file_lock/a.lock"
+        switch r in lock(caminho) {
+        case File:
+            var f = r
+            expect(exists(caminho))
+            expect(lock_falha_com(caminho, FileError.locked))
+            close(&f)
+        case FileError:
+            expect(false)
+        }
+        expect(not exists(caminho))
+        switch r2 in lock(caminho) {
+        case File:
+            var g = r2
+            close(&g)
+        case FileError:
+            expect(false)
+        }
+        expect(lock_falha_com("s4_std_file_lock_sem_pasta/a.lock", FileError.not_found))
+    }
+}
+
+test "os.last_error devolve o erro do sistema da ultima falha de open" {
+    if os.TARGET == "x86_64-windows" or os.TARGET == "x86_64-linux" {
+        var falhou = false
+        switch r in open("s4_std_file_nao_existe.bin", mode = OpenMode.read) {
+        case File:
+            var f = r
+            close(&f)
+        case FileError:
+            falhou = r == FileError.not_found
+        }
+        expect(falhou)
+        expect(os.last_error() == 2)
+    }
+}
+
+// forja 0.44.0: no Linux read_all e write_all gravam o errno em os.last_error (pasta = 21, inexistente = 2); antes ficava 0 e o app caia num codigo do Windows.
+test "Linux read_all e write_all gravam o errno em os.last_error" {
+    if os.TARGET == "x86_64-linux" {
+        let pasta = "s4_std_file_errno"
+        teste_limpar(pasta)
+        defer teste_limpar(pasta)
+        expect(make_dir(pasta, all = true) == none)
+        var leu_pasta = false
+        switch r1 in read_all(pasta, alloc = heap) {
+        case [dynamic]u8:
+            delete(r1)
+        case FileError:
+            leu_pasta = true
+        }
+        expect(leu_pasta)
+        expect(os.last_error() == 21)
+        var leu_nada = false
+        switch r2 in read_all("s4_std_file_errno/nao_existe.bin", alloc = heap) {
+        case [dynamic]u8:
+            delete(r2)
+        case FileError:
+            leu_nada = true
+        }
+        expect(leu_nada)
+        expect(os.last_error() == 2)
+        var entrada: [1]u8 = {1}
+        expect(write_all("s4_std_file_errno_sem_pasta/a.bin", entrada[..]) != none)
+        expect(os.last_error() == 2)
+    }
+}

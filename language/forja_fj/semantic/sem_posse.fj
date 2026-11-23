@@ -1,0 +1,420 @@
+// semantic/sem_posse.fj - porte de compiler/semantic/sem_posse.c
+// sha256 de semantic/sem_posse.c: 1a111ffac9a9e898d882a30bb644bdd61122d86447d58d70b6b1676ae32f9dcb
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "common"
+import "frontend"
+
+// C: semantic/sem_posse.c:16
+proc origem_rastreada_como_heap(origem: u8) -> bool {
+    return (origem == (frontend.ALOC_HEAP as u8)) or (origem == (frontend.ALOC_PARAM as u8))
+}
+
+// C: semantic/sem_posse.c:22
+proc origem_da_chamada(r: ?^LocalRastreado) -> str {
+    var tern_1: str = ""
+    if ((r as ^LocalRastreado).de_chamada as i32) != 0 {
+        tern_1 = " (veio de uma chamada com alloc = heap)"
+    }
+    return tern_1
+}
+
+// C: semantic/sem_posse.c:28
+proc valor_veio_de_chamada_heap(valor: ?^frontend.Expr) -> bool {
+    var valor_v: ?^frontend.Expr = valor
+    if ((valor_v as ^frontend.Expr).tipo_no == (frontend.EX_EMBRULHA as u8)) or ((valor_v as ^frontend.Expr).tipo_no == (frontend.EX_TRY as u8)) {
+        valor_v = (valor_v as ^frontend.Expr).a
+    }
+    return (((valor_v as ^frontend.Expr).tipo_no == (frontend.EX_CHAMADA as u8)) and ((valor_v as ^frontend.Expr).ref == (frontend.REF_PROC as u8))) and ((valor_v as ^frontend.Expr).alocacao == (frontend.ALOC_HEAP as u8))
+}
+
+// C: semantic/sem_posse.c:35
+proc erro_de_texto_sem_dono(s: ^Semantica, alvo: ?^frontend.Expr, origem: u8) -> bool {
+    let nome: str = sem_nome_texto(s, (alvo as ^frontend.Expr).nome)
+    if origem == (ORIGEM_C as u8) {
+        let classe: i32 = tipo_classe_de(&s.tipos, (alvo as ^frontend.Expr).tipo)
+        let ponteiro: bool = (common.c2f_s2u_32(classe) == (TC_PONTEIRO as u32)) or (common.c2f_s2u_32(classe) == (TC_ANULAVEL as u32))
+        var tern_1: str = "o texto"
+        if common.c2f_b2i32(ponteiro) != 0 {
+            tern_1 = "o objeto"
+        }
+        let msg_1 = format(f"'{nome}' veio de um proc foreign: {tern_1} e emprestado da biblioteca C e delete nao o libera; se a biblioteca pede para liberar, chame a funcao dela", alloc = heap)
+        defer delete(msg_1)
+        return sem_erro(s, common.E0310, (alvo as ^frontend.Expr).pos, msg_1)
+    }
+    let msg_2 = format(f"'{nome}' guarda um texto literal: delete so libera o que veio de format(..., alloc = heap)", alloc = heap)
+    defer delete(msg_2)
+    return sem_erro(s, common.E0310, (alvo as ^frontend.Expr).pos, msg_2)
+}
+
+// C: semantic/sem_posse.c:48
+proc erro_de_origem(s: ^Semantica, alvo: ?^frontend.Expr, origem: u8, com_pool: bool) -> bool {
+    let nome: str = sem_nome_texto(s, (alvo as ^frontend.Expr).nome)
+    let lista: bool = sem_colecao_dona(s, (alvo as ^frontend.Expr).tipo)
+    if origem == (frontend.ALOC_ESCOPO as u8) {
+        let msg_1 = format(f"'{nome}' e de escopo: o delete e automatico no fim do bloco", alloc = heap)
+        defer delete(msg_1)
+        return sem_erro(s, common.E0316, (alvo as ^frontend.Expr).pos, msg_1)
+    }
+    if (origem as i32) >= ORIGEM_LITERAL {
+        return erro_de_texto_sem_dono(s, alvo, origem)
+    }
+    if (origem == (frontend.ALOC_PARAM as u8)) and (not lista) {
+        let msg_2 = format(f"'{nome}' veio do alocador do chamador (alloc): o delete so libera heap e a memoria pode ser de Arena; devolva-a por return, guarde-a num campo ou entregue-a a outra proc", alloc = heap)
+        defer delete(msg_2)
+        return sem_erro(s, common.E0310, (alvo as ^frontend.Expr).pos, msg_2)
+    }
+    if (origem == (frontend.ALOC_ARENA as u8)) and (not lista) {
+        let msg_3 = format(f"objeto de Arena nao se libera um a um: arena_reset ou arena_destroy liberam tudo", alloc = heap)
+        defer delete(msg_3)
+        return sem_erro(s, common.E0310, (alvo as ^frontend.Expr).pos, msg_3)
+    }
+    if (origem == (frontend.ALOC_POOL as u8)) and (not com_pool) {
+        let msg_4 = format(f"objeto de Pool volta com delete({nome}, alloc = pool)", alloc = heap)
+        defer delete(msg_4)
+        return sem_erro(s, common.E0310, (alvo as ^frontend.Expr).pos, msg_4)
+    }
+    if (origem != (frontend.ALOC_POOL as u8)) and (common.c2f_b2i32(com_pool) != 0) {
+        let msg_5 = format(f"delete(p, alloc = pool) pede ^T vindo de new(T, alloc = pool)", alloc = heap)
+        defer delete(msg_5)
+        return sem_erro(s, common.E0310, (alvo as ^frontend.Expr).pos, msg_5)
+    }
+    return true
+}
+
+// C: semantic/sem_posse.c:68
+proc sem_achar_rastreado(s: ^Semantica, e: ?^frontend.Expr) -> ?^LocalRastreado {
+    if (((e as ^frontend.Expr).tipo_no != (frontend.EX_NOME as u8)) or ((e as ^frontend.Expr).ref != (frontend.REF_LOCAL as u8))) or ((e as ^frontend.Expr).modulo != 0) {
+        return none
+    }
+    var k: u64 = len(s.rastreados) as u64
+    while k > 0 {
+        let r: ^LocalRastreado = &s.rastreados[k - 1]
+        if r.local_id == (e as ^frontend.Expr).ref_id {
+            return r
+        }
+        k -= 1
+    }
+    return none
+}
+
+// C: semantic/sem_posse.c:79
+proc sem_conferir_delete(s: ^Semantica, e: ^frontend.Expr) -> bool {
+    let alvo: ?^frontend.Expr = (e.args or_else {})[0].valor
+    var local: ?^LocalInfo = none
+    var r: ?^LocalRastreado = none
+    if ((alvo as ^frontend.Expr).tipo_no != (frontend.EX_NOME as u8)) or ((alvo as ^frontend.Expr).modulo != 0) {
+        return true
+    }
+    local = escopo_buscar(&s.escopo, (alvo as ^frontend.Expr).nome)
+    if (local == none) or ((local as ^LocalInfo).origem == (frontend.ALOC_NENHUM as u8)) {
+        return true
+    }
+    var tern_1: ?^LocalRastreado = none
+    if (len(s.rastreados) as u64) == 0 {
+        tern_1 = none
+    } else {
+        tern_1 = sem_achar_rastreado(s, alvo)
+    }
+    r = tern_1
+    if not erro_de_origem(s, alvo, (local as ^LocalInfo).origem, e.nargs > 1) {
+        if (r != none) and ((r as ^LocalRastreado).origem == (frontend.ALOC_PARAM as u8)) {
+            let ptr_1: ^LocalRastreado = r as ^LocalRastreado
+            ptr_1.estado = POSSE_LIBERADO as u8
+        }
+        return false
+    }
+    if r == none {
+        return true
+    }
+    if origem_rastreada_como_heap((r as ^LocalRastreado).origem) {
+        let ptr_2: ^LocalRastreado = r as ^LocalRastreado
+        ptr_2.estado = POSSE_LIBERADO as u8
+    }
+    return true
+}
+
+// C: semantic/sem_posse.c:98
+proc posse_do_nome(s: ^Semantica, e: ?^frontend.Expr, r: ?^LocalRastreado, ponto: i32) -> bool {
+    var ponto_v: i32 = ponto
+    if (r as ^LocalRastreado).origem == (ALOC_HANDLE as u8) {
+        return sem_posse_do_handle(s, e, r, ponto_v)
+    }
+    if common.c2f_s2u_32(ponto_v) >= (PONTO_EMPRESTIMO as u32) {
+        ponto_v = PONTO_ARGUMENTO
+    }
+    let nome: str = sem_nome_texto(s, (r as ^LocalRastreado).nome)
+    if (r as ^LocalRastreado).origem == (frontend.ALOC_ESCOPO as u8) {
+        if common.c2f_s2u_32(ponto_v) == (PONTO_ARGUMENTO as u32) {
+            return true
+        }
+        let msg_1 = format(f"'{nome}' e de escopo: nao sai do bloco (return, campo, elemento, append ou copia); use alloc = heap para entregar", alloc = heap)
+        defer delete(msg_1)
+        return sem_erro(s, common.E0316, (e as ^frontend.Expr).pos, msg_1)
+    }
+    if (common.c2f_s2u_32(ponto_v) == (PONTO_COPIA as u32)) and ((r as ^LocalRastreado).origem == (frontend.ALOC_PARAM as u8)) {
+        let msg_2 = format(f"'{nome}' e dono de memoria do alocador do chamador (alloc): copiar cria dois donos; entregue (proc, return, campo) ou use &{nome}", alloc = heap)
+        defer delete(msg_2)
+        return sem_erro(s, common.E0317, (e as ^frontend.Expr).pos, msg_2)
+    }
+    if common.c2f_s2u_32(ponto_v) == (PONTO_COPIA as u32) {
+        let msg_3 = format(f"'{nome}' e dono de memoria de heap{origem_da_chamada(r)}: copiar cria dois donos; entregue (proc, return, campo) ou use &{nome}", alloc = heap)
+        defer delete(msg_3)
+        return sem_erro(s, common.E0317, (e as ^frontend.Expr).pos, msg_3)
+    }
+    let ptr_1: ^LocalRastreado = r as ^LocalRastreado
+    ptr_1.estado = POSSE_ENTREGUE as u8
+    return true
+}
+
+// C: semantic/sem_posse.c:117
+proc sem_conferir_posse_lento(s: ^Semantica, e: ?^frontend.Expr, ponto: i32) -> bool {
+    var e_v: ?^frontend.Expr = e
+    var r: ?^LocalRastreado = none
+    if (e_v as ^frontend.Expr).tipo_no == (frontend.EX_EMBRULHA as u8) {
+        e_v = (e_v as ^frontend.Expr).a
+    }
+    if ((e_v as ^frontend.Expr).tipo_no == (frontend.EX_UNARIO as u8)) and ((e_v as ^frontend.Expr).op == (frontend.OP_ENDERECO as u8)) {
+        r = sem_achar_rastreado(s, (e_v as ^frontend.Expr).a)
+        if (r != none) and (common.c2f_b2i32(origem_rastreada_como_heap((r as ^LocalRastreado).origem)) != 0) {
+            let ptr_1: ^LocalRastreado = r as ^LocalRastreado
+            ptr_1.estado = POSSE_ENTREGUE as u8
+        }
+        return true
+    }
+    r = sem_achar_rastreado(s, e_v)
+    return (r == none) or (common.c2f_b2i32(posse_do_nome(s, e_v, r, ponto)) != 0)
+}
+
+// C: semantic/sem_posse.c:131
+proc sem_conferir_reatribuicao_lento(s: ^Semantica, st: ^frontend.Stmt) -> bool {
+    let r: ?^LocalRastreado = sem_achar_rastreado(s, st.alvo)
+    if r == none {
+        return true
+    }
+    if (r as ^LocalRastreado).origem == (ALOC_HANDLE as u8) {
+        return sem_reatribuicao_do_handle(s, st, r)
+    }
+    let nome: str = sem_nome_texto(s, (r as ^LocalRastreado).nome)
+    if (r as ^LocalRastreado).origem == (frontend.ALOC_ESCOPO as u8) {
+        let msg_1 = format(f"'{nome}' e de escopo: nao se reatribui", alloc = heap)
+        defer delete(msg_1)
+        return sem_erro(s, common.E0316, (st.alvo as ^frontend.Expr).pos, msg_1)
+    }
+    if ((r as ^LocalRastreado).estado == (POSSE_VIVO as u8)) and ((r as ^LocalRastreado).origem == (frontend.ALOC_PARAM as u8)) {
+        let msg_2 = format(f"'{nome}' ainda segura memoria do alocador do chamador (alloc) sem entrega: devolva-a ou entregue-a antes de reatribuir", alloc = heap)
+        defer delete(msg_2)
+        return sem_erro(s, common.E0317, (st.alvo as ^frontend.Expr).pos, msg_2)
+    }
+    if (r as ^LocalRastreado).estado == (POSSE_VIVO as u8) {
+        let msg_3 = format(f"'{nome}' ainda segura memoria de heap{origem_da_chamada(r)}: delete({nome}) antes de reatribuir", alloc = heap)
+        defer delete(msg_3)
+        return sem_erro(s, common.E0317, (st.alvo as ^frontend.Expr).pos, msg_3)
+    }
+    let origem_nova: u8 = sem_origem_do_valor(st.expr)
+    if origem_rastreada_como_heap(origem_nova) {
+        let ptr_1: ^LocalRastreado = r as ^LocalRastreado
+        ptr_1.estado = POSSE_VIVO as u8
+        let ptr_2: ^LocalRastreado = r as ^LocalRastreado
+        ptr_2.origem = origem_nova
+        let ptr_3: ^LocalRastreado = r as ^LocalRastreado
+        ptr_3.de_chamada = common.c2f_b2i32(valor_veio_de_chamada_heap(st.expr)) as u8
+    }
+    return true
+}
+
+// C: semantic/sem_posse.c:155
+proc sem_posse_dos_argumentos_lento(s: ^Semantica, chamada: ^frontend.Expr, proc_c: ?^frontend.Decl) -> bool {
+    var tern_1: i32 = PONTO_EMPRESTIMO_FORJA
+    if common.c2f_b2i32((proc_c as ^frontend.Decl).externo) != 0 {
+        tern_1 = PONTO_EMPRESTIMO
+    }
+    let emprestimo: i32 = tern_1
+    var k: u32 = 0
+    while k < chamada.nargs {
+        var tern_2: u32 = common.c2f_s2u_32(emprestimo)
+        if common.c2f_b2i32(sem_entrega_do_argumento(proc_c, (chamada.args or_else {})[k].indice)) != 0 {
+            tern_2 = PONTO_ARGUMENTO as u32
+        }
+        let ponto: i32 = transmute(tern_2, to = i32)
+        if not sem_conferir_posse_lento(s, (chamada.args or_else {})[k].valor, ponto) {
+            return false
+        }
+        k += 1
+    }
+    return true
+}
+
+// C: semantic/sem_posse.c:166
+proc sem_conferir_saida_lenta(s: ^Semantica, marca: u32, st: ^frontend.Stmt) -> bool {
+    var k: u64 = marca as u64
+    while k < (len(s.rastreados) as u64) {
+        let r: ^LocalRastreado = &s.rastreados[k]
+        if r.estado != (POSSE_VIVO as u8) {
+            k += 1
+            continue
+        }
+        if r.origem == (ALOC_HANDLE as u8) {
+            return sem_erro_do_handle_vivo(s, r, st.pos, true)
+        }
+        if not origem_rastreada_como_heap(r.origem) {
+            k += 1
+            continue
+        }
+        let nome: str = sem_nome_texto(s, r.nome)
+        if r.origem == (frontend.ALOC_PARAM as u8) {
+            let msg_1 = format(f"'{nome}' guarda memoria do alocador do chamador (alloc) e esta saida (return, break ou continue) a deixa sem entregar: devolva-a por return, guarde-a num campo ou entregue-a a outra proc", alloc = heap)
+            defer delete(msg_1)
+            return sem_erro(s, common.E0317, st.pos, msg_1)
+        }
+        let msg_2 = format(f"'{nome}' segura memoria de heap{origem_da_chamada(r)} e esta saida (return, break ou continue) a deixa viva: use defer delete({nome}) logo depois do let", alloc = heap)
+        defer delete(msg_2)
+        return sem_erro(s, common.E0317, st.pos, msg_2)
+    }
+    return true
+}
+
+// C: semantic/sem_posse.c:183
+proc sem_conferir_fim_do_bloco(s: ^Semantica, marca: u32) -> bool {
+    var k: u64 = marca as u64
+    while k < (len(s.rastreados) as u64) {
+        let r: ^LocalRastreado = &s.rastreados[k]
+        if r.estado != (POSSE_VIVO as u8) {
+            k += 1
+            continue
+        }
+        if r.origem == (ALOC_HANDLE as u8) {
+            return sem_erro_do_handle_vivo(s, r, r.pos, false)
+        }
+        if not origem_rastreada_como_heap(r.origem) {
+            k += 1
+            continue
+        }
+        let nome: str = sem_nome_texto(s, r.nome)
+        if r.origem == (frontend.ALOC_PARAM as u8) {
+            let msg_1 = format(f"'{nome}' recebe memoria do alocador do chamador (alloc) e nao e entregue ate o fim do bloco: devolva-a por return, guarde-a num campo ou entregue-a a outra proc", alloc = heap)
+            defer delete(msg_1)
+            return sem_erro(s, common.E0317, r.pos, msg_1)
+        }
+        let msg_2 = format(f"'{nome}' recebe memoria de heap{origem_da_chamada(r)} e nao e liberado nem entregue ate o fim do bloco: delete({nome}), defer delete({nome}) ou alloc = scope", alloc = heap)
+        defer delete(msg_2)
+        return sem_erro(s, common.E0317, r.pos, msg_2)
+    }
+    truncate(&s.rastreados, marca as int) // C: s->rastreados.n = marca
+    return true
+}
+
+// C: semantic/sem_posse.c:201
+proc sem_rastrear_local(s: ^Semantica, st: ^frontend.Stmt, origem: u8) -> bool {
+    append(&s.rastreados, item = LocalRastreado{})
+    let r: ^LocalRastreado = &s.rastreados[len(s.rastreados) - 1]
+    r.local_id = st.local_id
+    r.nome = st.nome
+    r.pos = sem_pos_depois_da_palavra(s, st.pos)
+    r.origem = origem
+    r.tipo = st.tipo_local
+    r.estado = POSSE_VIVO as u8
+    r.de_chamada = common.c2f_b2i32(valor_veio_de_chamada_heap(st.expr)) as u8
+    return true
+}
+
+// C: semantic/sem_posse.c:215
+proc sem_defer_do_escopo(s: ^Semantica, st: ^frontend.Stmt) {
+    let nome: ^frontend.Expr = s4_novo_expr(s)
+    let chamada: ^frontend.Expr = s4_novo_expr(s)
+    let comando: ^frontend.Stmt = s6_novo_stmt(s)
+    let adiado: ^frontend.Stmt = s6_novo_stmt(s)
+    nome.tipo_no = frontend.EX_NOME as u8
+    nome.nome = st.nome
+    nome.pos = st.pos
+    nome.pos_op = st.pos
+    nome.ref = frontend.REF_LOCAL as u8
+    nome.ref_id = st.local_id
+    nome.tipo = st.tipo_local
+    chamada.tipo_no = frontend.EX_CHAMADA as u8
+    chamada.nome = s.nome_delete
+    chamada.pos = st.pos
+    chamada.pos_op = st.pos
+    chamada.ref = frontend.REF_EMBUTIDO as u8
+    chamada.ref_id = frontend.EMB_DELETE
+    chamada.tipo = TIPO_VAZIO as u32
+    chamada.alocacao = frontend.ALOC_HEAP as u8
+    chamada.nargs = 1
+    let args: []frontend.Arg = frontend.arena_fatia_arg(s.arena as ^common.Arena, 1)
+    args[0] = frontend.Arg{nome = -1, pos_nome = st.pos, valor = nome, indice = 0}
+    chamada.args = args
+    comando.tipo_no = frontend.ST_CHAMADA as u8
+    comando.pos = st.pos
+    comando.expr = chamada
+    adiado.tipo_no = frontend.ST_DEFER as u8
+    adiado.pos = st.pos
+    adiado.corpo = comando
+    st.corpo = adiado
+}
+
+// S6 (sem par no C): `ArenaAlocar(s->arena, sizeof(Stmt))` zerado (idem s4_novo_expr; new(frontend.Stmt) e E1003 fora do pacote e nao ha helper de Stmt).
+proc s6_novo_stmt(s: ^Semantica) -> ^frontend.Stmt {
+    var l = make([dynamic]frontend.Stmt, alloc = common.arena_mem(s.arena as ^common.Arena), cap = 1)
+    append(&l, item = frontend.Stmt{})
+    let fatia = l[..]
+    return &fatia[0]
+}
+
+// ---------------------------------------------------------------- G3 S6: testes de posse (rastreados montados a mao; textos = saida real do forja.exe nas fixtures tests\semantica\err_E0317_*, err_handle_*)
+
+// empilha um local rastreado (local_id = a posicao)
+proc s6_rastr(c: ^S6Cen, nome: str, pos: u32, origem: i32, estado: i32, de_chamada: u8) {
+    append(&c.s.rastreados, item = LocalRastreado{local_id = len(c.s.rastreados) as i32, nome = s6_nome(c, nome), pos = pos, tipo = TIPO_INT as u32, origem = origem as u8, estado = estado as u8, de_chamada = de_chamada})
+}
+
+test "sem_posse: sem_conferir_fim_do_bloco (heap, heap de chamada, alloc do chamador; liberado/arena passam; marca preserva o que veio antes)" {
+    let c = s6_cen_novo("proc f() {\n    let x = new(T, alloc = heap)\n}\n")
+    defer s6_cen_liberar(c)
+    let s: ^Semantica = &c.s
+    s6_rastr(c, "x", 20, frontend.ALOC_HEAP, POSSE_VIVO, 0)
+    expect(not sem_conferir_fim_do_bloco(s, 0))
+    expect(c.diag.tem and c.diag.codigo == common.E0317 and c.diag.off == 20)
+    expect((c.diag.causa or_else "") == "'x' recebe memoria de heap e nao e liberado nem entregue ate o fim do bloco: delete(x), defer delete(x) ou alloc = scope")
+    expect(len(s.rastreados) == 1) // com erro a pilha nao e cortada
+    s.rastreados[0].de_chamada = 1
+    expect(not sem_conferir_fim_do_bloco(s, 0))
+    expect((c.diag.causa or_else "") == "'x' recebe memoria de heap (veio de uma chamada com alloc = heap) e nao e liberado nem entregue ate o fim do bloco: delete(x), defer delete(x) ou alloc = scope")
+    s.rastreados[0].origem = frontend.ALOC_PARAM as u8
+    expect(not sem_conferir_fim_do_bloco(s, 0))
+    expect((c.diag.causa or_else "") == "'x' recebe memoria do alocador do chamador (alloc) e nao e entregue ate o fim do bloco: devolva-a por return, guarde-a num campo ou entregue-a a outra proc")
+    // nao vivos e origens que nao sao heap/param nao reclamam; a pilha volta a marca
+    s.rastreados[0].estado = POSSE_LIBERADO as u8
+    expect(sem_conferir_fim_do_bloco(s, 0))
+    expect(len(s.rastreados) == 0)
+    s6_rastr(c, "a", 20, frontend.ALOC_ARENA, POSSE_VIVO, 0)
+    s6_rastr(c, "b", 21, frontend.ALOC_HEAP, POSSE_ENTREGUE, 0)
+    s6_rastr(c, "d", 22, frontend.ALOC_ESCOPO, POSSE_VIVO, 0)
+    expect(sem_conferir_fim_do_bloco(s, 0) and len(s.rastreados) == 0)
+    // marca = 1: o que esta antes da marca (vivo, heap) nao e conferido e fica
+    s6_rastr(c, "x", 20, frontend.ALOC_HEAP, POSSE_VIVO, 0)
+    s6_rastr(c, "y", 21, frontend.ALOC_HEAP, POSSE_LIBERADO, 0)
+    expect(sem_conferir_fim_do_bloco(s, 1) and len(s.rastreados) == 1)
+    expect(sem_nome_texto(s, s.rastreados[0].nome) == "x")
+}
+
+test "sem_posse: sem_defer_do_escopo monta `defer delete(x)` no corpo do let" {
+    let c = s6_cen_novo("proc f() {\n    let x = new(T, alloc = heap)\n}\n")
+    defer s6_cen_liberar(c)
+    let s: ^Semantica = &c.s
+    s.nome_delete = s6_nome(c, "delete")
+    let st = s6_st_local(s, frontend.ST_LET, 15, s6_nome(c, "x"), 3, TIPO_INT as u32, none)
+    sem_defer_do_escopo(s, st)
+    expect(st.corpo != none)
+    let adiado: ^frontend.Stmt = st.corpo as ^frontend.Stmt
+    expect(adiado.tipo_no == (frontend.ST_DEFER as u8) and adiado.pos == 15)
+    let comando: ^frontend.Stmt = adiado.corpo as ^frontend.Stmt
+    expect(comando.tipo_no == (frontend.ST_CHAMADA as u8) and comando.pos == 15)
+    let chamada: ^frontend.Expr = comando.expr as ^frontend.Expr
+    expect(chamada.tipo_no == (frontend.EX_CHAMADA as u8) and chamada.ref == (frontend.REF_EMBUTIDO as u8) and chamada.ref_id == frontend.EMB_DELETE)
+    expect(chamada.nome == s6_nome(c, "delete") and chamada.nargs == 1 and chamada.alocacao == (frontend.ALOC_HEAP as u8) and chamada.tipo == (TIPO_VAZIO as u32))
+    let arg: frontend.Arg = (chamada.args or_else {})[0]
+    expect(arg.nome == -1 and arg.indice == 0 and arg.pos_nome == 15)
+    let alvo: ^frontend.Expr = arg.valor as ^frontend.Expr
+    expect(alvo.tipo_no == (frontend.EX_NOME as u8) and alvo.ref == (frontend.REF_LOCAL as u8) and alvo.ref_id == 3 and alvo.nome == s6_nome(c, "x") and alvo.tipo == (TIPO_INT as u32))
+}

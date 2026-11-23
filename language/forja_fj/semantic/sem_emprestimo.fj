@@ -1,0 +1,1021 @@
+// semantic/sem_emprestimo.fj - porte de compiler/semantic/sem_emprestimo.c
+// sha256 de semantic/sem_emprestimo.c: 297c94219160ad1bd0d6c3fd077af5677e4775c53df9956ec5f123c80f5bc897
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "common"
+import "frontend"
+
+struct Emprestimo {
+    var_c: i32
+    colecao: i32
+    decl: ?^frontend.Stmt
+    pos_decl: u32
+    pos_mut: u32
+    quente_laco: u32
+    nome_mut: i32
+    invalido: bool
+    relatado: bool
+    mut_solta: bool
+}
+
+struct Percorre {
+    colecao: i32
+    item: i32
+    pos_for: u32
+}
+
+struct Mutacao {
+    colecao: i32
+    nome: i32
+    pos: u32
+    solta: bool
+}
+
+struct Achado {
+    ponteiro: ?str
+    colecao: ?str
+    mutacao: ?str
+    linha_x: u32
+    linha_y: u32
+}
+
+struct Correcao {
+    let_pos: u32
+    linha_fim: u32
+    novo: ?str
+}
+
+struct Emp {
+    s: ?^Semantica
+    proc_c: ?^frontend.Decl
+    emp: [dynamic]Emprestimo
+    itera: [dynamic]Percorre
+    muts: [dynamic]Mutacao
+    imutavel: ?[]u8
+    comando: ?^frontend.Expr
+    serie: u32
+    prescan: bool
+    parar: bool
+    erro: bool
+}
+
+struct Ramo {
+    estado: [dynamic]Emprestimo
+    sai: bool
+}
+
+const INDICE_MAX: i32 = 24
+
+// C: semantic/sem_emprestimo.c:53
+proc eh_local_ou_param(e: ?^frontend.Expr) -> bool {
+    return ((e as ^frontend.Expr).tipo_no == (frontend.EX_NOME as u8)) and (((e as ^frontend.Expr).ref == (frontend.REF_LOCAL as u8)) or ((e as ^frontend.Expr).ref == (frontend.REF_PARAM as u8)))
+}
+
+// C: semantic/sem_emprestimo.c:59
+proc colecao_de(m: ^Emp, e: ?^frontend.Expr) -> i32 {
+    var e_v: ?^frontend.Expr = e
+    if e_v == none {
+        return -1
+    }
+    if ((e_v as ^frontend.Expr).tipo_no == (frontend.EX_UNARIO as u8)) and ((e_v as ^frontend.Expr).op == (frontend.OP_ENDERECO as u8)) {
+        e_v = (e_v as ^frontend.Expr).a
+    }
+    if not eh_local_ou_param(e_v) {
+        return -1
+    }
+    var t: u32 = (e_v as ^frontend.Expr).tipo
+    if common.c2f_s2u_32(tipo_classe_de(&(m.s as ^Semantica).tipos, t)) == (TC_PONTEIRO as u32) {
+        t = tipo_de(&(m.s as ^Semantica).tipos, t).a
+    }
+    let c: i32 = tipo_classe_de(&(m.s as ^Semantica).tipos, t)
+    var tern_1: i32 = -1
+    if (common.c2f_s2u_32(c) == (TC_DINAMICO as u32)) or (common.c2f_s2u_32(c) == (TC_MAPA as u32)) {
+        tern_1 = (e_v as ^frontend.Expr).ref_id
+    }
+    return tern_1
+}
+
+// C: semantic/sem_emprestimo.c:71
+proc raiz_do_indice(m: ^Emp, x: ?^frontend.Expr) -> i32 {
+    var x_v: ?^frontend.Expr = x
+    while (x_v != none) and (((x_v as ^frontend.Expr).tipo_no == (frontend.EX_CAMPO as u8)) or ((x_v as ^frontend.Expr).tipo_no == (frontend.EX_INDICE as u8))) {
+        var tern_1: i32 = -1
+        if (x_v as ^frontend.Expr).tipo_no == (frontend.EX_INDICE as u8) {
+            tern_1 = colecao_de(m, (x_v as ^frontend.Expr).a)
+        }
+        let c: i32 = tern_1
+        if c >= 0 {
+            return c
+        }
+        if ((x_v as ^frontend.Expr).tipo_no == (frontend.EX_CAMPO as u8)) and (common.c2f_s2u_32(tipo_classe_de(&(m.s as ^Semantica).tipos, ((x_v as ^frontend.Expr).a as ^frontend.Expr).tipo)) == (TC_PONTEIRO as u32)) {
+            return -1
+        }
+        x_v = (x_v as ^frontend.Expr).a
+    }
+    return -1
+}
+
+// C: semantic/sem_emprestimo.c:83
+proc raiz_do_emprestimo(m: ^Emp, e: ?^frontend.Expr) -> i32 {
+    if e == none {
+        return -1
+    }
+    let ex: ^frontend.Expr = e as ^frontend.Expr
+    let t: i32 = ex.tipo_no as i32
+    if t == frontend.EX_UNARIO {
+        if ex.op == (frontend.OP_ENDERECO as u8) {
+            return raiz_do_indice(m, ex.a)
+        }
+        return -1
+    }
+    if t == frontend.EX_FATIA {
+        return colecao_de(m, ex.a)
+    }
+    if t == frontend.EX_CHAMADA {
+        if ((ex.ref == (frontend.REF_EMBUTIDO as u8)) and (ex.ref_id == frontend.EMB_GET_PTR)) and (ex.nargs > 0) {
+            return colecao_de(m, (ex.args or_else {})[0].valor)
+        }
+        return -1
+    }
+    if t == frontend.EX_OR_ELSE {
+        let c: i32 = raiz_do_emprestimo(m, ex.a)
+        if c >= 0 {
+            return c
+        }
+        return raiz_do_emprestimo(m, ex.b)
+    }
+    if t == frontend.EX_EMBRULHA or t == frontend.EX_CONVERSAO or t == frontend.EX_TRY {
+        return raiz_do_emprestimo(m, ex.a)
+    }
+    return -1
+}
+
+// C: semantic/sem_emprestimo.c:101
+proc emprestimo_de(m: ^Emp, var_c: i32) -> ?^Emprestimo {
+    for i in (0 as u64)..<(len(m.emp) as u64) {
+        let e: ^Emprestimo = &m.emp[i]
+        if e.var_c == var_c {
+            return e
+        }
+    }
+    return none
+}
+
+// C: semantic/sem_emprestimo.c:110
+proc abrir_emprestimo(m: ^Emp, var_c: i32, colecao: i32, decl: ?^frontend.Stmt, pos: u32) {
+    append(&m.emp, item = Emprestimo{})
+    let e: ^Emprestimo = &m.emp[len(m.emp) - 1]
+    e.var_c = var_c
+    e.colecao = colecao
+    e.decl = decl
+    e.pos_decl = pos
+}
+
+// C: semantic/sem_emprestimo.c:121
+proc nome_do_local(m: ^Emp, id: i32) -> str {
+    if (((m.proc_c as ^frontend.Decl).nomes_locais == none) or (id < 0)) or (common.c2f_s2u_32(id) >= (m.proc_c as ^frontend.Decl).nlocais) {
+        return "?"
+    }
+    return sem_nome_texto(m.s as ^Semantica, ((m.proc_c as ^frontend.Decl).nomes_locais or_else {})[id].nome)
+}
+
+// C: semantic/sem_emprestimo.c:127
+proc linha_de(m: ^Emp, pos: u32) -> u32 {
+    return common.fonte_localizar_no_arquivo((m.s as ^Semantica).fonte, pos).linha
+}
+
+// C: semantic/sem_emprestimo.c:132
+proc guardar_2(m: ^Emp) {
+    m.erro = true
+    if not sem_guardar_erro(m.s as ^Semantica, (m.proc_c as ^frontend.Decl).modulo) {
+        m.parar = true
+    }
+}
+
+// C: semantic/sem_emprestimo.c:138
+proc escrever_erro(m: ^Emp, pos: u32, a: ^Achado) {
+    let txt_1 = a.ponteiro or_else "(null)"
+    let txt_2 = a.colecao or_else "(null)"
+    let txt_3 = a.mutacao or_else "(null)"
+    let txt_4 = a.colecao or_else "(null)"
+    let txt_5 = a.colecao or_else "(null)"
+    let txt_6 = a.mutacao or_else "(null)"
+    let msg_1 = format(f"'{txt_1}' aponta para dentro de '{txt_2}' (linha {a.linha_x}) e o {txt_3} da linha {a.linha_y} pode mover o buffer: guarde o indice e leia {txt_4}[i] depois, ou pegue &{txt_5}[i] de novo depois do {txt_6}", alloc = heap)
+    defer delete(msg_1)
+    _ = sem_erro(m.s as ^Semantica, common.E0913, pos, msg_1)
+}
+
+// C: semantic/sem_emprestimo.c:146
+// C2F-33: `char *saida` (INDICE_MAX = 24) = []u8 do chamador
+proc texto_do_indice(m: ^Emp, init: ?^frontend.Expr, saida: []u8) -> bool {
+    if (init == none) or ((init as ^frontend.Expr).tipo_no != (frontend.EX_UNARIO as u8)) or ((init as ^frontend.Expr).op != (frontend.OP_ENDERECO as u8)) {
+        return false
+    }
+    let x: ^frontend.Expr = (init as ^frontend.Expr).a as ^frontend.Expr
+    if (x.tipo_no != (frontend.EX_INDICE as u8)) or (x.nargs != 0) or (not eh_local_ou_param(x.a)) {
+        return false
+    }
+    let b: ^frontend.Expr = x.b as ^frontend.Expr
+    if b.tipo_no == (frontend.EX_NOME as u8) {
+        let imutavel: bool = eh_local_ou_param(b) and (b.ref_id >= 0) and (common.c2f_s2u_32(b.ref_id) < (m.proc_c as ^frontend.Decl).nlocais) and ((m.imutavel or_else {})[b.ref_id] != 0)
+        return imutavel and (common.c2f_snprintf(saida[0..<INDICE_MAX], sem_nome_texto(m.s as ^Semantica, b.nome)) < INDICE_MAX)
+    }
+    if b.tipo_no != (frontend.EX_INT as u8) {
+        return false
+    }
+    let t: []u8 = ((m.s as ^Semantica).fonte as ^common.Fonte).texto
+    var n: u32 = 0
+    while (eh_alnum_ascii(t[b.pos + n]) or (t[b.pos + n] == 95)) and (n < ((INDICE_MAX as u32) - 1)) { // '_'
+        n += 1
+    }
+    if (n == 0) or eh_alnum_ascii(t[b.pos + n]) {
+        return false
+    }
+    for k in (0 as u32)..<n {
+        saida[k] = t[b.pos + k]
+    }
+    saida[n] = 0
+    return true
+}
+
+// C: semantic/sem_emprestimo.c:167
+proc calcular_correcao(m: ^Emp, e: ?^Emprestimo, c: ^Correcao) -> bool {
+    let t: []u8 = ((m.s as ^Semantica).fonte as ^common.Fonte).texto
+    var indice: [24]u8 = {} // C: char indice[INDICE_MAX]
+    let emp: ^Emprestimo = e as ^Emprestimo
+    if emp.decl == none {
+        return false
+    }
+    let decl: ^frontend.Stmt = emp.decl as ^frontend.Stmt
+    if (decl.tipo_no != (frontend.ST_LET as u8)) or (not emp.mut_solta) or (t[decl.pos] != 108) or (t[decl.pos + 1] != 101) or (t[decl.pos + 2] != 116) { // strncmp(.., "let", 3)
+        return false
+    }
+    let mutacao: str = sem_nome_texto(m.s as ^Semantica, emp.nome_mut)
+    // P93k: a correcao PROVAVEL so vale para append/insert (o elemento do indice segue existindo); clear/remove/delete/resize ficam em dica
+    if (mutacao != "append") and (mutacao != "insert") {
+        return false
+    }
+    if not texto_do_indice(m, decl.expr, indice[..]) {
+        return false
+    }
+    var ini: u32 = emp.pos_mut
+    var fim: u32 = emp.pos_mut
+    while (ini > 0) and ((t[ini - 1] == 32) or (t[ini - 1] == 9)) { // ' ' '\t'
+        ini -= 1
+    }
+    if (ini > 0) and (t[ini - 1] != 10) { // '\n'
+        return false
+    }
+    while (t[fim] != 0) and (t[fim] != 10) and (t[fim] != 13) { // '\n' '\r'
+        fim += 1
+    }
+    var eol: str = "\n"
+    if t[fim] == 13 { // '\r'
+        eol = "\r\n"
+    }
+    let recuo: str = from_bytes(t[ini..<emp.pos_mut], alloc = heap)
+    defer delete(recuo)
+    let texto_indice: str = from_bytes(indice[0..<common.c2f_strlen_b(indice[..])], alloc = heap)
+    defer delete(texto_indice)
+    let novo = format(f"{eol}{recuo}{nome_do_local(m, emp.var_c)} = &{nome_do_local(m, emp.colecao)}[{texto_indice}]", alloc = heap)
+    defer delete(novo)
+    if len(novo) >= (common.DIAG_NOVO_MAX as int) { // n >= sizeof c->novo
+        return false
+    }
+    c.novo = format(f"{novo}", alloc = frame) // Correcao nao tem dono que o libere: frame (o diag_editar copia)
+    c.let_pos = decl.pos
+    c.linha_fim = fim
+    return true
+}
+
+// C: semantic/sem_emprestimo.c:188
+proc sugerir_reemprestimo(m: ^Emp, e: ?^Emprestimo, a: ^Achado) {
+    let sug: ^common.DiagSugestoes = &((m.s as ^Semantica).diag as ^common.Diag).sug
+    var c: Correcao = Correcao{}
+    if not calcular_correcao(m, e, &c) {
+        let txt_1 = a.colecao or_else "(null)"
+        let txt_2 = a.mutacao or_else "(null)"
+        let msg_1 = format(f"guarde o indice e leia {txt_1}[i] depois do {txt_2}, ou pegue o endereco de novo depois dele", alloc = heap)
+        defer delete(msg_1)
+        _ = common.diag_sugerir(sug, common.DIAG_SO_DICA, msg_1)
+        return
+    }
+    let txt_3 = a.ponteiro or_else "(null)"
+    let txt_4 = a.colecao or_else "(null)"
+    let txt_5 = a.mutacao or_else "(null)"
+    let msg_2 = format(f"troque let por var e pegue {txt_3} = &{txt_4}[...] de novo logo depois do {txt_5}", alloc = heap)
+    defer delete(msg_2)
+    _ = common.diag_sugerir(sug, common.DIAG_PROVAVEL, msg_2)
+    if (common.c2f_b2i32(common.diag_editar(sug, c.let_pos, c.let_pos + 3, "var")) != 0) and (common.c2f_b2i32(common.diag_editar(sug, c.linha_fim, c.linha_fim, c.novo)) != 0) {
+        return
+    }
+    sug.itens[(sug.n as i32) - 1].nedicoes = 0
+    sug.itens[(sug.n as i32) - 1].confianca = common.DIAG_SO_DICA as u8
+}
+
+// C: semantic/sem_emprestimo.c:202
+proc relatar_emprestimo(m: ^Emp, e: ?^Emprestimo, pos_uso: u32) {
+    var a: Achado = Achado{ponteiro = nome_do_local(m, (e as ^Emprestimo).var_c), colecao = nome_do_local(m, (e as ^Emprestimo).colecao), mutacao = sem_nome_texto(m.s as ^Semantica, (e as ^Emprestimo).nome_mut), linha_x = linha_de(m, (e as ^Emprestimo).pos_decl), linha_y = linha_de(m, (e as ^Emprestimo).pos_mut)}
+    escrever_erro(m, pos_uso, &a)
+    sugerir_reemprestimo(m, e, &a)
+    guardar_2(m)
+}
+
+// C: semantic/sem_emprestimo.c:213
+proc uso_de_nome(m: ^Emp, e: ?^frontend.Expr) {
+    if (common.c2f_b2i32(m.prescan) != 0) or (not eh_local_ou_param(e)) {
+        return
+    }
+    let emp: ?^Emprestimo = emprestimo_de(m, (e as ^frontend.Expr).ref_id)
+    if (((emp == none) or ((emp as ^Emprestimo).colecao < 0)) or (common.c2f_b2i32((emp as ^Emprestimo).relatado) != 0)) or ((not (emp as ^Emprestimo).invalido) and ((emp as ^Emprestimo).quente_laco == 0)) {
+        return
+    }
+    let ptr_1: ^Emprestimo = emp as ^Emprestimo
+    ptr_1.relatado = true
+    relatar_emprestimo(m, emp, (e as ^frontend.Expr).pos)
+}
+
+// C: semantic/sem_emprestimo.c:223
+proc conferir_percorridos(m: ^Emp, mut: ^Mutacao) {
+    var i: u64 = 0
+    while (i < (len(m.itera) as u64)) and (not m.parar) {
+        let p: ^Percorre = &m.itera[i]
+        if p.colecao != mut.colecao {
+            i += 1
+            continue
+        }
+        var a: Achado = Achado{ponteiro = nome_do_local(m, p.item), colecao = nome_do_local(m, p.colecao), mutacao = sem_nome_texto(m.s as ^Semantica, mut.nome), linha_x = linha_de(m, p.pos_for), linha_y = linha_de(m, mut.pos)}
+        escrever_erro(m, mut.pos, &a)
+        let txt_1 = a.mutacao or_else "(null)"
+        let msg_1 = format(f"junte os novos numa lista auxiliar e faca o {txt_1} depois do for", alloc = heap)
+        defer delete(msg_1)
+        _ = common.diag_sugerir(&((m.s as ^Semantica).diag as ^common.Diag).sug, common.DIAG_SO_DICA, msg_1)
+        guardar_2(m)
+        i += 1
+    }
+}
+
+// C: semantic/sem_emprestimo.c:236
+proc mutar(m: ^Emp, e: ?^frontend.Expr) {
+    let ex: ^frontend.Expr = e as ^frontend.Expr
+    var colecao: i32 = -1
+    if ex.nargs > 0 {
+        colecao = colecao_de(m, (ex.args or_else {})[0].valor)
+    }
+    if colecao < 0 {
+        return
+    }
+    var mut: Mutacao = Mutacao{colecao = colecao, nome = ex.nome, pos = ex.pos, solta = e == m.comando}
+    if m.prescan {
+        append(&m.muts, item = mut)
+        return
+    }
+    conferir_percorridos(m, &mut)
+    var i: u64 = 0
+    while i < (len(m.emp) as u64) {
+        let emp: ^Emprestimo = &m.emp[i]
+        if (emp.colecao != colecao) or emp.invalido {
+            i += 1
+            continue
+        }
+        emp.invalido = true
+        emp.pos_mut = mut.pos
+        emp.nome_mut = mut.nome
+        emp.mut_solta = mut.solta
+        i += 1
+    }
+}
+
+// C: semantic/sem_emprestimo.c:256
+proc visitar_expr(m: ^Emp, e: ?^frontend.Expr) {
+    if (e == none) or (common.c2f_b2i32(m.parar) != 0) {
+        return
+    }
+    visitar_expr(m, (e as ^frontend.Expr).a)
+    visitar_expr(m, (e as ^frontend.Expr).b)
+    for i in (0 as u32)..<(e as ^frontend.Expr).nargs {
+        visitar_expr(m, ((e as ^frontend.Expr).args or_else {})[i].valor)
+    }
+    if (e as ^frontend.Expr).tipo_no == (frontend.EX_NOME as u8) {
+        uso_de_nome(m, e)
+    } else if (((e as ^frontend.Expr).tipo_no == (frontend.EX_CHAMADA as u8)) and ((e as ^frontend.Expr).ref == (frontend.REF_EMBUTIDO as u8))) and (common.c2f_b2i32(sem_embutido_muta_colecao((e as ^frontend.Expr).ref_id)) != 0) {
+        mutar(m, e)
+    }
+}
+
+// C: semantic/sem_emprestimo.c:268
+proc mutacao_da(m: ^Emp, desde: u64, colecao: i32) -> ?^Mutacao {
+    for k in desde..<(len(m.muts) as u64) {
+        let mut: ^Mutacao = &m.muts[k]
+        if mut.colecao == colecao {
+            return mut
+        }
+    }
+    return none
+}
+
+// C: semantic/sem_emprestimo.c:278
+proc marcar_quentes(m: ^Emp, cond: ?^frontend.Expr, corpo: ?^frontend.Stmt) -> u32 {
+    let desde: u64 = len(m.muts) as u64
+    m.prescan = true
+    visitar_expr(m, cond)
+    visitar_bloco(m, corpo)
+    m.prescan = false
+    m.serie += 1
+    let serie: u32 = m.serie
+    var i: u64 = 0
+    while i < (len(m.emp) as u64) {
+        let emp: ^Emprestimo = &m.emp[i]
+        var mut: ?^Mutacao = none
+        if (emp.colecao >= 0) and (emp.quente_laco == 0) {
+            mut = mutacao_da(m, desde, emp.colecao)
+        }
+        if mut == none {
+            i += 1
+            continue
+        }
+        emp.quente_laco = serie
+        if emp.invalido {
+            i += 1
+            continue
+        }
+        emp.pos_mut = (mut as ^Mutacao).pos
+        emp.nome_mut = (mut as ^Mutacao).nome
+        emp.mut_solta = (mut as ^Mutacao).solta
+        i += 1
+    }
+    truncate(&m.muts, desde as int) // C: m->muts.n = desde
+    return serie
+}
+
+// C: semantic/sem_emprestimo.c:300
+proc laco(m: ^Emp, cond: ?^frontend.Expr, corpo: ?^frontend.Stmt) {
+    var tern_1: u32 = 0
+    if common.c2f_b2i32(m.prescan) != 0 {
+        tern_1 = 0
+    } else {
+        tern_1 = marcar_quentes(m, cond, corpo)
+    }
+    let serie: u32 = tern_1
+    visitar_expr(m, cond)
+    visitar_bloco(m, corpo)
+    if serie == 0 {
+        return
+    }
+    var i: u64 = 0
+    while i < (len(m.emp) as u64) {
+        let emp: ^Emprestimo = &m.emp[i]
+        if emp.quente_laco == serie {
+            emp.quente_laco = 0
+        }
+        i += 1
+    }
+}
+
+// C: semantic/sem_emprestimo.c:312
+proc marcar_imutavel(m: ^Emp, id: i32) {
+    if (id >= 0) and (common.c2f_s2u_32(id) < (m.proc_c as ^frontend.Decl).nlocais) {
+        let p_1 = m.imutavel or_else {}
+        p_1[id] = 1
+    }
+}
+
+// C: semantic/sem_emprestimo.c:317
+proc para(m: ^Emp, st: ?^frontend.Stmt) {
+    let cmd: ^frontend.Stmt = st as ^frontend.Stmt
+    visitar_expr(m, cmd.expr)
+    visitar_expr(m, cmd.expr2)
+    var colecao: i32 = -1
+    if not m.prescan {
+        marcar_imutavel(m, cmd.local_id)
+        marcar_imutavel(m, cmd.local_indice)
+        if (cmd.expr2 == none) and cmd.item_ref {
+            colecao = colecao_de(m, cmd.expr)
+        }
+    }
+    if colecao >= 0 {
+        append(&m.itera, item = Percorre{colecao = colecao, item = cmd.local_id, pos_for = cmd.pos})
+    }
+    laco(m, none, cmd.corpo)
+    if colecao >= 0 {
+        truncate(&m.itera, len(m.itera) - 1) // C: m->itera.n--
+    }
+}
+
+// C: semantic/sem_emprestimo.c:334
+proc declarar_local_2(m: ^Emp, st: ?^frontend.Stmt) {
+    visitar_expr(m, (st as ^frontend.Stmt).expr)
+    if ((common.c2f_b2i32(m.prescan) != 0) or ((st as ^frontend.Stmt).local_id < 0)) or (common.c2f_s2u_32((st as ^frontend.Stmt).local_id) >= (m.proc_c as ^frontend.Decl).nlocais) {
+        return
+    }
+    let ptr_1: ^frontend.Stmt = st as ^frontend.Stmt
+    let p_1 = m.imutavel or_else {}
+    p_1[ptr_1.local_id] = common.c2f_b2i32((st as ^frontend.Stmt).tipo_no == (frontend.ST_LET as u8)) as u8
+    let colecao: i32 = raiz_do_emprestimo(m, (st as ^frontend.Stmt).expr)
+    if colecao >= 0 {
+        abrir_emprestimo(m, (st as ^frontend.Stmt).local_id, colecao, st, (st as ^frontend.Stmt).pos)
+    }
+}
+
+// C: semantic/sem_emprestimo.c:344
+proc revalidar(m: ^Emp, st: ?^frontend.Stmt) {
+    let cmd: ^frontend.Stmt = st as ^frontend.Stmt
+    let colecao: i32 = raiz_do_emprestimo(m, cmd.expr)
+    let alvo: ^frontend.Expr = cmd.alvo as ^frontend.Expr
+    let emp: ?^Emprestimo = emprestimo_de(m, alvo.ref_id)
+    if emp == none {
+        if colecao >= 0 {
+            abrir_emprestimo(m, alvo.ref_id, colecao, none, cmd.pos)
+        }
+        return
+    }
+    let e: ^Emprestimo = emp as ^Emprestimo
+    e.colecao = colecao
+    e.decl = none
+    e.pos_decl = cmd.pos
+    e.invalido = false
+    e.relatado = false
+    e.quente_laco = 0
+}
+
+// C: semantic/sem_emprestimo.c:359
+proc atribuir(m: ^Emp, st: ?^frontend.Stmt) {
+    if ((st as ^frontend.Stmt).op == 0) and (common.c2f_b2i32(eh_local_ou_param((st as ^frontend.Stmt).alvo)) != 0) {
+        visitar_expr(m, (st as ^frontend.Stmt).expr)
+        if not m.prescan {
+            revalidar(m, st)
+        }
+        return
+    }
+    visitar_expr(m, (st as ^frontend.Stmt).alvo)
+    visitar_expr(m, (st as ^frontend.Stmt).expr)
+}
+
+// C: semantic/sem_emprestimo.c:374
+proc salvar_estado(m: ^Emp, destino: ^[dynamic]Emprestimo) {
+    destino^ = make([dynamic]Emprestimo, alloc = heap)
+    var i: u64 = 0
+    while i < (len(m.emp) as u64) {
+        append(destino, item = Emprestimo{})
+        destino[len(destino^) - 1] = m.emp[i]
+        i += 1
+    }
+}
+
+// C: semantic/sem_emprestimo.c:380
+proc restaurar_estado(m: ^Emp, origem: ^[dynamic]Emprestimo) {
+    clear(&m.emp) // C: m->emp.n = 0
+    var i: u64 = 0
+    while i < (len(origem^) as u64) {
+        append(&m.emp, item = Emprestimo{})
+        m.emp[len(m.emp) - 1] = origem[i]
+        i += 1
+    }
+}
+
+// C: semantic/sem_emprestimo.c:387
+proc bloco_sai(st: ?^frontend.Stmt) -> bool {
+    var st_v: ?^frontend.Stmt = st
+    while st_v != none {
+        if (((st_v as ^frontend.Stmt).tipo_no == (frontend.ST_RETURN as u8)) or ((st_v as ^frontend.Stmt).tipo_no == (frontend.ST_BREAK as u8))) or ((st_v as ^frontend.Stmt).tipo_no == (frontend.ST_CONTINUE as u8)) {
+            return true
+        }
+        if ((((st_v as ^frontend.Stmt).tipo_no == (frontend.ST_IF as u8)) and ((st_v as ^frontend.Stmt).senao != none)) and (common.c2f_b2i32(bloco_sai((st_v as ^frontend.Stmt).corpo)) != 0)) and (common.c2f_b2i32(bloco_sai((st_v as ^frontend.Stmt).senao)) != 0) {
+            return true
+        }
+        st_v = (st_v as ^frontend.Stmt).prox
+    }
+    return false
+}
+
+// C: semantic/sem_emprestimo.c:396
+// S6: corpo vira ?^Stmt (o C passa NULL = caminho vazio que segue; ramificar tem corpos NULL)
+proc visitar_ramo(m: ^Emp, base: ^[dynamic]Emprestimo, corpo: ?^frontend.Stmt, ramo: ^Ramo) {
+    restaurar_estado(m, base)
+    visitar_bloco(m, corpo)
+    ramo.sai = bloco_sai(corpo)
+    salvar_estado(m, &ramo.estado)
+}
+
+// C: semantic/sem_emprestimo.c:406
+// C2F-13: ramos fundido em n (len)
+proc juntar_ramos(m: ^Emp, base: ^[dynamic]Emprestimo, ramos: []Ramo) {
+    restaurar_estado(m, base)
+    var i: u64 = 0
+    while i < (len(base^) as u64) {
+        var fonte: ?^Emprestimo = none
+        for r in (0 as u64)..<(len(ramos) as u64) {
+            var tern_1: ?^Emprestimo = none
+            if common.c2f_b2i32(ramos[r].sai) != 0 {
+                tern_1 = none
+            } else {
+                tern_1 = &ramos[r].estado[i]
+            }
+            let x: ?^Emprestimo = tern_1
+            if (x != none) and ((fonte == none) or ((common.c2f_b2i32((x as ^Emprestimo).invalido) != 0) and (not (fonte as ^Emprestimo).invalido))) {
+                fonte = x
+            }
+        }
+        if fonte != none {
+            m.emp[i] = (fonte as ^Emprestimo)^
+        }
+        i += 1
+    }
+    for r in (0 as u64)..<(len(ramos) as u64) {
+        if ramos[r].sai {
+            continue
+        }
+        var k: u64 = len(base^) as u64
+        while k < (len(ramos[r].estado) as u64) {
+            let x: ^Emprestimo = &ramos[r].estado[k]
+            if emprestimo_de(m, x.var_c) == none {
+                append(&m.emp, item = Emprestimo{})
+                m.emp[len(m.emp) - 1] = x^
+            }
+            k += 1
+        }
+    }
+}
+
+// C: semantic/sem_emprestimo.c:427
+// C2F-13: corpos fundido em n (len)
+// R-S4: a copia de estado e por elemento (salvar_estado/restaurar_estado); ramos e base sao listas de heap liberadas aqui
+proc ramificar(m: ^Emp, corpos: []?^frontend.Stmt) {
+    let n: u64 = len(corpos) as u64
+    var base: Ramo = Ramo{}
+    var ramos = make([dynamic]Ramo, alloc = heap)
+    for r in (0 as u64)..<n {
+        append(&ramos, item = Ramo{})
+    }
+    salvar_estado(m, &base.estado)
+    var r: u64 = 0
+    while (r < n) and (not m.parar) {
+        visitar_ramo(m, &base.estado, corpos[r], &ramos[r])
+        r += 1
+    }
+    if not m.parar {
+        juntar_ramos(m, &base.estado, ramos[..])
+    }
+    for k in (0 as u64)..<n {
+        if cap(ramos[k].estado) > 0 {
+            delete(ramos[k].estado)
+        }
+    }
+    delete(ramos)
+    delete(base.estado)
+}
+
+// C: semantic/sem_emprestimo.c:441
+proc se(m: ^Emp, st: ?^frontend.Stmt) {
+    let cmd: ^frontend.Stmt = st as ^frontend.Stmt
+    visitar_expr(m, cmd.expr)
+    if m.prescan {
+        visitar_bloco(m, cmd.corpo)
+        visitar_bloco(m, cmd.senao)
+        return
+    }
+    var corpos: [2]?^frontend.Stmt = {cmd.corpo, cmd.senao}
+    ramificar(m, corpos[..])
+}
+
+// C: semantic/sem_emprestimo.c:453
+proc trocar(m: ^Emp, st: ?^frontend.Stmt) {
+    let cmd: ^frontend.Stmt = st as ^frontend.Stmt
+    let casos: []frontend.Caso = cmd.casos or_else {}
+    visitar_expr(m, cmd.expr)
+    if m.prescan {
+        var k: u32 = 0
+        while (k < cmd.ncasos) and (not m.parar) {
+            visitar_bloco(m, casos[k].corpo)
+            k += 1
+        }
+        return
+    }
+    var tem_padrao: bool = false
+    var corpos = make([dynamic]?^frontend.Stmt, alloc = heap)
+    defer delete(corpos)
+    for k in (0 as u32)..<cmd.ncasos {
+        append(&corpos, item = casos[k].corpo)
+        tem_padrao = tem_padrao or casos[k].padrao
+    }
+    let sem_corpo: ?^frontend.Stmt = none
+    append(&corpos, item = sem_corpo) // sem default o switch pode nao entrar em nenhum case: o estado de antes tambem segue
+    var qtd: u64 = (cmd.ncasos as u64) + 1
+    if tem_padrao {
+        qtd = cmd.ncasos as u64
+    }
+    ramificar(m, corpos[0..<qtd])
+}
+
+// C: semantic/sem_emprestimo.c:470
+proc let_multiplo(m: ^Emp, st: ?^frontend.Stmt) {
+    visitar_expr(m, (st as ^frontend.Stmt).expr)
+    if m.prescan {
+        return
+    }
+    var k: u32 = 0
+    while k < (st as ^frontend.Stmt).ncasos {
+        if (((st as ^frontend.Stmt).nomes or_else {})[k].local_id >= 0) and (common.c2f_s2u_32(((st as ^frontend.Stmt).nomes or_else {})[k].local_id) < (m.proc_c as ^frontend.Decl).nlocais) {
+            let ptr_1: ^frontend.Stmt = st as ^frontend.Stmt
+            let p_1 = m.imutavel or_else {}
+            p_1[(ptr_1.nomes or_else {})[k].local_id] = common.c2f_b2i32((st as ^frontend.Stmt).op == 0) as u8
+        }
+        k += 1
+    }
+}
+
+// C: semantic/sem_emprestimo.c:479
+proc visitar_comando(m: ^Emp, st: ?^frontend.Stmt) {
+    let sw_1 = (st as ^frontend.Stmt).tipo_no as i32
+    if sw_1 == frontend.ST_LET or sw_1 == frontend.ST_VAR {
+        declarar_local_2(m, st)
+    } else if sw_1 == frontend.ST_ATRIBUICAO {
+        atribuir(m, st)
+    } else if sw_1 == frontend.ST_IF {
+        se(m, st)
+    } else if sw_1 == frontend.ST_WHILE {
+        laco(m, (st as ^frontend.Stmt).expr, (st as ^frontend.Stmt).corpo)
+    } else if sw_1 == frontend.ST_FOR {
+        para(m, st)
+    } else if sw_1 == frontend.ST_CHAMADA {
+        m.comando = (st as ^frontend.Stmt).expr
+        visitar_expr(m, (st as ^frontend.Stmt).expr)
+    } else if sw_1 == frontend.ST_SWITCH {
+        trocar(m, st)
+    } else if sw_1 == frontend.ST_LET_MULTIPLO {
+        let_multiplo(m, st)
+    } else if sw_1 == frontend.ST_RETURN or sw_1 == frontend.ST_EXPECT {
+        visitar_expr(m, (st as ^frontend.Stmt).expr)
+        visitar_expr(m, (st as ^frontend.Stmt).expr2)
+    } else {
+    }
+}
+
+// C: semantic/sem_emprestimo.c:503
+proc visitar_bloco(m: ^Emp, st: ?^frontend.Stmt) {
+    var st_v: ?^frontend.Stmt = st
+    while (st_v != none) and (not m.parar) {
+        visitar_comando(m, st_v)
+        st_v = (st_v as ^frontend.Stmt).prox
+    }
+}
+
+// C: semantic/sem_emprestimo.c:509
+proc sem_emprestimo_corpo(s: ^Semantica, d: ?^frontend.Decl) -> bool {
+    let decl: ^frontend.Decl = d as ^frontend.Decl
+    var m: Emp = Emp{s = s, proc_c = d}
+    m.emp = make([dynamic]Emprestimo, alloc = heap)
+    m.itera = make([dynamic]Percorre, alloc = heap)
+    m.muts = make([dynamic]Mutacao, alloc = heap)
+    let imutavel: []u8 = common.arena_fatia_u8(s.arena as ^common.Arena, (decl.nlocais as int) + 1)
+    m.imutavel = imutavel
+    var i: u32 = 0
+    while (i < decl.nparams) and (i < decl.nlocais) {
+        imutavel[i] = 1
+        i += 1
+    }
+    visitar_bloco(&m, decl.corpo)
+    delete(m.emp)
+    delete(m.itera)
+    delete(m.muts)
+    return not m.erro
+}
+
+// ---------------------------------------------------------------- G3 S6: testes de E0913 (AST a mao; valor esperado = saida real do forja.exe em ps6_t\e1..e3, b1..b7)
+
+// a -> b (a.prox = b); devolve a
+proc s6_liga(a: ^frontend.Stmt, b: ^frontend.Stmt) -> ^frontend.Stmt {
+    a.prox = b
+    return a
+}
+
+// comando de chamada solta (statement ST_CHAMADA)
+proc s6_ch(s: ^Semantica, pos: u32, e: ^frontend.Expr) -> ^frontend.Stmt {
+    let st = s6_st(s, frontend.ST_CHAMADA, pos)
+    st.expr = e
+    return st
+}
+
+// embutido que muta a colecao `l` (local 0, [dynamic]int): append(&l, item = 2), clear(&l)...
+proc s6_mut(c: ^S6Cen, emb: i32, nome: str, pos: u32) -> ^frontend.Expr {
+    let s: ^Semantica = &c.s
+    let t_l: u32 = tipo_dinamico(&s.tipos, TIPO_INT as u32)
+    let t_pl: u32 = tipo_ponteiro(&s.tipos, t_l)
+    let a0 = s6_ex_unario(s, frontend.OP_ENDERECO, s6_ex_nome(s, s6_nome(c, "l"), 0, t_l, pos + 7), t_pl, pos + 7)
+    return s6_ex_embutido2(s, emb, s6_nome(c, nome), pos, a0, s6_ex_int(s, pos + 17))
+}
+
+// &l[<indice>]: `&` em pos, o indice (um inteiro literal em pos_idx, ou o local `id_idx` quando id_idx >= 0)
+proc s6_end_l(c: ^S6Cen, pos: u32, pos_idx: u32, id_idx: i32) -> ^frontend.Expr {
+    let s: ^Semantica = &c.s
+    let t_l: u32 = tipo_dinamico(&s.tipos, TIPO_INT as u32)
+    let t_p: u32 = tipo_ponteiro(&s.tipos, TIPO_INT as u32)
+    var idx: ^frontend.Expr = s6_ex_int(s, pos_idx)
+    if id_idx >= 0 {
+        idx = s6_ex_nome(s, s6_nome(c, "i"), id_idx, TIPO_INT as u32, pos_idx)
+    }
+    let ind = s6_ex_indice(s, s6_ex_nome(s, s6_nome(c, "l"), 0, t_l, pos + 1), idx, TIPO_INT as u32, pos + 2)
+    return s6_ex_unario(s, frontend.OP_ENDERECO, ind, t_p, pos)
+}
+
+// `let p = &l[0]` / `var p = &l[0]` (local 1; `&` 8 colunas depois do inicio do comando)
+proc s6_decl_p(c: ^S6Cen, tipo_no: i32, pos: u32) -> ^frontend.Stmt {
+    let t_p: u32 = tipo_ponteiro(&c.s.tipos, TIPO_INT as u32)
+    return s6_st_local(&c.s, tipo_no, pos, s6_nome(c, "p"), 1, t_p, s6_end_l(c, pos + 8, pos + 11, -1))
+}
+
+// `p = &l[0]` (atribuicao simples ao local 1)
+proc s6_atrib_p(c: ^S6Cen, pos: u32) -> ^frontend.Stmt {
+    let s: ^Semantica = &c.s
+    let t_p: u32 = tipo_ponteiro(&s.tipos, TIPO_INT as u32)
+    let st = s6_st(s, frontend.ST_ATRIBUICAO, pos)
+    st.alvo = s6_ex_nome(s, s6_nome(c, "p"), 1, t_p, pos)
+    st.expr = s6_end_l(c, pos + 4, pos + 7, -1)
+    return st
+}
+
+// print(<nome>^) lendo o local `id` em pos_uso
+proc s6_uso(c: ^S6Cen, nome: str, id: i32, pos_uso: u32) -> ^frontend.Stmt {
+    let s: ^Semantica = &c.s
+    let t_p: u32 = tipo_ponteiro(&s.tipos, TIPO_INT as u32)
+    return s6_ch(s, pos_uso - 6, s6_ex_unario(s, frontend.OP_DEREF, s6_ex_nome(s, s6_nome(c, nome), id, t_p, pos_uso), TIPO_INT as u32, pos_uso + 1))
+}
+
+// comando solto de pouco efeito (print(1)): ST_CHAMADA de um inteiro
+proc s6_nada(s: ^Semantica, pos: u32) -> ^frontend.Stmt {
+    return s6_ch(s, pos, s6_ex_int(s, pos))
+}
+
+// prologo comum de e1..b7: `var l = make(...)` (local 0, pos 18) e `append(&l, item = 1)` (pos 83); `resto` segue depois
+proc s6_prologo(c: ^S6Cen, resto: ^frontend.Stmt) -> ^frontend.Stmt {
+    let s: ^Semantica = &c.s
+    let t_l: u32 = tipo_dinamico(&s.tipos, TIPO_INT as u32)
+    let s1 = s6_st_local(s, frontend.ST_VAR, 18, s6_nome(c, "l"), 0, t_l, s6_ex_int(s, 26))
+    return s6_liga(s1, s6_liga(s6_ch(s, 83, s6_mut(c, frontend.EMB_APPEND, "append", 83)), resto))
+}
+
+// 3 casos (a, b e o default `d`) de um switch
+proc s6_casos(s: ^Semantica, a: ?^frontend.Stmt, b: ?^frontend.Stmt, d: ?^frontend.Stmt) -> []frontend.Caso {
+    var l = make([dynamic]frontend.Caso, alloc = common.arena_mem(s.arena as ^common.Arena), cap = 3)
+    append(&l, item = frontend.Caso{corpo = a})
+    append(&l, item = frontend.Caso{corpo = b})
+    append(&l, item = frontend.Caso{corpo = d, padrao = true})
+    return l[..]
+}
+
+// o unico E0913 guardado na lista do cenario
+proc s6_unico_e0913(c: ^S6Cen) -> ^common.Diag {
+    return &c.s.lista.itens[0]
+}
+
+// e1: `let p = &l[0]` + append solto + uso de p: correcao PROVAVEL (let -> var + `p = &l[0]` depois do append)
+test "sem_emprestimo: E0913 let p = &l[0], append, uso de p (correcao PROVAVEL)" {
+    let c = s6_cen_novo("proc main() {\n    var l = make([dynamic]int, alloc = heap)\n    defer delete(l)\n    append(&l, item = 1)\n    let p = &l[0]\n    append(&l, item = 2)\n    print(p^)\n}\n")
+    defer s6_cen_liberar(c)
+    let s: ^Semantica = &c.s
+    let corpo = s6_prologo(c, s6_liga(s6_decl_p(c, frontend.ST_LET, 108), s6_liga(s6_ch(s, 126, s6_mut(c, frontend.EMB_APPEND, "append", 126)), s6_uso(c, "p", 1, 157))))
+    var nl: [2]i32 = {s6_nome(c, "l"), s6_nome(c, "p")}
+    let d = s6_decl_proc(s, s6_nome(c, "main"), nl[..], 0, corpo)
+    expect(not sem_emprestimo_corpo(s, d))
+    expect(s.lista.n == 1)
+    let e = s6_unico_e0913(c)
+    expect(e.codigo == common.E0913 and e.off == 157)
+    expect((e.causa or_else "") == "'p' aponta para dentro de 'l' (linha 5) e o append da linha 6 pode mover o buffer: guarde o indice e leia l[i] depois, ou pegue &l[i] de novo depois do append")
+    expect(e.sug.n == 1 and e.sug.itens[0].confianca == (common.DIAG_PROVAVEL as u8) and e.sug.itens[0].nedicoes == 2)
+    expect((e.sug.itens[0].descricao or_else "") == "troque let por var e pegue p = &l[...] de novo logo depois do append")
+    expect(e.sug.itens[0].edicoes[0].ini == 108 and e.sug.itens[0].edicoes[0].fim == 111 and (e.sug.itens[0].edicoes[0].novo or_else "") == "var")
+    expect(e.sug.itens[0].edicoes[1].ini == 146 and e.sug.itens[0].edicoes[1].fim == 146 and (e.sug.itens[0].edicoes[1].novo or_else "") == "\n    p = &l[0]")
+}
+
+// e2: regra 3 (colecao mutada dentro de `for &x in l`): erro na mutacao, so dica
+test "sem_emprestimo: E0913 append dentro de for &x in l (regra 3, so dica)" {
+    let c = s6_cen_novo("proc main() {\n    var l = make([dynamic]int, alloc = heap)\n    defer delete(l)\n    append(&l, item = 1)\n    for &x in l {\n        append(&l, item = 2)\n        print(x^)\n    }\n}\n")
+    defer s6_cen_liberar(c)
+    let s: ^Semantica = &c.s
+    let t_l: u32 = tipo_dinamico(&s.tipos, TIPO_INT as u32)
+    let para = s6_st(s, frontend.ST_FOR, 108)
+    para.expr = s6_ex_nome(s, s6_nome(c, "l"), 0, t_l, 118)
+    para.item_ref = true
+    para.local_id = 1
+    para.local_indice = -1
+    para.corpo = s6_liga(s6_ch(s, 130, s6_mut(c, frontend.EMB_APPEND, "append", 130)), s6_uso(c, "x", 1, 165))
+    let corpo = s6_prologo(c, para)
+    var nl: [2]i32 = {s6_nome(c, "l"), s6_nome(c, "x")}
+    let d = s6_decl_proc(s, s6_nome(c, "main"), nl[..], 0, corpo)
+    expect(not sem_emprestimo_corpo(s, d))
+    expect(s.lista.n == 1)
+    let e = s6_unico_e0913(c)
+    expect(e.codigo == common.E0913 and e.off == 130)
+    expect((e.causa or_else "") == "'x' aponta para dentro de 'l' (linha 5) e o append da linha 6 pode mover o buffer: guarde o indice e leia l[i] depois, ou pegue &l[i] de novo depois do append")
+    expect(e.sug.n == 1 and e.sug.itens[0].confianca == (common.DIAG_SO_DICA as u8) and e.sug.itens[0].nedicoes == 0)
+    expect((e.sug.itens[0].descricao or_else "") == "junte os novos numa lista auxiliar e faca o append depois do for")
+}
+
+// e3: laco quente (prescan): p lido antes do append, no mesmo laco; decl e `var` => so dica
+test "sem_emprestimo: E0913 laco quente (while com append depois do uso de p)" {
+    let c = s6_cen_novo("proc main() {\n    var l = make([dynamic]int, alloc = heap)\n    defer delete(l)\n    append(&l, item = 1)\n    let i = 0\n    var p = &l[i]\n    var n = 0\n    while n < 3 {\n        print(p^)\n        append(&l, item = 2)\n        n += 1\n    }\n}\n")
+    defer s6_cen_liberar(c)
+    let s: ^Semantica = &c.s
+    let t_p: u32 = tipo_ponteiro(&s.tipos, TIPO_INT as u32)
+    let st_i = s6_st_local(s, frontend.ST_LET, 108, s6_nome(c, "i"), 1, TIPO_INT as u32, s6_ex_int(s, 116))
+    let st_p = s6_st_local(s, frontend.ST_VAR, 122, s6_nome(c, "p"), 2, t_p, s6_end_l(c, 130, 133, 1))
+    let st_n = s6_st_local(s, frontend.ST_VAR, 140, s6_nome(c, "n"), 3, TIPO_INT as u32, s6_ex_int(s, 148))
+    let laco = s6_st(s, frontend.ST_WHILE, 154)
+    laco.expr = s6_ex_nome(s, s6_nome(c, "n"), 3, TIPO_INT as u32, 160)
+    laco.corpo = s6_liga(s6_uso(c, "p", 2, 182), s6_ch(s, 194, s6_mut(c, frontend.EMB_APPEND, "append", 194)))
+    let corpo = s6_prologo(c, s6_liga(st_i, s6_liga(st_p, s6_liga(st_n, laco))))
+    var nl: [4]i32 = {s6_nome(c, "l"), s6_nome(c, "i"), s6_nome(c, "p"), s6_nome(c, "n")}
+    let d = s6_decl_proc(s, s6_nome(c, "main"), nl[..], 0, corpo)
+    expect(not sem_emprestimo_corpo(s, d))
+    expect(s.lista.n == 1)
+    let e = s6_unico_e0913(c)
+    expect(e.codigo == common.E0913 and e.off == 182)
+    expect((e.causa or_else "") == "'p' aponta para dentro de 'l' (linha 6) e o append da linha 10 pode mover o buffer: guarde o indice e leia l[i] depois, ou pegue &l[i] de novo depois do append")
+    expect(e.sug.n == 1 and e.sug.itens[0].confianca == (common.DIAG_SO_DICA as u8) and e.sug.itens[0].nedicoes == 0)
+    expect((e.sug.itens[0].descricao or_else "") == "guarde o indice e leia l[i] depois do append, ou pegue o endereco de novo depois dele")
+}
+
+// b1/b2/b3: if com mutacao so num ramo (erro) x os dois ramos repontando p (limpo) x o ramo que muta sai por return (limpo)
+test "sem_emprestimo: if sem else que muta invalida p depois do if; reatribuir nos dois ramos ou sair por return limpa" {
+    // b1: erro
+    let c = s6_cen_novo("proc main() {\n    var l = make([dynamic]int, alloc = heap)\n    defer delete(l)\n    append(&l, item = 1)\n    var p = &l[0]\n    let c = len(l) > 5\n    if c {\n        append(&l, item = 2)\n    }\n    print(p^)\n}\n")
+    defer s6_cen_liberar(c)
+    let s: ^Semantica = &c.s
+    let st_c = s6_st_local(s, frontend.ST_LET, 126, s6_nome(c, "c"), 2, TIPO_INT as u32, s6_ex_int(s, 134))
+    let se = s6_st(s, frontend.ST_IF, 145)
+    se.expr = s6_ex_nome(s, s6_nome(c, "c"), 2, TIPO_INT as u32, 148)
+    se.corpo = s6_ch(s, 164, s6_mut(c, frontend.EMB_APPEND, "append", 164))
+    let corpo = s6_prologo(c, s6_liga(s6_decl_p(c, frontend.ST_VAR, 108), s6_liga(st_c, s6_liga(se, s6_uso(c, "p", 1, 201)))))
+    var nl: [3]i32 = {s6_nome(c, "l"), s6_nome(c, "p"), s6_nome(c, "c")}
+    let d = s6_decl_proc(s, s6_nome(c, "main"), nl[..], 0, corpo)
+    expect(not sem_emprestimo_corpo(s, d))
+    expect(s.lista.n == 1)
+    let e = s6_unico_e0913(c)
+    expect(e.codigo == common.E0913 and e.off == 201)
+    expect((e.causa or_else "") == "'p' aponta para dentro de 'l' (linha 5) e o append da linha 8 pode mover o buffer: guarde o indice e leia l[i] depois, ou pegue &l[i] de novo depois do append")
+    expect(e.sug.n == 1 and e.sug.itens[0].confianca == (common.DIAG_SO_DICA as u8))
+    // b2: if/else que muta e repontam p nos dois ramos: limpo (o if de b2 tem corpo e senao)
+    let c2 = s6_cen_novo("proc main() {\n    var l = make([dynamic]int, alloc = heap)\n    defer delete(l)\n    append(&l, item = 1)\n    var p = &l[0]\n    let c = len(l) > 5\n    if c {\n        append(&l, item = 2)\n        p = &l[0]\n    } else {\n        append(&l, item = 3)\n        p = &l[0]\n    }\n    print(p^)\n}\n")
+    defer s6_cen_liberar(c2)
+    let s2: ^Semantica = &c2.s
+    let st_c2 = s6_st_local(s2, frontend.ST_LET, 126, s6_nome(c2, "c"), 2, TIPO_INT as u32, s6_ex_int(s2, 134))
+    let se2 = s6_st(s2, frontend.ST_IF, 145)
+    se2.expr = s6_ex_nome(s2, s6_nome(c2, "c"), 2, TIPO_INT as u32, 148)
+    se2.corpo = s6_liga(s6_ch(s2, 164, s6_mut(c2, frontend.EMB_APPEND, "append", 164)), s6_atrib_p(c2, 193))
+    se2.senao = s6_liga(s6_ch(s2, 224, s6_mut(c2, frontend.EMB_APPEND, "append", 224)), s6_atrib_p(c2, 253))
+    let corpo2 = s6_prologo(c2, s6_liga(s6_decl_p(c2, frontend.ST_VAR, 108), s6_liga(st_c2, s6_liga(se2, s6_uso(c2, "p", 1, 279)))))
+    let d2 = s6_decl_proc(s2, s6_nome(c2, "main"), nl[..], 0, corpo2)
+    expect(sem_emprestimo_corpo(s2, d2))
+    expect(s2.lista.n == 0)
+    // b3: o ramo que muta termina em return (bloco_sai): o estado do ramo nao vale depois do if
+    let c3 = s6_cen_novo("proc main() {\n    var l = make([dynamic]int, alloc = heap)\n    defer delete(l)\n    append(&l, item = 1)\n    let p = &l[0]\n    let c = len(l) > 5\n    if c {\n        append(&l, item = 2)\n        return\n    }\n    print(p^)\n}\n")
+    defer s6_cen_liberar(c3)
+    let s3: ^Semantica = &c3.s
+    let st_c3 = s6_st_local(s3, frontend.ST_LET, 126, s6_nome(c3, "c"), 2, TIPO_INT as u32, s6_ex_int(s3, 134))
+    let se3 = s6_st(s3, frontend.ST_IF, 145)
+    se3.expr = s6_ex_nome(s3, s6_nome(c3, "c"), 2, TIPO_INT as u32, 148)
+    se3.corpo = s6_liga(s6_ch(s3, 164, s6_mut(c3, frontend.EMB_APPEND, "append", 164)), s6_st(s3, frontend.ST_RETURN, 185))
+    let corpo3 = s6_prologo(c3, s6_liga(s6_decl_p(c3, frontend.ST_LET, 108), s6_liga(st_c3, s6_liga(se3, s6_uso(c3, "p", 1, 212)))))
+    let d3 = s6_decl_proc(s3, s6_nome(c3, "main"), nl[..], 0, corpo3)
+    expect(sem_emprestimo_corpo(s3, d3))
+    expect(s3.lista.n == 0)
+}
+
+// b6/b7: switch com default; um caso muta (erro, com correcao PROVAVEL no recuo do caso) x todos os casos repontam p (limpo)
+test "sem_emprestimo: switch com default que muta num caso invalida p; repontar em todos os casos limpa" {
+    // b6: erro (correcao PROVAVEL; a edicao de insercao vem no fim da linha do append dentro do case)
+    let c = s6_cen_novo("enum Cor { verde, azul, rosa }\nproc main() {\n    var l = make([dynamic]int, alloc = heap)\n    defer delete(l)\n    append(&l, item = 1)\n    let p = &l[0]\n    let c = Cor.azul\n    switch c {\n    case Cor.verde:\n        append(&l, item = 2)\n    case Cor.azul:\n        print(1)\n    default:\n        print(2)\n    }\n    print(p^)\n}\n")
+    defer s6_cen_liberar(c)
+    let s: ^Semantica = &c.s
+    let st_c = s6_st_local(s, frontend.ST_LET, 153, s6_nome(c, "c"), 2, TIPO_INT as u32, s6_ex_int(s, 161))
+    let sw = s6_st(s, frontend.ST_SWITCH, 174)
+    sw.expr = s6_ex_nome(s, s6_nome(c, "c"), 2, TIPO_INT as u32, 181)
+    sw.ncasos = 3
+    sw.casos = s6_casos(s, s6_ch(s, 217, s6_mut(c, frontend.EMB_APPEND, "append", 217)), s6_nada(s, 265), s6_nada(s, 295))
+    let corpo = s6_prologo(c, s6_liga(s6_decl_p(c, frontend.ST_LET, 139), s6_liga(st_c, s6_liga(sw, s6_uso(c, "p", 1, 320)))))
+    var nl: [3]i32 = {s6_nome(c, "l"), s6_nome(c, "p"), s6_nome(c, "c")}
+    let d = s6_decl_proc(s, s6_nome(c, "main"), nl[..], 0, corpo)
+    expect(not sem_emprestimo_corpo(s, d))
+    expect(s.lista.n == 1)
+    let e = s6_unico_e0913(c)
+    expect(e.codigo == common.E0913 and e.off == 320)
+    expect((e.causa or_else "") == "'p' aponta para dentro de 'l' (linha 6) e o append da linha 10 pode mover o buffer: guarde o indice e leia l[i] depois, ou pegue &l[i] de novo depois do append")
+    expect(e.sug.n == 1 and e.sug.itens[0].confianca == (common.DIAG_PROVAVEL as u8) and e.sug.itens[0].nedicoes == 2)
+    expect(e.sug.itens[0].edicoes[0].ini == 139 and e.sug.itens[0].edicoes[0].fim == 142 and (e.sug.itens[0].edicoes[0].novo or_else "") == "var")
+    expect(e.sug.itens[0].edicoes[1].ini == 237 and e.sug.itens[0].edicoes[1].fim == 237 and (e.sug.itens[0].edicoes[1].novo or_else "") == "\n        p = &l[0]")
+    // b7: todos os casos (inclusive o default) repontam p: limpo
+    let c2 = s6_cen_novo("enum Cor { verde, azul, rosa }\nproc main() {\n    var l = make([dynamic]int, alloc = heap)\n    defer delete(l)\n    append(&l, item = 1)\n    var p = &l[0]\n    let c = Cor.azul\n    switch c {\n    case Cor.verde:\n        append(&l, item = 2)\n        p = &l[0]\n    default:\n        p = &l[0]\n    }\n    print(p^)\n}\n")
+    defer s6_cen_liberar(c2)
+    let s2: ^Semantica = &c2.s
+    let st_c2 = s6_st_local(s2, frontend.ST_LET, 153, s6_nome(c2, "c"), 2, TIPO_INT as u32, s6_ex_int(s2, 161))
+    let sw2 = s6_st(s2, frontend.ST_SWITCH, 174)
+    sw2.expr = s6_ex_nome(s2, s6_nome(c2, "c"), 2, TIPO_INT as u32, 181)
+    sw2.ncasos = 3
+    let caso_verde = s6_liga(s6_ch(s2, 217, s6_mut(c2, frontend.EMB_APPEND, "append", 217)), s6_atrib_p(c2, 246))
+    sw2.casos = s6_casos(s2, caso_verde, s6_nada(s2, 265), s6_atrib_p(c2, 295))
+    let corpo2 = s6_prologo(c2, s6_liga(s6_decl_p(c2, frontend.ST_VAR, 139), s6_liga(st_c2, s6_liga(sw2, s6_uso(c2, "p", 1, 330)))))
+    let d2 = s6_decl_proc(s2, s6_nome(c2, "main"), nl[..], 0, corpo2)
+    expect(sem_emprestimo_corpo(s2, d2))
+    expect(s2.lista.n == 0)
+}

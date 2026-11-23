@@ -1,0 +1,184 @@
+// nativo/a64/a64_isel_estouro.fj - ADD_OV SUB_OV MUL_OV NEG_OV, ARMADILHA e SELECIONA inteiro (contrato_a64 §3.7 e §4; A1.3(iv))
+// Versao: 0.2.0
+// Changelog: 0.2.0 - A2.2(c): ARMADILHA chama o proc da ponte do runtime de falha (a64_alcance) e acaba em brk; sai o texto R embutido (A1).
+//                    0.1.0 - A1.3(iv): estouro por flags em I32/I64 (adds/subs + b.vs, ou b.hs/b.lo sem sinal); I8/I16 operam em w sobre valores
+//                    estendidos e conferem a faixa (o resultado tem de voltar ao mesmo valor ao estender); MUL de 32 bits por smull/umull
+//                    e de 64 por smulh/umulh + comparacao; ARMADILHA sem runtime = write(2, texto R, n) + exit_group(101) com o texto
+//                    embutido no .text logo apos o brk; SELECIONA inteiro por cmp + csel.
+// Desvios: sem relaxacao, todo desvio condicional e `b.<inverso> .+8` seguido de B (so o B alcanca o bloco).
+
+import "nativo/bir"
+
+const A64_COND_EQ: u32 = 0
+const A64_COND_NE: u32 = 1
+const A64_COND_HS: u32 = 2
+const A64_COND_LO: u32 = 3
+const A64_COND_VS: u32 = 6
+
+// B.cond para o bloco: `b.<inverso> .+8` pula o B quando a condicao nao vale
+proc a64_desviar_se(c: ^A64Ctx, cond: u32, bloco: u32) {
+    a64_op(c, A64F_B_COND, false, A64Ops{imm = 2, imm2 = cond ~ 1})
+    a64_b_bloco(c, bloco)
+}
+
+// cbz reg,.+8 ; b bloco: desvia quando o registrador de 64 bits e diferente de zero
+proc a64_desviar_se_nao_zero(c: ^A64Ctx, reg: u32, bloco: u32) {
+    a64_op(c, A64F_CBZ, true, A64Ops{rd = reg, imm = 2})
+    a64_b_bloco(c, bloco)
+}
+
+// I8/I16: o resultado em w tem de voltar ao mesmo valor ao ser estendido (sxt/uxt); se nao volta, estourou
+proc a64_confere_faixa(c: ^A64Ctx, bloco: u32, bits: u32, com_sinal: bool) {
+    var forma: u32 = A64F_UBFM
+    if com_sinal {
+        forma = A64F_SBFM
+    }
+    a64_op(c, forma, false, A64Ops{rd = R_T2, rn = R_T0, imm = 0, imm2 = bits - 1})
+    a64_op(c, A64F_SUBS_REG, false, A64Ops{rd = R_XZR, rn = R_T0, rm = R_T2})
+    a64_desviar_se(c, A64_COND_NE, bloco)
+}
+
+// ADD_OV, SUB_OV e NEG_OV (= 0 - b, a = 0 imediato na BIR): I32/I64 por flags; I8/I16 em w + faixa
+proc a64_isel_soma_ov(c: ^A64Ctx, ins: ^bir.BirInstr) -> bool {
+    if (not a64_operando(c, R_T0, &ins.a)) or (not a64_operando(c, R_T1, &ins.b)) {
+        return false
+    }
+    let com_sinal = (ins.aux as i32) == bir.BIR_SINAL
+    let subtrai = (ins.op as i32) != bir.BIR_ADD_OV
+    let bits = a64_bits_estreitos(ins.classe)
+    let alvo = ins.alvo[0]
+    if (bits == 8) or (bits == 16) {
+        a64_estender(c, R_T0, ins.classe, com_sinal)
+        a64_estender(c, R_T1, ins.classe, com_sinal)
+        var forma_w: u32 = A64F_ADD_REG
+        if subtrai {
+            forma_w = A64F_SUB_REG
+        }
+        a64_op(c, forma_w, false, A64Ops{rd = R_T0, rn = R_T0, rm = R_T1})
+        a64_confere_faixa(c, alvo, bits, com_sinal)
+    } else {
+        var forma: u32 = A64F_ADDS_REG
+        var cond: u32 = A64_COND_HS
+        if subtrai {
+            forma = A64F_SUBS_REG
+            cond = A64_COND_LO
+        }
+        if com_sinal {
+            cond = A64_COND_VS
+        }
+        a64_op(c, forma, a64_x(ins.classe), A64Ops{rd = R_T0, rn = R_T0, rm = R_T1})
+        a64_desviar_se(c, cond, alvo)
+    }
+    a64_resultado(c, ins, R_T0)
+    return true
+}
+
+// I32: o produto de 64 bits cabe; com sinal estoura se a parte alta nao for a extensao do bit 31, sem sinal se nao for zero
+proc a64_mul_32_ov(c: ^A64Ctx, alvo: u32, com_sinal: bool) {
+    if com_sinal {
+        a64_op(c, A64F_SMULL, false, A64Ops{rd = R_T0, rn = R_T0, rm = R_T1})
+        a64_op(c, A64F_SBFM, true, A64Ops{rd = R_T2, rn = R_T0, imm = 0, imm2 = 31})
+        a64_op(c, A64F_SUBS_REG, true, A64Ops{rd = R_XZR, rn = R_T0, rm = R_T2})
+        a64_desviar_se(c, A64_COND_NE, alvo)
+    } else {
+        a64_op(c, A64F_UMULL, false, A64Ops{rd = R_T0, rn = R_T0, rm = R_T1})
+        a64_op(c, A64F_UBFM, true, A64Ops{rd = R_T2, rn = R_T0, imm = 32, imm2 = 63})
+        a64_desviar_se_nao_zero(c, R_T2, alvo)
+    }
+}
+
+// I64: a parte alta vem de smulh/umulh (antes do mul, que sobrescreve o operando); estouro pela comparacao com o sinal do baixo
+proc a64_mul_64_ov(c: ^A64Ctx, alvo: u32, com_sinal: bool) {
+    if com_sinal {
+        a64_op(c, A64F_SMULH, false, A64Ops{rd = R_T2, rn = R_T0, rm = R_T1})
+        a64_op(c, A64F_MADD, true, A64Ops{rd = R_T0, rn = R_T0, rm = R_T1, imm = 31})
+        a64_op(c, A64F_SBFM, true, A64Ops{rd = R_T1, rn = R_T0, imm = 63, imm2 = 63})
+        a64_op(c, A64F_SUBS_REG, true, A64Ops{rd = R_XZR, rn = R_T2, rm = R_T1})
+        a64_desviar_se(c, A64_COND_NE, alvo)
+    } else {
+        a64_op(c, A64F_UMULH, false, A64Ops{rd = R_T2, rn = R_T0, rm = R_T1})
+        a64_op(c, A64F_MADD, true, A64Ops{rd = R_T0, rn = R_T0, rm = R_T1, imm = 31})
+        a64_desviar_se_nao_zero(c, R_T2, alvo)
+    }
+}
+
+// MUL_OV: I8/I16 em w + faixa; I32 e I64 pelas partes altas (a64_mul_32_ov / a64_mul_64_ov)
+proc a64_isel_mul_ov(c: ^A64Ctx, ins: ^bir.BirInstr) -> bool {
+    if (not a64_operando(c, R_T0, &ins.a)) or (not a64_operando(c, R_T1, &ins.b)) {
+        return false
+    }
+    let com_sinal = (ins.aux as i32) == bir.BIR_SINAL
+    let bits = a64_bits_estreitos(ins.classe)
+    let alvo = ins.alvo[0]
+    if (bits == 8) or (bits == 16) {
+        a64_estender(c, R_T0, ins.classe, com_sinal)
+        a64_estender(c, R_T1, ins.classe, com_sinal)
+        a64_op(c, A64F_MADD, false, A64Ops{rd = R_T0, rn = R_T0, rm = R_T1, imm = 31})
+        a64_confere_faixa(c, alvo, bits, com_sinal)
+    } else if bits == 32 {
+        a64_mul_32_ov(c, alvo, com_sinal)
+    } else {
+        a64_mul_64_ov(c, alvo, com_sinal)
+    }
+    a64_resultado(c, ins, R_T0)
+    return true
+}
+
+// ARMADILHA = chamada ao proc da ponte do runtime de falha (como wasm_emitir_armadilha: o proc sai pelo exit 101) + brk.
+// Falha sem proc (alocacao, pilha...) = X0001 ate o A2.2 completar.
+proc a64_isel_armadilha(c: ^A64Ctx, ins: ^bir.BirInstr) -> bool {
+    let funcoes: []bir.BirFuncao = c.p.funcoes or_else {}
+    let sim: ^bir.BirSimbolo = &c.p.simbolos[ins.simbolo]
+    let nome = sim.nome or_else ""
+    let k: u32 = a64_alcance_do_runtime(c.p, funcoes, nome)
+    if k == A64_ALC_SEM {
+        let o_que = format(f"runtime de falha '{nome}'", alloc = heap)
+        defer delete(o_que)
+        return a64_recusa(c, o_que)
+    }
+    if not a64_chamar_simbolo(c, ins, funcoes[k].simbolo) {
+        return false
+    }
+    a64_op(c, A64F_BRK, false, A64Ops{imm = 0})
+    return true
+}
+
+// SELECIONA inteiro: cmp dos args (estendidos como o CMP), depois csel dst, a, b com a condicao direta (contrato §4)
+proc a64_isel_seleciona(c: ^A64Ctx, ins: ^bir.BirInstr) -> bool {
+    let cond = ins.aux as i32
+    if cond > bir.BCOND_GE_U {
+        return a64_recusa(c, "selecao real")
+    }
+    let args: []bir.BirOperando = ins.args or_else {}
+    if (not a64_classe_inteira(args[0].classe)) or (not a64_classe_inteira(args[1].classe)) {
+        return a64_recusa(c, "comparacao real")
+    }
+    if (not a64_operando(c, R_T0, &args[0])) or (not a64_operando(c, R_T1, &args[1])) {
+        return false
+    }
+    let com_sinal = (cond >= bir.BCOND_LT_S) and (cond <= bir.BCOND_GE_S)
+    a64_estender(c, R_T0, args[0].classe, com_sinal)
+    a64_estender(c, R_T1, args[0].classe, com_sinal)
+    a64_op(c, A64F_SUBS_REG, a64_x(args[0].classe), A64Ops{rd = R_XZR, rn = R_T0, rm = R_T1})
+    if (not a64_operando(c, R_T2, &ins.a)) or (not a64_operando(c, R_T1, &ins.b)) {
+        return false
+    }
+    a64_op(c, A64F_CSEL, a64_x(ins.classe), A64Ops{rd = R_T0, rn = R_T2, rm = R_T1, imm = A64_COND_DA_BIR[cond]})
+    a64_resultado(c, ins, R_T0)
+    return true
+}
+
+// despacho de OV, SELECIONA e ARMADILHA (a64_isel.fj chama so para essas ops)
+proc a64_selecionar_estouro(c: ^A64Ctx, ins: ^bir.BirInstr) -> bool {
+    let op = ins.op as i32
+    if op == bir.BIR_MUL_OV {
+        return a64_isel_mul_ov(c, ins)
+    }
+    if (op == bir.BIR_ADD_OV) or (op == bir.BIR_SUB_OV) or (op == bir.BIR_NEG_OV) {
+        return a64_isel_soma_ov(c, ins)
+    }
+    if op == bir.BIR_SELECIONA {
+        return a64_isel_seleciona(c, ins)
+    }
+    return a64_isel_armadilha(c, ins)
+}

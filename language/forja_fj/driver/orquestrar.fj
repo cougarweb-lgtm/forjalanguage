@@ -1,0 +1,788 @@
+// driver/orquestrar.fj - porte de compiler/driver/orquestrar.c, compiler/driver/orquestrar.h
+// sha256 de driver/orquestrar.c: dc3000ea7ff0d30dfe5d0ed187c140b111da089c44d2d1de68b75325cbcc5f64
+// sha256 de driver/orquestrar.h: e0719e762c8dd17cff6b3d5ab25faa55dc3640e4882b2504582b91ab29d67f46
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.2.0
+// Changelog: 0.2.0 - G3 V5-O1: corpo real. O SaidaDiag unico do principal (C2F-70) chega por `sd` em orquestrar_projeto, conferir_backend_2, relatar_erro e montar_ordem (somem os 2 `var sd` provisorios);
+//            o main chama orquestrar_projeto(o, sd). GetSystemTimeAsFileTime -> filetime_agora (orquestrar_tempos.fj); GetModuleFileNameA -> os.exe_path; ArquivoLerInteiro+Hash64 -> cache.arquivo_ler_inteiro+common.hash64;
+//            calloc/free de Avaliacao.arquivos, Plano.camada e Plano.ordem: Avaliacao.arquivos vira [dynamic] de heap (liberar_avaliacao o solta, sem o contador narquivos) e camada/ordem sao listas de frame
+//            (resize + fatia; o compilador nunca chama frame_reset); printf/puts/putchar -> texto montado em [dynamic]u8 e escrito por escrever_stdout (cmd_fmt_arquivo.fj); errno das mensagens de estado e de forja.exe = 0
+//            ("sem codigo de erro": o std nao expoe o errno do CRT).
+
+import "std:os"
+import "std:file"
+import "std:text"
+import "cache"
+import "common"
+import "nativo"
+
+struct Avaliacao {
+    deps: [32]cache.EstadoDep
+    gravadas: [dynamic]cache.EntradaGravada
+    tem_entradas: bool
+    arquivos: [dynamic]cache.EstadoArquivo
+    mudou: ?^cache.EntradaGravada
+}
+
+const ORQ_ALVO: str = "x86_64-windows"
+const ORQ_MANIFESTO_PADRAO: str = "forja.proj"
+
+// C: driver/orquestrar.c:45
+proc conferir_backend_2(o: ^Opcoes, sd: ^common.SaidaDiag) -> bool {
+    if (o.backend == none) or (common.c2f_b2i32(backend_eh_x64(o)) != 0) {
+        return true
+    }
+    common.diag_imprimir_json_sem_fonte(common.X0003, "o orquestrador so usa o backend x64 (o padrao): --projeto nao aceita outro --backend", common.c2f_saida_stderr(), sd)
+    return false
+}
+
+// C: driver/orquestrar.c:52
+proc agora_filetime() -> u64 {
+    return filetime_agora()
+}
+
+// C: driver/orquestrar.c:61
+// Hash64 dos bytes do proprio forja.exe: o id do binario (a versao textual nao basta, o exe muda sem trocar de versao).
+proc id_do_forja(id: ^u64) -> bool {
+    switch exe in os.exe_path(alloc = heap) {
+    case str:
+        defer delete(exe)
+        if len(exe) >= (cache.PROJETO_CAMINHO_MAX as int) {
+            return false
+        }
+        return hash_do_arquivo(exe, id)
+    case os.OsError:
+        return false
+    }
+    return false
+}
+
+proc caminho_do_estado_texto(pl: ^Plano2) -> str {
+    let pasta: str = pl.projeto.pasta or_else ""
+    let modo: str = pl.modo or_else ""
+    return format(f"{pasta}\\.forja_cache\\estado\\{modo}.tsv", alloc = frame)
+}
+
+proc caminho_das_entradas_texto(pl: ^Plano2, pr: ^cache.Produto) -> str {
+    let pasta: str = pl.projeto.pasta or_else ""
+    let modo: str = pl.modo or_else ""
+    let nome: str = pr.nome or_else ""
+    return format(f"{pasta}\\.forja_cache\\estado\\{modo}\\{nome}.entradas", alloc = frame)
+}
+
+// C: driver/orquestrar.c:73
+proc orq_caminho_do_estado(pl: ^Plano2, destino: []u8, tam: u64) {
+    let limite: int = min(tam as int, len(destino))
+    _ = common.c2f_snprintf(destino[0..<limite], caminho_do_estado_texto(pl))
+}
+
+// C: driver/orquestrar.c:78
+proc orq_caminho_das_entradas(pl: ^Plano2, pr: ^cache.Produto, destino: []u8, tam: u64) {
+    let limite: int = min(tam as int, len(destino))
+    _ = common.c2f_snprintf(destino[0..<limite], caminho_das_entradas_texto(pl, pr))
+}
+
+// C: driver/orquestrar.c:84
+// A linha e a saida de uma dependencia declarada do produto: entra na chave como "dep:", nao como arquivo (o corpo da dll mudar nao recompila o dependente).
+proc eh_saida_de_dependencia(pl: ^Plano2, pr: ^cache.Produto, caminho: str) -> bool {
+    var j: u32 = 0
+    while j < pr.ndep {
+        let dep: ^cache.Produto = cache.projeto_produto(&pl.projeto, pr.dep[j])
+        if common.c2f_stricmp((dep.saida or_else ""), caminho) == 0 {
+            return true
+        }
+        j += 1
+    }
+    return false
+}
+
+// C: driver/orquestrar.c:92
+proc dependencias_de_hoje(pl: ^Plano2, pr: ^cache.Produto, av: ^Avaliacao) {
+    var j: u32 = 0
+    while j < pr.ndep {
+        let dep: ^cache.Produto = cache.projeto_produto(&pl.projeto, pr.dep[j])
+        let linha: ?^cache.EstadoLinha = cache.estado_achar(&pl.estado, (dep.nome or_else ""))
+        var tern_1: u64 = 0
+        if linha != none {
+            tern_1 = (linha as ^cache.EstadoLinha).hash_interface
+        }
+        av.deps[j] = cache.EstadoDep{nome = dep.nome, tem = (linha != none) and (common.c2f_b2i32((linha as ^cache.EstadoLinha).tem_interface) != 0), hash = tern_1}
+        j += 1
+    }
+}
+
+// C: driver/orquestrar.c:103
+proc entrada_mudou_ou_sumiu(achou: bool, hash_c: u64, g: ^cache.EntradaGravada) -> bool {
+    return (not achou) or (hash_c != g.hash)
+}
+
+// C: driver/orquestrar.c:109
+// Hash de hoje de cada linha do .entradas (menos as saidas de dependencias); guarda a 1a que mudou ou sumiu.
+proc arquivos_de_hoje(pl: ^Plano2, pr: ^cache.Produto, av: ^Avaliacao) {
+    av.arquivos = make([dynamic]cache.EstadoArquivo, alloc = heap)
+    for k in (0 as u64)..<(len(av.gravadas) as u64) {
+        let g: ^cache.EntradaGravada = &av.gravadas[k]
+        if eh_saida_de_dependencia(pl, pr, (g.caminho or_else "")) {
+            continue
+        }
+        var hash_c: u64 = 0
+        let achou: bool = cache.entrada_hash_atual(g, pl.inicio, &hash_c)
+        append(&av.arquivos, item = cache.EstadoArquivo{caminho = g.caminho, hash = hash_c})
+        if (av.mudou == none) and entrada_mudou_ou_sumiu(achou, hash_c, g) {
+            av.mudou = g
+        }
+    }
+}
+
+// C: driver/orquestrar.c:125
+proc apurar(pl: ^Plano2, pr: ^cache.Produto, av: ^Avaliacao) {
+    av.tem_entradas = cache.entradas_ler(caminho_das_entradas_texto(pl, pr), &av.gravadas)
+    dependencias_de_hoje(pl, pr, av)
+    arquivos_de_hoje(pl, pr, av)
+}
+
+// C: driver/orquestrar.c:137
+// Estado pos-build: o hash que o filho gravou no .entradas (o que ele compilou), nunca o do disco de hoje. Edicao entre o fim do filho e a gravacao do
+// estado tem de aparecer como mudanca no proximo plano; com o hash de hoje o binario antigo ficaria com a chave do conteudo novo (build "em dia" e velho).
+proc apurar_compilado(pl: ^Plano2, pr: ^cache.Produto, av: ^Avaliacao) {
+    av.tem_entradas = cache.entradas_ler(caminho_das_entradas_texto(pl, pr), &av.gravadas)
+    dependencias_de_hoje(pl, pr, av)
+    av.arquivos = make([dynamic]cache.EstadoArquivo, alloc = heap)
+    for k in (0 as u64)..<(len(av.gravadas) as u64) {
+        let g: ^cache.EntradaGravada = &av.gravadas[k]
+        if eh_saida_de_dependencia(pl, pr, (g.caminho or_else "")) {
+            continue
+        }
+        append(&av.arquivos, item = cache.EstadoArquivo{caminho = g.caminho, hash = g.hash})
+    }
+}
+
+// C: driver/orquestrar.c:154
+proc liberar_avaliacao(av: ^Avaliacao) {
+    delete(av.gravadas)
+    delete(av.arquivos)
+}
+
+// C: driver/orquestrar.c:162
+proc montar_chave(pl: ^Plano2, pr: ^cache.Produto, av: ^Avaliacao) -> cache.ChavePedido {
+    var cp: cache.ChavePedido = cache.ChavePedido{}
+    cp.forja = pl.forja_id
+    cp.alvo = ORQ_ALVO
+    cp.modo = pl.modo
+    var tipo_texto: str = "exe"
+    if pr.tipo == cache.PRODUTO_DLL {
+        tipo_texto = "dll"
+    }
+    cp.tipo = tipo_texto
+    cp.entrada = pr.entrada
+    cp.lib_pasta = pl.projeto.saida
+    cp.deps = av.deps[..]
+    cp.ndeps = pr.ndep as u64
+    cp.arquivos = av.arquivos[..]
+    cp.narquivos = len(av.arquivos) as u64
+    return cp
+}
+
+// C: driver/orquestrar.c:180
+// O Hash64 do arquivo inteiro; false = nao abriu.
+proc hash_do_arquivo(caminho: str, hash_c: ^u64) -> bool {
+    var dados = make([dynamic]u8, alloc = heap)
+    defer delete(dados)
+    if not cache.arquivo_ler_inteiro(caminho, &dados) {
+        return false
+    }
+    let tam: int = len(dados) - 1
+    hash_c^ = common.hash64(dados[0..<tam], (tam as u64), common.HASH64_SEMENTE)
+    return true
+}
+
+// C: driver/orquestrar.c:192
+proc saida_medida_confere(pr: ^cache.Produto, ant: ?^cache.EstadoLinha) -> bool {
+    var tamanho: u64 = 0
+    var mtime: u64 = 0
+    if not cache.arquivo_medir((pr.saida or_else ""), &tamanho, &mtime) {
+        return false
+    }
+    return (tamanho == (ant as ^cache.EstadoLinha).tamanho) and (mtime == (ant as ^cache.EstadoLinha).mtime)
+}
+
+// C: driver/orquestrar.c:201
+proc saida_confere(pr: ^cache.Produto, ant: ?^cache.EstadoLinha) -> bool {
+    var hash_c: u64 = 0
+    if not saida_medida_confere(pr, ant) {
+        return false
+    }
+    if common.c2f_s2u_32(pr.tipo) != (cache.PRODUTO_DLL as u32) {
+        return true
+    }
+    return ((common.c2f_b2i32((ant as ^cache.EstadoLinha).tem_interface) != 0) and (common.c2f_b2i32(hash_do_arquivo((pr.cabecalho or_else ""), &hash_c)) != 0)) and (hash_c == (ant as ^cache.EstadoLinha).hash_interface)
+}
+
+// C: driver/orquestrar.c:211
+// Nome da 1a dependencia cuja "nome=<hash>" nao esta na coluna deps gravada; "" = todas iguais.
+proc dependencia_que_mudou(av: ^Avaliacao, ndeps: u64, gravadas: str) -> str {
+    let palheiro = format(f",{gravadas},", alloc = heap)
+    defer delete(palheiro)
+    for k in (0 as u64)..<ndeps {
+        let nome: str = av.deps[k].nome or_else ""
+        var agulha: str = ""
+        if av.deps[k].tem {
+            let hash_dep: u64 = av.deps[k].hash
+            agulha = format(f",{nome}={hash_dep:016x},", alloc = frame)
+        } else {
+            agulha = format(f",{nome}=-,", alloc = frame)
+        }
+        let achou: bool = text.str_contains(palheiro, agulha)
+        if not achou {
+            return nome
+        }
+    }
+    return ""
+}
+
+// C: driver/orquestrar.c:227
+// O caminho relativo a pasta do projeto quando esta dentro dela.
+proc relativo_ao_projeto(pl: ^Plano2, caminho: str) -> str {
+    let pasta: str = pl.projeto.pasta or_else ""
+    let tam: int = len(pasta)
+    if (len(caminho) > tam) and (common.c2f_stricmp(caminho[0..<tam], pasta) == 0) and (caminho[tam] == 92) {
+        return caminho[(tam + 1)..<len(caminho)]
+    }
+    return caminho
+}
+
+// C: driver/orquestrar.c:235
+proc apurar_fatos(pl: ^Plano2, pr: ^cache.Produto, ant: ?^cache.EstadoLinha, av: ^Avaliacao) -> cache.MotivoPedido {
+    var cp: cache.ChavePedido = montar_chave(pl, pr, av)
+    var m: cache.MotivoPedido = cache.MotivoPedido{forcado = false}
+    m.forcado = (pl.opcoes as ^Opcoes).tudo
+    m.primeira_vez = (ant == none) or (not av.tem_entradas)
+    m.dep_mudou = ""
+    m.arquivo_mudou = ""
+    if m.primeira_vez {
+        return m
+    }
+    m.chave_igual = cache.estado_chave(&cp) == (ant as ^cache.EstadoLinha).chave
+    m.ambiente_igual = cache.estado_ambiente(&cp) == (ant as ^cache.EstadoLinha).ambiente
+    m.saida_ok = saida_confere(pr, ant)
+    m.dep_mudou = dependencia_que_mudou(av, pr.ndep as u64, ((ant as ^cache.EstadoLinha).deps or_else ""))
+    if av.mudou != none {
+        m.arquivo_mudou = relativo_ao_projeto(pl, ((av.mudou as ^cache.EntradaGravada).caminho or_else ""))
+        m.arquivo_e_lib = ((av.mudou as ^cache.EntradaGravada).tipo or_else "") == "lib"
+    }
+    return m
+}
+
+// C: driver/orquestrar.c:257
+// true = recompilaria; motivo recebe o texto.
+proc orq_avaliar_produto(pl: ^Plano2, k: u32, motivo: []u8, n: u64) -> bool {
+    let pr: ^cache.Produto = cache.projeto_produto(&pl.projeto, k)
+    var av: Avaliacao = Avaliacao{}
+    let ini: u64 = tempos_agora(&pl.tempos)
+    apurar(pl, pr, &av)
+    var fatos: cache.MotivoPedido = apurar_fatos(pl, pr, cache.estado_achar(&pl.estado, (pr.nome or_else "")), &av)
+    let recompila: bool = cache.estado_motivo(&fatos, motivo, n)
+    liberar_avaliacao(&av)
+    tempos_fechar(&pl.tempos, "avaliar", pr.nome, ini)
+    return recompila
+}
+
+// C: driver/orquestrar.c:274
+proc interface_do_produto(pr: ^cache.Produto, l: ^cache.EstadoLinha) -> bool {
+    l.tem_interface = common.c2f_s2u_32(pr.tipo) == (cache.PRODUTO_DLL as u32)
+    return (not l.tem_interface) or (common.c2f_b2i32(hash_do_arquivo((pr.cabecalho or_else ""), &l.hash_interface)) != 0)
+}
+
+// C: driver/orquestrar.c:280
+proc orq_linha_do_estado(pl: ^Plano2, k: u32, l: ^cache.EstadoLinha) -> bool {
+    let pr: ^cache.Produto = cache.projeto_produto(&pl.projeto, k)
+    var av: Avaliacao = Avaliacao{}
+    let ini: u64 = tempos_agora(&pl.tempos)
+    apurar_compilado(pl, pr, &av)
+    var cp: cache.ChavePedido = montar_chave(pl, pr, &av)
+    l^ = cache.EstadoLinha{}
+    l.nome = pr.nome
+    l.saida = pr.saida
+    l.chave = cache.estado_chave(&cp)
+    l.ambiente = cache.estado_ambiente(&cp)
+    // 2656 = cache.ESTADO_DEPS_MAX (constante de outro pacote nao serve de tamanho de array)
+    var deps_buf: [2656]u8 = {}
+    cache.estado_deps_texto(&cp, deps_buf[..], (cache.ESTADO_DEPS_MAX as u64))
+    let deps_texto: str = from_bytes(deps_buf[0..<common.c2f_strlen_b(deps_buf[..])], alloc = frame)
+    l.deps = deps_texto
+    if deps_texto == "-" {
+        l.deps = ""
+    }
+    let ok: bool = av.tem_entradas and cache.arquivo_medir((pr.saida or_else ""), &l.tamanho, &l.mtime) and interface_do_produto(pr, l)
+    liberar_avaliacao(&av)
+    tempos_fechar(&pl.tempos, "linha_estado", pr.nome, ini)
+    return ok
+}
+
+// "texto" entre aspas, com \ e " escapados, anexado a out (o C escrevia com putchar).
+proc json_texto_escapado(texto: str, out: ^[dynamic]u8) {
+    append(out, item = "\"")
+    for i in 0..<len(texto) {
+        let c: u8 = texto[i]
+        if (c == 34) or (c == 92) {
+            append(out, item = 92)
+        }
+        append(out, item = c)
+    }
+    append(out, item = "\"")
+}
+
+// C: driver/orquestrar.c:305
+proc orq_texto_json(texto: str) {
+    var buf = make([dynamic]u8, alloc = heap)
+    defer delete(buf)
+    json_texto_escapado(texto, &buf)
+    escrever_stdout(buf[..])
+}
+
+// A linha do produto no plano (JSON ou texto), com o \n do fim.
+// LIMITE: parametros 5 (json/nome/recompila/motivo descrevem uma linha e out e o destino; struct so para isto nao ganha clareza).
+proc texto_do_produto(json: bool, nome: str, recompila: bool, motivo: str, out: ^[dynamic]u8) {
+    if json {
+        var acao: str = "reusado"
+        if recompila {
+            acao = "recompilaria"
+        }
+        format(f"{{\"produto\": \"{nome}\", \"acao\": \"{acao}\", \"motivo\": ", into = out)
+        if recompila {
+            json_texto_escapado(motivo, out)
+        } else {
+            json_texto_escapado("", out)
+        }
+        append(out, item = "}\n")
+    } else if recompila {
+        format(f"forja: [{nome}] recompilaria ({motivo})\n", into = out)
+    } else {
+        format(f"forja: [{nome}] reusado\n", into = out)
+    }
+}
+
+// C: driver/orquestrar.c:315
+proc imprimir_produto(o: ^Opcoes, nome: str, recompila: bool, motivo: str) {
+    var buf = make([dynamic]u8, alloc = heap)
+    defer delete(buf)
+    texto_do_produto(o.json, nome, recompila, motivo, &buf)
+    escrever_stdout(buf[..])
+}
+
+// A linha de resumo do plano (JSON ou texto), com o \n do fim.
+proc texto_do_resumo(json: bool, total: u32, recompilam: u32) -> str {
+    let reusados: u32 = total - recompilam
+    if json {
+        return format(f"{{\"plano\": {{\"produtos\": {total}, \"recompilariam\": {recompilam}, \"reusados\": {reusados}}}}}\n", alloc = heap)
+    }
+    return format(f"forja: plano: {total} produtos, {recompilam} recompilariam, {reusados} reusados\n", alloc = heap)
+}
+
+// C: driver/orquestrar.c:328
+proc imprimir_resumo(o: ^Opcoes, total: u32, recompilam: u32) {
+    let msg = texto_do_resumo(o.json, total, recompilam)
+    defer delete(msg)
+    escrever_stdout(as_bytes(msg))
+}
+
+// C: driver/orquestrar.c:339
+proc liberar_plano(pl: ^Plano2) {
+    // camada e ordem sao listas de frame (montar_ordem): nada a soltar
+    if cap(pl.estado.linhas) > 0 {
+        cache.estado_liberar(&pl.estado)
+    }
+    cache.projeto_liberar(&pl.projeto)
+}
+
+// C: driver/orquestrar.c:348
+// O estado gravado do modo (etapa estado_ler). Falha = mensagem com a causa.
+proc ler_estado_medido(pl: ^Plano2) -> bool {
+    let ini: u64 = tempos_agora(&pl.tempos)
+    let caminho: str = caminho_do_estado_texto(pl)
+    let lido: bool = cache.estado_ler(caminho, &pl.estado)
+    tempos_fechar(&pl.tempos, "estado_ler", none, ini)
+    if lido {
+        return true
+    }
+    let causa: str = causa_do_errno(0)
+    let msg = format(f"forja: nao consegui ler o estado '{caminho}' ({causa})\n", alloc = heap)
+    defer delete(msg)
+    escrever_stderr(msg)
+    return false
+}
+
+// C: driver/orquestrar.c:367
+// O id do forja.exe (etapa id_forja). Falha = mensagem com a causa.
+proc identificar_forja(pl: ^Plano2) -> bool {
+    let ini: u64 = tempos_agora(&pl.tempos)
+    let lido: bool = id_do_forja(&pl.forja_id)
+    tempos_fechar(&pl.tempos, "id_forja", none, ini)
+    if lido {
+        return true
+    }
+    let causa: str = causa_do_errno(0)
+    let msg = format(f"forja: nao consegui ler o proprio forja.exe para o id do binario ({causa})\n", alloc = heap)
+    defer delete(msg)
+    escrever_stderr(msg)
+    return false
+}
+
+// C: driver/orquestrar.c:384
+proc orq_preparar_plano(pl: ^Plano2) -> bool {
+    if (not ler_estado_medido(pl)) or (not identificar_forja(pl)) {
+        return false
+    }
+    pl.inicio = agora_filetime()
+    return true
+}
+
+// C: driver/orquestrar.c:392
+// B0005 (ou B0007): o JSON em stderr; sem erro.tem o arquivo nao abriu e a mensagem ja saiu.
+proc relatar_erro(erro: ^common.Diag, sd: ^common.SaidaDiag) -> i32 {
+    if erro.tem {
+        common.diag_imprimir_json_sem_fonte(erro.codigo, erro.causa, common.c2f_saida_stderr(), sd)
+    }
+    return nativo.SAIDA_USO
+}
+
+// C: driver/orquestrar.c:398
+proc planejar(pl: ^Plano2) -> i32 {
+    let total: u32 = len(pl.projeto.produtos) as u32
+    var recompilam: u32 = 0
+    // 1164 = ORQ_MOTIVO_MAX (PROJETO_CAMINHO_MAX + 64)
+    var motivo: [1164]u8 = {}
+    if not orq_preparar_plano(pl) {
+        return nativo.SAIDA_USO
+    }
+    let ordem: []u32 = pl.ordem or_else {}
+    var i: u32 = 0
+    while i < total {
+        let k: u32 = ordem[i]
+        let recompila: bool = orq_avaliar_produto(pl, k, motivo[..], (ORQ_MOTIVO_MAX as u64))
+        let texto_motivo: str = from_bytes(motivo[0..<common.c2f_strlen_b(motivo[..])], alloc = frame)
+        imprimir_produto((pl.opcoes as ^Opcoes), (cache.projeto_produto(&pl.projeto, k).nome or_else ""), recompila, texto_motivo)
+        if recompila {
+            recompilam += 1
+        }
+        i += 1
+    }
+    imprimir_resumo((pl.opcoes as ^Opcoes), total, recompilam)
+    return nativo.SAIDA_OK
+}
+
+// C: driver/orquestrar.c:416
+// Camadas e ordem. false = ciclo (B0007 ja impresso).
+proc montar_ordem(pl: ^Plano2, sd: ^common.SaidaDiag) -> bool {
+    var erro: common.Diag = common.Diag{tem = false}
+    let n: int = len(pl.projeto.produtos)
+    let ini: u64 = tempos_agora(&pl.tempos)
+    var camada = make([dynamic]u32, alloc = frame, cap = n)
+    var ordem = make([dynamic]u32, alloc = frame, cap = n)
+    resize(&camada, n)
+    resize(&ordem, n)
+    pl.camada = camada[..]
+    pl.ordem = ordem[..]
+    let montou: bool = cache.projeto_camadas(&pl.projeto, camada[..], ordem[..], &erro)
+    tempos_fechar(&pl.tempos, "ordem", none, ini)
+    if montou {
+        return true
+    }
+    _ = relatar_erro(&erro, sd)
+    return false
+}
+
+// C: driver/orquestrar.c:434
+// ProjetoLer com a etapa ler_proj medida.
+proc ler_projeto_medido(pl: ^Plano2, erro: ^common.Diag) -> bool {
+    let manifesto: str = (pl.opcoes as ^Opcoes).entrada or_else ORQ_MANIFESTO_PADRAO
+    let ini: u64 = tempos_agora(&pl.tempos)
+    let lido: bool = cache.projeto_ler(manifesto, &pl.projeto, erro)
+    tempos_fechar(&pl.tempos, "ler_proj", none, ini)
+    return lido
+}
+
+// C: driver/orquestrar.c:445
+// Planeja ou constroi; depois grava o total e as linhas medidas (tempos_gravar fica de fora do total).
+proc executar_4(pl: ^Plano2) -> i32 {
+    var tern_1: i32 = 0
+    if common.c2f_b2i32((pl.opcoes as ^Opcoes).plano) != 0 {
+        tern_1 = planejar(pl)
+    } else {
+        tern_1 = orq_construir(pl)
+    }
+    let codigo: i32 = tern_1
+    tempos_fechar(&pl.tempos, "total", none, pl.tempos.inicio)
+    tempos_gravar(&pl.tempos)
+    return codigo
+}
+
+// C: driver/orquestrar.c:454
+// `sd` e o SaidaDiag unico do principal (C2F-70).
+proc orquestrar_projeto(o: ^Opcoes, sd: ^common.SaidaDiag) -> i32 {
+    var pl: Plano2 = Plano2{opcoes = none}
+    var erro: common.Diag = common.Diag{tem = false}
+    var codigo: i32 = nativo.SAIDA_USO
+    if not conferir_backend_2(o, sd) {
+        return nativo.SAIDA_USO
+    }
+    pl.opcoes = o
+    var tern_1: str = "dev"
+    if common.c2f_b2i32(o.release) != 0 {
+        tern_1 = "release"
+    }
+    pl.modo = tern_1
+    tempos_iniciar(&pl.tempos)
+    if not ler_projeto_medido(&pl, &erro) {
+        // o C vaza as linhas aqui; em Forja a lista de heap (R0009) e solta sem gravar (o arquivo de tempos fica como o C o deixa: so o cabecalho vazio)
+        if pl.tempos.ativo {
+            delete(pl.tempos.linhas)
+        }
+        return relatar_erro(&erro, sd)
+    }
+    if not montar_ordem(&pl, sd) {
+        liberar_plano(&pl)
+        if pl.tempos.ativo {
+            delete(pl.tempos.linhas)
+        }
+        return nativo.SAIDA_USO
+    }
+    codigo = executar_4(&pl)
+    liberar_plano(&pl)
+    return codigo
+}
+
+// ---------------------------------------------------------------- testes (G3 V5-O1)
+
+proc oo_gravar(caminho: str, texto: str) {
+    assert(file.write_all(caminho, data = as_bytes(texto)) == none, msg = "oo_gravar falhou")
+}
+
+test "orquestrar: caminhos do estado e das entradas" {
+    var pl: Plano2 = Plano2{opcoes = none}
+    pl.projeto.pasta = "C:\\proj"
+    pl.modo = "release"
+    var pr: cache.Produto = cache.Produto{nome = "app"}
+    var buf: [128]u8 = {}
+    orq_caminho_do_estado(&pl, buf[..], 128)
+    expect(from_bytes(buf[0..<common.c2f_strlen_b(buf[..])], alloc = frame) == "C:\\proj\\.forja_cache\\estado\\release.tsv")
+    orq_caminho_das_entradas(&pl, &pr, buf[..], 128)
+    expect(from_bytes(buf[0..<common.c2f_strlen_b(buf[..])], alloc = frame) == "C:\\proj\\.forja_cache\\estado\\release\\app.entradas")
+    var curto: [8]u8 = {}
+    orq_caminho_do_estado(&pl, curto[..], 8)
+    expect(from_bytes(curto[0..<common.c2f_strlen_b(curto[..])], alloc = frame) == "C:\\proj")
+}
+
+test "orquestrar: relativo_ao_projeto" {
+    var pl: Plano2 = Plano2{opcoes = none}
+    pl.projeto.pasta = "C:\\Proj"
+    expect(relativo_ao_projeto(&pl, "c:\\proj\\sub\\x.fj") == "sub\\x.fj")
+    expect(relativo_ao_projeto(&pl, "C:\\Proj") == "C:\\Proj")
+    expect(relativo_ao_projeto(&pl, "C:\\Projeto\\x") == "C:\\Projeto\\x")
+    expect(relativo_ao_projeto(&pl, "D:\\x") == "D:\\x")
+    expect(relativo_ao_projeto(&pl, "") == "")
+}
+
+test "orquestrar: dependencia_que_mudou" {
+    var av: Avaliacao = Avaliacao{}
+    av.deps[0] = cache.EstadoDep{nome = "a", tem = true, hash = 31}
+    av.deps[1] = cache.EstadoDep{nome = "b", tem = false, hash = 0}
+    expect(dependencia_que_mudou(&av, 2, "a=000000000000001f,b=-") == "")
+    expect(dependencia_que_mudou(&av, 2, "b=-,a=000000000000001f") == "")
+    expect(dependencia_que_mudou(&av, 2, "a=000000000000001e,b=-") == "a")
+    expect(dependencia_que_mudou(&av, 2, "a=000000000000001f,b=000000000000001f") == "b")
+    expect(dependencia_que_mudou(&av, 2, "") == "a")
+    expect(dependencia_que_mudou(&av, 1, "a=000000000000001f") == "")
+    expect(dependencia_que_mudou(&av, 0, "") == "")
+    // o nome que e sufixo de outro nao casa: ",a=" exige a virgula antes
+    expect(dependencia_que_mudou(&av, 1, "xa=000000000000001f") == "a")
+}
+
+test "orquestrar: entrada_mudou_ou_sumiu, json_texto_escapado e textos de saida" {
+    var g: cache.EntradaGravada = cache.EntradaGravada{hash = 5}
+    expect(not entrada_mudou_ou_sumiu(true, 5, &g))
+    expect(entrada_mudou_ou_sumiu(true, 6, &g))
+    expect(entrada_mudou_ou_sumiu(false, 5, &g))
+    var buf = make([dynamic]u8, alloc = heap)
+    defer delete(buf)
+    json_texto_escapado("a\"b\\c", &buf)
+    expect(from_bytes(buf[..], alloc = frame) == "\"a\\\"b\\\\c\"")
+    clear(&buf)
+    texto_do_produto(false, "app", true, "primeira vez", &buf)
+    expect(from_bytes(buf[..], alloc = frame) == "forja: [app] recompilaria (primeira vez)\n")
+    clear(&buf)
+    texto_do_produto(false, "app", false, "ignorado", &buf)
+    expect(from_bytes(buf[..], alloc = frame) == "forja: [app] reusado\n")
+    clear(&buf)
+    texto_do_produto(true, "app", true, "fonte mudou: \"a\".fj", &buf)
+    expect(from_bytes(buf[..], alloc = frame) == "{\"produto\": \"app\", \"acao\": \"recompilaria\", \"motivo\": \"fonte mudou: \\\"a\\\".fj\"}\n")
+    clear(&buf)
+    texto_do_produto(true, "app", false, "ignorado", &buf)
+    expect(from_bytes(buf[..], alloc = frame) == "{\"produto\": \"app\", \"acao\": \"reusado\", \"motivo\": \"\"}\n")
+    let r1 = texto_do_resumo(false, 3, 1)
+    expect(r1 == "forja: plano: 3 produtos, 1 recompilariam, 2 reusados\n")
+    delete(r1)
+    let r2 = texto_do_resumo(true, 3, 3)
+    expect(r2 == "{\"plano\": {\"produtos\": 3, \"recompilariam\": 3, \"reusados\": 0}}\n")
+    delete(r2)
+}
+
+test "orquestrar: hash_do_arquivo, id_do_forja, interface_do_produto e agora_filetime" {
+    let base = pw_pasta_temp()
+    let caminho = format(f"{base}\\forja_orq_hash_{os.pid()}.txt", alloc = heap)
+    oo_gravar(caminho, "abc")
+    var h: u64 = 0
+    expect(hash_do_arquivo(caminho, &h))
+    expect(h == common.hash64(as_bytes("abc"), 3, common.HASH64_SEMENTE))
+    var pr: cache.Produto = cache.Produto{nome = "d", tipo = cache.PRODUTO_DLL, cabecalho = caminho}
+    var l: cache.EstadoLinha = cache.EstadoLinha{}
+    expect(interface_do_produto(&pr, &l))
+    expect(l.tem_interface)
+    expect(l.hash_interface == h)
+    pr.cabecalho = "C:\\forja_nao_existe_xyz\\a.h"
+    expect(not interface_do_produto(&pr, &l))
+    pr.tipo = 0
+    expect(interface_do_produto(&pr, &l))
+    expect(not l.tem_interface)
+    expect(not hash_do_arquivo("C:\\forja_nao_existe_xyz\\a.h", &h))
+    var id: u64 = 0
+    expect(id_do_forja(&id))
+    expect(id != 0)
+    expect(agora_filetime() > 116444736000000000)
+    _ = file.remove_file(caminho)
+    delete(caminho)
+    delete(base)
+}
+
+proc oo_produto_dll_e_exe() -> Plano2 {
+    var pl: Plano2 = Plano2{opcoes = none}
+    pl.modo = "dev"
+    pl.forja_id = 77
+    pl.projeto.pasta = "C:\\proj"
+    pl.projeto.saida = "C:\\proj\\lib"
+    pl.projeto.produtos = make([dynamic]cache.Produto, alloc = heap)
+    var exe: cache.Produto = cache.Produto{nome = "app", tipo = 0, entrada = "app.fj", saida = "C:\\proj\\app.exe", ndep = 1}
+    exe.dep[0] = 1
+    let dll: cache.Produto = cache.Produto{nome = "lib", tipo = cache.PRODUTO_DLL, entrada = "lib.fj", saida = "C:\\proj\\lib\\lib.dll", cabecalho = "C:\\proj\\lib\\lib.h"}
+    append(&pl.projeto.produtos, item = exe)
+    append(&pl.projeto.produtos, item = dll)
+    pl.estado.linhas = make([dynamic]cache.EstadoLinha, alloc = heap)
+    return pl
+}
+
+test "orquestrar: eh_saida_de_dependencia, montar_chave e dependencias_de_hoje" {
+    var pl: Plano2 = oo_produto_dll_e_exe()
+    let app: ^cache.Produto = cache.projeto_produto(&pl.projeto, 0)
+    expect(eh_saida_de_dependencia(&pl, app, "c:\\PROJ\\LIB\\LIB.DLL"))
+    expect(not eh_saida_de_dependencia(&pl, app, "C:\\proj\\app.exe"))
+    append(&pl.estado.linhas, item = cache.EstadoLinha{nome = "lib", tem_interface = true, hash_interface = 9})
+    var av: Avaliacao = Avaliacao{}
+    av.arquivos = make([dynamic]cache.EstadoArquivo, alloc = heap)
+    append(&av.arquivos, item = cache.EstadoArquivo{caminho = "x", hash = 1})
+    dependencias_de_hoje(&pl, app, &av)
+    expect((av.deps[0].nome or_else "") == "lib")
+    expect(av.deps[0].tem)
+    expect(av.deps[0].hash == 9)
+    let cp = montar_chave(&pl, app, &av)
+    expect(cp.forja == 77)
+    expect((cp.alvo or_else "") == "x86_64-windows")
+    expect((cp.modo or_else "") == "dev")
+    expect((cp.tipo or_else "") == "exe")
+    expect((cp.entrada or_else "") == "app.fj")
+    expect((cp.lib_pasta or_else "") == "C:\\proj\\lib")
+    expect(cp.ndeps == 1)
+    expect(cp.narquivos == 1)
+    expect(cp.nivel == 0)
+    let dll: ^cache.Produto = cache.projeto_produto(&pl.projeto, 1)
+    let cp_dll = montar_chave(&pl, dll, &av)
+    expect((cp_dll.tipo or_else "") == "dll")
+    delete(av.arquivos)
+    liberar_plano(&pl)
+}
+
+test "orquestrar: montar_ordem poe a dependencia antes" {
+    var pl: Plano2 = oo_produto_dll_e_exe()
+    var o: Opcoes = Opcoes{}
+    pl.opcoes = &o
+    var sd: common.SaidaDiag = common.SaidaDiag{}
+    expect(conferir_backend_2(&o, &sd))
+    expect(montar_ordem(&pl, &sd))
+    let ordem: []u32 = pl.ordem or_else {}
+    let camada: []u32 = pl.camada or_else {}
+    expect(len(ordem) == 2)
+    expect(ordem[0] == 1)
+    expect(ordem[1] == 0)
+    expect(camada[0] == 1)
+    expect(camada[1] == 0)
+    liberar_plano(&pl)
+}
+
+test "orquestrar: avaliar produto, linha do estado e motivo pelo .entradas" {
+    let base = pw_pasta_temp()
+    let pasta = format(f"{base}\\forja_orq_teste_{os.pid()}", alloc = heap)
+    let dir_estado = format(f"{pasta}\\.forja_cache\\estado\\dev", alloc = heap)
+    let fonte = format(f"{pasta}\\a.fj", alloc = heap)
+    let exe = format(f"{pasta}\\a.exe", alloc = heap)
+    let entradas = format(f"{dir_estado}\\a.entradas", alloc = heap)
+    expect(file.make_dir(dir_estado, all = true) == none)
+    oo_gravar(fonte, "abc")
+    var tam: u64 = 0
+    var mtime: u64 = 0
+    expect(cache.arquivo_medir(fonte, &tam, &mtime))
+    let hash_abc: u64 = common.hash64(as_bytes("abc"), 3, common.HASH64_SEMENTE)
+    let texto_entradas = format(f"# forja-entradas 1\nfj\t{fonte}\t{tam}\t{mtime}\t{hash_abc:016x}\n", alloc = heap)
+    oo_gravar(entradas, texto_entradas)
+
+    var pl: Plano2 = Plano2{opcoes = none}
+    var o: Opcoes = Opcoes{}
+    pl.opcoes = &o
+    pl.modo = "dev"
+    pl.projeto.pasta = pasta
+    pl.projeto.saida = pasta
+    pl.projeto.produtos = make([dynamic]cache.Produto, alloc = heap)
+    append(&pl.projeto.produtos, item = cache.Produto{nome = "a", tipo = 0, entrada = fonte, saida = exe})
+    expect(orq_preparar_plano(&pl))
+    expect(pl.forja_id != 0)
+    expect(pl.inicio > 116444736000000000)
+    pl.inicio = 0
+
+    var motivo: [200]u8 = {}
+    expect(orq_avaliar_produto(&pl, 0, motivo[..], 200))
+    expect(from_bytes(motivo[0..<common.c2f_strlen_b(motivo[..])], alloc = frame) == "primeira vez")
+
+    oo_gravar(exe, "x")
+    var linha: cache.EstadoLinha = cache.EstadoLinha{}
+    expect(orq_linha_do_estado(&pl, 0, &linha))
+    expect((linha.nome or_else "") == "a")
+    expect((linha.saida or_else "") == exe)
+    expect(not linha.tem_interface)
+    expect((linha.deps or_else "x") == "")
+    expect(linha.tamanho == 1)
+    append(&pl.estado.linhas, item = linha)
+    var vazio: [200]u8 = {}
+    expect(not orq_avaliar_produto(&pl, 0, vazio[..], 200))
+
+    oo_gravar(fonte, "abd")
+    expect(orq_avaliar_produto(&pl, 0, motivo[..], 200))
+    expect(from_bytes(motivo[0..<common.c2f_strlen_b(motivo[..])], alloc = frame) == "fonte mudou: a.fj")
+    oo_gravar(fonte, "abc")
+    expect(not orq_avaliar_produto(&pl, 0, vazio[..], 200))
+
+    expect(file.remove_file(exe) == none)
+    expect(orq_avaliar_produto(&pl, 0, motivo[..], 200))
+    expect(from_bytes(motivo[0..<common.c2f_strlen_b(motivo[..])], alloc = frame) == "saida ausente ou alterada")
+    o.tudo = true
+    oo_gravar(exe, "x")
+    expect(orq_avaliar_produto(&pl, 0, motivo[..], 200))
+    expect(from_bytes(motivo[0..<common.c2f_strlen_b(motivo[..])], alloc = frame) == "forcado (--tudo)")
+
+    liberar_plano(&pl)
+    _ = file.remove_dir(pasta, all = true)
+    delete(texto_entradas)
+    delete(entradas)
+    delete(exe)
+    delete(fonte)
+    delete(dir_estado)
+    delete(pasta)
+    delete(base)
+}

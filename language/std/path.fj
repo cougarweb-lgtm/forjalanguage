@@ -1,0 +1,484 @@
+// std:path - caminhos de arquivo no texto: separar, juntar, limpar e relativizar (IA1-S2d2, A42, B11). API em ingles (ADR-39); Forja pura, so lexica: NENHUM acesso a disco (nao existe, nao resolve link, nao le o diretorio atual), igual nos 2 backends.
+// Versao: 0.2.0. Changelog: 0.2.0 - B01e1: clean, join, join2, rel e with_ext (e os auxiliares fold_elements, clean_volume_only, climb_and_descend, relate_names) ganham `alloc: Allocator` (ultimo parametro, sem padrao); o resultado vai para o alocador do chamador, os temporarios deletados continuam no heap; 0.1.0 - IA1-S2d2: sep, is_abs, base, dir, ext, stem, split, clean, join, join2, rel, with_ext, has_ext.
+// Caminho e uma sequencia de BYTES (UTF-8 passa intacto); nada de normalizar maiuscula/minuscula, nem no Windows (rel compara as letras como estao).
+// Separador pelo alvo da compilacao (os.TARGET, B11): "x86_64-windows" usa '\' e aceita TAMBEM '/' na ENTRADA; qualquer outro alvo (x86_64-linux) so tem '/'. A SAIDA de clean, join e rel usa sempre o separador nativo (sep()).
+// Windows, volume: `X:` (X letra ASCII) e UNC `\\servidor\compartilhamento` (servidor e compartilhamento nao vazios) sao o "volume" do caminho: clean e rel o preservam, base/dir/ext/split nao o tratam como componente. Nao ha o prefixo `\\?\` nem `\\.\` (sao lidos como UNC comum ou como caminho normal).
+// Posse: is_abs, has_ext, sep, base, dir, ext, stem e split NAO alocam: as fatias sao VISTAS de p (vivem enquanto p viver, sem delete); onde falta texto na entrada (base de "" e de so separadores, dir sem pasta) a vista e um literal ("." ou o separador nativo). clean, join, join2, rel e with_ext recebem `alloc: Allocator` por ultimo e devolvem texto DONO do alocador que o chamador passou: delete(texto) so se o alloc foi heap.
+// Diferencas conhecidas em relacao ao Go (filepath): clean/join/rel comparam e preservam bytes sem dobrar caixa; join de "C:" com "a" da "C:\a" (Go da "C:a"); dir/base/ext/stem ignoram as barras do fim ("a/b/" -> base "b", dir "a"), como o dirname/basename do POSIX; base("C:") e "." (o Go da o separador).
+import "std:os" as os
+
+const SLASH: u8 = 47
+const BACKSLASH: u8 = 92
+const COLON: u8 = 58
+const DOT: u8 = 46
+const LETRA_A_MAIUSCULA: u8 = 65
+const LETRA_Z_MAIUSCULA: u8 = 90
+const LETRA_A_MINUSCULA: u8 = 97
+const LETRA_Z_MINUSCULA: u8 = 122
+const FILL_BYTE: u8 = 0
+const WINDOWS_TARGET: str = "x86_64-windows"
+const DRIVE_LEN: int = 2
+const MIN_UNC_LEN: int = 5
+const PARENT_DIR: str = ".."
+const CURRENT_DIR: str = "."
+
+// true quando o alvo da compilacao e o Windows (decidido na compilacao pelo os.TARGET).
+proc is_windows() -> bool {
+    return os.TARGET == WINDOWS_TARGET
+}
+
+// O separador nativo do alvo: '\' no Windows, '/' nos demais.
+pub proc sep() -> u8 {
+    if is_windows() {
+        return BACKSLASH
+    }
+    return SLASH
+}
+
+// O separador nativo como texto de 1 byte (literal, sem alocar).
+proc sep_str() -> str {
+    if is_windows() {
+        return "\\"
+    }
+    return "/"
+}
+
+// true se b separa componentes na ENTRADA: '/' sempre; '\' so no Windows.
+proc is_sep(b: u8) -> bool {
+    return b == SLASH or (b == BACKSLASH and is_windows())
+}
+
+proc is_letter(b: u8) -> bool {
+    return (b >= LETRA_A_MAIUSCULA and b <= LETRA_Z_MAIUSCULA) or (b >= LETRA_A_MINUSCULA and b <= LETRA_Z_MINUSCULA)
+}
+
+// Tamanho do volume UNC `\\servidor\compartilhamento` no comeco de p (0 se nao ha). Servidor e compartilhamento nao vazios.
+proc unc_len(p: str) -> int {
+    let n = len(p)
+    if n < MIN_UNC_LEN or not is_sep(p[0]) or not is_sep(p[1]) or is_sep(p[2]) {
+        return 0
+    }
+    var i = 2
+    while i < n and not is_sep(p[i]) {
+        i += 1
+    }
+    if i + 1 >= n or is_sep(p[i + 1]) {
+        return 0
+    }
+    i += 1
+    while i < n and not is_sep(p[i]) {
+        i += 1
+    }
+    return i
+}
+
+// Tamanho do volume no comeco de p: 2 para `X:`, o tamanho do UNC, ou 0 (sempre 0 fora do Windows).
+proc vol_len(p: str) -> int {
+    if not is_windows() {
+        return 0
+    }
+    if len(p) >= DRIVE_LEN and p[1] == COLON and is_letter(p[0]) {
+        return DRIVE_LEN
+    }
+    return unc_len(p)
+}
+
+// Fim do componente que comeca em start: posicao do proximo separador de s, ou len(s).
+proc element_end(s: str, start: int) -> int {
+    var i = start
+    while i < len(s) and not is_sep(s[i]) {
+        i += 1
+    }
+    return i
+}
+
+// Limites [start, stop) do ultimo componente de p, sem o volume e sem as barras do fim. start == stop quando nao ha componente (p vazio, so volume ou so separadores).
+proc last_component(p: str) -> (start: int, stop: int) {
+    let vol = vol_len(p)
+    var stop = len(p)
+    while stop > vol and is_sep(p[stop - 1]) {
+        stop -= 1
+    }
+    var start = stop
+    while start > vol and not is_sep(p[start - 1]) {
+        start -= 1
+    }
+    return start, stop
+}
+
+// Menor tamanho que dir() mantem: o volume mais a raiz (o separador logo depois do volume), se houver.
+proc root_end(p: str) -> int {
+    let vol = vol_len(p)
+    if vol < len(p) and is_sep(p[vol]) {
+        return vol + 1
+    }
+    return vol
+}
+
+// Onde a extensao comeca dentro do nome (len(name) se nao ha): do ultimo '.', exceto o ponto inicial (".bashrc" nao tem) e os nomes "." e "..".
+proc ext_offset(name: str) -> int {
+    let n = len(name)
+    if name == CURRENT_DIR or name == PARENT_DIR {
+        return n
+    }
+    var i = n - 1
+    while i > 0 {
+        if name[i] == DOT {
+            return i
+        }
+        i -= 1
+    }
+    return n
+}
+
+// true se p e absoluto. Windows: comeca com separador (inclui UNC) ou com `X:` e um separador (`C:` e `C:rel` NAO sao absolutos). Linux: comeca com '/'.
+pub proc is_abs(p: str) -> bool {
+    if len(p) == 0 {
+        return false
+    }
+    if not is_windows() {
+        return p[0] == SLASH
+    }
+    if is_sep(p[0]) {
+        return true
+    }
+    return len(p) > DRIVE_LEN and p[1] == COLON and is_letter(p[0]) and is_sep(p[2])
+}
+
+// Ultimo componente de p (vista), ignorando as barras do fim: "a/b/" da "b"; "" da "."; so separadores da o separador nativo; so volume (`C:`) da ".".
+pub proc base(p: str) -> str {
+    if len(p) == 0 {
+        return CURRENT_DIR
+    }
+    let start, stop = last_component(p)
+    if start < stop {
+        return p[start..<stop]
+    }
+    if len(p) > vol_len(p) {
+        return sep_str()
+    }
+    return CURRENT_DIR
+}
+
+// Tudo antes do ultimo componente (vista), sem deixar barra no fim: "a/b" da "a"; "a" e "" dao "."; "/a" da "/"; "/" da "/"; "C:\a" da "C:\"; "C:a" da "C:". Nao limpa o miolo ("a//b/c" da "a//b"): para isso use clean.
+pub proc dir(p: str) -> str {
+    if len(p) == 0 {
+        return CURRENT_DIR
+    }
+    let start, stop = last_component(p)
+    let floor = root_end(p)
+    if start == stop {
+        return p[0..<floor]
+    }
+    var cut_at = start
+    while cut_at > floor and is_sep(p[cut_at - 1]) {
+        cut_at -= 1
+    }
+    if cut_at == 0 {
+        return CURRENT_DIR
+    }
+    return p[0..<cut_at]
+}
+
+// Extensao do ultimo componente (vista), com o ponto: "a.tar.gz" da ".gz"; "a." da "."; "" se nao ha ponto, se o unico ponto e o 1o byte do nome (".bashrc") ou se o nome e "." ou "..".
+pub proc ext(p: str) -> str {
+    let start, stop = last_component(p)
+    return p[start + ext_offset(p[start..<stop])..<stop]
+}
+
+// O ultimo componente sem a extensao (vista): "a.tar.gz" da "a.tar"; ".bashrc" da ".bashrc"; sem componente da o mesmo que base.
+pub proc stem(p: str) -> str {
+    let start, stop = last_component(p)
+    if start == stop {
+        return base(p)
+    }
+    return p[start..<start + ext_offset(p[start..<stop])]
+}
+
+// Regra do Go filepath.Split: (tudo ate a ultima barra INCLUSIVE, o que vem depois). "a/b" da ("a/", "b"); "b" da ("", "b"); "a/" da ("a/", ""); `C:a` da ("C:", "a"). dir_part + file_part e sempre p.
+pub proc split(p: str) -> (dir_part: str, file_part: str) {
+    let vol = vol_len(p)
+    var i = len(p) - 1
+    while i >= vol and not is_sep(p[i]) {
+        i -= 1
+    }
+    return p[0..<i + 1], p[i + 1..<len(p)]
+}
+
+// Acrescenta s ao builder trocando cada separador de entrada pelo nativo.
+proc append_native(out: ^[dynamic]u8, s: str) {
+    for i in 0..<len(s) {
+        if is_sep(s[i]) {
+            append(out, item = sep())
+        } else {
+            append(out, item = s[i])
+        }
+    }
+}
+
+// Se o caminho recuou um componente: nova posicao de escrita w (a do separador que o antecedia, nunca antes de dotdot).
+proc backtrack(out: []u8, w: int, dotdot: int) -> int {
+    var pos = w - 1
+    while pos > dotdot and out[pos] != sep() {
+        pos -= 1
+    }
+    return pos
+}
+
+// O ".." do Go Clean: recua um componente se der (w > dotdot); na raiz absoluta some; num relativo sem o que recuar vira um ".." escrito (e dotdot passa a valer depois dele). Devolve a nova (w, dotdot).
+proc push_parent(out: []u8, w: int, dotdot: int, rooted: bool) -> (new_w: int, new_dotdot: int) {
+    if w > dotdot {
+        return backtrack(out, w = w, dotdot = dotdot), dotdot
+    }
+    if rooted {
+        return w, dotdot
+    }
+    var pos = w
+    if pos > 0 {
+        out[pos] = sep()
+        pos += 1
+    }
+    out[pos] = DOT
+    out[pos + 1] = DOT
+    return pos + 2, pos + 2
+}
+
+// Escreve o componente name em out na posicao w (com o separador antes, salvo no 1o) e devolve a nova posicao.
+proc push_name(out: []u8, w: int, name: str, rooted: bool) -> int {
+    var pos = w
+    if (rooted and pos != 1) or (not rooted and pos != 0) {
+        out[pos] = sep()
+        pos += 1
+    }
+    for k in 0..<len(name) {
+        out[pos] = name[k]
+        pos += 1
+    }
+    return pos
+}
+
+// Parte limpa do caminho (sem o volume), a regra do Go Clean: junta separadores repetidos, tira ".", resolve ".." sem tocar o disco; ".." inicial de caminho relativo fica; ".." acima da raiz some; vazio da ".". Texto DONO do alocador que o chamador passou, com separador nativo (o builder temporario fica no heap).
+proc fold_elements(rest: str, alloc: Allocator) -> str {
+    let n = len(rest)
+    var out = make([dynamic]u8, alloc = heap, cap = n + 3)
+    defer delete(out)
+    for _k in 0..<n + 3 {
+        append(&out, item = FILL_BYTE)
+    }
+    let rooted = is_sep(rest[0])
+    var w = 0
+    var dotdot = 0
+    var r = 0
+    if rooted {
+        out[0] = sep()
+        w = 1
+        r = 1
+        dotdot = 1
+    }
+    while r < n {
+        if is_sep(rest[r]) {
+            r += 1
+            continue
+        }
+        let e = element_end(rest, start = r)
+        let name = rest[r..<e]
+        r = e
+        if name == CURRENT_DIR {
+            continue
+        }
+        if name == PARENT_DIR {
+            let new_w, new_dotdot = push_parent(out[..], w = w, dotdot = dotdot, rooted = rooted)
+            w = new_w
+            dotdot = new_dotdot
+            continue
+        }
+        w = push_name(out[..], w = w, name = name, rooted = rooted)
+    }
+    if w == 0 {
+        return clone(CURRENT_DIR, alloc = alloc)
+    }
+    let whole = to_str(&out)
+    defer delete(whole)
+    return clone(whole[0..<w], alloc = alloc)
+}
+
+// clean de p quando so ha volume: UNC fica como veio (separador nativo); `X:` da `X:.`; vazio da ".".
+proc clean_volume_only(p: str, vol: int, alloc: Allocator) -> str {
+    var out = make([dynamic]u8, alloc = alloc, cap = len(p) + 1)
+    defer delete(out)
+    append_native(&out, p)
+    if vol < MIN_UNC_LEN {
+        append(&out, item = DOT)
+    }
+    return to_str(&out)
+}
+
+// Caminho em forma canonica, so lexica (Go filepath.Clean): separador nativo, sem separadores repetidos, sem componente ".", ".." resolvido sem tocar o disco, ".." inicial relativo mantido, ".." acima da raiz absoluta descartado, vazio vira ".". No Windows preserva o volume `X:` e o UNC. Texto DONO do alocador que o chamador passou: delete so se o alloc foi heap.
+pub proc clean(p: str, alloc: Allocator) -> str {
+    let vol = vol_len(p)
+    if len(p) == vol {
+        return clean_volume_only(p, vol, alloc = alloc)
+    }
+    let folded = fold_elements(p[vol..<len(p)], alloc = heap)
+    defer delete(folded)
+    var out = make([dynamic]u8, alloc = alloc, cap = len(p) + 3)
+    defer delete(out)
+    append_native(&out, p[0..<vol])
+    append(&out, item = folded)
+    return to_str(&out)
+}
+
+// Junta as partes com o separador nativo, ignorando as vazias, e limpa o resultado (clean). Todas vazias (ou lista vazia) da "". join(["a", "/b"]) da "a/b" (a '/' do meio nao zera o caminho, como no Go). Texto DONO do alocador que o chamador passou: delete so se o alloc foi heap.
+pub proc join(parts: []str, alloc: Allocator) -> str {
+    var joined = make([dynamic]u8, alloc = heap)
+    defer delete(joined)
+    var has_part = false
+    for part in parts {
+        if len(part) == 0 {
+            continue
+        }
+        if has_part {
+            append(&joined, item = sep())
+        }
+        append(&joined, item = part)
+        has_part = true
+    }
+    if not has_part {
+        return clone("", alloc = alloc)
+    }
+    let text = to_str(&joined)
+    defer delete(text)
+    return clean(text, alloc = alloc)
+}
+
+// Atalho de join para 2 partes: join2(a, b = x, alloc = heap) = join([a, x], alloc = heap). Texto DONO do alocador que o chamador passou: delete so se o alloc foi heap.
+pub proc join2(a: str, b: str, alloc: Allocator) -> str {
+    var parts: [2]str = {a, b}
+    return join(parts[..], alloc = alloc)
+}
+
+// A parte de um caminho ja limpo que vem depois do volume, pronta para comparar nomes: "." vira "" e o UNC puro vira a raiz.
+proc after_volume(p: str, vol: int) -> str {
+    let rest = p[vol..<len(p)]
+    if rest == CURRENT_DIR {
+        return rest[0..<0]
+    }
+    if len(rest) == 0 and vol > DRIVE_LEN {
+        return sep_str()
+    }
+    return rest
+}
+
+// s sem o separador inicial (a raiz), se tiver.
+proc strip_root(s: str) -> str {
+    if len(s) > 0 and is_sep(s[0]) {
+        return s[1..<len(s)]
+    }
+    return s
+}
+
+// Quantos componentes tem s (limpo, sem raiz): "" 0, "a" 1, "a/b" 2.
+proc count_elements(s: str) -> int {
+    if len(s) == 0 {
+        return 0
+    }
+    var total = 1
+    for i in 0..<len(s) {
+        if is_sep(s[i]) {
+            total += 1
+        }
+    }
+    return total
+}
+
+// O caminho que sobe uma vez por componente de from_left (".." separados) e desce por to_left; "." se os dois estao vazios.
+proc climb_and_descend(from_left: str, to_left: str, alloc: Allocator) -> str {
+    let ups = count_elements(from_left)
+    var out = make([dynamic]u8, alloc = alloc, cap = ups * 3 + len(to_left) + 1)
+    defer delete(out)
+    for k in 0..<ups {
+        if k > 0 {
+            append(&out, item = sep())
+        }
+        append(&out, item = PARENT_DIR)
+    }
+    if len(to_left) > 0 {
+        if ups > 0 {
+            append(&out, item = sep())
+        }
+        append(&out, item = to_left)
+    }
+    if len(out) == 0 {
+        return clone(CURRENT_DIR, alloc = alloc)
+    }
+    return to_str(&out)
+}
+
+// Compara from_names e to_names (limpos, sem raiz) componente a componente e monta o caminho; "" se sobrou um ".." em from_names (nao da para saber o nome da pasta atras dele).
+proc relate_names(from_names: str, to_names: str, alloc: Allocator) -> str {
+    let nf = len(from_names)
+    let nt = len(to_names)
+    var fi = 0
+    var ti = 0
+    while fi < nf and ti < nt {
+        let fe = element_end(from_names, start = fi)
+        let te = element_end(to_names, start = ti)
+        if from_names[fi..<fe] != to_names[ti..<te] {
+            break
+        }
+        fi = min(fe + 1, b = nf)
+        ti = min(te + 1, b = nt)
+    }
+    let from_left = from_names[fi..<nf]
+    if from_left[0..<element_end(from_left, start = 0)] == PARENT_DIR {
+        return clone("", alloc = alloc)
+    }
+    return climb_and_descend(from_left, to_names[ti..<nt], alloc = alloc)
+}
+
+// Caminho relativo, lexico, que leva de base ate target (Go filepath.Rel): join2(base, b = rel(base, target)) limpo = clean(target). Os dois sao limpos antes. Devolve "" (vazio) quando nao existe: um absoluto e o outro relativo, volumes diferentes no Windows, ou base com ".." que sobra. Iguais da ".". Texto DONO do alocador que o chamador passou: delete so se o alloc foi heap.
+pub proc rel(base: str, target: str, alloc: Allocator) -> str {
+    let from_path = clean(base, alloc = heap)
+    defer delete(from_path)
+    let to_path = clean(target, alloc = heap)
+    defer delete(to_path)
+    let from_vol = vol_len(from_path)
+    let to_vol = vol_len(to_path)
+    if from_path[0..<from_vol] != to_path[0..<to_vol] {
+        return clone("", alloc = alloc)
+    }
+    let from_rest = after_volume(from_path, vol = from_vol)
+    let to_rest = after_volume(to_path, vol = to_vol)
+    let from_names = strip_root(from_rest)
+    let to_names = strip_root(to_rest)
+    let from_rooted = len(from_names) != len(from_rest)
+    let to_rooted = len(to_names) != len(to_rest)
+    if from_rooted != to_rooted {
+        return clone("", alloc = alloc)
+    }
+    return relate_names(from_names, to_names, alloc = alloc)
+}
+
+// Troca (ou poe) a extensao do ultimo componente: ext com ou sem ponto inicial ("md" e ".md" dao o mesmo); ext vazio tira a extensao. As barras do fim ficam. Sem componente (p vazio, so volume ou so separadores) ou componente "." / "..": devolve copia de p. Texto DONO do alocador que o chamador passou: delete so se o alloc foi heap.
+pub proc with_ext(p: str, ext: str, alloc: Allocator) -> str {
+    let start, stop = last_component(p)
+    let name = p[start..<stop]
+    if start == stop or name == CURRENT_DIR or name == PARENT_DIR {
+        return clone(p, alloc = alloc)
+    }
+    var out = make([dynamic]u8, alloc = alloc, cap = len(p) + len(ext) + 1)
+    defer delete(out)
+    append(&out, item = p[0..<start + ext_offset(name)])
+    if len(ext) > 0 and ext[0] != DOT {
+        append(&out, item = DOT)
+    }
+    append(&out, item = ext)
+    append(&out, item = p[stop..<len(p)])
+    return to_str(&out)
+}
+
+// true se a extensao de p (como ext(p), COM o ponto) e igual a ext, byte a byte: has_ext("a.txt", ext = ".txt") e true, com "txt" e false; has_ext("a", ext = "") e true.
+pub proc has_ext(p: str, ext: str) -> bool {
+    let start, stop = last_component(p)
+    return p[start + ext_offset(p[start..<stop])..<stop] == ext
+}

@@ -1,0 +1,917 @@
+// nativo/bir/bir_construir.fj - porte de compiler/nativo/bir/bir_construir.c
+// sha256 de nativo/bir/bir_construir.c: 08731d03dbb11d77c04935cc01d22709c688dd0acdd49baf924d8c1ac2d3943b
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "common"
+import "ir"
+import "semantic"
+
+struct BirPrint {
+    tipo: u32 // TipoId
+    funcao: str
+    extensao: u8
+}
+
+const MARCO_PENDENTE: str = "M2"
+const TEXTO_SEM_RETORNO: str = "fim da proc sem retorno (IR)"
+const NOME_X0001_MAX: i32 = 256
+const CAUSA_INCONSISTENTE_MAX: i32 = 400
+// C: nativo/bir/bir_construir.c:370 (forja_print_* do runtime nativo; a extensao segue o sinal do tipo)
+const PRINTS: [9]BirPrint = {
+    BirPrint{tipo = semantic.TIPO_I8 as u32, funcao = "forja_print_i32", extensao = BE_SINAL as u8},
+    BirPrint{tipo = semantic.TIPO_I16 as u32, funcao = "forja_print_i32", extensao = BE_SINAL as u8},
+    BirPrint{tipo = semantic.TIPO_I32 as u32, funcao = "forja_print_i32", extensao = BE_SINAL as u8},
+    BirPrint{tipo = semantic.TIPO_INT as u32, funcao = "forja_print_i64", extensao = BE_NENHUMA as u8},
+    BirPrint{tipo = semantic.TIPO_U8 as u32, funcao = "forja_print_u64", extensao = BE_ZERO as u8},
+    BirPrint{tipo = semantic.TIPO_U16 as u32, funcao = "forja_print_u64", extensao = BE_ZERO as u8},
+    BirPrint{tipo = semantic.TIPO_U32 as u32, funcao = "forja_print_u64", extensao = BE_ZERO as u8},
+    BirPrint{tipo = semantic.TIPO_UINT as u32, funcao = "forja_print_u64", extensao = BE_NENHUMA as u8},
+    BirPrint{tipo = semantic.TIPO_BOOL as u32, funcao = "forja_print_bool", extensao = BE_ZERO as u8},
+}
+// C: nativo/bir/bir_construir.c:672 (nomes do runtime de copia e zera sem alvo escolhido: os do Windows)
+const NOMES_MEM_WINDOWS: BirNomesMem = BirNomesMem{copia = "memcpy", zera = "memset"}
+
+// C: nativo/bir/bir_construir.c:49
+// C2F: str nao muda; o buffer do C vira o [dynamic]u8 do chamador, com o mesmo limite cap-1 do snprintf
+proc acrescentar_parte(saida: ^[dynamic]u8, cap: u64, parte: ?str) {
+    let texto: str = parte or_else "-"
+    if texto == "-" {
+        return
+    }
+    if len(saida) > 0 {
+        if (len(saida) as u64) + 1 >= cap {
+            return
+        }
+        append(saida, item = (32 as u8))
+    }
+    let bytes: []u8 = as_bytes(texto)
+    for k in 0..<len(bytes) {
+        if (len(saida) as u64) + 1 >= cap {
+            return
+        }
+        append(saida, item = bytes[k])
+    }
+}
+
+// Valores conferidos com o AcrescentarParte do C (bir_construir.c:49), buffer de 8 e de 16 bytes
+test "acrescentar_parte" {
+    var a: [dynamic]u8 = make([dynamic]u8, alloc = heap, cap = 8)
+    defer delete(a)
+    acrescentar_parte(&a, 8, "ab")
+    acrescentar_parte(&a, 8, "cd")
+    acrescentar_parte(&a, 8, "efgh")
+    expect(from_bytes(a[..], alloc = frame) == "ab cd e")
+    var b: [dynamic]u8 = make([dynamic]u8, alloc = heap, cap = 8)
+    defer delete(b)
+    acrescentar_parte(&b, 8, "-")
+    acrescentar_parte(&b, 8, none)
+    acrescentar_parte(&b, 8, "xyz")
+    expect(from_bytes(b[..], alloc = frame) == "xyz")
+    var c: [dynamic]u8 = make([dynamic]u8, alloc = heap, cap = 16)
+    defer delete(c)
+    acrescentar_parte(&c, 16, "i32")
+    acrescentar_parte(&c, 16, "-")
+    acrescentar_parte(&c, 16, "u8")
+    expect(from_bytes(c[..], alloc = frame) == "i32 u8")
+}
+
+// Valores conferidos com o AcrescentarParte do C (gcc -O0, snprintf): corte no meio da parte e separador antes de ""
+test "acrescentar_parte_corte" {
+    var a: [dynamic]u8 = make([dynamic]u8, alloc = heap, cap = 16)
+    defer delete(a)
+    acrescentar_parte(&a, 16, "abcdefghijklmnopqrstu")
+    acrescentar_parte(&a, 16, "bb")
+    expect(from_bytes(a[..], alloc = frame) == "abcdefghijklmno")
+    var b: [dynamic]u8 = make([dynamic]u8, alloc = heap, cap = 10)
+    defer delete(b)
+    acrescentar_parte(&b, 10, "12345")
+    acrescentar_parte(&b, 10, "678901")
+    expect(from_bytes(b[..], alloc = frame) == "12345 678")
+    var c: [dynamic]u8 = make([dynamic]u8, alloc = heap, cap = 6)
+    defer delete(c)
+    acrescentar_parte(&c, 6, "ab")
+    acrescentar_parte(&c, 6, "cdefgh")
+    expect(from_bytes(c[..], alloc = frame) == "ab cd")
+    var d: [dynamic]u8 = make([dynamic]u8, alloc = heap, cap = 256)
+    defer delete(d)
+    acrescentar_parte(&d, 256, "Add")
+    acrescentar_parte(&d, 256, "")
+    acrescentar_parte(&d, 256, "i32")
+    expect(from_bytes(d[..], alloc = frame) == "Add  i32")
+}
+
+// Mensagem do X0001 conferida com DiagRelatar do C: parte "" entra com separador (o C so pula NULL e "-")
+test "bir_falha_x0001_mensagem" {
+    var d: common.Diag = common.Diag{tem = false}
+    var c: BirCtx = BirCtx{d = &d}
+    _ = bir_falha_x0001(&c, 5, {"Add", "", "i32"}, "M2")
+    expect((d.causa or_else "") == "Add  i32 ainda nao suportado no backend nativo (marco M2)")
+}
+
+// C: nativo/bir/bir_construir.c:59
+proc bir_falha_x0001(c: ^BirCtx, pos: u32, partes: [3]str, marco: str) -> bool {
+    var nome: [dynamic]u8 = make([dynamic]u8, alloc = heap, cap = NOME_X0001_MAX as int)
+    defer delete(nome)
+    for k in 0..<3 {
+        acrescentar_parte(&nome, NOME_X0001_MAX as u64, partes[k])
+    }
+    let nome_txt: str = from_bytes(nome[..], alloc = heap)
+    defer delete(nome_txt)
+    let msg_1 = format(f"{nome_txt} ainda nao suportado no backend nativo (marco {marco})", alloc = heap)
+    defer delete(msg_1)
+    var posicao: u32 = pos
+    if pos == BIR_SEM_POS {
+        posicao = 0
+    }
+    return common.diag_relatar(c.d as ^common.Diag, common.X0001, posicao, msg_1)
+}
+
+// C: nativo/bir/bir_construir.c:68
+proc nome_da_classe(classe: i32) -> str {
+    let sw_1 = common.c2f_s2u_32(classe)
+    if sw_1 == (semantic.TC_STRUCT as u32) {
+        return "struct"
+    } else if sw_1 == (semantic.TC_ENUM as u32) {
+        return "enum"
+    } else if sw_1 == (semantic.TC_PONTEIRO as u32) {
+        return "ponteiro"
+    } else if sw_1 == (semantic.TC_RESULTADO as u32) {
+        return "resultado"
+    } else if sw_1 == (semantic.TC_REAL as u32) {
+        return "real"
+    } else if sw_1 == (semantic.TC_ARRAY as u32) {
+        return "array"
+    } else if sw_1 == (semantic.TC_FATIA as u32) {
+        return "fatia"
+    } else if sw_1 == (semantic.TC_DINAMICO as u32) {
+        return "lista"
+    } else if sw_1 == (semantic.TC_OPCIONAL as u32) or sw_1 == (semantic.TC_ANULAVEL as u32) {
+        return "opcional"
+    } else if sw_1 == (semantic.TC_UNIAO as u32) {
+        return "union"
+    } else if sw_1 == (semantic.TC_TUPLA as u32) {
+        return "tupla"
+    } else if sw_1 == (semantic.TC_PROC as u32) {
+        return "callback"
+    } else {
+        return "tipo"
+    }
+    return ""
+}
+
+// C: nativo/bir/bir_construir.c:87
+pub proc bir_nome_do_tipo(tipos: ^semantic.Tipos, tipo: u32) -> ?str {
+    let fixo: ?str = semantic.tipo_nome_fixo(tipo)
+    if fixo != none {
+        return fixo
+    }
+    return nome_da_classe(semantic.tipo_classe_de(tipos, tipo))
+}
+
+// C: nativo/bir/bir_construir.c:94
+proc nome_do_tipo(c: ^BirCtx, tipo: u32) -> ?str {
+    return bir_nome_do_tipo((c.e as ^BirEntrada).tipos as ^semantic.Tipos, tipo)
+}
+
+// C: nativo/bir/bir_construir.c:99
+proc bir_falha_tipo(c: ^BirCtx, i: ?^ir.IrInstr, variante: str, tipo: u32) -> bool {
+    let instr: ^ir.IrInstr = i as ^ir.IrInstr
+    // nome_do_tipo nunca e none (o C devolve sempre texto): o or_else so cumpre o tipo
+    let partes: [3]str = {bir_nome_do_op(instr.op as u8), variante, nome_do_tipo(c, tipo) or_else ""}
+    return bir_falha_x0001(c, instr.pos, partes, MARCO_PENDENTE)
+}
+
+// C: nativo/bir/bir_construir.c:104
+proc bir_falha_inconsistente(c: ^BirCtx, causa: str) -> bool {
+    var tern_1: u32 = 0
+    if c.atual != none {
+        tern_1 = (c.atual as ^ir.IrInstr).pos
+    }
+    let pos: u32 = tern_1
+    let msg_1 = format(f"IR inconsistente para a BIR: {causa}", alloc = heap)
+    defer delete(msg_1)
+    return common.diag_relatar(c.d as ^common.Diag, common.X0904, pos, msg_1)
+}
+
+// C: nativo/bir/bir_construir.c:114
+proc classe_do_tipo_primitivo(tipo: u32, classe: ^u8) -> bool {
+    if tipo == (semantic.TIPO_BOOL as u32) or tipo == (semantic.TIPO_I8 as u32) or tipo == (semantic.TIPO_U8 as u32) {
+        classe^ = BC_I8 as u8
+        return true
+    } else if tipo == (semantic.TIPO_I16 as u32) or tipo == (semantic.TIPO_U16 as u32) {
+        classe^ = BC_I16 as u8
+        return true
+    } else if tipo == (semantic.TIPO_I32 as u32) or tipo == (semantic.TIPO_U32 as u32) {
+        classe^ = BC_I32 as u8
+        return true
+    } else if tipo == (semantic.TIPO_INT as u32) or tipo == (semantic.TIPO_UINT as u32) {
+        classe^ = BC_I64 as u8
+        return true
+    } else if tipo == (semantic.TIPO_F64 as u32) {
+        classe^ = BC_F64 as u8
+        return true
+    } else {
+        return false
+    }
+    return false
+}
+
+// C: nativo/bir/bir_construir.c:127
+proc tipo_eh_endereco(tipos: ^semantic.Tipos, tipo: u32) -> bool {
+    let sw_1 = common.c2f_s2u_32(semantic.tipo_classe_de(tipos, tipo))
+    if sw_1 == (semantic.TC_PONTEIRO as u32) or sw_1 == (semantic.TC_ANULAVEL as u32) or sw_1 == (semantic.TC_RAWPTR as u32) or sw_1 == (semantic.TC_CSTR as u32) or sw_1 == (semantic.TC_PROC as u32) {
+        return true
+    } else {
+        return semantic.tipo_opcional_nicho(tipos, tipo)
+    }
+    return false
+}
+
+// C: nativo/bir/bir_construir.c:135
+proc bir_classe_do_tipo(tipos: ^semantic.Tipos, tipo: u32, classe: ^u8) -> bool {
+    if classe_do_tipo_primitivo(tipo, classe) {
+        return true
+    }
+    if tipo_eh_endereco(tipos, tipo) {
+        classe^ = BC_I64 as u8
+        return true
+    }
+    if common.c2f_s2u_32(semantic.tipo_classe_de(tipos, tipo)) == (semantic.TC_ENUM as u32) {
+        classe^ = BC_I32 as u8
+        return true
+    }
+    if bir_classe_do_conjunto(tipos, tipo, classe) {
+        return true
+    }
+    if not semantic.tipo_eh_real(tipos, tipo) {
+        return false
+    }
+    classe^ = BC_F32 as u8
+    return true
+}
+
+// C: nativo/bir/bir_construir.c:155
+proc indice_valido(id: i32, n: u32) -> bool {
+    return (id >= 0) and (common.c2f_s2u_32(id) < n)
+}
+
+// C: nativo/bir/bir_construir.c:161
+// C2F-INDECIDIVEL: mapa
+proc declarar_no_mapa(c: ^BirCtx, mapa: []i32, id: i32, classe: u8) -> bool {
+    if mapa[id] < 0 {
+        mapa[id] = bir_novo_vreg(c, classe) as i32
+    }
+    let classes: []u8 = (c.f as ^BirFuncao).classe_vreg or_else {}
+    if classes[mapa[id] as u32] != classe {
+        let causa = format(f"numero {id} redefinido com outra classe", alloc = heap)
+        defer delete(causa)
+        return bir_falha_inconsistente(c, causa)
+    }
+    return true
+}
+
+// C: nativo/bir/bir_construir.c:174
+proc bir_vreg_declarar(c: ^BirCtx, local: i32, classe: u8, vreg: ^u32) -> bool {
+    if not indice_valido(local, c.n_local) {
+        let causa = format(f"local {local} fora de nlocais ({c.n_local})", alloc = heap)
+        defer delete(causa)
+        return bir_falha_inconsistente(c, causa)
+    }
+    let mapa: []i32 = c.vreg_local or_else {}
+    if not declarar_no_mapa(c, mapa, local, classe) {
+        return false
+    }
+    vreg^ = mapa[local] as u32
+    return true
+}
+
+// C: nativo/bir/bir_construir.c:188
+proc bir_definir_destino(c: ^BirCtx, classe: u8, vreg: ^u32) -> bool {
+    let destino: i32 = (c.atual as ^ir.IrInstr).destino as i32
+    if not indice_valido(destino, c.n_temp) {
+        let causa = format(f"temporario {destino} fora de ntemps ({c.n_temp})", alloc = heap)
+        defer delete(causa)
+        return bir_falha_inconsistente(c, causa)
+    }
+    let mapa: []i32 = c.vreg_temp or_else {}
+    if not declarar_no_mapa(c, mapa, destino, classe) {
+        return false
+    }
+    vreg^ = mapa[destino] as u32
+    return true
+}
+
+// C: nativo/bir/bir_construir.c:204
+proc bir_vreg_local(c: ^BirCtx, local: i32, vreg: ^u32) -> bool {
+    let mapa: []i32 = c.vreg_local or_else {}
+    if indice_valido(local, c.n_local) {
+        if mapa[local] >= 0 {
+            vreg^ = mapa[local] as u32
+            return true
+        }
+    }
+    let causa = format(f"local {local} usado antes de declarado", alloc = heap)
+    defer delete(causa)
+    return bir_falha_inconsistente(c, causa)
+}
+
+// C: nativo/bir/bir_construir.c:216
+proc bir_vreg_temp(c: ^BirCtx, id: i32, vreg: ^u32) -> bool {
+    let mapa: []i32 = c.vreg_temp or_else {}
+    if indice_valido(id, c.n_temp) {
+        if mapa[id] >= 0 {
+            vreg^ = mapa[id] as u32
+            return true
+        }
+    }
+    let causa = format(f"temporario {id} usado antes de definido", alloc = heap)
+    defer delete(causa)
+    return bir_falha_inconsistente(c, causa)
+}
+
+// C: nativo/bir/bir_construir.c:228
+proc eh_cstr_literal(v: ^ir.Valor) -> bool {
+    return (v.tipo_no == (ir.V_TEXTO as u8)) and (v.tipo == (semantic.TIPO_CSTR as u32))
+}
+
+// C: nativo/bir/bir_construir.c:234
+proc valor_sem_operando(v: ^ir.Valor) -> bool {
+    return ((v.tipo_no == (ir.V_TEXTO as u8)) and (v.tipo != (semantic.TIPO_CSTR as u32))) or (v.tipo_no == (ir.V_NENHUM as u8))
+}
+
+// C: nativo/bir/bir_construir.c:239
+proc real_em_classe_inteira(v: ^ir.Valor, classe: u8) -> bool {
+    return (v.tipo_no == (ir.V_REAL as u8)) and (not bir_classe_eh_real(classe as i32))
+}
+
+// C: nativo/bir/bir_construir.c:244
+proc eh_imediato_real(v: ^ir.Valor, classe: u8) -> bool {
+    return (common.c2f_b2i32(bir_classe_eh_real(classe as i32)) != 0) and ((v.tipo_no == (ir.V_REAL as u8)) or (v.tipo_no == (ir.V_INT as u8)))
+}
+
+// C: nativo/bir/bir_construir.c:249
+proc eh_imediato_inteiro(v: ^ir.Valor) -> bool {
+    return ((v.tipo_no == (ir.V_INT as u8)) or (v.tipo_no == (ir.V_BOOL as u8))) or (v.tipo_no == (ir.V_NULO as u8))
+}
+
+// C: nativo/bir/bir_construir.c:254
+proc eh_local_em_memoria(c: ^BirCtx, v: ^ir.Valor) -> bool {
+    return (((v.tipo_no == (ir.V_LOCAL as u8)) and (v.id >= 0)) and (common.c2f_s2u_32(v.id) < c.n_local)) and (((c.em_memoria or_else {})[v.id] as i32) != 0)
+}
+
+// C: nativo/bir/bir_construir.c:260
+proc operando_de_vreg(c: ^BirCtx, v: ^ir.Valor, saida: ^BirOperando) -> bool {
+    var vreg: u32 = 0
+    var tern_1: i32 = 0
+    if v.tipo_no == (ir.V_TEMP as u8) {
+        tern_1 = common.c2f_b2i32(not bir_vreg_temp(c, v.id, &vreg))
+    } else {
+        tern_1 = common.c2f_b2i32(not bir_vreg_local(c, v.id, &vreg))
+    }
+    if tern_1 != 0 {
+        return false
+    }
+    saida^ = op_vreg(vreg, ((c.f as ^BirFuncao).classe_vreg or_else {})[vreg])
+    return true
+}
+
+// C: nativo/bir/bir_construir.c:271
+proc operando_numerico(c: ^BirCtx, v: ^ir.Valor, classe: u8, saida: ^BirOperando) -> bool {
+    if eh_imediato_real(v, classe) {
+        return bir_imediato_real(v, classe, saida)
+    }
+    if eh_imediato_inteiro(v) {
+        var tern_1: i64 = 0
+        if v.tipo_no == (ir.V_NULO as u8) {
+            tern_1 = 0
+        } else {
+            tern_1 = bir_inteiro_do_valor(c, v)
+        }
+        saida^ = op_imed(tern_1, classe)
+        return true
+    }
+    if eh_local_em_memoria(c, v) {
+        return bir_ler_local_em_memoria(c, v, saida)
+    }
+    return operando_de_vreg(c, v, saida)
+}
+
+// C: nativo/bir/bir_construir.c:285
+proc bir_operando_de(c: ^BirCtx, i: ?^ir.IrInstr, v: ^ir.Valor, saida: ^BirOperando) -> bool {
+    var classe: u8 = BC_NADA as u8
+    if v.tipo_no == (ir.V_PROC as u8) {
+        return bir_operando_proc(c, v, saida)
+    }
+    if eh_cstr_literal(v) {
+        return bir_texto_cstr(c, v, saida)
+    }
+    if ((not bir_classe_do_tipo((c.e as ^BirEntrada).tipos as ^semantic.Tipos, v.tipo, &classe)) or (common.c2f_b2i32(valor_sem_operando(v)) != 0)) or (common.c2f_b2i32(real_em_classe_inteira(v, classe)) != 0) {
+        let arg_1: u32 = v.tipo
+        let arg_2: str = bir_variante_de(c, i)
+        let arg_3: ?^ir.IrInstr = i
+        let arg_4: ^BirCtx = c
+        return bir_falha_tipo(arg_4, arg_3, arg_2, arg_1)
+    }
+    return operando_numerico(c, v, classe, saida)
+}
+
+// C: nativo/bir/bir_construir.c:298
+proc bir_operando_vreg(c: ^BirCtx, o: BirOperando, saida: ^BirOperando) -> bool {
+    var vreg: u32 = 0
+    if o.tipo != (BO_IMED as u8) {
+        saida^ = o
+        return true
+    }
+    vreg = bir_novo_vreg(c, o.classe)
+    bir_mover(c, vreg, o)
+    saida^ = op_vreg(vreg, o.classe)
+    return true
+}
+
+// C: nativo/bir/bir_construir.c:314
+// C2F: caminho e const char ** do C: vira ^?str (o texto da Fonte, emprestado)
+proc bir_arquivo_e_linha(c: ^BirCtx, pos: u32, caminho: ^?str, linha: ^u32) {
+    let p: common.FontePosicao = common.fonte_localizar_no_arquivo((c.e as ^BirEntrada).fonte, pos)
+    caminho^ = p.caminho
+    linha^ = p.linha
+}
+
+// C: nativo/bir/bir_construir.c:322
+proc bir_vreg_do_texto(c: ^BirCtx, bytes: ?str, tam: u32) -> u32 {
+    let simbolo: u32 = bir_simbolo_texto(c, bytes, tam)
+    let vreg: u32 = bir_novo_vreg(c, BC_I64 as u8)
+    _ = bir_emitir_pedido(c, BirPedido{op = BIR_END_SIMBOLO as u8, dst = vreg, a = op_simbolo(simbolo)})
+    return vreg
+}
+
+// C: nativo/bir/bir_construir.c:333
+proc bir_regra_local(c: ^BirCtx, i: ^ir.IrInstr) -> bool {
+    var classe: u8 = BC_NADA as u8
+    var vreg: u32 = 0
+    var origem: BirOperando = BirOperando{}
+    bir_registrar_tipo_local(c, i.destino, i.tipo)
+    if bir_local_em_memoria(c, i) {
+        return bir_regra_local_mem(c, i)
+    }
+    if not bir_classe_do_tipo((c.e as ^BirEntrada).tipos as ^semantic.Tipos, i.tipo, &classe) {
+        return bir_falha_tipo(c, i, "-", i.tipo)
+    }
+    if not bir_vreg_declarar(c, i.destino, classe, &vreg) {
+        return false
+    }
+    origem = op_imed(0, classe)
+    if (i.a.tipo_no != (ir.V_NENHUM as u8)) and (not bir_operando_de(c, i, &i.a, &origem)) {
+        return false
+    }
+    bir_mover(c, vreg, origem)
+    return true
+}
+
+// C: nativo/bir/bir_construir.c:354
+proc bir_regra_atribuicao(c: ^BirCtx, i: ^ir.IrInstr) -> bool {
+    var vreg: u32 = 0
+    var origem: BirOperando = BirOperando{}
+    if bir_atribuicao_em_memoria(c, i) {
+        return bir_regra_atribuicao_mem(c, i)
+    }
+    if (not bir_vreg_local(c, i.destino, &vreg)) or (not bir_operando_de(c, i, &i.a, &origem)) {
+        return false
+    }
+    bir_mover(c, vreg, origem)
+    return true
+}
+
+// C: nativo/bir/bir_construir.c:382
+proc chamar_runtime_um_arg(c: ^BirCtx, funcao: str, arg: BirOperando) {
+    let args: []BirOperando = arena_fatia_bir_operando(&(c.p as ^BirPrograma).arena, 1)
+    args[0] = arg
+    let chama: ^BirInstr = bir_emitir(c, BIR_CHAMA, BC_NADA as u8)
+    chama.simbolo = bir_simbolo_runtime(c, funcao)
+    chama.args = args
+    chama.nargs = 1
+}
+
+// C: nativo/bir/bir_construir.c:394
+proc imprimir_texto(c: ^BirCtx, i: ^ir.IrInstr) -> bool {
+    let texto: str = common.interner_texto((c.e as ^BirEntrada).nomes as ^common.Interner, i.a.id)
+    let vreg: u32 = bir_vreg_do_texto(c, texto, common.interner_tam((c.e as ^BirEntrada).nomes as ^common.Interner, i.a.id))
+    chamar_runtime_um_arg(c, "forja_print_texto", op_vreg(vreg, BC_I64 as u8))
+    return true
+}
+
+// C: nativo/bir/bir_construir.c:404
+proc imprimir_cstr_variavel(c: ^BirCtx, i: ^ir.IrInstr) -> bool {
+    var valor: BirOperando = BirOperando{}
+    if (not bir_operando_de(c, i, &i.a, &valor)) or (not bir_operando_vreg(c, valor, &valor)) {
+        return false
+    }
+    chamar_runtime_um_arg(c, "forja_print_texto", valor)
+    return true
+}
+
+// C: nativo/bir/bir_construir.c:415
+proc imprimir_escalar(c: ^BirCtx, i: ^ir.IrInstr) -> bool {
+    let tipos: ^semantic.Tipos = (c.e as ^BirEntrada).tipos as ^semantic.Tipos
+    var tipo: u32 = i.a.tipo
+    if (i.a.tipo != (semantic.TIPO_F64 as u32)) and semantic.tipo_eh_real(tipos, i.a.tipo) {
+        tipo = semantic.TIPO_F32 as u32
+    }
+    for k in 0..<len(PRINTS) {
+        if PRINTS[k].tipo != tipo {
+            continue
+        }
+        var valor: BirOperando = BirOperando{}
+        if not bir_operando_de(c, i, &i.a, &valor) {
+            return false
+        }
+        chamar_runtime_um_arg(c, PRINTS[k].funcao, op_com_extensao(valor, PRINTS[k].extensao))
+        return true
+    }
+    return bir_falha_tipo(c, i, "-", i.a.tipo)
+}
+
+// C: nativo/bir/bir_construir.c:431
+proc bir_regra_imprime(c: ^BirCtx, i: ^ir.IrInstr) -> bool {
+    if (i.a.tipo_no == (ir.V_TEXTO as u8)) and (i.a.tipo == (semantic.TIPO_CSTR as u32)) {
+        return imprimir_texto(c, i)
+    }
+    if i.a.tipo == (semantic.TIPO_STR as u32) {
+        return bir_imprime_str(c, i)
+    }
+    if i.a.tipo == (semantic.TIPO_CSTR as u32) {
+        return imprimir_cstr_variavel(c, i)
+    }
+    return imprimir_escalar(c, i)
+}
+
+// C: nativo/bir/bir_construir.c:444
+proc regra_utilizavel(regra: ?BirRegra) -> bool {
+    if regra == none {
+        return false
+    }
+    let r: BirRegra = regra or_else BirRegra{}
+    return ((r.estado as i32) == BR_SUPORTADO) and (r.fn != 0)
+}
+
+// C: nativo/bir/bir_construir.c:449
+proc bir_construir_instr(c: ^BirCtx, i: ?^ir.IrInstr) -> bool {
+    let instr: ^ir.IrInstr = i as ^ir.IrInstr
+    let anterior: ?^ir.IrInstr = c.atual
+    let variante: str = bir_variante_de(c, i)
+    let regra: ?BirRegra = bir_achar_regra(c, instr.op as u8, variante)
+    c.atual = i
+    var ok: bool = false
+    if not regra_utilizavel(regra) {
+        var marco: str = MARCO_PENDENTE
+        if regra != none {
+            marco = (regra or_else BirRegra{}).marco or_else MARCO_PENDENTE
+        }
+        let partes: [3]str = {bir_nome_do_op(instr.op as u8), variante, "-"}
+        ok = bir_falha_x0001(c, instr.pos, partes, marco)
+    } else {
+        let tag: u16 = (regra or_else BirRegra{}).fn
+        ok = chamar_bir_regra_fn(tag, c, instr)
+        if ok and (c.e as ^BirEntrada).traco {
+            ok = bir_tracar(c, i)
+        }
+    }
+    c.atual = anterior
+    return ok
+}
+
+// C: nativo/bir/bir_construir.c:467
+proc registrar_ocorrencia(c: ^BirCtx) {
+    let d: ^common.Diag = c.d as ^common.Diag
+    if d.codigo == common.X0001 {
+        let texto: str = d.causa or_else ""
+        var tam: int = len(texto)
+        if tam > 511 {
+            tam = 511
+        }
+        let causa_copia: str = from_bytes(as_bytes(texto)[0..<tam], alloc = frame)
+        append(c.varredura as ^[dynamic]BirOcorrencia, item = BirOcorrencia{pos = d.off, causa = causa_copia})
+    }
+    d.tem = false
+}
+
+// C: nativo/bir/bir_construir.c:478
+proc bir_construir_bloco(c: ^BirCtx, bloco: ^ir.IrBloco) -> bool {
+    var i: ?^ir.IrInstr = bloco.primeira
+    while i != none {
+        if bir_construir_instr(c, i) {
+            i = (i as ^ir.IrInstr).prox
+            continue
+        }
+        if c.varredura == none {
+            return false
+        }
+        registrar_ocorrencia(c)
+        i = (i as ^ir.IrInstr).prox
+    }
+    return true
+}
+
+// C: nativo/bir/bir_construir.c:492
+proc pos_da_funcao(irf: ^ir.IrFuncao) -> u32 {
+    var tern_1: u32 = BIR_SEM_POS
+    if irf.corpo.primeira != none {
+        tern_1 = (irf.corpo.primeira as ^ir.IrInstr).pos
+    }
+    return tern_1
+}
+
+// C: nativo/bir/bir_construir.c:497
+// C2F: o realloc do C vira fatia nova na arena (sem free); cap^ guarda o tamanho dado a fatia
+proc redimensionar_mapa(c: ^BirCtx, mapa: ?[]i32, cap: ^u32, n: u32) -> []i32 {
+    var saida: []i32 = mapa or_else {}
+    if n > cap^ {
+        saida = common.arena_fatia_i32(&(c.p as ^BirPrograma).arena, n as int)
+        cap^ = n
+    }
+    for k in (0 as u32)..<n {
+        saida[k] = -1
+    }
+    return saida
+}
+
+// C: nativo/bir/bir_construir.c:510
+proc preparar_mapas(c: ^BirCtx, irf: ^ir.IrFuncao) {
+    c.n_local = irf.nlocais
+    c.n_temp = irf.ntemps
+    c.vreg_local = redimensionar_mapa(c, c.vreg_local, &c.cap_local, irf.nlocais)
+    c.vreg_temp = redimensionar_mapa(c, c.vreg_temp, &c.cap_temp, irf.ntemps)
+    let locais: []i32 = c.vreg_local or_else {}
+    var k: u32 = 0
+    while (k < irf.nparams) and (k < irf.nlocais) {
+        locais[k] = k as i32
+        k += 1
+    }
+    bir_mem_preparar_funcao(c, irf)
+}
+
+// C: nativo/bir/bir_construir.c:522
+proc fechar_funcao(c: ^BirCtx) {
+    if c.cur == BIR_SEM_BLOCO {
+        return
+    }
+    let f: ^BirFuncao = c.f as ^BirFuncao
+    if (f.retorno as i32) == BC_NADA {
+        bir_retorna(c, none)
+        return
+    }
+    let fonte: ^common.Fonte = (c.e as ^BirEntrada).fonte as ^common.Fonte
+    let arquivo: str = fonte.caminho or_else ""
+    let vreg_texto: u32 = bir_vreg_do_texto(c, TEXTO_SEM_RETORNO, (len(TEXTO_SEM_RETORNO) as u64) as u32)
+    let vreg_arquivo: u32 = bir_vreg_do_texto(c, arquivo, (len(arquivo) as u64) as u32)
+    var args: [3]BirOperando = {op_vreg(vreg_texto, BC_I64 as u8), op_vreg(vreg_arquivo, BC_I64 as u8), op_imed(0, BC_I32 as u8)}
+    bir_armadilha(c, bir_simbolo_runtime(c, "forja_panic"), args[..])
+}
+
+// C: nativo/bir/bir_construir.c:539
+proc construir_funcao(c: ^BirCtx, irf: ^ir.IrFuncao) -> bool {
+    let p: ^BirPrograma = c.p as ^BirPrograma
+    let indice: u32 = p.nfuncoes
+    p.nfuncoes += 1
+    let fatia: []BirFuncao = p.funcoes or_else {}
+    let f: ^BirFuncao = &fatia[indice]
+    f.simbolo = c.simbolo_do_nome[irf.nome]
+    f.nparams = irf.nparams
+    f.pos = pos_da_funcao(irf)
+    f.blocos = make([dynamic]BirBloco, alloc = heap, cap = BLOCOS_INICIAL as int)
+    f.slots = make([dynamic]BirSlot, alloc = heap, cap = BLOCOS_INICIAL as int)
+    c.f = f
+    c.cap_vregs = 0
+    c.nlacos = 0
+    c.atual = none
+    if not bir_preparar_assinatura(c, irf) {
+        return false
+    }
+    preparar_mapas(c, irf)
+    if (c.e as ^BirEntrada).traco {
+        c.funcao_ir = irf
+        c.slot_traco = -1
+        ir.ir_numerar_funcao(irf, &p.arena, &c.num)
+    }
+    c.cur = bir_novo_bloco(c, false)
+    if not bir_construir_bloco(c, &irf.corpo) {
+        return false
+    }
+    fechar_funcao(c)
+    bir_retratar_locais(c, irf)
+    if irf.e_main {
+        c.main_retorno = f.retorno
+        c.main_tipo = irf.retorno
+    }
+    return true
+}
+
+// C: nativo/bir/bir_construir.c:570
+proc construir_programa(c: ^BirCtx) -> bool {
+    let p: ^BirPrograma = c.p as ^BirPrograma
+    let indice: u32 = p.nfuncoes
+    p.nfuncoes += 1
+    let fatia: []BirFuncao = p.funcoes or_else {}
+    let f: ^BirFuncao = &fatia[indice]
+    f.simbolo = bir_simbolo_global(c, "forja_programa")
+    f.retorno = BC_I32 as u8
+    f.pos = BIR_SEM_POS
+    f.sintetica = true
+    f.blocos = make([dynamic]BirBloco, alloc = heap, cap = BLOCOS_INICIAL as int)
+    f.slots = make([dynamic]BirSlot, alloc = heap, cap = BLOCOS_INICIAL as int)
+    c.f = f
+    c.cap_vregs = 0
+    c.atual = none
+    c.cur = bir_novo_bloco(c, false)
+    if (c.e as ^BirEntrada).teste {
+        return bir_programa_teste(c)
+    }
+    let tipos: ^semantic.Tipos = (c.e as ^BirEntrada).tipos as ^semantic.Tipos
+    if semantic.tipo_classe_de(tipos, c.main_tipo) == semantic.TC_RESULTADO {
+        return bir_main_resultado(c)
+    }
+    let chama: ^BirInstr = bir_emitir(c, BIR_CHAMA, c.main_retorno)
+    chama.simbolo = c.main_simbolo
+    var zero: BirOperando = op_imed(0, BC_I32 as u8)
+    bir_retorna(c, &zero)
+    return true
+}
+
+// C: nativo/bir/bir_construir.c:592
+// C2F: as tabelas do programa: a de funcoes e fatia da arena (2 por funcao e trampolim, +2), a de nomes e lista no heap
+proc alocar_tabelas_do_programa(c: ^BirCtx) {
+    let entrada: ^BirEntrada = c.e as ^BirEntrada
+    let ir_c: ^ir.IrPrograma = entrada.ir as ^ir.IrPrograma
+    let p: ^BirPrograma = c.p as ^BirPrograma
+    c.n_nomes = (len((entrada.nomes as ^common.Interner).nomes) as u64) as u32
+    c.simbolo_do_nome = make([dynamic]u32, alloc = heap, cap = (c.n_nomes + 1) as int)
+    for k in (0 as u32)..<(c.n_nomes + 1) {
+        append(&c.simbolo_do_nome, item = BIR_SEM_SIMBOLO)
+    }
+    let total: u32 = 2 * ir_c.nfuncoes + 2 * ir_c.ntrampolins + 2
+    var funcoes = make([dynamic]BirFuncao, alloc = common.arena_mem(&p.arena), cap = total as int)
+    for k in (0 as u32)..<total {
+        append(&funcoes, item = BirFuncao{})
+    }
+    p.funcoes = funcoes[..]
+    p.simbolos = make([dynamic]BirSimbolo, alloc = heap, cap = SIMBOLOS_INICIAL as int)
+    c.lacos = make([dynamic]BirLaco, alloc = heap, cap = LACOS_INICIAL as int)
+}
+
+// C: nativo/bir/bir_construir.c:605
+proc marcar_externos(c: ^BirCtx) {
+    let ir_c: ?^ir.IrPrograma = (c.e as ^BirEntrada).ir
+    for k in (0 as u32)..<(ir_c as ^ir.IrPrograma).nexternos {
+        let ptr_1: ^ir.IrPrograma = ir_c as ^ir.IrPrograma
+        c.simbolo_do_nome[(ptr_1.externos or_else {})[k].nome] = BIR_SIMBOLO_EXTERNO
+    }
+}
+
+// C: nativo/bir/bir_construir.c:614
+proc funcao_na_bir(c: ^BirCtx, k: u32) -> bool {
+    if (common.c2f_b2i32((((c.e as ^BirEntrada).ir as ^ir.IrPrograma).funcoes or_else {})[k].e_teste) != 0) and (not (c.e as ^BirEntrada).teste) {
+        return false
+    }
+    return (c.alcance == none) or (common.c2f_b2i32(bir_alcance_funcao(c.alcance, k)) != 0)
+}
+
+// C: nativo/bir/bir_construir.c:622
+proc registrar_simbolos_das_funcoes(c: ^BirCtx) {
+    let ir_c: ?^ir.IrPrograma = (c.e as ^BirEntrada).ir
+    var k: u32 = 0
+    while k < (ir_c as ^ir.IrPrograma).nfuncoes {
+        let irf: ^ir.IrFuncao = &((ir_c as ^ir.IrPrograma).funcoes or_else {})[k]
+        if not funcao_na_bir(c, k) {
+            k += 1
+            continue
+        }
+        c.simbolo_do_nome[irf.nome] = bir_simbolo_funcao(c, common.interner_texto((c.e as ^BirEntrada).nomes as ^common.Interner, irf.nome))
+        if irf.e_main {
+            c.tem_main = true
+            c.main_simbolo = c.simbolo_do_nome[irf.nome]
+        }
+        k += 1
+    }
+}
+
+// C: nativo/bir/bir_construir.c:639
+proc preparar_programa(c: ^BirCtx) -> bool {
+    alocar_tabelas_do_programa(c)
+    marcar_externos(c)
+    registrar_simbolos_das_funcoes(c)
+    return ((common.c2f_b2i32(c.tem_main) != 0) or (common.c2f_b2i32((c.e as ^BirEntrada).dll) != 0)) or (common.c2f_b2i32(bir_falha_inconsistente(c, "programa sem proc main")) != 0)
+}
+
+// C: nativo/bir/bir_construir.c:647
+proc construir_funcoes(c: ^BirCtx) -> bool {
+    let ir_c: ?^ir.IrPrograma = (c.e as ^BirEntrada).ir
+    var k: u32 = 0
+    while k < (ir_c as ^ir.IrPrograma).nfuncoes {
+        if (not funcao_na_bir(c, k)) or (common.c2f_b2i32(construir_funcao(c, &((ir_c as ^ir.IrPrograma).funcoes or_else {})[k])) != 0) {
+            k += 1
+            continue
+        }
+        if c.varredura == none {
+            return false
+        }
+        registrar_ocorrencia(c)
+        k += 1
+    }
+    return true
+}
+
+// C: nativo/bir/bir_construir.c:661
+// C2F: vreg_local, vreg_temp e os ponteiros de tabela sao fatias da arena (nao tem free); o resto libera aqui
+proc liberar_ctx(c: ^BirCtx) {
+    delete(c.regras)
+    delete(c.lacos)
+    delete(c.simbolo_do_nome)
+    delete(c.hash)
+    bir_mem_liberar(c)
+}
+
+// C: nativo/bir/bir_construir.c:675
+proc programa_inicial(entrada: ^BirEntrada, alcance: ^BirAlcance) -> BirPrograma {
+    var p: BirPrograma = BirPrograma{}
+    p.modo = entrada.modo
+    p.fonte = entrada.fonte
+    p.procs_total = alcance.total
+    p.procs_gerados = alcance.total
+    if entrada.poda {
+        p.procs_gerados = alcance.gerados
+    }
+    p.sysv = entrada.sysv
+    p.guarda = entrada.guarda
+    p.checagem = entrada.checagem
+    p.simbolos_dbg = entrada.simbolos_dbg
+    p.perfil = entrada.perfil
+    p.wasm = entrada.wasm
+    p.nomes_mem = NOMES_MEM_WINDOWS
+    if entrada.nomes_mem.copia != none {
+        p.nomes_mem = entrada.nomes_mem
+    }
+    return p
+}
+
+// C: nativo/bir/bir_construir.c:683
+// C2F: varredura NULL (none) = construcao normal, para no 1o erro
+proc construir_tudo(entrada: ^BirEntrada, saida: ^BirPrograma, erro: ^common.Diag, varredura: ?^[dynamic]BirOcorrencia) -> bool {
+    var c: BirCtx = BirCtx{e = entrada, p = saida, d = erro, varredura = varredura}
+    var alcance: BirAlcance = BirAlcance{}
+    var ok: bool = false
+    bir_regras_copiar(&c)
+    bir_alcance_calcular(entrada, &alcance)
+    var tern_1: ?^BirAlcance = none
+    if common.c2f_b2i32(entrada.poda) != 0 {
+        tern_1 = &alcance
+    }
+    c.alcance = tern_1
+    saida^ = programa_inicial(entrada, &alcance)
+    ok = ((common.c2f_b2i32(preparar_programa(&c)) != 0) and (common.c2f_b2i32(construir_funcoes(&c)) != 0)) and (common.c2f_b2i32(bir_construir_trampolins(&c)) != 0)
+    if ok {
+        var tern_2: i32 = 0
+        if common.c2f_b2i32(entrada.dll) != 0 {
+            tern_2 = common.c2f_b2i32(bir_construir_exports(&c))
+        } else {
+            tern_2 = common.c2f_b2i32(construir_programa(&c))
+        }
+        ok = tern_2 != 0
+    }
+    liberar_ctx(&c)
+    bir_alcance_liberar(&alcance)
+    return ok
+}
+
+// C: nativo/bir/bir_construir.c:700
+pub proc bir_construir(entrada: ^BirEntrada, saida: ^BirPrograma, erro: ^common.Diag) -> bool {
+    return construir_tudo(entrada, saida, erro, none)
+}
+
+// C: nativo/bir/bir_construir.c:705
+pub proc bir_varrer_suporte(entrada: ^BirEntrada, ocorrencias: ^[dynamic]BirOcorrencia) {
+    var descarte: BirPrograma = BirPrograma{}
+    var erro: common.Diag = common.Diag{tem = false}
+    _ = construir_tudo(entrada, &descarte, &erro, ocorrencias)
+    bir_liberar(&descarte)
+}
+
+// C: nativo/bir/bir_construir.c:714
+pub proc bir_liberar(programa: ^BirPrograma) {
+    let fatia: []BirFuncao = programa.funcoes or_else {}
+    var k: u32 = 0
+    while k < programa.nfuncoes {
+        let f: ^BirFuncao = &fatia[k]
+        var b: u32 = 0
+        while b < f.nblocos {
+            let bloco: ^BirBloco = &f.blocos[b]
+            delete(bloco.instrs)
+            b += 1
+        }
+        delete(f.blocos)
+        delete(f.slots)
+        k += 1
+    }
+    delete(programa.simbolos)
+    common.arena_liberar(&programa.arena)
+    programa^ = BirPrograma{}
+}

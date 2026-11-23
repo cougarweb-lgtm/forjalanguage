@@ -1,0 +1,931 @@
+// semantic/sem_sugestao.fj - porte de compiler/semantic/sem_sugestao.c
+// sha256 de semantic/sem_sugestao.c: 87772e1db61abc8c1fe8ad00502c1d2f7c58d0fda0ca6463cc802e173b833c18
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "common"
+import "frontend"
+
+const PEDACO_MAX: i32 = 40
+
+// G3 S8 (sem par no C): t[i] como o C le a fonte, com 0 (o NUL) fora da fatia; nunca R0006.
+proc sug_byte(t: []u8, i: u32) -> u8 {
+    return common.c2f_nul_em_b(t, i as int)
+}
+
+// G3 S8 (sem par no C): strncmp(t + pos, texto, len(texto)) == 0 (texto nao tem NUL; o NUL do fonte nunca casa).
+proc fonte_tem_em(t: []u8, pos: u32, texto: str) -> bool {
+    for k in 0..<len(texto) {
+        if sug_byte(t, pos + (k as u32)) != texto[k] {
+            return false
+        }
+    }
+    return true
+}
+
+// C: semantic/sem_sugestao.c:20
+proc diag_eh(s: ^Semantica, codigo: i32) -> bool {
+    return (common.c2f_b2i32((s.diag as ^common.Diag).tem) != 0) and (common.c2f_s2u_32((s.diag as ^common.Diag).codigo) == common.c2f_s2u_32(codigo))
+}
+
+// C: semantic/sem_sugestao.c:31
+// ASSINATURA ALTERADA no lote: t: ?str -> []u8 (e o texto da fonte, `const char *t` = s->fonte->texto); o nome vem com tam bytes.
+proc nome_na_pos(t: []u8, pos: u32, nome: str, tam: u64) -> bool {
+    return fonte_tem_em(t, pos, nome[0..<(tam as int)]) and (not char_de_nome(sug_byte(t, pos + (tam as u32))))
+}
+
+// C: semantic/sem_sugestao.c:36
+proc abrir_2(s: ^Semantica, confianca: i32, texto: str) -> bool {
+    let msg_1 = format(f"{texto}", alloc = heap)
+    defer delete(msg_1)
+    return common.diag_sugerir(&(s.diag as ^common.Diag).sug, confianca, msg_1)
+}
+
+// C: semantic/sem_sugestao.c:41
+proc rebaixar(s: ^Semantica) {
+    let aberta: ^common.DiagSugestao = &(s.diag as ^common.Diag).sug.itens[((s.diag as ^common.Diag).sug.n as i32) - 1]
+    aberta.confianca = common.DIAG_SO_DICA as u8
+    aberta.nedicoes = 0
+}
+
+// C: semantic/sem_sugestao.c:49
+proc editar_2(s: ^Semantica, ini: u32, fim: u32, novo: str) {
+    let t: []u8 = (s.fonte as ^common.Fonte).texto
+    let aberta: ^common.DiagSugestao = &(s.diag as ^common.Diag).sug.itens[((s.diag as ^common.Diag).sug.n as i32) - 1]
+    var uma_linha: bool = fim >= ini
+    if uma_linha {
+        var k: u32 = ini
+        while k < fim {
+            if sug_byte(t, k) == 10 { // '\n'
+                uma_linha = false
+                break
+            }
+            k += 1
+        }
+    }
+    if (aberta.confianca as i32) == common.DIAG_SO_DICA {
+        return
+    }
+    if uma_linha and common.diag_editar(&(s.diag as ^common.Diag).sug, ini, fim, novo) {
+        return
+    }
+    rebaixar(s)
+}
+
+// C: semantic/sem_sugestao.c:59
+proc sem_sugerir_so_dica(s: ^Semantica, codigo: i32, texto: str) {
+    if diag_eh(s, codigo) {
+        _ = abrir_2(s, common.DIAG_SO_DICA, texto)
+    }
+}
+
+// C: semantic/sem_sugestao.c:66
+// O corte em DIAG_DESCRICAO_MAX - 1 do char texto[] acontece dentro de diag_sugerir (R-S8): o texto e o mesmo.
+proc sem_sugerir_troca(s: ^Semantica, troca: ^TrocaDeNome, confianca: i32, nota: str) {
+    let antigo: str = troca.antigo or_else ""
+    let novo: str = troca.novo or_else ""
+    let achado = from_bytes(as_bytes(antigo)[0..<(troca.tam_antigo as int)], alloc = heap)
+    defer delete(achado)
+    let texto = format(f"troque '{achado}' por '{novo}'{nota}", alloc = heap)
+    defer delete(texto)
+    if not abrir_2(s, confianca, texto) {
+        return
+    }
+    if not nome_na_pos((s.fonte as ^common.Fonte).texto, troca.pos, antigo, troca.tam_antigo) {
+        rebaixar(s)
+        return
+    }
+    editar_2(s, troca.pos, troca.pos + (troca.tam_antigo as u32), novo)
+}
+
+// C: semantic/sem_sugestao.c:79
+proc sem_sugerir_caixa(s: ^Semantica, nome: i32, pos: u32, certo: str) {
+    var troca: TrocaDeNome = TrocaDeNome{pos = pos, antigo = sem_nome_texto(s, nome), tam_antigo = common.interner_tam(nomes_da_sem(s), nome) as u64, novo = certo}
+    if (not diag_eh(s, common.E0102)) or (len(certo) >= (common.DIAG_NOVO_MAX as int)) {
+        return
+    }
+    sem_sugerir_troca(s, &troca, common.DIAG_PROVAVEL, "; renomeie tambem os usos")
+}
+
+// C: semantic/sem_sugestao.c:88
+proc sem_sugerir_parecido(s: ^Semantica, sp: ^SemParecido) {
+    let busca: ^common.Parecidos = &sp.busca
+    if ((sp.codigo != common.E0201) and (sp.codigo != common.E1003)) or (busca.qtd == 0) or (not diag_eh(s, sp.codigo)) {
+        return
+    }
+    if (busca.qtd > 1) and (busca.nomes[0].distancia == busca.nomes[1].distancia) {
+        return
+    }
+    if busca.nomes[0].tam >= (common.DIAG_NOVO_MAX as u64) { // sizeof novo
+        return
+    }
+    let primeiro: str = busca.nomes[0].texto or_else ""
+    let novo = from_bytes(as_bytes(primeiro)[0..<(busca.nomes[0].tam as int)], alloc = heap)
+    defer delete(novo)
+    var troca: TrocaDeNome = TrocaDeNome{pos = sp.pos, antigo = busca.alvo, tam_antigo = busca.tam_alvo, novo = novo}
+    sem_sugerir_troca(s, &troca, common.DIAG_PROVAVEL, "")
+}
+
+// C: semantic/sem_sugestao.c:102
+proc apelido_do_modulo(s: ^Semantica, modulo: u8) -> ?str {
+    let m: ^frontend.Modulos = &(s.modulos or_else {})[0]
+    var i: u64 = 0
+    while i < (len(m.apelidos) as u64) {
+        let a: ^frontend.ApelidoDeArquivo = &m.apelidos[i]
+        if (a.arquivo == s.arquivo_atual) and (a.modulo == modulo) {
+            return sem_nome_texto(s, a.nome)
+        }
+        i += 1
+    }
+    return none
+}
+
+// C: semantic/sem_sugestao.c:114
+proc sem_sugerir_qualificar(s: ^Semantica, uso: ^NomeUsado, dono: ?^frontend.Decl) {
+    let d: ^frontend.Decl = dono as ^frontend.Decl
+    let apelido: ?str = apelido_do_modulo(s, d.modulo)
+    if not diag_eh(s, common.E1003) {
+        return
+    }
+    if (apelido == none) or ((len(apelido or_else "") + 2) >= (common.DIAG_NOVO_MAX as int)) {
+        _ = abrir_2(s, common.DIAG_SO_DICA, "importe o modulo do nome e escreva apelido.nome")
+        return
+    }
+    let nome_do_apelido: str = apelido or_else ""
+    let novo = format(f"{nome_do_apelido}.", alloc = heap)
+    defer delete(novo)
+    let texto = format(f"escreva {novo}{sem_nome_texto(s, uso.nome)}: o nome e do modulo importado como '{nome_do_apelido}'", alloc = heap)
+    defer delete(texto)
+    var confianca: i32 = common.DIAG_PROVAVEL
+    if d.publico {
+        confianca = common.DIAG_CERTA
+    }
+    if abrir_2(s, confianca, texto) {
+        editar_2(s, uso.pos, uso.pos, novo)
+    }
+}
+
+// C: semantic/sem_sugestao.c:130
+proc sem_sugerir_alias_de_foreign(s: ^Semantica, d: ^frontend.Decl) {
+    let nome: str = sem_nome_texto(s, d.nome)
+    let tam: u32 = common.interner_tam(nomes_da_sem(s), d.nome)
+    if (not diag_eh(s, common.E0202)) or (not d.externo) or (d.simbolo >= 0) or ((s.globais or_else {})[d.nome].categoria != (SIM_PROC_EMBUTIDO as u8)) {
+        return
+    }
+    if ((tam + 4) >= (common.DIAG_NOVO_MAX as u32)) or (not nome_na_pos((s.fonte as ^common.Fonte).texto, d.pos, nome, tam as u64)) {
+        return
+    }
+    let aspa: str = "\""
+    let alias = format(f" = {aspa}{nome}{aspa}", alloc = heap)
+    defer delete(alias)
+    let texto = format(f"declare com alias: proc c_{nome} = {aspa}{nome}{aspa}(...) e chame c_{nome}", alloc = heap)
+    defer delete(texto)
+    if not abrir_2(s, common.DIAG_PROVAVEL, texto) {
+        return
+    }
+    editar_2(s, d.pos, d.pos, "c_")
+    editar_2(s, d.pos + tam, d.pos + tam, alias)
+}
+
+// C: semantic/sem_sugestao.c:146
+proc sem_sugerir_renomear_proc(s: ^Semantica, nome: i32, pos: u32) {
+    let texto: str = sem_nome_texto(s, nome)
+    let tam: u64 = common.interner_tam(nomes_da_sem(s), nome) as u64
+    if (not diag_eh(s, common.E0202)) or ((tam + 4) >= (common.DIAG_NOVO_MAX as u64)) {
+        return
+    }
+    let novo = format(f"{texto}_fj", alloc = heap)
+    defer delete(novo)
+    var troca: TrocaDeNome = TrocaDeNome{pos = pos, antigo = texto, tam_antigo = tam, novo = novo}
+    sem_sugerir_troca(s, &troca, common.DIAG_PROVAVEL, "; renomeie tambem as chamadas")
+}
+
+// C: semantic/sem_sugestao.c:159
+// ASSINATURA ALTERADA no lote: t: ?str -> []u8 (texto da fonte).
+proc pular_espacos_3(t: []u8, i: u32) -> u32 {
+    var i_v: u32 = i
+    while (sug_byte(t, i_v) == 32) or (sug_byte(t, i_v) == 9) { // ' ' '\t'
+        i_v += 1
+    }
+    return i_v
+}
+
+// C: semantic/sem_sugestao.c:166
+proc fim_do_texto_2(t: []u8, i: u32) -> u32 {
+    var i_v: u32 = i
+    i_v += 1
+    while ((sug_byte(t, i_v) != 0) and (sug_byte(t, i_v) != 10)) and (sug_byte(t, i_v) != 34) { // '\0' '\n' '"'
+        if (sug_byte(t, i_v) == 92) and (sug_byte(t, i_v + 1) != 0) { // '\\' '\0'
+            i_v += 1
+        }
+        i_v += 1
+    }
+    return i_v
+}
+
+// C: semantic/sem_sugestao.c:175
+// ASSINATURA ALTERADA no lote: t: ?str -> []u8 (texto da fonte).
+proc fim_do_argumento(t: []u8, ini: u32) -> u32 {
+    var fundo: i32 = 0
+    var i: u32 = ini
+    while (sug_byte(t, i) != 0) and (sug_byte(t, i) != 10) {
+        let c: u8 = sug_byte(t, i)
+        if c == 34 { // '"'
+            i = fim_do_texto_2(t, i)
+        } else if (c == 40) or (c == 91) or (c == 123) { // '(' '[' '{'
+            fundo += 1
+        } else if (c == 41) or (c == 93) or (c == 125) { // ')' ']' '}'
+            if fundo > 0 {
+                fundo -= 1
+            } else {
+                while (i > ini) and (sug_byte(t, i - 1) == 32) {
+                    i -= 1
+                }
+                return i
+            }
+        } else if (c == 44) and (fundo == 0) { // ','
+            while (i > ini) and (sug_byte(t, i - 1) == 32) {
+                i -= 1
+            }
+            return i
+        }
+        i += 1
+    }
+    return 0
+}
+
+// C: semantic/sem_sugestao.c:198
+proc depois_do_nome_e_igual(t: []u8, ini: u32) -> u32 {
+    var i: u32 = ini
+    while char_de_nome(sug_byte(t, i)) {
+        i += 1
+    }
+    i = pular_espacos_3(t, i)
+    if (sug_byte(t, i) != 61) or (sug_byte(t, i + 1) == 61) { // '='
+        return 0
+    }
+    return pular_espacos_3(t, i + 1)
+}
+
+// C: semantic/sem_sugestao.c:209
+proc sem_sugerir_tirar_nome(s: ^Semantica, g: ^frontend.Arg, param0: i32) {
+    let fim: u32 = depois_do_nome_e_igual((s.fonte as ^common.Fonte).texto, g.pos_nome)
+    if not diag_eh(s, common.E0502) {
+        return
+    }
+    let texto = format(f"o 1o argumento e posicional: tire '{sem_nome_texto(s, g.nome)} = '", alloc = heap)
+    defer delete(texto)
+    var confianca: i32 = common.DIAG_PROVAVEL
+    if g.nome == param0 {
+        confianca = common.DIAG_CERTA
+    }
+    if not abrir_2(s, confianca, texto) {
+        return
+    }
+    if fim == 0 {
+        rebaixar(s)
+    } else {
+        editar_2(s, g.pos_nome, fim, "")
+    }
+}
+
+// C: semantic/sem_sugestao.c:222
+proc sem_sugerir_nomear_arg(s: ^Semantica, g: ^frontend.Arg, nome: str) {
+    if (not diag_eh(s, common.E0502)) or ((len(nome) + 4) >= (common.DIAG_NOVO_MAX as int)) {
+        return
+    }
+    let novo = format(f"{nome} = ", alloc = heap)
+    defer delete(novo)
+    let texto = format(f"escreva '{novo}' antes do valor: o argumento depois de um nomeado tambem e nomeado", alloc = heap)
+    defer delete(texto)
+    if abrir_2(s, common.DIAG_CERTA, texto) {
+        editar_2(s, (g.valor as ^frontend.Expr).pos, (g.valor as ^frontend.Expr).pos, novo)
+    }
+}
+
+// C: semantic/sem_sugestao.c:233
+proc sem_sugerir_tirar_arg(s: ^Semantica, g: ^frontend.Arg) {
+    let t: []u8 = (s.fonte as ^common.Fonte).texto
+    let fim: u32 = fim_do_argumento(t, (g.valor as ^frontend.Expr).pos)
+    if (not diag_eh(s, common.E0502)) or (not abrir_2(s, common.DIAG_PROVAVEL, "o argumento sobra (o proc nao tem parametro para ele): tire-o")) {
+        return
+    }
+    if (fim == 0) or (sug_byte(t, pular_espacos_3(t, fim)) != 41) { // ')'
+        rebaixar(s)
+    } else {
+        editar_2(s, (g.valor as ^frontend.Expr).pos, fim, "")
+    }
+}
+
+// C: semantic/sem_sugestao.c:246
+proc sem_sugerir_endereco_do_append(s: ^Semantica, lista: ?^frontend.Expr) {
+    let raiz: ?^frontend.Expr = sem_raiz_da_cadeia(s, lista)
+    var tern_1: ?^LocalInfo = none
+    if (raiz != none) and ((raiz as ^frontend.Expr).tipo_no == (frontend.EX_NOME as u8)) {
+        tern_1 = escopo_buscar(&s.escopo, (raiz as ^frontend.Expr).nome)
+    }
+    let local: ?^LocalInfo = tern_1
+    let mutavel: bool = (raiz == none) or ((local != none) and ((local as ^LocalInfo).natureza == (LOC_VAR as u8)))
+    if (not diag_eh(s, common.E0310)) or (((lista as ^frontend.Expr).tipo_no != (frontend.EX_NOME as u8)) and ((lista as ^frontend.Expr).tipo_no != (frontend.EX_CAMPO as u8))) {
+        return
+    }
+    var tern_2: i32 = common.DIAG_PROVAVEL
+    if common.c2f_b2i32(mutavel) != 0 {
+        tern_2 = common.DIAG_CERTA
+    }
+    if abrir_2(s, tern_2, "append recebe o endereco da colecao: escreva &lista (a lista precisa ser var)") {
+        editar_2(s, (lista as ^frontend.Expr).pos, (lista as ^frontend.Expr).pos, "&")
+    }
+}
+
+// C: semantic/sem_sugestao.c:259
+proc fim_da_cadeia_2(t: []u8, i: u32) -> u32 {
+    var i_v: u32 = i
+    while char_de_nome(sug_byte(t, i_v)) or ((sug_byte(t, i_v) == 46) and char_de_nome(sug_byte(t, i_v + 1))) { // '.'
+        i_v += 1
+    }
+    return i_v
+}
+
+// C: semantic/sem_sugestao.c:266
+proc sem_sugerir_emprestimo(s: ^Semantica, e: ?^frontend.Expr) {
+    let t: []u8 = (s.fonte as ^common.Fonte).texto
+    let fim: u32 = fim_da_cadeia_2(t, (e as ^frontend.Expr).pos)
+    if (not diag_eh(s, common.E0311)) or (((e as ^frontend.Expr).tipo_no != (frontend.EX_NOME as u8)) and ((e as ^frontend.Expr).tipo_no != (frontend.EX_CAMPO as u8))) {
+        return
+    }
+    if ((fim == (e as ^frontend.Expr).pos) or (sug_byte(t, fim) == 40)) or (sug_byte(t, fim) == 91) { // '(' '['
+        return
+    }
+    if abrir_2(s, common.DIAG_PROVAVEL, "empreste em vez de copiar: &x (b vira ponteiro; use b^ ou b.campo)") {
+        editar_2(s, (e as ^frontend.Expr).pos, (e as ^frontend.Expr).pos, "&")
+    }
+    if common.c2f_s2u_32(tipo_classe_de(&s.tipos, (e as ^frontend.Expr).tipo)) != (TC_DINAMICO as u32) {
+        return
+    }
+    if abrir_2(s, common.DIAG_PROVAVEL, "ou empreste uma fatia: x[..] (b vira []T, le e altera os elementos)") {
+        editar_2(s, fim, fim, "[..]")
+    }
+}
+
+// C: semantic/sem_sugestao.c:281
+// saida = char[PEDACO_MAX] (NUL no fim, como o C); o pedaco `{nome}` ou o texto do literal.
+proc pedaco_do_f_texto_2(s: ^Semantica, x: ?^frontend.Expr, saida: []u8, fim: ^u32) -> bool {
+    let t: []u8 = (s.fonte as ^common.Fonte).texto
+    let xe: ^frontend.Expr = x as ^frontend.Expr
+    if (xe.tipo_no == (frontend.EX_NOME as u8)) and (xe.modulo == 0) and (xe.tipo == (TIPO_TEXTO as u32)) {
+        fim^ = xe.pos_op + common.interner_tam(nomes_da_sem(s), xe.nome)
+        let pedaco = format(f"{{{sem_nome_texto(s, xe.nome)}}}", alloc = heap)
+        defer delete(pedaco)
+        return common.c2f_snprintf(saida[0..<(PEDACO_MAX as int)], pedaco) < PEDACO_MAX
+    }
+    if (xe.tipo_no != (frontend.EX_TEXTO as u8)) or (sug_byte(t, xe.pos) != 34) { // '"'
+        return false
+    }
+    let aspa: u32 = fim_do_texto_2(t, xe.pos)
+    let tam: u32 = aspa - xe.pos - 1
+    var ruim: bool = false
+    var k: u32 = xe.pos + 1
+    while k < aspa {
+        let c: u8 = sug_byte(t, k)
+        if (c == 123) or (c == 125) or (c == 92) { // '{' '}' '\\'
+            ruim = true
+            break
+        }
+        k += 1
+    }
+    if (sug_byte(t, aspa) != 34) or (tam >= (PEDACO_MAX as u32)) or ruim {
+        return false
+    }
+    var j: u32 = 0
+    while j < tam {
+        saida[j] = sug_byte(t, xe.pos + 1 + j)
+        j += 1
+    }
+    saida[tam] = 0
+    fim^ = aspa + 1
+    return true
+}
+
+// C: semantic/sem_sugestao.c:301
+// ASSINATURA ALTERADA no lote: t: ?str -> []u8 (texto da fonte).
+proc soma_eh_o_argumento_do_print(t: []u8, ini: u32, fim: u32) -> bool {
+    var i: u32 = ini
+    while (i > 0) and (sug_byte(t, i - 1) == 32) {
+        i -= 1
+    }
+    return (((i >= 6) and fonte_tem_em(t, i - 6, "print(")) and ((i == 6) or (not char_de_nome(sug_byte(t, i - 7))))) and (sug_byte(t, pular_espacos_3(t, fim)) == 41) // ')'
+}
+
+// C: semantic/sem_sugestao.c:309
+proc sem_sugerir_concatenar(s: ^Semantica, soma: ^frontend.Expr) {
+    var a: [40]u8 = {}
+    var b: [40]u8 = {}
+    var fim_a: u32 = 0
+    var fim_b: u32 = 0
+    let cobre: bool = pedaco_do_f_texto_2(s, soma.a, a[..], &fim_a) and pedaco_do_f_texto_2(s, soma.b, b[..], &fim_b)
+    if (not diag_eh(s, common.E0307)) or (soma.op != (frontend.OP_SOMA as u8)) {
+        return
+    }
+    let texto_a = from_bytes(a[0..<common.c2f_strlen_b(a[..])], alloc = heap)
+    defer delete(texto_a)
+    let texto_b = from_bytes(b[0..<common.c2f_strlen_b(b[..])], alloc = heap)
+    defer delete(texto_b)
+    let aspa: str = "\""
+    let novo = format(f"f{aspa}{texto_a}{texto_b}{aspa}", alloc = heap)
+    defer delete(novo)
+    let t: []u8 = (s.fonte as ^common.Fonte).texto
+    if (cobre and soma_eh_o_argumento_do_print(t, (soma.a as ^frontend.Expr).pos, fim_b)) and (len(novo) < (common.DIAG_NOVO_MAX as int)) {
+        if abrir_2(s, common.DIAG_CERTA, "em print, junte os textos num f\"...\": f\"{a}{b}\"") {
+            editar_2(s, (soma.a as ^frontend.Expr).pos, fim_b, novo)
+        }
+        return
+    }
+    _ = abrir_2(s, common.DIAG_SO_DICA, "str nao tem '+': use f\"{a}{b}\" dentro de print, ou format(f\"{a}{b}\", alloc = heap) para guardar o texto (pede delete)")
+}
+
+// ---------------------------------------------------------------- andaime dos test do G3 S8 (sem par no C)
+
+// Bytes do texto + 4 zeros de sentinela (como a Fonte): o chamador faz delete.
+proc s8_texto(t: str) -> [dynamic]u8 {
+    var b = make([dynamic]u8, alloc = heap)
+    append(&b, items = as_bytes(t))
+    resize(&b, len(t) + 4)
+    return b
+}
+
+// Semantica minima para os test: fonte com `texto`, Interner de nomes, Diag aberto com `codigo`, programa vazio.
+proc s8_preparar(sv: ^Semantica, f: ^common.Fonte, d: ^common.Diag, ar: ^common.Arena, nomes: ^common.Interner, prog: ^frontend.Programa, texto: str, codigo: i32) {
+    f.dono_texto = make([dynamic]u8, alloc = heap)
+    append(&f.dono_texto, items = as_bytes(texto))
+    resize(&f.dono_texto, len(texto) + 4)
+    f.texto = f.dono_texto[..]
+    f.tam = len(texto) as u64
+    common.interner_iniciar(nomes, ar)
+    sv.fonte = f
+    sv.nomes = slice_from(nomes, len = 1)
+    sv.arena = ar
+    sv.diag = d
+    sv.programa = prog
+    d.tem = true
+    d.codigo = codigo
+}
+
+// Depois de internar todos os nomes: qtd_nomes, uma entrada vazia em `gl` por nome (o chamador faz `sv.globais = gl[..]` e delete) e a tabela de tipos (16 TipoInfo zerados, com o Interner dos nomes).
+proc s8_tabelas(sv: ^Semantica, gl: ^[dynamic]Simbolo, nomes: ^common.Interner) {
+    sv.qtd_nomes = len(nomes.nomes) as u32
+    for _k in 0..<(sv.qtd_nomes as int) {
+        append(gl, item = Simbolo{})
+    }
+    sv.tipos.nomes = nomes
+    sv.tipos.itens = make([dynamic]TipoInfo, alloc = heap)
+    for _k in 0..<16 {
+        append(&sv.tipos.itens, item = TipoInfo{})
+    }
+}
+
+proc s8_liberar(f: ^common.Fonte, nomes: ^common.Interner, ar: ^common.Arena) {
+    common.fonte_liberar(f)
+    common.interner_liberar(nomes)
+    common.arena_liberar(ar)
+}
+
+// G3 S8: funcoes puras sobre o texto, valores calculados a mao (indices contados no literal).
+test "sem_sugestao: texto da fonte (nome_na_pos, espacos, texto, argumento, igual, cadeia, print)" {
+    var b1 = s8_texto("abc defg")
+    defer delete(b1)
+    let t1: []u8 = b1[..]
+    expect(sug_byte(t1, 0) == 97 and sug_byte(t1, 999) == 0 and sug_byte(t1, 8) == 0)
+    expect(fonte_tem_em(t1, 4, "defg") and not fonte_tem_em(t1, 4, "defh") and fonte_tem_em(t1, 0, "") and not fonte_tem_em(t1, 6, "fgxx"))
+    expect(nome_na_pos(t1, 0, "abc", 3) and nome_na_pos(t1, 4, "defg", 4)) // 'abc' acaba no espaco; 'defg' acaba no NUL
+    expect(not nome_na_pos(t1, 0, "ab", 2) and not nome_na_pos(t1, 4, "def", 3) and not nome_na_pos(t1, 0, "abd", 3)) // prefixo de nome maior; texto diferente
+    var b2 = s8_texto("  \t x")
+    defer delete(b2)
+    expect(pular_espacos_3(b2[..], 0) == 4 and pular_espacos_3(b2[..], 4) == 4 and pular_espacos_3(b2[..], 5) == 5)
+    var b3 = s8_texto("\"ab\\\"c\" x") // "ab\"c" x
+    defer delete(b3)
+    expect(fim_do_texto_2(b3[..], 0) == 6) // a barra pula a aspa escapada
+    var b4 = s8_texto("\"ab\nc") // texto sem fechar: para no fim da linha
+    defer delete(b4)
+    expect(fim_do_texto_2(b4[..], 0) == 3)
+    var b5 = s8_texto("\"a\\") // barra no fim, antes do NUL: nao pula
+    defer delete(b5)
+    expect(fim_do_texto_2(b5[..], 0) == 3)
+    var b6 = s8_texto("g(1, 2), 3)")
+    defer delete(b6)
+    expect(fim_do_argumento(b6[..], 0) == 7) // a virgula do nivel 0 depois do parentese interno
+    var b7 = s8_texto("a  )")
+    defer delete(b7)
+    expect(fim_do_argumento(b7[..], 0) == 1) // tira os espacos do fim
+    var b8 = s8_texto("\"x,y\"), z")
+    defer delete(b8)
+    expect(fim_do_argumento(b8[..], 0) == 5) // a virgula dentro do texto nao conta
+    var b9 = s8_texto("abc\nd)")
+    defer delete(b9)
+    expect(fim_do_argumento(b9[..], 0) == 0) // nao achou na linha
+    var b10 = s8_texto("(a")
+    defer delete(b10)
+    expect(fim_do_argumento(b10[..], 0) == 0)
+    var b11 = s8_texto("nome = valor")
+    defer delete(b11)
+    expect(depois_do_nome_e_igual(b11[..], 0) == 7)
+    var b12 = s8_texto("a == b")
+    defer delete(b12)
+    expect(depois_do_nome_e_igual(b12[..], 0) == 0) // '==' nao e atribuicao de nome
+    var b13 = s8_texto("abc")
+    defer delete(b13)
+    expect(depois_do_nome_e_igual(b13[..], 0) == 0)
+    var b14 = s8_texto("x=3")
+    defer delete(b14)
+    expect(depois_do_nome_e_igual(b14[..], 0) == 2)
+    var b15 = s8_texto("a.b.c(x)")
+    defer delete(b15)
+    expect(fim_da_cadeia_2(b15[..], 0) == 5)
+    var b16 = s8_texto("a.")
+    defer delete(b16)
+    expect(fim_da_cadeia_2(b16[..], 0) == 1) // '.' sem nome depois nao entra
+    var b17 = s8_texto("a.1b")
+    defer delete(b17)
+    expect(fim_da_cadeia_2(b17[..], 0) == 4)
+    var b18 = s8_texto("print(a + b)")
+    defer delete(b18)
+    expect(soma_eh_o_argumento_do_print(b18[..], 6, 11))
+    var b19 = s8_texto("xprint(a+b)")
+    defer delete(b19)
+    expect(not soma_eh_o_argumento_do_print(b19[..], 7, 10)) // 'xprint(' nao e print(
+    var b20 = s8_texto("print(a + b, c)")
+    defer delete(b20)
+    expect(not soma_eh_o_argumento_do_print(b20[..], 6, 11)) // depois da soma vem ',' e nao ')'
+    var b21 = s8_texto("a + b")
+    defer delete(b21)
+    expect(not soma_eh_o_argumento_do_print(b21[..], 0, 5)) // i < 6
+}
+
+// G3 S8: E0102 caixa; oraculo = forja.exe real em `let Valor = 1` (troque 'Valor' por 'valor'; renomeie tambem os usos, provavel, edicao [22,27) -> valor).
+test "sem_sugestao: caixa e renomear proc" {
+    var sv: Semantica = Semantica{}
+    var f: common.Fonte = common.Fonte{}
+    var d: common.Diag = common.Diag{}
+    var ar: common.Arena = common.Arena{}
+    var nomes: common.Interner = common.Interner{}
+    var prog: frontend.Programa = frontend.Programa{}
+    s8_preparar(&sv, &f, &d, &ar, &nomes, &prog, "proc main() {\n    let Valor = 1\n    print(Valor)\n}\n", common.E0102)
+    let valor: i32 = common.internar(&nomes, "Valor", 5)
+    sem_sugerir_caixa(&sv, valor, 22, "valor")
+    expect(d.sug.n == 1 and (d.sug.itens[0].confianca as i32) == common.DIAG_PROVAVEL and (d.sug.itens[0].descricao or_else "") == "troque 'Valor' por 'valor'; renomeie tambem os usos")
+    expect(d.sug.itens[0].nedicoes == 1 and d.sug.itens[0].edicoes[0].ini == 22 and d.sug.itens[0].edicoes[0].fim == 27 and (d.sug.itens[0].edicoes[0].novo or_else "") == "valor")
+    // codigo diferente de E0102: nao sugere
+    d.sug.n = 0
+    d.codigo = common.E0201
+    sem_sugerir_caixa(&sv, valor, 22, "valor")
+    expect(d.sug.n == 0)
+    // o novo nome nao cabe em DIAG_NOVO_MAX (32): nao sugere
+    d.codigo = common.E0102
+    sem_sugerir_caixa(&sv, valor, 22, "um_nome_certo_com_mais_de_trinta_e_dois_bytes")
+    expect(d.sug.n == 0)
+    // nome de outro texto na posicao: a sugestao abre e e rebaixada a so_dica, sem edicao
+    sem_sugerir_caixa(&sv, valor, 23, "valor")
+    expect(d.sug.n == 1 and (d.sug.itens[0].confianca as i32) == common.DIAG_SO_DICA and d.sug.itens[0].nedicoes == 0)
+    // renomear proc (E0202): 'remove' vira 'remove_fj'
+    d = common.Diag{}
+    d.tem = true
+    d.codigo = common.E0202
+    let remove: i32 = common.internar(&nomes, "remove", 6)
+    sem_sugerir_renomear_proc(&sv, remove, 5) // na posicao 5 do fonte esta 'main', nao 'remove': rebaixada
+    expect(d.sug.n == 1 and (d.sug.itens[0].descricao or_else "") == "troque 'remove' por 'remove_fj'; renomeie tambem as chamadas" and (d.sug.itens[0].confianca as i32) == common.DIAG_SO_DICA and d.sug.itens[0].nedicoes == 0)
+    s8_liberar(&f, &nomes, &ar)
+    var sv2: Semantica = Semantica{}
+    var f2: common.Fonte = common.Fonte{}
+    var d2: common.Diag = common.Diag{}
+    var ar2: common.Arena = common.Arena{}
+    var nomes2: common.Interner = common.Interner{}
+    s8_preparar(&sv2, &f2, &d2, &ar2, &nomes2, &prog, "proc remove() {}", common.E0202)
+    sem_sugerir_renomear_proc(&sv2, common.internar(&nomes2, "remove", 6), 5)
+    expect(d2.sug.n == 1 and (d2.sug.itens[0].confianca as i32) == common.DIAG_PROVAVEL and d2.sug.itens[0].nedicoes == 1)
+    expect(d2.sug.itens[0].edicoes[0].ini == 5 and d2.sug.itens[0].edicoes[0].fim == 11 and (d2.sug.itens[0].edicoes[0].novo or_else "") == "remove_fj")
+    // nome longo (tam + 4 >= 32): nao sugere
+    d2.sug.n = 0
+    sem_sugerir_renomear_proc(&sv2, common.internar(&nomes2, "um_nome_de_proc_bem_comprido_ok", 31), 5)
+    expect(d2.sug.n == 0)
+    s8_liberar(&f2, &nomes2, &ar2)
+}
+
+// G3 S8: E0307; oraculo = forja.exe real em print("ab" + "cd") (certa, edicao [24,35) -> f"abcd").
+test "sem_sugestao: concatenar" {
+    var sv: Semantica = Semantica{}
+    var f: common.Fonte = common.Fonte{}
+    var d: common.Diag = common.Diag{}
+    var ar: common.Arena = common.Arena{}
+    var nomes: common.Interner = common.Interner{}
+    var prog: frontend.Programa = frontend.Programa{}
+    s8_preparar(&sv, &f, &d, &ar, &nomes, &prog, "proc main() {\n    print(\"ab\" + \"cd\")\n}\n", common.E0307)
+    var ea: frontend.Expr = frontend.Expr{}
+    var eb: frontend.Expr = frontend.Expr{}
+    var soma: frontend.Expr = frontend.Expr{}
+    ea.tipo_no = frontend.EX_TEXTO as u8
+    ea.pos = 24
+    eb.tipo_no = frontend.EX_TEXTO as u8
+    eb.pos = 31
+    soma.op = frontend.OP_SOMA as u8
+    soma.a = &ea
+    soma.b = &eb
+    sem_sugerir_concatenar(&sv, &soma)
+    expect(d.sug.n == 1 and (d.sug.itens[0].confianca as i32) == common.DIAG_CERTA and (d.sug.itens[0].descricao or_else "") == "em print, junte os textos num f\"...\": f\"{a}{b}\"")
+    expect(d.sug.itens[0].nedicoes == 1 and d.sug.itens[0].edicoes[0].ini == 24 and d.sug.itens[0].edicoes[0].fim == 35 and (d.sug.itens[0].edicoes[0].novo or_else "") == "f\"abcd\"")
+    // outro operador: nada
+    d.sug.n = 0
+    soma.op = frontend.OP_SUB as u8
+    sem_sugerir_concatenar(&sv, &soma)
+    expect(d.sug.n == 0)
+    s8_liberar(&f, &nomes, &ar)
+    // fora de print: so dica, sem edicao
+    var sv2: Semantica = Semantica{}
+    var f2: common.Fonte = common.Fonte{}
+    var d2: common.Diag = common.Diag{}
+    var ar2: common.Arena = common.Arena{}
+    var nomes2: common.Interner = common.Interner{}
+    s8_preparar(&sv2, &f2, &d2, &ar2, &nomes2, &prog, "proc main() {\n    let y = \"ab\" + \"cd\"\n}\n", common.E0307)
+    ea.pos = 26
+    eb.pos = 33
+    soma.op = frontend.OP_SOMA as u8
+    sem_sugerir_concatenar(&sv2, &soma)
+    expect(d2.sug.n == 1 and (d2.sug.itens[0].confianca as i32) == common.DIAG_SO_DICA and d2.sug.itens[0].nedicoes == 0)
+    expect((d2.sug.itens[0].descricao or_else "") == "str nao tem '+': use f\"{a}{b}\" dentro de print, ou format(f\"{a}{b}\", alloc = heap) para guardar o texto (pede delete)")
+    s8_liberar(&f2, &nomes2, &ar2)
+    // nome de str + literal: `{nm}` + texto do literal
+    var sv3: Semantica = Semantica{}
+    var f3: common.Fonte = common.Fonte{}
+    var d3: common.Diag = common.Diag{}
+    var ar3: common.Arena = common.Arena{}
+    var nomes3: common.Interner = common.Interner{}
+    s8_preparar(&sv3, &f3, &d3, &ar3, &nomes3, &prog, "print(nm + \"z\")", common.E0307)
+    ea.tipo_no = frontend.EX_NOME as u8
+    ea.modulo = 0
+    ea.tipo = TIPO_TEXTO as u32
+    ea.pos = 6
+    ea.pos_op = 6
+    ea.nome = common.internar(&nomes3, "nm", 2)
+    eb.pos = 11
+    sem_sugerir_concatenar(&sv3, &soma)
+    expect(d3.sug.n == 1 and (d3.sug.itens[0].confianca as i32) == common.DIAG_CERTA and d3.sug.itens[0].edicoes[0].ini == 6 and d3.sug.itens[0].edicoes[0].fim == 14 and (d3.sug.itens[0].edicoes[0].novo or_else "") == "f\"{nm}z\"")
+    s8_liberar(&f3, &nomes3, &ar3)
+    // literal de 25 caracteres (abaixo do corte PEDACO_MAX = 40, novo com 29 < DIAG_NOVO_MAX): ainda cobre
+    var sv4: Semantica = Semantica{}
+    var f4: common.Fonte = common.Fonte{}
+    var d4: common.Diag = common.Diag{}
+    var ar4: common.Arena = common.Arena{}
+    var nomes4: common.Interner = common.Interner{}
+    s8_preparar(&sv4, &f4, &d4, &ar4, &nomes4, &prog, "print(\"xxxxxxxxxxxxxxxxxxxxxxxxx\" + \"z\")", common.E0307)
+    ea.tipo_no = frontend.EX_TEXTO as u8
+    ea.pos = 6
+    eb.pos = 36
+    sem_sugerir_concatenar(&sv4, &soma)
+    expect(d4.sug.n == 1 and (d4.sug.itens[0].confianca as i32) == common.DIAG_CERTA and d4.sug.itens[0].edicoes[0].ini == 6 and d4.sug.itens[0].edicoes[0].fim == 39 and (d4.sug.itens[0].edicoes[0].novo or_else "") == "f\"xxxxxxxxxxxxxxxxxxxxxxxxxz\"")
+    s8_liberar(&f4, &nomes4, &ar4)
+}
+
+// G3 S8: E0502; oraculo = forja.exe real em soma(a = 1, 2) (escreva 'b = ', certa, edicao [90,90) -> "b = ").
+test "sem_sugestao: argumentos (nomear, tirar nome, tirar argumento, rebaixar)" {
+    var sv: Semantica = Semantica{}
+    var f: common.Fonte = common.Fonte{}
+    var d: common.Diag = common.Diag{}
+    var ar: common.Arena = common.Arena{}
+    var nomes: common.Interner = common.Interner{}
+    var prog: frontend.Programa = frontend.Programa{}
+    s8_preparar(&sv, &f, &d, &ar, &nomes, &prog, "proc soma(a: i32, b: i32) -> i32 {\n    return a + b\n}\nproc main() {\n    print(soma(a = 1, 2))\n}\n", common.E0502)
+    var valor: frontend.Expr = frontend.Expr{}
+    valor.pos = 90
+    var g: frontend.Arg = frontend.Arg{}
+    g.valor = &valor
+    sem_sugerir_nomear_arg(&sv, &g, "b")
+    expect(d.sug.n == 1 and (d.sug.itens[0].confianca as i32) == common.DIAG_CERTA and (d.sug.itens[0].descricao or_else "") == "escreva 'b = ' antes do valor: o argumento depois de um nomeado tambem e nomeado")
+    expect(d.sug.itens[0].nedicoes == 1 and d.sug.itens[0].edicoes[0].ini == 90 and d.sug.itens[0].edicoes[0].fim == 90 and (d.sug.itens[0].edicoes[0].novo or_else "") == "b = ")
+    d.sug.n = 0
+    sem_sugerir_nomear_arg(&sv, &g, "um_nome_de_parametro_muito_grande_demais") // strlen + 4 >= 32
+    expect(d.sug.n == 0)
+    d.codigo = common.E0201
+    sem_sugerir_nomear_arg(&sv, &g, "b")
+    expect(d.sug.n == 0)
+    s8_liberar(&f, &nomes, &ar)
+    // tirar o nome do 1o argumento: g(x = 5)
+    var sv2: Semantica = Semantica{}
+    var f2: common.Fonte = common.Fonte{}
+    var d2: common.Diag = common.Diag{}
+    var ar2: common.Arena = common.Arena{}
+    var nomes2: common.Interner = common.Interner{}
+    s8_preparar(&sv2, &f2, &d2, &ar2, &nomes2, &prog, "g(x = 5)", common.E0502)
+    let x: i32 = common.internar(&nomes2, "x", 1)
+    var g2: frontend.Arg = frontend.Arg{}
+    g2.nome = x
+    g2.pos_nome = 2
+    sem_sugerir_tirar_nome(&sv2, &g2, x) // o nome e o do 1o parametro: certa
+    expect(d2.sug.n == 1 and (d2.sug.itens[0].confianca as i32) == common.DIAG_CERTA and (d2.sug.itens[0].descricao or_else "") == "o 1o argumento e posicional: tire 'x = '")
+    expect(d2.sug.itens[0].nedicoes == 1 and d2.sug.itens[0].edicoes[0].ini == 2 and d2.sug.itens[0].edicoes[0].fim == 6 and (d2.sug.itens[0].edicoes[0].novo or_else "") == "")
+    d2.sug.n = 0
+    sem_sugerir_tirar_nome(&sv2, &g2, x + 1) // outro parametro: provavel
+    expect(d2.sug.n == 1 and (d2.sug.itens[0].confianca as i32) == common.DIAG_PROVAVEL)
+    s8_liberar(&f2, &nomes2, &ar2)
+    // 'x == 5': nao e 'nome = valor', a sugestao abre e e rebaixada
+    var sv3: Semantica = Semantica{}
+    var f3: common.Fonte = common.Fonte{}
+    var d3: common.Diag = common.Diag{}
+    var ar3: common.Arena = common.Arena{}
+    var nomes3: common.Interner = common.Interner{}
+    s8_preparar(&sv3, &f3, &d3, &ar3, &nomes3, &prog, "g(x == 5)", common.E0502)
+    let x3: i32 = common.internar(&nomes3, "x", 1)
+    var g3: frontend.Arg = frontend.Arg{}
+    g3.nome = x3
+    g3.pos_nome = 2
+    sem_sugerir_tirar_nome(&sv3, &g3, x3)
+    expect(d3.sug.n == 1 and (d3.sug.itens[0].confianca as i32) == common.DIAG_SO_DICA and d3.sug.itens[0].nedicoes == 0)
+    s8_liberar(&f3, &nomes3, &ar3)
+    // tirar o argumento que sobra: g(5) tira o 5; g(5, 6) rebaixa (nao e o ultimo)
+    var sv4: Semantica = Semantica{}
+    var f4: common.Fonte = common.Fonte{}
+    var d4: common.Diag = common.Diag{}
+    var ar4: common.Arena = common.Arena{}
+    var nomes4: common.Interner = common.Interner{}
+    s8_preparar(&sv4, &f4, &d4, &ar4, &nomes4, &prog, "g(5)", common.E0502)
+    var v4: frontend.Expr = frontend.Expr{}
+    v4.pos = 2
+    var g4: frontend.Arg = frontend.Arg{}
+    g4.valor = &v4
+    sem_sugerir_tirar_arg(&sv4, &g4)
+    expect(d4.sug.n == 1 and (d4.sug.itens[0].confianca as i32) == common.DIAG_PROVAVEL and (d4.sug.itens[0].descricao or_else "") == "o argumento sobra (o proc nao tem parametro para ele): tire-o")
+    expect(d4.sug.itens[0].nedicoes == 1 and d4.sug.itens[0].edicoes[0].ini == 2 and d4.sug.itens[0].edicoes[0].fim == 3)
+    s8_liberar(&f4, &nomes4, &ar4)
+    var sv5: Semantica = Semantica{}
+    var f5: common.Fonte = common.Fonte{}
+    var d5: common.Diag = common.Diag{}
+    var ar5: common.Arena = common.Arena{}
+    var nomes5: common.Interner = common.Interner{}
+    s8_preparar(&sv5, &f5, &d5, &ar5, &nomes5, &prog, "g(5, 6)", common.E0502)
+    sem_sugerir_tirar_arg(&sv5, &g4)
+    expect(d5.sug.n == 1 and (d5.sug.itens[0].confianca as i32) == common.DIAG_SO_DICA and d5.sug.itens[0].nedicoes == 0)
+    // rebaixar direto: zera as edicoes
+    d5.sug.itens[0].confianca = common.DIAG_CERTA as u8
+    d5.sug.itens[0].nedicoes = 2
+    rebaixar(&sv5)
+    expect((d5.sug.itens[0].confianca as i32) == common.DIAG_SO_DICA and d5.sug.itens[0].nedicoes == 0)
+    s8_liberar(&f5, &nomes5, &ar5)
+}
+
+// G3 S8: so_dica, alias de foreign (E0202) e qualificar (E1003): textos e edicoes do C, valores contados a mao.
+test "sem_sugestao: so_dica, alias de foreign e qualificar" {
+    var sv: Semantica = Semantica{}
+    var f: common.Fonte = common.Fonte{}
+    var d: common.Diag = common.Diag{}
+    var ar: common.Arena = common.Arena{}
+    var nomes: common.Interner = common.Interner{}
+    var prog: frontend.Programa = frontend.Programa{}
+    s8_preparar(&sv, &f, &d, &ar, &nomes, &prog, "proc remove()", common.E0202)
+    sem_sugerir_so_dica(&sv, common.E0201, "outro codigo")
+    expect(d.sug.n == 0)
+    sem_sugerir_so_dica(&sv, common.E0202, "so uma dica")
+    expect(d.sug.n == 1 and (d.sug.itens[0].confianca as i32) == common.DIAG_SO_DICA and (d.sug.itens[0].descricao or_else "") == "so uma dica" and d.sug.itens[0].nedicoes == 0)
+    // alias de foreign: o proc `remove` foreign sem alias, cujo nome a linguagem reserva
+    d = common.Diag{}
+    d.tem = true
+    d.codigo = common.E0202
+    let remove: i32 = common.internar(&nomes, "remove", 6)
+    sv.qtd_nomes = len(nomes.nomes) as u32
+    var gl = make([dynamic]Simbolo, alloc = heap)
+    defer delete(gl)
+    for _k in 0..<4 {
+        append(&gl, item = Simbolo{})
+    }
+    gl[remove] = Simbolo{categoria = SIM_PROC_EMBUTIDO as u8}
+    sv.globais = gl[0..<len(gl)]
+    var dec: frontend.Decl = frontend.Decl{}
+    dec.nome = remove
+    dec.pos = 5
+    dec.externo = true
+    dec.simbolo = -1
+    sem_sugerir_alias_de_foreign(&sv, &dec)
+    expect(d.sug.n == 1 and (d.sug.itens[0].confianca as i32) == common.DIAG_PROVAVEL and (d.sug.itens[0].descricao or_else "") == "declare com alias: proc c_remove = \"remove\"(...) e chame c_remove")
+    expect(d.sug.itens[0].nedicoes == 2 and d.sug.itens[0].edicoes[0].ini == 5 and d.sug.itens[0].edicoes[0].fim == 5 and (d.sug.itens[0].edicoes[0].novo or_else "") == "c_")
+    expect(d.sug.itens[0].edicoes[1].ini == 11 and d.sug.itens[0].edicoes[1].fim == 11 and (d.sug.itens[0].edicoes[1].novo or_else "") == " = \"remove\"")
+    // nao sugere: nao e foreign, ja tem simbolo, nome nao reservado (categoria diferente de proc embutido) ou nome fora da posicao
+    d.sug.n = 0
+    dec.externo = false
+    sem_sugerir_alias_de_foreign(&sv, &dec)
+    dec.externo = true
+    dec.simbolo = 0
+    sem_sugerir_alias_de_foreign(&sv, &dec)
+    dec.simbolo = -1
+    gl[remove] = Simbolo{categoria = SIM_CONST as u8}
+    sem_sugerir_alias_de_foreign(&sv, &dec)
+    gl[remove] = Simbolo{categoria = SIM_PROC_EMBUTIDO as u8}
+    dec.pos = 6
+    sem_sugerir_alias_de_foreign(&sv, &dec)
+    expect(d.sug.n == 0)
+    // qualificar: o arquivo importou o modulo 2 como 'db'
+    var mods: frontend.Modulos = frontend.Modulos{}
+    mods.apelidos = make([dynamic]frontend.ApelidoDeArquivo, alloc = heap)
+    defer delete(mods.apelidos)
+    append(&mods.apelidos, item = frontend.ApelidoDeArquivo{arquivo = 1, modulo = 2, nome = common.internar(&nomes, "outro", 5)})
+    append(&mods.apelidos, item = frontend.ApelidoDeArquivo{arquivo = 0, modulo = 2, nome = common.internar(&nomes, "db", 2)})
+    sv.modulos = slice_from(&mods, len = 1)
+    sv.arquivo_atual = 0
+    d = common.Diag{}
+    d.tem = true
+    d.codigo = common.E1003
+    let abrir: i32 = common.internar(&nomes, "abrir", 5)
+    var uso: NomeUsado = NomeUsado{nome = abrir, pos = 10}
+    var dono: frontend.Decl = frontend.Decl{}
+    dono.modulo = 2
+    dono.publico = true
+    sem_sugerir_qualificar(&sv, &uso, &dono)
+    expect(d.sug.n == 1 and (d.sug.itens[0].confianca as i32) == common.DIAG_CERTA and (d.sug.itens[0].descricao or_else "") == "escreva db.abrir: o nome e do modulo importado como 'db'")
+    expect(d.sug.itens[0].nedicoes == 1 and d.sug.itens[0].edicoes[0].ini == 10 and d.sug.itens[0].edicoes[0].fim == 10 and (d.sug.itens[0].edicoes[0].novo or_else "") == "db.")
+    d.sug.n = 0
+    dono.publico = false // falta o pub la: provavel
+    sem_sugerir_qualificar(&sv, &uso, &dono)
+    expect(d.sug.n == 1 and (d.sug.itens[0].confianca as i32) == common.DIAG_PROVAVEL)
+    d.sug.n = 0
+    dono.modulo = 3 // o arquivo nao importa o modulo 3: so dica
+    sem_sugerir_qualificar(&sv, &uso, &dono)
+    expect(d.sug.n == 1 and (d.sug.itens[0].confianca as i32) == common.DIAG_SO_DICA and (d.sug.itens[0].descricao or_else "") == "importe o modulo do nome e escreva apelido.nome" and d.sug.itens[0].nedicoes == 0)
+    d.sug.n = 0
+    d.codigo = common.E0201
+    sem_sugerir_qualificar(&sv, &uso, &dono)
+    expect(d.sug.n == 0)
+    expect((apelido_do_modulo(&sv, 2) or_else "") == "db" and apelido_do_modulo(&sv, 2) != none and apelido_do_modulo(&sv, 3) == none)
+    s8_liberar(&f, &nomes, &ar)
+}
+
+// G3 S8: E0310 (append sem '&') e E0311 (let b = a): confianca e edicoes.
+test "sem_sugestao: endereco do append e emprestimo" {
+    var sv: Semantica = Semantica{}
+    var f: common.Fonte = common.Fonte{}
+    var d: common.Diag = common.Diag{}
+    var ar: common.Arena = common.Arena{}
+    var nomes: common.Interner = common.Interner{}
+    var prog: frontend.Programa = frontend.Programa{}
+    s8_preparar(&sv, &f, &d, &ar, &nomes, &prog, "append(l, item = 1)", common.E0310)
+    let nl: i32 = common.internar(&nomes, "l", 1)
+    sv.qtd_nomes = len(nomes.nomes) as u32
+    escopo_iniciar(&sv.escopo, &ar, sv.qtd_nomes)
+    defer delete(sv.escopo.pilha)
+    var lista: frontend.Expr = frontend.Expr{}
+    lista.tipo_no = frontend.EX_NOME as u8
+    lista.nome = nl
+    lista.pos = 7
+    sem_sugerir_endereco_do_append(&sv, &lista) // sem local: falta o var (provavel)
+    expect(d.sug.n == 1 and (d.sug.itens[0].confianca as i32) == common.DIAG_PROVAVEL and (d.sug.itens[0].descricao or_else "") == "append recebe o endereco da colecao: escreva &lista (a lista precisa ser var)")
+    expect(d.sug.itens[0].nedicoes == 1 and d.sug.itens[0].edicoes[0].ini == 7 and d.sug.itens[0].edicoes[0].fim == 7 and (d.sug.itens[0].edicoes[0].novo or_else "") == "&")
+    d.sug.n = 0
+    var local: LocalInfo = LocalInfo{nome = nl, natureza = LOC_VAR as u8}
+    escopo_empurrar(&sv.escopo, &local)
+    sem_sugerir_endereco_do_append(&sv, &lista) // local var: certa
+    expect(d.sug.n == 1 and (d.sug.itens[0].confianca as i32) == common.DIAG_CERTA)
+    d.sug.n = 0
+    lista.tipo_no = frontend.EX_TEXTO as u8 // nao e nome nem campo: nada
+    sem_sugerir_endereco_do_append(&sv, &lista)
+    expect(d.sug.n == 0)
+    d.sug.n = 0
+    lista.tipo_no = frontend.EX_NOME as u8
+    d.codigo = common.E0201
+    sem_sugerir_endereco_do_append(&sv, &lista)
+    expect(d.sug.n == 0)
+    s8_liberar(&f, &nomes, &ar)
+    // emprestimo: let b = a
+    var sv2: Semantica = Semantica{}
+    var f2: common.Fonte = common.Fonte{}
+    var d2: common.Diag = common.Diag{}
+    var ar2: common.Arena = common.Arena{}
+    var nomes2: common.Interner = common.Interner{}
+    s8_preparar(&sv2, &f2, &d2, &ar2, &nomes2, &prog, "let b = a", common.E0311)
+    sv2.tipos.itens = make([dynamic]TipoInfo, alloc = heap)
+    defer delete(sv2.tipos.itens)
+    for _k in 0..<16 {
+        append(&sv2.tipos.itens, item = TipoInfo{})
+    }
+    sv2.tipos.itens[7].classe = TC_DINAMICO as u8
+    var e: frontend.Expr = frontend.Expr{}
+    e.tipo_no = frontend.EX_NOME as u8
+    e.pos = 8
+    e.tipo = TIPO_INT as u32
+    sem_sugerir_emprestimo(&sv2, &e) // a classe do tipo nao e dinamica: so o &x
+    expect(d2.sug.n == 1 and (d2.sug.itens[0].confianca as i32) == common.DIAG_PROVAVEL and (d2.sug.itens[0].descricao or_else "") == "empreste em vez de copiar: &x (b vira ponteiro; use b^ ou b.campo)")
+    expect(d2.sug.itens[0].nedicoes == 1 and d2.sug.itens[0].edicoes[0].ini == 8 and d2.sug.itens[0].edicoes[0].fim == 8 and (d2.sug.itens[0].edicoes[0].novo or_else "") == "&")
+    d2.sug.n = 0
+    e.tipo = 7 // lista dinamica: tambem a fatia x[..]
+    sem_sugerir_emprestimo(&sv2, &e)
+    expect(d2.sug.n == 2 and (d2.sug.itens[1].confianca as i32) == common.DIAG_PROVAVEL and (d2.sug.itens[1].descricao or_else "") == "ou empreste uma fatia: x[..] (b vira []T, le e altera os elementos)")
+    expect(d2.sug.itens[1].nedicoes == 1 and d2.sug.itens[1].edicoes[0].ini == 9 and d2.sug.itens[1].edicoes[0].fim == 9 and (d2.sug.itens[1].edicoes[0].novo or_else "") == "[..]")
+    s8_liberar(&f2, &nomes2, &ar2)
+    // a(x): chamada, nao se empresta
+    var sv3: Semantica = Semantica{}
+    var f3: common.Fonte = common.Fonte{}
+    var d3: common.Diag = common.Diag{}
+    var ar3: common.Arena = common.Arena{}
+    var nomes3: common.Interner = common.Interner{}
+    s8_preparar(&sv3, &f3, &d3, &ar3, &nomes3, &prog, "let b = a(x)", common.E0311)
+    sem_sugerir_emprestimo(&sv3, &e)
+    expect(d3.sug.n == 0)
+    d3.codigo = common.E0201
+    sem_sugerir_emprestimo(&sv3, &e)
+    expect(d3.sug.n == 0)
+    s8_liberar(&f3, &nomes3, &ar3)
+}

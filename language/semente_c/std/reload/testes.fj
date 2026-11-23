@@ -1,0 +1,93 @@
+// std:reload - testes do modulo (M8 H2). Anexados ao texto de std:reload SO em forja test std:reload (o build normal nao os ve).
+// Versao: 0.1.0. Changelog: 0.1.0 - M8 H2: arquivo inexistente (not_found), caminho vazio, DLL sem forja_dll_info (kernel32.dll copiada para TEMP: no_info), symbol/generation numa DLL aberta. Sem DLL Forja: a prova do hot reload de verdade e do H3 (tests\reload).
+// Os testes valem nos 2 alvos com o mesmo resultado: no Linux (stub) todo open devolve unsupported_target, e o esperado de cada teste troca conforme os.TARGET.
+// Sem import e sem proc main: o pedaco fica dentro do modulo, entao chama as procs dele SEM prefixo (open, close) e o std:os como os.
+
+const TESTE_PASTA_SOMBRA: str = "forja_reload_teste_h2"
+
+proc teste_no_windows() -> bool {
+    return os.TARGET == "x86_64-windows"
+}
+
+// Erro que open deve dar para um arquivo que nao existe: not_found no Windows, unsupported_target no Linux (stub).
+proc teste_erro_de_ausente() -> ReloadError {
+    if teste_no_windows() {
+        return ReloadError.not_found
+    }
+    return ReloadError.unsupported_target
+}
+
+// Pasta de trabalho do teste dentro do TEMP da casa (texto DONO do heap: quem recebe faz delete).
+proc teste_pasta() -> str {
+    var pasta = format(f".\\{TESTE_PASTA_SOMBRA}", alloc = heap)
+    switch base in os.temp_dir(alloc = heap) {
+    case str:
+        delete(pasta)
+        pasta = format(f"{base}\\{TESTE_PASTA_SOMBRA}", alloc = heap)
+        delete(base)
+    case os.OsError:
+        delete(pasta)
+        pasta = format(f".\\{TESTE_PASTA_SOMBRA}", alloc = heap)
+    }
+    return pasta
+}
+
+test "arquivo inexistente: not_found no Windows, unsupported_target no Linux" {
+    switch r in open("reload_arquivo_que_nao_existe_h2.dll", alloc = heap) {
+    case Library:
+        var lib = r
+        close(&lib)
+        expect(false)
+    case ReloadError:
+        expect(r == teste_erro_de_ausente())
+    }
+}
+
+test "caminho vazio: not_found" {
+    switch r in open("", alloc = heap) {
+    case Library:
+        var lib = r
+        close(&lib)
+        expect(false)
+    case ReloadError:
+        expect(r == ReloadError.not_found)
+    }
+}
+
+test "DLL do sistema sem forja_dll_info: no_info no Windows, unsupported_target no Linux" {
+    let pasta = teste_pasta()
+    defer delete(pasta)
+    let alvo = format(f"{pasta}\\kernel32_copia.dll", alloc = heap)
+    defer delete(alvo)
+    var raiz_do_sistema: str = "C:\\Windows"
+    switch raiz in os.env("SystemRoot") {
+    case str:
+        raiz_do_sistema = raiz
+    case none:
+        raiz_do_sistema = "C:\\Windows"
+    }
+    let origem = format(f"{raiz_do_sistema}\\System32\\kernel32.dll", alloc = heap)
+    defer delete(origem)
+    var origem_c: [512]u8 = {}
+    var pasta_c: [512]u8 = {}
+    var alvo_c: [512]u8 = {}
+    expect(store(origem_c[..], origem) and store(pasta_c[..], pasta) and store(alvo_c[..], alvo))
+    if teste_no_windows() {
+        expect(forja_reload_copiar(&origem_c[0], &pasta_c[0], &alvo_c[0]) == 0)
+    }
+    var esperado = ReloadError.unsupported_target
+    if teste_no_windows() {
+        esperado = ReloadError.no_info
+    }
+    switch r in open(alvo, alloc = heap) {
+    case Library:
+        var lib = r
+        close(&lib)
+        expect(false)
+    case ReloadError:
+        expect(r == esperado)
+    }
+    var padrao_c: [16]u8 = {}
+    expect(store(padrao_c[..], "*.dll"))
+    _ = forja_reload_limpar(&pasta_c[0], &padrao_c[0])
+}

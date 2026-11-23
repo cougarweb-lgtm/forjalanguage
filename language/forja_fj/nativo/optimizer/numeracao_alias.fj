@@ -1,0 +1,147 @@
+// nativo/optimizer/numeracao_alias.fj - porte de compiler/nativo/optimizer/numeracao_alias.c
+// sha256 de nativo/optimizer/numeracao_alias.c: ae62f49d106536cec8b6bb0744b82e16367cfaf9d531c1fcaf41563b619bbd4c
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "common"
+import "nativo/bir"
+
+const BYTES: [8]u8 = {0, 1, 2, 4, 8, 4, 8, 16}
+
+// C: nativo/optimizer/numeracao_alias.c:13
+proc num_tamanho_da_classe(classe: u8) -> u32 {
+    if (classe as u32) < (len(BYTES) as u32) {
+        return BYTES[classe as int] as u32
+    }
+    return 0
+}
+
+// C: nativo/optimizer/numeracao_alias.c:20
+proc definicao_unica(c: ^NumCtx, vreg: u32) -> ?^bir.BirInstr {
+    if (((vreg >= c.nvregs) or ((c.ndefs or_else {})[vreg] != 1)) or (vreg < (c.f as ^bir.BirFuncao).nparams)) or ((c.def_b or_else {})[vreg] == NUM_SEM) {
+        return none
+    }
+    return &(c.f as ^bir.BirFuncao).blocos[(c.def_b or_else {})[vreg]].instrs[(c.def_k or_else {})[vreg]]
+}
+
+// C: nativo/optimizer/numeracao_alias.c:28
+proc num_base_de(c: ^NumCtx, vreg: u32) -> NumBase {
+    let d: ?^bir.BirInstr = definicao_unica(c, vreg)
+    if (d != none) and ((d as ^bir.BirInstr).op == (bir.BIR_END_SLOT as u8)) {
+        return NumBase{slot = 1, id = (d as ^bir.BirInstr).a.imed as u32}
+    }
+    return NumBase{slot = 0, id = vreg}
+}
+
+// C: nativo/optimizer/numeracao_alias.c:38
+proc produto_com_passo(c: ^NumCtx, vreg: u32, passo: ^i64) -> bool {
+    let m: ?^bir.BirInstr = definicao_unica(c, vreg)
+    if ((((m == none) or ((m as ^bir.BirInstr).b.tipo != (bir.BO_IMED as u8))) or ((m as ^bir.BirInstr).b.imed <= 0)) or (((m as ^bir.BirInstr).op != (bir.BIR_MUL as u8)) and ((m as ^bir.BirInstr).op != (bir.BIR_SHL as u8)))) or (((m as ^bir.BirInstr).op == (bir.BIR_SHL as u8)) and ((m as ^bir.BirInstr).b.imed >= 31)) {
+        return false
+    }
+    // O5: so o ramo do SHL calcula 1 << k (o C so avalia o ramo escolhido; no MUL o imed pode passar de u32)
+    if (m as ^bir.BirInstr).op == (bir.BIR_MUL as u8) {
+        passo^ = (m as ^bir.BirInstr).b.imed
+    } else {
+        passo^ = common.c2f_shl_i64(1, (m as ^bir.BirInstr).b.imed as u32)
+    }
+    return true
+}
+
+// C: nativo/optimizer/numeracao_alias.c:49
+proc forma_de_array(c: ^NumCtx, p: u32, base: ^NumBase, passo: ^i64) -> bool {
+    let soma: ?^bir.BirInstr = definicao_unica(c, p)
+    if ((((soma == none) or ((soma as ^bir.BirInstr).op != (bir.BIR_ADD as u8))) or ((soma as ^bir.BirInstr).classe != (bir.BC_I64 as u8))) or ((soma as ^bir.BirInstr).a.tipo != (bir.BO_VREG as u8))) or ((soma as ^bir.BirInstr).b.tipo != (bir.BO_VREG as u8)) {
+        return false
+    }
+    for lado in (0 as u32)..<2 {
+        var tern_1: ^bir.BirOperando = &(soma as ^bir.BirInstr).b
+        if lado == 0 {
+            tern_1 = &(soma as ^bir.BirInstr).a
+        }
+        let raiz: ^bir.BirOperando = tern_1
+        var tern_2: ^bir.BirOperando = &(soma as ^bir.BirInstr).a
+        if lado == 0 {
+            tern_2 = &(soma as ^bir.BirInstr).b
+        }
+        let prod: ^bir.BirOperando = tern_2
+        if not produto_com_passo(c, prod.id, passo) {
+            continue
+        }
+        base^ = num_base_de(c, raiz.id)
+        return ((base.slot as i32) != 0) or ((c.ndefs or_else {})[raiz.id] == 1)
+    }
+    return false
+}
+
+// C: nativo/optimizer/numeracao_alias.c:67
+proc faixa_no_elemento(desloc: i64, tam: u32, passo: i64) -> bool {
+    return ((tam > 0) and (desloc >= 0)) and ((desloc + (tam as i64)) <= passo)
+}
+
+// C: nativo/optimizer/numeracao_alias.c:73
+proc campos_disjuntos_do_array(c: ^NumCtx, x: ^NumChave, y: ?^NumChave) -> bool {
+    let tam_x: u32 = num_tamanho_da_classe(x.classe)
+    let tam_y: u32 = (y as ^NumChave).vb as u32
+    var bx: NumBase = NumBase{}
+    var by: NumBase = NumBase{}
+    var sx: i64 = 0
+    var sy: i64 = 0
+    if (not forma_de_array(c, x.va as u32, &bx, &sx)) or (not forma_de_array(c, (y as ^NumChave).va as u32, &by, &sy)) {
+        return false
+    }
+    if ((sx != sy) or ((bx.slot as i32) != (by.slot as i32))) or (bx.id != by.id) {
+        return false
+    }
+    if (not faixa_no_elemento(x.desloc as i64, tam_x, sx)) or (not faixa_no_elemento((y as ^NumChave).desloc as i64, tam_y, sx)) {
+        return false
+    }
+    return (((x.desloc as i64) + (tam_x as i64)) <= ((y as ^NumChave).desloc as i64)) or ((((y as ^NumChave).desloc as i64) + (tam_y as i64)) <= (x.desloc as i64))
+}
+
+// C: nativo/optimizer/numeracao_alias.c:89
+proc num_pode_sobrepor(c: ^NumCtx, carga: ^NumChave, gravacao: ?^NumChave) -> bool {
+    let tam_c: u32 = num_tamanho_da_classe(carga.classe)
+    let tam_g: i64 = (gravacao as ^NumChave).vb
+    var bc: NumBase = NumBase{}
+    var bg: NumBase = NumBase{}
+    if ((tam_g <= 0) or (carga.ta != (bir.BO_VREG as u8))) or ((gravacao as ^NumChave).ta != (bir.BO_VREG as u8)) {
+        return true
+    }
+    bc = num_base_de(c, carga.va as u32)
+    bg = num_base_de(c, (gravacao as ^NumChave).va as u32)
+    if ((bc.slot as i32) == (bg.slot as i32)) and (bc.id == bg.id) {
+        return ((carga.desloc as i64) < (((gravacao as ^NumChave).desloc as i64) + tam_g)) and (((gravacao as ^NumChave).desloc as i64) < ((carga.desloc as i64) + (tam_c as i64)))
+    }
+    if ((bc.slot as i32) != 0) and ((bg.slot as i32) != 0) {
+        return false
+    }
+    return not campos_disjuntos_do_array(c, carga, gravacao)
+}
+
+test "num_tamanho_da_classe_do_c" {
+    expect(num_tamanho_da_classe(0) == 0)
+    expect(num_tamanho_da_classe(1) == 1)
+    expect(num_tamanho_da_classe(3) == 4)
+    expect(num_tamanho_da_classe(4) == 8)
+    expect(num_tamanho_da_classe(5) == 4)
+    expect(num_tamanho_da_classe(6) == 8)
+    expect(num_tamanho_da_classe(7) == 16)
+    expect(num_tamanho_da_classe(8) == 0)
+    expect(num_tamanho_da_classe(255) == 0)
+}
+
+test "num_pode_sobrepor_mesma_base_do_c" {
+    var c = NumCtx{nvregs = 4}
+    num_preparar(&c, 64)
+    c.ndefs = num_temp(&c, 5, 0)
+    c.def_b = num_temp(&c, 5, 255)
+    var carga = NumChave{op = bir.BIR_CARREGA as u8, classe = bir.BC_I32 as u8, ta = bir.BO_VREG as u8, va = 1, desloc = 0}
+    var grava = NumChave{op = bir.BIR_GRAVA as u8, ta = bir.BO_VREG as u8, va = 1, desloc = 8, vb = 4}
+    expect(not num_pode_sobrepor(&c, &carga, &grava))
+    grava.desloc = 2
+    expect(num_pode_sobrepor(&c, &carga, &grava))
+    grava.vb = 0
+    expect(num_pode_sobrepor(&c, &carga, &grava))
+    num_fatos_liberar(&c)
+}

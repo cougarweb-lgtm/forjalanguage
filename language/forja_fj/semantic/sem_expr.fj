@@ -1,0 +1,1225 @@
+// semantic/sem_expr.fj - porte de compiler/semantic/sem_expr.c
+// sha256 de semantic/sem_expr.c: c63a7bffab27773d811595f930d722565291c5b3cde93bb9bcbbf463426333db
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "common"
+import "frontend"
+
+// Digitos decimais que SEMPRE cabem no tipo (99 em u8/i8, 9999 em 16 bits, ...): literal com tantos digitos ou menos nao le a fonte.
+// Tabela do C ([TIPO_I8] = 2, [TIPO_U8] = 2, [TIPO_I16] = 4, [TIPO_U16] = 4, [TIPO_I32] = 9, [TIPO_U32] = 9, [TIPO_INT] = 18, [TIPO_UINT] = 19), indexada pelo TipoId.
+const DIGITOS_SEGUROS: [17]u8 = {0, 0, 0, 9, 18, 0, 0, 0, 2, 4, 2, 4, 9, 19, 0, 0, 0}
+// CHECAGENS[EX_CHAMADA_IND + 1] do C (ponteiro de funcao por tipo_no do Expr, C2F-A0/80): a tag de chamar_checa_expr, indexada por EX_*
+// (INT REAL BOOL TEXTO NOME CAMPO CHAMADA LITERAL_STRUCT UNARIO BINARIO CONVERSAO TRY OR_ELSE NONE INDICE FATIA LITERAL_ARRAY TIPO EMBRULHA OPC_TESTE TUPLA FTEXTO CHAMADA_IND)
+const CHECAGENS: [23]u16 = {2, 2, 3, 4, 6, 7, 11, 12, 8, 10, 9, 13, 14, 5, 15, 16, 1, 17, 18, 18, 19, 20, 21}
+
+pub const CHECA_EXPR_SEM_LITERAL_ARRAY: u16 = 1
+pub const CHECA_EXPR_EX_LITERAL: u16 = 2
+pub const CHECA_EXPR_EX_BOOL_2: u16 = 3
+pub const CHECA_EXPR_EX_TEXTO_2: u16 = 4
+pub const CHECA_EXPR_EX_NONE_2: u16 = 5
+pub const CHECA_EXPR_EX_NOME_2: u16 = 6
+pub const CHECA_EXPR_EX_CAMPO_2: u16 = 7
+pub const CHECA_EXPR_EX_UNARIO_2: u16 = 8
+pub const CHECA_EXPR_EX_CONVERSAO_2: u16 = 9
+pub const CHECA_EXPR_EX_BINARIO_2: u16 = 10
+pub const CHECA_EXPR_EX_CHAMADA_2: u16 = 11
+pub const CHECA_EXPR_EX_LITERAL_STRUCT_2: u16 = 12
+pub const CHECA_EXPR_EX_TRY_2: u16 = 13
+pub const CHECA_EXPR_EX_OR_ELSE_2: u16 = 14
+pub const CHECA_EXPR_EX_INDICE_2: u16 = 15
+pub const CHECA_EXPR_EX_FATIA_2: u16 = 16
+pub const CHECA_EXPR_EX_TIPO_2: u16 = 17
+pub const CHECA_EXPR_EX_JA_TIPADO: u16 = 18
+pub const CHECA_EXPR_EX_TUPLA_2: u16 = 19
+pub const CHECA_EXPR_EX_F_TEXTO_2: u16 = 20
+pub const CHECA_EXPR_EX_CHAMADA_IND_2: u16 = 21
+pub proc chamar_checa_expr(tag: u16, s: ^Semantica, e: ^frontend.Expr, ctx: u32) -> bool {
+    if tag == 1 {
+        return sem_literal_array(s, e, ctx)
+    }
+    if tag == 2 {
+        return ex_literal(s, e, ctx)
+    }
+    if tag == 3 {
+        return ex_bool_2(s, e, ctx)
+    }
+    if tag == 4 {
+        return ex_texto_2(s, e, ctx)
+    }
+    if tag == 5 {
+        return ex_none_2(s, e, ctx)
+    }
+    if tag == 6 {
+        return ex_nome_2(s, e, ctx)
+    }
+    if tag == 7 {
+        return ex_campo_2(s, e, ctx)
+    }
+    if tag == 8 {
+        return ex_unario_2(s, e, ctx)
+    }
+    if tag == 9 {
+        return ex_conversao_2(s, e, ctx)
+    }
+    if tag == 10 {
+        return ex_binario_2(s, e, ctx)
+    }
+    if tag == 11 {
+        return ex_chamada_2(s, e, ctx)
+    }
+    if tag == 12 {
+        return ex_literal_struct_2(s, e, ctx)
+    }
+    if tag == 13 {
+        return ex_try_2(s, e, ctx)
+    }
+    if tag == 14 {
+        return ex_or_else_2(s, e, ctx)
+    }
+    if tag == 15 {
+        return ex_indice_2(s, e, ctx)
+    }
+    if tag == 16 {
+        return ex_fatia_2(s, e, ctx)
+    }
+    if tag == 17 {
+        return ex_tipo_2(s, e, ctx)
+    }
+    if tag == 18 {
+        return ex_ja_tipado(s, e, ctx)
+    }
+    if tag == 19 {
+        return ex_tupla_2(s, e, ctx)
+    }
+    if tag == 20 {
+        return ex_f_texto_2(s, e, ctx)
+    }
+    if tag == 21 {
+        return ex_chamada_ind_2(s, e, ctx)
+    }
+    panic("C2F-80: tag sem alvo em chamar_checa_expr (ponteiro NULL no C)")
+    return false
+}
+
+// C: semantic/sem_expr.c:52
+proc eh_aritmetico(op: u8) -> bool {
+    return ((op as i32) >= frontend.OP_SOMA) and ((op as i32) <= frontend.OP_RESTO)
+}
+
+// C: semantic/sem_expr.c:53
+proc eh_bits(op: u8) -> bool {
+    return ((op as i32) >= frontend.OP_BIT_E) and ((op as i32) <= frontend.OP_DESLOCA_DIR)
+}
+
+// C: semantic/sem_expr.c:55
+proc no_flexivel(e: ?^frontend.Expr) -> bool {
+    if ((e as ^frontend.Expr).tipo_no == (frontend.EX_INT as u8)) or ((e as ^frontend.Expr).tipo_no == (frontend.EX_REAL as u8)) {
+        return true
+    }
+    if (e as ^frontend.Expr).tipo_no == (frontend.EX_UNARIO as u8) {
+        return (((e as ^frontend.Expr).op == (frontend.OP_NEGAR as u8)) or ((e as ^frontend.Expr).op == (frontend.OP_BIT_NAO as u8))) and (common.c2f_b2i32(((e as ^frontend.Expr).a as ^frontend.Expr).flexivel) != 0)
+    }
+    if (e as ^frontend.Expr).tipo_no != (frontend.EX_BINARIO as u8) {
+        return false
+    }
+    return (((common.c2f_b2i32(eh_aritmetico((e as ^frontend.Expr).op)) != 0) or (common.c2f_b2i32(eh_bits((e as ^frontend.Expr).op)) != 0)) and (common.c2f_b2i32(((e as ^frontend.Expr).a as ^frontend.Expr).flexivel) != 0)) and (common.c2f_b2i32(((e as ^frontend.Expr).b as ^frontend.Expr).flexivel) != 0)
+}
+
+// C: semantic/sem_expr.c:63
+proc sem_marcar_flexivel(e: ?^frontend.Expr) {
+    if (e as ^frontend.Expr).a != none {
+        sem_marcar_flexivel((e as ^frontend.Expr).a)
+    }
+    if (e as ^frontend.Expr).b != none {
+        sem_marcar_flexivel((e as ^frontend.Expr).b)
+    }
+    for i in (0 as u32)..<(e as ^frontend.Expr).nargs {
+        sem_marcar_flexivel(((e as ^frontend.Expr).args or_else {})[i].valor)
+    }
+    let ptr_1: ^frontend.Expr = e as ^frontend.Expr
+    ptr_1.flexivel = no_flexivel(e)
+}
+
+// C: semantic/sem_expr.c:79
+// E0420 por largura: o literal (negado se 'negativo') cabe no tipo? 'pos' = onde o erro aponta (o literal, ou o '-').
+proc conferir_literal_inteiro(s: ^Semantica, literal: ?^frontend.Expr, tipo: u32, negativo: bool, pos: u32) -> bool {
+    var mag: u64 = 0
+    if (((literal as ^frontend.Expr).op as i32) <= (DIGITOS_SEGUROS[tipo as int] as i32)) and (not (negativo and tipo_eh_sem_sinal(tipo))) {
+        return true
+    }
+    let digitos = numero_da_fonte(s, (literal as ^frontend.Expr).pos_op)
+    defer delete(digitos)
+    if not tipo_ler_literal_u64(as_bytes(digitos), &mag) {
+        let msg_1 = format(f"o literal passa de 64 bits (maximo 18446744073709551615)", alloc = heap)
+        defer delete(msg_1)
+        return sem_erro(s, common.E0420, pos, msg_1)
+    }
+    if tipo_inteiro_cabe(tipo, negativo, mag) {
+        return true
+    }
+    var rotulo: str = "literal"
+    var sinal: str = ""
+    if negativo {
+        rotulo = "valor"
+        sinal = "-"
+    }
+    let nome_fixo: str = tipo_nome_fixo(tipo) or_else "(null)"
+    let msg_2 = format(f"o {rotulo} {sinal}{mag} nao cabe em {nome_fixo} ({tipo_inteiro_min(tipo)}..={tipo_inteiro_max(tipo)})", alloc = heap)
+    defer delete(msg_2)
+    return sem_erro(s, common.E0420, pos, msg_2)
+}
+
+// C: semantic/sem_expr.c:92
+proc ex_literal(s: ^Semantica, e: ^frontend.Expr, ctx: u32) -> bool {
+    var ctx_v: u32 = ctx
+    ctx_v = sem_ctx_sem_opcional(s, ctx_v)
+    if e.tipo_no == (frontend.EX_INT as u8) {
+        if tipo_eh_real(&s.tipos, ctx_v) {
+            return sem_literal_inteiro_em_real(s, e, ctx_v)
+        }
+        var tern_1: u32 = TIPO_INT as u32
+        if common.c2f_b2i32(tipo_eh_inteiro(ctx_v)) != 0 {
+            tern_1 = ctx_v
+        }
+        e.tipo = tern_1
+        return conferir_literal_inteiro(s, e, e.tipo, false, e.pos)
+    }
+    var tern_2: u32 = TIPO_F32 as u32
+    if (ctx_v == (TIPO_F64 as u32)) or (common.c2f_s2u_32(tipo_classe_de(&s.tipos, ctx_v)) == (TC_REAL as u32)) {
+        tern_2 = ctx_v
+    }
+    e.tipo = tern_2
+    return true
+}
+
+// C: semantic/sem_expr.c:104
+proc ex_bool_2(s: ^Semantica, e: ^frontend.Expr, ctx: u32) -> bool {
+    e.tipo = TIPO_BOOL as u32
+    return true
+}
+
+// C: semantic/sem_expr.c:112
+proc ex_texto_2(s: ^Semantica, e: ^frontend.Expr, ctx: u32) -> bool {
+    var ctx_v: u32 = ctx
+    ctx_v = sem_ctx_sem_opcional(s, ctx_v)
+    var tern_1: i32 = TIPO_TEXTO
+    if ctx_v == (TIPO_CSTR as u32) {
+        tern_1 = TIPO_CSTR
+    }
+    e.tipo = common.c2f_s2u_32(tern_1)
+    return true
+}
+
+// C: semantic/sem_expr.c:120
+proc ex_none_2(s: ^Semantica, e: ^frontend.Expr, ctx: u32) -> bool {
+    let c: i32 = tipo_classe_de(&s.tipos, ctx)
+    if ((common.c2f_s2u_32(c) == (TC_ANULAVEL as u32)) or (common.c2f_s2u_32(c) == (TC_RAWPTR as u32))) or (common.c2f_s2u_32(c) == (TC_OPCIONAL as u32)) {
+        e.tipo = ctx
+        return true
+    }
+    if common.c2f_s2u_32(c) == (TC_PONTEIRO as u32) {
+        let msg_1 = format(f"'^T' nunca e none; declare '?^T' para aceitar none", alloc = heap)
+        defer delete(msg_1)
+        return sem_erro(s, common.E0306, e.pos, msg_1)
+    }
+    let msg_2 = format(f"none precisa de um tipo ?T, ?^T ou rawptr pelo contexto (ex.: let a: ?i32 = none)", alloc = heap)
+    defer delete(msg_2)
+    return sem_erro(s, common.E0306, e.pos, msg_2)
+}
+
+// C: semantic/sem_expr.c:131
+proc ex_nome_2(s: ^Semantica, e: ^frontend.Expr, ctx: u32) -> bool {
+    var tern_1: ?^LocalInfo = none
+    if e.modulo != 0 {
+        tern_1 = none
+    } else {
+        tern_1 = escopo_buscar_mut(&s.escopo, e.nome)
+    }
+    let local: ?^LocalInfo = tern_1
+    if local != none {
+        if common.c2f_b2i32(((s.tipo_allocator != 0) and ((local as ^LocalInfo).tipo == s.tipo_allocator)) and (not s.alocador_lendo)) != 0 {
+            return sem_allocator_valor_solto(s, e)
+        }
+        let ptr_1: ^LocalInfo = local as ^LocalInfo
+        ptr_1.usos = ptr_1.usos | (LOCAL_LIDO as u8)
+        var tern_2: i32 = frontend.REF_LOCAL
+        if (local as ^LocalInfo).natureza == (LOC_PARAM as u8) {
+            tern_2 = frontend.REF_PARAM
+        }
+        e.ref = tern_2 as u8
+        e.op = (local as ^LocalInfo).natureza
+        e.ref_id = (local as ^LocalInfo).id
+        e.tipo = (local as ^LocalInfo).tipo
+        return true
+    }
+    let y: ^Simbolo = sem_achar_simbolo(s, e.nome, e.modulo)
+    var tern_3: u32 = e.pos
+    if e.modulo != 0 {
+        tern_3 = e.pos_op
+    }
+    var uso: NomeUsado = NomeUsado{nome = e.nome, pos = tern_3, modulo = e.modulo}
+    if not sem_visivel(s, y, &uso) {
+        return false
+    }
+    if common.c2f_b2i32(sem_simbolo_veneno(y)) != 0 {
+        e.tipo = TIPO_VENENO as u32
+        return true
+    }
+    if y.categoria == (SIM_CONST as u8) {
+        e.ref = frontend.REF_CONST as u8
+        e.ref_id = y.indice
+        e.tipo = y.tipo
+        return true
+    }
+    if y.categoria == (SIM_PROC as u8) {
+        return sem_proc_como_callback(s, e, y, ctx)
+    }
+    if ((y.categoria == (SIM_NENHUM as u8)) and (e.modulo == 0)) and (common.c2f_b2i32(sem_nome_ja_relatado(s, e.nome)) != 0) {
+        return sem_erro_calado(s, e.pos_op)
+    }
+    if ((y.categoria == (SIM_NENHUM as u8)) and (e.modulo == 0)) and (common.c2f_b2i32(sem_idioma_de_nome(s, e)) != 0) {
+        return false
+    }
+    var sp: SemParecido = SemParecido{}
+    sem_parecido_iniciar(s, common.E0201, e.pos_op, e.nome, &sp)
+    sem_parecidos_de_nome(s, e.modulo, &sp)
+    let msg_1 = format(f"nome '{sem_nome_texto(s, e.nome)}' nao declarado como variavel ou constante", alloc = heap)
+    defer delete(msg_1)
+    return sem_erro_parecido(s, &sp, msg_1)
+}
+
+// C: semantic/sem_expr.c:167
+proc nome_eh_enum(s: ^Semantica, nome: ?^frontend.Expr) -> bool {
+    return (((nome as ^frontend.Expr).tipo_no == (frontend.EX_NOME as u8)) and (((nome as ^frontend.Expr).modulo != 0) or (escopo_buscar(&s.escopo, (nome as ^frontend.Expr).nome) == none))) and (sem_achar_simbolo(s, (nome as ^frontend.Expr).nome, (nome as ^frontend.Expr).modulo).categoria == (SIM_ENUM as u8))
+}
+
+// C: semantic/sem_expr.c:173
+proc ex_membro(s: ^Semantica, e: ^frontend.Expr) -> bool {
+    let base: ^frontend.Expr = e.a as ^frontend.Expr
+    let y: ^Simbolo = sem_achar_simbolo(s, base.nome, base.modulo)
+    var pos_uso: u32 = base.pos
+    if base.modulo != 0 {
+        pos_uso = base.pos_op
+    }
+    var uso: NomeUsado = NomeUsado{nome = base.nome, pos = pos_uso, modulo = base.modulo}
+    if not sem_visivel(s, y, &uso) {
+        return false
+    }
+    if sem_simbolo_veneno(y) { // L8: enum com erro: os membros dele nao sao conferidos
+        base.tipo = TIPO_VENENO as u32
+        e.tipo = TIPO_VENENO as u32
+        return true
+    }
+    let idx: i32 = sem_achar_membro(s, y.decl, e.nome, e.pos_op)
+    if idx < 0 {
+        return sem_membro_ausente(s, e, y.decl, idx)
+    }
+    base.ref = frontend.REF_ENUM as u8
+    base.ref_id = y.indice
+    base.tipo = y.tipo
+    e.ref = frontend.REF_MEMBRO as u8
+    e.ref_id = idx
+    e.tipo = y.tipo
+    return true
+}
+
+// C: semantic/sem_expr.c:195
+proc eh_colecao(s: ^Semantica, t: u32) -> bool {
+    var forma: i32 = 0
+    _ = sem_elemento_de(s, t, &forma)
+    return common.c2f_s2u_32(forma) != (FORMA_NENHUMA as u32)
+}
+
+// C: semantic/sem_expr.c:203
+proc eh_lista(s: ^Semantica, t: u32) -> bool {
+    var forma: i32 = 0
+    _ = sem_elemento_de(s, t, &forma)
+    return (common.c2f_s2u_32(forma) == (FORMA_DINAMICO as u32)) or (common.c2f_s2u_32(forma) == (FORMA_PONTEIRO_DINAMICO as u32))
+}
+
+// C: semantic/sem_expr.c:211
+// Campo pedido onde nao ha struct: '?^T' (pode ser none) e '^^T' (o '.' desreferencia um nivel so) ganham causa propria.
+proc erro_campo_sem_struct(s: ^Semantica, e: ^frontend.Expr) -> bool {
+    let k: ^TipoInfo = tipo_de(&s.tipos, (e.a as ^frontend.Expr).tipo)
+    if eh_lista(s, (e.a as ^frontend.Expr).tipo) {
+        let msg_1 = format(f"lista nao tem campo: use l[0] e len(l)", alloc = heap)
+        defer delete(msg_1)
+        return sem_erro(s, common.E0308, e.pos_op, msg_1)
+    }
+    if eh_colecao(s, (e.a as ^frontend.Expr).tipo) {
+        let msg_2 = format(f"array nao tem campo: use a[0] (.x .y .z .w so em [2]T, [3]T e [4]T de numero; matrix[R, C]T usa m[i, j])", alloc = heap)
+        defer delete(msg_2)
+        return sem_erro(s, common.E0308, e.pos_op, msg_2)
+    }
+    if k.classe == (TC_ANULAVEL as u8) {
+        let apontado = texto_do_tipo(s, k.a, 96)
+        defer delete(apontado)
+        let msg_3 = format(f"campo de '?^{apontado}' pode estar em none: converta com 'p as ^{apontado}' antes", alloc = heap)
+        defer delete(msg_3)
+        return sem_erro(s, common.E0306, e.pos_op, msg_3)
+    }
+    if k.classe == (TC_OPCIONAL as u8) {
+        let apontado = texto_do_tipo(s, (e.a as ^frontend.Expr).tipo, 96)
+        defer delete(apontado)
+        let msg_4 = format(f"campo de '{apontado}' pode estar em none: desembrulhe com switch v in x {{ case T: ... case none: ... }} ou x or_else padrao", alloc = heap)
+        defer delete(msg_4)
+        return sem_erro(s, common.E0312, e.pos_op, msg_4)
+    }
+    if k.classe == (TC_UNIAO as u8) {
+        let msg_5 = format(f"union nao tem campo: leia com switch v in x {{ case Variante: v.{sem_nome_texto(s, e.nome)} }}", alloc = heap)
+        defer delete(msg_5)
+        return sem_erro(s, common.E0313, e.pos_op, msg_5)
+    }
+    if (k.classe == (TC_PONTEIRO as u8)) and (tipo_classe_de(&s.tipos, k.a) == TC_PONTEIRO) {
+        let msg_6 = format(f"'.' desreferencia um nivel so; escreva 'pp^.{sem_nome_texto(s, e.nome)}'", alloc = heap)
+        defer delete(msg_6)
+        return sem_erro(s, common.E0306, e.pos_op, msg_6)
+    }
+    let msg_7 = format(f"campo '{sem_nome_texto(s, e.nome)}' pedido em valor que nao e struct", alloc = heap)
+    defer delete(msg_7)
+    return sem_erro(s, common.E0201, e.pos_op, msg_7)
+}
+
+// C: semantic/sem_expr.c:237
+proc campo_fora_de_struct(s: ^Semantica, e: ^frontend.Expr) -> bool {
+    if (common.c2f_b2i32(tipos_tem_v19(&s.tipos)) != 0) and (common.c2f_b2i32(sem_eh_tipo_v19(s, (e.a as ^frontend.Expr).tipo)) != 0) {
+        return sem_campo_v19(s, e)
+    }
+    var tern_1: i32 = 0
+    if common.c2f_b2i32(sem_idioma_de_campo(s, e)) != 0 {
+        tern_1 = 0
+    } else {
+        tern_1 = common.c2f_b2i32(erro_campo_sem_struct(s, e))
+    }
+    return tern_1 != 0
+}
+
+// C: semantic/sem_expr.c:243
+proc ex_campo_2(s: ^Semantica, e: ^frontend.Expr, ctx: u32) -> bool {
+    if nome_eh_enum(s, e.a) {
+        return ex_membro(s, e)
+    }
+    s.alocador_lendo = (e.a as ^frontend.Expr).tipo_no == (frontend.EX_NOME as u8)
+    let base_ok: bool = sem_checar(s, e.a, TIPO_VAZIO as u32)
+    s.alocador_lendo = false
+    if not base_ok {
+        return false
+    }
+    if sem_eh_lista_fixa_ou_ponteiro(s, (e.a as ^frontend.Expr).tipo) {
+        var tern_1: i32 = 0
+        if common.c2f_b2i32(sem_idioma_de_campo(s, e)) != 0 {
+            tern_1 = 0
+        } else {
+            tern_1 = common.c2f_b2i32(sem_erro_de_lista_fixa(s, e.pos_op, "[dynamic, N]T nao tem campo: use l[i], len(l), l[..] e append(&l, item = x)"))
+        }
+        return tern_1 != 0
+    }
+    if common.c2f_b2i32(sem_eh_allocator(s, (e.a as ^frontend.Expr).tipo)) != 0 {
+        return sem_allocator_ler_campo(s, e)
+    }
+    let estrutura: ?^frontend.Decl = sem_decl_da_struct(s, (e.a as ^frontend.Expr).tipo)
+    if estrutura == none {
+        var tern_2: i32 = 0
+        if common.c2f_b2i32(sem_eh_swizzle(s, e)) != 0 {
+            tern_2 = common.c2f_b2i32(sem_swizzle(s, e))
+        } else {
+            tern_2 = common.c2f_b2i32(campo_fora_de_struct(s, e))
+        }
+        return tern_2 != 0
+    }
+    let idx: i32 = sem_achar_campo(estrutura, e.nome)
+    if idx < 0 {
+        if (estrutura as ^frontend.Decl).externo {
+            let msg_1 = format(f"o tipo opaco '{sem_nome_texto(s, (estrutura as ^frontend.Decl).nome)}' nao tem campos visiveis: use as funcoes da biblioteca C", alloc = heap)
+            defer delete(msg_1)
+            return sem_erro(s, common.E0908, e.pos_op, msg_1)
+        }
+        var sp: SemParecido = SemParecido{}
+        sem_parecido_iniciar(s, common.E0201, e.pos_op, e.nome, &sp)
+        sem_parecidos_de_campos(s, estrutura, &sp)
+        let msg_2 = format(f"a struct '{sem_nome_texto(s, (estrutura as ^frontend.Decl).nome)}' nao tem o campo '{sem_nome_texto(s, e.nome)}'", alloc = heap)
+        defer delete(msg_2)
+        return sem_erro_parecido(s, &sp, msg_2)
+    }
+    e.ref = frontend.REF_CAMPO as u8
+    e.ref_id = idx
+    e.tipo = ((estrutura as ^frontend.Decl).campos or_else {})[idx].tipo.tipo
+    return true
+}
+
+// C: semantic/sem_expr.c:276
+proc unario_nao(s: ^Semantica, e: ^frontend.Expr) -> bool {
+    if not sem_checar(s, e.a, TIPO_BOOL as u32) {
+        return false
+    }
+    if (e.a as ^frontend.Expr).tipo != (TIPO_BOOL as u32) {
+        let msg_1 = format(f"'not' pede bool", alloc = heap)
+        defer delete(msg_1)
+        return sem_erro(s, common.E0301, e.pos, msg_1)
+    }
+    e.tipo = TIPO_BOOL as u32
+    return true
+}
+
+// C: semantic/sem_expr.c:284
+proc unario_endereco(s: ^Semantica, e: ^frontend.Expr) -> bool {
+    let a: ?^frontend.Expr = e.a
+    if ((a as ^frontend.Expr).tipo_no == (frontend.EX_CAMPO as u8)) or ((a as ^frontend.Expr).tipo_no == (frontend.EX_INDICE as u8)) {
+        if not sem_checar(s, a, TIPO_VAZIO as u32) {
+            return false
+        }
+        if ((common.c2f_b2i32(s.tipos.tem_soa) != 0) and ((a as ^frontend.Expr).tipo_no == (frontend.EX_INDICE as u8))) and (common.c2f_s2u_32(tipo_classe_de(&s.tipos, ((a as ^frontend.Expr).a as ^frontend.Expr).tipo)) == (TC_SOA as u32)) {
+            let msg_1 = format(f"&a[i] nao existe em soa: a struct nao fica inteira na memoria; use &a[i].campo", alloc = heap)
+            defer delete(msg_1)
+            return sem_erro(s, common.E0320, e.pos, msg_1)
+        }
+        if not sem_lvalor_mutavel_de(s, a, "'&' de campo ou elemento permite altera-lo: declare com var") {
+            return false
+        }
+        e.tipo = tipo_ponteiro(&s.tipos, (a as ^frontend.Expr).tipo)
+        return true
+    }
+    if (a as ^frontend.Expr).tipo_no != (frontend.EX_NOME as u8) {
+        let msg_2 = format(f"'&' vale sobre variavel, campo ou elemento (a[i])", alloc = heap)
+        defer delete(msg_2)
+        return sem_erro(s, common.E0301, e.pos, msg_2)
+    }
+    if not sem_checar(s, a, TIPO_VAZIO as u32) {
+        return false
+    }
+    if ((a as ^frontend.Expr).ref != (frontend.REF_LOCAL as u8)) and ((a as ^frontend.Expr).ref != (frontend.REF_PARAM as u8)) {
+        let msg_3 = format(f"'&' so vale sobre o nome de uma variavel", alloc = heap)
+        defer delete(msg_3)
+        return sem_erro(s, common.E0301, e.pos, msg_3)
+    }
+    if (a as ^frontend.Expr).op != (LOC_VAR as u8) {
+        let msg_4 = format(f"'{sem_nome_texto(s, (a as ^frontend.Expr).nome)}' e imutavel: '&' permitiria alterar o valor; declare com var", alloc = heap)
+        defer delete(msg_4)
+        return sem_erro(s, common.E0705, (a as ^frontend.Expr).pos, msg_4)
+    }
+    sem_higiene_alterar(s, a)
+    e.tipo = tipo_ponteiro(&s.tipos, (a as ^frontend.Expr).tipo)
+    return true
+}
+
+// C: semantic/sem_expr.c:310
+// 'p^': so ^T se desreferencia; as outras formas de ponteiro dizem o que fazer.
+proc unario_deref(s: ^Semantica, e: ^frontend.Expr) -> bool {
+    if not sem_checar(s, e.a, TIPO_VAZIO as u32) {
+        return false
+    }
+    let k: ^TipoInfo = tipo_de(&s.tipos, (e.a as ^frontend.Expr).tipo)
+    if k.classe == (TC_PONTEIRO as u8) {
+        if s.tem_opaco and sem_tipo_eh_opaco(s, k.a) {
+            let apontado = texto_do_tipo(s, k.a, 96)
+            defer delete(apontado)
+            let msg_1 = format(f"nao da para ler o valor de um tipo opaco ('{apontado}'): passe o ponteiro ^{apontado} para as funcoes da biblioteca C", alloc = heap)
+            defer delete(msg_1)
+            return sem_erro(s, common.E0908, e.pos_op, msg_1)
+        }
+        e.tipo = k.a
+        return true
+    }
+    if k.classe == (TC_ANULAVEL as u8) {
+        let apontado = texto_do_tipo(s, k.a, 96)
+        defer delete(apontado)
+        let msg_2 = format(f"'?^{apontado}' pode ser none: teste 'p != none' e converta com 'p as ^{apontado}' antes de ler", alloc = heap)
+        defer delete(msg_2)
+        return sem_erro(s, common.E0306, e.pos_op, msg_2)
+    }
+    if k.classe == (TC_RAWPTR as u8) {
+        let msg_3 = format(f"rawptr nao tem tipo apontado: converta com 'p as ^T' antes de ler", alloc = heap)
+        defer delete(msg_3)
+        return sem_erro(s, common.E0306, e.pos_op, msg_3)
+    }
+    if k.classe == (TC_CSTR as u8) {
+        let msg_4 = format(f"cstr nao se desreferencia; converta para str com 'c as str'", alloc = heap)
+        defer delete(msg_4)
+        return sem_erro(s, common.E0306, e.pos_op, msg_4)
+    }
+    let tipo = texto_do_tipo(s, (e.a as ^frontend.Expr).tipo, 96)
+    defer delete(tipo)
+    let msg_5 = format(f"'^' depois de um valor que nao e ponteiro (tipo {tipo})", alloc = heap)
+    defer delete(msg_5)
+    return sem_erro(s, common.E0306, e.pos_op, msg_5)
+}
+
+// C: semantic/sem_expr.c:337
+proc unario_negar(s: ^Semantica, e: ^frontend.Expr, ctx: u32) -> bool {
+    let a: ^frontend.Expr = e.a as ^frontend.Expr
+    if (a.tipo_no == (frontend.EX_INT as u8)) and tipo_eh_real(&s.tipos, ctx) { // v1.11: '-1' em contexto real; o sinal nao muda a exatidao
+        e.tipo = ctx
+        return sem_literal_inteiro_em_real(s, a, ctx)
+    }
+    if a.tipo_no == (frontend.EX_INT as u8) { // '-literal' e conferido inteiro: -128 cabe em i8 mesmo que 128 nao caiba
+        var tipo: u32 = TIPO_INT as u32
+        if tipo_eh_inteiro(ctx) {
+            tipo = ctx
+        }
+        a.tipo = tipo
+        e.tipo = tipo
+        return conferir_literal_inteiro(s, a, tipo, true, e.pos)
+    }
+    if not sem_checar(s, a, ctx) {
+        return false
+    }
+    if not tipo_eh_numerico(&s.tipos, a.tipo) {
+        if tipo_classe_de(&s.tipos, a.tipo) == TC_MATRIZ { // -m (v1.9)
+            e.tipo = a.tipo
+            return true
+        }
+        if tipo_classe_de(&s.tipos, a.tipo) == TC_ARRAY {
+            return sem_negar_vetor(s, e) // -a em [N]T (v1.11)
+        }
+        if sem_eh_quat(s, a.tipo) { // -q (v1.11 L14a)
+            e.tipo = a.tipo
+            return true
+        }
+        let msg_1 = format(f"'-' pede numero", alloc = heap)
+        defer delete(msg_1)
+        return sem_erro(s, common.E0301, e.pos, msg_1)
+    }
+    if tipo_eh_sem_sinal(a.tipo) {
+        let nome_fixo: str = tipo_nome_fixo(a.tipo) or_else "(null)"
+        let msg_2 = format(f"'-' em inteiro sem sinal ({nome_fixo})", alloc = heap)
+        defer delete(msg_2)
+        return sem_erro(s, common.E0305, e.pos, msg_2)
+    }
+    e.tipo = a.tipo
+    return true
+}
+
+// C: semantic/sem_expr.c:368
+proc unario_bit_nao(s: ^Semantica, e: ^frontend.Expr, ctx: u32) -> bool {
+    if not sem_checar(s, e.a, ctx) {
+        return false
+    }
+    if not tipo_eh_sem_sinal((e.a as ^frontend.Expr).tipo) {
+        let msg_1 = format(f"'~' em tipo que nao e inteiro sem sinal", alloc = heap)
+        defer delete(msg_1)
+        return sem_erro(s, common.E0303, e.pos, msg_1)
+    }
+    e.tipo = (e.a as ^frontend.Expr).tipo
+    return true
+}
+
+// C: semantic/sem_expr.c:376
+proc ex_unario_2(s: ^Semantica, e: ^frontend.Expr, ctx: u32) -> bool {
+    var ctx_v: u32 = ctx
+    ctx_v = sem_ctx_sem_opcional(s, ctx_v)
+    if e.op == (frontend.OP_NAO as u8) {
+        return unario_nao(s, e)
+    }
+    if e.op == (frontend.OP_ENDERECO as u8) {
+        return unario_endereco(s, e)
+    }
+    if e.op == (frontend.OP_DEREF as u8) {
+        return unario_deref(s, e)
+    }
+    if e.op == (frontend.OP_BIT_NAO as u8) {
+        return unario_bit_nao(s, e, ctx_v)
+    }
+    return unario_negar(s, e, ctx_v)
+}
+
+// C: semantic/sem_expr.c:387
+proc conferir_literal_sob_as(s: ^Semantica, e: ^frontend.Expr, alvo: u32) -> bool {
+    var literal: ?^frontend.Expr = e.a
+    let negativo: bool = (((literal as ^frontend.Expr).tipo_no == (frontend.EX_UNARIO as u8)) and ((literal as ^frontend.Expr).op == (frontend.OP_NEGAR as u8))) and (((literal as ^frontend.Expr).a as ^frontend.Expr).tipo_no == (frontend.EX_INT as u8))
+    if negativo {
+        literal = (literal as ^frontend.Expr).a
+    }
+    if ((literal as ^frontend.Expr).tipo_no != (frontend.EX_INT as u8)) or (not tipo_eh_inteiro(alvo)) {
+        return true
+    }
+    var tern_1: u32 = (literal as ^frontend.Expr).pos
+    if common.c2f_b2i32(negativo) != 0 {
+        tern_1 = (e.a as ^frontend.Expr).pos
+    }
+    return conferir_literal_inteiro(s, literal, alvo, negativo, tern_1)
+}
+
+// C: semantic/sem_expr.c:396
+proc eh_ponteiro_ou_anulavel(c: i32) -> bool {
+    return (common.c2f_s2u_32(c) == (TC_PONTEIRO as u32)) or (common.c2f_s2u_32(c) == (TC_ANULAVEL as u32))
+}
+
+// C: semantic/sem_expr.c:399
+proc conversao_para_proc(s: ^Semantica, e: ^frontend.Expr, origem: u32, alvo: u32) -> bool {
+    let co: i32 = tipo_classe_de(&s.tipos, origem)
+    if ((common.c2f_s2u_32(co) == (TC_RAWPTR as u32)) or (common.c2f_b2i32(eh_ponteiro_ou_anulavel(co)) != 0)) or (common.c2f_b2i32(tipo_proc_compativel(&s.tipos, origem, alvo)) != 0) {
+        return true
+    }
+    let msg_1 = format(f"'as proc(...)' so converte de rawptr, ^T, ?^T (endereco de funcao vindo do C) ou de proc com a mesma assinatura", alloc = heap)
+    defer delete(msg_1)
+    return sem_erro(s, common.E0910, e.pos_op, msg_1)
+}
+
+// C: semantic/sem_expr.c:408
+proc conversao_nao_numerica(s: ^Semantica, e: ^frontend.Expr, origem: u32, alvo: u32) -> bool {
+    let t: ^Tipos = &s.tipos
+    let co: i32 = tipo_classe_de(t, origem)
+    let ca: i32 = tipo_classe_de(t, alvo)
+    if origem == alvo {
+        return true
+    }
+    if (common.c2f_s2u_32(co) == (TC_CSTR as u32)) and (alvo == (TIPO_TEXTO as u32)) {
+        return true
+    }
+    if (origem == (TIPO_TEXTO as u32)) and (common.c2f_s2u_32(ca) == (TC_CSTR as u32)) {
+        let msg_1 = format(f"str nao termina em NUL: um cstr a partir de str precisa alocar e copiar (format_c, v1.6); para literal escreva let c: cstr = \"...\"", alloc = heap)
+        defer delete(msg_1)
+        return sem_erro(s, common.E0307, e.pos_op, msg_1)
+    }
+    if ((common.c2f_b2i32(tipo_eh_familia_ponteiro(t, origem)) != 0) and (common.c2f_b2i32(tipo_eh_numerico(t, alvo)) != 0)) or ((common.c2f_b2i32(tipo_eh_familia_ponteiro(t, alvo)) != 0) and (common.c2f_b2i32(tipo_eh_numerico(t, origem)) != 0)) {
+        let msg_2 = format(f"ponteiro nao vira numero nem numero vira ponteiro", alloc = heap)
+        defer delete(msg_2)
+        return sem_erro(s, common.E0306, e.pos_op, msg_2)
+    }
+    if common.c2f_s2u_32(ca) == (TC_PROC as u32) {
+        return conversao_para_proc(s, e, origem, alvo)
+    }
+    if (common.c2f_s2u_32(co) == (TC_PROC as u32)) and (common.c2f_s2u_32(ca) == (TC_RAWPTR as u32)) {
+        return true
+    }
+    if (((common.c2f_s2u_32(co) == (TC_PONTEIRO as u32)) or (common.c2f_s2u_32(co) == (TC_ANULAVEL as u32))) or (common.c2f_s2u_32(co) == (TC_CSTR as u32))) and (common.c2f_s2u_32(ca) == (TC_RAWPTR as u32)) {
+        return true
+    }
+    if (common.c2f_s2u_32(co) == (TC_RAWPTR as u32)) and (((common.c2f_s2u_32(ca) == (TC_PONTEIRO as u32)) or (common.c2f_s2u_32(ca) == (TC_ANULAVEL as u32))) or (common.c2f_s2u_32(ca) == (TC_CSTR as u32))) {
+        return true
+    }
+    if (common.c2f_b2i32(eh_ponteiro_ou_anulavel(co)) != 0) and (common.c2f_b2i32(eh_ponteiro_ou_anulavel(ca)) != 0) {
+        if tipo_de(t, origem).a == tipo_de(t, alvo).a {
+            return true
+        }
+        let msg_3 = format(f"'as' nao troca o tipo apontado direto; passe por rawptr: (p as rawptr) as ^B", alloc = heap)
+        defer delete(msg_3)
+        return sem_erro(s, common.E0306, e.pos_op, msg_3)
+    }
+    let msg_4 = format(f"'as' converte entre numericos, entre ponteiros (^T, ?^T, rawptr, cstr) e de cstr para str", alloc = heap)
+    defer delete(msg_4)
+    return sem_erro(s, common.E0301, e.pos_op, msg_4)
+}
+
+// C: semantic/sem_expr.c:435
+proc ex_conversao_2(s: ^Semantica, e: ^frontend.Expr, ctx: u32) -> bool {
+    var alvo: u32 = 0
+    if (not sem_checar(s, e.a, TIPO_VAZIO as u32)) or (not sem_resolver_tipo_ref(s, e.alvo)) {
+        return false
+    }
+    alvo = (e.alvo as ^frontend.TipoRef).tipo
+    if (not tipo_eh_numerico(&s.tipos, (e.a as ^frontend.Expr).tipo)) or (not tipo_eh_numerico(&s.tipos, alvo)) {
+        if not conversao_nao_numerica(s, e, (e.a as ^frontend.Expr).tipo, alvo) {
+            return false
+        }
+        e.tipo = alvo
+        return true
+    }
+    if not conferir_literal_sob_as(s, e, alvo) {
+        return false
+    }
+    e.tipo = alvo
+    return true
+}
+
+// C: semantic/sem_expr.c:453
+proc eh_logico(op: u8) -> bool {
+    return (op == (frontend.OP_E as u8)) or (op == (frontend.OP_OU as u8))
+}
+
+// C: semantic/sem_expr.c:454
+proc eh_comparacao(op: u8) -> bool {
+    return ((op as i32) >= frontend.OP_IGUAL) and ((op as i32) <= frontend.OP_MAIOR_IGUAL)
+}
+
+// C: semantic/sem_expr.c:457
+proc contexto_do_literal(s: ^Semantica, outro: u32, op: u8) -> u32 {
+    if (common.c2f_b2i32(s.tipos.tem_matriz) != 0) and (common.c2f_s2u_32(tipo_classe_de(&s.tipos, outro)) == (TC_MATRIZ as u32)) {
+        return tipo_de(&s.tipos, outro).a
+    }
+    if sem_eh_quat(s, outro) {
+        return TIPO_F32 as u32
+    }
+    if common.c2f_s2u_32(tipo_classe_de(&s.tipos, outro)) == (TC_ARRAY as u32) {
+        return contexto_do_literal(s, tipo_de(&s.tipos, outro).a, op)
+    }
+    let produto: bool = (op == (frontend.OP_MUL as u8)) or (op == (frontend.OP_DIV as u8))
+    var tern_1: u32 = outro
+    if (common.c2f_s2u_32(tipo_classe_de(&s.tipos, outro)) == (TC_REAL as u32)) and (common.c2f_b2i32(produto) != 0) {
+        tern_1 = TIPO_F32 as u32
+    }
+    return tern_1
+}
+
+// C: semantic/sem_expr.c:468
+proc operandos_do_binario(s: ^Semantica, e: ^frontend.Expr, ctx: u32) -> bool {
+    let a: ?^frontend.Expr = e.a
+    let b: ?^frontend.Expr = e.b
+    var tern_1: u32 = TIPO_VAZIO as u32
+    if (common.c2f_b2i32(eh_aritmetico(e.op)) != 0) or (common.c2f_b2i32(eh_bits(e.op)) != 0) {
+        tern_1 = ctx
+    }
+    let ctx_operando: u32 = tern_1
+    if eh_logico(e.op) {
+        return (common.c2f_b2i32(sem_checar(s, a, TIPO_BOOL as u32)) != 0) and (common.c2f_b2i32(sem_checar(s, b, TIPO_BOOL as u32)) != 0)
+    }
+    if ((a as ^frontend.Expr).tipo_no == (frontend.EX_NONE as u8)) and ((b as ^frontend.Expr).tipo_no != (frontend.EX_NONE as u8)) {
+        return (common.c2f_b2i32(sem_checar(s, b, ctx_operando)) != 0) and (common.c2f_b2i32(sem_checar(s, a, (b as ^frontend.Expr).tipo)) != 0)
+    }
+    if (common.c2f_b2i32((a as ^frontend.Expr).flexivel) != 0) and (not (b as ^frontend.Expr).flexivel) {
+        return (common.c2f_b2i32(sem_checar(s, b, ctx_operando)) != 0) and (common.c2f_b2i32(sem_checar(s, a, contexto_do_literal(s, (b as ^frontend.Expr).tipo, e.op))) != 0)
+    }
+    if not sem_checar(s, a, ctx_operando) {
+        return false
+    }
+    if (b as ^frontend.Expr).tipo_no == (frontend.EX_NONE as u8) {
+        return sem_checar(s, b, (a as ^frontend.Expr).tipo)
+    }
+    var tern_2: u32 = ctx_operando
+    if common.c2f_b2i32((b as ^frontend.Expr).flexivel) != 0 {
+        tern_2 = contexto_do_literal(s, (a as ^frontend.Expr).tipo, e.op)
+    }
+    return sem_checar(s, b, tern_2)
+}
+
+// C: semantic/sem_expr.c:484
+proc aplicar_logica(s: ^Semantica, e: ^frontend.Expr) -> bool {
+    if ((e.a as ^frontend.Expr).tipo != (TIPO_BOOL as u32)) or ((e.b as ^frontend.Expr).tipo != (TIPO_BOOL as u32)) {
+        let msg_1 = format(f"'and' e 'or' pedem operandos bool", alloc = heap)
+        defer delete(msg_1)
+        return sem_erro(s, common.E0301, e.pos_op, msg_1)
+    }
+    e.tipo = TIPO_BOOL as u32
+    return true
+}
+
+// C: semantic/sem_expr.c:494
+proc classe_comparavel(c: i32) -> bool {
+    return (((((((((common.c2f_s2u_32(c) == (TC_BOOL as u32)) or (common.c2f_s2u_32(c) == (TC_I32 as u32))) or (common.c2f_s2u_32(c) == (TC_INT as u32))) or (common.c2f_s2u_32(c) == (TC_REAL as u32))) or (common.c2f_s2u_32(c) == (TC_ENUM as u32))) or ((common.c2f_s2u_32(c) >= (TC_I8 as u32)) and (common.c2f_s2u_32(c) <= (TC_F64 as u32)))) or (common.c2f_s2u_32(c) == (TC_PONTEIRO as u32))) or (common.c2f_s2u_32(c) == (TC_ANULAVEL as u32))) or (common.c2f_s2u_32(c) == (TC_RAWPTR as u32))) or (common.c2f_s2u_32(c) == (TC_TEXTO as u32))
+}
+
+// C: semantic/sem_expr.c:500
+proc eh_ordem(op: u8) -> bool {
+    return ((op as i32) >= frontend.OP_MENOR) and ((op as i32) <= frontend.OP_MAIOR_IGUAL)
+}
+
+// C: semantic/sem_expr.c:503
+proc comparacao_valida(s: ^Semantica, e: ^frontend.Expr) -> bool {
+    let ca: i32 = tipo_classe_de(&s.tipos, (e.a as ^frontend.Expr).tipo)
+    let cb: i32 = tipo_classe_de(&s.tipos, (e.b as ^frontend.Expr).tipo)
+    if common.c2f_s2u_32(ca) != common.c2f_s2u_32(cb) {
+        return (((common.c2f_b2i32(eh_ponteiro_ou_anulavel(ca)) != 0) and (common.c2f_b2i32(eh_ponteiro_ou_anulavel(cb)) != 0)) and (not eh_ordem(e.op))) and (tipo_de(&s.tipos, (e.a as ^frontend.Expr).tipo).a == tipo_de(&s.tipos, (e.b as ^frontend.Expr).tipo).a)
+    }
+    if not classe_comparavel(ca) {
+        return false
+    }
+    if ((common.c2f_s2u_32(ca) == (TC_ENUM as u32)) or (common.c2f_s2u_32(ca) == (TC_PONTEIRO as u32))) or (common.c2f_s2u_32(ca) == (TC_ANULAVEL as u32)) {
+        return ((e.a as ^frontend.Expr).tipo == (e.b as ^frontend.Expr).tipo) and (not eh_ordem(e.op))
+    }
+    return ((common.c2f_s2u_32(ca) != (TC_RAWPTR as u32)) and (common.c2f_s2u_32(ca) != (TC_TEXTO as u32))) or (not eh_ordem(e.op))
+}
+
+// C: semantic/sem_expr.c:516
+proc erro_de_operandos(s: ^Semantica, e: ^frontend.Expr, causa: str) -> bool {
+    let msg_1 = format(f"{causa}", alloc = heap)
+    defer delete(msg_1)
+    _ = sem_erro(s, common.E0301, e.pos_op, msg_1)
+    sem_forma_operandos(s, e)
+    return false
+}
+
+// C: semantic/sem_expr.c:523
+proc erro_de_comparacao(s: ^Semantica, e: ^frontend.Expr) -> bool {
+    if (common.c2f_b2i32(eh_lista(s, (e.a as ^frontend.Expr).tipo)) != 0) or (common.c2f_b2i32(eh_lista(s, (e.b as ^frontend.Expr).tipo)) != 0) {
+        let msg_1 = format(f"lista nao tem ==, != nem ordem nem conta: compare elemento a elemento num for", alloc = heap)
+        defer delete(msg_1)
+        return sem_erro(s, common.E0308, e.pos_op, msg_1)
+    }
+    if (common.c2f_b2i32(eh_colecao(s, (e.a as ^frontend.Expr).tipo)) != 0) or (common.c2f_b2i32(eh_colecao(s, (e.b as ^frontend.Expr).tipo)) != 0) {
+        let msg_2 = format(f"array e fatia nao tem ==, != nem ordem: compare elemento a elemento num for", alloc = heap)
+        defer delete(msg_2)
+        return sem_erro(s, common.E0308, e.pos_op, msg_2)
+    }
+    if (common.c2f_b2i32(eh_ordem(e.op)) != 0) and ((common.c2f_b2i32(tipo_eh_familia_ponteiro(&s.tipos, (e.a as ^frontend.Expr).tipo)) != 0) or (common.c2f_b2i32(tipo_eh_familia_ponteiro(&s.tipos, (e.b as ^frontend.Expr).tipo)) != 0)) {
+        let msg_3 = format(f"ponteiro nao tem ordem; so == e !=", alloc = heap)
+        defer delete(msg_3)
+        return sem_erro(s, common.E0306, e.pos_op, msg_3)
+    }
+    if (common.c2f_b2i32(eh_ordem(e.op)) != 0) and (((e.a as ^frontend.Expr).tipo == (TIPO_TEXTO as u32)) or ((e.b as ^frontend.Expr).tipo == (TIPO_TEXTO as u32))) {
+        let msg_4 = format(f"str nao tem ordem nesta versao; so == e !=", alloc = heap)
+        defer delete(msg_4)
+        return sem_erro(s, common.E0307, e.pos_op, msg_4)
+    }
+    if ((e.a as ^frontend.Expr).tipo == (TIPO_CSTR as u32)) or ((e.b as ^frontend.Expr).tipo == (TIPO_CSTR as u32)) {
+        let msg_5 = format(f"== em cstr compararia enderecos: compare como str, (a as str) == (b as str)", alloc = heap)
+        defer delete(msg_5)
+        return sem_erro(s, common.E0307, e.pos_op, msg_5)
+    }
+    return erro_de_operandos(s, e, "comparacao entre tipos incompativeis")
+}
+
+// C: semantic/sem_expr.c:545
+proc comparacao_com_none(s: ^Semantica, e: ^frontend.Expr) -> bool {
+    let com_none: bool = ((e.b as ^frontend.Expr).tipo_no == (frontend.EX_NONE as u8)) or ((e.a as ^frontend.Expr).tipo_no == (frontend.EX_NONE as u8))
+    if (not com_none) or ((e.op != (frontend.OP_IGUAL as u8)) and (e.op != (frontend.OP_DIFERENTE as u8))) {
+        let msg_1 = format(f"?T so se compara com none (x == none, x != none); para o valor use switch ou or_else", alloc = heap)
+        defer delete(msg_1)
+        return sem_erro(s, common.E0312, e.pos_op, msg_1)
+    }
+    var tern_1: ?^frontend.Expr = e.b
+    if (e.b as ^frontend.Expr).tipo_no == (frontend.EX_NONE as u8) {
+        tern_1 = e.a
+    }
+    let valor: ?^frontend.Expr = tern_1
+    var tern_2: i32 = 0
+    if e.op == (frontend.OP_IGUAL as u8) {
+        tern_2 = 1
+    }
+    e.op = tern_2 as u8
+    e.tipo_no = frontend.EX_OPC_TESTE as u8
+    e.a = valor
+    e.b = none
+    e.tipo = TIPO_BOOL as u32
+    return true
+}
+
+// C: semantic/sem_expr.c:561
+proc comparacao_rara(s: ^Semantica, e: ^frontend.Expr) -> bool {
+    let ca: i32 = tipo_classe_de(&s.tipos, (e.a as ^frontend.Expr).tipo)
+    let cb: i32 = tipo_classe_de(&s.tipos, (e.b as ^frontend.Expr).tipo)
+    if (common.c2f_b2i32(sem_eh_quat(s, (e.a as ^frontend.Expr).tipo)) != 0) or (common.c2f_b2i32(sem_eh_quat(s, (e.b as ^frontend.Expr).tipo)) != 0) {
+        return sem_comparacao_quat(s, e)
+    }
+    if (common.c2f_s2u_32(ca) >= (TC_MAPA as u32)) or (common.c2f_s2u_32(cb) >= (TC_MAPA as u32)) {
+        return sem_comparacao_v19(s, e)
+    }
+    if (common.c2f_s2u_32(ca) == (TC_OPCIONAL as u32)) or (common.c2f_s2u_32(cb) == (TC_OPCIONAL as u32)) {
+        return comparacao_com_none(s, e)
+    }
+    if (common.c2f_s2u_32(ca) == (TC_UNIAO as u32)) or (common.c2f_s2u_32(cb) == (TC_UNIAO as u32)) {
+        let msg_1 = format(f"union nao tem ==: compare a variante com switch", alloc = heap)
+        defer delete(msg_1)
+        return sem_erro(s, common.E0313, e.pos_op, msg_1)
+    }
+    return erro_de_comparacao(s, e)
+}
+
+// C: semantic/sem_expr.c:573
+proc aplicar_comparacao(s: ^Semantica, e: ^frontend.Expr) -> bool {
+    let ta: u32 = (e.a as ^frontend.Expr).tipo
+    let tb: u32 = (e.b as ^frontend.Expr).tipo
+    if not comparacao_valida(s, e) {
+        return comparacao_rara(s, e)
+    }
+    if (common.c2f_s2u_32(tipo_classe_de(&s.tipos, ta)) == (TC_REAL as u32)) and (ta != tb) {
+        let msg_1 = format(f"comparacao entre dimensoes diferentes", alloc = heap)
+        defer delete(msg_1)
+        return sem_erro(s, common.E0412, e.pos_op, msg_1)
+    }
+    if (common.c2f_b2i32(eh_ordem(e.op)) != 0) and (not tipo_eh_numerico(&s.tipos, ta)) {
+        let msg_2 = format(f"a ordem (<, <=, >, >=) pede numero", alloc = heap)
+        defer delete(msg_2)
+        return sem_erro(s, common.E0301, e.pos_op, msg_2)
+    }
+    e.tipo = TIPO_BOOL as u32
+    return true
+}
+
+// C: semantic/sem_expr.c:587
+proc aritmetica_real(s: ^Semantica, e: ^frontend.Expr, ta: u32, tb: u32) -> bool {
+    if e.op == (frontend.OP_RESTO as u8) {
+        let msg_1 = format(f"'%' so vale para inteiros", alloc = heap)
+        defer delete(msg_1)
+        return sem_erro(s, common.E0301, e.pos_op, msg_1)
+    }
+    if (e.op == (frontend.OP_SOMA as u8)) or (e.op == (frontend.OP_SUB as u8)) {
+        if ta != tb {
+            let msg_2 = format(f"soma ou subtracao entre dimensoes diferentes", alloc = heap)
+            defer delete(msg_2)
+            return sem_erro(s, common.E0412, e.pos_op, msg_2)
+        }
+        e.tipo = ta
+        return true
+    }
+    var sinal: i32 = -1
+    if e.op == (frontend.OP_MUL as u8) {
+        sinal = 1
+    }
+    let dim: u32 = dim_combinar(&s.dims, tipo_de(&s.tipos, ta).a, tipo_de(&s.tipos, tb).a, sinal)
+    if not dim_declarada(&s.dims, dim) {
+        let msg_3 = format(f"a dimensao do resultado nao tem unidade declarada", alloc = heap)
+        defer delete(msg_3)
+        return sem_erro(s, common.E0412, e.pos_op, msg_3)
+    }
+    e.tipo = tipo_real(&s.tipos, dim)
+    return true
+}
+
+// C: semantic/sem_expr.c:604
+proc erro_conta_de_colecao(s: ^Semantica, e: ^frontend.Expr) -> bool {
+    let msg_1 = format(f"bits (& | ~ << >>) nao existem em array, fatia nem lista: a conta elemento a elemento tem + - * /; use for", alloc = heap)
+    defer delete(msg_1)
+    return sem_erro(s, common.E0331, e.pos_op, msg_1)
+}
+
+// C: semantic/sem_expr.c:610
+proc conta_de_opcional(s: ^Semantica, ta: u32, tb: u32) -> bool {
+    let ca: i32 = tipo_classe_de(&s.tipos, ta)
+    let cb: i32 = tipo_classe_de(&s.tipos, tb)
+    return (((common.c2f_s2u_32(ca) == (TC_OPCIONAL as u32)) or (common.c2f_s2u_32(cb) == (TC_OPCIONAL as u32))) or (common.c2f_s2u_32(ca) == (TC_UNIAO as u32))) or (common.c2f_s2u_32(cb) == (TC_UNIAO as u32))
+}
+
+// C: semantic/sem_expr.c:616
+proc erro_conta_de_opcional(s: ^Semantica, e: ^frontend.Expr) -> bool {
+    if (common.c2f_s2u_32(tipo_classe_de(&s.tipos, (e.a as ^frontend.Expr).tipo)) == (TC_UNIAO as u32)) or (common.c2f_s2u_32(tipo_classe_de(&s.tipos, (e.b as ^frontend.Expr).tipo)) == (TC_UNIAO as u32)) {
+        let msg_1 = format(f"union nao faz conta: leia a variante com switch", alloc = heap)
+        defer delete(msg_1)
+        return sem_erro(s, common.E0313, e.pos_op, msg_1)
+    }
+    let msg_2 = format(f"?T nao faz conta: desembrulhe antes (x or_else 0)", alloc = heap)
+    defer delete(msg_2)
+    return sem_erro(s, common.E0312, e.pos_op, msg_2)
+}
+
+// C: semantic/sem_expr.c:625
+proc eh_conta_de_ponteiro(s: ^Semantica, ta: u32, tb: u32) -> bool {
+    return (((common.c2f_b2i32(tipo_eh_familia_ponteiro(&s.tipos, ta)) != 0) or (common.c2f_b2i32(tipo_eh_familia_ponteiro(&s.tipos, tb)) != 0)) or (ta == (TIPO_TEXTO as u32))) or (tb == (TIPO_TEXTO as u32))
+}
+
+// C: semantic/sem_expr.c:630
+proc erro_conta_de_ponteiro(s: ^Semantica, e: ^frontend.Expr) -> bool {
+    let dois_textos: bool = ((e.op == (frontend.OP_SOMA as u8)) and (((e.a as ^frontend.Expr).tipo_no == (frontend.EX_TEXTO as u8)) or ((e.a as ^frontend.Expr).tipo == (TIPO_TEXTO as u32)))) and (((e.b as ^frontend.Expr).tipo_no == (frontend.EX_TEXTO as u8)) or ((e.b as ^frontend.Expr).tipo == (TIPO_TEXTO as u32)))
+    if (common.c2f_b2i32(dois_textos) != 0) or ((not tipo_eh_familia_ponteiro(&s.tipos, (e.a as ^frontend.Expr).tipo)) and (not tipo_eh_familia_ponteiro(&s.tipos, (e.b as ^frontend.Expr).tipo))) {
+        let msg_1 = format(f"str nao se soma nem faz conta; concatenar precisa alocar (format, v1.6/v1.7)", alloc = heap)
+        defer delete(msg_1)
+        _ = sem_erro(s, common.E0307, e.pos_op, msg_1)
+        sem_sugerir_concatenar(s, e)
+        return false
+    }
+    let msg_2 = format(f"ponteiro nao tem conta (sem aritmetica de ponteiro); para andar numa sequencia use fatia e indice (v1.5)", alloc = heap)
+    defer delete(msg_2)
+    _ = sem_erro(s, common.E0306, e.pos_op, msg_2)
+    sem_forma_conta_de_texto(s, e)
+    return false
+}
+
+// C: semantic/sem_expr.c:644
+proc sem_aritmetica(s: ^Semantica, e: ^frontend.Expr) -> bool {
+    let ta: u32 = (e.a as ^frontend.Expr).tipo
+    let tb: u32 = (e.b as ^frontend.Expr).tipo
+    let real_a: bool = common.c2f_s2u_32(tipo_classe_de(&s.tipos, ta)) == (TC_REAL as u32)
+    let real_b: bool = common.c2f_s2u_32(tipo_classe_de(&s.tipos, tb)) == (TC_REAL as u32)
+    if (common.c2f_b2i32(real_a) != 0) and (common.c2f_b2i32(real_b) != 0) {
+        return aritmetica_real(s, e, ta, tb)
+    }
+    if (ta == (TIPO_F64 as u32)) and (tb == (TIPO_F64 as u32)) {
+        if e.op == (frontend.OP_RESTO as u8) {
+            let msg_1 = format(f"'%' so vale para inteiros", alloc = heap)
+            defer delete(msg_1)
+            return sem_erro(s, common.E0301, e.pos_op, msg_1)
+        }
+        e.tipo = TIPO_F64 as u32
+        return true
+    }
+    if (ta != tb) or (not tipo_eh_inteiro(ta)) {
+        if (common.c2f_b2i32(tipos_tem_v19(&s.tipos)) != 0) and ((common.c2f_s2u_32(tipo_classe_de(&s.tipos, ta)) >= (TC_MAPA as u32)) or (common.c2f_s2u_32(tipo_classe_de(&s.tipos, tb)) >= (TC_MAPA as u32))) {
+            return sem_conta_v19(s, e)
+        }
+        if (common.c2f_b2i32(sem_eh_quat(s, ta)) != 0) or (common.c2f_b2i32(sem_eh_quat(s, tb)) != 0) {
+            return sem_conta_quat(s, e)
+        }
+        if conta_de_opcional(s, ta, tb) {
+            return erro_conta_de_opcional(s, e)
+        }
+        if (common.c2f_b2i32(eh_colecao(s, ta)) != 0) or (common.c2f_b2i32(eh_colecao(s, tb)) != 0) {
+            return sem_conta_vetor(s, e)
+        }
+        if eh_conta_de_ponteiro(s, ta, tb) {
+            return erro_conta_de_ponteiro(s, e)
+        }
+        return erro_de_operandos(s, e, "operandos numericos de tipos diferentes")
+    }
+    e.tipo = ta
+    return true
+}
+
+// C: semantic/sem_expr.c:669
+proc aplicar_bits(s: ^Semantica, e: ^frontend.Expr) -> bool {
+    let ta: u32 = (e.a as ^frontend.Expr).tipo
+    let tb: u32 = (e.b as ^frontend.Expr).tipo
+    if (ta != tb) or (not tipo_eh_sem_sinal(ta)) {
+        if (common.c2f_b2i32(tipos_tem_v19(&s.tipos)) != 0) and ((common.c2f_s2u_32(tipo_classe_de(&s.tipos, ta)) >= (TC_MAPA as u32)) or (common.c2f_s2u_32(tipo_classe_de(&s.tipos, tb)) >= (TC_MAPA as u32))) {
+            return sem_conta_v19(s, e)
+        }
+        if conta_de_opcional(s, ta, tb) {
+            return erro_conta_de_opcional(s, e)
+        }
+        if (common.c2f_b2i32(eh_colecao(s, ta)) != 0) or (common.c2f_b2i32(eh_colecao(s, tb)) != 0) {
+            return erro_conta_de_colecao(s, e)
+        }
+        if eh_conta_de_ponteiro(s, ta, tb) {
+            return erro_conta_de_ponteiro(s, e)
+        }
+        if ta != tb {
+            return erro_de_operandos(s, e, "operandos de bits de tipos diferentes")
+        }
+    }
+    if not tipo_eh_sem_sinal(ta) {
+        let msg_1 = format(f"operador de bits em tipo que nao e inteiro sem sinal", alloc = heap)
+        defer delete(msg_1)
+        return sem_erro(s, common.E0303, e.pos_op, msg_1)
+    }
+    e.tipo = ta
+    return true
+}
+
+// C: semantic/sem_expr.c:686
+proc ex_binario_2(s: ^Semantica, e: ^frontend.Expr, ctx: u32) -> bool {
+    if not operandos_do_binario(s, e, sem_ctx_sem_opcional(s, ctx)) {
+        return false
+    }
+    if eh_logico(e.op) {
+        return aplicar_logica(s, e)
+    }
+    if eh_bits(e.op) {
+        return aplicar_bits(s, e)
+    }
+    if eh_comparacao(e.op) {
+        return aplicar_comparacao(s, e)
+    }
+    return sem_aritmetica(s, e)
+}
+
+// C: semantic/sem_expr.c:697
+proc ex_chamada_2(s: ^Semantica, e: ^frontend.Expr, ctx: u32) -> bool {
+    return sem_chamada(s, e)
+}
+
+// C: semantic/sem_expr.c:703
+proc ex_literal_struct_2(s: ^Semantica, e: ^frontend.Expr, ctx: u32) -> bool {
+    return sem_literal_struct(s, e)
+}
+
+// C: semantic/sem_expr.c:709
+proc ex_try_2(s: ^Semantica, e: ^frontend.Expr, ctx: u32) -> bool {
+    return sem_try(s, e)
+}
+
+// C: semantic/sem_expr.c:715
+proc ex_or_else_2(s: ^Semantica, e: ^frontend.Expr, ctx: u32) -> bool {
+    return sem_or_else(s, e)
+}
+
+// C: semantic/sem_expr.c:721
+proc ex_indice_2(s: ^Semantica, e: ^frontend.Expr, ctx: u32) -> bool {
+    return sem_indice(s, e)
+}
+
+// C: semantic/sem_expr.c:727
+proc ex_fatia_2(s: ^Semantica, e: ^frontend.Expr, ctx: u32) -> bool {
+    return sem_fatia(s, e)
+}
+
+// C: semantic/sem_expr.c:733
+proc ex_tipo_2(s: ^Semantica, e: ^frontend.Expr, ctx: u32) -> bool {
+    return sem_tipo_solto(s, e)
+}
+
+// C: semantic/sem_expr.c:740
+proc ex_ja_tipado(s: ^Semantica, e: ^frontend.Expr, ctx: u32) -> bool {
+    return true
+}
+
+// C: semantic/sem_expr.c:749
+proc ex_tupla_2(s: ^Semantica, e: ^frontend.Expr, ctx: u32) -> bool {
+    let msg_1 = format(f"'a, b' so existe em 'return a, b' de proc com retorno multiplo", alloc = heap)
+    defer delete(msg_1)
+    return sem_erro(s, common.E0314, e.pos, msg_1)
+}
+
+// C: semantic/sem_expr.c:756
+proc ex_f_texto_2(s: ^Semantica, e: ^frontend.Expr, ctx: u32) -> bool {
+    let msg_1 = format(f"f\"...\" so vale como 1o argumento de print, format ou format_c", alloc = heap)
+    defer delete(msg_1)
+    return sem_erro(s, common.E0315, e.pos, msg_1)
+}
+
+// C: semantic/sem_expr.c:762
+proc ex_chamada_ind_2(s: ^Semantica, e: ^frontend.Expr, ctx: u32) -> bool {
+    return sem_chamada_ind(s, e)
+}
+
+// C: semantic/sem_expr.c:778
+proc sem_checar(s: ^Semantica, e: ?^frontend.Expr, ctx: u32) -> bool {
+    let ok: bool = chamar_checa_expr(CHECAGENS[(e as ^frontend.Expr).tipo_no as int], s, e as ^frontend.Expr, ctx)
+    if ((e as ^frontend.Expr).tipo == (TIPO_VENENO as u32)) and ok {
+        s.tocou_veneno = true // L8: o erro que vier depois e cascata
+    }
+    return ok
+}
+
+// C: semantic/sem_expr.c:785
+proc sem_expr(s: ^Semantica, e: ?^frontend.Expr, ctx: u32) -> bool {
+    sem_marcar_flexivel(e)
+    return sem_checar(s, e, ctx)
+}
+
+// C: semantic/sem_expr.c:791
+proc sem_expr_com(s: ^Semantica, e: ?^frontend.Expr, esperado: u32) -> bool {
+    return (common.c2f_b2i32(sem_expr(s, e, esperado)) != 0) and (common.c2f_b2i32(sem_coagir(s, e, esperado, (e as ^frontend.Expr).pos)) != 0)
+}
+
+// C: semantic/sem_expr.c:796
+proc sem_condicao(s: ^Semantica, cond: ?^frontend.Expr) -> bool {
+    if not sem_expr(s, cond, TIPO_BOOL as u32) {
+        return false
+    }
+    if (cond as ^frontend.Expr).tipo == (TIPO_BOOL as u32) {
+        return true
+    }
+    let msg_1 = format(f"a condicao precisa ser bool", alloc = heap)
+    defer delete(msg_1)
+    _ = sem_erro(s, common.E0301, (cond as ^frontend.Expr).pos, msg_1)
+    sem_forma_do_valor(s, cond, TIPO_BOOL as u32, "a condicao")
+    return false
+}
+
+// Valores esperados lidos do C (sem_expr.c:52..53, 453..454, 494..500): faixas de operador e vizinhos de cada borda.
+test "sem_expr: faixas de operador" {
+    expect(eh_aritmetico(frontend.OP_SOMA as u8) and eh_aritmetico(frontend.OP_MUL as u8) and eh_aritmetico(frontend.OP_RESTO as u8))
+    expect(not eh_aritmetico(frontend.OP_MAIOR_IGUAL as u8) and not eh_aritmetico(frontend.OP_NEGAR as u8))
+    expect(eh_bits(frontend.OP_BIT_E as u8) and eh_bits(frontend.OP_BIT_XOU as u8) and eh_bits(frontend.OP_DESLOCA_DIR as u8))
+    expect(not eh_bits(frontend.OP_BIT_NAO as u8) and not eh_bits(frontend.OP_RESTO as u8) and not eh_bits(frontend.OP_SOMA as u8))
+    expect(eh_logico(frontend.OP_E as u8) and eh_logico(frontend.OP_OU as u8) and not eh_logico(frontend.OP_IGUAL as u8))
+    expect(eh_comparacao(frontend.OP_IGUAL as u8) and eh_comparacao(frontend.OP_MAIOR_IGUAL as u8))
+    expect(not eh_comparacao(frontend.OP_E as u8) and not eh_comparacao(frontend.OP_SOMA as u8))
+    expect(eh_ordem(frontend.OP_MENOR as u8) and eh_ordem(frontend.OP_MAIOR_IGUAL as u8))
+    expect(not eh_ordem(frontend.OP_IGUAL as u8) and not eh_ordem(frontend.OP_DIFERENTE as u8) and not eh_ordem(frontend.OP_SOMA as u8))
+}
+
+test "sem_expr: classe_comparavel" {
+    expect(classe_comparavel(TC_BOOL) and classe_comparavel(TC_I32) and classe_comparavel(TC_INT) and classe_comparavel(TC_REAL))
+    expect(classe_comparavel(TC_ENUM) and classe_comparavel(TC_PONTEIRO) and classe_comparavel(TC_ANULAVEL) and classe_comparavel(TC_RAWPTR) and classe_comparavel(TC_TEXTO))
+    expect(classe_comparavel(TC_I8) and classe_comparavel(TC_U32) and classe_comparavel(TC_F64)) // faixa TC_I8..TC_F64
+    expect(not classe_comparavel(TC_VAZIO) and not classe_comparavel(TC_STRUCT) and not classe_comparavel(TC_RESULTADO) and not classe_comparavel(TC_VENENO))
+    expect(not classe_comparavel(TC_CSTR) and not classe_comparavel(TC_ARRAY) and not classe_comparavel(TC_TUPLA))
+}
+
+test "sem_expr: flexivel de literal, negacao e conta" {
+    var lit = frontend.Expr{tipo_no = frontend.EX_INT as u8}
+    var nome = frontend.Expr{tipo_no = frontend.EX_NOME as u8}
+    var neg = frontend.Expr{tipo_no = frontend.EX_UNARIO as u8, op = frontend.OP_NEGAR as u8, a = &lit}
+    var nao = frontend.Expr{tipo_no = frontend.EX_UNARIO as u8, op = frontend.OP_NAO as u8, a = &lit}
+    var soma = frontend.Expr{tipo_no = frontend.EX_BINARIO as u8, op = frontend.OP_SOMA as u8, a = &lit, b = &neg}
+    var mista = frontend.Expr{tipo_no = frontend.EX_BINARIO as u8, op = frontend.OP_SOMA as u8, a = &lit, b = &nome}
+    var igual = frontend.Expr{tipo_no = frontend.EX_BINARIO as u8, op = frontend.OP_IGUAL as u8, a = &lit, b = &lit}
+    sem_marcar_flexivel(&soma)
+    expect(lit.flexivel and neg.flexivel and soma.flexivel) // literal, -literal e literal + (-literal)
+    sem_marcar_flexivel(&nao)
+    expect(not nao.flexivel) // OP_NAO nao e flexivel
+    sem_marcar_flexivel(&mista)
+    expect(not nome.flexivel and not mista.flexivel) // um nome estraga a conta toda
+    sem_marcar_flexivel(&igual)
+    expect(not igual.flexivel) // comparacao nao e aritmetica nem de bits
+}

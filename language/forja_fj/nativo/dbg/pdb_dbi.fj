@@ -1,0 +1,236 @@
+// nativo/dbg/pdb_dbi.fj - porte de compiler/nativo/dbg/pdb_dbi.c
+// sha256 de nativo/dbg/pdb_dbi.c: 1399d3357a0da08f18c09b37dd682b2549bb31eafa69e0a0b332f1e0134ba015
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.2.0
+// Changelog: 0.2.0 - G3 V4-W6: 5 stubs promovidos (pdb_secoes_ler, pdb_mod_info, pdb_section_map, pdb_file_info, pdb_fluxo_dbi).
+
+import "common"
+
+const PDB_FLUXO_NULO: u32 = 65535
+const PDB_DBI_VERSAO_70: u32 = 19990903
+const PDB_DBI_CONSTRUCAO: u32 = 36352
+const PDB_MAQUINA_AMD64: u32 = 34404
+const PDB_FLUXO_MODULO: u32 = 6
+const PDB_FLUXO_SECOES: u32 = 7
+const PDB_SC_VERSAO: u32 = 4046371373
+const PDB_SC_TAM: u32 = 28
+const PDB_SC_CARACTERISTICAS: u32 = 1610612768
+const PDB_MODINFO_FIXO: u32 = 64
+const PDB_SECAO_LEITURA: u32 = 1073741824
+const PDB_SECAO_ESCRITA: u32 = 2147483648
+const PDB_SECAO_EXECUCAO: u32 = 536870912
+const PDB_MAPA_BASE: u32 = 264
+const PDB_MAPA_ABSOLUTA: u32 = 520
+const PDB_MAPA_SEM_NOME: u32 = 65535
+const PDB_OPCIONAL_QTD: u32 = 11
+const PDB_OPCIONAL_SECTION_HDR: u32 = 5
+
+// C: nativo/dbg/pdb_dbi.c:30
+// C2F-INDECIDIVEL: p
+proc le32(p: []u8) -> u32 {
+    return (((p[0] as u32) | ((p[1] as u32) << 8)) | ((p[2] as u32) << 16)) | ((p[3] as u32) << 24)
+}
+
+// C: nativo/dbg/pdb_dbi.c:35
+// Acha os cabecalhos de secao do exe (PE malformado ou sem .text = falha interna); s.cabecalhos e visao do exe.
+proc pdb_secoes_ler(exe: ^[dynamic]u8, s: ^PdbSecoes) {
+    let d: []u8 = exe^[..]
+    let texto_pe: [8]u8 = {46, 116, 101, 120, 116, 0, 0, 0}
+    s.cabecalhos = none
+    s.qtd = 0
+    s.texto = 0
+    if len(d) < 0x40 {
+        let msg_1 = format(f"pdb: exe de {len(d)} bytes sem cabecalho PE", alloc = heap)
+        defer delete(msg_1)
+        common.falha_interna(msg_1)
+    }
+    let pe: u64 = le32(d[0x3C ..< 0x40]) as u64
+    if pe + 24 > len(d) as u64 {
+        let msg_2 = format(f"pdb: e_lfanew {pe} fora do exe", alloc = heap)
+        defer delete(msg_2)
+        common.falha_interna(msg_2)
+    }
+    s.qtd = (d[pe + 6] as u32) | ((d[pe + 7] as u32) << 8)
+    let tam_opcional: u64 = (d[pe + 20] as u64) | ((d[pe + 21] as u64) << 8)
+    let ini: u64 = pe + 24 + tam_opcional
+    if ini + (PDB_TAM_CABECALHO_SECAO as u64) * (s.qtd as u64) > len(d) as u64 {
+        common.falha_interna("pdb: a tabela de secoes do exe passa do arquivo")
+    }
+    s.cabecalhos = d[ini ..< ini + (PDB_TAM_CABECALHO_SECAO as u64) * (s.qtd as u64)]
+    let cab = s.cabecalhos or_else {}
+    var k: u64 = 0
+    while k < (s.qtd as u64) and s.texto == 0 {
+        var igual: bool = true
+        for j in (0 as u64)..<8 {
+            if cab[(PDB_TAM_CABECALHO_SECAO as u64) * k + j] != texto_pe[j] {
+                igual = false
+            }
+        }
+        if igual {
+            s.texto = (k as u32) + 1
+        }
+        k += 1
+    }
+    if s.texto == 0 {
+        common.falha_interna("pdb: o exe nao tem secao .text")
+    }
+}
+
+// C: nativo/dbg/pdb_dbi.c:61
+// A SectionContribution do modulo: a .text do programa, do offset 0 por codigo_tam bytes.
+proc pdb_contribuicao(b: ^[dynamic]u8, p: ^PdbParametros, s: ^PdbSecoes) {
+    pdb_u16(b, s.texto)
+    pdb_u16(b, 0)
+    pdb_u32(b, 0)
+    pdb_u32(b, p.codigo_tam)
+    pdb_u32(b, PDB_SC_CARACTERISTICAS)
+    pdb_u16(b, 0)
+    pdb_u16(b, 0)
+    pdb_u32(b, 0)
+    pdb_u32(b, 0)
+}
+
+// C: nativo/dbg/pdb_dbi.c:75
+// ModInfo: 64 bytes fixos e ModuleName + ObjFileName, com padding ate multiplo de 4.
+proc pdb_mod_info(b: ^[dynamic]u8, p: ^PdbParametros, s: ^PdbSecoes, t: ^PdbTamanhosModulo) {
+    let inicio: u64 = len(b^) as u64
+    let modulo: str = p.modulo or_else ""
+    var zeros3: [3]u8 = {0, 0, 0}
+    pdb_u32(b, 0)
+    pdb_contribuicao(b, p, s)
+    pdb_u16(b, 0)
+    pdb_u16(b, PDB_FLUXO_MODULO)
+    pdb_u32(b, t.simbolos)
+    pdb_u32(b, 0)
+    pdb_u32(b, t.c13)
+    pdb_u16(b, len((t.arquivos as ^PdbArquivos).lista) as u32)
+    pdb_u16(b, 0)
+    pdb_u32(b, 0)
+    pdb_u32(b, 0)
+    pdb_u32(b, 0)
+    if (len(b^) as u64) - inicio != (PDB_MODINFO_FIXO as u64) {
+        let msg_1 = format(f"pdb: ModInfo com {(len(b^) as u64) - inicio} bytes fixos (esperado {PDB_MODINFO_FIXO})", alloc = heap)
+        defer delete(msg_1)
+        common.falha_interna(msg_1)
+    }
+    append(b, items = as_bytes(modulo))
+    append(b, item = 0 as u8)
+    append(b, items = as_bytes(modulo))
+    append(b, item = 0 as u8)
+    let pad: u64 = (4 - ((len(b^) as u64) & 3)) & 3
+    append(b, items = zeros3[0 ..< pad])
+}
+
+// C: nativo/dbg/pdb_dbi.c:99
+// SectionMap: as secoes e a entrada absoluta (Count e LogCount = qtd + 1).
+proc pdb_section_map(b: ^[dynamic]u8, s: ^PdbSecoes) {
+    let cab = s.cabecalhos or_else {}
+    pdb_u16(b, s.qtd + 1)
+    pdb_u16(b, s.qtd + 1)
+    var k: u32 = 0
+    while k < s.qtd {
+        let base: u64 = (PDB_TAM_CABECALHO_SECAO as u64) * (k as u64)
+        let caract: u32 = le32(cab[base + 36 ..< base + 40])
+        var flags: u32 = PDB_MAPA_BASE
+        if (caract & PDB_SECAO_LEITURA) != 0 {
+            flags = flags | 1
+        }
+        if (caract & PDB_SECAO_ESCRITA) != 0 {
+            flags = flags | 2
+        }
+        if (caract & PDB_SECAO_EXECUCAO) != 0 {
+            flags = flags | 4
+        }
+        pdb_u16(b, flags)
+        pdb_u16(b, 0)
+        pdb_u16(b, 0)
+        pdb_u16(b, k + 1)
+        pdb_u16(b, PDB_MAPA_SEM_NOME)
+        pdb_u16(b, PDB_MAPA_SEM_NOME)
+        pdb_u32(b, 0)
+        pdb_u32(b, le32(cab[base + 8 ..< base + 12]))
+        k += 1
+    }
+    pdb_u16(b, PDB_MAPA_ABSOLUTA)
+    pdb_u16(b, 0)
+    pdb_u16(b, 0)
+    pdb_u16(b, s.qtd + 1)
+    pdb_u16(b, PDB_MAPA_SEM_NOME)
+    pdb_u16(b, PDB_MAPA_SEM_NOME)
+    pdb_u32(b, 0)
+    pdb_u32(b, 0xFFFFFFFF)
+}
+
+// C: nativo/dbg/pdb_dbi.c:130
+// FileInfo: 1 modulo com os seus arquivos (NamesBuffer = o bloco de nomes do /names). Sem arquivo: so o cabecalho de 8 B.
+proc pdb_file_info(b: ^[dynamic]u8, a: ^PdbArquivos) {
+    var zeros3: [3]u8 = {0, 0, 0}
+    let qtd: u32 = (len(a.lista) as u32) & 0xFFFF
+    pdb_u16(b, 1)
+    pdb_u16(b, qtd)
+    pdb_u16(b, 0)
+    pdb_u16(b, qtd)
+    if qtd == 0 {
+        return
+    }
+    var k: u32 = 0
+    while k < qtd {
+        pdb_u32(b, a.lista[k].nome_off)
+        k += 1
+    }
+    append(b, items = a.nomes[..])
+    let pad: u64 = (4 - ((len(b^) as u64) & 3)) & 3
+    append(b, items = zeros3[0 ..< pad])
+}
+
+// C: nativo/dbg/pdb_dbi.c:146
+proc pdb_opcional(b: ^[dynamic]u8) {
+    for k in (0 as u32)..<PDB_OPCIONAL_QTD {
+        var tern_1: u32 = PDB_FLUXO_NULO
+        if k == PDB_OPCIONAL_SECTION_HDR {
+            tern_1 = PDB_FLUXO_SECOES
+        }
+        pdb_u16(b, tern_1)
+    }
+}
+
+// C: nativo/dbg/pdb_dbi.c:152
+// Fluxo DBI: cabecalho de 64 bytes e os substreams (ModInfo, SectionContribution, SectionMap, FileInfo, OptionalDbgHeader).
+proc pdb_fluxo_dbi(b: ^[dynamic]u8, p: ^PdbParametros, s: ^PdbSecoes, t: ^PdbTamanhosModulo) {
+    var corpo = make([dynamic]u8, alloc = heap)
+    defer delete(corpo)
+    var tam: [5]u32 = {0, 0, 0, 0, 0}
+    pdb_mod_info(&corpo, p, s, t)
+    tam[0] = len(corpo) as u32
+    pdb_u32(&corpo, PDB_SC_VERSAO)
+    pdb_contribuicao(&corpo, p, s)
+    tam[1] = (len(corpo) as u32) - tam[0]
+    pdb_section_map(&corpo, s)
+    tam[2] = (len(corpo) as u32) - tam[0] - tam[1]
+    pdb_file_info(&corpo, t.arquivos as ^PdbArquivos)
+    tam[3] = (len(corpo) as u32) - tam[0] - tam[1] - tam[2]
+    pdb_opcional(&corpo)
+    tam[4] = (len(corpo) as u32) - tam[0] - tam[1] - tam[2] - tam[3]
+
+    pdb_u32(b, 0xFFFFFFFF)
+    pdb_u32(b, PDB_DBI_VERSAO_70)
+    pdb_u32(b, p.idade)
+    pdb_u16(b, PDB_FLUXO_NULO)
+    pdb_u16(b, PDB_DBI_CONSTRUCAO)
+    pdb_u16(b, PDB_FLUXO_NULO)
+    pdb_u16(b, 0)
+    pdb_u16(b, PDB_FLUXO_NULO)
+    pdb_u16(b, 0)
+    pdb_u32(b, tam[0])
+    pdb_u32(b, tam[1])
+    pdb_u32(b, tam[2])
+    pdb_u32(b, tam[3])
+    pdb_u32(b, 0)
+    pdb_u32(b, 0)
+    pdb_u32(b, tam[4])
+    pdb_u32(b, 0)
+    pdb_u16(b, 0)
+    pdb_u16(b, PDB_MAQUINA_AMD64)
+    pdb_u32(b, 0)
+    append(b, items = corpo[..])
+}

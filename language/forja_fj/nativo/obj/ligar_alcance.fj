@@ -1,0 +1,438 @@
+// nativo/obj/ligar_alcance.fj - porte de compiler/nativo/obj/ligar_alcance.c, compiler/nativo/obj/ligar_alcance.h
+// sha256 de nativo/obj/ligar_alcance.c: 2fff22b4484bf9311f1df1399a3d831cf4ba9afbd1413ced6a897a88871c69fb
+// sha256 de nativo/obj/ligar_alcance.h: 95afeae2d22e9a79590cb499a8d67759cedb51447efeaad46f402cc3248d8386
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.2.0
+// Changelog: 0.2.0 - A4.3: AlcanceEntrada.dinamico (ELF dinamico): simbolo indefinido nao e erro de alcance, vira import da GOT
+
+import "common"
+
+struct AlcanceRaiz {
+    objeto: i32
+    simbolo: ?str
+}
+
+struct AlcanceEntrada {
+    obj: ?[16]?^Objeto
+    raizes: ?[]AlcanceRaiz
+    qtd_raizes: u32
+    imports: ?[]str
+    qtd_imports: u32
+    dinamico: bool
+}
+
+struct Alcance {
+    entrada: ?^AlcanceEntrada
+    vivo: [16][dynamic]u8 // C2F-INDECIDIVEL
+    ini: [16][dynamic]u32 // C2F: uint32_t em Vec (antes marcado INDECIDIVEL)
+    ord: [16][dynamic]u32 // C2F: uint32_t em Vec (antes marcado INDECIDIVEL)
+    pilha: [dynamic]AlcancePar
+    imports_usados: [10]u32
+    indefinido: ?str
+    import_fora: ?str
+}
+
+struct AlcancePar {
+    objeto: u32
+    secao: u32
+}
+
+const ALVO_NENHUM: i32 = 0
+const ALVO_SECAO: i32 = 1
+const ALVO_IMPORT: i32 = 2
+const ALCANCE_QTD_OBJETOS: i32 = 16
+const ALCANCE_PREFIXO_IMP: str = "__imp_"
+const ALCANCE_TAM_PREFIXO_IMP: i32 = 6
+const ALCANCE_MAX_IMPORTS: i32 = 320
+const ALCANCE_BITS_PALAVRA: u32 = 32
+const ALCANCE_PALAVRAS_IMPORTS: u32 = 10
+const ALCANCE_SIMBOLOS_DO_LIGADOR: [7]str = {"__init_array_start", "__init_array_end", "__fini_array_start", "__fini_array_end", "__ehdr_start", "_GLOBAL_OFFSET_TABLE_", "_DYNAMIC"}
+
+// C: nativo/obj/ligar_alcance.c:26
+proc alcance_simbolo(a: ^Alcance, o: i32, i: u32) -> ^ObjSimbolo {
+    return &(((a.entrada as ^AlcanceEntrada).obj or_else {})[o] as ^Objeto).simbolos[i as u64]
+}
+
+// C: nativo/obj/ligar_alcance.c:31
+proc alcance_vivo(a: ^Alcance, o: i32, sec: u32) -> bool {
+    return a.vivo[o][sec as u64] != 0
+}
+
+// C: nativo/obj/ligar_alcance.c:36
+proc alcance_marcar(a: ^Alcance, o: i32, sec: u32) {
+    if a.vivo[o][sec as u64] != 0 {
+        return
+    }
+    a.vivo[o][sec as u64] = 1
+    append(&a.pilha, item = AlcancePar{objeto = common.c2f_s2u_32(o), secao = sec})
+}
+
+// C: nativo/obj/ligar_alcance.c:49
+proc alcance_contar(a: ^Alcance, o: i32) {
+    let obj: ^Objeto = (((a.entrada as ^AlcanceEntrada).obj or_else {})[o] as ^Objeto)
+    let ini: ^[dynamic]u32 = &a.ini[o]
+    var r: u64 = 0
+    while r < (len(obj.relocs) as u64) {
+        let sec: u64 = (obj.relocs[r].alvo.secao as u64) + 1
+        ini[sec] += 1
+        r += 1
+    }
+    var s: u64 = 0
+    while s < (len(obj.secoes) as u64) {
+        ini[s + 1] += ini[s]
+        s += 1
+    }
+}
+
+// C: nativo/obj/ligar_alcance.c:59
+proc alcance_distribuir(a: ^Alcance, o: i32) {
+    let obj: ^Objeto = (((a.entrada as ^AlcanceEntrada).obj or_else {})[o] as ^Objeto)
+    let ini: ^[dynamic]u32 = &a.ini[o]
+    var cursor: [dynamic]u32 = make([dynamic]u32, alloc = heap)
+    defer delete(cursor)
+    var s: u64 = 0
+    while s < (len(obj.secoes) as u64) {
+        append(&cursor, item = ini[s])
+        s += 1
+    }
+    var r: u64 = 0
+    while r < (len(obj.relocs) as u64) {
+        let sec: u64 = obj.relocs[r].alvo.secao as u64
+        let pos: u64 = cursor[sec] as u64
+        a.ord[o][pos] = r as u32
+        cursor[sec] += 1
+        r += 1
+    }
+}
+
+// C: nativo/obj/ligar_alcance.c:74
+proc alcance_indexar(a: ^Alcance, o: i32) {
+    let obj: ^Objeto = (((a.entrada as ^AlcanceEntrada).obj or_else {})[o] as ^Objeto)
+    a.vivo[o] = make([dynamic]u8, alloc = heap)
+    a.ini[o] = make([dynamic]u32, alloc = heap)
+    a.ord[o] = make([dynamic]u32, alloc = heap)
+    var s: u64 = 0
+    while s < (len(obj.secoes) as u64) {
+        append(&a.vivo[o], item = 0)
+        s += 1
+    }
+    var t: u64 = 0
+    while t <= (len(obj.secoes) as u64) {
+        append(&a.ini[o], item = 0)
+        t += 1
+    }
+    var r: u64 = 0
+    while r < (len(obj.relocs) as u64) {
+        append(&a.ord[o], item = 0)
+        r += 1
+    }
+    alcance_contar(a, o)
+    alcance_distribuir(a, o)
+}
+
+// C: nativo/obj/ligar_alcance.c:92
+proc alcance_eh_import(nome: str) -> bool {
+    return common.c2f_prefixo_igual(nome, ALCANCE_PREFIXO_IMP, 6)
+}
+
+// C: nativo/obj/ligar_alcance.c:98
+proc alcance_definido_em(a: ^Alcance, o: i32, nome: str, alvo: ^AlcancePar) -> bool {
+    let i: i64 = obj_achar_simbolo(((a.entrada as ^AlcanceEntrada).obj or_else {})[o] as ^Objeto, nome)
+    if i < 0 {
+        return false
+    }
+    let def: ^ObjSimbolo = alcance_simbolo(a, o, i as u32)
+    if (not def.global) or (def.secao < 0) {
+        return false
+    }
+    alvo^ = AlcancePar{objeto = common.c2f_s2u_32(o), secao = common.c2f_s2u_32(def.secao)}
+    return true
+}
+
+// C: nativo/obj/ligar_alcance.c:110
+proc alcance_achar_em_outro(a: ^Alcance, o: i32, nome: str, alvo: ^AlcancePar) -> bool {
+    for outro in (0 as i32)..<ALCANCE_QTD_OBJETOS {
+        if (outro != o) and (common.c2f_b2i32(alcance_definido_em(a, outro, nome, alvo)) != 0) {
+            return true
+        }
+    }
+    return false
+}
+
+// C: nativo/obj/ligar_alcance.c:122
+proc alcance_indice_simbolo_do_ligador(nome: str) -> i32 {
+    for k in (0 as i32)..<((56 / 8) as i32) { // C2F: sizeof ALCANCE_SIMBOLOS_DO_LIGADOR C2F: sizeof ALCANCE_SIMBOLOS_DO_LIGADOR [ 0 ]
+        if ALCANCE_SIMBOLOS_DO_LIGADOR[k] == nome {
+            return k
+        }
+    }
+    return -1
+}
+
+// C: nativo/obj/ligar_alcance.c:132
+proc alcance_resolver(a: ^Alcance, o: i32, s: ^ObjSimbolo, alvo: ^AlcancePar) -> i32 {
+    if s.secao >= 0 {
+        alvo^ = AlcancePar{objeto = common.c2f_s2u_32(o), secao = common.c2f_s2u_32(s.secao)}
+        return ALVO_SECAO
+    }
+    if alcance_achar_em_outro(a, o, (s.nome or_else ""), alvo) {
+        return ALVO_SECAO
+    }
+    var tern_1: i32 = ALVO_NENHUM
+    if common.c2f_b2i32(alcance_eh_import((s.nome or_else ""))) != 0 {
+        tern_1 = ALVO_IMPORT
+    }
+    return tern_1
+}
+
+// C: nativo/obj/ligar_alcance.c:143
+proc alcance_import_usado(a: ^Alcance, k: u32) -> bool {
+    return (a.imports_usados[k / ALCANCE_BITS_PALAVRA] & (1 << ((k % ALCANCE_BITS_PALAVRA) & 31))) != 0
+}
+
+// C: nativo/obj/ligar_alcance.c:149
+proc alcance_usar_import(a: ^Alcance, nome: str) {
+    let base: str = nome[(ALCANCE_TAM_PREFIXO_IMP as u64)..<(len(nome) as u64)]
+    let ent: ^AlcanceEntrada = a.entrada as ^AlcanceEntrada
+    var k: u32 = 0
+    while k < ent.qtd_imports {
+        if ((ent.imports or_else {})[k]) == base {
+            a.imports_usados[k / ALCANCE_BITS_PALAVRA] = a.imports_usados[k / ALCANCE_BITS_PALAVRA] | (1 << ((k % ALCANCE_BITS_PALAVRA) & 31))
+            return
+        }
+        k += 1
+    }
+    if a.import_fora == none {
+        a.import_fora = nome
+    }
+}
+
+// C: nativo/obj/ligar_alcance.c:162
+proc alcance_seguir(a: ^Alcance, o: i32, r: ^ObjReloc) {
+    let s: ^ObjSimbolo = alcance_simbolo(a, o, r.correcao.simbolo)
+    var alvo: AlcancePar = AlcancePar{}
+    let sw_1 = common.c2f_s2u_32(alcance_resolver(a, o, s, &alvo))
+    if sw_1 == (ALVO_SECAO as u32) {
+        alcance_marcar(a, transmute(alvo.objeto, to = i32), alvo.secao)
+    } else if sw_1 == (ALVO_IMPORT as u32) {
+        alcance_usar_import(a, (s.nome or_else ""))
+    } else if sw_1 == (ALVO_NENHUM as u32) {
+        if (((a.indefinido == none) and (not s.fraco)) and (alcance_indice_simbolo_do_ligador((s.nome or_else "")) < 0)) and (not (a.entrada as ^AlcanceEntrada).dinamico) {
+            a.indefinido = s.nome
+        }
+    }
+}
+
+// C: nativo/obj/ligar_alcance.c:182
+proc alcance_drenar(a: ^Alcance) {
+    while len(a.pilha) > 0 {
+        let p: AlcancePar = pop(&a.pilha) or_else AlcancePar{}
+        let ini: ^[dynamic]u32 = &a.ini[p.objeto]
+        let ord: ^[dynamic]u32 = &a.ord[p.objeto]
+        let obj: ^Objeto = ((a.entrada as ^AlcanceEntrada).obj or_else {})[transmute(p.objeto, to = i32)] as ^Objeto
+        let rels: ^[dynamic]ObjReloc = &obj.relocs
+        var k: u32 = ini[p.secao]
+        while k < ini[p.secao + 1] {
+            alcance_seguir(a, transmute(p.objeto, to = i32), &rels[ord[k] as u64])
+            k += 1
+        }
+    }
+}
+
+// C: nativo/obj/ligar_alcance.c:198
+proc alcance_descreve_codigo_vivo(a: ^Alcance, o: i32, sec: u32) -> bool {
+    let ini: ^[dynamic]u32 = &a.ini[o]
+    let ord: ^[dynamic]u32 = &a.ord[o]
+    let obj: ^Objeto = ((a.entrada as ^AlcanceEntrada).obj or_else {})[o] as ^Objeto
+    var k: u32 = ini[sec]
+    while k < ini[sec + 1] {
+        let r: ^ObjReloc = &obj.relocs[ord[k] as u64]
+        var alvo: AlcancePar = AlcancePar{}
+        if alcance_resolver(a, o, alcance_simbolo(a, o, r.correcao.simbolo), &alvo) == ALVO_SECAO {
+            let dono: ^Objeto = ((a.entrada as ^AlcanceEntrada).obj or_else {})[transmute(alvo.objeto, to = i32)] as ^Objeto
+            let destino: ^ObjSecao = &dono.secoes[alvo.secao as u64]
+            if (destino.tipo == OS_TEXTO) and alcance_vivo(a, transmute(alvo.objeto, to = i32), alvo.secao) {
+                return true
+            }
+        }
+        k += 1
+    }
+    return false
+}
+
+// C: nativo/obj/ligar_alcance.c:216
+proc alcance_subir_pdata(a: ^Alcance) -> bool {
+    var subiu: bool = false
+    for o in (0 as i32)..<ALCANCE_QTD_OBJETOS {
+        let secoes: ^[dynamic]ObjSecao = &(((a.entrada as ^AlcanceEntrada).obj or_else {})[o] as ^Objeto).secoes
+        var s: u32 = 0
+        while (s as u64) < (len(secoes^) as u64) {
+            let sec: ^ObjSecao = &secoes[s as u64]
+            if ((common.c2f_s2u_32(sec.tipo) != (OS_PDATA as u32)) or (common.c2f_b2i32(alcance_vivo(a, o, s)) != 0)) or (not alcance_descreve_codigo_vivo(a, o, s)) {
+                s += 1
+                continue
+            }
+            alcance_marcar(a, o, s)
+            subiu = true
+            s += 1
+        }
+    }
+    return subiu
+}
+
+// C: nativo/obj/ligar_alcance.c:234
+proc alcance_marcar_raiz(a: ^Alcance, raiz: ^AlcanceRaiz) {
+    let obj_c: ?^Objeto = ((a.entrada as ^AlcanceEntrada).obj or_else {})[raiz.objeto]
+    if raiz.simbolo == none {
+        var s: u32 = 0
+        while (s as u64) < (len((obj_c as ^Objeto).secoes) as u64) {
+            alcance_marcar(a, raiz.objeto, s)
+            s += 1
+        }
+        return
+    }
+    let i: i64 = obj_achar_simbolo(obj_c as ^Objeto, raiz.simbolo)
+    if i < 0 {
+        return
+    }
+    let s: ^ObjSimbolo = &(obj_c as ^Objeto).simbolos[common.c2f_s2u_64(i)]
+    if (common.c2f_b2i32(s.global) != 0) and (s.secao >= 0) {
+        alcance_marcar(a, raiz.objeto, common.c2f_s2u_32(s.secao))
+    }
+}
+
+// C: nativo/obj/ligar_alcance.c:251
+proc alcance_marcar_init_array(a: ^Alcance) {
+    for o in (0 as i32)..<ALCANCE_QTD_OBJETOS {
+        let secoes: ^[dynamic]ObjSecao = &(((a.entrada as ^AlcanceEntrada).obj or_else {})[o] as ^Objeto).secoes
+        var s: u32 = 0
+        while (s as u64) < (len(secoes^) as u64) {
+            if common.c2f_s2u_32(secoes[s as u64].tipo) == (OS_INIT_ARRAY as u32) {
+                alcance_marcar(a, o, s)
+            }
+            s += 1
+        }
+    }
+}
+
+// C: nativo/obj/ligar_alcance.c:262
+proc alcance_calcular(entrada: ^AlcanceEntrada, a: ^Alcance) {
+    a^ = Alcance{entrada = entrada, pilha = make([dynamic]AlcancePar, alloc = heap)}
+    for o in (0 as i32)..<ALCANCE_QTD_OBJETOS {
+        alcance_indexar(a, o)
+    }
+    var k: u32 = 0
+    while k < entrada.qtd_raizes {
+        alcance_marcar_raiz(a, &(entrada.raizes or_else {})[k as u64])
+        k += 1
+    }
+    alcance_marcar_init_array(a)
+    alcance_drenar(a)
+    while alcance_subir_pdata(a) {
+        alcance_drenar(a)
+    }
+}
+
+// C: nativo/obj/ligar_alcance.c:277
+proc alcance_liberar(a: ^Alcance) {
+    for o in (0 as i32)..<ALCANCE_QTD_OBJETOS {
+        delete(a.vivo[o])
+        delete(a.ini[o])
+        delete(a.ord[o])
+    }
+    delete(a.pilha)
+}
+
+test "alcance: simbolos do ligador, __imp_ e bitmap de imports usados" {
+    expect(alcance_indice_simbolo_do_ligador("__init_array_start") == 0)
+    expect(alcance_indice_simbolo_do_ligador("__ehdr_start") == 4)
+    expect(alcance_indice_simbolo_do_ligador("_DYNAMIC") == 6)
+    expect(alcance_indice_simbolo_do_ligador("_dynamic") == -1)
+    expect(alcance_indice_simbolo_do_ligador("") == -1)
+    expect(alcance_eh_import("__imp_X"))
+    expect(alcance_eh_import("__imp_"))
+    expect(not alcance_eh_import("__imp"))
+    expect(not alcance_eh_import("imp__X"))
+    var a: Alcance = Alcance{}
+    a.imports_usados[0] = 2147483649 // bits 0 e 31
+    a.imports_usados[1] = 2 // bit 33
+    expect(alcance_import_usado(&a, 0))
+    expect(not alcance_import_usado(&a, 1))
+    expect(alcance_import_usado(&a, 31))
+    expect(not alcance_import_usado(&a, 32))
+    expect(alcance_import_usado(&a, 33))
+    expect(not alcance_import_usado(&a, 319))
+}
+
+test "alcance: alcancabilidade por raiz, relocacao, .pdata que sobe, .init_array e imports" {
+    var objs: [16]Objeto = {}
+    var ptrs: [16]?^Objeto = {}
+    for i in (0 as u32)..<16 {
+        obj_iniciar(&objs[i])
+        ptrs[i] = &objs[i]
+    }
+    let sec_t: u32 = obj_secao_abrir(&objs[0], ".text", OS_TEXTO, 1)
+    let sec_p: u32 = obj_secao_abrir(&objs[0], ".pdata", OS_PDATA, 4)
+    let sec_i: u32 = obj_secao_abrir(&objs[0], ".init_array", OS_INIT_ARRAY, 8)
+    let sec_m: u32 = obj_secao_abrir(&objs[0], ".text$morta", OS_TEXTO, 1)
+    let sec_pm: u32 = obj_secao_abrir(&objs[0], ".pdata$morta", OS_PDATA, 4)
+    let sec_o0: u32 = obj_secao_abrir(&objs[1], ".text$o0", OS_TEXTO, 1)
+    let sec_o1: u32 = obj_secao_abrir(&objs[1], ".text$o1", OS_TEXTO, 1)
+    let s_ini: u32 = obj_simbolo_definir(&objs[0], "inicio", sec_t as i32, 0)
+    let s_foo: u32 = obj_simbolo_referir(&objs[0], "__imp_Foo")
+    let s_fraco: u32 = obj_simbolo_referir(&objs[0], "fraco")
+    let s_lig: u32 = obj_simbolo_referir(&objs[0], "__init_array_start")
+    let s_sumiu: u32 = obj_simbolo_referir(&objs[0], "sumiu")
+    let s_zzz: u32 = obj_simbolo_referir(&objs[0], "__imp_Zzz")
+    let s_fora: u32 = obj_simbolo_referir(&objs[0], "outro_def")
+    let s_morto: u32 = obj_simbolo_definir(&objs[0], "morto", sec_m as i32, 0)
+    let s_o0: u32 = obj_simbolo_definir(&objs[1], "outro_def", sec_o0 as i32, 0)
+    objs[0].simbolos[s_fraco as u64].fraco = true
+    let alvo_t: ObjAlvoReloc = ObjAlvoReloc{secao = sec_t, off = 0}
+    obj_relocar(&objs[0], alvo_t, ObjCorrecao{tipo = OR_REL32, simbolo = s_foo, adendo = 0})
+    obj_relocar(&objs[0], alvo_t, ObjCorrecao{tipo = OR_REL32, simbolo = s_fraco, adendo = 0})
+    obj_relocar(&objs[0], alvo_t, ObjCorrecao{tipo = OR_REL32, simbolo = s_lig, adendo = 0})
+    obj_relocar(&objs[0], alvo_t, ObjCorrecao{tipo = OR_REL32, simbolo = s_sumiu, adendo = 0})
+    obj_relocar(&objs[0], alvo_t, ObjCorrecao{tipo = OR_REL32, simbolo = s_zzz, adendo = 0})
+    obj_relocar(&objs[0], alvo_t, ObjCorrecao{tipo = OR_REL32, simbolo = s_fora, adendo = 0})
+    // .pdata do codigo vivo (aponta para "inicio") e .pdata$morta (aponta para a secao morta)
+    obj_relocar(&objs[0], ObjAlvoReloc{secao = sec_p, off = 0}, ObjCorrecao{tipo = OR_ADDR32NB, simbolo = s_ini, adendo = 0})
+    obj_relocar(&objs[0], ObjAlvoReloc{secao = sec_pm, off = 0}, ObjCorrecao{tipo = OR_ADDR32NB, simbolo = s_morto, adendo = 0})
+    var imports: [2]str = {"Foo", "Bar"}
+    var raizes: [1]AlcanceRaiz = {}
+    raizes[0] = AlcanceRaiz{objeto = 0, simbolo = "inicio"}
+    var entrada: AlcanceEntrada = AlcanceEntrada{obj = ptrs, raizes = raizes[..], qtd_raizes = 1, imports = imports[..], qtd_imports = 2}
+    var a: Alcance = Alcance{}
+    alcance_calcular(&entrada, &a)
+    defer alcance_liberar(&a)
+    // indice das relocacoes: 6 em .text, 1 em .pdata, 1 em .pdata$morta (ordem estavel)
+    expect(a.ini[0][0] == 0)
+    expect(a.ini[0][1] == 6)
+    expect(a.ini[0][2] == 7)
+    expect(a.ini[0][3] == 7)
+    expect(a.ini[0][4] == 7)
+    expect(a.ini[0][5] == 8)
+    expect(a.ord[0][0] == 0)
+    expect(a.ord[0][5] == 5)
+    expect(a.ord[0][6] == 6)
+    expect(a.ord[0][7] == 7)
+    expect(len(a.ini[1]) == 3)
+    expect(len(a.ord[1]) == 0)
+    // vivas: a raiz, o .pdata que descreve codigo vivo (sobe), o .init_array e o que "outro_def" cita no objeto 1
+    expect(alcance_vivo(&a, 0, sec_t))
+    expect(alcance_vivo(&a, 0, sec_p))
+    expect(alcance_vivo(&a, 0, sec_i))
+    expect(not alcance_vivo(&a, 0, sec_m))
+    expect(not alcance_vivo(&a, 0, sec_pm))
+    expect(alcance_vivo(&a, 1, sec_o0))
+    expect(not alcance_vivo(&a, 1, sec_o1))
+    expect(s_o0 == 0)
+    // imports: Foo usado, Bar nao; "__imp_Zzz" fora das tabelas; "sumiu" indefinido (o fraco e o do ligador nao contam)
+    expect(alcance_import_usado(&a, 0))
+    expect(not alcance_import_usado(&a, 1))
+    expect((a.import_fora or_else "") == "__imp_Zzz")
+    expect((a.indefinido or_else "") == "sumiu")
+    for i in (0 as u32)..<16 {
+        obj_liberar(&objs[i])
+    }
+}

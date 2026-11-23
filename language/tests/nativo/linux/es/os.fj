@@ -1,0 +1,212 @@
+// std:os no Linux (M5 P28b-1) - A52: cwd, abs_path, exe_path, temp_dir, set_env, unset_env e random_bytes. Programa do Linux (caminhos com "/"); o .env do caso traz FJ_ANTES=antes e FJ_OUTRA=outra.
+import "std:os" as sys
+
+proc erro_texto(e: sys.OsError) -> str {
+    var t: str = "other"
+    switch e {
+    case sys.OsError.not_found:
+        t = "not_found"
+    case sys.OsError.no_permission:
+        t = "no_permission"
+    case sys.OsError.invalid_input:
+        t = "invalid_input"
+    case sys.OsError.other:
+        t = "other"
+    }
+    return t
+}
+
+// Imprime o rotulo e o resultado (ok ou o erro tipado) de uma operacao.
+proc passo(rotulo: str, erro: ?sys.OsError) {
+    switch e in erro {
+    case sys.OsError:
+        print(f"{rotulo} {erro_texto(e)}")
+    case none:
+        print(f"{rotulo} ok")
+    }
+}
+
+proc mostrar_env(nome: str) {
+    switch v in sys.env(nome) {
+    case str:
+        print(f"env {nome}=<{v}> ({len(v)})")
+    case none:
+        print(f"env {nome}=none")
+    }
+}
+
+proc mostrar_cwd() {
+    switch r in sys.cwd(alloc = heap) {
+    case str:
+        let comeca_com_barra = r[0] == 47
+        let nao_vazio = len(r) > 1
+        print(f"cwd barra={comeca_com_barra} nao_vazio={nao_vazio}")
+        delete(r)
+    case sys.OsError:
+        print(f"cwd {erro_texto(r)}")
+    }
+}
+
+proc mostrar_abs(entrada: str) {
+    switch r in sys.abs_path(entrada, alloc = heap) {
+    case str:
+        print(f"abs <{entrada}> -> <{r}>")
+        delete(r)
+    case sys.OsError:
+        print(f"abs <{entrada}> {erro_texto(r)}")
+    }
+}
+
+// abs_path de um caminho relativo = cwd + o resultado lexico.
+proc conferir_abs_relativo() {
+    switch pasta in sys.cwd(alloc = heap) {
+    case str:
+        let esperado = format(f"{pasta}/k/m", alloc = heap)
+        switch r in sys.abs_path("rel/../k/./m/", alloc = heap) {
+        case str:
+            let igual = r == esperado
+            print(f"abs relativo = cwd + /k/m: {igual}")
+            delete(r)
+        case sys.OsError:
+            print(f"abs relativo {erro_texto(r)}")
+        }
+        delete(esperado)
+        delete(pasta)
+    case sys.OsError:
+        print(f"cwd {erro_texto(pasta)}")
+    }
+}
+
+// O kernel recebe o caminho absoluto do executavel (o lote roda "$T/pN"): exe_path = args[0].
+proc conferir_exe() {
+    let a = sys.args()
+    switch r in sys.exe_path(alloc = heap) {
+    case str:
+        let igual = r == a[0]
+        let barra = r[0] == 47
+        print(f"exe igual a args[0]: {igual} barra={barra}")
+        delete(r)
+    case sys.OsError:
+        print(f"exe {erro_texto(r)}")
+    }
+}
+
+proc mostrar_temp(rotulo: str) {
+    switch r in sys.temp_dir(alloc = heap) {
+    case str:
+        print(f"temp {rotulo} -> <{r}>")
+        delete(r)
+    case sys.OsError:
+        print(f"temp {rotulo} {erro_texto(r)}")
+    }
+}
+
+proc casos_de_temp() {
+    passo("unset TMPDIR", sys.unset_env("TMPDIR"))
+    mostrar_temp("sem TMPDIR")
+    passo("set TMPDIR /var/tmp", sys.set_env("TMPDIR", "/var/tmp"))
+    mostrar_temp("/var/tmp")
+    passo("set TMPDIR /var/tmp/", sys.set_env("TMPDIR", "/var/tmp/"))
+    mostrar_temp("/var/tmp/")
+    passo("set TMPDIR //", sys.set_env("TMPDIR", "//"))
+    mostrar_temp("//")
+    passo("set TMPDIR vazio", sys.set_env("TMPDIR", ""))
+    mostrar_temp("vazio")
+}
+
+proc casos_de_ambiente() {
+    mostrar_env("FJ_ANTES")
+    mostrar_env("FJ_OUTRA")
+    passo("set FJ_ANTES", sys.set_env("FJ_ANTES", "depois"))
+    mostrar_env("FJ_ANTES")
+    mostrar_env("FJ_OUTRA")
+    passo("set FJ_NOVA", sys.set_env("FJ_NOVA", "n1"))
+    mostrar_env("FJ_NOVA")
+    passo("set FJ_NOVA vazio", sys.set_env("FJ_NOVA", ""))
+    mostrar_env("FJ_NOVA")
+    passo("set FJ_NOVA acento", sys.set_env("FJ_NOVA", "ação"))
+    mostrar_env("FJ_NOVA")
+    passo("unset FJ_NOVA", sys.unset_env("FJ_NOVA"))
+    mostrar_env("FJ_NOVA")
+    passo("unset FJ_NOVA de novo", sys.unset_env("FJ_NOVA"))
+    passo("unset FJ_ANTES", sys.unset_env("FJ_ANTES"))
+    mostrar_env("FJ_ANTES")
+    mostrar_env("FJ_OUTRA")
+    passo("set nome vazio", sys.set_env("", "x"))
+    passo("set nome com igual", sys.set_env("A=B", "x"))
+    passo("unset nome vazio", sys.unset_env(""))
+}
+
+// 50 variaveis novas (o vetor cresce no heap), conferidas e removidas.
+proc muitas_variaveis() {
+    var erros: int = 0
+    for i in 0..<50 {
+        let nome = format(f"FJ_V{i}", alloc = heap)
+        defer delete(nome)
+        if sys.set_env(nome, "v") != none {
+            erros += 1
+        }
+    }
+    mostrar_env("FJ_V0")
+    mostrar_env("FJ_V49")
+    for i in 0..<50 {
+        let nome = format(f"FJ_V{i}", alloc = heap)
+        defer delete(nome)
+        if sys.unset_env(nome) != none {
+            erros += 1
+        }
+    }
+    mostrar_env("FJ_V25")
+    mostrar_env("FJ_OUTRA")
+    print(f"muitas erros={erros}")
+}
+
+proc contar_nao_zeros(dados: []u8) -> int {
+    var n: int = 0
+    for b in dados {
+        if b != 0 {
+            n += 1
+        }
+    }
+    return n
+}
+
+proc casos_aleatorios() {
+    var a: [64]u8 = {}
+    var b: [64]u8 = {}
+    passo("random a", sys.random_bytes(a[..]))
+    passo("random b", sys.random_bytes(b[..]))
+    var iguais: int = 0
+    for i in 0..<64 {
+        if a[i] == b[i] {
+            iguais += 1
+        }
+    }
+    let nao_zeros = contar_nao_zeros(a[..])
+    print(f"random distintos={iguais < 8} nao_zeros_muitos={nao_zeros > 40}")
+    passo("random vazio", sys.random_bytes(a[0..<0]))
+    var um: [1]u8 = {}
+    passo("random 1 byte", sys.random_bytes(um[..]))
+    var grande = make([dynamic]u8, alloc = heap, len = 3000000)
+    defer delete(grande)
+    passo("random 3000000", sys.random_bytes(grande[..]))
+    let nz = contar_nao_zeros(grande[..])
+    let nz_final = contar_nao_zeros(grande[2900000..<3000000])
+    print(f"random grande nao_zeros={nz > 2950000} ultimo_trecho_cheio={nz_final > 99000}")
+}
+
+proc main() {
+    mostrar_cwd()
+    mostrar_abs("/x/./y/../z//")
+    mostrar_abs("/..")
+    mostrar_abs("/")
+    mostrar_abs("//a///b/")
+    mostrar_abs("/a/b/../../../..")
+    mostrar_abs("/ação/./é")
+    conferir_abs_relativo()
+    conferir_exe()
+    casos_de_temp()
+    casos_de_ambiente()
+    muitas_variaveis()
+    casos_aleatorios()
+}

@@ -1,0 +1,834 @@
+// semantic/sem_fuga.fj - porte de compiler/semantic/sem_fuga.c, compiler/semantic/sem_fuga.h
+// sha256 de semantic/sem_fuga.c: 6933f4a6ed38cd704ddf37b9aa539d449ed969a2cc0c219a19148070bbb647a1
+// sha256 de semantic/sem_fuga.h: 4d235f692fb93e77d3737fd2c0ae5dddba65d3519eab62c34a1c57bc7cb1318b
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "common"
+import "frontend"
+
+struct FugaLocal {
+    nome: i32
+    pos: u32
+    rastreado: bool
+}
+
+struct FugaProv {
+    var_c: i32
+    bit: i32
+    de: i32
+}
+
+struct FugaSumidouro {
+    tipo: u8
+    nome: i32
+    pos: u32
+    callee: i32
+}
+
+struct FugaResumo {
+    retorno_de: u64
+    guarda: ?[]u64
+    nparams: u32
+    flags: u8
+}
+
+struct FugaTabela {
+    proc_c: ?[]FugaResumo
+    n: u32
+    mudou: bool
+    rascunho: [dynamic]u64
+}
+
+struct FugaGravacao {
+    valor: ?^frontend.Expr
+    pos: u32
+    callee: ?^frontend.Decl
+    param: i32
+}
+
+struct Fuga {
+    s: ?^Semantica
+    proc_c: ?^frontend.Decl
+    nl: u32
+    np: u32
+    pal: u32
+    conj: []u64
+    v: []u64
+    p: ?[]u64
+    locais: []FugaLocal // C2F-INDECIDIVEL
+    prov: [dynamic]FugaProv
+    tab: ?^FugaTabela
+    meu: ?^FugaResumo
+    mudou: bool
+    laco: bool
+    silencioso: bool
+    candidato: bool
+}
+
+struct CorposDaFuga {
+    s: ?^Semantica
+    tab: FugaTabela
+    corpos: [dynamic]?^frontend.Decl
+    nprocs: u32
+    suspeito: ?[]bool
+}
+
+const FUGA_GLOBAL: i32 = 0
+const FUGA_HEAP: i32 = 1
+const FUGA_FOREIGN: i32 = 2
+const FUGA_DESC: i32 = 3
+const FUGA_FLAGS: i32 = 4
+const SUM_RETURN: i32 = 0
+const SUM_PARAM: i32 = 1
+const SUM_HEAP: i32 = 2
+const SUM_GLOBAL: i32 = 3
+const SUM_FOREIGN: i32 = 4
+const SUM_DESC: i32 = 5
+const SUM_CALLEE: i32 = 6
+const FUGA_PARAMS_MAX: i32 = 64
+// C2F:? tabela COMANDOS_FUGA (const AndaComando[14]): folha nao escalar {'txt': '[ ST_LET ] = FugaLet'}
+
+pub proc arena_fatia_fuga_resumo(a: ^common.Arena, n: int) -> []FugaResumo {
+    var l = make([dynamic]FugaResumo, alloc = common.arena_mem(a), cap = n)
+    for i in 0..<n {
+        append(&l, item = FugaResumo{})
+    }
+    return l[..]
+}
+
+// S6 (sem par no C): `f->locais` era um pedaco do rascunho de uint64_t (cast); a Fuga e congelada (locais: []FugaLocal), entao a fatia sai da arena, zerada (a arena nao devolve memoria: cresce nl * 16 bytes por volta do ponto fixo).
+proc arena_fatia_fuga_local(a: ^common.Arena, n: int) -> []FugaLocal {
+    var l = make([dynamic]FugaLocal, alloc = common.arena_mem(a), cap = n)
+    for i in 0..<n {
+        append(&l, item = FugaLocal{})
+    }
+    return l[..]
+}
+
+pub const ANDA_COMANDO_FUGA_RETURN: u16 = 1
+pub const ANDA_COMANDO_FUGA_ATRIBUICAO: u16 = 2
+pub const ANDA_COMANDO_FUGA_LET: u16 = 3
+pub const ANDA_COMANDO_FUGA_LET_MULTIPLO: u16 = 4
+pub const ANDA_COMANDO_FUGA_IF: u16 = 5
+pub const ANDA_COMANDO_FUGA_WHILE: u16 = 6
+pub const ANDA_COMANDO_FUGA_FOR: u16 = 7
+pub const ANDA_COMANDO_FUGA_SWITCH: u16 = 8
+pub const ANDA_COMANDO_FUGA_DEFER: u16 = 9
+pub const ANDA_COMANDO_SEM_EFEITO: u16 = 10
+pub proc chamar_anda_comando(tag: u16, f: ^Fuga, st: ^frontend.Stmt) -> bool {
+    if tag == 1 {
+        return fuga_return(f, st)
+    }
+    if tag == 2 {
+        return fuga_atribuicao(f, st)
+    }
+    if tag == 3 {
+        return fuga_let(f, st)
+    }
+    if tag == 4 {
+        return fuga_let_multiplo(f, st)
+    }
+    if tag == 5 {
+        return fuga_if(f, st)
+    }
+    if tag == 6 {
+        return fuga_while(f, st)
+    }
+    if tag == 7 {
+        return fuga_for(f, st)
+    }
+    if tag == 8 {
+        return fuga_switch(f, st)
+    }
+    if tag == 9 {
+        return fuga_defer(f, st)
+    }
+    if tag == 10 {
+        return sem_efeito(f, st)
+    }
+    panic("sem_fuga: tag de AndaComando invalida (o C chamaria ponteiro nulo)")
+    return false
+}
+
+pub const FUGA_RODADA_RODADA_DO_CORPO: u16 = 1
+pub proc chamar_fuga_rodada(tag: u16, ctx: rawptr, i: u32) -> bool {
+    if tag == 1 {
+        return rodada_do_corpo(ctx, i)
+    }
+    panic("sem_fuga: tag de FugaRodada invalida (o C chamaria ponteiro nulo)")
+    return false
+}
+
+// C: COMANDOS_FUGA[st->tipo_no] (sem_fuga.c:243): tabela designada ST_* -> AndaComando, em tag (C2F-80). Os 14 ST_* tem entrada.
+proc tag_do_comando(tipo_no: u8) -> u16 {
+    let t = tipo_no as i32
+    if t == frontend.ST_LET or t == frontend.ST_VAR {
+        return ANDA_COMANDO_FUGA_LET
+    }
+    if t == frontend.ST_ATRIBUICAO {
+        return ANDA_COMANDO_FUGA_ATRIBUICAO
+    }
+    if t == frontend.ST_IF {
+        return ANDA_COMANDO_FUGA_IF
+    }
+    if t == frontend.ST_WHILE {
+        return ANDA_COMANDO_FUGA_WHILE
+    }
+    if t == frontend.ST_FOR {
+        return ANDA_COMANDO_FUGA_FOR
+    }
+    if t == frontend.ST_RETURN {
+        return ANDA_COMANDO_FUGA_RETURN
+    }
+    if t == frontend.ST_DEFER {
+        return ANDA_COMANDO_FUGA_DEFER
+    }
+    if t == frontend.ST_SWITCH {
+        return ANDA_COMANDO_FUGA_SWITCH
+    }
+    if t == frontend.ST_LET_MULTIPLO {
+        return ANDA_COMANDO_FUGA_LET_MULTIPLO
+    }
+    if t == frontend.ST_CHAMADA or t == frontend.ST_BREAK or t == frontend.ST_CONTINUE or t == frontend.ST_EXPECT {
+        return ANDA_COMANDO_SEM_EFEITO
+    }
+    return 0
+}
+
+// C: semantic/sem_fuga.h:60
+// C2F-INDECIDIVEL: o FugaConj (uint64_t *) e a fatia de pal palavras do conjunto de var_c dentro de conj; a escrita na fatia grava em f.conj
+proc fuga_conj_de(f: ^Fuga, var_c: u32) -> []u64 {
+    let ini: u64 = (var_c as u64) * (f.pal as u64)
+    return f.conj[ini..<(ini + (f.pal as u64))]
+}
+
+// C: semantic/sem_fuga.h:61
+proc fuga_bit_param(f: ^Fuga, n: u32) -> u32 {
+    return f.nl + n
+}
+
+// C: semantic/sem_fuga.h:62
+proc fuga_bit_flag(f: ^Fuga, g: i32) -> u32 {
+    return (f.nl + f.np) + common.c2f_s2u_32(g)
+}
+
+// C: semantic/sem_fuga.h:63
+// C2F-INDECIDIVEL: c
+proc fuga_ligar(c: []u64, bit: u32) {
+    c[bit >> 6] = c[bit >> 6] | (1 << (((bit & 63) as u64) & 63))
+}
+
+// C: semantic/sem_fuga.h:64
+// C2F-INDECIDIVEL: c
+proc fuga_tem(c: []u64, bit: u32) -> bool {
+    return ((c[bit >> 6] >> (((bit & 63) as u64) & 63)) & 1) != 0
+}
+
+// C: semantic/sem_fuga.h:65
+// C2F-INDECIDIVEL: c
+proc fuga_ligar_flag(f: ^Fuga, c: []u64, g: i32) {
+    fuga_ligar(c, fuga_bit_flag(f, g))
+}
+
+// C: semantic/sem_fuga.h:66
+// C2F-INDECIDIVEL: c
+proc fuga_zerar(f: ^Fuga, c: []u64) {
+    for w in (0 as u32)..<f.pal {
+        c[w] = 0
+    }
+}
+
+// C: semantic/sem_fuga.h:71
+proc fuga_contem_por_valor(f: ^Fuga, t: u32) -> bool {
+    let c: i32 = tipo_classe_de(&(f.s as ^Semantica).tipos, t)
+    return (((common.c2f_s2u_32(c) == (TC_ARRAY as u32)) or (common.c2f_s2u_32(c) == (TC_DINAMICO as u32))) or (common.c2f_s2u_32(c) == (TC_MAPA as u32))) or (common.c2f_s2u_32(c) == (TC_SOA as u32))
+}
+
+// C: semantic/sem_fuga.h:86
+proc fuga_rastreia(f: ^Fuga, t: u32) -> bool {
+    return sem_fuga_tipo_tem_ponteiro(f.s as ^Semantica, t)
+}
+
+// C: semantic/sem_fuga.c:20
+proc registrar_novos(f: ^Fuga, var_c: u32, palavra: u32, novo: u64, origem: ?^frontend.Expr) {
+    var resto: u64 = novo
+    while resto != 0 {
+        let bit: u32 = (palavra * 64) + (trailing_zeros(resto) as u32)
+        resto = resto & (resto - 1)
+        if bit < f.nl {
+            fuga_prov_registrar(f, var_c, bit, origem)
+        }
+    }
+}
+
+// C: semantic/sem_fuga.c:29
+// C2F-INDECIDIVEL: v
+proc fuga_unir_em(f: ^Fuga, var_c: u32, v: []u64, origem: ?^frontend.Expr) {
+    let c: []u64 = fuga_conj_de(f, var_c)
+    for w in (0 as u32)..<f.pal {
+        let novo: u64 = v[w] & (~c[w])
+        if novo == 0 {
+            continue
+        }
+        c[w] = c[w] | novo
+        f.mudou = true
+        registrar_novos(f, var_c, w, novo, origem)
+    }
+}
+
+// C: semantic/sem_fuga.c:41
+// C2F-INDECIDIVEL: c
+proc fuga_primeiro_local(f: ^Fuga, c: []u64) -> i32 {
+    var w: u32 = 0
+    while (w < f.pal) and ((w * 64) < f.nl) {
+        let palavra: u64 = c[w]
+        if palavra == 0 {
+            w += 1
+            continue
+        }
+        let bit: u32 = (w * 64) + (trailing_zeros(palavra) as u32)
+        if bit < f.nl {
+            return bit as i32
+        }
+        return -1
+    }
+    return -1
+}
+
+// C: semantic/sem_fuga.c:54
+proc declarar(f: ^Fuga, id: i32, nome: i32, pos: u32, tipo: u32) {
+    if (id < 0) or (common.c2f_s2u_32(id) >= f.nl) {
+        return
+    }
+    f.locais[id] = FugaLocal{nome = nome, pos = pos, rastreado = sem_fuga_tipo_tem_ponteiro(f.s as ^Semantica, tipo)}
+}
+
+// C: semantic/sem_fuga.c:60
+proc rastreado(f: ^Fuga, id: i32) -> bool {
+    return ((id >= 0) and (common.c2f_s2u_32(id) < f.nl)) and f.locais[id].rastreado
+}
+
+// C: semantic/sem_fuga.c:66
+proc guardar_no_local(f: ^Fuga, id: i32, origem: ?^frontend.Expr) {
+    if rastreado(f, id) {
+        fuga_unir_em(f, common.c2f_s2u_32(id), f.v, origem)
+    }
+}
+
+// C: semantic/sem_fuga.c:73
+proc sumidouro_do_valor(f: ^Fuga, valor: ?^frontend.Expr, sum: ^FugaSumidouro) -> bool {
+    fuga_zerar(f, f.v)
+    fuga_avaliar(f, valor, f.v)
+    fuga_registrar_retorno(f, f.v)
+    let bit: i32 = fuga_primeiro_local(f, f.v)
+    if bit < 0 {
+        return true
+    }
+    f.candidato = true
+    return f.silencioso or fuga_reportar(f, valor, common.c2f_s2u_32(bit), sum)
+}
+
+// C: semantic/sem_fuga.c:84
+proc fuga_return(f: ^Fuga, st: ^frontend.Stmt) -> bool {
+    var sum: FugaSumidouro = FugaSumidouro{tipo = SUM_RETURN as u8, nome = -1, pos = st.pos, callee = -1}
+    if st.expr == none {
+        return true
+    }
+    if (st.expr as ^frontend.Expr).tipo_no != (frontend.EX_TUPLA as u8) {
+        return sumidouro_do_valor(f, st.expr, &sum)
+    }
+    var k: u32 = 0
+    while k < (st.expr as ^frontend.Expr).nargs {
+        if not sumidouro_do_valor(f, ((st.expr as ^frontend.Expr).args or_else {})[k].valor, &sum) {
+            return false
+        }
+        k += 1
+    }
+    return true
+}
+
+// C: semantic/sem_fuga.c:98
+proc base_direta(f: ^Fuga, x: ?^frontend.Expr) -> ?^frontend.Expr {
+    if (x as ^frontend.Expr).tipo_no == (frontend.EX_CAMPO as u8) {
+        var tern_1: ?^frontend.Expr = (x as ^frontend.Expr).a
+        if common.c2f_s2u_32(tipo_classe_de(&(f.s as ^Semantica).tipos, ((x as ^frontend.Expr).a as ^frontend.Expr).tipo)) == (TC_PONTEIRO as u32) {
+            tern_1 = none
+        }
+        return tern_1
+    }
+    if (x as ^frontend.Expr).tipo_no != (frontend.EX_INDICE as u8) {
+        return none
+    }
+    var tern_2: ?^frontend.Expr = none
+    if common.c2f_b2i32(fuga_contem_por_valor(f, ((x as ^frontend.Expr).a as ^frontend.Expr).tipo)) != 0 {
+        tern_2 = (x as ^frontend.Expr).a
+    }
+    return tern_2
+}
+
+// C: semantic/sem_fuga.c:106
+proc ponteiro_do_salto(f: ^Fuga, x: ?^frontend.Expr) -> ?^frontend.Expr {
+    if (x as ^frontend.Expr).tipo_no == (frontend.EX_CAMPO as u8) {
+        return (x as ^frontend.Expr).a
+    }
+    if ((x as ^frontend.Expr).tipo_no == (frontend.EX_UNARIO as u8)) and ((x as ^frontend.Expr).op == (frontend.OP_DEREF as u8)) {
+        return (x as ^frontend.Expr).a
+    }
+    if (x as ^frontend.Expr).tipo_no != (frontend.EX_INDICE as u8) {
+        return none
+    }
+    let classe: i32 = tipo_classe_de(&(f.s as ^Semantica).tipos, ((x as ^frontend.Expr).a as ^frontend.Expr).tipo)
+    var tern_1: ?^frontend.Expr = none
+    if (common.c2f_s2u_32(classe) == (TC_FATIA as u32)) or (common.c2f_s2u_32(classe) == (TC_PONTEIRO as u32)) {
+        tern_1 = (x as ^frontend.Expr).a
+    }
+    return tern_1
+}
+
+// C: semantic/sem_fuga.c:116
+proc gravar_por_ponteiro(f: ^Fuga, x: ?^frontend.Expr, st: ^frontend.Stmt) -> bool {
+    let ponteiro: ?^frontend.Expr = ponteiro_do_salto(f, x)
+    if ponteiro == none {
+        return true
+    }
+    let p: []u64 = f.p or_else {}
+    fuga_zerar(f, p)
+    fuga_avaliar(f, ponteiro, p)
+    var g: FugaGravacao = FugaGravacao{valor = st.expr, pos = st.pos, callee = none, param = -1}
+    return fuga_armazenar(f, &g)
+}
+
+// C: semantic/sem_fuga.c:125
+proc fuga_atribuicao(f: ^Fuga, st: ^frontend.Stmt) -> bool {
+    var x: ?^frontend.Expr = st.alvo
+    if (st.op != 0) or (not fuga_rastreia(f, (x as ^frontend.Expr).tipo)) {
+        return true
+    }
+    fuga_zerar(f, f.v)
+    fuga_avaliar(f, st.expr, f.v)
+    while (x as ^frontend.Expr).tipo_no != (frontend.EX_NOME as u8) {
+        let base: ?^frontend.Expr = base_direta(f, x)
+        if base == none {
+            return gravar_por_ponteiro(f, x, st)
+        }
+        x = base
+    }
+    let nome: ^frontend.Expr = x as ^frontend.Expr
+    if (nome.ref == (frontend.REF_LOCAL as u8)) or (nome.ref == (frontend.REF_PARAM as u8)) {
+        guardar_no_local(f, nome.ref_id, st.expr)
+    }
+    return true
+}
+
+// C: semantic/sem_fuga.c:142
+proc fuga_let(f: ^Fuga, st: ^frontend.Stmt) -> bool {
+    if f.silencioso and (not fuga_rastreia(f, st.tipo_local)) {
+        return true
+    }
+    declarar(f, st.local_id, st.nome, sem_pos_depois_da_palavra(f.s as ^Semantica, st.pos), st.tipo_local)
+    if not rastreado(f, st.local_id) {
+        return true
+    }
+    fuga_zerar(f, f.v)
+    fuga_avaliar(f, st.expr, f.v)
+    guardar_no_local(f, st.local_id, st.expr)
+    return true
+}
+
+// C: semantic/sem_fuga.c:156
+proc fuga_let_multiplo(f: ^Fuga, st: ^frontend.Stmt) -> bool {
+    let nomes: []frontend.NomeLet = st.nomes or_else {}
+    for k in (0 as u32)..<st.ncasos {
+        let n: frontend.NomeLet = nomes[k]
+        declarar(f, n.local_id, n.nome, n.pos, n.tipo)
+        if not rastreado(f, n.local_id) {
+            continue
+        }
+        fuga_zerar(f, f.v)
+        fuga_avaliar(f, st.expr, f.v)
+        guardar_no_local(f, n.local_id, st.expr)
+    }
+    return true
+}
+
+// C: semantic/sem_fuga.c:173
+proc fuga_if(f: ^Fuga, st: ^frontend.Stmt) -> bool {
+    return (common.c2f_b2i32(fuga_bloco(f, st.corpo)) != 0) and (common.c2f_b2i32(fuga_bloco(f, st.senao)) != 0)
+}
+
+// C: semantic/sem_fuga.c:178
+proc fuga_while(f: ^Fuga, st: ^frontend.Stmt) -> bool {
+    f.laco = true
+    return fuga_bloco(f, st.corpo)
+}
+
+// C: semantic/sem_fuga.c:186
+// C2F-INDECIDIVEL: dst
+proc origem_do_item(f: ^Fuga, st: ^frontend.Stmt, dst: []u64) {
+    let classe: i32 = tipo_classe_de(&(f.s as ^Semantica).tipos, (st.expr as ^frontend.Expr).tipo)
+    if not st.item_ref {
+        if fuga_contem_por_valor(f, (st.expr as ^frontend.Expr).tipo) {
+            fuga_avaliar(f, st.expr, dst)
+        } else {
+            fuga_ligar_flag(f, dst, FUGA_DESC)
+        }
+    } else if common.c2f_s2u_32(classe) == (TC_ARRAY as u32) {
+        fuga_endereco(f, st.expr, dst)
+    } else if common.c2f_s2u_32(classe) == (TC_DINAMICO as u32) {
+        fuga_ligar_flag(f, dst, FUGA_HEAP)
+    } else {
+        fuga_avaliar(f, st.expr, dst)
+    }
+}
+
+// C: semantic/sem_fuga.c:201
+proc fuga_for(f: ^Fuga, st: ^frontend.Stmt) -> bool {
+    f.laco = true
+    if st.expr2 == none {
+        declarar(f, st.local_id, st.nome, sem_pos_depois_da_palavra(f.s as ^Semantica, st.pos), st.tipo_local)
+        if rastreado(f, st.local_id) {
+            fuga_zerar(f, f.v)
+            origem_do_item(f, st, f.v)
+            guardar_no_local(f, st.local_id, st.expr)
+        }
+    }
+    return fuga_bloco(f, st.corpo)
+}
+
+// C: semantic/sem_fuga.c:216
+proc fuga_switch(f: ^Fuga, st: ^frontend.Stmt) -> bool {
+    let casos: []frontend.Caso = st.casos or_else {}
+    for k in (0 as u32)..<st.ncasos {
+        let c: frontend.Caso = casos[k]
+        declarar(f, c.local_id, st.nome, sem_pos_depois_da_palavra(f.s as ^Semantica, st.pos), c.tipo)
+        if rastreado(f, c.local_id) {
+            fuga_zerar(f, f.v)
+            fuga_avaliar(f, st.expr, f.v)
+            guardar_no_local(f, c.local_id, st.expr)
+        }
+        if not fuga_bloco(f, c.corpo) {
+            return false
+        }
+    }
+    return true
+}
+
+// C: semantic/sem_fuga.c:231
+proc fuga_defer(f: ^Fuga, st: ^frontend.Stmt) -> bool {
+    return fuga_bloco(f, st.corpo)
+}
+
+// C: semantic/sem_fuga.c:236
+proc sem_efeito(f: ^Fuga, st: ^frontend.Stmt) -> bool {
+    return true
+}
+
+// C: semantic/sem_fuga.c:249
+proc fuga_bloco(f: ^Fuga, primeiro: ?^frontend.Stmt) -> bool {
+    var st: ?^frontend.Stmt = primeiro
+    while st != none {
+        let atual: ^frontend.Stmt = st as ^frontend.Stmt
+        if (not fuga_efeitos(f, atual)) or (not chamar_anda_comando(tag_do_comando(atual.tipo_no), f, atual)) {
+            return false
+        }
+        st = atual.prox
+    }
+    return true
+}
+
+// C: semantic/sem_fuga.c:260
+proc resumo_do_proc(s: ^Semantica, d: ^frontend.Decl, tab: ^FugaTabela) -> ^FugaResumo {
+    if (d.tipo_no == (frontend.D_PROC as u8)) and (d.indice >= 0) and (common.c2f_s2u_32(d.indice) < tab.n) {
+        return &(tab.proc_c or_else {})[d.indice]
+    }
+    let provisorio: []FugaResumo = arena_fatia_fuga_resumo(s.arena as ^common.Arena, 1)
+    provisorio[0].guarda = common.arena_fatia_u64(s.arena as ^common.Arena, 1)
+    return &provisorio[0]
+}
+
+// C: semantic/sem_fuga.c:268
+proc fuga_iniciar(f: ^Fuga, s: ^Semantica, d: ^frontend.Decl, tab: ^FugaTabela) {
+    f^ = Fuga{s = s, proc_c = d, nl = d.nlocais, np = d.nparams, tab = tab}
+    f.meu = resumo_do_proc(s, d, tab)
+    f.pal = ((f.nl + f.np) + (FUGA_FLAGS as u32) + 63) / 64
+    // C: palavras = (nl + 2) * pal + palavras_locais; os locais saem da arena (arena_fatia_fuga_local), nao do rascunho
+    let palavras: u64 = ((f.nl as u64) + 2) * (f.pal as u64)
+    clear(&tab.rascunho)
+    resize(&tab.rascunho, palavras as int)
+    let nl_pal: u64 = (f.nl as u64) * (f.pal as u64)
+    let pal: u64 = f.pal as u64
+    f.conj = tab.rascunho[0..<nl_pal]
+    f.v = tab.rascunho[nl_pal..<(nl_pal + pal)]
+    f.p = tab.rascunho[(nl_pal + pal)..<(nl_pal + (2 * pal))]
+    f.locais = arena_fatia_fuga_local(s.arena as ^common.Arena, f.nl as int)
+    f.prov = make([dynamic]FugaProv, alloc = heap)
+    sem_entrar_na_decl(s, d) // IA1-L8: os nomes de proc chamados no corpo se resolvem no modulo dele (fuga_resultado_da_chamada, resolver_alvo)
+    for i in (0 as u32)..<d.nparams {
+        let param: frontend.Param = (d.params or_else {})[i]
+        declarar(f, i as i32, param.nome, param.pos, param.tipo.tipo)
+        if f.locais[i].rastreado {
+            fuga_ligar(fuga_conj_de(f, i), fuga_bit_param(f, i))
+        }
+    }
+}
+
+// C: semantic/sem_fuga.c:290
+proc sem_fuga_proc(s: ^Semantica, d: ^frontend.Decl, tab: ^FugaTabela, silencioso: bool) -> bool {
+    var f: Fuga = Fuga{}
+    fuga_iniciar(&f, s, d, tab)
+    f.silencioso = silencioso
+    var ok: bool = true
+    while true {
+        f.mudou = false
+        f.laco = false
+        ok = fuga_bloco(&f, d.corpo)
+        if not (((common.c2f_b2i32(ok) != 0) and (common.c2f_b2i32(f.mudou) != 0)) and (common.c2f_b2i32(f.laco) != 0)) {
+            break
+        }
+    }
+    delete(f.prov)
+    return (common.c2f_b2i32(ok) != 0) and (not ((common.c2f_b2i32(silencioso) != 0) and (common.c2f_b2i32(f.candidato) != 0)))
+}
+
+// ---------------------------------------------------------------- G3 S6: cenario de teste montado a mao (arena, interner, tipos, fonte, diag)
+
+struct S6Cen {
+    arena: common.Arena
+    nomes: common.Interner
+    dims: DimTabela
+    fonte: common.Fonte
+    diag: common.Diag
+    s: Semantica
+}
+
+proc s6_cen_novo(texto: str) -> ^S6Cen {
+    let c = new(S6Cen, alloc = heap)
+    common.interner_iniciar(&c.nomes, &c.arena)
+    dim_iniciar(&c.dims)
+    c.fonte = sem_allocator_teste_fonte(texto)
+    c.fonte.tam = len(texto) as u64
+    c.s.arena = &c.arena
+    c.s.nomes = slice_from(&c.nomes, len = 1)
+    c.s.fonte = &c.fonte
+    c.s.diag = &c.diag
+    tipos_iniciar(&c.s.tipos, &c.nomes, &c.dims)
+    c.s.globais = arena_fatia_simbolo(&c.arena, 64)
+    c.s.rastreados = make([dynamic]LocalRastreado, alloc = heap)
+    return c
+}
+
+proc s6_cen_liberar(c: ^S6Cen) {
+    delete(c.s.rastreados)
+    tipos_liberar(&c.s.tipos)
+    dim_liberar(&c.dims)
+    common.interner_liberar(&c.nomes)
+    common.arena_liberar(&c.arena)
+    delete(c.fonte.dono_texto)
+    delete(c)
+}
+
+proc s6_nome(c: ^S6Cen, texto: str) -> i32 {
+    return common.internar(&c.nomes, texto, len(texto) as u32)
+}
+
+proc s6_ex_nome(s: ^Semantica, nome: i32, id: i32, tipo: u32, pos: u32) -> ^frontend.Expr {
+    let e = s4_novo_expr(s)
+    e.tipo_no = frontend.EX_NOME as u8
+    e.ref = frontend.REF_LOCAL as u8
+    e.ref_id = id
+    e.nome = nome
+    e.tipo = tipo
+    e.pos = pos
+    e.pos_op = pos
+    return e
+}
+
+proc s6_ex_unario(s: ^Semantica, op: i32, a: ^frontend.Expr, tipo: u32, pos: u32) -> ^frontend.Expr {
+    let e = s4_novo_expr(s)
+    e.tipo_no = frontend.EX_UNARIO as u8
+    e.op = op as u8
+    e.a = a
+    e.tipo = tipo
+    e.pos = pos
+    e.pos_op = pos
+    return e
+}
+
+proc s6_st(s: ^Semantica, tipo_no: i32, pos: u32) -> ^frontend.Stmt {
+    let st = s6_novo_stmt(s)
+    st.tipo_no = tipo_no as u8
+    st.pos = pos
+    return st
+}
+
+// let/var local_id nome tipo_local = expr
+proc s6_st_local(s: ^Semantica, tipo_no: i32, pos: u32, nome: i32, id: i32, tipo: u32, valor: ?^frontend.Expr) -> ^frontend.Stmt {
+    let st = s6_st(s, tipo_no, pos)
+    st.nome = nome
+    st.local_id = id
+    st.tipo_local = tipo
+    st.expr = valor
+    return st
+}
+
+proc s6_ex_int(s: ^Semantica, pos: u32) -> ^frontend.Expr {
+    let e = s4_novo_expr(s)
+    e.tipo_no = frontend.EX_INT as u8
+    e.tipo = TIPO_INT as u32
+    e.pos = pos
+    e.pos_op = pos
+    return e
+}
+
+// a[b] (sem argumentos nomeados)
+proc s6_ex_indice(s: ^Semantica, a: ^frontend.Expr, b: ^frontend.Expr, tipo: u32, pos: u32) -> ^frontend.Expr {
+    let e = s4_novo_expr(s)
+    e.tipo_no = frontend.EX_INDICE as u8
+    e.a = a
+    e.b = b
+    e.tipo = tipo
+    e.pos = pos
+    e.pos_op = pos
+    return e
+}
+
+// chamada de embutido com 2 argumentos posicionais (indice 0 e 1): append(&l, item = v), insert(...), remove(...)
+proc s6_ex_embutido2(s: ^Semantica, ref_id: i32, nome: i32, pos: u32, arg0: ^frontend.Expr, arg1: ^frontend.Expr) -> ^frontend.Expr {
+    let e = s4_novo_expr(s)
+    e.tipo_no = frontend.EX_CHAMADA as u8
+    e.ref = frontend.REF_EMBUTIDO as u8
+    e.ref_id = ref_id
+    e.nome = nome
+    e.pos = pos
+    e.pos_op = pos
+    e.nargs = 2
+    let args: []frontend.Arg = frontend.arena_fatia_arg(s.arena as ^common.Arena, 2)
+    args[0] = frontend.Arg{nome = -1, valor = arg0, indice = 0}
+    args[1] = frontend.Arg{nome = -1, valor = arg1, indice = 1}
+    e.args = args
+    return e
+}
+
+// proc/test com `n` locais e a tabela de nomes (nome_do_local do emprestimo e a cadeia da fuga leem dela)
+proc s6_decl_proc(s: ^Semantica, nome: i32, nomes_locais: []i32, nparams: u32, corpo: ?^frontend.Stmt) -> ^frontend.Decl {
+    let d = s4_novo_decl(s)
+    d.tipo_no = frontend.D_PROC as u8
+    d.nome = nome
+    d.nlocais = len(nomes_locais) as u32
+    d.nparams = nparams
+    d.corpo = corpo
+    let tabela: []frontend.LocalNome = frontend.arena_fatia_local_nome(s.arena as ^common.Arena, len(nomes_locais))
+    for i in 0..<len(nomes_locais) {
+        tabela[i].nome = nomes_locais[i]
+    }
+    d.nomes_locais = tabela
+    return d
+}
+
+// G3 S6: E0706 de ponta a ponta (fuga_iniciar, fuga_bloco, let, return, sumidouro, cadeia, relato). O texto, a cadeia e as posicoes
+// sao os do forja.exe real (C) para `proc f() -> ^int { var x: int = 1  let p = &x  return p }` (forja check: E0706 4:12).
+test "sem_fuga: E0706 var x / let p = &x / return p (cadeia x -> p -> return)" {
+    let c = s6_cen_novo("proc f() -> ^int {\n    var x: int = 1\n    let p = &x\n    return p\n}\n")
+    defer s6_cen_liberar(c)
+    let s: ^Semantica = &c.s
+    let n_f = s6_nome(c, "f")
+    let n_x = s6_nome(c, "x")
+    let n_p = s6_nome(c, "p")
+    let t_ptr: u32 = tipo_ponteiro(&s.tipos, TIPO_INT as u32)
+    let lit = s4_novo_expr(s)
+    lit.tipo_no = frontend.EX_INT as u8
+    lit.tipo = TIPO_INT as u32
+    let s_var = s6_st_local(s, frontend.ST_VAR, 23, n_x, 0, TIPO_INT as u32, lit)
+    let end_x = s6_ex_unario(s, frontend.OP_ENDERECO, s6_ex_nome(s, n_x, 0, TIPO_INT as u32, 51), t_ptr, 50)
+    let s_let = s6_st_local(s, frontend.ST_LET, 42, n_p, 1, t_ptr, end_x)
+    let s_ret = s6_st_local(s, frontend.ST_RETURN, 57, 0, 0, 0, s6_ex_nome(s, n_p, 1, t_ptr, 64))
+    s_var.prox = s_let
+    s_let.prox = s_ret
+    let d = s4_novo_decl(s)
+    d.tipo_no = frontend.D_PROC as u8
+    d.nome = n_f
+    d.nlocais = 2
+    d.corpo = s_var
+    var tab: FugaTabela = FugaTabela{}
+    tab.rascunho = make([dynamic]u64, alloc = heap)
+    defer delete(tab.rascunho)
+    // volta silenciosa: so detecta (candidato), nao relata
+    expect(not sem_fuga_proc(s, d, &tab, true))
+    expect(not c.diag.tem)
+    // volta que relata
+    expect(not sem_fuga_proc(s, d, &tab, false))
+    expect(c.diag.tem and c.diag.codigo == common.E0706 and c.diag.off == 64)
+    expect((c.diag.causa or_else "") == "'x' e local de 'f' e o endereco sai por return: x -> p -> return")
+    expect((c.diag.extras or_else "") == "\"cadeia\": [\"x (local, 2:9)\", \"p (3:9)\", \"return (4:5)\"]")
+}
+
+// parametros `nomes` todos do mesmo tipo (a fatia sai da arena)
+proc s6_params(s: ^Semantica, nomes: []i32, tipo: u32) -> []frontend.Param {
+    var l = make([dynamic]frontend.Param, alloc = common.arena_mem(s.arena as ^common.Arena), cap = len(nomes))
+    for i in 0..<len(nomes) {
+        append(&l, item = frontend.Param{nome = nomes[i], pos = (7 + (9 * i)) as u32, tipo = frontend.TipoRef{tipo = tipo}})
+    }
+    return l[..]
+}
+
+// proc g(a: ^int, b: ^int) com locais a, b, x, y (nlocais 4, nparams 2): bits LOCAL 0..3, PARAM 4..5, flags 6..9 (GLOBAL 6, HEAP 7, FOREIGN 8, DESC 9)
+proc s6_decl_g(c: ^S6Cen) -> ^frontend.Decl {
+    let s: ^Semantica = &c.s
+    let t_p: u32 = tipo_ponteiro(&s.tipos, TIPO_INT as u32)
+    var nl: [4]i32 = {s6_nome(c, "a"), s6_nome(c, "b"), s6_nome(c, "x"), s6_nome(c, "y")}
+    let d = s6_decl_proc(s, s6_nome(c, "g"), nl[..], 2, none)
+    d.params = s6_params(s, nl[0..<2], t_p)
+    return d
+}
+
+test "sem_fuga: bitset do conjunto (ligar/tem/flag/zerar), primeiro_local, mascaras, unir_em com procedencia, declarar" {
+    let c = s6_cen_novo("proc g(a: ^int, b: ^int) {}\n")
+    defer s6_cen_liberar(c)
+    let s: ^Semantica = &c.s
+    let d = s6_decl_g(c)
+    var tab: FugaTabela = FugaTabela{}
+    tab.rascunho = make([dynamic]u64, alloc = heap)
+    defer delete(tab.rascunho)
+    var f: Fuga = Fuga{}
+    fuga_iniciar(&f, s, d, &tab)
+    defer delete(f.prov)
+    expect(f.nl == 4 and f.np == 2 and f.pal == 1)
+    expect(fuga_bit_param(&f, 1) == 5 and fuga_bit_flag(&f, FUGA_GLOBAL) == 6 and fuga_bit_flag(&f, FUGA_HEAP) == 7 and fuga_bit_flag(&f, FUGA_DESC) == 9)
+    // cada parametro rastreado (^int) nasce ligado ao proprio bit PARAM
+    expect(f.locais[0].rastreado and f.locais[1].rastreado and not f.locais[2].rastreado)
+    expect(fuga_tem(fuga_conj_de(&f, 0), 4) and fuga_tem(fuga_conj_de(&f, 1), 5) and not fuga_tem(fuga_conj_de(&f, 0), 5))
+    let v = f.v
+    fuga_zerar(&f, v)
+    fuga_ligar(v, 2)
+    fuga_ligar_flag(&f, v, FUGA_HEAP)
+    fuga_ligar(v, fuga_bit_param(&f, 1))
+    expect(fuga_tem(v, 2) and fuga_tem(v, 7) and fuga_tem(v, 5) and not fuga_tem(v, 3) and not fuga_tem(v, 6))
+    expect(fuga_primeiro_local(&f, v) == 2)
+    expect(fuga_mascara_params(&f, v) == 2) // so o parametro 1
+    expect(fuga_mascara_flags(&f, v) == 2) // so FUGA_HEAP (1 << 1)
+    // procedencia: unir v em y(3) registra o LOCAL x(2) (bits >= nl nao entram na procedencia)
+    f.mudou = false
+    fuga_unir_em(&f, 3, v, none)
+    expect(f.mudou)
+    expect(fuga_tem(fuga_conj_de(&f, 3), 2) and fuga_tem(fuga_conj_de(&f, 3), 5) and fuga_tem(fuga_conj_de(&f, 3), 7))
+    expect(len(f.prov) == 1 and f.prov[0].var_c == 3 and f.prov[0].bit == 2 and f.prov[0].de == -1)
+    f.mudou = false
+    fuga_unir_em(&f, 3, v, none)
+    expect(not f.mudou and len(f.prov) == 1) // nada novo: nem muda nem registra
+    f.silencioso = true
+    fuga_unir_em(&f, 2, v, none)
+    expect(fuga_tem(fuga_conj_de(&f, 2), 2) and len(f.prov) == 1) // volta silenciosa nao registra procedencia
+    fuga_zerar(&f, v)
+    fuga_ligar(v, 5)
+    expect(fuga_primeiro_local(&f, v) == -1) // so bit de parametro: nenhum local
+    fuga_zerar(&f, v)
+    expect(not fuga_tem(v, 2) and not fuga_tem(v, 7))
+    // declarar: rastreado so com tipo que tem ponteiro; id fora da faixa e ignorado
+    declarar(&f, 2, s6_nome(c, "x"), 9, tipo_ponteiro(&s.tipos, TIPO_INT as u32))
+    expect(rastreado(&f, 2) and f.locais[2].pos == 9)
+    declarar(&f, 3, s6_nome(c, "y"), 11, TIPO_INT as u32)
+    expect(not rastreado(&f, 3))
+    declarar(&f, 99, s6_nome(c, "z"), 13, tipo_ponteiro(&s.tipos, TIPO_INT as u32))
+    expect(not rastreado(&f, 99) and not rastreado(&f, -1))
+}

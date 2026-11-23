@@ -1,0 +1,356 @@
+// semantic/sem_posse_handle.fj - porte de compiler/semantic/sem_posse_handle.c
+// sha256 de semantic/sem_posse_handle.c: d910b3bea9b89676489e052caeecc538f97ab71946869c78ab509603dc8ec5bd
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "common"
+import "frontend"
+
+// C: semantic/sem_posse_handle.c:14
+proc decl_da_chamada(s: ^Semantica, e: ?^frontend.Expr) -> ?^frontend.Decl {
+    var e_v: ?^frontend.Expr = e
+    if ((e_v as ^frontend.Expr).tipo_no == (frontend.EX_EMBRULHA as u8)) or ((e_v as ^frontend.Expr).tipo_no == (frontend.EX_TRY as u8)) {
+        e_v = (e_v as ^frontend.Expr).a
+    }
+    if ((e_v as ^frontend.Expr).tipo_no != (frontend.EX_CHAMADA as u8)) or ((e_v as ^frontend.Expr).ref != (frontend.REF_PROC as u8)) {
+        return none
+    }
+    let y: ?^Simbolo = sem_achar_simbolo(s, (e_v as ^frontend.Expr).nome, (e_v as ^frontend.Expr).modulo)
+    var tern_1: ?^frontend.Decl = (y as ^Simbolo).decl
+    if y == none {
+        tern_1 = none
+    }
+    return tern_1
+}
+
+// C: semantic/sem_posse_handle.c:23
+proc base_do_handle(s: ^Semantica, t: u32) -> u32 {
+    var t_v: u32 = t
+    while true {
+        let classe: i32 = tipo_classe_de(&s.tipos, t_v)
+        if (common.c2f_s2u_32(classe) != (TC_PONTEIRO as u32)) and (common.c2f_s2u_32(classe) != (TC_ANULAVEL as u32)) {
+            return t_v
+        }
+        t_v = tipo_de(&s.tipos, t_v).a
+    }
+    return 0
+}
+
+// C: semantic/sem_posse_handle.c:33
+pub proc sem_destruidor_do_tipo(s: ^Semantica, tipo: u32) -> ?^frontend.Decl {
+    let base: u32 = base_do_handle(s, tipo)
+    var d: ?^frontend.Decl = (s.programa as ^frontend.Programa).primeira
+    while d != none {
+        if ((d as ^frontend.Decl).tipo_no != (frontend.D_PROC as u8)) or ((d as ^frontend.Decl).posse_c != (frontend.POSSE_C_DESTROI as u8)) {
+            d = (d as ^frontend.Decl).prox
+            continue
+        }
+        if base_do_handle(s, ((d as ^frontend.Decl).params or_else {})[(d as ^frontend.Decl).posse_param].tipo.tipo) == base {
+            return d
+        }
+        d = (d as ^frontend.Decl).prox
+    }
+    return none
+}
+
+// C: semantic/sem_posse_handle.c:43
+proc sem_entrega_do_argumento(proc_c: ?^frontend.Decl, indice: i32) -> bool {
+    return (((proc_c as ^frontend.Decl).posse_c == (frontend.POSSE_C_DESTROI as u8)) or ((proc_c as ^frontend.Decl).posse_c == (frontend.POSSE_C_ENTREGA as u8))) and (indice == ((proc_c as ^frontend.Decl).posse_param as i32))
+}
+
+// C: semantic/sem_posse_handle.c:49
+proc sem_erro_do_handle_vivo(s: ^Semantica, r: ^LocalRastreado, pos: u32, saida: bool) -> bool {
+    let nome: str = sem_nome_texto(s, r.nome)
+    let destruidor: ?^frontend.Decl = sem_destruidor_do_tipo(s, r.tipo)
+    var buf_forma: [160]u8 = {} // C: char forma[160] (corte em 159, como o snprintf)
+    if r.de_chamada != 0 {
+        _ = common.c2f_snprintf(buf_forma[..], "feche no proc que abriu ou guarde-o num campo")
+    } else if destruidor != none {
+        let msg_1 = format(f"defer {sem_nome_texto(s, (destruidor as ^frontend.Decl).nome)}({nome}) logo depois do let", alloc = heap)
+        defer delete(msg_1)
+        _ = common.c2f_snprintf(buf_forma[..], msg_1)
+    } else {
+        let msg_2 = format(f"chame o proc da lib que fecha o handle de '{nome}' (destroys) logo depois do let", alloc = heap)
+        defer delete(msg_2)
+        _ = common.c2f_snprintf(buf_forma[..], msg_2)
+    }
+    var situacao: str = "esta saida (return, break ou continue) o deixa aberto"
+    if not saida {
+        situacao = "nao e fechado nem entregue ate o fim do bloco"
+    }
+    if r.de_chamada != 0 {
+        let msg_3 = format(f"'{nome}' guarda um handle de lib C que foi passado a um proc da Forja e {situacao}: a posse nao atravessa procs; feche onde abriu ou guarde-o num campo", alloc = heap)
+        defer delete(msg_3)
+        _ = sem_erro(s, common.E0317, pos, msg_3)
+    } else {
+        let msg_4 = format(f"'{nome}' guarda um handle de lib C que {situacao}: feche (destroys), entregue (takes, return, campo) ou use defer", alloc = heap)
+        defer delete(msg_4)
+        _ = sem_erro(s, common.E0317, pos, msg_4)
+    }
+    if ((s.diag as ^common.Diag).tem) and ((s.diag as ^common.Diag).codigo == common.E0317) {
+        let forma: str = from_bytes(buf_forma[0..<common.c2f_strlen_b(buf_forma[..])], alloc = heap)
+        defer delete(forma)
+        common.diag_forma(s.diag as ^common.Diag, none, forma)
+    }
+    return false
+}
+
+// C: semantic/sem_posse_handle.c:72
+proc sem_let_cria_handle(s: ^Semantica, st: ^frontend.Stmt) -> bool {
+    let proc_c: ?^frontend.Decl = decl_da_chamada(s, st.expr)
+    return (proc_c != none) and ((proc_c as ^frontend.Decl).posse_c == (frontend.POSSE_C_CRIA_RETORNO as u8))
+}
+
+// C: semantic/sem_posse_handle.c:79
+proc erro_handle_ainda_aberto(s: ^Semantica, pos: u32, r: ?^LocalRastreado) -> bool {
+    let msg_1 = format(f"'{sem_nome_texto(s, (r as ^LocalRastreado).nome)}' ainda guarda um handle de lib C aberto: feche (destroys) ou entregue antes de reatribuir", alloc = heap)
+    defer delete(msg_1)
+    return sem_erro(s, common.E0317, pos, msg_1)
+}
+
+// C: semantic/sem_posse_handle.c:85
+proc sem_handle_da_saida(s: ^Semantica, chamada: ^frontend.Expr, proc_c: ?^frontend.Decl) -> bool {
+    var valor: ?^frontend.Expr = none
+    for k in (0 as u32)..<chamada.nargs {
+        if (chamada.args or_else {})[k].indice == ((proc_c as ^frontend.Decl).posse_param as i32) {
+            valor = (chamada.args or_else {})[k].valor
+        }
+    }
+    if valor == none {
+        return true
+    }
+    var tern_1: ?^frontend.Expr = none
+    if ((valor as ^frontend.Expr).tipo_no == (frontend.EX_UNARIO as u8)) and ((valor as ^frontend.Expr).op == (frontend.OP_ENDERECO as u8)) {
+        tern_1 = (valor as ^frontend.Expr).a
+    }
+    let local: ?^frontend.Expr = tern_1
+    if (((local == none) or ((local as ^frontend.Expr).tipo_no != (frontend.EX_NOME as u8))) or ((local as ^frontend.Expr).ref != (frontend.REF_LOCAL as u8))) or ((local as ^frontend.Expr).modulo != 0) {
+        let msg_1 = format(f"o handle criado por '{sem_nome_texto(s, (proc_c as ^frontend.Decl).nome)}' vai para um local: &h", alloc = heap)
+        defer delete(msg_1)
+        return sem_erro(s, common.E0912, (valor as ^frontend.Expr).pos, msg_1)
+    }
+    var r: ?^LocalRastreado = sem_achar_rastreado(s, local)
+    if r != none {
+        if ((r as ^LocalRastreado).origem == (ALOC_HANDLE as u8)) and ((r as ^LocalRastreado).estado == (POSSE_VIVO as u8)) {
+            return erro_handle_ainda_aberto(s, (local as ^frontend.Expr).pos, r)
+        }
+        let ptr_1: ^LocalRastreado = r as ^LocalRastreado
+        ptr_1.estado = POSSE_VIVO as u8
+        return true
+    }
+    append(&s.rastreados, item = LocalRastreado{})
+    r = &s.rastreados[len(s.rastreados) - 1]
+    let p_1 = r as ^LocalRastreado
+    p_1^ = LocalRastreado{local_id = (local as ^frontend.Expr).ref_id, nome = (local as ^frontend.Expr).nome, pos = (local as ^frontend.Expr).pos, tipo = (local as ^frontend.Expr).tipo, origem = ALOC_HANDLE as u8, estado = POSSE_VIVO as u8, de_chamada = 0}
+    return true
+}
+
+// C: semantic/sem_posse_handle.c:108
+proc sem_posse_do_handle(s: ^Semantica, e: ?^frontend.Expr, r: ?^LocalRastreado, ponto: i32) -> bool {
+    if common.c2f_s2u_32(ponto) == (PONTO_COPIA as u32) {
+        let nome: str = sem_nome_texto(s, (r as ^LocalRastreado).nome)
+        let msg_1 = format(f"'{nome}' e dono de um handle de lib C: copiar cria dois donos; entregue (destroys, takes, return, campo) ou passe-o a um proc que so empresta", alloc = heap)
+        defer delete(msg_1)
+        return sem_erro(s, common.E0317, (e as ^frontend.Expr).pos, msg_1)
+    }
+    if common.c2f_s2u_32(ponto) == (PONTO_EMPRESTIMO_FORJA as u32) {
+        let ptr_1: ^LocalRastreado = r as ^LocalRastreado
+        ptr_1.de_chamada = 1
+    }
+    if (common.c2f_s2u_32(ponto) == (PONTO_EMPRESTIMO as u32)) or (common.c2f_s2u_32(ponto) == (PONTO_EMPRESTIMO_FORJA as u32)) {
+        return true
+    }
+    let ptr_2: ^LocalRastreado = r as ^LocalRastreado
+    ptr_2.estado = POSSE_ENTREGUE as u8
+    return true
+}
+
+// C: semantic/sem_posse_handle.c:121
+proc sem_reatribuicao_do_handle(s: ^Semantica, st: ^frontend.Stmt, r: ?^LocalRastreado) -> bool {
+    if (r as ^LocalRastreado).estado == (POSSE_VIVO as u8) {
+        return erro_handle_ainda_aberto(s, (st.alvo as ^frontend.Expr).pos, r)
+    }
+    let proc_c: ?^frontend.Decl = decl_da_chamada(s, st.expr)
+    if (proc_c != none) and ((proc_c as ^frontend.Decl).posse_c == (frontend.POSSE_C_CRIA_RETORNO as u8)) {
+        let ptr_1: ^LocalRastreado = r as ^LocalRastreado
+        ptr_1.estado = POSSE_VIVO as u8
+    }
+    return true
+}
+
+// C: semantic/sem_posse_handle.c:132
+proc eh_zero_literal(s: ^Semantica, e: ?^frontend.Expr) -> bool {
+    return (((e as ^frontend.Expr).tipo_no == (frontend.EX_INT as u8)) and ((e as ^frontend.Expr).op == 1)) and ((s.fonte as ^common.Fonte).texto[(e as ^frontend.Expr).pos_op] == 48) // '0'
+}
+
+// C: semantic/sem_posse_handle.c:138
+proc sem_guarda_none_abrir(s: ^Semantica, cond: ?^frontend.Expr) -> i32 {
+    if ((cond as ^frontend.Expr).tipo_no != (frontend.EX_BINARIO as u8)) or ((cond as ^frontend.Expr).op != (frontend.OP_IGUAL as u8)) {
+        return -1
+    }
+    var tern_1: ?^frontend.Expr = (cond as ^frontend.Expr).a
+    if ((cond as ^frontend.Expr).a as ^frontend.Expr).tipo_no == (frontend.EX_EMBRULHA as u8) {
+        tern_1 = ((cond as ^frontend.Expr).a as ^frontend.Expr).a
+    }
+    let lado: ?^frontend.Expr = tern_1
+    var tern_2: ?^frontend.Expr = (cond as ^frontend.Expr).b
+    if ((cond as ^frontend.Expr).b as ^frontend.Expr).tipo_no == (frontend.EX_EMBRULHA as u8) {
+        tern_2 = ((cond as ^frontend.Expr).b as ^frontend.Expr).a
+    }
+    let nada: ?^frontend.Expr = tern_2
+    let r: ?^LocalRastreado = sem_achar_rastreado(s, lado)
+    if ((r == none) or ((r as ^LocalRastreado).origem != (ALOC_HANDLE as u8))) or ((r as ^LocalRastreado).estado != (POSSE_VIVO as u8)) {
+        return -1
+    }
+    let zero_de_inteiro: bool = (common.c2f_b2i32(tipo_eh_inteiro((r as ^LocalRastreado).tipo)) != 0) and (common.c2f_b2i32(eh_zero_literal(s, nada)) != 0)
+    if ((nada as ^frontend.Expr).tipo_no != (frontend.EX_NONE as u8)) and (not zero_de_inteiro) {
+        return -1
+    }
+    let ptr_1: ^LocalRastreado = r as ^LocalRastreado
+    ptr_1.estado = POSSE_GUARDADO as u8
+    return (r as ^LocalRastreado).local_id
+}
+
+// C: semantic/sem_posse_handle.c:152
+proc sem_guarda_none_fechar(s: ^Semantica, local_id: i32) {
+    var k: u64 = len(s.rastreados) as u64
+    while k > 0 {
+        let r: ^LocalRastreado = &s.rastreados[k - 1]
+        if r.local_id != local_id {
+            k -= 1
+            continue
+        }
+        if r.estado == (POSSE_GUARDADO as u8) {
+            r.estado = POSSE_VIVO as u8
+        }
+        return
+    }
+}
+
+// ---------------------------------------------------------------- G3 S6: testes de handle de lib C (textos = saida real do forja.exe em tests\semantica\err_handle_*)
+
+test "sem_posse_handle: sem_erro_do_handle_vivo (sem/com destruidor, de chamada, fim do bloco x saida) e erro_handle_ainda_aberto" {
+    let c = s6_cen_novo("proc f() {\n    let h = abre()\n}\n")
+    defer s6_cen_liberar(c)
+    let s: ^Semantica = &c.s
+    var lista_prog = make([dynamic]frontend.Programa, alloc = common.arena_mem(s.arena as ^common.Arena), cap = 1) // na arena: o endereco de um local iria para o heap (E0706)
+    append(&lista_prog, item = frontend.Programa{})
+    let fatia_prog = lista_prog[..]
+    let prog: ^frontend.Programa = &fatia_prog[0]
+    s.programa = prog
+    s6_rastr(c, "h", 20, ALOC_HANDLE, POSSE_VIVO, 0)
+    let r: ^LocalRastreado = &s.rastreados[0]
+    // sem destruidor (err_handle_int_esquecido)
+    expect(not sem_erro_do_handle_vivo(s, r, 20, false))
+    expect(c.diag.tem and c.diag.codigo == common.E0317 and c.diag.off == 20)
+    expect((c.diag.causa or_else "") == "'h' guarda um handle de lib C que nao e fechado nem entregue ate o fim do bloco: feche (destroys), entregue (takes, return, campo) ou use defer")
+    expect((c.diag.forma or_else "") == "chame o proc da lib que fecha o handle de 'h' (destroys) logo depois do let")
+    // saida (err_handle_return_vivo)
+    expect(not sem_erro_do_handle_vivo(s, r, 44, true))
+    expect(c.diag.off == 44)
+    expect((c.diag.causa or_else "") == "'h' guarda um handle de lib C que esta saida (return, break ou continue) o deixa aberto: feche (destroys), entregue (takes, return, campo) ou use defer")
+    // handle que passou por proc da Forja (err_handle_proc_forja_fecha)
+    r.de_chamada = 1
+    expect(not sem_erro_do_handle_vivo(s, r, 20, false))
+    expect((c.diag.causa or_else "") == "'h' guarda um handle de lib C que foi passado a um proc da Forja e nao e fechado nem entregue ate o fim do bloco: a posse nao atravessa procs; feche onde abriu ou guarde-o num campo")
+    expect((c.diag.forma or_else "") == "feche no proc que abriu ou guarde-o num campo")
+    expect(not sem_erro_do_handle_vivo(s, r, 44, true))
+    expect((c.diag.causa or_else "") == "'h' guarda um handle de lib C que foi passado a um proc da Forja e esta saida (return, break ou continue) o deixa aberto: a posse nao atravessa procs; feche onde abriu ou guarde-o num campo")
+    // com destruidor da lib (err_handle_esquecido): defer <destruidor>(h)
+    r.de_chamada = 0
+    let fecha = s4_novo_decl(s)
+    fecha.tipo_no = frontend.D_PROC as u8
+    fecha.nome = s6_nome(c, "fclose_c")
+    fecha.posse_c = frontend.POSSE_C_DESTROI as u8
+    fecha.posse_param = 0
+    var um: [1]i32 = {s6_nome(c, "f")}
+    fecha.params = s6_params(s, um[..], TIPO_INT as u32)
+    fecha.nparams = 1
+    prog.primeira = fecha
+    prog.ultima = fecha
+    expect(not sem_erro_do_handle_vivo(s, r, 20, false))
+    expect((c.diag.forma or_else "") == "defer fclose_c(h) logo depois do let")
+    expect((sem_destruidor_do_tipo(s, TIPO_INT as u32) as ^frontend.Decl).nome == fecha.nome)
+    expect(sem_destruidor_do_tipo(s, TIPO_BOOL as u32) == none)
+    // o fim do bloco usa a posse do let e a forma de "nao e fechado"
+    expect(not sem_conferir_fim_do_bloco(s, 0))
+    expect(c.diag.off == 20 and (c.diag.causa or_else "") == "'h' guarda um handle de lib C que nao e fechado nem entregue ate o fim do bloco: feche (destroys), entregue (takes, return, campo) ou use defer")
+    // erro_handle_ainda_aberto
+    expect(not erro_handle_ainda_aberto(s, 33, r))
+    expect(c.diag.off == 33 and c.diag.codigo == common.E0317)
+    expect((c.diag.causa or_else "") == "'h' ainda guarda um handle de lib C aberto: feche (destroys) ou entregue antes de reatribuir")
+}
+
+test "sem_posse_handle: sem_reatribuicao_do_handle (vivo = E0317; entregue + chamada que cria = vivo de novo)" {
+    let c = s6_cen_novo("proc f() {\n    h = abre()\n}\n")
+    defer s6_cen_liberar(c)
+    let s: ^Semantica = &c.s
+    s6_rastr(c, "h", 20, ALOC_HANDLE, POSSE_VIVO, 0)
+    let r: ^LocalRastreado = &s.rastreados[0]
+    let abre = s4_novo_decl(s)
+    abre.tipo_no = frontend.D_PROC as u8
+    abre.posse_c = frontend.POSSE_C_CRIA_RETORNO as u8
+    let outra = s4_novo_decl(s)
+    outra.tipo_no = frontend.D_PROC as u8
+    let globais: []Simbolo = s.globais or_else {}
+    globais[s6_nome(c, "abre")].decl = abre
+    globais[s6_nome(c, "outra")].decl = outra
+    let chama_abre = s4_novo_expr(s)
+    chama_abre.tipo_no = frontend.EX_CHAMADA as u8
+    chama_abre.ref = frontend.REF_PROC as u8
+    chama_abre.nome = s6_nome(c, "abre")
+    let chama_outra = s4_novo_expr(s)
+    chama_outra.tipo_no = frontend.EX_CHAMADA as u8
+    chama_outra.ref = frontend.REF_PROC as u8
+    chama_outra.nome = s6_nome(c, "outra")
+    let st = s6_st(s, frontend.ST_ATRIBUICAO, 15)
+    st.alvo = s6_ex_nome(s, s6_nome(c, "h"), 0, TIPO_INT as u32, 15)
+    st.expr = chama_abre
+    expect(not sem_reatribuicao_do_handle(s, st, r)) // handle vivo: nao reatribui sem fechar
+    expect(c.diag.off == 15 and (c.diag.causa or_else "") == "'h' ainda guarda um handle de lib C aberto: feche (destroys) ou entregue antes de reatribuir")
+    r.estado = POSSE_ENTREGUE as u8
+    expect(sem_reatribuicao_do_handle(s, st, r) and r.estado == (POSSE_VIVO as u8)) // recebeu um handle novo
+    r.estado = POSSE_LIBERADO as u8
+    st.expr = chama_outra
+    expect(sem_reatribuicao_do_handle(s, st, r) and r.estado == (POSSE_LIBERADO as u8)) // proc que nao cria: segue como estava
+}
+
+test "sem_posse_handle: guarda `h == none` / `h == 0` (abrir marca GUARDADO e devolve o local; fechar devolve VIVO)" {
+    let c = s6_cen_novo("if h == 0 {}\n")
+    defer s6_cen_liberar(c)
+    let s: ^Semantica = &c.s
+    s6_rastr(c, "h", 3, ALOC_HANDLE, POSSE_VIVO, 0)
+    s6_rastr(c, "k", 4, frontend.ALOC_HEAP, POSSE_VIVO, 0)
+    let nome_h = s6_ex_nome(s, s6_nome(c, "h"), 0, TIPO_INT as u32, 3)
+    let nome_k = s6_ex_nome(s, s6_nome(c, "k"), 1, TIPO_INT as u32, 3)
+    let nada = s6_ex_gen(s, frontend.EX_NONE, none, none, TIPO_INT as u32)
+    let zero = s6_ex_int(s, 8)
+    zero.op = 1
+    zero.pos_op = 8
+    let um = s6_ex_int(s, 8)
+    um.op = 1
+    um.pos_op = 5 // o texto nesse offset e '=' e nao '0'
+    let igual = s6_ex_gen(s, frontend.EX_BINARIO, nome_h, nada, TIPO_INT as u32)
+    igual.op = frontend.OP_IGUAL as u8
+    // handle vivo com `== none`: abre
+    expect(sem_guarda_none_abrir(s, igual) == 0 and s.rastreados[0].estado == (POSSE_GUARDADO as u8))
+    expect(sem_guarda_none_abrir(s, igual) == -1) // ja nao esta vivo
+    sem_guarda_none_fechar(s, 0)
+    expect(s.rastreados[0].estado == (POSSE_VIVO as u8))
+    sem_guarda_none_fechar(s, 0) // nao guardado: fica
+    expect(s.rastreados[0].estado == (POSSE_VIVO as u8))
+    // handle inteiro: `== 0` literal serve; outro literal nao
+    igual.b = zero
+    expect(sem_guarda_none_abrir(s, igual) == 0)
+    sem_guarda_none_fechar(s, 0)
+    igual.b = um
+    expect(sem_guarda_none_abrir(s, igual) == -1 and s.rastreados[0].estado == (POSSE_VIVO as u8))
+    // so igualdade; so handle (heap nao conta)
+    igual.b = nada
+    igual.op = frontend.OP_DIFERENTE as u8
+    expect(sem_guarda_none_abrir(s, igual) == -1)
+    igual.op = frontend.OP_IGUAL as u8
+    igual.a = nome_k
+    expect(sem_guarda_none_abrir(s, igual) == -1)
+    expect(sem_guarda_none_abrir(s, nome_h) == -1) // nao e comparacao
+}

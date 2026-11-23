@@ -1,0 +1,328 @@
+// backend/interface_dll.fj - porte de compiler/backend/interface_dll.c, compiler/backend/interface_dll.h
+// sha256 de backend/interface_dll.c: cefbf82611b7a7a220ef4b9e7ccb9c5f194c67f3578ac195f3ff3c1f0182c85d
+// sha256 de backend/interface_dll.h: 7576913cae2a82c04fdb958a7b752ff846cd4344385c2e60e9a8c994f0a6ce31
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "common"
+import "ir"
+import "semantic"
+
+struct Interface {
+    prog: ?^ir.IrPrograma
+    tipos: ?^semantic.Tipos
+    nomes: ?^common.Interner
+    lay: ir.Layouts
+    alcancados: [dynamic]u32
+}
+
+// porte V4: o proc entra pelo indice em prog.funcoes (a ordem de declaracao do C); sem ponteiro para a lista
+struct Entrada {
+    nome: str
+    indice: u32
+    tipo: u32 // TipoId
+}
+
+const ENUM_BASE: str = "i32"
+pub const DLL_INFO_MAGIC: u32 = 1229603910
+pub const DLL_INFO_FORMATO: u32 = 1
+pub const DLL_INFO_TAM: u32 = 32
+pub const DLL_INFO_OFF_TEXTO: u32 = 16
+
+// C: backend/interface_dll.c:28
+proc achar_struct_2(x: ^Interface, tipo: u32) -> ^ir.IrStruct {
+    let nome: i32 = transmute(semantic.tipo_de(x.tipos as ^semantic.Tipos, tipo).a, to = i32)
+    for k in (0 as u32)..<(x.prog as ^ir.IrPrograma).nstructs {
+        if ((x.prog as ^ir.IrPrograma).structs or_else {})[k].nome == nome {
+            return &((x.prog as ^ir.IrPrograma).structs or_else {})[k]
+        }
+    }
+    let msg_1 = format(f"interface_dll: struct '{common.interner_texto(x.nomes as ^common.Interner, nome)}' nao esta no IR", alloc = heap)
+    defer delete(msg_1)
+    common.falha_interna(msg_1)
+    let nada: ?^ir.IrStruct = none
+    return nada as ^ir.IrStruct
+}
+
+// C: backend/interface_dll.c:39
+proc achar_enum(x: ^Interface, tipo: u32) -> ^ir.IrEnum {
+    let nome: i32 = transmute(semantic.tipo_de(x.tipos as ^semantic.Tipos, tipo).a, to = i32)
+    for k in (0 as u32)..<(x.prog as ^ir.IrPrograma).nenums {
+        if ((x.prog as ^ir.IrPrograma).enums or_else {})[k].nome == nome {
+            return &((x.prog as ^ir.IrPrograma).enums or_else {})[k]
+        }
+    }
+    let msg_1 = format(f"interface_dll: enum '{common.interner_texto(x.nomes as ^common.Interner, nome)}' nao esta no IR", alloc = heap)
+    defer delete(msg_1)
+    common.falha_interna(msg_1)
+    let nada: ?^ir.IrEnum = none
+    return nada as ^ir.IrEnum
+}
+
+// C: backend/interface_dll.c:50
+proc nome_escalar(classe: i32) -> ?str {
+    let sw_1 = common.c2f_s2u_32(classe)
+    if sw_1 == (semantic.TC_VAZIO as u32) {
+        return "void"
+    } else if sw_1 == (semantic.TC_BOOL as u32) {
+        return "bool"
+    } else if sw_1 == (semantic.TC_I8 as u32) {
+        return "i8"
+    } else if sw_1 == (semantic.TC_I16 as u32) {
+        return "i16"
+    } else if sw_1 == (semantic.TC_I32 as u32) {
+        return "i32"
+    } else if sw_1 == (semantic.TC_INT as u32) {
+        return "int"
+    } else if sw_1 == (semantic.TC_U8 as u32) {
+        return "u8"
+    } else if sw_1 == (semantic.TC_U16 as u32) {
+        return "u16"
+    } else if sw_1 == (semantic.TC_U32 as u32) {
+        return "u32"
+    } else if sw_1 == (semantic.TC_UINT as u32) {
+        return "uint"
+    } else if sw_1 == (semantic.TC_REAL as u32) {
+        return "f32"
+    } else if sw_1 == (semantic.TC_F64 as u32) {
+        return "f64"
+    } else if sw_1 == (semantic.TC_RAWPTR as u32) {
+        return "rawptr"
+    } else if sw_1 == (semantic.TC_CSTR as u32) {
+        return "cstr"
+    } else {
+        return none
+    }
+    return none
+}
+
+// C: backend/interface_dll.c:72
+proc anexar_tipo(x: ^Interface, saida: ^[dynamic]u8, tipo: u32) {
+    let tipos: ^semantic.Tipos = x.tipos as ^semantic.Tipos
+    let nomes: ^common.Interner = x.nomes as ^common.Interner
+    let info = semantic.tipo_de(tipos, tipo)
+    let classe: u32 = common.c2f_s2u_32(semantic.tipo_classe_de(tipos, tipo))
+    let escalar: ?str = nome_escalar(semantic.tipo_classe_de(tipos, tipo))
+    if escalar != none {
+        append(saida, item = escalar or_else "")
+        return
+    }
+    if common.c2f_b2i32(semantic.tipo_opcional_nicho(tipos, tipo)) != 0 {
+        append(saida, item = "?cstr")
+        return
+    }
+    if classe == (semantic.TC_STRUCT as u32) or classe == (semantic.TC_ENUM as u32) {
+        append(saida, item = common.interner_texto(nomes, info.a as i32))
+        return
+    }
+    if classe == (semantic.TC_PONTEIRO as u32) {
+        append(saida, item = "^")
+        anexar_tipo(x, saida, info.a as u32)
+        return
+    }
+    if classe == (semantic.TC_ANULAVEL as u32) {
+        append(saida, item = "?^")
+        anexar_tipo(x, saida, info.a as u32)
+        return
+    }
+    if classe == (semantic.TC_ARRAY as u32) {
+        format(f"[{info.b}]", into = saida)
+        anexar_tipo(x, saida, info.a as u32)
+        return
+    }
+    let msg_1 = format(f"interface_dll: tipo {tipo} de classe {classe} nao atravessa a ABI C (a semantica devia ter recusado, E0901)", alloc = heap)
+    defer delete(msg_1)
+    common.falha_interna(msg_1)
+}
+
+// C: backend/interface_dll.c:93
+proc ja_alcancado(x: ^Interface, tipo: u32) -> bool {
+    for k in (0 as u64)..<(len(x.alcancados) as u64) {
+        if x.alcancados[k] == tipo {
+            return true
+        }
+    }
+    return false
+}
+
+// C: backend/interface_dll.c:103
+proc alcancar(x: ^Interface, tipo: u32) {
+    let info: ^semantic.TipoInfo = semantic.tipo_de(x.tipos as ^semantic.Tipos, tipo)
+    if ((info.classe == (semantic.TC_PONTEIRO as u8)) or (info.classe == (semantic.TC_ANULAVEL as u8))) or (info.classe == (semantic.TC_ARRAY as u8)) {
+        alcancar(x, info.a)
+        return
+    }
+    if ((info.classe != (semantic.TC_STRUCT as u8)) and (info.classe != (semantic.TC_ENUM as u8))) or (common.c2f_b2i32(ja_alcancado(x, tipo)) != 0) {
+        return
+    }
+    append(&x.alcancados, item = 0)
+    x.alcancados[len(x.alcancados) - 1] = tipo
+    if info.classe != (semantic.TC_STRUCT as u8) {
+        return
+    }
+    let st: ^ir.IrStruct = achar_struct_2(x, tipo)
+    for c in (0 as u32)..<st.ncampos {
+        alcancar(x, (st.campos or_else {})[c].tipo)
+    }
+}
+
+// C: backend/interface_dll.c:123
+proc linha_do_proc(x: ^Interface, saida: ^[dynamic]u8, f: ^ir.IrFuncao) {
+    append(saida, item = common.interner_texto(x.nomes as ^common.Interner, f.nome))
+    append(saida, item = "(")
+    var p: u32 = 0
+    while p < f.nparams {
+        if p > 0 {
+            append(saida, item = ", ")
+        }
+        anexar_tipo(x, saida, (f.params or_else {})[p].tipo)
+        alcancar(x, (f.params or_else {})[p].tipo)
+        p += 1
+    }
+    append(saida, item = ") -> ")
+    anexar_tipo(x, saida, f.retorno)
+    alcancar(x, f.retorno)
+    append(saida, item = "\n")
+}
+
+// C: backend/interface_dll.c:140
+proc linha_da_struct(x: ^Interface, saida: ^[dynamic]u8, tipo: u32) {
+    let nomes: ^common.Interner = x.nomes as ^common.Interner
+    let st: ^ir.IrStruct = achar_struct_2(x, tipo)
+    let nome_st: str = common.interner_texto(nomes, st.nome)
+    format(f"struct {nome_st} ", into = saida)
+    if st.opaco {
+        append(saida, item = "opaque\n")
+        return
+    }
+    format(f"size {ir.layout_tamanho(&x.lay, tipo)} align {ir.layout_alinhamento(&x.lay, tipo)} {{", into = saida)
+    var c: u32 = 0
+    while c < st.ncampos {
+        let campo: ^ir.IrCampo = &(st.campos or_else {})[c as u64]
+        let nome_campo: str = common.interner_texto(nomes, campo.nome)
+        format(f" {nome_campo}: ", into = saida)
+        anexar_tipo(x, saida, campo.tipo)
+        format(f" @{ir.layout_offset_campo(&x.lay, tipo, c)};", into = saida)
+        c += 1
+    }
+    append(saida, item = " }\n")
+}
+
+// C: backend/interface_dll.c:159
+proc linha_do_enum(x: ^Interface, saida: ^[dynamic]u8, tipo: u32) {
+    let nomes: ^common.Interner = x.nomes as ^common.Interner
+    let en: ^ir.IrEnum = achar_enum(x, tipo)
+    let nome_en: str = common.interner_texto(nomes, en.nome)
+    format(f"enum {nome_en}: {ENUM_BASE} {{", into = saida)
+    var m: u32 = 0
+    while m < en.nmembros {
+        let membro: str = common.interner_texto(nomes, (en.membros or_else {})[m as u64])
+        var valor: i64 = m as i64
+        if en.valores != none {
+            valor = (en.valores or_else {})[m as u64]
+        }
+        format(f" {membro} = {valor};", into = saida)
+        m += 1
+    }
+    append(saida, item = " }\n")
+}
+
+// C: backend/interface_dll.c:172
+// C2F-VOID: a, b
+// ordem total: nome, depois indice (procs, ordem de declaracao), depois TipoId (tipos)
+proc compara_entrada(a: ^Entrada, b: ^Entrada) -> i32 {
+    let c: i32 = common.c2f_strcmp(a.nome, b.nome)
+    if c != 0 {
+        return c
+    }
+    if a.indice != b.indice {
+        if a.indice < b.indice {
+            return -1
+        }
+        return 1
+    }
+    if a.tipo < b.tipo {
+        return -1
+    }
+    if a.tipo > b.tipo {
+        return 1
+    }
+    return 0
+}
+
+// insercao estavel com compara_entrada: a ordem total do C (qsort) sai igual; sem ordenacao por ponteiro
+proc ordenar_entradas(lista: ^[dynamic]Entrada) {
+    var i: u64 = 1
+    while i < (len(lista^) as u64) {
+        var j: u64 = i
+        while (j > 0) and (compara_entrada(&(lista^)[j - 1], &(lista^)[j]) > 0) {
+            let esquerda: ^Entrada = &(lista^)[j - 1]
+            let direita: ^Entrada = &(lista^)[j]
+            let antes: Entrada = esquerda^
+            esquerda^ = direita^
+            direita^ = antes
+            j -= 1
+        }
+        i += 1
+    }
+}
+
+// C: backend/interface_dll.c:182
+proc linhas_dos_procs(x: ^Interface, saida: ^[dynamic]u8) {
+    let prog: ^ir.IrPrograma = x.prog as ^ir.IrPrograma
+    let nomes: ^common.Interner = x.nomes as ^common.Interner
+    var procs: [dynamic]Entrada = make([dynamic]Entrada, alloc = heap)
+    defer delete(procs)
+    var k: u32 = 0
+    while k < prog.nfuncoes {
+        let f: ^ir.IrFuncao = &(prog.funcoes or_else {})[k as u64]
+        if f.exportado {
+            append(&procs, item = Entrada{nome = common.interner_texto(nomes, f.nome), indice = k, tipo = 0})
+        }
+        k += 1
+    }
+    ordenar_entradas(&procs)
+    var q: u64 = 0
+    while q < (len(procs) as u64) {
+        let e: ^Entrada = &procs[q]
+        linha_do_proc(x, saida, &(prog.funcoes or_else {})[e.indice as u64])
+        q += 1
+    }
+}
+
+// C: backend/interface_dll.c:199
+proc linhas_dos_tipos(x: ^Interface, saida: ^[dynamic]u8) {
+    let tipos: ^semantic.Tipos = x.tipos as ^semantic.Tipos
+    let nomes: ^common.Interner = x.nomes as ^common.Interner
+    var lista: [dynamic]Entrada = make([dynamic]Entrada, alloc = heap)
+    defer delete(lista)
+    var k: u64 = 0
+    while k < (len(x.alcancados) as u64) {
+        let tipo: u32 = x.alcancados[k]
+        let nome_id: i32 = semantic.tipo_de(tipos, tipo).a as i32
+        append(&lista, item = Entrada{nome = common.interner_texto(nomes, nome_id), indice = 0, tipo = tipo})
+        k += 1
+    }
+    ordenar_entradas(&lista)
+    var q: u64 = 0
+    while q < (len(lista) as u64) {
+        let tipo_ordem: u32 = lista[q].tipo
+        if common.c2f_s2u_32(semantic.tipo_classe_de(tipos, tipo_ordem)) == (semantic.TC_STRUCT as u32) {
+            linha_da_struct(x, saida, tipo_ordem)
+        } else {
+            linha_do_enum(x, saida, tipo_ordem)
+        }
+        q += 1
+    }
+}
+
+// C: backend/interface_dll.c:220
+pub proc emitir_interface_dll(prog: ^ir.IrPrograma, tipos: ^semantic.Tipos, nomes: ^common.Interner, saida: ^[dynamic]u8) {
+    var arena: common.Arena = common.Arena{}
+    defer common.arena_liberar(&arena)
+    var x: Interface = Interface{prog = prog, tipos = tipos, nomes = nomes, lay = ir.Layouts{}, alcancados = make([dynamic]u32, alloc = heap)}
+    defer delete(x.alcancados)
+    ir.layout_calcular(tipos, prog, &arena, &x.lay)
+    linhas_dos_procs(&x, saida)
+    linhas_dos_tipos(&x, saida)
+}

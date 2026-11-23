@@ -1,0 +1,137 @@
+// driver/ligar.fj - porte de compiler/driver/ligar.c, compiler/driver/ligar.h
+// sha256 de driver/ligar.c: 0d67bc2b33bbfb0e75660fa932b02ef65005b856273570c039500e53c245a50b
+// sha256 de driver/ligar.h: 5fcf90a52f4dc3dae5a0c39ba7101924395d3bbf435bcebc150c8f60b70c46ef
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.2.0
+// Changelog: 0.2.0 - G3 V5-P1: corpo real. O .incbin do forja_ligar.py (FORJA_LIGAR_PASTA) vira #load relativo a raiz forja_fj (language\tools\forja_ligar\forja_ligar.py): o texto
+//            tem exatamente os bytes do arquivo, sem o NUL final do .incbin (o C gravava so fim - inicio). SaidaDiag local (subcomandos rodam antes do parse de opcoes: ModoResumo = false).
+
+import "std:os"
+import "std:file"
+import "common"
+
+// C2F-82 macro de funcao FORJA_TEXTO_AUX ( x ) # x
+// C2F-82 macro de funcao FORJA_TEXTO ( x ) FORJA_TEXTO_AUX ( x )
+const LIGAR_CAMINHO_MAX: i32 = 600
+const LIGAR_SAIDA_USO: i32 = 2
+const LIGAR_SAIDA_INTERNO: i32 = 3
+// C2F-A1: forja_ligar_py / forja_ligar_py_fim (.incbin) = o texto do #load; tam = len(FORJA_LIGAR_PY).
+const FORJA_LIGAR_PY: str = #load("../tools/forja_ligar/forja_ligar.py")
+
+// C: driver/ligar.c:42
+proc valor_do_ambiente(nome: str, padrao: ?str) -> ?str {
+    let v: ?str = os.env(nome)
+    if (v != none) and (len(v or_else "") > 0) {
+        return v
+    }
+    return padrao
+}
+
+// C: driver/ligar.c:50
+// Grava o script embutido em 'caminho'. false = nao deu para gravar (nada fica no disco).
+proc gravar_script(caminho: str) -> bool {
+    if file.write_all(caminho, as_bytes(FORJA_LIGAR_PY)) == none {
+        return true
+    }
+    _ = file.remove_file(caminho)
+    return false
+}
+
+// C: driver/ligar.c:66
+// args = {"-X", "utf8", script, argv[0..argc-1]}. Devolve o exit do script, ou LIGAR_SAIDA_USO (G0101) se o Python nao iniciou.
+proc executar_python(python: ?str, script: ?str, argc: i32, argv: []str) -> i32 {
+    var args = make([dynamic]str, alloc = heap)
+    defer delete(args)
+    var codigo: i32 = 0
+    append(&args, item = "-X")
+    append(&args, item = "utf8")
+    append(&args, item = script or_else "(null)")
+    for k in 0..<(argc as int) {
+        append(&args, item = argv[k])
+    }
+    if proc_executar_com_argumentos(python, args[..], &codigo) {
+        return codigo
+    }
+    let nome_python: str = python or_else "(null)"
+    let causa_inteira = format(f"python nao encontrado (tentou '{nome_python}'): instale o Python 3.10+ ou aponte FORJA_PYTHON para o python.exe", alloc = heap)
+    defer delete(causa_inteira)
+    // char causa[600]: o snprintf corta em 599 bytes
+    let causa: str = causa_inteira[0..<min(len(causa_inteira), (LIGAR_CAMINHO_MAX as int) - 1)]
+    var sd: common.SaidaDiag = common.SaidaDiag{}
+    let erro = common.c2f_saida_stderr()
+    common.diag_imprimir_json_sem_fonte(common.G0101, causa, erro, &sd)
+    _ = common.c2f_saida_fechar(erro)
+    return LIGAR_SAIDA_USO
+}
+
+// C: driver/ligar.c:90
+proc rodar_ligar(argc: i32, argv: []str) -> i32 {
+    let externo: ?str = valor_do_ambiente("FORJA_LIGAR_SCRIPT", none)
+    if externo != none {
+        return executar_python(valor_do_ambiente("FORJA_PYTHON", "python"), externo, argc, argv)
+    }
+    var temporario_buf: [600]u8 = {}
+    let gravou: bool = proc_arquivo_temporario(temporario_buf[..], LIGAR_CAMINHO_MAX as u64, "_ligar.py")
+    let temporario = from_bytes(temporario_buf[0..<common.c2f_strlen_b(temporario_buf[..])], alloc = heap)
+    defer delete(temporario)
+    if (not gravou) or (not gravar_script(temporario)) {
+        let msg = format(f"forja: nao deu para gravar {temporario}\n", alloc = heap)
+        defer delete(msg)
+        let err = common.c2f_saida_stderr()
+        common.c2f_saida_formatar(err, msg)
+        _ = common.c2f_saida_fechar(err)
+        return LIGAR_SAIDA_INTERNO
+    }
+    let codigo: i32 = executar_python(valor_do_ambiente("FORJA_PYTHON", "python"), temporario, argc, argv)
+    _ = file.remove_file(temporario)
+    return codigo
+}
+
+// ---------------------------------------------------------------- testes (G3 V5-P1)
+
+test "valor_do_ambiente: variavel ausente ou vazia cai no padrao" {
+    expect((valor_do_ambiente("FORJA_LIGAR_TESTE_AUSENTE_XYZ", "padrao") or_else "") == "padrao")
+    expect(valor_do_ambiente("FORJA_LIGAR_TESTE_AUSENTE_XYZ", none) == none)
+    expect(os.set_env("FORJA_LIGAR_TESTE_VAZIA", "") == none)
+    expect((valor_do_ambiente("FORJA_LIGAR_TESTE_VAZIA", "padrao") or_else "") == "padrao")
+    expect(os.set_env("FORJA_LIGAR_TESTE_CHEIA", "valor") == none)
+    expect((valor_do_ambiente("FORJA_LIGAR_TESTE_CHEIA", "padrao") or_else "") == "valor")
+}
+
+test "gravar_script: o #load tem o corpo do forja_ligar.py e grava os mesmos bytes" {
+    expect(len(FORJA_LIGAR_PY) > 100000)
+    expect(starts_with_ligar(FORJA_LIGAR_PY))
+    var tmp_buf: [600]u8 = {}
+    expect(proc_arquivo_temporario(tmp_buf[..], 600, "_ligar_teste.py"))
+    let tmp = from_bytes(tmp_buf[0..<common.c2f_strlen_b(tmp_buf[..])], alloc = heap)
+    expect(gravar_script(tmp))
+    switch dados in file.read_all(tmp, alloc = heap) {
+    case [dynamic]u8:
+        expect(len(dados) == len(FORJA_LIGAR_PY))
+        expect(common.c2f_memcmp(dados[..], as_bytes(FORJA_LIGAR_PY)) == 0)
+        delete(dados)
+    case file.FileError:
+        expect(false)
+    }
+    _ = file.remove_file(tmp)
+    expect(not gravar_script("C:\\nao_existe_forja_dir\\x\\ligar.py"))
+    delete(tmp)
+}
+
+proc starts_with_ligar(s: str) -> bool {
+    let cabeca: str = "# -*- coding: utf-8 -*-"
+    return (len(s) >= len(cabeca)) and (s[0..<len(cabeca)] == cabeca)
+}
+
+test "executar_python: python ausente da G0101 e devolve 2; python real devolve o exit do script" {
+    var argv: [1]str = {"--x"}
+    expect(executar_python("C:\\nao_existe_forja\\python.exe", "s.py", 1, argv[..]) == LIGAR_SAIDA_USO)
+    var tmp_buf: [600]u8 = {}
+    expect(proc_arquivo_temporario(tmp_buf[..], 600, "_ligar_teste2.py"))
+    let tmp = from_bytes(tmp_buf[0..<common.c2f_strlen_b(tmp_buf[..])], alloc = heap)
+    expect(file.write_all(tmp, as_bytes("import sys\nsys.exit(5 if sys.argv[1:] == ['--x'] else 9)\n")) == none)
+    expect(executar_python("python", tmp, 1, argv[..]) == 5)
+    expect(executar_python("python", tmp, 0, {}) == 9)
+    _ = file.remove_file(tmp)
+    delete(tmp)
+}

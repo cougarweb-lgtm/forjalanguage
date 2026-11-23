@@ -1,0 +1,622 @@
+// nativo/optimizer/checagem.fj - porte de compiler/nativo/optimizer/checagem.c, compiler/nativo/optimizer/checagem.h
+// sha256 de nativo/optimizer/checagem.c: 95ef61b91489cb8ea04638fa657af38c90c40815b773d1c5a984d865e132f2f6
+// sha256 de nativo/optimizer/checagem.h: 086f6d323f661b5c27cae7027a6ad026d9b8b13f0a2d9387735b9813aa6050dc
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "common"
+import "nativo/bir"
+
+// memoria, vivo_memoria e maximo_memoria sao os donos dos vetores; os campos ?[]T sao visoes neles (a Forja nao tem calloc sem dono).
+// def_b[0]/def_i[0] = 1a definicao de cada vreg; [1] = ultima (iguais com 1 definicao).
+struct Fatos {
+    nvregs: u32
+    nblocos: u32
+    ndefs: ?[]u32
+    usos: ?[]u32
+    refs: ?[]u32
+    def_b: [2]?[]u32
+    def_i: [2]?[]u32
+    maximo: ?[]i64
+    provado: ?[]u8
+    memoria: [dynamic]u32
+    vivo_memoria: [dynamic]u8
+    maximo_memoria: [dynamic]i64
+}
+
+struct Laco {
+    v: u32
+    vk: u32
+    corpo: u32
+}
+
+const LIMITE_AFIM: i64 = 2147483648
+
+// C: nativo/optimizer/checagem.c:21
+proc eh_conta_ov_3(op: u8) -> bool {
+    return (((op == (bir.BIR_ADD_OV as u8)) or (op == (bir.BIR_SUB_OV as u8))) or (op == (bir.BIR_MUL_OV as u8))) or (op == (bir.BIR_NEG_OV as u8))
+}
+
+// C: nativo/optimizer/checagem.c:26
+proc define_vreg(i: ^bir.BirInstr) -> bool {
+    if i.dst == bir.BIR_SEM_VREG {
+        return false
+    }
+    return ((((((i.op != (bir.BIR_SALTA as u8)) and (i.op != (bir.BIR_DESVIA as u8))) and (i.op != (bir.BIR_RETORNA as u8))) and (i.op != (bir.BIR_ARMADILHA as u8))) and (i.op != (bir.BIR_GRAVA as u8))) and (i.op != (bir.BIR_COPIA_MEM as u8))) and (i.op != (bir.BIR_ZERA_MEM as u8))
+}
+
+// C: nativo/optimizer/checagem.c:34
+proc usa(t: ^Fatos, o: ^bir.BirOperando) {
+    if (o.tipo == (bir.BO_VREG as u8)) and (o.id < t.nvregs) {
+        let p_1 = t.usos or_else {}
+        p_1[o.id] += 1
+    }
+}
+
+// C: nativo/optimizer/checagem.c:40
+proc contar_def(t: ^Fatos, i: ^bir.BirInstr, b: u32, k: u32) {
+    if (not define_vreg(i)) or (i.dst >= t.nvregs) {
+        return
+    }
+    let ndefs: []u32 = t.ndefs or_else {}
+    if ndefs[i.dst] == 0 {
+        let def_b0: []u32 = t.def_b[0] or_else {}
+        let def_i0: []u32 = t.def_i[0] or_else {}
+        def_b0[i.dst] = b
+        def_i0[i.dst] = k
+    }
+    ndefs[i.dst] += 1
+    let def_b1: []u32 = t.def_b[1] or_else {}
+    let def_i1: []u32 = t.def_i[1] or_else {}
+    def_b1[i.dst] = b
+    def_i1[i.dst] = k
+}
+
+// C: nativo/optimizer/checagem.c:53
+// C2F-INDECIDIVEL: refs
+proc marcar_alvos(refs: []u32, i: ^bir.BirInstr) {
+    if ((common.c2f_b2i32(eh_conta_ov_3(i.op)) != 0) or (i.op == (bir.BIR_SALTA as u8))) or (i.op == (bir.BIR_DESVIA as u8)) {
+        refs[i.alvo[0]] += 1
+    }
+    if i.op == (bir.BIR_DESVIA as u8) {
+        refs[i.alvo[1]] += 1
+    }
+}
+
+// C: nativo/optimizer/checagem.c:62
+// C2F-INDECIDIVEL: novo
+proc renumerar_alvos(i: ^bir.BirInstr, novo: []u32) {
+    if ((common.c2f_b2i32(eh_conta_ov_3(i.op)) != 0) or (i.op == (bir.BIR_SALTA as u8))) or (i.op == (bir.BIR_DESVIA as u8)) {
+        i.alvo[0] = novo[i.alvo[0]]
+    }
+    if i.op == (bir.BIR_DESVIA as u8) {
+        i.alvo[1] = novo[i.alvo[1]]
+    }
+}
+
+// C: nativo/optimizer/checagem.c:70
+proc contar(t: ^Fatos, f: ^bir.BirFuncao) {
+    var k: u32 = 0
+    while (k < f.nparams) and (k < t.nvregs) {
+        let p_1 = t.ndefs or_else {}
+        p_1[k] += 1
+        k += 1
+    }
+    var b: u32 = 0
+    while b < f.nblocos {
+        var k_2: u32 = 0
+        while k_2 < f.blocos[b].n {
+            let i: ^bir.BirInstr = &f.blocos[b].instrs[k_2]
+            contar_def(t, i, b, k_2)
+            marcar_alvos((t.refs or_else {}), i)
+            usa(t, &i.a)
+            usa(t, &i.b)
+            for m in (0 as u32)..<i.nargs {
+                usa(t, &(i.args or_else {})[m])
+            }
+            k_2 += 1
+        }
+        b += 1
+    }
+}
+
+// C: nativo/optimizer/checagem.c:88
+// Forja nao devolve NULL de make (falta de memoria aborta): o retorno e sempre true; o calloc do C testava NULL.
+proc reservar_fatos(t: ^Fatos, f: ^bir.BirFuncao) -> bool {
+    let m: int = f.nvregs as int
+    let nb: int = f.nblocos as int
+    t.nvregs = f.nvregs
+    t.nblocos = f.nblocos
+    t.memoria = make([dynamic]u32, alloc = heap, cap = 6 * m + nb + 1)
+    resize(&t.memoria, 6 * m + nb)
+    t.vivo_memoria = make([dynamic]u8, alloc = heap, cap = m + 1)
+    resize(&t.vivo_memoria, m)
+    t.maximo_memoria = make([dynamic]i64, alloc = heap, cap = m + 1)
+    resize(&t.maximo_memoria, m)
+    let w: []u32 = t.memoria[..]
+    t.ndefs = w[0..<m]
+    t.usos = w[m..<(2 * m)]
+    t.def_b[0] = w[(2 * m)..<(3 * m)]
+    t.def_b[1] = w[(3 * m)..<(4 * m)]
+    t.def_i[0] = w[(4 * m)..<(5 * m)]
+    t.def_i[1] = w[(5 * m)..<(6 * m)]
+    t.refs = w[(6 * m)..<(6 * m + nb)]
+    t.provado = t.vivo_memoria[..]
+    t.maximo = t.maximo_memoria[..]
+    return true
+}
+
+// C: nativo/optimizer/checagem.c:104
+proc liberar_fatos(t: ^Fatos) {
+    delete(t.memoria)
+    delete(t.vivo_memoria)
+    delete(t.maximo_memoria)
+}
+
+// C: nativo/optimizer/checagem.c:118
+proc def_de(t: ^Fatos, f: ^bir.BirFuncao, v: u32, qual: u32) -> ^bir.BirInstr {
+    let def_b: []u32 = t.def_b[qual] or_else {}
+    let def_i: []u32 = t.def_i[qual] or_else {}
+    let blk: ^bir.BirBloco = &f.blocos[def_b[v]]
+    return &blk.instrs[def_i[v]]
+}
+
+// C: nativo/optimizer/checagem.c:123
+proc eh_imed(o: ^bir.BirOperando, valor: i64) -> bool {
+    return (o.tipo == (bir.BO_IMED as u8)) and (o.imed == valor)
+}
+
+// C: nativo/optimizer/checagem.c:132
+proc eh_menos_um(t: ^Fatos, f: ^bir.BirFuncao, v: u32, base: ^u32) -> bool {
+    var d: ?^bir.BirInstr = none
+    if (v >= t.nvregs) or ((t.ndefs or_else {})[v] != 1) {
+        return false
+    }
+    d = def_de(t, f, v, 0)
+    if (((d as ^bir.BirInstr).op != (bir.BIR_SUB as u8)) or ((d as ^bir.BirInstr).a.tipo != (bir.BO_VREG as u8))) or (not eh_imed(&(d as ^bir.BirInstr).b, 1)) {
+        return false
+    }
+    base^ = (d as ^bir.BirInstr).a.id
+    return true
+}
+
+// C: nativo/optimizer/checagem.c:146
+proc verifica_saida(t: ^Fatos, f: ^bir.BirFuncao, verifica: u32, laco: ^Laco) -> bool {
+    let blk: ^bir.BirBloco = &f.blocos[verifica]
+    var d: ?^bir.BirInstr = none
+    var c: ?^bir.BirInstr = none
+    var base: u32 = 0
+    if blk.n < 2 {
+        return false
+    }
+    d = &blk.instrs[blk.n - 1]
+    c = &blk.instrs[blk.n - 2]
+    if (((((((d as ^bir.BirInstr).op != (bir.BIR_DESVIA as u8)) or ((c as ^bir.BirInstr).op != (bir.BIR_CMP as u8))) or ((c as ^bir.BirInstr).aux != (bir.BCOND_EQ as u8))) or ((c as ^bir.BirInstr).dst != (d as ^bir.BirInstr).a.id)) or ((c as ^bir.BirInstr).a.tipo != (bir.BO_VREG as u8))) or ((c as ^bir.BirInstr).a.id != laco.v)) or ((c as ^bir.BirInstr).b.tipo != (bir.BO_VREG as u8)) {
+        return false
+    }
+    return (common.c2f_b2i32(eh_menos_um(t, f, (c as ^bir.BirInstr).b.id, &base)) != 0) and (base == laco.vk)
+}
+
+// C: nativo/optimizer/checagem.c:163
+proc bloco_soma(t: ^Fatos, f: ^bir.BirFuncao, laco: ^Laco, verifica: ^u32) -> bool {
+    let refs: []u32 = t.refs or_else {}
+    let def_b1: []u32 = t.def_b[1] or_else {}
+    let soma: u32 = def_b1[laco.v]
+    let blk: ^bir.BirBloco = &f.blocos[soma]
+    if (refs[soma] != 1) or (refs[laco.corpo] != 2) or (blk.n != 2) {
+        return false
+    }
+    let primeira: ^bir.BirInstr = &blk.instrs[0]
+    let segunda: ^bir.BirInstr = &blk.instrs[1]
+    if (primeira.op != (bir.BIR_ADD as u8)) or (primeira.dst != laco.v) or (primeira.a.tipo != (bir.BO_VREG as u8)) or (primeira.a.id != laco.v) or (not eh_imed(&primeira.b, 1)) or (segunda.op != (bir.BIR_SALTA as u8)) or (segunda.alvo[0] != laco.corpo) {
+        return false
+    }
+    var b: u32 = 0
+    while b < f.nblocos {
+        let outro: ^bir.BirBloco = &f.blocos[b]
+        if (outro.n > 0) and (outro.instrs[outro.n - 1].op == (bir.BIR_DESVIA as u8)) and (outro.instrs[outro.n - 1].alvo[1] == soma) {
+            verifica^ = b
+            return true
+        }
+        b += 1
+    }
+    return false
+}
+
+// C: nativo/optimizer/checagem.c:187
+// INVARIANTE (revisao Opus M7a, P1): a prova nao olha o fluxo; vale porque o lowering so le V dentro do corpo do laco. Todo passe que leve uma copia/conta de V
+// (ou do que herda dela) para fora do laco (propagacao de copia, LICM, reducao de forca: M7b) deve antes exigir que a definicao seja dominada pelo corpo.
+proc tenta_laco_contado(t: ^Fatos, f: ^bir.BirFuncao, b: u32) {
+    let blk: ^bir.BirBloco = &f.blocos[b]
+    if blk.n < 2 {
+        return
+    }
+    let d: ^bir.BirInstr = &blk.instrs[blk.n - 1]
+    let c: ^bir.BirInstr = &blk.instrs[blk.n - 2]
+    if (d.op != (bir.BIR_DESVIA as u8)) or (c.op != (bir.BIR_CMP as u8)) or (c.aux != (bir.BCOND_LT_S as u8)) or (c.dst != d.a.id) or (c.a.tipo != (bir.BO_VREG as u8)) or (c.b.tipo != (bir.BO_VREG as u8)) or (c.a.classe != (bir.BC_I64 as u8)) {
+        return
+    }
+    let v: u32 = c.a.id
+    let vk: u32 = c.b.id
+    if (v >= t.nvregs) or (vk >= t.nvregs) or ((t.ndefs or_else {})[v] != 2) or ((t.ndefs or_else {})[vk] != 1) {
+        return
+    }
+    let s: ^bir.BirInstr = def_de(t, f, v, 0)
+    let soma: ^bir.BirInstr = def_de(t, f, v, 1)
+    let k: ^bir.BirInstr = def_de(t, f, vk, 0)
+    if (s.op != (bir.BIR_CONST as u8)) or ((t.def_b[0] or_else {})[v] != b) or (s.a.imed < 0) or (k.op != (bir.BIR_CONST as u8)) or (soma.op != (bir.BIR_ADD as u8)) {
+        return
+    }
+    // laco morto (K <= S): sem intervalo a provar; tambem evita K - 1 estourar com K = INT64_MIN
+    if k.a.imed <= s.a.imed {
+        return
+    }
+    var laco = Laco{v = v, vk = vk, corpo = d.alvo[0]}
+    var verifica: u32 = 0
+    if (not bloco_soma(t, f, &laco, &verifica)) or (not verifica_saida(t, f, verifica, &laco)) {
+        return
+    }
+    let provado: []u8 = t.provado or_else {}
+    let maximo: []i64 = t.maximo or_else {}
+    provado[v] = 1
+    maximo[v] = k.a.imed - 1
+}
+
+// C: nativo/optimizer/checagem.c:220
+proc herda_copias(t: ^Fatos, f: ^bir.BirFuncao) {
+    var b: u32 = 0
+    while b < f.nblocos {
+        var k: u32 = 0
+        while k < f.blocos[b].n {
+            let i: ^bir.BirInstr = &f.blocos[b].instrs[k]
+            if (((((i.op != (bir.BIR_COPIA as u8)) or (i.dst >= t.nvregs)) or ((t.ndefs or_else {})[i.dst] != 1)) or (i.a.tipo != (bir.BO_VREG as u8))) or (i.a.id >= t.nvregs)) or (not ((t.provado or_else {})[i.a.id] != 0)) {
+                k += 1
+                continue
+            }
+            let p_1 = t.provado or_else {}
+            p_1[i.dst] = 1
+            let p_2 = t.maximo or_else {}
+            p_2[i.dst] = (t.maximo or_else {})[i.a.id]
+            k += 1
+        }
+        b += 1
+    }
+}
+
+// C: nativo/optimizer/checagem.c:238
+proc maximo_de(t: ^Fatos, o: ^bir.BirOperando, max: ^i64) -> bool {
+    if o.tipo == (bir.BO_IMED as u8) {
+        max^ = o.imed
+    } else if ((o.tipo == (bir.BO_VREG as u8)) and (o.id < t.nvregs)) and (((t.provado or_else {})[o.id] as i32) != 0) {
+        max^ = (t.maximo or_else {})[o.id]
+    } else {
+        return false
+    }
+    return (max^ >= 0) and (max^ <= LIMITE_AFIM)
+}
+
+// C: nativo/optimizer/checagem.c:250
+proc prova_afim(t: ^Fatos, i: ^bir.BirInstr) -> bool {
+    var ma: i64 = 0
+    var mb: i64 = 0
+    if (((((i.op != (bir.BIR_ADD as u8)) and (i.op != (bir.BIR_MUL as u8))) or (i.classe != (bir.BC_I64 as u8))) or (i.dst >= t.nvregs)) or ((t.ndefs or_else {})[i.dst] != 1)) or (((t.provado or_else {})[i.dst] as i32) != 0) {
+        return false
+    }
+    if (not maximo_de(t, &i.a, &ma)) or (not maximo_de(t, &i.b, &mb)) {
+        return false
+    }
+    let p_1 = t.provado or_else {}
+    p_1[i.dst] = 1
+    var tern_1: i64 = 0
+    if i.op == (bir.BIR_ADD as u8) {
+        tern_1 = ma + mb
+    } else {
+        tern_1 = ma * mb
+    }
+    let p_2 = t.maximo or_else {}
+    p_2[i.dst] = tern_1
+    return true
+}
+
+// C: nativo/optimizer/checagem.c:264
+proc propaga_afim(t: ^Fatos, f: ^bir.BirFuncao) {
+    var mudou: bool = true
+    while mudou {
+        mudou = false
+        var b: u32 = 0
+        while b < f.nblocos {
+            var k: u32 = 0
+            while k < f.blocos[b].n {
+                // C: `mudou |= ProvaAfim(...)` chama sempre; nao curto-circuitar
+                let provou: bool = prova_afim(t, &f.blocos[b].instrs[k])
+                if provou {
+                    mudou = true
+                }
+                k += 1
+            }
+            b += 1
+        }
+    }
+}
+
+// C: nativo/optimizer/checagem.c:278
+proc tira_checagem(t: ^Fatos, f: ^bir.BirFuncao, b: u32) -> bool {
+    let blk: ^bir.BirBloco = &f.blocos[b]
+    var d: ?^bir.BirInstr = none
+    var c: ?^bir.BirInstr = none
+    if blk.n < 2 {
+        return false
+    }
+    d = &blk.instrs[blk.n - 1]
+    c = &blk.instrs[blk.n - 2]
+    if ((((((((((d as ^bir.BirInstr).op != (bir.BIR_DESVIA as u8)) or ((c as ^bir.BirInstr).op != (bir.BIR_CMP as u8))) or ((c as ^bir.BirInstr).aux != (bir.BCOND_GE_U as u8))) or ((c as ^bir.BirInstr).dst != (d as ^bir.BirInstr).a.id)) or ((c as ^bir.BirInstr).dst >= t.nvregs)) or ((t.usos or_else {})[(c as ^bir.BirInstr).dst] != 1)) or ((t.ndefs or_else {})[(c as ^bir.BirInstr).dst] != 1)) or ((c as ^bir.BirInstr).a.tipo != (bir.BO_VREG as u8))) or ((c as ^bir.BirInstr).b.tipo != (bir.BO_IMED as u8))) or (not f.blocos[(d as ^bir.BirInstr).alvo[0]].frio) {
+        return false
+    }
+    if (((c as ^bir.BirInstr).a.id >= t.nvregs) or (not ((t.provado or_else {})[(c as ^bir.BirInstr).a.id] != 0))) or ((t.maximo or_else {})[(c as ^bir.BirInstr).a.id] >= (c as ^bir.BirInstr).b.imed) {
+        return false
+    }
+    let ptr_1: ^bir.BirInstr = c as ^bir.BirInstr
+    ptr_1.op = bir.BIR_SALTA as u8
+    let ptr_2: ^bir.BirInstr = c as ^bir.BirInstr
+    ptr_2.alvo[0] = (d as ^bir.BirInstr).alvo[1]
+    let ptr_3: ^bir.BirInstr = c as ^bir.BirInstr
+    ptr_3.dst = bir.BIR_SEM_VREG
+    let ptr_4: ^bir.BirInstr = c as ^bir.BirInstr
+    ptr_4.a = bir.BirOperando{}
+    let ptr_5: ^bir.BirInstr = c as ^bir.BirInstr
+    ptr_5.b = bir.BirOperando{}
+    blk.n -= 1
+    return true
+}
+
+// C: nativo/optimizer/checagem.c:303
+proc mescla_segue(t: ^Fatos, f: ^bir.BirFuncao, b: u32) -> bool {
+    let blk: ^bir.BirBloco = &f.blocos[b]
+    let s: u32 = blk.instrs[blk.n - 1].alvo[0]
+    let seg: ^bir.BirBloco = &f.blocos[s]
+    let refs: []u32 = t.refs or_else {}
+    if (s == 0) or (s == b) or seg.frio or (seg.n == 0) or (refs[s] != 1) {
+        return false
+    }
+    // tira o `salta` do fim de b e copia as instrucoes de s no lugar dele; a lista fica com len == n (molde do absorver do cfg)
+    truncate(&blk.instrs, (blk.n - 1) as int)
+    var k: u32 = 0
+    while k < seg.n {
+        append(&blk.instrs, item = seg.instrs[k])
+        k += 1
+    }
+    blk.n = blk.n - 1 + seg.n
+    blk.cap = (cap(blk.instrs) as u64) as u32
+    seg.n = 0
+    return true
+}
+
+// Marca em refs os blocos nomeados como alvo por qualquer instrucao viva da funcao.
+proc marcar_refs_funcao(f: ^bir.BirFuncao, refs: []u32) {
+    var b: u32 = 0
+    while b < f.nblocos {
+        var k: u32 = 0
+        while k < f.blocos[b].n {
+            marcar_alvos(refs, &f.blocos[b].instrs[k])
+            k += 1
+        }
+        b += 1
+    }
+}
+
+// Anota em ordem, na ordem antiga, os blocos que sobrevivem; morto = vazio, ou frio sem referencia (o bloco 0 nunca morre).
+// refs_antes sao as referencias dos Fatos (antes da limpeza), como no C.
+proc anotar_blocos_vivos(t: ^Fatos, f: ^bir.BirFuncao, refs: []u32, ordem: ^[dynamic]u32) {
+    let refs_antes: []u32 = t.refs or_else {}
+    var b: u32 = 0
+    while b < f.nblocos {
+        let blk: ^bir.BirBloco = &f.blocos[b]
+        let morto: bool = (b != 0) and ((blk.n == 0) or (blk.frio and (refs[b] == 0) and (refs_antes[b] != 0)))
+        if not morto {
+            append(ordem, item = b)
+        }
+        b += 1
+    }
+}
+
+// C: nativo/optimizer/checagem.c:327
+// Os blocos vivos vao para cfg_aplicar_ordem (cfg_ordem.fj), que refaz a lista de blocos e renumera os alvos com BIR_SEM_BLOCO nos mortos:
+// a Forja nao tira elemento de lista de dono sem copiar (E0311), e esse e o caminho que o cfg ja usa. Mesmo resultado que o C.
+proc remove_blocos_mortos(t: ^Fatos, f: ^bir.BirFuncao) {
+    var refs = make([dynamic]u32, alloc = heap, cap = (f.nblocos as int) + 1)
+    defer delete(refs)
+    resize(&refs, f.nblocos as int)
+    marcar_refs_funcao(f, refs[..])
+    var ordem = make([dynamic]u32, alloc = heap, cap = (f.nblocos as int) + 1)
+    defer delete(ordem)
+    anotar_blocos_vivos(t, f, refs[..], &ordem)
+    cfg_aplicar_ordem(f, ordem[..])
+}
+
+// ---- testes dirigidos (funcoes montadas a mao; helpers com prefixo chkt_ para nao colidir no pacote)
+
+proc chkt_vreg(id: u32) -> bir.BirOperando {
+    return bir.BirOperando{tipo = (bir.BO_VREG as u8), classe = (bir.BC_I64 as u8), id = id}
+}
+
+proc chkt_imed(valor: i64) -> bir.BirOperando {
+    return bir.BirOperando{tipo = (bir.BO_IMED as u8), classe = (bir.BC_I64 as u8), imed = valor}
+}
+
+proc chkt_bloco(f: ^bir.BirFuncao) -> u32 {
+    append(&f.blocos, item = bir.BirBloco{})
+    f.blocos[f.nblocos].instrs = make([dynamic]bir.BirInstr, alloc = heap, cap = 8)
+    f.nblocos += 1
+    return f.nblocos - 1
+}
+
+proc chkt_emite(f: ^bir.BirFuncao, b: u32, ins: bir.BirInstr) {
+    append(&f.blocos[b].instrs, item = ins)
+    f.blocos[b].n += 1
+}
+
+proc chkt_libera(f: ^bir.BirFuncao) {
+    var k: u32 = 0
+    while k < f.nblocos {
+        delete(f.blocos[k].instrs)
+        k += 1
+    }
+    delete(f.blocos)
+}
+
+test "checagem_classifica_conta_ov_e_define_vreg" {
+    expect(eh_conta_ov_3(bir.BIR_ADD_OV as u8))
+    expect(eh_conta_ov_3(bir.BIR_NEG_OV as u8))
+    expect(not eh_conta_ov_3(bir.BIR_CHAMA as u8))
+    var ins = bir.BirInstr{op = (bir.BIR_ADD as u8), dst = 3}
+    expect(define_vreg(&ins))
+    ins.dst = bir.BIR_SEM_VREG
+    expect(not define_vreg(&ins))
+    ins.op = (bir.BIR_SALTA as u8)
+    ins.dst = 3
+    expect(not define_vreg(&ins))
+}
+
+test "checagem_reserva_zerada_e_libera" {
+    var f = bir.BirFuncao{}
+    f.nvregs = 3
+    f.nblocos = 2
+    var t = Fatos{nvregs = 0}
+    expect(reservar_fatos(&t, &f))
+    expect(len(t.ndefs or_else {}) == 3)
+    expect((t.ndefs or_else {})[2] == 0)
+    expect(len(t.refs or_else {}) == 2)
+    liberar_fatos(&t)
+    var zero = Fatos{nvregs = 0}
+    liberar_fatos(&zero)
+}
+
+test "checagem_laco_contado_prova_intervalo_de_v" {
+    // B1 = cabecalho (v = 0; vk = 10; c = v < vk; desvia c, B2, B4); B2 = corpo (salta B5); B3 = soma (v = v + 1; salta B2);
+    // B5 = verificacao (vl = vk - 1; c2 = v == vl; desvia c2, B4, B3). vregs: v=0 vk=1 c=2 vl=3 c2=4.
+    var f = bir.BirFuncao{}
+    f.blocos = make([dynamic]bir.BirBloco, alloc = heap, cap = 8)
+    f.nvregs = 5
+    let entrada: u32 = chkt_bloco(&f)
+    let cab: u32 = chkt_bloco(&f)
+    let corpo: u32 = chkt_bloco(&f)
+    let soma: u32 = chkt_bloco(&f)
+    let saida: u32 = chkt_bloco(&f)
+    let verif: u32 = chkt_bloco(&f)
+    var salta_cab = bir.BirInstr{op = (bir.BIR_SALTA as u8)}
+    salta_cab.alvo[0] = cab
+    chkt_emite(&f, entrada, salta_cab)
+    chkt_emite(&f, cab, bir.BirInstr{op = (bir.BIR_CONST as u8), dst = 0, a = chkt_imed(0)})
+    chkt_emite(&f, cab, bir.BirInstr{op = (bir.BIR_CONST as u8), dst = 1, a = chkt_imed(10)})
+    chkt_emite(&f, cab, bir.BirInstr{op = (bir.BIR_CMP as u8), aux = (bir.BCOND_LT_S as u8), classe = (bir.BC_I64 as u8), dst = 2, a = chkt_vreg(0), b = chkt_vreg(1)})
+    var desvia_cab = bir.BirInstr{op = (bir.BIR_DESVIA as u8), a = chkt_vreg(2)}
+    desvia_cab.alvo[0] = corpo
+    desvia_cab.alvo[1] = saida
+    chkt_emite(&f, cab, desvia_cab)
+    var salta_corpo = bir.BirInstr{op = (bir.BIR_SALTA as u8)}
+    salta_corpo.alvo[0] = verif
+    chkt_emite(&f, corpo, salta_corpo)
+    chkt_emite(&f, soma, bir.BirInstr{op = (bir.BIR_ADD as u8), dst = 0, classe = (bir.BC_I64 as u8), a = chkt_vreg(0), b = chkt_imed(1)})
+    var salta_soma = bir.BirInstr{op = (bir.BIR_SALTA as u8)}
+    salta_soma.alvo[0] = corpo
+    chkt_emite(&f, soma, salta_soma)
+    chkt_emite(&f, saida, bir.BirInstr{op = (bir.BIR_RETORNA as u8)})
+    chkt_emite(&f, verif, bir.BirInstr{op = (bir.BIR_SUB as u8), dst = 3, classe = (bir.BC_I64 as u8), a = chkt_vreg(1), b = chkt_imed(1)})
+    chkt_emite(&f, verif, bir.BirInstr{op = (bir.BIR_CMP as u8), aux = (bir.BCOND_EQ as u8), classe = (bir.BC_I64 as u8), dst = 4, a = chkt_vreg(0), b = chkt_vreg(3)})
+    var desvia_verif = bir.BirInstr{op = (bir.BIR_DESVIA as u8), a = chkt_vreg(4)}
+    desvia_verif.alvo[0] = saida
+    desvia_verif.alvo[1] = soma
+    chkt_emite(&f, verif, desvia_verif)
+    var t = Fatos{nvregs = 0}
+    expect(reservar_fatos(&t, &f))
+    contar(&t, &f)
+    tenta_laco_contado(&t, &f, cab)
+    expect((t.provado or_else {})[0] == 1)
+    expect((t.maximo or_else {})[0] == 9)
+    expect((t.provado or_else {})[1] == 0)
+    liberar_fatos(&t)
+    chkt_libera(&f)
+}
+
+test "checagem_propaga_afim_soma_de_constantes" {
+    var f = bir.BirFuncao{}
+    f.blocos = make([dynamic]bir.BirBloco, alloc = heap, cap = 4)
+    f.nvregs = 1
+    let b: u32 = chkt_bloco(&f)
+    chkt_emite(&f, b, bir.BirInstr{op = (bir.BIR_ADD as u8), dst = 0, classe = (bir.BC_I64 as u8), a = chkt_imed(3), b = chkt_imed(4)})
+    var t = Fatos{nvregs = 0}
+    expect(reservar_fatos(&t, &f))
+    contar(&t, &f)
+    propaga_afim(&t, &f)
+    expect((t.provado or_else {})[0] == 1)
+    expect((t.maximo or_else {})[0] == 7)
+    liberar_fatos(&t)
+    chkt_libera(&f)
+}
+
+test "checagem_mescla_segue_e_remove_vazios" {
+    // B0 = salta B1; B1 = (add; retorna) com so B0 como predecessor: mescla em B0; B2 fica vazio e sai
+    var f = bir.BirFuncao{}
+    f.blocos = make([dynamic]bir.BirBloco, alloc = heap, cap = 4)
+    f.nvregs = 1
+    let b0: u32 = chkt_bloco(&f)
+    let b1: u32 = chkt_bloco(&f)
+    _ = chkt_bloco(&f)
+    var salta = bir.BirInstr{op = (bir.BIR_SALTA as u8)}
+    salta.alvo[0] = b1
+    chkt_emite(&f, b0, salta)
+    chkt_emite(&f, b1, bir.BirInstr{op = (bir.BIR_ADD as u8), dst = 0, classe = (bir.BC_I64 as u8), a = chkt_imed(1), b = chkt_imed(2)})
+    chkt_emite(&f, b1, bir.BirInstr{op = (bir.BIR_RETORNA as u8)})
+    var t = Fatos{nvregs = 0}
+    expect(reservar_fatos(&t, &f))
+    contar(&t, &f)
+    expect(mescla_segue(&t, &f, b0))
+    expect(f.blocos[b0].n == 2)
+    expect(f.blocos[b0].instrs[1].op == (bir.BIR_RETORNA as u8))
+    expect(f.blocos[b1].n == 0)
+    remove_blocos_mortos(&t, &f)
+    expect(f.nblocos == 1)
+    expect(f.blocos[0].instrs[1].op == (bir.BIR_RETORNA as u8))
+    liberar_fatos(&t)
+    chkt_libera(&f)
+}
+
+// C: nativo/optimizer/checagem.c:359
+proc otim_checagem_aplicar(programa: ^bir.BirPrograma, funcao: ^bir.BirFuncao) {
+    var t: Fatos = Fatos{nvregs = 0}
+    var tiradas: u32 = 0
+    var candidata: bool = false
+    var b: u32 = 0
+    while (b < funcao.nblocos) and (not candidata) {
+        let blk: ^bir.BirBloco = &funcao.blocos[b]
+        candidata = (((blk.n >= 2) and (blk.instrs[blk.n - 1].op == (bir.BIR_DESVIA as u8))) and (blk.instrs[blk.n - 2].op == (bir.BIR_CMP as u8))) and (blk.instrs[blk.n - 2].aux == (bir.BCOND_GE_U as u8))
+        b += 1
+    }
+    if not candidata {
+        return
+    }
+    if ((not programa.checagem) or (funcao.nblocos == 0)) or (not reservar_fatos(&t, funcao)) {
+        liberar_fatos(&t)
+        return
+    }
+    contar(&t, funcao)
+    for b_2 in (0 as u32)..<funcao.nblocos {
+        tenta_laco_contado(&t, funcao, b_2)
+    }
+    herda_copias(&t, funcao)
+    propaga_afim(&t, funcao)
+    var b_2: u32 = 0
+    while b_2 < funcao.nblocos {
+        while (funcao.blocos[b_2].n > 0) and (common.c2f_b2i32(tira_checagem(&t, funcao, b_2)) != 0) {
+            tiradas += 1
+            if not mescla_segue(&t, funcao, b_2) {
+                break
+            }
+        }
+        b_2 += 1
+    }
+    if tiradas > 0 {
+        remove_blocos_mortos(&t, funcao)
+    }
+    liberar_fatos(&t)
+}

@@ -1,0 +1,212 @@
+// nativo/wasm/wasm_mem.fj - emissao das operacoes de memoria da BIR (CARREGA, GRAVA, COPIA_MEM, ZERA_MEM) no alvo wasm32-wasip1
+// Versao: 0.1.0 (W1.e3b: load/store escalar de i8 a f64 e copia/zera pelo bulk-memory; vetor fica X0001)
+// Contrato: wasm_emitir_memoria(ins, corpo, erro) acrescenta em `corpo` a sequencia wasm da op e devolve true; operando ou classe
+// sem equivalente devolve false e registra X0001 em `erro`. O ponteiro e vreg i64 e entra como i32 (i32.wrap_i64).
+// Convencao: COPIA_MEM usa a = destino e b = origem (x64_isel_mem.fj:112); ZERA_MEM usa a = destino. Em CARREGA/GRAVA o desloc
+// e o offset do acesso; em COPIA_MEM/ZERA_MEM e o numero de bytes.
+
+import "common"
+import "nativo/bir"
+import "nativo/fmt" as pefmt
+
+const MEM_OP_I32_ADD: u8 = 0x6A
+const MEM_PREFIXO_FC: u8 = 0xFC // prefixo das instrucoes bulk-memory
+const MEM_SUB_COPIA: u32 = 10 // memory.copy
+const MEM_SUB_PREENCHE: u32 = 11 // memory.fill
+const MEM_INDICE_MEMORIA: u8 = 0 // unica memoria do modulo
+
+// Indice = classe da BIR (BC_I8 = 1 .. BC_F64 = 6); 0 = sem load/store escalar (V128 e classe fora da faixa)
+const MEM_OP_CARGA: [8]u8 = {0, 0x2D, 0x2F, 0x28, 0x29, 0x2A, 0x2B, 0}
+const MEM_OP_GRAVA: [8]u8 = {0, 0x3A, 0x3B, 0x36, 0x37, 0x38, 0x39, 0}
+// Alinhamento em log2 do memarg: i8 0, i16 1, i32 2, i64 3, f32 2, f64 3
+const MEM_ALINHAMENTO: [8]u8 = {0, 0, 1, 2, 3, 2, 3, 0}
+
+// Indice da tabela por classe; classe fora de I8..F64 cai em 0 (sem equivalente)
+proc wasm_mem_indice(classe: u8) -> u32 {
+    let c = classe as i32
+    if (c < bir.BC_I8) or (c > bir.BC_F64) {
+        return 0
+    }
+    return classe as u32
+}
+
+// Empilha o ponteiro i64 da BIR como endereco i32 (wasm32)
+proc wasm_mem_empilhar_base(ptr: bir.BirOperando, corpo: ^[dynamic]u8) -> bool {
+    if not wasm_classe_i64(ptr.classe) {
+        return false
+    }
+    if not wasm_empilhar(ptr, corpo) {
+        return false
+    }
+    append(corpo, item = OP_I32_WRAP_I64)
+    return true
+}
+
+// Endereco de load/store: base + desloc. Desloc negativo nao cabe no memarg (sem sinal), entao soma antes do acesso
+proc wasm_mem_empilhar_endereco(ptr: bir.BirOperando, desloc: i32, corpo: ^[dynamic]u8) -> bool {
+    if not wasm_mem_empilhar_base(ptr, corpo) {
+        return false
+    }
+    if desloc < 0 {
+        append(corpo, item = OP_I32_CONST)
+        pefmt.wasm_leb_s32(corpo, desloc)
+        append(corpo, item = MEM_OP_I32_ADD)
+    }
+    return true
+}
+
+// memarg = LEB(align) LEB(offset); offset e o desloc quando nao negativo, senao 0 (o negativo ja foi somado na pilha)
+proc wasm_mem_memarg(align: u8, desloc: i32, corpo: ^[dynamic]u8) {
+    pefmt.wasm_leb_u32(corpo, align as u32)
+    var offset: u32 = 0
+    if desloc >= 0 {
+        offset = desloc as u32
+    }
+    pefmt.wasm_leb_u32(corpo, offset)
+}
+
+// dst = *(a + desloc) com largura e extensao pela classe (sempre zero-extendido: i8/i16 usam load_u)
+proc wasm_emitir_carrega(ins: ^bir.BirInstr, corpo: ^[dynamic]u8, erro: ^common.Diag) -> bool {
+    let indice = wasm_mem_indice(ins.classe)
+    let opcode = MEM_OP_CARGA[indice]
+    if opcode == 0 {
+        return wasm_nao_suportado(erro, ins.pos, "carrega de vetor")
+    }
+    if not wasm_mem_empilhar_endereco(ins.a, ins.desloc, corpo) {
+        return wasm_nao_suportado(erro, ins.pos, "carrega com endereco invalido")
+    }
+    append(corpo, item = opcode)
+    wasm_mem_memarg(MEM_ALINHAMENTO[indice], ins.desloc, corpo)
+    wasm_gravar_destino(ins, corpo)
+    return true
+}
+
+// *(a + desloc) = b com largura pela classe de b; store8/store16 truncam, por isso nao ha normalizacao dos bits altos
+proc wasm_emitir_grava(ins: ^bir.BirInstr, corpo: ^[dynamic]u8, erro: ^common.Diag) -> bool {
+    let indice = wasm_mem_indice(ins.b.classe)
+    let opcode = MEM_OP_GRAVA[indice]
+    if opcode == 0 {
+        return wasm_nao_suportado(erro, ins.pos, "grava de vetor")
+    }
+    if not wasm_mem_empilhar_endereco(ins.a, ins.desloc, corpo) {
+        return wasm_nao_suportado(erro, ins.pos, "grava com endereco invalido")
+    }
+    if not wasm_empilhar(ins.b, corpo) {
+        return wasm_nao_suportado(erro, ins.pos, "grava com operando invalido")
+    }
+    append(corpo, item = opcode)
+    wasm_mem_memarg(MEM_ALINHAMENTO[indice], ins.desloc, corpo)
+    return true
+}
+
+// memory.copy(destino = a, origem = b, n = desloc): a pilha leva destino antes da origem
+proc wasm_emitir_copia_mem(ins: ^bir.BirInstr, corpo: ^[dynamic]u8, erro: ^common.Diag) -> bool {
+    if ins.desloc < 0 {
+        return wasm_nao_suportado(erro, ins.pos, "copia_mem com tamanho negativo")
+    }
+    if not (wasm_mem_empilhar_base(ins.a, corpo) and wasm_mem_empilhar_base(ins.b, corpo)) {
+        return wasm_nao_suportado(erro, ins.pos, "copia_mem com operando invalido")
+    }
+    append(corpo, item = OP_I32_CONST)
+    pefmt.wasm_leb_s32(corpo, ins.desloc)
+    append(corpo, item = MEM_PREFIXO_FC)
+    pefmt.wasm_leb_u32(corpo, MEM_SUB_COPIA)
+    append(corpo, item = MEM_INDICE_MEMORIA)
+    append(corpo, item = MEM_INDICE_MEMORIA)
+    return true
+}
+
+// memory.fill(destino = a, valor = 0, n = desloc)
+proc wasm_emitir_zera_mem(ins: ^bir.BirInstr, corpo: ^[dynamic]u8, erro: ^common.Diag) -> bool {
+    if ins.desloc < 0 {
+        return wasm_nao_suportado(erro, ins.pos, "zera_mem com tamanho negativo")
+    }
+    if not wasm_mem_empilhar_base(ins.a, corpo) {
+        return wasm_nao_suportado(erro, ins.pos, "zera_mem com operando invalido")
+    }
+    append(corpo, item = OP_I32_CONST)
+    pefmt.wasm_leb_s32(corpo, 0)
+    append(corpo, item = OP_I32_CONST)
+    pefmt.wasm_leb_s32(corpo, ins.desloc)
+    append(corpo, item = MEM_PREFIXO_FC)
+    pefmt.wasm_leb_u32(corpo, MEM_SUB_PREENCHE)
+    append(corpo, item = MEM_INDICE_MEMORIA)
+    return true
+}
+
+// memory.copy (0xFC 0x0A 0x00 0x00): destino, origem e n ja estao na pilha
+proc wasm_mem_emitir_copy(corpo: ^[dynamic]u8) {
+    append(corpo, item = MEM_PREFIXO_FC)
+    pefmt.wasm_leb_u32(corpo, MEM_SUB_COPIA)
+    append(corpo, item = MEM_INDICE_MEMORIA)
+    append(corpo, item = MEM_INDICE_MEMORIA)
+}
+
+// Retorno agregado: o chamado devolve o endereco i64 do agregado (nada roda entre o epilogo e esta copia); a pilha ja tem o destino
+// embaixo dele: i32.wrap_i64 do endereco, tam, memory.copy
+proc wasm_mem_copiar_retorno(tam: u32, corpo: ^[dynamic]u8) {
+    append(corpo, item = OP_I32_WRAP_I64)
+    append(corpo, item = OP_I32_CONST)
+    pefmt.wasm_leb_s32(corpo, tam as i32)
+    wasm_mem_emitir_copy(corpo)
+}
+
+// Argumento de chamada ao runtime memory.*: endereco e tamanho (i64) entram como i32; o valor do fill ja e i32
+proc wasm_mem_empilhar_argumento(arg: bir.BirOperando, corpo: ^[dynamic]u8) -> bool {
+    if not wasm_empilhar(arg, corpo) {
+        return false
+    }
+    if wasm_classe_i64(arg.classe) {
+        append(corpo, item = OP_I32_WRAP_I64)
+    }
+    return true
+}
+
+// CHAMA aos simbolos de runtime "memory.copy"(dst, src, n) e "memory.fill"(dst, valor, n) (blocos > 64 B ou de tamanho dinamico)
+proc wasm_emitir_chamada_memoria(ins: ^bir.BirInstr, preenche: bool, corpo: ^[dynamic]u8, erro: ^common.Diag) -> bool {
+    let args: []bir.BirOperando = ins.args or_else {}
+    if ins.nargs != 3 {
+        return wasm_nao_suportado(erro, ins.pos, "memory.copy/memory.fill sem 3 argumentos")
+    }
+    for k in (0 as u32)..<3 {
+        if not wasm_mem_empilhar_argumento(args[k], corpo) {
+            return wasm_nao_suportado(erro, ins.pos, "memory.copy/memory.fill com argumento invalido")
+        }
+    }
+    if not preenche {
+        wasm_mem_emitir_copy(corpo)
+        return true
+    }
+    append(corpo, item = MEM_PREFIXO_FC)
+    pefmt.wasm_leb_u32(corpo, MEM_SUB_PREENCHE)
+    append(corpo, item = MEM_INDICE_MEMORIA)
+    return true
+}
+
+// Despacho das quatro operacoes de memoria da BIR; qualquer outra op cai em X0001
+proc wasm_emitir_memoria(ins: ^bir.BirInstr, corpo: ^[dynamic]u8, erro: ^common.Diag) -> bool {
+    let op = ins.op as i32
+    if op == bir.BIR_CARREGA {
+        return wasm_emitir_carrega(ins, corpo, erro)
+    }
+    if op == bir.BIR_GRAVA {
+        return wasm_emitir_grava(ins, corpo, erro)
+    }
+    if op == bir.BIR_COPIA_MEM {
+        return wasm_emitir_copia_mem(ins, corpo, erro)
+    }
+    if op == bir.BIR_ZERA_MEM {
+        return wasm_emitir_zera_mem(ins, corpo, erro)
+    }
+    return wasm_nao_suportado(erro, ins.pos, wasm_nome_do_op(ins.op))
+}
+
+test "wasm_mem_opcodes" {
+    expect(MEM_OP_CARGA[wasm_mem_indice(bir.BC_I8 as u8)] == 0x2D)
+    expect(MEM_OP_CARGA[wasm_mem_indice(bir.BC_I16 as u8)] == 0x2F)
+    expect(MEM_OP_CARGA[wasm_mem_indice(bir.BC_I32 as u8)] == 0x28)
+    expect(MEM_OP_CARGA[wasm_mem_indice(bir.BC_I64 as u8)] == 0x29)
+    expect(MEM_OP_GRAVA[wasm_mem_indice(bir.BC_F64 as u8)] == 0x39)
+    expect(MEM_ALINHAMENTO[wasm_mem_indice(bir.BC_I16 as u8)] == 1)
+    expect(MEM_OP_CARGA[wasm_mem_indice(bir.BC_V128 as u8)] == 0)
+}

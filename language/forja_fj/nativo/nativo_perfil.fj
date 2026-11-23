@@ -1,0 +1,102 @@
+// nativo/nativo_perfil.fj - porte de compiler/nativo/nativo_perfil.c, compiler/nativo/nativo_perfil.h
+// sha256 de nativo/nativo_perfil.c: b66f1c346c96de1935dbdc64ce2c87d23c19e1ee60058b691af62e8caa5f5169
+// sha256 de nativo/nativo_perfil.h: 1f7673c0624e91b47f0884ab1427c777cb5c2bba10d28bd5bf8c4f6cfb7a2eef
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "common"
+import "nativo/bir"
+import "nativo/obj"
+import "nativo/optimizer"
+
+const PERFIL_TABELA_SIMBOLO: str = "forja_perfil_tabela"
+const PERFIL_MAGIC: u32 = 826691654
+const PERFIL_BYTES_U32: u32 = 4
+const PERFIL_BITS_BYTE: u32 = 8
+const PERFIL_ALINHAMENTO_TABELA: u32 = 8
+
+// C: nativo/nativo_perfil.c:21
+proc nativo_perfil_ler(pedido: ^NativoPedido, alvo_elf: bool, saida: ^obj.Objeto, erro: ^common.Diag) -> bool {
+    if not pedido.perfil {
+        return true
+    }
+    var n: u64 = 0
+    if alvo_elf {
+        let bytes_elf: ^u8 = rt_nativo_linux_perfil(&n)
+        return obj.coff_ler(bytes_elf, n, saida, erro)
+    }
+    let bytes_win: ^u8 = rt_nativo_win_perfil(&n)
+    return obj.coff_ler(bytes_win, n, saida, erro)
+}
+
+// C: nativo/nativo_perfil.c:32
+proc anexar_u32(b: ^[dynamic]u8, v: u32) {
+    for k in (0 as u32)..<PERFIL_BYTES_U32 {
+        let deslocado: u32 = v >> (k * PERFIL_BITS_BYTE)
+        append(b, item = common.c2f_trunc_u8(deslocado as u64))
+    }
+}
+
+// C: nativo/nativo_perfil.c:42
+// C2F-INDECIDIVEL: offsets -> []u32; quem chama aloca nfuncoes+1 posicoes (o malloc do C)
+proc colher_nomes(bir_c: ^bir.BirPrograma, textos: ^[dynamic]u8, offsets: []u32) -> u32 {
+    var n: u32 = 0
+    var nome: [512]u8 = {}
+    var i: u32 = 0
+    while i < bir_c.nfuncoes as u32 {
+        let funcao: ^bir.BirFuncao = &(bir_c.funcoes or_else {})[i as u64]
+        if optimizer.otim_perfil_proc(bir_c, funcao) {
+            optimizer.otim_perfil_nome(bir_c, funcao, nome[..], 512)
+            let tam_nome: u64 = common.c2f_strlen_b(nome[..]) as u64
+            offsets[n as u64] = len(textos^) as u32
+            n += 1
+            // o NUL do fim de cada nome entra junto (strlen + 1, como no C)
+            append(textos, items = nome[0..<(tam_nome + 1)])
+        }
+        i += 1
+    }
+    return n
+}
+
+// C: nativo/nativo_perfil.c:57
+proc nativo_perfil_tabela(programa: ^obj.Objeto, bir_c: ^bir.BirPrograma, pedido: ^NativoPedido) -> bool {
+    if not pedido.perfil {
+        return true
+    }
+    var textos: [dynamic]u8 = make([dynamic]u8, alloc = heap)
+    defer delete(textos)
+    var offsets: [dynamic]u32 = make([dynamic]u32, alloc = heap)
+    defer delete(offsets)
+    var k: u32 = 0
+    while k <= bir_c.nfuncoes as u32 {
+        append(&offsets, item = 0)
+        k += 1
+    }
+    let n: u32 = colher_nomes(bir_c, &textos, offsets[..])
+    let rdata: u32 = nativo_abrir_rdata(programa)
+    let s: ^obj.ObjSecao = &programa.secoes[rdata as u64]
+    while (len(s.bytes) as u32) % PERFIL_ALINHAMENTO_TABELA != 0 {
+        append(&s.bytes, item = 0 as u8)
+    }
+    let off: u32 = len(s.bytes) as u32
+    anexar_u32(&s.bytes, PERFIL_MAGIC)
+    anexar_u32(&s.bytes, n)
+    // cada deslocamento e relativo ao inicio da tabela: 2 palavras de cabecalho + n deslocamentos
+    let base: u32 = wrapping_mul(n + 2, PERFIL_BYTES_U32)
+    var j: u32 = 0
+    while j < n {
+        anexar_u32(&s.bytes, wrapping_add(base, offsets[j as u64]))
+        j += 1
+    }
+    append(&s.bytes, items = textos[..])
+    _ = obj.obj_simbolo_definir(programa, PERFIL_TABELA_SIMBOLO, rdata as i32, off)
+    return true
+}
+
+// testes: valores conferidos a mao contra nativo_perfil.c
+test "anexar_u32 grava os 4 bytes little-endian do magic FPF1" {
+    var b: [dynamic]u8 = make([dynamic]u8, alloc = heap)
+    defer delete(b)
+    anexar_u32(&b, PERFIL_MAGIC)
+    expect(len(b) == 4 and b[0] == 70 and b[1] == 80 and b[2] == 70 and b[3] == 49)
+}

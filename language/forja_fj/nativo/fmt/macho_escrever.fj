@@ -1,0 +1,575 @@
+// nativo/fmt/macho_escrever.fj - escritor do Mach-O arm64 dos alvos iOS (I2a layout/load commands, I2b assinatura ad-hoc)
+// Versao: 0.3.0
+// Changelog: 0.3.0 - I6: `MachoPlano.libs` = caminhos dos dylibs extras (frameworks, libobjc): um LC_LOAD_DYLIB por item depois da libSystem (ordinal 2, 3...). Sem libs, os bytes saem iguais aos da 0.2.0.
+//            0.2.0 - I5: Imagem de --modo dll vira MH_DYLIB (filetype 6): base 0, sem PAGEZERO/DYLINKER/MAIN, LC_ID_DYLIB `@rpath/<arquivo>`, flags sem PIE, execSegFlags 0.
+//                    O exe (I2) sai com os mesmos bytes de antes.
+//            0.1.0 - I2: exe MH_EXECUTE (PAGEZERO/TEXT/DATA/LINKEDIT, paginas de 16 KiB), fixups por opcodes (LC_DYLD_INFO_ONLY), libSystem,
+//                    LC_MAIN, LC_BUILD_VERSION (plataforma 7 simulador / 2 aparelho) e assinatura ad-hoc (CodeDirectory v0x20400, SHA-256 por pagina de 4 KiB).
+// Molde: gabarito do ld64 (language\gaveta\ios_prova\gabarito2, hello_opcodes). A Imagem vem do ligador ELF PIE dinamico (RVA == offset no arquivo);
+// o ligador que monta os opcodes/simbolos e chama este escritor e nativo\obj\ligar_macho.fj.
+
+import "common"
+import "std:sha" as sha
+
+pub const MACHO_BASE: u64 = 4294967296
+const MACHO_PAGINA: u32 = 16384
+const MACHO_PAGINA_HASH: u32 = 4096
+const MACHO_TAM_CABECALHO: u32 = 32
+const MACHO_TAM_CD_CABECALHO: u32 = 88
+const MACHO_TAM_SB_CABECALHO: u32 = 20
+const MACHO_LC_SEGMENTO: u32 = 25
+const MACHO_LC_SYMTAB: u32 = 2
+const MACHO_LC_DYSYMTAB: u32 = 11
+const MACHO_LC_LOAD_DYLIB: u32 = 12
+const MACHO_LC_ID_DYLIB: u32 = 13
+const MACHO_LC_LOAD_DYLINKER: u32 = 14
+const MACHO_LC_UUID: u32 = 27
+const MACHO_LC_CODE_SIGNATURE: u32 = 29
+const MACHO_LC_SOURCE_VERSION: u32 = 42
+const MACHO_LC_FUNCTION_STARTS: u32 = 38
+const MACHO_LC_DATA_IN_CODE: u32 = 41
+const MACHO_LC_BUILD_VERSION: u32 = 50
+const MACHO_LC_MAIN: u32 = 2147483688
+const MACHO_LC_DYLD_INFO_ONLY: u32 = 2147483682
+const MACHO_ESCRITA: u32 = 2147483648
+const MACHO_CMDS_FIXOS: u32 = 15
+
+// um LC_SEGMENT_64 (os campos que variam; o resto e fixo)
+struct MachoSegLc {
+    nome: str
+    vmaddr: u64
+    vmsize: u64
+    fileoff: u64
+    filesize: u64
+    prot: u32
+    nsects: u32
+}
+
+// divisao da Imagem em segmentos (tudo em bytes; RVA == offset no arquivo)
+pub struct MachoLayout {
+    texto_fim: u32
+    tem_dados: bool
+    dados_ini: u32
+    dados_arq: u32
+    dados_vm: u32
+    n_texto: u32
+    n_dados: u32
+    linkedit_off: u32
+    linkedit_vm: u64
+    dylib: bool // I5: Imagem de --modo dll = MH_DYLIB (sem PAGEZERO, base 0)
+    base: u64
+}
+
+// o que o ligador monta para o __LINKEDIT (blobs ja prontos)
+pub struct MachoPlano {
+    plataforma: u32
+    nome: str
+    rebase: [dynamic]u8
+    bind: [dynamic]u8
+    exporta: [dynamic]u8
+    funcoes: [dynamic]u8
+    simbolos: [dynamic]u8
+    nomes: [dynamic]u8
+    n_extdef: u32
+    n_undef: u32
+    entrada: u32
+    dylib: bool
+    libs: [dynamic]str // I6: nomes dos `link` de sistema alem da libSystem, na ordem dos ordinais (2, 3...)
+}
+
+struct MachoLinkedit {
+    rebase_off: u32
+    bind_off: u32
+    exporta_off: u32
+    funcoes_off: u32
+    simbolos_off: u32
+    nomes_off: u32
+    assina_off: u32
+    assina_tam: u32
+    fim: u32
+}
+
+pub proc macho_le(b: ^[dynamic]u8, valor: u64, tam: u32) {
+    var v: u64 = valor
+    for k in (0 as u32)..<tam {
+        append(b, item = (v & 255) as u8)
+        v = v >> 8
+    }
+}
+
+proc macho_be(b: ^[dynamic]u8, valor: u64, tam: u32) {
+    var k: u32 = tam
+    while k > 0 {
+        k -= 1
+        append(b, item = ((valor >> ((k as u64) * 8)) & 255) as u8)
+    }
+}
+
+// ULEB128 dos opcodes de fixup e da trie de exports
+pub proc macho_uleb(b: ^[dynamic]u8, valor: u64) {
+    var v: u64 = valor
+    var mais: bool = true
+    while mais {
+        let byte: u64 = v & 127
+        v = v >> 7
+        if v != 0 {
+            append(b, item = (byte | 128) as u8)
+        } else {
+            append(b, item = byte as u8)
+            mais = false
+        }
+    }
+}
+
+pub proc macho_cstr(b: ^[dynamic]u8, texto: str) {
+    for k in (0 as int)..<len(texto) {
+        append(b, item = texto[k])
+    }
+    append(b, item = 0 as u8)
+}
+
+// zeros ate o tamanho `ate`
+proc macho_zeros(b: ^[dynamic]u8, ate: u64) {
+    while (len(b^) as u64) < ate {
+        append(b, item = 0 as u8)
+    }
+}
+
+// texto fixo de `tam` bytes (preenchido com zeros): segname/sectname
+proc macho_nome_fixo(b: ^[dynamic]u8, texto: str, tam: u32) {
+    for k in (0 as u32)..<tam {
+        if (k as int) < len(texto) {
+            append(b, item = texto[k as int])
+        } else {
+            append(b, item = 0 as u8)
+        }
+    }
+}
+
+proc macho_alinhar(v: u32, a: u32) -> u32 {
+    return ((v + a - 1) / a) * a
+}
+
+// nome da secao Mach-O de uma secao da Imagem; none = nao existe equivalente (TLS, init_array)
+proc macho_nome_secao(n: str) -> ?str {
+    if n == ".text" {
+        return "__text"
+    }
+    if n == ".rdata" {
+        return "__const"
+    }
+    if n == ".data" {
+        return "__data"
+    }
+    if n == ".got" {
+        return "__got"
+    }
+    if n == ".bss" {
+        return "__bss"
+    }
+    return none
+}
+
+proc macho_escrevivel(s: ^PeSecao) -> bool {
+    return (s.caracteristicas & MACHO_ESCRITA) != 0
+}
+
+// divide as secoes em __TEXT (so leitura/codigo) e __DATA (escrita); recusa o que o Mach-O desta fatia nao tem
+pub proc macho_layout(im: ^Imagem, l: ^MachoLayout, erro: ^common.Diag) -> bool {
+    l.dylib = im.dll
+    l.base = MACHO_BASE
+    if im.dll {
+        l.base = 0
+    }
+    var dados_fim_arq: u32 = 0
+    var dados_fim_vm: u32 = 0
+    for i in (0 as u32)..<im.qtd_secoes {
+        let s: ^PeSecao = &im.secoes[i]
+        let nome: str = s.nome or_else ""
+        if macho_nome_secao(nome) == none {
+            let msg = format(f"Mach-O: a secao '{nome}' (TLS ou init_array) ainda nao existe no alvo iOS", alloc = heap)
+            defer delete(msg)
+            return common.diag_relatar(erro, common.X0903, 0, msg)
+        }
+        let fim: u32 = s.rva + s.tam_virtual
+        if not macho_escrevivel(s) {
+            l.n_texto += 1
+            l.texto_fim = fim
+            continue
+        }
+        if not l.tem_dados {
+            l.tem_dados = true
+            l.dados_ini = s.rva
+        }
+        l.n_dados += 1
+        dados_fim_vm = fim
+        if len(s.bytes) > 0 {
+            dados_fim_arq = s.rva + (len(s.bytes) as u32)
+        }
+    }
+    l.texto_fim = macho_alinhar(l.texto_fim, MACHO_PAGINA)
+    l.linkedit_off = l.texto_fim
+    l.linkedit_vm = l.base + (l.texto_fim as u64)
+    if l.tem_dados {
+        l.dados_arq = macho_alinhar(dados_fim_arq - l.dados_ini, MACHO_PAGINA)
+        l.dados_vm = macho_alinhar(dados_fim_vm - l.dados_ini, MACHO_PAGINA)
+        l.linkedit_off = l.dados_ini + l.dados_arq
+        l.linkedit_vm = l.base + ((l.dados_ini + l.dados_vm) as u64)
+    }
+    return true
+}
+
+proc macho_lc_cabeca(b: ^[dynamic]u8, cmd: u32, tam: u32) {
+    macho_le(b, cmd as u64, 4)
+    macho_le(b, tam as u64, 4)
+}
+
+proc macho_lc_segmento(b: ^[dynamic]u8, s: ^MachoSegLc) {
+    macho_lc_cabeca(b, MACHO_LC_SEGMENTO, 72 + (80 * s.nsects))
+    macho_nome_fixo(b, s.nome, 16)
+    macho_le(b, s.vmaddr, 8)
+    macho_le(b, s.vmsize, 8)
+    macho_le(b, s.fileoff, 8)
+    macho_le(b, s.filesize, 8)
+    macho_le(b, s.prot as u64, 4) // maxprot
+    macho_le(b, s.prot as u64, 4) // initprot
+    macho_le(b, s.nsects as u64, 4)
+    macho_le(b, 0, 4) // flags
+}
+
+// cabecalho de uma secao (section_64, 80 bytes); bss = zerofill sem bytes no arquivo
+proc macho_lc_secao(b: ^[dynamic]u8, s: ^PeSecao, segnome: str, base: u64) {
+    let nome: str = macho_nome_secao(s.nome or_else "") or_else ""
+    let codigo: bool = (s.caracteristicas & 32) != 0
+    var flags: u32 = 0
+    var alinha: u32 = 4
+    var off: u32 = s.rva
+    if codigo {
+        flags = 2147484672 // S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS
+        alinha = 2
+    } else if len(s.bytes) == 0 {
+        flags = 1 // S_ZEROFILL
+        off = 0
+    }
+    macho_nome_fixo(b, nome, 16)
+    macho_nome_fixo(b, segnome, 16)
+    macho_le(b, base + (s.rva as u64), 8)
+    macho_le(b, s.tam_virtual as u64, 8)
+    macho_le(b, off as u64, 4)
+    macho_le(b, alinha as u64, 4)
+    macho_le(b, 0, 4) // reloff
+    macho_le(b, 0, 4) // nreloc
+    macho_le(b, flags as u64, 4)
+    macho_le(b, 0, 12) // reserved1..3
+}
+
+// PAGEZERO, TEXT (+ secoes), DATA (+ secoes) e LINKEDIT, nessa ordem
+proc macho_lcs_segmentos(b: ^[dynamic]u8, im: ^Imagem, l: ^MachoLayout, le: ^MachoLinkedit) {
+    if not l.dylib {
+        var pz = MachoSegLc{nome = "__PAGEZERO", vmsize = MACHO_BASE}
+        macho_lc_segmento(b, &pz)
+    }
+    var tx = MachoSegLc{nome = "__TEXT", vmaddr = l.base, vmsize = l.texto_fim as u64, filesize = l.texto_fim as u64, prot = 5, nsects = l.n_texto}
+    macho_lc_segmento(b, &tx)
+    for i in (0 as u32)..<im.qtd_secoes {
+        if not macho_escrevivel(&im.secoes[i]) {
+            macho_lc_secao(b, &im.secoes[i], "__TEXT", l.base)
+        }
+    }
+    if l.tem_dados {
+        var dt = MachoSegLc{nome = "__DATA", vmaddr = l.base + (l.dados_ini as u64), vmsize = l.dados_vm as u64, fileoff = l.dados_ini as u64, filesize = l.dados_arq as u64, prot = 3, nsects = l.n_dados}
+        macho_lc_segmento(b, &dt)
+        for i in (0 as u32)..<im.qtd_secoes {
+            if macho_escrevivel(&im.secoes[i]) {
+                macho_lc_secao(b, &im.secoes[i], "__DATA", l.base)
+            }
+        }
+    }
+    let le_tam: u64 = (le.fim - l.linkedit_off) as u64
+    var lk = MachoSegLc{nome = "__LINKEDIT", vmaddr = l.linkedit_vm, vmsize = macho_alinhar(le.fim - l.linkedit_off, MACHO_PAGINA) as u64, fileoff = l.linkedit_off as u64, filesize = le_tam, prot = 1}
+    macho_lc_segmento(b, &lk)
+}
+
+// LC_DYLD_INFO_ONLY, SYMTAB e DYSYMTAB
+proc macho_lcs_tabelas(b: ^[dynamic]u8, p: ^MachoPlano, le: ^MachoLinkedit) {
+    macho_lc_cabeca(b, MACHO_LC_DYLD_INFO_ONLY, 48)
+    macho_le(b, le.rebase_off as u64, 4)
+    macho_le(b, len(p.rebase) as u64, 4)
+    macho_le(b, le.bind_off as u64, 4)
+    macho_le(b, len(p.bind) as u64, 4)
+    macho_le(b, 0, 16) // weak_bind e lazy_bind vazios
+    macho_le(b, le.exporta_off as u64, 4)
+    macho_le(b, len(p.exporta) as u64, 4)
+    macho_lc_cabeca(b, MACHO_LC_SYMTAB, 24)
+    macho_le(b, le.simbolos_off as u64, 4)
+    macho_le(b, (p.n_extdef + p.n_undef) as u64, 4)
+    macho_le(b, le.nomes_off as u64, 4)
+    macho_le(b, len(p.nomes) as u64, 4)
+    macho_lc_cabeca(b, MACHO_LC_DYSYMTAB, 80)
+    macho_le(b, 0, 8) // ilocalsym, nlocalsym
+    macho_le(b, 0, 4) // iextdefsym
+    macho_le(b, p.n_extdef as u64, 4)
+    macho_le(b, p.n_extdef as u64, 4) // iundefsym
+    macho_le(b, p.n_undef as u64, 4)
+    macho_le(b, 0, 48) // toc, modtab, extrefsym, indirectsym, extrel, locrel: nada
+}
+
+// uuid deterministico: SHA-256 dos bytes das secoes e do nome, com os bits de versao/variante
+proc macho_uuid(im: ^Imagem, p: ^MachoPlano, uuid: ^[16]u8) {
+    var amostra = make([dynamic]u8, alloc = heap)
+    defer delete(amostra)
+    for i in (0 as u32)..<im.qtd_secoes {
+        append(&amostra, items = im.secoes[i].bytes[..])
+    }
+    macho_cstr(&amostra, p.nome)
+    let h: [32]u8 = sha.sha256(amostra[..])
+    for k in 0..<16 {
+        uuid^[k] = h[k]
+    }
+    uuid^[6] = (uuid^[6] & 15) | 48
+    uuid^[8] = (uuid^[8] & 63) | 128
+}
+
+// I5: LC_ID_DYLIB do dylib: install name `@rpath/<arquivo>` (o host acha a lib por rpath ou por caminho absoluto), versoes 1.0.0
+proc macho_lc_id_dylib(b: ^[dynamic]u8, nome: str) {
+    let install: str = format(f"@rpath/{nome}", alloc = heap)
+    defer delete(install)
+    let tam: u32 = macho_alinhar(24 + (len(install) as u32) + 1, 8)
+    macho_lc_cabeca(b, MACHO_LC_ID_DYLIB, tam)
+    macho_le(b, 24, 4) // offset do nome
+    macho_le(b, 1, 4) // timestamp
+    macho_le(b, 65536, 4) // current_version 1.0.0
+    macho_le(b, 65536, 4) // compatibility_version 1.0.0
+    macho_nome_fixo(b, install, tam - 24)
+}
+
+// I6: `link` de sistema do iOS (objc, UIKit, Foundation, CoreFoundation, QuartzCore, CoreGraphics) -> caminho do dylib; "" = nao e um desses
+pub proc macho_caminho_lib(lib: str) -> str {
+    if lib == "objc" {
+        return "/usr/lib/libobjc.A.dylib"
+    }
+    if (lib == "UIKit") or (lib == "Foundation") or (lib == "CoreFoundation") or (lib == "QuartzCore") or (lib == "CoreGraphics") {
+        return format(f"/System/Library/Frameworks/{lib}.framework/{lib}", alloc = frame)
+    }
+    return ""
+}
+
+// I6: LC_LOAD_DYLIB de um framework ou da libobjc (versoes 1.0.0: o dyld so confere o nome)
+proc macho_lc_load_dylib(b: ^[dynamic]u8, lib: str) {
+    let caminho: str = macho_caminho_lib(lib)
+    let tam: u32 = macho_alinhar(24 + (len(caminho) as u32) + 1, 8)
+    macho_lc_cabeca(b, MACHO_LC_LOAD_DYLIB, tam)
+    macho_le(b, 24, 4)
+    macho_le(b, 2, 4)
+    macho_le(b, 65536, 4)
+    macho_le(b, 65536, 4)
+    macho_nome_fixo(b, caminho, tam - 24)
+}
+
+// DYLINKER (exe) ou ID_DYLIB (dylib), UUID, BUILD_VERSION, SOURCE_VERSION, MAIN, LOAD_DYLIB, FUNCTION_STARTS, DATA_IN_CODE e CODE_SIGNATURE
+proc macho_lcs_fim(b: ^[dynamic]u8, im: ^Imagem, p: ^MachoPlano, le: ^MachoLinkedit) {
+    if not p.dylib {
+        macho_lc_cabeca(b, MACHO_LC_LOAD_DYLINKER, 32)
+        macho_le(b, 12, 4)
+        macho_nome_fixo(b, "/usr/lib/dyld", 20)
+    } else {
+        macho_lc_id_dylib(b, p.nome)
+    }
+    var uuid: [16]u8 = {}
+    macho_uuid(im, p, &uuid)
+    macho_lc_cabeca(b, MACHO_LC_UUID, 24)
+    append(b, items = uuid[..])
+    macho_lc_cabeca(b, MACHO_LC_BUILD_VERSION, 32)
+    macho_le(b, p.plataforma as u64, 4)
+    macho_le(b, 983040, 4) // minos 15.0
+    macho_le(b, 1180928, 4) // sdk 18.5
+    macho_le(b, 1, 4) // ntools
+    macho_le(b, 3, 4) // LD
+    macho_le(b, 76481792, 4) // 1167.5
+    macho_lc_cabeca(b, MACHO_LC_SOURCE_VERSION, 16)
+    macho_le(b, 0, 8)
+    if not p.dylib {
+        macho_lc_cabeca(b, MACHO_LC_MAIN, 24)
+        macho_le(b, p.entrada as u64, 8)
+        macho_le(b, 0, 8) // stacksize
+    }
+    macho_lc_cabeca(b, MACHO_LC_LOAD_DYLIB, 56)
+    macho_le(b, 24, 4)
+    macho_le(b, 2, 4)
+    macho_le(b, 88539136, 4) // 1351.0.0
+    macho_le(b, 65536, 4) // 1.0.0
+    macho_nome_fixo(b, "/usr/lib/libSystem.B.dylib", 32)
+    for k in (0 as u64)..<(len(p.libs) as u64) {
+        macho_lc_load_dylib(b, p.libs[k])
+    }
+    macho_lc_cabeca(b, MACHO_LC_FUNCTION_STARTS, 16)
+    macho_le(b, le.funcoes_off as u64, 4)
+    macho_le(b, len(p.funcoes) as u64, 4)
+    macho_lc_cabeca(b, MACHO_LC_DATA_IN_CODE, 16)
+    macho_le(b, le.funcoes_off as u64, 4)
+    macho_le(b, 0, 4)
+    macho_lc_cabeca(b, MACHO_LC_CODE_SIGNATURE, 16)
+    macho_le(b, le.assina_off as u64, 4)
+    macho_le(b, le.assina_tam as u64, 4)
+}
+
+// bytes da assinatura (SuperBlob + CodeDirectory + hashes, sem o preenchimento) para um arquivo de `limite` bytes
+proc macho_assina_conteudo(nome: str, limite: u32) -> u32 {
+    let paginas: u32 = (limite + MACHO_PAGINA_HASH - 1) / MACHO_PAGINA_HASH
+    return MACHO_TAM_SB_CABECALHO + MACHO_TAM_CD_CABECALHO + (len(nome) as u32) + 1 + (32 * paginas)
+}
+
+// posicoes dos blobs no __LINKEDIT (8 em 8 bytes; a assinatura em 16)
+proc macho_linkedit_posicoes(p: ^MachoPlano, l: ^MachoLayout, le: ^MachoLinkedit) {
+    var pos: u32 = l.linkedit_off
+    le.rebase_off = pos
+    pos = macho_alinhar(pos + (len(p.rebase) as u32), 8)
+    le.bind_off = pos
+    pos = macho_alinhar(pos + (len(p.bind) as u32), 8)
+    le.exporta_off = pos
+    pos = macho_alinhar(pos + (len(p.exporta) as u32), 8)
+    le.funcoes_off = pos
+    pos = macho_alinhar(pos + (len(p.funcoes) as u32), 8)
+    le.simbolos_off = pos
+    pos = pos + (len(p.simbolos) as u32)
+    le.nomes_off = pos
+    pos = macho_alinhar(pos + (len(p.nomes) as u32), 16)
+    le.assina_off = pos
+    le.assina_tam = macho_alinhar(macho_assina_conteudo(p.nome, pos), 16)
+    le.fim = pos + le.assina_tam
+}
+
+// copia um blob para a posicao `off` do arquivo
+proc macho_blob(b: ^[dynamic]u8, blob: ^[dynamic]u8, off: u32) {
+    macho_zeros(b, off as u64)
+    append(b, items = blob^[..])
+}
+
+// escreve CodeDirectory (SHA-256 por pagina de 4 KiB de tudo antes da assinatura) dentro de um SuperBlob
+proc macho_assinar(b: ^[dynamic]u8, p: ^MachoPlano, l: ^MachoLayout, le: ^MachoLinkedit) {
+    let limite: u32 = le.assina_off
+    let paginas: u32 = (limite + MACHO_PAGINA_HASH - 1) / MACHO_PAGINA_HASH
+    let conteudo: u32 = macho_assina_conteudo(p.nome, limite)
+    let cd_tam: u32 = conteudo - MACHO_TAM_SB_CABECALHO
+    let hash_off: u32 = MACHO_TAM_CD_CABECALHO + (len(p.nome) as u32) + 1
+    var sb = make([dynamic]u8, alloc = heap)
+    defer delete(sb)
+    macho_be(&sb, 4208856256, 4) // 0xfade0cc0 SuperBlob
+    macho_be(&sb, conteudo as u64, 4)
+    macho_be(&sb, 1, 4)
+    macho_be(&sb, 0, 4) // CSSLOT_CODEDIRECTORY
+    macho_be(&sb, MACHO_TAM_SB_CABECALHO as u64, 4)
+    macho_be(&sb, 4208856066, 4) // 0xfade0c02 CodeDirectory
+    macho_be(&sb, cd_tam as u64, 4)
+    macho_be(&sb, 132096, 4) // versao 0x20400
+    macho_be(&sb, 131074, 4) // flags 0x20002: adhoc | linker-signed
+    macho_be(&sb, hash_off as u64, 4)
+    macho_be(&sb, MACHO_TAM_CD_CABECALHO as u64, 4) // identOffset
+    macho_be(&sb, 0, 4) // nSpecialSlots
+    macho_be(&sb, paginas as u64, 4)
+    macho_be(&sb, limite as u64, 4)
+    macho_be(&sb, 32, 1) // hashSize
+    macho_be(&sb, 2, 1) // SHA-256
+    macho_be(&sb, 0, 1) // platform
+    macho_be(&sb, 12, 1) // pageSize = 2^12
+    macho_be(&sb, 0, 16) // spare2, scatter, team, spare3
+    macho_be(&sb, 0, 8) // codeLimit64
+    macho_be(&sb, 0, 8) // execSegBase = inicio do __TEXT
+    macho_be(&sb, l.texto_fim as u64, 8) // execSegLimit = tamanho do __TEXT
+    var exec_flags: u64 = 1 // CS_EXECSEG_MAIN_BINARY (dylib: 0)
+    if p.dylib {
+        exec_flags = 0
+    }
+    macho_be(&sb, exec_flags, 8)
+    macho_cstr(&sb, p.nome)
+    for k in (0 as u32)..<paginas {
+        let ini: u32 = k * MACHO_PAGINA_HASH
+        var fim: u32 = ini + MACHO_PAGINA_HASH
+        if fim > limite {
+            fim = limite
+        }
+        var h: [32]u8 = sha.sha256(b^[(ini as u64)..<(fim as u64)])
+        append(&sb, items = h[..])
+    }
+    append(b, items = sb[..])
+    macho_zeros(b, (le.assina_off + le.assina_tam) as u64)
+}
+
+// monta o arquivo: cabecalho + load commands, secoes em offset == RVA, blobs do __LINKEDIT e a assinatura
+pub proc macho_escrever(im: ^Imagem, p: ^MachoPlano, saida: ^[dynamic]u8, erro: ^common.Diag) -> bool {
+    var l = MachoLayout{}
+    if not macho_layout(im, &l, erro) {
+        return false
+    }
+    var le = MachoLinkedit{}
+    macho_linkedit_posicoes(p, &l, &le)
+    var lcs = make([dynamic]u8, alloc = heap)
+    defer delete(lcs)
+    macho_lcs_todos(&lcs, im, &l, p, &le)
+    var n_cmds: u32 = MACHO_CMDS_FIXOS
+    var tipo_arquivo: u64 = 2 // MH_EXECUTE
+    var flags_cabecalho: u64 = 2097285 // NOUNDEFS | DYLDLINK | TWOLEVEL | PIE
+    if l.dylib {
+        n_cmds -= 2 // sem PAGEZERO/DYLINKER/MAIN, com ID_DYLIB
+        tipo_arquivo = 6 // MH_DYLIB
+        flags_cabecalho = 1048709 // NOUNDEFS | DYLDLINK | TWOLEVEL | NO_REEXPORTED_DYLIBS
+    }
+    if l.tem_dados {
+        n_cmds += 1
+    }
+    n_cmds += len(p.libs) as u32
+    if ((MACHO_TAM_CABECALHO as u64) + (len(lcs) as u64)) > (im.secoes[0].rva as u64) {
+        return common.diag_relatar(erro, common.X0903, 0, "Mach-O: os load commands passam da primeira secao")
+    }
+    macho_le(saida, 4277009103, 4) // MH_MAGIC_64
+    macho_le(saida, 16777228, 4) // CPU_TYPE_ARM64
+    macho_le(saida, 0, 4)
+    macho_le(saida, tipo_arquivo, 4)
+    macho_le(saida, n_cmds as u64, 4)
+    macho_le(saida, len(lcs) as u64, 4)
+    macho_le(saida, flags_cabecalho, 4)
+    macho_le(saida, 0, 4)
+    append(saida, items = lcs[..])
+    for i in (0 as u32)..<im.qtd_secoes {
+        if len(im.secoes[i].bytes) > 0 {
+            macho_zeros(saida, im.secoes[i].rva as u64)
+            append(saida, items = im.secoes[i].bytes[..])
+        }
+    }
+    macho_blob(saida, &p.rebase, le.rebase_off)
+    macho_blob(saida, &p.bind, le.bind_off)
+    macho_blob(saida, &p.exporta, le.exporta_off)
+    macho_blob(saida, &p.funcoes, le.funcoes_off)
+    macho_blob(saida, &p.simbolos, le.simbolos_off)
+    macho_blob(saida, &p.nomes, le.nomes_off)
+    macho_zeros(saida, le.assina_off as u64)
+    macho_assinar(saida, p, &l, &le)
+    return true
+}
+
+// todos os load commands na ordem do ld64 (sem DATA_CONST nem stubs: esta fatia nao tem foreign lazy)
+proc macho_lcs_todos(b: ^[dynamic]u8, im: ^Imagem, l: ^MachoLayout, p: ^MachoPlano, le: ^MachoLinkedit) {
+    macho_lcs_segmentos(b, im, l, le)
+    macho_lcs_tabelas(b, p, le)
+    macho_lcs_fim(b, im, p, le)
+}
+
+test "macho_uleb_um_e_dois_bytes" {
+    var b = make([dynamic]u8, alloc = heap)
+    defer delete(b)
+    macho_uleb(&b, 127)
+    macho_uleb(&b, 128)
+    macho_uleb(&b, 16384)
+    expect(len(b) == 6)
+    expect((b[0] == 127) and (b[1] == 128) and (b[2] == 1))
+    expect((b[3] == 128) and (b[4] == 128) and (b[5] == 1))
+}
+
+test "macho_be_e_le" {
+    var b = make([dynamic]u8, alloc = heap)
+    defer delete(b)
+    macho_be(&b, 4208856256, 4)
+    macho_le(&b, 4277009103, 4)
+    expect((b[0] == 250) and (b[1] == 222) and (b[2] == 12) and (b[3] == 192))
+    expect((b[4] == 207) and (b[5] == 250) and (b[6] == 237) and (b[7] == 254))
+}

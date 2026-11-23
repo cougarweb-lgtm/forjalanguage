@@ -1,0 +1,255 @@
+// driver/editar_nos.fj - porte de compiler/driver/editar_nos.c
+// sha256 de driver/editar_nos.c: 7a6606027460ed942037db5a489809c54c15a6eea09806c933d478be2b1d78e7
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "common"
+import "frontend"
+import "semantic"
+
+// C: driver/editar_nos.c:19
+// A compilacao so de sintaxe do projeto (nasce na 1a vez e fica em p.sintatica). none = erro em p.erro.
+proc compilacao_sintatica(p: ^Plano) -> ?^Compilacao {
+    if p.sintatica != none {
+        return p.sintatica
+    }
+    let principal: ^Compilacao = (p.q as ^Consulta).c as ^Compilacao
+    let c: ^Compilacao = new(Compilacao, alloc = heap)
+    if not common.fonte_ler(&c.fonte, principal.fonte.caminho) {
+        delete(c)
+        let cam: str = principal.fonte.caminho or_else ""
+        let msg = format(f"nao consegui reler '{cam}'", alloc = heap)
+        defer delete(msg)
+        _ = plano_erro(p, msg)
+        return none
+    }
+    iniciar_compilacao(c)
+    c.opcoes = principal.opcoes
+    c.sem.lista.teto = opcoes_max_erros(c.opcoes)
+    if not analisar_sintaxe(c, true) {
+        liberar_compilacao(c)
+        delete(c)
+        _ = plano_erro(p, "o projeto nao passou na analise de sintaxe ao resolver o id")
+        return none
+    }
+    p.sintatica = c
+    return c
+}
+
+// C: driver/editar_nos.c:45
+proc ler_par(obj_c: ?^JsonValor, chave: str, linha: ^u32, coluna: ^u32) -> bool {
+    let lista: ?^JsonValor = json_membro(obj_c, chave)
+    if (((lista == none) or (common.c2f_s2u_32((lista as ^JsonValor).tipo) != (JSON_LISTA as u32))) or ((lista as ^JsonValor).filho == none)) or (((lista as ^JsonValor).filho as ^JsonValor).prox == none) {
+        return false
+    }
+    linha^ = ((lista as ^JsonValor).filho as ^JsonValor).numero as u32
+    coluna^ = (((lista as ^JsonValor).filho as ^JsonValor).prox as ^JsonValor).numero as u32
+    return true
+}
+
+// C: driver/editar_nos.c:56
+// O arquivo do no 'id' no modulo k: o do modulo; num pacote (pasta com 2+ arquivos), o da declaracao de topo cujo id abre o 'id'.
+proc arquivo_do_no_do_modulo(c: ?^Compilacao, k: u32, id: str) -> ?str {
+    let cc: ^Compilacao = c as ^Compilacao
+    let f: ^common.Fonte = &cc.fonte
+    var primeiro: u32 = 0
+    let n: u32 = frontend.modulos_trechos_do_pacote(&cc.modulos, f.ntrechos, k as u8, &primeiro)
+    if f.ntrechos == 0 {
+        return f.caminho
+    }
+    var d: ?^frontend.Decl = cc.parser.programa.primeira
+    while (n > 1) and (d != none) {
+        let dd: ^frontend.Decl = d as ^frontend.Decl
+        if ((dd.modulo as u32) == k) and decl_abre_o_id(cc, dd, id) {
+            return (f.trechos or_else {})[common.fonte_trecho_do_offset(f, dd.pos)].caminho
+        }
+        d = dd.prox
+    }
+    return (f.trechos or_else {})[primeiro].caminho
+}
+
+// a base do id da declaracao d (AstIdBaseDaDecl) abre o 'id'?
+proc decl_abre_o_id(c: ^Compilacao, d: ^frontend.Decl, id: str) -> bool {
+    var base = make([dynamic]u8, alloc = heap)
+    defer delete(base)
+    semantic.ast_id_base_da_decl(&base, &c.modulos, &c.nomes, d)
+    return id_abre_com_base(id, base[..])
+}
+
+// o id abre com a base: a base vem inteira e o id acaba ali ou tem '/' logo depois (strncmp + id[n] do C)
+proc id_abre_com_base(id: str, base: []u8) -> bool {
+    let n: int = len(base)
+    if n > len(id) {
+        return false
+    }
+    let ib: []u8 = as_bytes(id)
+    if common.c2f_memcmp(ib[0..<n], base) != 0 {
+        return false
+    }
+    return (n == len(id)) or (ib[n] == 47) // '/'
+}
+
+// C: driver/editar_nos.c:76
+// O arquivo do modulo cujo caminho abre o id ("jogo/fisica:aceleracao/corpo[0]" -> jogo/fisica); o de nome mais longo vence ("std:mem" e "std:mem2"). none = nenhum.
+proc arquivo_do_id(c: ?^Compilacao, id: str) -> ?str {
+    let cc: ^Compilacao = c as ^Compilacao
+    let ib: []u8 = as_bytes(id)
+    var achado: ?str = none
+    var melhor: int = 0
+    for k in (0 as u32)..<cc.modulos.n {
+        let caminho: i32 = cc.modulos.itens[k].caminho
+        let n: int = common.interner_tam(&cc.nomes, caminho) as int
+        if (n < melhor) or (not common.c2f_prefixo_igual(id, common.interner_texto(&cc.nomes, caminho), n)) or (n >= len(id)) or (ib[n] != 58) { // ':'
+            continue
+        }
+        melhor = n
+        achado = arquivo_do_no_do_modulo(c, k, id)
+    }
+    return achado
+}
+
+// C: driver/editar_nos.c:93
+// A faixa [pos, fim) do no com esse id (posicoes locais ao arquivo; *arquivo = o arquivo do no). false = erro em p.erro.
+proc faixa_do_no(p: ^Plano, id: str, arquivo: ^?str, faixa: ^Edicao) -> bool {
+    let c: ?^Compilacao = compilacao_sintatica(p)
+    if c == none {
+        return false
+    }
+    let cc: ^Compilacao = c as ^Compilacao
+    var saida = make([dynamic]u8, alloc = heap)
+    defer delete(saida)
+    var arena: common.Arena = common.Arena{}
+    defer common.arena_liberar(&arena)
+    var erro: str = ""
+    var pedido: semantic.AstPedido = semantic.AstPedido{programa = &cc.parser.programa, fonte = &cc.fonte, nomes = &cc.nomes, modulos = &cc.modulos, diag = &cc.diag, no = id, projeto = true}
+    if not semantic.ast_imprimir(&pedido, &saida, &erro) {
+        let msg = format(f"no inexistente: '{id}' (o id vem de 'forja ast --projeto', campo \"id\")", alloc = heap)
+        defer delete(msg)
+        return plano_erro(p, msg)
+    }
+    let txt: str = from_bytes(saida[..], alloc = heap)
+    defer delete(txt)
+    let doc: ?^JsonValor = json_ler(&arena, txt, len(saida) as u64)
+    let sub: ?^JsonValor = json_membro(doc, "subarvore")
+    arquivo^ = arquivo_do_id(c, id)
+    let ok: bool = (arquivo^ != none) and ler_par(sub, "pos", &faixa.linha, &faixa.coluna) and ler_par(sub, "fim", &faixa.linha_fim, &faixa.coluna_fim)
+    if not ok {
+        let msg2 = format(f"o no '{id}' nao tem posicao (no criado pela semantica): nao se troca", alloc = heap)
+        defer delete(msg2)
+        return plano_erro(p, msg2)
+    }
+    return true
+}
+
+// C: driver/editar_nos.c:118
+proc editar_trocar_no(p: ^Plano, id: str, texto: str) -> bool {
+    var arquivo: ?str = none
+    var faixa: Edicao = Edicao{}
+    if not faixa_do_no(p, id, &arquivo, &faixa) {
+        return false
+    }
+    return plano_trocar_faixa(p, arquivo, &faixa, texto)
+}
+
+// C: driver/editar_nos.c:128
+proc token_em(q: ^Consulta, i: u32) -> ^frontend.Token {
+    return &q.fim.toks[i as u64]
+}
+
+// C: driver/editar_nos.c:134
+proc chaves_do_corpo(p: ^Plano, d: ?^frontend.Decl, abre: ^u32, fecha: ^u32) -> bool {
+    let q: ?^Consulta = p.q
+    let fim: u32 = frontend.ast_fim_decl(&(q as ^Consulta).fim, d)
+    var i: u32 = 0
+    let n: u32 = (len((q as ^Consulta).fim.toks) as u64) as u32
+    while (i < n) and (token_em(q as ^Consulta, i).off < fim) {
+        i += 1
+    }
+    if ((i == 0) or (((d as ^frontend.Decl).tipo_no != (frontend.D_PROC as u8)) and ((d as ^frontend.Decl).tipo_no != (frontend.D_TEST as u8)))) or (common.c2f_b2i32((d as ^frontend.Decl).externo) != 0) {
+        let msg_1 = format(f"so proc e test (com corpo) tem corpo para trocar", alloc = heap)
+        defer delete(msg_1)
+        return plano_erro(p, msg_1)
+    }
+    fecha^ = i - 1
+    abre^ = (q as ^Consulta).fim.par[fecha^ as u64]
+    if ((token_em(q as ^Consulta, fecha^).tipo != (frontend.TK_RBRACE as u8)) or (abre^ == (frontend.AST_FIM_NENHUM as u32))) or (token_em(q as ^Consulta, abre^).tipo != (frontend.TK_LBRACE as u8)) {
+        let msg_2 = format(f"nao achei as chaves do corpo", alloc = heap)
+        defer delete(msg_2)
+        return plano_erro(p, msg_2)
+    }
+    return true
+}
+
+// C: driver/editar_nos.c:148
+proc inicio_da_linha_2(texto: []u8, off: u64) -> u64 {
+    var off_v: u64 = off
+    while (off_v > 0) and (texto[off_v - 1] != 10) { // '\n'
+        off_v -= 1
+    }
+    return off_v
+}
+
+// C: driver/editar_nos.c:155
+proc so_espacos(texto: []u8, de: u64, ate: u64) -> bool {
+    for k in de..<ate {
+        if (texto[k] != 32) and (texto[k] != 9) { // ' ' '\t'
+            return false
+        }
+    }
+    return true
+}
+
+// C: driver/editar_nos.c:165
+// O texto que fica entre '{' e '}': quebra de linha, o corpo (sem as quebras do fim) e a quebra que leva o '}' para a linha dele.
+// Se o '}' nao abre a linha, a indentacao dele e a da linha do '{'. *fim_troca = onde a troca vai (o '}' ou o inicio da indentacao dele).
+proc miolo(q: ^Consulta, abre: u32, fecha: u32, corpo: str, miolo: ^[dynamic]u8, fim_troca: ^u64) {
+    let texto: []u8 = (q.c as ^Compilacao).fonte.texto
+    let pos_fecha: u64 = token_em(q, fecha).off as u64
+    let ini_linha: u64 = inicio_da_linha_2(texto, pos_fecha)
+    let abre_a_linha: bool = so_espacos(texto, ini_linha, pos_fecha)
+    var tam_corpo: int = len(corpo)
+    while (tam_corpo > 0) and ((corpo[tam_corpo - 1] == 10) or (corpo[tam_corpo - 1] == 13)) { // '\n' '\r'
+        tam_corpo -= 1
+    }
+    fim_troca^ = pos_fecha
+    if abre_a_linha {
+        fim_troca^ = ini_linha
+    }
+    append(miolo, items = as_bytes("\n"))
+    if tam_corpo > 0 {
+        let cb: []u8 = as_bytes(corpo)
+        append(miolo, items = cb[0..<tam_corpo])
+        append(miolo, items = as_bytes("\n"))
+    }
+    if not abre_a_linha {
+        let ini_abre: u64 = inicio_da_linha_2(texto, token_em(q, abre).off as u64)
+        var fim_abre: u64 = ini_abre
+        while (texto[fim_abre] == 32) or (texto[fim_abre] == 9) { // ' ' '\t'
+            fim_abre += 1
+        }
+        append(miolo, items = texto[(ini_abre as int)..<(fim_abre as int)])
+    }
+}
+
+// C: driver/editar_nos.c:186
+proc editar_trocar_corpo(p: ^Plano, id: str, texto: str) -> bool {
+    let q: ^Consulta = p.q as ^Consulta
+    let d: ?^frontend.Decl = consulta_achar_decl(q, id)
+    var abre: u32 = 0
+    var fecha: u32 = 0
+    if d == none {
+        let msg = format(f"'{id}' nao e declaracao do projeto (use o nome ou o id de 'forja consultar simbolos')", alloc = heap)
+        defer delete(msg)
+        return plano_erro(p, msg)
+    }
+    if not chaves_do_corpo(p, d, &abre, &fecha) {
+        return false
+    }
+    var corpo_novo = make([dynamic]u8, alloc = heap)
+    defer delete(corpo_novo)
+    var fim_troca: u64 = 0
+    miolo(q, abre, fecha, texto, &corpo_novo, &fim_troca)
+    let novo: str = from_bytes(corpo_novo[..], alloc = heap)
+    defer delete(novo)
+    return plano_trocar_offsets(p, token_em(q, abre).off + 1, fim_troca as u32, novo)
+}

@@ -1,0 +1,100 @@
+CENSO P64 (M6 DWARF/gdb) - backend x64 da forja 0.19.2, medido por leitura do codigo em 15/11/2026.
+Escopo: so leitura. Nenhum arquivo de compiler\ ou runtime\ foi alterado.
+
+== (a1) IrInstr.pos ate o MInstr e o offset ==
+
+Cadeia (todos os saltos conferidos por Read, arquivo:linha):
+  1. ir\ir.h:410           IrInstr.pos (offset na fonte).
+  2. nativo\bir\bir_construir.c:450   BirConstruirInstr: c->atual = i (o IrInstr em construcao).
+  3. nativo\bir\bir_base.c:83         BirEmitir: BirInstr.pos = c->atual->pos (BIR_SEM_POS se c->atual == NULL).
+  4. nativo\bir\bir.h:116             BirInstr.pos "offset na fonte (IrInstr.pos) ou BIR_SEM_POS".
+  5. nativo\x64\x64_isel.c:350        X64Selecionar: c->instr = i (o BirInstr corrente; NULL no prologo e no epilogo).
+  6. nativo\x64\x64_emitir.c:63       X64Emitir: mi.pos = PosDoErro(c) = c->instr->pos; sem instrucao, c->f->pos; BIR_SEM_POS vira 0.
+  7. nativo\x64\x64.h:57              MInstr.pos (campo). MInstr.bir existe mas nao e preenchido aqui.
+  8. nativo\x64\x64_emitir.c:64-70    X64Emitir: depois de codificar (BufAnexarN dos bytes), X64ListarInstr(c, &mi, tam) com o offset
+                                      X64Offset(c) - tam. Ponto natural do gancho do DbgPrograma (offset + pos no mesmo lugar).
+  9. nativo\x64\x64_listar.c:69       X64ListarInstr/LocalNaBir: registro->pos = c->instr->pos (so com --debug-code).
+ 10. nativo\x64\x64_rastro.c:58       FRT1 (--rastreio): novo->pos = c->instr->pos; posicao convertida por
+                                      FonteLocalizarNoArquivo(c->p->fonte, pos) (x64_rastro.c:121) -> arquivo, linha, coluna.
+
+Conclusao (a1): IrInstr.pos chega ao MInstr.pos por X64Emitir (ponto unico de emissao). O offset final
+  da instrucao em .text e X64Offset(c) - tam (x64_listar.c:79). Para o DbgPrograma (D-M6-2) o gancho e
+  X64Emitir: gravar o par (offset, pos) SO quando pos muda e pos != BIR_SEM_POS (o 0 de PosDoErro NAO
+  pode virar linha: e o fallback de erro). Inicio/fim de proc: x64_gerar.c:113 (c->inicio) e 119-122
+  (depois de GerarCodigo). Nome/simbolo: c->p->simbolos[c->f->simbolo].nome (x64_listar.c:32).
+  Limitacao: o prologo e o epilogo saem com pos = f->pos (PosDoErro, x64_emitir.c:53) quando nao ha
+  instrucao; o DbgPrograma deve marcar esses offsets com a linha da 1a instrucao do corpo (mesma regra do
+  diagnostico, x64_emitir.c:4 changelog 0.1.3), nao com 0.
+
+== (a2) Todo local/parametro NOMEADO tem casa fixa na pilha (slot rbp) em dev? ==
+
+RESULTADO: SIM. Nenhum local nomeado fica em registrador. PARA do contrato NAO disparado.
+
+Fatos (x64_alocar.c header 0.4.0: "degrau 0: todo vreg vive num slot de 8 bytes da pilha, sem otimizador"):
+  - AlocDeslocamento (x64_alocar.c:28-35):
+      vreg < nparams e AbiWinParamEmBytes  -> [rbp - 8*(nvregs - nparams + ordem + 1)]   (ponteiro do agregado de param 1/2/4/8 B)
+      vreg < nparams                       -> [rbp + AbiWinParamRbp(vreg + oculto)] = [rbp + 16 + 8*k] (home area / pilha do chamador)
+      vreg >= nparams                      -> [rbp - 8*(vreg - nparams + 1)]
+  - AlocSlot (x64_alocar.c:37) e o unico caminho de vreg para memoria. Nao existe alocacao em registrador.
+    Busca por "AlocReg|RegDeVreg|reg_vreg" em nativo\: zero ocorrencias.
+  - Memoria explicita (agregados e escalar com &): BirFuncao.slots (bir.h:122,134), posicionada por
+    QuadroPosicionarSlots (x64_quadro.c:49-60) em [rbp - slot_off[k]] (x64_isel_mem.c:16, x64_interno.h:92).
+  - Parametros: AbiWinParamRbp(k) = 16 + 8k (abi_win.c:76); a prologo copia rcx,rdx,r8,r9 para a home
+    area (x64_quadro.c:188, GuardarHome). Tudo rbp-relativo.
+  - Dev e release: a alocacao nao le o modo (grep "release|modo" em nativo\x64 = so 1 ocorrencia, sem efeito
+    no alocador). Logo a premissa vale nos dois.
+  - Os 2 SOs: AlocDeslocamento nao le o SO. Mesmo slot no Windows e no ELF.
+
+Onde ficam NOME e TipoId (dado que o DWARF/PDB precisa e hoje NAO chega ao backend):
+  - Parametros: IrParam{nome, tipo} (ir\ir.h:423) em IrFuncao.params (ir.h:428). Nome e TipoId EXISTEM no IR.
+    Na BIR/x64 o parametro vira so vreg com classe BC_* (bir.h); nome e TipoId NAO descem.
+  - Locais let/var: nome = Stmt.nome (frontend\ast.h:256), TipoId = Stmt.tipo_local (ast.h:258),
+    numero = Stmt.local_id (ast.h:259). IR_LOCAL (ir.h:70) carrega destino = local_id e tipo = TipoId,
+    MAS NAO o nome (lower_stmt.c:33-37 nao preenche IrInstr.nome). BIR: so classe do vreg.
+    => P65 precisa levar o nome: candidato = IrInstr.nome no IR_LOCAL (campo livre na tabela de ir.h:70)
+       ou tabela IrFuncao.nomes_locais[local_id]. DECISAO P65 (nao tomada aqui).
+  - Locais nomeados em outras formas (todos IR_LOCAL com nome em Stmt ou no no AST):
+      lower_stmt.c:33  let/var (ST_LET/ST_VAR)            - NOMEADO
+      lower_stmt.c:318 let multiplo (NomeLet.nome)        - NOMEADO (nome->local_id, nome->tipo)
+      lower_mapa.c:86  LocalDoFor (variavel do for)       - NOMEADO (checar o nome no Stmt de ST_FOR)
+      lower_fluxo.c:148 ligacao de 'switch r in'           - NOMEADO (origem->local_id, ligacao)
+    Sem nome (temporarios, nao entram no DWARF): lower_call.c:71,367; lower_expr.c:217; lower_fluxo.c:77;
+      lower_stmt.c:269; lower_v19.c:253,271; lower_lista_fixa.c:55; lower_memoria.c:249; lower_soa.c:117;
+      lower_vetor.c:95; lower_ops.c:94.
+
+Agregados nomeados (struct, [N]T, str, []T): IR_LOCAL de agregado vira BirNovoVreg (I64 = endereco) +
+  BirNovoSlot (bir_construir_mem.c:250-265) e BIR_END_SLOT a cada definicao (bir_construir_mem.c:264).
+  O slot e a CASA FIXA do dado (rbp - slot_off[k]); o vreg e so o ponteiro (tambem rbp). Para o DWARF,
+  a localizacao do agregado = o slot k (DW_OP_fbreg de slot_off[k]), nao o vreg.
+  Escalar com '&' (BirLocalEmMemoria, bir_interno.h:215): tambem vive num slot.
+
+== (a3) Todo proc fj_ tem prologo push rbp / mov rbp,rsp? ==
+
+RESULTADO: SIM, sem excecao em codigo BIR. Lista de excecoes = VAZIA para fj_ e para o forja_programa.
+
+Caminho de todo proc BIR (x64_gerar.c:95-124):
+  GerarFuncao -> GerarCodigo (x64_gerar.c:78-92) -> QuadroPrologo (x64_quadro.c:278) -> SalvarRbp
+  (x64_quadro.c:229-238): FX_PUSH64_R rbp; FX_MOV64_RR rbp,rsp. A marca push e mov ficam em c->prologo.
+  Nao ha ramo "folha" nem "sem quadro": GerarCodigo chama QuadroPrologo sempre.
+  Sondagem (>= 4096 B, x64_quadro.c:116,282) fica DEPOIS do push/mov, como exige o unwind.
+
+Entradas que NAO sao BirFuncao (para a lista de excecoes pedida):
+  - fjt_<nome> (stub de callback SysV): x64_entrada_sysv.c:90 emite PUSH rbp + MOV rbp,rsp tambem.
+    Logo NAO e excecao. Tem o mesmo formato de frame para o unwind e o gdb.
+  - Nenhum outro simbolo de proc fj_ e gerado sem GerarFuncao (leitura de x64_gerar.c: so GerarFuncao e as
+    entradas SysV). O runtime C, se aparecer no .text, NAO foi verificado nesta leitura (nao e fj_).
+
+Nota de simbolo: o nome do simbolo e "fj_" + chave (bir_base.c:266, emit_c_*.c). Proc de modulo importado
+  usa o nome de modulo (common\nome_modulo.h). Os 6 casos do P64 cobrem isso (break em proc de modulo).
+
+== (a4) Premissas usadas em P65..P68 (confirmadas por esta leitura) ==
+  - Offsets por instrucao: X64Offset(c) - tam, em X64Emitir (x64_emitir.c:70, x64_listar.c:79).
+  - Inicio/fim de proc: c->inicio (x64_gerar.c:113), fim = X64Offset depois de GerarCodigo (x64_gerar.c:119).
+  - Linha: FonteLocalizarNoArquivo(c->p->fonte, pos) (x64_rastro.c:121).
+  - Slot de param: AbiWinParamRbp(k + oculto) (x64_alocar.c:33); de vreg: AlocDeslocamento (x64_alocar.c:28).
+  - Slot de agregado: slot_off[k] (x64_gerar.c:103-105), com QuadroPosicionarSlots.
+  - Nome e TipoId de local NAO estao no BIR nem no x64 hoje (ver a2): P65 cria o caminho.
+
+== Itens aguardando decisao (nao bloqueiam P64) ==
+  - Nome de local: IrInstr.nome em IR_LOCAL x tabela IrFuncao (P65 decide com o Sonnet medium; ambos cabem em D-M6-2).
+  - O prologo/epilogo sem pos: usar a 1a instrucao do corpo (regra do x64_emitir.c:4), nao 0.

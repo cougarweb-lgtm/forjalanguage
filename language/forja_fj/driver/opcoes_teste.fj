@@ -1,0 +1,381 @@
+// driver/opcoes_teste.fj - testes do porte de driver\{opcoes, main_opcoes, main_despacho, main, carga_pacote, limites, erro_sistema}.c (G3, P-driver DA)
+// Versao: 0.4.0
+// Changelog: 0.4.0 - I1: testes dos alvos aarch64-apple-ios e -ios-sim (build recusado ate a I2, run/test recusados).
+// Changelog: 0.3.0 - A4.2: tabela de opcoes com 37 (--runpath).
+// Changelog: 0.2.0 - A4.1: testes do alvo aarch64-linux-android (build/--modo dll aceitos; run/test recusados; a64 dll segue recusado)
+// Changelog: 0.1.0 - G3 P-driver DA: valores conferidos contra o forja.exe do C (compiler\forja.exe) e contra o texto do C; sem arquivo no disco alem de pastas que existem sempre.
+
+import "std:os"
+import "common"
+
+proc opt_ler(texto: []str) -> ?str {
+    var o: Opcoes = Opcoes{}
+    return opcoes_ler(len(texto) as i32, texto, &o)
+}
+
+proc texto_win(codigo: u32, buffer: []u8) -> str {
+    erro_win_texto(codigo, buffer, 256)
+    return from_bytes(buffer[0..<common.c2f_strlen_b(buffer)], alloc = frame)
+}
+
+test "opcoes_ler_valores_e_marcas" {
+    var argv: [8]str = {"forja", "build", "-o", "x.exe", "--release", "--max-erros", "5", "a.fj"}
+    var o: Opcoes = Opcoes{}
+    let erro: ?str = opcoes_ler(8, argv[..], &o)
+    expect(erro == none)
+    expect((o.comando or_else "") == "build")
+    expect((o.saida or_else "") == "x.exe")
+    expect(o.release)
+    expect((o.max_erros or_else "") == "5")
+    expect((o.entrada or_else "") == "a.fj")
+    expect(not o.suporte)
+}
+
+test "opcoes_alvo_a64_so_build" {
+    var b: [5]str = {"forja", "build", "--target", "aarch64-linux", "a.fj"}
+    var o: Opcoes = Opcoes{}
+    expect(opcoes_ler(5, b[..], &o) == none)
+    expect(alvo_eh_a64(&o))
+    expect(not alvo_eh_linux(&o))
+    expect(not alvo_eh_wasm(&o))
+}
+
+test "opcoes_alvo_android_build_dll_e_recusa_run_test" {
+    var b: [5]str = {"forja", "build", "--target", "aarch64-linux-android", "a.fj"}
+    var o: Opcoes = Opcoes{}
+    expect(opcoes_ler(5, b[..], &o) == none)
+    expect(alvo_eh_android(&o))
+    expect(alvo_eh_a64(&o))
+    expect(not alvo_eh_linux(&o))
+    opcoes_resolver_backend(&o)
+    expect(recusa_do_alvo_a64(&o) == none)
+    var d: [7]str = {"forja", "build", "--modo", "dll", "--target", "aarch64-linux-android", "a.fj"}
+    var od: Opcoes = Opcoes{}
+    expect(opcoes_ler(7, d[..], &od) == none)
+    opcoes_resolver_backend(&od)
+    expect(recusa_do_alvo_a64(&od) == none)
+    var r: [5]str = {"forja", "run", "--target", "aarch64-linux-android", "a.fj"}
+    var orun: Opcoes = Opcoes{}
+    expect(opcoes_ler(5, r[..], &orun) == none)
+    opcoes_resolver_backend(&orun)
+    expect(recusa_do_alvo_a64(&orun) != none)
+    var t: [5]str = {"forja", "test", "--target", "aarch64-linux-android", "a.fj"}
+    var ot: Opcoes = Opcoes{}
+    expect(opcoes_ler(5, t[..], &ot) == none)
+    opcoes_resolver_backend(&ot)
+    expect(recusa_do_alvo_a64(&ot) != none)
+}
+
+test "opcoes_alvo_ios_build_aceito_run_test_dll_recusados" {
+    var b: [5]str = {"forja", "build", "--target", "aarch64-apple-ios", "a.fj"}
+    var o: Opcoes = Opcoes{}
+    expect(opcoes_ler(5, b[..], &o) == none)
+    expect(alvo_eh_ios(&o))
+    expect(alvo_eh_a64(&o))
+    opcoes_resolver_backend(&o)
+    expect(recusa_do_alvo_a64(&o) == none)
+    var si: [5]str = {"forja", "build", "--target", "aarch64-apple-ios-sim", "a.fj"}
+    var osim: Opcoes = Opcoes{}
+    expect(opcoes_ler(5, si[..], &osim) == none)
+    expect(alvo_eh_ios(&osim))
+    opcoes_resolver_backend(&osim)
+    expect(recusa_do_alvo_a64(&osim) == none)
+    var dl: [7]str = {"forja", "build", "--modo", "dll", "--target", "aarch64-apple-ios-sim", "a.fj"}
+    var odll: Opcoes = Opcoes{}
+    expect(opcoes_ler(7, dl[..], &odll) == none)
+    opcoes_resolver_backend(&odll)
+    expect(recusa_do_alvo_a64(&odll) == none) // I5: --modo dll no iOS = dylib
+    var r: [5]str = {"forja", "run", "--target", "aarch64-apple-ios-sim", "a.fj"}
+    var orun: Opcoes = Opcoes{}
+    expect(opcoes_ler(5, r[..], &orun) == none)
+    opcoes_resolver_backend(&orun)
+    expect(recusa_do_alvo_a64(&orun) != none)
+}
+
+test "opcoes_alvo_a64_dll_segue_recusado" {
+    var d: [7]str = {"forja", "build", "--modo", "dll", "--target", "aarch64-linux", "a.fj"}
+    var o: Opcoes = Opcoes{}
+    expect(opcoes_ler(7, d[..], &o) == none)
+    opcoes_resolver_backend(&o)
+    expect(recusa_do_alvo_a64(&o) != none)
+}
+
+test "opcoes_alvo_wasm_apelido" {
+    var apelido: [5]str = {"forja", "build", "--target", "wasm", "a.fj"}
+    var o: Opcoes = Opcoes{}
+    expect(opcoes_ler(5, apelido[..], &o) == none)
+    expect((o.target or_else "") == "wasm32-wasip1")
+    expect(alvo_eh_wasm(&o))
+    var canonico: [5]str = {"forja", "build", "--target", "wasm32-wasip1", "a.fj"}
+    var c: Opcoes = Opcoes{}
+    expect(opcoes_ler(5, canonico[..], &c) == none)
+    expect((c.target or_else "") == "wasm32-wasip1")
+    var errado: [5]str = {"forja", "build", "--target", "wasip", "a.fj"}
+    var e: Opcoes = Opcoes{}
+    expect(opcoes_ler(5, errado[..], &e) == none)
+    expect((e.target or_else "") == "wasip")
+    expect(not alvo_eh_wasm(&e))
+}
+
+test "opcoes_ler_erros_de_uso" {
+    var desconhecida: [3]str = {"forja", "check", "--nao-existe"}
+    expect((opt_ler(desconhecida[..]) or_else "") == "opcao desconhecida")
+    var sem_valor: [4]str = {"forja", "check", "a.fj", "-o"}
+    expect((opt_ler(sem_valor[..]) or_else "") == "opcao sem valor")
+    var duas: [4]str = {"forja", "check", "a.fj", "b.fj"}
+    expect((opt_ler(duas[..]) or_else "") == "mais de um arquivo de entrada")
+    var sem_arquivo: [2]str = {"forja", "check"}
+    expect((opt_ler(sem_arquivo[..]) or_else "") == "falta o arquivo .fj")
+    var sem_codigo: [2]str = {"forja", "explicar"}
+    expect((opt_ler(sem_codigo[..]) or_else "") == "falta o codigo do diagnostico")
+    var suporte: [3]str = {"forja", "build", "--suporte"}
+    expect(opt_ler(suporte[..]) == none)
+}
+
+test "opcoes_ler_depois_do_traco_traco" {
+    var argv: [7]str = {"forja", "run", "a.fj", "--", "x", "--release", "y z"}
+    var o: Opcoes = Opcoes{}
+    expect(opcoes_ler(7, argv[..], &o) == none)
+    expect(not o.release)
+    expect(o.nargs_programa == 3)
+    let args: []str = o.args_programa or_else {}
+    expect(args[0] == "x")
+    expect(args[1] == "--release")
+    expect(args[2] == "y z")
+}
+
+test "opcoes_tabela_tem_37_opcoes_distintas" {
+    expect(len(OPCOES_CLI) == 37)
+    for k in 0..<len(OPCOES_CLI) {
+        expect(achar_opcao(OPCOES_CLI[k].nome or_else "") == k)
+        expect(OPCOES_CLI[k].destino == ((k as u64) + 1))
+    }
+    expect(achar_opcao("--nao-existe") == -1)
+}
+
+test "opcoes_max_erros_e_jobs" {
+    var o: Opcoes = Opcoes{}
+    expect(opcoes_max_erros(&o) == 0)
+    o.max_erros = "5"
+    expect(opcoes_max_erros(&o) == 5)
+    o.max_erros = "100"
+    expect(opcoes_max_erros(&o) == 100)
+    o.max_erros = "101"
+    expect(opcoes_max_erros(&o) == 0)
+    o.max_erros = "0"
+    expect(opcoes_max_erros(&o) == 0)
+    o.max_erros = "5x"
+    expect(opcoes_max_erros(&o) == 0)
+    o.max_erros = ""
+    expect(opcoes_max_erros(&o) == 0)
+    var n: u32 = 0
+    expect(opcoes_jobs_texto("64", &n))
+    expect(n == 64)
+    expect(not opcoes_jobs_texto("65", &n))
+    expect(not opcoes_jobs_texto("0", &n))
+    expect(not opcoes_jobs_texto("-3", &n))
+    expect(not opcoes_jobs_texto(" 3", &n))
+    expect(not opcoes_jobs_texto("3x", &n))
+    expect(not opcoes_jobs_texto(none, &n))
+}
+
+test "opcoes_alvo_do_teste" {
+    expect(entrada_eh_alvo("std:text"))
+    expect(entrada_eh_alvo("vendor:json/x"))
+    expect(not entrada_eh_alvo("C:\\x.fj"))
+    expect(not entrada_eh_alvo("a:b"))
+    expect(not entrada_eh_alvo("x/y:z"))
+    expect(not entrada_eh_alvo("sem_dois_pontos"))
+    expect(prefixo_de_alvo_conhecido("std:text"))
+    expect(prefixo_de_alvo_conhecido("engine:lib"))
+    expect(not prefixo_de_alvo_conhecido("xx:text"))
+    expect(not prefixo_de_alvo_conhecido("stdx:text"))
+    var nome: [32]u8 = {}
+    nome_do_alvo_saneado("std:text/parse", nome[..], 32)
+    expect(from_bytes(nome[0..<common.c2f_strlen_b(nome[..])], alloc = frame) == "std_text_parse")
+}
+
+test "opcoes_preparar_alvo_do_teste" {
+    var o: Opcoes = Opcoes{}
+    o.comando = "test"
+    o.entrada = "std:text/parse"
+    expect(opcoes_preparar_alvo_do_teste(&o) == none)
+    expect((o.alvo_teste or_else "") == "std:text/parse")
+    expect((o.raiz_alvo or_else "") == "import \"std:text/parse\" as alvo_teste\nproc main() {\n}\n")
+    let caminho: str = o.entrada or_else ""
+    expect(len(caminho) > len("\\std_text_parse.teste.fj"))
+    expect(caminho[(len(caminho) - 24)..<len(caminho)] == "\\std_text_parse.teste.fj")
+    var outro: Opcoes = Opcoes{}
+    outro.comando = "check"
+    outro.entrada = "std:text"
+    expect(opcoes_preparar_alvo_do_teste(&outro) == none)
+    expect(outro.alvo_teste == none)
+}
+
+test "opcoes_linha_de_comando" {
+    var argv: [5]str = {"forja", "check", "a b.fj", "--max-erros", "3"}
+    var buffer: [64]u8 = {}
+    opcoes_linha_de_comando(5, argv[..], buffer[..], 64)
+    expect(from_bytes(buffer[0..<common.c2f_strlen_b(buffer[..])], alloc = frame) == "forja check \"a b.fj\" --max-erros 3")
+    var curto: [12]u8 = {}
+    opcoes_linha_de_comando(5, argv[..], curto[..], 12)
+    expect(from_bytes(curto[0..<common.c2f_strlen_b(curto[..])], alloc = frame) == "forja check")
+}
+
+test "opcoes_validar_comandos_e_combinacoes" {
+    var o: Opcoes = Opcoes{}
+    o.comando = "nada"
+    expect((opcoes_validar(&o) or_else "") == "comando desconhecido")
+    var b: Opcoes = Opcoes{}
+    b.comando = "build"
+    expect((opcoes_validar(&b) or_else "") == "build exige -o <saida>")
+    b.saida = "x.exe"
+    expect(opcoes_validar(&b) == none)
+    b.modo = "c"
+    expect((opcoes_validar(&b) or_else "") == "--modo aceita exe ou dll")
+    var t: Opcoes = Opcoes{}
+    t.comando = "test"
+    t.entrada = "xx:y"
+    expect((opcoes_validar(&t) or_else "") == "forja test aceita std:<modulo>, vendor:<modulo> ou engine:<modulo>")
+    var p: Opcoes = Opcoes{}
+    p.comando = "build"
+    p.projeto = true
+    p.saida = "x"
+    expect((opcoes_validar(&p) or_else "") == "--projeto nao aceita -o, --modo, --tempos, --suporte nem as opcoes de um arquivo .fj")
+    var q: Opcoes = Opcoes{}
+    q.comando = "build"
+    q.projeto = true
+    q.entrada = "a.FJ"
+    expect((opcoes_validar(&q) or_else "") == "--projeto recebe o forja.proj, nao um arquivo .fj")
+    var j: Opcoes = Opcoes{}
+    j.comando = "build"
+    j.projeto = true
+    j.jobs = "0"
+    expect((opcoes_validar(&j) or_else "") == "--jobs aceita um numero inteiro de 1 a 64")
+    var s: Opcoes = Opcoes{}
+    s.comando = "build"
+    s.release = false
+    s.saida = "x"
+    s.sem_otim = "nao_existe"
+    expect((opcoes_validar(&s) or_else "") == "--sem-otim so vale com --release (o dev nunca roda passe de otimizacao)")
+}
+
+test "opcoes_ambiente_do_teste" {
+    var o: Opcoes = Opcoes{}
+    o.filtro = "abc"
+    o.json = true
+    opcoes_ambiente_do_teste(&o)
+    expect((os.env("FORJA_TESTE_FILTRO") or_else "") == "abc")
+    expect((os.env("FORJA_TESTE_JSON") or_else "") == "1")
+    var vazio: Opcoes = Opcoes{}
+    opcoes_ambiente_do_teste(&vazio)
+    expect(os.env("FORJA_TESTE_FILTRO") == none)
+    expect(os.env("FORJA_TESTE_JSON") == none)
+}
+
+test "main_opcoes_caminhos" {
+    let cabecalho_a = caminho_do_cabecalho("a\\x.dll")
+    defer delete(cabecalho_a)
+    expect(cabecalho_a == "a\\x.h")
+    let cabecalho_b = caminho_do_cabecalho("x")
+    defer delete(cabecalho_b)
+    expect(cabecalho_b == "x.h")
+    let cabecalho_c = caminho_do_cabecalho("a.b\\x")
+    defer delete(cabecalho_c)
+    expect(cabecalho_c == "a.b\\x.h")
+    expect(pasta_do_absoluto("C:\\a\\b.fj") == "C:\\a")
+    expect(pasta_do_absoluto("semcorte") == "semcorte")
+}
+
+test "main_montar_caminho" {
+    let caminho = montar_caminho("C:\\p", "a/b", ".fj")
+    defer delete(caminho)
+    expect(caminho == "C:\\p\\a\\b.fj")
+    let load = montar_caminho("C:/p", "x/y.bin", "")
+    defer delete(load)
+    expect(load == "C:/p\\x\\y.bin")
+}
+
+test "main_despacho_subcomandos" {
+    var codigo: i32 = -1
+    var desconhecido: [3]str = {"forja", "nada", "a"}
+    expect(not despachar_subcomando(3, desconhecido[..], &codigo))
+    expect(codigo == -1)
+    var explicar_sozinho: [2]str = {"forja", "explicar"}
+    expect(not despachar_subcomando(2, explicar_sozinho[..], &codigo))
+    expect(len(SUBCOMANDOS) == 9)
+    expect(SUBCOMANDOS[8].nome == "explicar")
+    expect(SUBCOMANDOS[8].argc_min == 3)
+}
+
+test "carga_pacote_pastas" {
+    expect(eh_pasta("."))
+    expect(not eh_arquivo("."))
+    expect(not eh_pasta("nao_existe_xyz"))
+    expect(not eh_arquivo("nao_existe_xyz"))
+    expect(mesmo_arquivo(".\\a.fj", "./a.fj"))
+    expect(mesmo_arquivo("A.FJ", "a.fj"))
+    expect(not mesmo_arquivo("a.fj", "b.fj"))
+}
+
+test "limites_formatos" {
+    var segundos: f64 = 0.0
+    expect(ler_tempo("5", &segundos))
+    expect(segundos == 5.0)
+    expect(ler_tempo("0.5", &segundos))
+    expect(not ler_tempo("0.0001", &segundos))
+    expect(not ler_tempo("86401", &segundos))
+    expect(not ler_tempo("1e3", &segundos))
+    var bytes: u64 = 0
+    expect(ler_memoria("1", &bytes))
+    expect(bytes == 1048576)
+    expect(not ler_memoria("1048577", &bytes))
+    expect(not ler_memoria("0", &bytes))
+    expect(ler_saida("64KiB", &bytes))
+    expect(bytes == 65536)
+    expect(ler_saida("1mib", &bytes))
+    expect(bytes == 1048576)
+    expect(not ler_saida("1MB", &bytes))
+    expect(not ler_saida("1099511627777", &bytes))
+    var l: Limites = Limites{}
+    var o: Opcoes = Opcoes{}
+    o.limite_mem = "0"
+    expect((limites_ler(&o, &l) or_else "") == "--limite-mem aceita um numero inteiro de MiB, de 1 a 1048576")
+}
+
+test "limites_linhas_e_escapes" {
+    expect(resolver_escapes(as_bytes("a\\nb\\\\c\\x")) == "a\nb\\c\\x")
+    expect(contar_linhas_2(as_bytes(""), 0) == 0)
+    expect(contar_linhas_2(as_bytes("a\nb"), 3) == 2)
+    expect(contar_linhas_2(as_bytes("a\nb\n"), 4) == 2)
+    var lista = make([dynamic]str, alloc = heap)
+    defer delete(lista)
+    separar_linhas(as_bytes("um\r\n\ntres"), 9, &lista)
+    expect(len(lista) == 3)
+    expect(lista[0] == "um")
+    expect(lista[1] == "")
+    expect(lista[2] == "tres")
+}
+
+test "erro_sistema_textos" {
+    var buffer: [256]u8 = {}
+    erro_crt_texto(0, buffer[..], 256)
+    expect(from_bytes(buffer[0..<common.c2f_strlen_b(buffer[..])], alloc = frame) == "sem codigo de erro")
+    erro_crt_texto(2, buffer[..], 256)
+    expect(from_bytes(buffer[0..<common.c2f_strlen_b(buffer[..])], alloc = frame) == "errno 2: No such file or directory")
+    erro_crt_texto(13, buffer[..], 256)
+    expect(from_bytes(buffer[0..<common.c2f_strlen_b(buffer[..])], alloc = frame) == "errno 13: Permission denied")
+    erro_crt_texto(99999, buffer[..], 256)
+    expect(from_bytes(buffer[0..<common.c2f_strlen_b(buffer[..])], alloc = frame) == "errno 99999: Unknown error")
+    erro_win_texto(2, buffer[..], 256)
+    // valores medidos com o erro_sistema.c do C (FormatMessageA, ingles dos EUA), C2F-63
+    expect(texto_win(2, buffer[..]) == "erro 2: The system cannot find the file specified.")
+    expect(texto_win(3, buffer[..]) == "erro 3: The system cannot find the path specified.")
+    expect(texto_win(5, buffer[..]) == "erro 5: Access is denied.")
+    expect(texto_win(32, buffer[..]) == "erro 32: The process cannot access the file because it is being used by another process.")
+    expect(texto_win(87, buffer[..]) == "erro 87: The parameter is incorrect.")
+    expect(texto_win(193, buffer[..]) == "erro 193: %1 is not a valid Win32 application.")
+    expect(texto_win(1314, buffer[..]) == "erro 1314: A required privilege is not held by the client.")
+    expect(texto_win(998, buffer[..]) == "erro 998: Invalid access to memory location.")
+    expect(texto_win(123456789, buffer[..]) == "erro 123456789")
+}

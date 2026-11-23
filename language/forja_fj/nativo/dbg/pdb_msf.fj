@@ -1,0 +1,204 @@
+// nativo/dbg/pdb_msf.fj - porte de compiler/nativo/dbg/pdb_msf.c
+// sha256 de nativo/dbg/pdb_msf.c: a9a48d00b3e6fb13f0b8e7c526d736d675fdb8013f79c3f2fbf18a4038d6d511
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.2.0
+// Changelog: 0.2.0 - G3 V4-W6: stubs promovidos (pdb_u16/u32, msf_escrever_*, pdb_msf_serializar, pdb_msf_iniciar);
+//            msf_escrever_diretorio recebe dir: []u8 (escrita); pdb_msf_novo_fluxo faz make do fluxo (R0007: zero nao aceita append).
+
+import "common"
+
+struct MsfPlano {
+    primeiro: [16]u32
+    dir_bytes: u32
+    dir_primeiro: u32
+    dir_blocos: u32
+    mapa_bloco: u32
+    total: u32
+}
+
+const MSF_BLOCO_MAPA_LIVRE: u32 = 2
+const MSF_PRIMEIRO_BLOCO_LIVRE: u32 = 3
+const MSF_MAX_BLOCOS: u32 = 32768
+const MSF_MAX_BLOCOS_DIRETORIO: u32 = 1024
+const MSF_TAM_MAGICA: u32 = 32
+const MSF_MAGICA: [33]u8 = {77, 105, 99, 114, 111, 115, 111, 102, 116, 32, 67, 47, 67, 43, 43, 32, 77, 83, 70, 32, 55, 46, 48, 48, 13, 10, 26, 68, 83, 0, 0, 0, 0}
+// C2F:? tabela ZEROS_2 (const char[4096]): lista invalida para array
+
+// C: nativo/dbg/pdb_msf.c:17
+proc pdb_u16(b: ^[dynamic]u8, v: u32) {
+    var c: [2]u8 = {common.c2f_trunc_u8(v as u64), common.c2f_trunc_u8((v >> 8) as u64)}
+    append(b, items = c[..])
+}
+
+// C: nativo/dbg/pdb_msf.c:24
+proc pdb_u32(b: ^[dynamic]u8, v: u32) {
+    var c: [4]u8 = {common.c2f_trunc_u8(v as u64), common.c2f_trunc_u8((v >> 8) as u64), common.c2f_trunc_u8((v >> 16) as u64), common.c2f_trunc_u8((v >> 24) as u64)}
+    append(b, items = c[..])
+}
+
+// C: nativo/dbg/pdb_msf.c:31
+// memset(m, 0): o chamador declara o PdbMsf zerado; a lista de cada fluxo nasce em pdb_msf_novo_fluxo.
+proc pdb_msf_iniciar(m: ^PdbMsf) {
+    m.qtd = 0
+}
+
+// C: nativo/dbg/pdb_msf.c:36
+proc pdb_msf_liberar(m: ^PdbMsf) {
+    for i in (0 as u32)..<m.qtd {
+        delete(m.fluxos[i])
+    }
+    m.qtd = 0
+}
+
+// C: nativo/dbg/pdb_msf.c:43
+proc pdb_msf_novo_fluxo(m: ^PdbMsf) -> ^[dynamic]u8 {
+    if m.qtd >= PDB_MAX_FLUXOS {
+        let msg_1 = format(f"pdb: o MSF passou de {PDB_MAX_FLUXOS} fluxos", alloc = heap)
+        defer delete(msg_1)
+        common.falha_interna(msg_1)
+    }
+    let antes_1: u32 = m.qtd
+    m.qtd += 1
+    m.fluxos[antes_1] = make([dynamic]u8, alloc = heap)
+    return &m.fluxos[antes_1]
+}
+
+// C: nativo/dbg/pdb_msf.c:50
+proc msf_blocos(bytes: u64) -> u32 {
+    return (((bytes + (PDB_TAM_BLOCO as u64)) - 1) / (PDB_TAM_BLOCO as u64)) as u32
+}
+
+// C: nativo/dbg/pdb_msf.c:62
+proc msf_planejar(m: ^PdbMsf, p: ^MsfPlano) -> bool {
+    var prox: u32 = MSF_PRIMEIRO_BLOCO_LIVRE
+    p.dir_bytes = 4 + (4 * m.qtd)
+    var i: u32 = 0
+    while i < m.qtd {
+        let n: u32 = msf_blocos(len(m.fluxos[i]) as u64)
+        p.primeiro[i] = prox
+        prox += n
+        p.dir_bytes += 4 * n
+        i += 1
+    }
+    p.dir_blocos = msf_blocos(p.dir_bytes as u64)
+    p.dir_primeiro = prox
+    p.mapa_bloco = prox + p.dir_blocos
+    p.total = p.mapa_bloco + 1
+    return (p.dir_blocos <= MSF_MAX_BLOCOS_DIRETORIO) and (p.total <= MSF_MAX_BLOCOS)
+}
+
+// C: nativo/dbg/pdb_msf.c:80
+proc msf_gravar32(dst: []u8, v: u32) {
+    for k in (0 as u32)..<4 {
+        dst[k] = common.c2f_trunc_u8((v >> ((8 * k) & 31)) as u64)
+    }
+}
+
+// C: nativo/dbg/pdb_msf.c:86
+proc msf_escrever_superbloco(arq: []u8, p: ^MsfPlano) {
+    for k in (0 as u32)..<MSF_TAM_MAGICA {
+        arq[k] = MSF_MAGICA[k]
+    }
+    msf_gravar32(arq[32..<36], PDB_TAM_BLOCO)
+    msf_gravar32(arq[36..<40], MSF_BLOCO_MAPA_LIVRE)
+    msf_gravar32(arq[40..<44], p.total)
+    msf_gravar32(arq[44..<48], p.dir_bytes)
+    msf_gravar32(arq[48..<52], 0)
+    msf_gravar32(arq[52..<56], p.mapa_bloco)
+}
+
+// C: nativo/dbg/pdb_msf.c:98
+// Bit k do mapa = bloco k livre (1) ou em uso (0): todo bloco do arquivo esta em uso (bit zerado).
+proc msf_escrever_mapa_livre(bloco: []u8, total: u32) {
+    for i in (0 as u32)..<PDB_TAM_BLOCO {
+        bloco[i] = 255
+    }
+    for k in (0 as u32)..<total {
+        let mascara: u8 = ((1 as u32) << (k % 8)) as u8
+        bloco[k / 8] = bloco[k / 8] & ~mascara
+    }
+}
+
+// C: nativo/dbg/pdb_msf.c:106
+// NumStreams, tamanho de cada fluxo e a lista de blocos de cada um (os fluxos sao contiguos).
+proc msf_escrever_diretorio(m: ^PdbMsf, p: ^MsfPlano, dir: []u8) {
+    var k: u32 = 0
+    msf_gravar32(dir[(4 * k) ..< (4 * k + 4)], m.qtd)
+    k += 1
+    for i in (0 as u32)..<m.qtd {
+        msf_gravar32(dir[(4 * k) ..< (4 * k + 4)], len(m.fluxos[i]) as u32)
+        k += 1
+    }
+    for i in (0 as u32)..<m.qtd {
+        let blocos: u32 = msf_blocos(len(m.fluxos[i]) as u64)
+        for b in (0 as u32)..<blocos {
+            msf_gravar32(dir[(4 * k) ..< (4 * k + 4)], p.primeiro[i] + b)
+            k += 1
+        }
+    }
+}
+
+// C: nativo/dbg/pdb_msf.c:119
+proc pdb_msf_serializar(m: ^PdbMsf, saida: ^[dynamic]u8) -> bool {
+    var p: MsfPlano = MsfPlano{}
+    var zeros: [4096]u8 = {}
+    if len(saida^) != 0 {
+        common.falha_interna("pdb: PdbMsfSerializar recebeu uma saida que nao esta vazia")
+    }
+    if not msf_planejar(m, &p) {
+        return false
+    }
+    for b in (0 as u32)..<p.total {
+        append(saida, items = zeros[..])
+    }
+    let arq: []u8 = saida^[..]
+    msf_escrever_superbloco(arq, &p)
+    let mapa_ini: u64 = (MSF_BLOCO_MAPA_LIVRE as u64) * (PDB_TAM_BLOCO as u64)
+    msf_escrever_mapa_livre(arq[mapa_ini ..< mapa_ini + (PDB_TAM_BLOCO as u64)], p.total)
+    for i in (0 as u32)..<m.qtd {
+        let tam: u64 = len(m.fluxos[i]) as u64
+        if tam > 0 {
+            let ini: u64 = (p.primeiro[i] as u64) * (PDB_TAM_BLOCO as u64)
+            for k in (0 as u64)..<tam {
+                arq[ini + k] = m.fluxos[i][k]
+            }
+        }
+    }
+    let dir_ini: u64 = (p.dir_primeiro as u64) * (PDB_TAM_BLOCO as u64)
+    msf_escrever_diretorio(m, &p, arq[dir_ini ..< (p.total as u64) * (PDB_TAM_BLOCO as u64)])
+    let mapa_dir: u64 = (p.mapa_bloco as u64) * (PDB_TAM_BLOCO as u64)
+    for b in (0 as u32)..<p.dir_blocos {
+        msf_gravar32(arq[(mapa_dir + 4 * (b as u64)) ..< (mapa_dir + 4 * (b as u64) + 4)], p.dir_primeiro + b)
+    }
+    return true
+}
+
+test "pdb_u16_u32_little_endian" {
+    var b = make([dynamic]u8, alloc = heap)
+    defer delete(b)
+    pdb_u16(&b, 0x1234)
+    pdb_u32(&b, 0x01020304)
+    expect(len(b) == 6)
+    expect(b[0] == 0x34)
+    expect(b[1] == 0x12)
+    expect(b[2] == 4)
+    expect(b[5] == 1)
+}
+
+test "msf_planejar_sem_fluxos" {
+    var m = PdbMsf{}
+    var p = MsfPlano{}
+    expect(msf_planejar(&m, &p))
+    expect(p.dir_bytes == 4)
+    expect(p.dir_blocos == 1)
+    expect(p.dir_primeiro == 3)
+    expect(p.mapa_bloco == 4)
+    expect(p.total == 5)
+}
+
+test "msf_mapa_livre_zera_so_os_blocos_do_arquivo" {
+    var arr: [4096]u8 = {}
+    msf_escrever_mapa_livre(arr[..], 3)
+    expect(arr[0] == 248)
+    expect(arr[1] == 255)
+}

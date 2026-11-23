@@ -1,0 +1,601 @@
+// nativo/nativo_erro.fj - porte de compiler/nativo/nativo_erro.c, compiler/nativo/nativo_erro.h
+// sha256 de nativo/nativo_erro.c: 4d2c71b65e8e0d239a5cb0aab57bb10374e37248bc53a80178533bf2efc99c61
+// sha256 de nativo/nativo_erro.h: f60a604593894b22029d2fbfdbd9968a02087fc37e325005301aae64383fee89
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+// Changelog: 0.1.0 - G3 V4-W7b: corpo real dos 20 stubs; gravar_na_pasta recebe bytes ([]u8, como o buffer do C); abrir_pasta_do_relato e gravar_pacote devolvem ?str (a pasta so vale se o pacote saiu inteiro).
+
+import "std:file"
+import "std:os"
+import "common"
+import "ir"
+import "nativo/bir"
+import "semantic"
+
+// O SaidaDiag unico do principal (C2F-70, o "spec" sai inteiro so na 1a vez da execucao); sem ele (testes) nasce um no heap, que vive ate o fim do processo.
+proc sd_do_pedido(p: ^NativoPedido) -> ^common.SaidaDiag {
+    if p.sd == none {
+        p.sd = common.saida_diag_nova()
+    }
+    return p.sd as ^common.SaidaDiag
+}
+
+struct ErroOrigem {
+    etapa: ?str
+    bir: ?^bir.BirPrograma
+    bir_funcoes: u32
+    campos: ?str
+}
+
+struct MapaInjecao {
+    etapa: ?str
+    codigo: i32
+}
+
+struct BuscaIr {
+    off: u32
+    causa: ?str
+    corrente: ?^ir.IrFuncao
+    funcao: ?^ir.IrFuncao
+    instr: ?^ir.IrInstr
+    indice: i32
+    contador: u32
+    achou: bool
+    exato: bool
+}
+
+struct ErroContexto {
+    pedido: ?^NativoPedido
+    erro: ?^common.Diag
+    origem: ?^ErroOrigem
+}
+
+struct TrechoFonte {
+    caminho: ?str
+    texto: []u8
+    tam: u64
+}
+
+const ETAPA_BIR: str = "bir"
+const ETAPA_LAYOUT: str = "layout"
+const ETAPA_ISEL: str = "isel"
+const ETAPA_CODIFICAR: str = "codificar"
+const ETAPA_LIGAR: str = "ligar"
+const ETAPA_ESCREVER: str = "escrever"
+const ERRO_TAM_PASTA: i32 = 520
+const ERRO_TAM_ARQUIVO: i32 = 700
+const ERRO_TAM_CAMINHO: i32 = 1222
+const ERRO_PREFIXO_IR_FUNCAO: str = "IR_FUNCAO"
+// Mesma ordem da MAPA_INJECAO do C (o FORJA_TESTE_INJETAR acha a primeira etapa+codigo que casa).
+const MAPA_INJECAO: [7]MapaInjecao = {MapaInjecao{etapa = ETAPA_BIR, codigo = common.X0904}, MapaInjecao{etapa = ETAPA_BIR, codigo = common.X0001}, MapaInjecao{etapa = ETAPA_LAYOUT, codigo = common.X0906}, MapaInjecao{etapa = ETAPA_ISEL, codigo = common.X0901}, MapaInjecao{etapa = ETAPA_CODIFICAR, codigo = common.X0902}, MapaInjecao{etapa = ETAPA_LIGAR, codigo = common.X0903}, MapaInjecao{etapa = ETAPA_ESCREVER, codigo = common.X0905}}
+
+// C: nativo/nativo_erro.c:51
+proc posicao_da_injecao(p: ^NativoPedido) -> u32 {
+    for k in (0 as u32)..<(p.ir as ^ir.IrPrograma).nfuncoes {
+        let f: ^ir.IrFuncao = &((p.ir as ^ir.IrPrograma).funcoes or_else {})[k]
+        if (common.c2f_b2i32(f.e_main) != 0) and (f.corpo.primeira != none) {
+            return (f.corpo.primeira as ^ir.IrInstr).pos
+        }
+    }
+    return 0
+}
+
+// C: nativo/nativo_erro.c:62
+proc nativo_injetar_falha(pedido: ^NativoPedido, etapa: str, erro: ^common.Diag) -> bool {
+    let env_txt: ?str = os.env("FORJA_TESTE_INJETAR")
+    if env_txt == none {
+        return false
+    }
+    let pedido_env: str = env_txt or_else ""
+    var k: u32 = 0
+    while k < 7 {
+        let mapa: MapaInjecao = MAPA_INJECAO[k]
+        if ((mapa.etapa or_else "") == etapa) and (common.diag_codigo_texto(mapa.codigo) == pedido_env) {
+            let msg_1 = format(f"falha injetada por FORJA_TESTE_INJETAR={pedido_env} na etapa {etapa}", alloc = heap)
+            defer delete(msg_1)
+            // diag_relatar devolve sempre false (o C e void): a injecao dispara, entao o retorno e true
+            _ = common.diag_relatar(erro, mapa.codigo, posicao_da_injecao(pedido), msg_1)
+            return true
+        }
+        k += 1
+    }
+    return false
+}
+
+// C: nativo/nativo_erro.c:90
+proc causa_cita_op(causa: str, op: u8) -> bool {
+    let nome: str = bir.bir_nome_do_op(op)
+    let n: int = len(nome)
+    if len(causa) < n {
+        return false
+    }
+    if causa[0..<n] != nome {
+        return false
+    }
+    if len(causa) == n {
+        return true
+    }
+    return causa[n] == 32
+}
+
+// C: nativo/nativo_erro.c:101
+proc visitar_instr(s: ^BuscaIr, i: ?^ir.IrInstr) {
+    let cita: bool = causa_cita_op((s.causa or_else ""), (i as ^ir.IrInstr).op)
+    if ((i as ^ir.IrInstr).pos == s.off) and ((not s.achou) or (common.c2f_b2i32(cita) != 0)) {
+        s.achou = true
+        s.exato = cita
+        s.funcao = s.corrente
+        s.instr = i
+        s.indice = transmute(s.contador, to = i32)
+    }
+    s.contador += 1
+    visitar_bloco(s, &(i as ^ir.IrInstr).cond)
+    visitar_bloco(s, &(i as ^ir.IrInstr).corpo)
+    visitar_bloco(s, &(i as ^ir.IrInstr).senao)
+    for k in (0 as u32)..<(i as ^ir.IrInstr).ncasos {
+        visitar_bloco(s, &((i as ^ir.IrInstr).casos or_else {})[k].corpo)
+    }
+}
+
+// C: nativo/nativo_erro.c:120
+proc visitar_bloco(s: ^BuscaIr, bloco: ^ir.IrBloco) {
+    var i: ?^ir.IrInstr = bloco.primeira
+    while (i != none) and (not s.exato) {
+        visitar_instr(s, i)
+        i = (i as ^ir.IrInstr).prox
+    }
+}
+
+// C: nativo/nativo_erro.c:127
+proc buscar_assinatura(s: ^BuscaIr, ir_c: ^ir.IrPrograma) {
+    var k: u32 = 0
+    while (k < ir_c.nfuncoes) and (not s.achou) {
+        let f: ^ir.IrFuncao = &(ir_c.funcoes or_else {})[k]
+        if (f.corpo.primeira != none) and ((f.corpo.primeira as ^ir.IrInstr).pos == s.off) {
+            s.achou = true
+            s.funcao = f
+            s.indice = -1
+        }
+        k += 1
+    }
+}
+
+// C: nativo/nativo_erro.c:140
+proc localizar_na_ir(p: ^NativoPedido, off: u32, causa: str) -> BuscaIr {
+    var s: BuscaIr = BuscaIr{off = off, causa = causa}
+    if common.c2f_prefixo_igual(causa, ERRO_PREFIXO_IR_FUNCAO, len(ERRO_PREFIXO_IR_FUNCAO)) {
+        buscar_assinatura(&s, p.ir as ^ir.IrPrograma)
+        return s
+    }
+    var k: u32 = 0
+    while (k < (p.ir as ^ir.IrPrograma).nfuncoes) and (not s.exato) {
+        s.corrente = &((p.ir as ^ir.IrPrograma).funcoes or_else {})[k]
+        s.contador = 0
+        visitar_bloco(&s, &(s.corrente as ^ir.IrFuncao).corpo)
+        k += 1
+    }
+    return s
+}
+
+// C: nativo/nativo_erro.c:157
+proc tipo_da_assinatura(p: ^NativoPedido, f: ^ir.IrFuncao) -> ?str {
+    if (f.retorno != (semantic.TIPO_VAZIO as u32)) and (not bir.bir_tipo_passavel(p.tipos as ^semantic.Tipos, f.retorno)) {
+        return bir.bir_nome_do_tipo(p.tipos as ^semantic.Tipos, f.retorno)
+    }
+    var k: u32 = 0
+    while k < f.nparams {
+        if not bir.bir_tipo_passavel(p.tipos as ^semantic.Tipos, (f.params or_else {})[k].tipo) {
+            return bir.bir_nome_do_tipo(p.tipos as ^semantic.Tipos, (f.params or_else {})[k].tipo)
+        }
+        k += 1
+    }
+    return "vazio"
+}
+
+// C: nativo/nativo_erro.c:169
+// Tipo da instrucao; as que nao tem destino (print) guardam o tipo no valor 'a'. "-" quando nenhum dos dois diz.
+proc tipo_da_instr(p: ^NativoPedido, i: ?^ir.IrInstr) -> ?str {
+    let ins: ^ir.IrInstr = i as ^ir.IrInstr
+    var tipo: u32 = ins.tipo
+    if tipo == 0 {
+        tipo = ins.a.tipo
+    }
+    if tipo == 0 {
+        return "-"
+    }
+    return bir.bir_nome_do_tipo(p.tipos as ^semantic.Tipos, tipo)
+}
+
+// C: nativo/nativo_erro.c:176
+proc nativo_anexar_ir(b: ^[dynamic]u8, p: ^NativoPedido, off: u32, causa: str) -> bool {
+    let achado: BuscaIr = localizar_na_ir(p, off, causa)
+    if not achado.achou {
+        return false
+    }
+    let funcao: ^ir.IrFuncao = achado.funcao as ^ir.IrFuncao
+    let nome_funcao: str = common.interner_texto(p.nomes as ^common.Interner, funcao.nome)
+    append(b, item = ", \"ir\": {\"funcao\": ")
+    json_texto(b, nome_funcao, len(nome_funcao) as u64)
+    var nome_op: str = ERRO_PREFIXO_IR_FUNCAO
+    var op_aux: u32 = 0
+    var nome_tipo: str = "vazio"
+    if achado.instr != none {
+        let instr: ^ir.IrInstr = achado.instr as ^ir.IrInstr
+        nome_op = bir.bir_nome_do_op(instr.op)
+        op_aux = instr.op_aux as u32
+        nome_tipo = tipo_da_instr(p, achado.instr) or_else "-"
+    } else {
+        nome_tipo = tipo_da_assinatura(p, funcao) or_else "vazio"
+    }
+    format(f", \"instr\": {achado.indice}, \"op\": \"{nome_op}\", \"op_aux\": {op_aux}, \"tipo\": ", into = b)
+    json_texto(b, nome_tipo, len(nome_tipo) as u64)
+    append(b, item = "}"[0..<1])
+    return true
+}
+
+// C: nativo/nativo_erro.c:203
+// Diagnostico (exit 1, sem pacote de relato): o X0001 de recurso fora do backend e os X01xx de biblioteca; o resto (X09xx) e erro interno (exit 3).
+proc eh_diagnostico(codigo: i32) -> bool {
+    return (common.c2f_s2u_32(codigo) == (common.X0001 as u32)) or common.c2f_prefixo_igual(common.diag_codigo_texto(codigo), "X01", 3)
+}
+
+// C: nativo/nativo_erro.c:208
+proc montar_extras(b: ^[dynamic]u8, c: ^ErroContexto, relato: ?str) {
+    let p: ^NativoPedido = c.pedido as ^NativoPedido
+    let erro: ^common.Diag = c.erro as ^common.Diag
+    let origem: ^ErroOrigem = c.origem as ^ErroOrigem
+    let interno: bool = not eh_diagnostico(erro.codigo)
+    if origem.etapa != none {
+        let alvo: str = p.alvo or_else NATIVO_ALVO_PADRAO
+        let etapa: str = origem.etapa or_else ""
+        format(f"\"alvo\": \"{alvo}\", \"etapa\": \"{etapa}\"", into = b)
+        if origem.campos != none {
+            let campos: str = origem.campos or_else ""
+            format(f", {campos}", into = b)
+        }
+    } else {
+        append(b, item = origem.campos or_else "")
+    }
+    _ = nativo_anexar_ir(b, p, erro.off, erro.causa or_else "")
+    var interno_txt: str = "false"
+    if interno {
+        interno_txt = "true"
+    }
+    format(f", \"interno\": {interno_txt}", into = b)
+    if relato != none {
+        append(b, item = ", \"relato\": ")
+        json_caminho(b, relato)
+    }
+}
+
+// C: nativo/nativo_erro.c:238
+// Trecho k do fonte (sem trechos, o arquivo inteiro).
+proc texto_da_fonte(f: ^common.Fonte, k: u32) -> TrechoFonte {
+    var t: TrechoFonte = TrechoFonte{caminho = f.caminho, texto = f.texto, tam = f.tam}
+    if f.ntrechos == 0 {
+        return t
+    }
+    let trecho: common.FonteTrecho = (f.trechos or_else {})[k]
+    let inicio: int = trecho.inicio as int
+    let fim: int = trecho.fim as int
+    t.caminho = trecho.caminho
+    t.texto = f.texto[inicio..<fim]
+    t.tam = (trecho.fim - trecho.inicio) as u64
+    return t
+}
+
+// C: nativo/nativo_erro.c:250
+proc qtd_fontes(f: ^common.Fonte) -> u32 {
+    var tern_1: u32 = f.ntrechos
+    if f.ntrechos == 0 {
+        tern_1 = 1
+    }
+    return tern_1
+}
+
+// FNV-1a de 32 bits sobre bytes (a formula do Fnv32 de nativo_json.c). Local porque nativo_json.fnv32 recebe rawptr (C2F-VOID) e ainda e stub de outro lote.
+proc fnv32_relato(h: u32, dados: []u8) -> u32 {
+    var acumulado: u32 = h
+    var k: int = 0
+    while k < len(dados) {
+        acumulado = wrapping_mul(acumulado ~ (dados[k] as u32), FNV32_PRIMO)
+        k += 1
+    }
+    return acumulado
+}
+
+// C: nativo/nativo_erro.c:255
+// Comando + texto de cada trecho das fontes; a mesma linha de comando com as mesmas fontes cai na mesma pasta.
+proc hash_do_relato(p: ^NativoPedido) -> u32 {
+    let comando: str = p.comando or_else ""
+    var h: u32 = fnv32_relato(FNV32_INICIO, as_bytes(comando))
+    let fonte: ^common.Fonte = p.fonte as ^common.Fonte
+    var k: u32 = 0
+    while k < qtd_fontes(fonte) {
+        let t: TrechoFonte = texto_da_fonte(fonte, k)
+        h = fnv32_relato(h, t.texto[0..<t.tam])
+        k += 1
+    }
+    return h
+}
+
+// Hash de 32 bits como %08x do C: 8 digitos minusculos.
+proc hash_em_hex(valor: u32) -> str {
+    let digitos: str = "0123456789abcdef"
+    var hex: [8]u8 = {48, 48, 48, 48, 48, 48, 48, 48}
+    var k: u32 = 0
+    while k < 8 {
+        let nibble: u32 = (valor >> ((7 - k) * 4)) & 15
+        hex[k] = digitos[nibble as int]
+        k += 1
+    }
+    return from_bytes(hex[..], alloc = frame)
+}
+
+// C: nativo/nativo_erro.c:268
+proc criar_pasta(caminho: str) -> bool {
+    let erro: ?file.FileError = file.make_dir(caminho)
+    if erro == none {
+        return true
+    }
+    return (erro or_else file.FileError.other) == file.FileError.already_exists
+}
+
+// O erro ja saiu em stdout; o que faltou do pacote de relato vai para stderr, para o usuario nao procurar uma pasta que nao existe.
+proc avisar_sem_relato(motivo: str, detalhe: str) {
+    let msg_1 = format(f"forja: aviso: pacote de relato nao gerado: {motivo}{detalhe}\n", alloc = heap)
+    defer delete(msg_1)
+    common.c2f_saida_formatar(common.c2f_saida_stderr(), msg_1)
+}
+
+// C: nativo/nativo_erro.c:284
+// Pasta %TEMP%\forja_relato_<hash>; none = sem TEMP/TMP ou sem conseguir criar a pasta (o aviso ja saiu).
+proc abrir_pasta_do_relato(p: ^NativoPedido) -> ?str {
+    var base: ?str = os.env("TEMP")
+    if base == none {
+        base = os.env("TMP")
+    }
+    if base == none {
+        avisar_sem_relato("o ambiente nao tem TEMP nem TMP", "")
+        return none
+    }
+    let base_txt: str = base or_else ""
+    let codigo_hash: str = hash_em_hex(hash_do_relato(p))
+    let pasta: str = format(f"{base_txt}/forja_relato_{codigo_hash}", alloc = frame)
+    if not criar_pasta(pasta) {
+        avisar_sem_relato("nao consegui criar a pasta ", pasta)
+        return none
+    }
+    return pasta
+}
+
+// C: nativo/nativo_erro.c:302
+// Grava dados (bytes) em pasta/nome; false = nao gravou.
+proc gravar_na_pasta(pasta: str, nome: str, dados: []u8) -> bool {
+    let caminho: str = format(f"{pasta}/{nome}", alloc = heap)
+    defer delete(caminho)
+    return file.write_all(caminho, dados) == none
+}
+
+// C: nativo/nativo_erro.c:310
+proc gravar_texto(pasta: str, nome: str, texto: str) -> bool {
+    return gravar_na_pasta(pasta, nome, as_bytes(texto))
+}
+
+// C: nativo/nativo_erro.c:315
+// Parte depois da ultima barra (/ ou \); sem barra, o proprio caminho.
+proc nome_do_arquivo_2(caminho: str) -> str {
+    var k: int = len(caminho) - 1
+    while k >= 0 {
+        let c: u8 = caminho[k]
+        if (c == 47) or (c == 92) {
+            let inicio: int = k + 1
+            return caminho[inicio..<len(caminho)]
+        }
+        k -= 1
+    }
+    return caminho
+}
+
+// C: nativo/nativo_erro.c:325
+// Cada trecho vira um arquivo; k > 0 ganha o prefixo "<k>_".
+proc gravar_fontes(pasta: str, f: ^common.Fonte) -> bool {
+    var ok: bool = true
+    var k: u32 = 0
+    while k < qtd_fontes(f) {
+        let t: TrechoFonte = texto_da_fonte(f, k)
+        let caminho_t: str = t.caminho or_else ""
+        var nome: str = nome_do_arquivo_2(caminho_t)
+        if k > 0 {
+            nome = format(f"{k}_{nome}", alloc = frame)
+        }
+        ok = (gravar_na_pasta(pasta, nome, t.texto[0..<t.tam]) and ok)
+        k += 1
+    }
+    return ok
+}
+
+// C: nativo/nativo_erro.c:344
+// Indice+1 da 1a funcao da BIR (entre as n completas) que tem uma instrucao na posicao do erro; 0 se nenhuma.
+// LIMITE: niveis 4 (funcao, bloco, instrucao e a comparacao da posicao; partir criaria helper de uso unico).
+proc funcao_da_bir_na_posicao(bir_c: ?^bir.BirPrograma, n: u32, off: u32) -> u32 {
+    for k in (0 as u32)..<n {
+        let f: ^bir.BirFuncao = &((bir_c as ^bir.BirPrograma).funcoes or_else {})[k]
+        for b in (0 as u32)..<f.nblocos {
+            for i in (0 as u32)..<f.blocos[b].n {
+                if f.blocos[b].instrs[i].pos == off {
+                    return k + 1
+                }
+            }
+        }
+    }
+    return 0
+}
+
+// C: nativo/nativo_erro.c:360
+// A BIR ate a funcao do erro (inclusive); se a posicao nao cai em funcao nenhuma, todas as completas.
+// O C copia a BirPrograma para mudar nfuncoes; aqui muda-se e restaura-se o nfuncoes do original (so leitura de bir_imprimir).
+proc gravar_bir(pasta: str, erro: ^common.Diag, origem: ^ErroOrigem) -> bool {
+    if origem.bir == none {
+        return gravar_texto(pasta, "bir.txt", "(sem BIR: o erro veio antes de ela existir)\n")
+    }
+    let bir_c: ^bir.BirPrograma = origem.bir as ^bir.BirPrograma
+    var nfuncoes: u32 = funcao_da_bir_na_posicao(origem.bir, origem.bir_funcoes, erro.off)
+    if nfuncoes == 0 {
+        nfuncoes = origem.bir_funcoes
+    }
+    let salvo: u32 = bir_c.nfuncoes
+    bir_c.nfuncoes = nfuncoes
+    var texto: [dynamic]u8 = make([dynamic]u8, alloc = heap)
+    defer delete(texto)
+    bir.bir_imprimir(bir_c, &texto)
+    bir_c.nfuncoes = salvo
+    return gravar_na_pasta(pasta, "bir.txt", texto[..])
+}
+
+// C: nativo/nativo_erro.c:379
+proc gravar_leiame(pasta: str, p: ^NativoPedido, erro: ^common.Diag, etapa: ?str) -> bool {
+    let versao: str = p.versao or_else "(null)"
+    let etapa_txt: str = etapa or_else "(null)"
+    let primeiro_trecho: TrechoFonte = texto_da_fonte(p.fonte as ^common.Fonte, 0)
+    let arquivo: str = nome_do_arquivo_2(primeiro_trecho.caminho or_else "")
+    let codigo: str = common.diag_codigo_texto(erro.codigo)
+    let texto: str = format(f"Pacote de relato do forja {versao}: erro interno {codigo} na etapa '{etapa_txt}' do backend nativo x64.\nReproduza nesta pasta: forja build --backend x64 {arquivo} -o x.exe (a linha original esta em comando.txt).\nConteudo: comando.txt, versao.txt, os .fj (o principal e os modulos como <k>_<nome>), bir.txt (a BIR ate a funcao) e erro.json.\nNada sai desta maquina sozinho: envie esta pasta inteira a quem mantem a Forja.\n", alloc = frame)
+    return gravar_texto(pasta, "LEIAME.txt", texto)
+}
+
+// C: nativo/nativo_erro.c:394
+proc gravar_versao(pasta: str, p: ^NativoPedido, etapa: ?str) -> bool {
+    let versao: str = p.versao or_else "(null)"
+    let alvo: str = p.alvo or_else NATIVO_ALVO_PADRAO
+    var modo: str = "dev"
+    if p.modo == (bir.BM_RELEASE as u8) {
+        modo = "release"
+    }
+    let etapa_txt: str = etapa or_else "(null)"
+    let texto: str = format(f"forja {versao}\nalvo {alvo}\nmodo {modo}\netapa {etapa_txt}\n", alloc = frame)
+    return gravar_texto(pasta, "versao.txt", texto)
+}
+
+// C: nativo/nativo_erro.c:403
+proc gravar_comando(pasta: str, p: ^NativoPedido) -> bool {
+    let comando: str = p.comando or_else ""
+    let texto: str = format(f"{comando}\n", alloc = frame)
+    return gravar_texto(pasta, "comando.txt", texto)
+}
+
+// C: nativo/nativo_erro.c:415
+// Os arquivos do pacote, todos tentados mesmo que um falhe; false = algum nao gravou.
+proc gravar_arquivos_do_pacote(c: ^ErroContexto, pasta: str) -> bool {
+    let p: ?^NativoPedido = c.pedido
+    var ok: bool = gravar_comando(pasta, p as ^NativoPedido)
+    ok = (common.c2f_b2i32(gravar_versao(pasta, p as ^NativoPedido, (c.origem as ^ErroOrigem).etapa)) != 0) and (common.c2f_b2i32(ok) != 0)
+    ok = (common.c2f_b2i32(gravar_fontes(pasta, (p as ^NativoPedido).fonte as ^common.Fonte)) != 0) and (common.c2f_b2i32(ok) != 0)
+    ok = (common.c2f_b2i32(gravar_bir(pasta, c.erro as ^common.Diag, c.origem as ^ErroOrigem)) != 0) and (common.c2f_b2i32(ok) != 0)
+    ok = (common.c2f_b2i32(gravar_leiame(pasta, p as ^NativoPedido, c.erro as ^common.Diag, (c.origem as ^ErroOrigem).etapa)) != 0) and (common.c2f_b2i32(ok) != 0)
+    return ok
+}
+
+// C: nativo/nativo_erro.c:428
+// Tudo menos o erro.json, que precisa do caminho da pasta dentro dos extras. none = nao deu para montar o pacote (a pasta so e devolvida se saiu inteira).
+proc gravar_pacote(c: ^ErroContexto) -> ?str {
+    let pasta: ?str = abrir_pasta_do_relato(c.pedido as ^NativoPedido)
+    if pasta == none {
+        return none
+    }
+    let pasta_txt: str = pasta or_else ""
+    if not gravar_arquivos_do_pacote(c, pasta_txt) {
+        avisar_sem_relato("nao consegui gravar todos os arquivos em ", pasta_txt)
+        return none
+    }
+    return pasta
+}
+
+// C: nativo/nativo_erro.c:440
+proc gravar_erro_json(pasta: str, p: ^NativoPedido, erro: ^common.Diag, extras: ?str) -> bool {
+    let caminho: str = format(f"{pasta}/erro.json", alloc = heap)
+    defer delete(caminho)
+    let arquivo: ?^common.Saida = common.c2f_saida_abrir(caminho, "wb")
+    if arquivo == none {
+        avisar_sem_relato("nao consegui gravar ", caminho)
+        return false
+    }
+    let saida: ^common.Saida = arquivo as ^common.Saida
+    common.diag_imprimir_json_extras(erro, p.fonte as ^common.Fonte, extras, saida, sd_do_pedido(p))
+    return common.c2f_saida_fechar(saida) == 0
+}
+
+// Os bytes do buffer dos extras como texto (copia para o alocador frame: o caminho de erro roda uma vez por processo).
+proc texto_do_buffer(b: ^[dynamic]u8) -> str {
+    return from_bytes(b[..], alloc = frame)
+}
+
+// C: nativo/nativo_erro.c:456
+// Os extras apontam a pasta do relato; se o erro.json nao pode ser gravado nela, sai sem a pasta (nao aponta caminho invalido).
+proc montar_extras_com_relato(extras: ^[dynamic]u8, p: ^NativoPedido, erro: ^common.Diag, origem: ^ErroOrigem) {
+    var c: ErroContexto = ErroContexto{pedido = p, erro = erro, origem = origem}
+    var pasta: ?str = none
+    if not eh_diagnostico(erro.codigo) {
+        pasta = gravar_pacote(&c)
+    }
+    montar_extras(extras, &c, pasta)
+    if pasta == none {
+        return
+    }
+    if not gravar_erro_json(pasta or_else "", p, erro, texto_do_buffer(extras)) {
+        clear(extras)
+        montar_extras(extras, &c, none)
+    }
+}
+
+// C: nativo/nativo_erro.c:469
+// Imprime o erro em stdout (uma linha JSON com os extras) e devolve o exit do forja: 1 para X0001 e os X01xx, 3 para os internos.
+proc nativo_relatar_erro(pedido: ^NativoPedido, erro: ^common.Diag, origem: ^ErroOrigem) -> i32 {
+    var extras: [dynamic]u8 = make([dynamic]u8, alloc = heap)
+    defer delete(extras)
+    montar_extras_com_relato(&extras, pedido, erro, origem)
+    let saida: ^common.Saida = common.c2f_saida_stdout()
+    common.diag_imprimir_json_extras(erro, pedido.fonte as ^common.Fonte, texto_do_buffer(&extras), saida, sd_do_pedido(pedido))
+    _ = common.c2f_saida_fechar(saida)
+    if eh_diagnostico(erro.codigo) {
+        return SAIDA_DIAGNOSTICO
+    }
+    return SAIDA_INTERNO
+}
+
+test "nativo_erro: causa_cita_op casa o nome da operacao seguido de espaco ou fim" {
+    let nome: str = bir.bir_nome_do_op(0)
+    expect(causa_cita_op(nome, 0))
+    expect(causa_cita_op(format(f"{nome} ainda nao suportado", alloc = frame), 0))
+    expect(not causa_cita_op("zzz_nao_existe", 0))
+}
+
+test "nativo_erro: eh_diagnostico so para X0001 e X01xx" {
+    expect(eh_diagnostico(common.X0001))
+    expect(not eh_diagnostico(common.X0901))
+    expect(not eh_diagnostico(common.X0906))
+}
+
+test "nativo_erro: nome_do_arquivo_2 pega a parte depois de / ou barra invertida" {
+    expect(nome_do_arquivo_2("C:\\pasta\\modulo.fj") == "modulo.fj")
+    expect(nome_do_arquivo_2("pasta/sub/arq.fj") == "arq.fj")
+    expect(nome_do_arquivo_2("sem_barra.fj") == "sem_barra.fj")
+    expect(nome_do_arquivo_2("pasta/") == "")
+}
+
+test "nativo_erro: hash_em_hex igual ao %08x do C" {
+    expect(hash_em_hex(0) == "00000000")
+    expect(hash_em_hex(0xdeadbeef) == "deadbeef")
+    expect(hash_em_hex(0x0a0b0c0d) == "0a0b0c0d")
+}
+
+test "nativo_erro: fnv32_relato e FNV-1a de 32 bits" {
+    expect(fnv32_relato(FNV32_INICIO, as_bytes("")) == FNV32_INICIO)
+    expect(fnv32_relato(FNV32_INICIO, as_bytes("a")) == 0xe40c292c)
+    expect(fnv32_relato(FNV32_INICIO, as_bytes("foobar")) == 0xbf9cf968)
+}
+
+test "nativo_erro: qtd_fontes sem trechos conta 1" {
+    var fonte: common.Fonte = common.Fonte{}
+    expect(qtd_fontes(&fonte) == 1)
+}

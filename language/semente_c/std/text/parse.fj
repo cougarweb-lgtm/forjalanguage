@@ -1,0 +1,685 @@
+// std:text, pedaco parse (parte do modulo std:text: veja text.fj)
+// Versao: 0.3.0. Changelog: 0.3.0 - L3 do marco G3: parse_float com arredondamento correto (round-half-even, f64, subnormais e underflow para 0) para QUALQUER entrada valida: caminho exato de Clinger, Eisel-Lemire (tabela em text\parse_float_tabela.fj) e, onde ele recusa, comparacao com o ponto medio em inteiros grandes; 0.2.0 - IA1-S2b2b: parse_bool, parse_int_base, parse_uint e parse_uint_base; 0.1.0 - IA1-S2b2a: parse_int, parse_float e ParseError vindos de text.fj.
+pub enum ParseError { empty, invalid, overflow }
+
+const SINAL_MAIS: u8 = 43
+const SINAL_MENOS: u8 = 45
+const PONTO: u8 = 46
+const LETRA_E_MINUSCULA: u8 = 101
+const LETRA_E_MAIUSCULA: u8 = 69
+// Menor int, e o menor valor que ainda aceita mais um digito sem estourar (MENOR_INT / 10).
+const MENOR_INT: int = -9223372036854775807 - 1
+const LIMITE_ACUMULADO: int = -922337203685477580
+// A mantissa de parse_float guarda ate 19 algarismos significativos (cabem em u64); os demais so deslocam o expoente e, se nao forem zero, marcam a mantissa como truncada.
+const DIGITOS_MANTISSA_MAX: int = 19
+const LIMITE_EXPOENTE: int = 100000
+const POTENCIA_EXATA_MAX: int = 22
+// Caminho exato: a mantissa cabe em 53 bits. Eisel-Lemire: tabela de 10^-348 a 10^347 e o 217706 / 65536 (log2 de 10) com o desvio que o deixa positivo (65536 * 1157).
+const MANTISSA_EXATA_MAX: u64 = 9007199254740992
+const EXP10_MINIMO: int = -348
+const EXP10_MAXIMO: int = 347
+const LOG2_DE_10_NUM: int = 217706
+const LOG2_DE_10_DESVIO: int = 75825152
+const LOG2_DE_10_DESVIO_BLOCOS: int = 1157
+const EXPOENTE_F64_VIES: int = 1023
+const EXPOENTE_F64_INF: int = 2047
+const MASCARA_9_BITS: u64 = 0x1FF
+// Bits do f64 (positivo): 0x7FF0... e o infinito, 0x7FEF... o maior finito; NAO_DECIDIU nao e bits de nenhum finito (Eisel-Lemire recusou).
+const BITS_INFINITO: u64 = 0x7FF0000000000000
+const BITS_MAIOR_FINITO: u64 = 0x7FEFFFFFFFFFFFFF
+const BIT_SINAL: u64 = 0x8000000000000000
+const BIT_IMPLICITO: u64 = 0x0010000000000000
+const MASCARA_FRACAO: u64 = 0x000FFFFFFFFFFFFF
+const NAO_DECIDIU: u64 = 0xFFFFFFFFFFFFFFFF
+// Caminho exato (inteiros grandes): ate 800 algarismos lidos (um f64 tem no maximo 767 significativos, o ponto medio 768); acima de 10^310 estoura e abaixo de 10^-324 e zero.
+const DIGITOS_EXATOS_MAX: int = 800
+const GRANDEZA_ESTOURO: int = 310
+const GRANDEZA_ZERO: int = -324
+const MASCARA_PALAVRA: u64 = 0xFFFFFFFF
+const PASSO_POTENCIA_5: int = 13
+const CINCO_ELEVADO_13: u64 = 1220703125
+const MAIOR_U64: u64 = 18446744073709551615
+// Magnitude maxima de um int: 2^63 - 1 (positivo) e 2^63 (negativo, o menor int).
+const MAGNITUDE_MAIOR_INT: u64 = 9223372036854775807
+const MAGNITUDE_MENOR_INT: u64 = 9223372036854775808
+const BASE_MINIMA: int = 2
+const BASE_MAXIMA: int = 36
+const BASE_INFERIDA: int = 0
+const LETRA_B_MINUSCULA: u8 = 98
+const LETRA_B_MAIUSCULA: u8 = 66
+const LETRA_O_MINUSCULA: u8 = 111
+const LETRA_O_MAIUSCULA: u8 = 79
+const LETRA_X_MINUSCULA: u8 = 120
+const LETRA_X_MAIUSCULA: u8 = 88
+const BOOL_VERDADEIROS: [6]str = {"1", "t", "T", "TRUE", "true", "True"}
+const BOOL_FALSOS: [6]str = {"0", "f", "F", "FALSE", "false", "False"}
+
+// Valor do digito decimal, ou -1 se o byte nao e digito.
+proc digito_de(b: u8) -> int {
+    if b >= DIGITO_ZERO and b <= DIGITO_NOVE {
+        return (b - DIGITO_ZERO) as int
+    }
+    return -1
+}
+
+// Posicao logo depois do sinal opcional de s a partir de 0; negativo recebe true se o sinal e '-'.
+proc pular_sinal(s: str, negativo: ^bool) -> int {
+    if len(s) == 0 {
+        return 0
+    }
+    if s[0] == SINAL_MENOS {
+        negativo^ = true
+        return 1
+    }
+    if s[0] == SINAL_MAIS {
+        return 1
+    }
+    return 0
+}
+
+// Inteiro de s em decimal, com sinal opcional: ParseError.empty, invalid (byte que nao e digito) ou overflow (nao cabe em 64 bits).
+pub proc parse_int(s: str) -> int ! ParseError {
+    if len(s) == 0 {
+        return ParseError.empty
+    }
+    var negativo = false
+    var i = pular_sinal(s, negativo = &negativo)
+    if i == len(s) {
+        return ParseError.invalid
+    }
+    // Acumula em negativo: o menor int nao tem oposto positivo.
+    var acumulado = 0
+    var estourou = false
+    while i < len(s) {
+        let d = digito_de(s[i])
+        if d < 0 {
+            return ParseError.invalid
+        }
+        if acumulado < LIMITE_ACUMULADO {
+            estourou = true
+        } else {
+            acumulado = acumulado * 10
+            if acumulado < MENOR_INT + d {
+                estourou = true
+            } else {
+                acumulado -= d
+            }
+        }
+        i += 1
+    }
+    if estourou or (not negativo and acumulado == MENOR_INT) {
+        return ParseError.overflow
+    }
+    if negativo {
+        return acumulado
+    }
+    return -acumulado
+}
+
+// ---- Bool, inteiro com base e sem sinal (IA1-S2b2b, T15). Mesma regra de erro de parse_int: ParseError.empty (texto vazio), invalid (fora da forma) e overflow (nao cabe no tipo); invalid vence overflow quando o texto tem os dois defeitos.
+
+// Bool de s, exatamente como o Go (strconv.ParseBool, com caixa): "1", "t", "T", "TRUE", "true" e "True" dao true; "0", "f", "F", "FALSE", "false" e "False" dao false; vazio = ParseError.empty; qualquer outra coisa ("yes", "TrUe", " true") = ParseError.invalid.
+pub proc parse_bool(s: str) -> bool ! ParseError {
+    if len(s) == 0 {
+        return ParseError.empty
+    }
+    for i in 0..<len(BOOL_VERDADEIROS) {
+        if s == BOOL_VERDADEIROS[i] {
+            return true
+        }
+    }
+    for i in 0..<len(BOOL_FALSOS) {
+        if s == BOOL_FALSOS[i] {
+            return false
+        }
+    }
+    return ParseError.invalid
+}
+
+// Valor do digito em base ate 36: '0'-'9' = 0..9, 'a'-'z' e 'A'-'Z' = 10..35; -1 se o byte nao e digito.
+proc valor_do_digito(b: u8) -> int {
+    if b >= DIGITO_ZERO and b <= DIGITO_NOVE {
+        return (b - DIGITO_ZERO) as int
+    }
+    if b >= LETRA_A_MINUSCULA and b <= LETRA_Z_MINUSCULA {
+        return (b - LETRA_A_MINUSCULA) as int + 10
+    }
+    if b >= LETRA_A_MAIUSCULA and b <= LETRA_Z_MAIUSCULA {
+        return (b - LETRA_A_MAIUSCULA) as int + 10
+    }
+    return -1
+}
+
+// Base fora de 0 e 2..36 e erro de quem chama (nao do texto): panic com a mensagem (R0003), igual a repeat com estouro.
+proc exigir_base_valida(base: int) {
+    if base != BASE_INFERIDA and (base < BASE_MINIMA or base > BASE_MAXIMA) {
+        panic("parse: base fora de 0 e 2..36")
+    }
+}
+
+// Base que o byte depois do '0' anuncia: 'x'/'X' = 16, 'b'/'B' = 2, 'o'/'O' = 8; 0 se nao e prefixo.
+proc base_do_prefixo(letra: u8) -> int {
+    if letra == LETRA_X_MINUSCULA or letra == LETRA_X_MAIUSCULA {
+        return 16
+    }
+    if letra == LETRA_B_MINUSCULA or letra == LETRA_B_MAIUSCULA {
+        return 2
+    }
+    if letra == LETRA_O_MINUSCULA or letra == LETRA_O_MAIUSCULA {
+        return 8
+    }
+    return 0
+}
+
+// So com base 0 (inferir): resolve a base real em base^ (decimal sem prefixo) e devolve a posicao depois de 0x/0b/0o em i; com base explicita nao mexe em nada (o prefixo entao e texto invalido).
+proc resolver_prefixo(s: str, i: int, base: ^int) -> int {
+    if base^ != BASE_INFERIDA {
+        return i
+    }
+    base^ = 10
+    if i + 1 < len(s) and s[i] == DIGITO_ZERO {
+        let anunciada = base_do_prefixo(s[i + 1])
+        if anunciada != 0 {
+            base^ = anunciada
+            return i + 2
+        }
+    }
+    return i
+}
+
+// Valor sem sinal dos digitos de s a partir de inicio, na base (2..36): ParseError.invalid (nenhum digito, ou byte que nao e digito dessa base) ou overflow (passa de u64). Nucleo de parse_int_base e parse_uint_base.
+proc ler_magnitude(s: str, inicio: int, base: int) -> u64 ! ParseError {
+    if inicio >= len(s) {
+        return ParseError.invalid
+    }
+    let base_u = base as u64
+    let limite = MAIOR_U64 / base_u
+    var acumulado: u64 = 0
+    var estourou = false
+    for i in inicio..<len(s) {
+        let d = valor_do_digito(s[i])
+        if d < 0 or d >= base {
+            return ParseError.invalid
+        }
+        let digito = d as u64
+        if acumulado > limite or acumulado * base_u > MAIOR_U64 - digito {
+            estourou = true
+        } else {
+            acumulado = acumulado * base_u + digito
+        }
+    }
+    if estourou {
+        return ParseError.overflow
+    }
+    return acumulado
+}
+
+// Inteiro de s na base dada (2..36; digitos 0-9, a-z, A-Z) ou, com base 0, na base do prefixo: 0x/0X = 16, 0b/0B = 2, 0o/0O = 8, sem prefixo = 10 (diferente do Go, "017" e 17, nao octal). Sinal '+' ou '-' opcional ANTES do prefixo; o prefixo so vale com base 0 (com base 16, "0x1F" e invalid); "0x" sozinho e invalid. Erros: empty, invalid, overflow (inclusive 2^63 positivo; o menor int cabe). Base fora de 0 e 2..36 = panic (R0003), checado antes do texto.
+pub proc parse_int_base(s: str, base: int) -> int ! ParseError {
+    exigir_base_valida(base)
+    if len(s) == 0 {
+        return ParseError.empty
+    }
+    var negativo = false
+    let depois_do_sinal = pular_sinal(s, negativo = &negativo)
+    var base_real = base
+    let inicio = resolver_prefixo(s, depois_do_sinal, base = &base_real)
+    let magnitude = try ler_magnitude(s, inicio, base = base_real)
+    if negativo and magnitude == MAGNITUDE_MENOR_INT {
+        return MENOR_INT
+    }
+    if magnitude > MAGNITUDE_MAIOR_INT {
+        return ParseError.overflow
+    }
+    if negativo {
+        return -(magnitude as int)
+    }
+    return magnitude as int
+}
+
+// Inteiro sem sinal de s na base dada (2..36) ou, com base 0, na do prefixo (as mesmas regras de parse_int_base, mas SEM sinal: '+' e '-' sao invalid). Erros: empty, invalid, overflow (passa de 18446744073709551615). Base fora de 0 e 2..36 = panic (R0003).
+pub proc parse_uint_base(s: str, base: int) -> u64 ! ParseError {
+    exigir_base_valida(base)
+    if len(s) == 0 {
+        return ParseError.empty
+    }
+    var base_real = base
+    let inicio = resolver_prefixo(s, 0, base = &base_real)
+    return try ler_magnitude(s, inicio, base = base_real)
+}
+
+// Inteiro sem sinal decimal de s: so digitos 0-9 ('+', '-', espaco, prefixo = invalid); vazio = empty; passa de 18446744073709551615 = overflow.
+pub proc parse_uint(s: str) -> u64 ! ParseError {
+    return try parse_uint_base(s, base = 10)
+}
+
+// O que parse_float le de s: os 19 primeiros algarismos significativos (mantissa), o expoente decimal e o sinal; valor = mantissa * 10^expoente. truncada = depois dos 19 sobrou algarismo diferente de zero (o valor real fica entre mantissa e mantissa + 1). inicio..fim = onde estao os algarismos da mantissa em s e literal = o expoente escrito depois do 'e': o caminho exato (bits_exatos) refaz a leitura com mais algarismos.
+struct Decimal {
+    mantissa: u64 = 0
+    digitos: int = 0
+    expoente: int = 0
+    literal: int = 0
+    inicio: int = 0
+    fim: int = 0
+    negativo: bool = false
+    truncada: bool = false
+}
+
+// Soma um digito a mantissa de d: zero a esquerda so desloca o expoente (se vem depois do ponto); ate 19 significativos entram na mantissa; os demais so deslocam o expoente (se vem antes do ponto) e marcam truncada quando nao sao zero.
+proc acumular_digito(d: ^Decimal, digito: int, depois_do_ponto: bool) {
+    if d.mantissa == 0 and digito == 0 {
+        if depois_do_ponto {
+            d.expoente -= 1
+        }
+        return
+    }
+    if d.digitos < DIGITOS_MANTISSA_MAX {
+        d.mantissa = d.mantissa * 10 + (digito as u64)
+        d.digitos += 1
+        if depois_do_ponto {
+            d.expoente -= 1
+        }
+        return
+    }
+    if digito != 0 {
+        d.truncada = true
+    }
+    if not depois_do_ponto {
+        d.expoente += 1
+    }
+}
+
+// Le os digitos da mantissa (com o ponto) a partir de i; devolve a posicao seguinte, ou -1 se nao houve digito. Digito alem dos 19 so desloca o expoente (e marca truncada se nao for zero).
+proc ler_mantissa(s: str, i: int, d: ^Decimal) -> int {
+    var pos = i
+    var depois_do_ponto = false
+    var viu_digito = false
+    d.inicio = i
+    while pos < len(s) {
+        if s[pos] == PONTO and not depois_do_ponto {
+            depois_do_ponto = true
+            pos += 1
+            continue
+        }
+        let digito = digito_de(s[pos])
+        if digito < 0 {
+            break
+        }
+        viu_digito = true
+        acumular_digito(d, digito, depois_do_ponto)
+        pos += 1
+    }
+    if not viu_digito {
+        return -1
+    }
+    d.fim = pos
+    return pos
+}
+
+// Le 'e'/'E', sinal opcional e digitos a partir de i e soma ao expoente de d; false se o expoente esta malformado. Em i == len(s) nao ha expoente e vale true.
+proc ler_expoente(s: str, i: int, d: ^Decimal) -> bool {
+    if i == len(s) {
+        return true
+    }
+    if s[i] != LETRA_E_MINUSCULA and s[i] != LETRA_E_MAIUSCULA {
+        return false
+    }
+    var negativo = false
+    var pos = i + 1
+    pos += pular_sinal(s[pos..<len(s)], negativo = &negativo)
+    if pos == len(s) {
+        return false
+    }
+    var valor = 0
+    while pos < len(s) {
+        let digito = digito_de(s[pos])
+        if digito < 0 {
+            return false
+        }
+        if valor < LIMITE_EXPOENTE {
+            valor = valor * 10 + digito
+        }
+        pos += 1
+    }
+    if negativo {
+        valor = -valor
+    }
+    d.literal = valor
+    d.expoente += valor
+    return true
+}
+
+// 10 elevado a n (0..22) sem erro: toda potencia ate 1e22 cabe exata em f64.
+proc potencia_de_dez(n: int) -> f64 {
+    var p: f64 = 1.0
+    for _passo in 0..<n {
+        p = p * 10.0
+    }
+    return p
+}
+
+// mantissa * 10^expoente: um so produto ou quociente exato (e arredondado certo) quando a mantissa cabe em 53 bits e |expoente| <= 22 (Clinger); acima disso escala por 1e22 em passos e erra por alguns ulps: serve de ESTIMATIVA para o caminho exato (bits_exatos).
+proc escalar(mantissa: f64, expoente: int) -> f64 {
+    var valor = mantissa
+    if expoente > POTENCIA_EXATA_MAX {
+        // O resto da divisao por 22 multiplica primeiro (exato enquanto cabe em 53 bits): ate 1e43 sobra um so arredondamento, o do produto por 1e22.
+        let blocos = expoente / POTENCIA_EXATA_MAX
+        valor = valor * potencia_de_dez(expoente - blocos * POTENCIA_EXATA_MAX)
+        for _bloco in 0..<blocos {
+            valor = valor * potencia_de_dez(POTENCIA_EXATA_MAX)
+        }
+        return valor
+    }
+    var restante = expoente
+    while restante < -POTENCIA_EXATA_MAX {
+        valor = valor / potencia_de_dez(POTENCIA_EXATA_MAX)
+        restante += POTENCIA_EXATA_MAX
+    }
+    if restante >= 0 {
+        return valor * potencia_de_dez(restante)
+    }
+    return valor / potencia_de_dez(-restante)
+}
+
+// ---- Arredondamento correto (G3-L3). Eisel-Lemire como o strconv do Go; onde ele recusa, comparacao exata em inteiros grandes.
+
+// Bits do f64 positivo mais proximo de man * 10^exp10 pelo Eisel-Lemire (man != 0, exp10 em EXP10_MINIMO..EXP10_MAXIMO), ou NAO_DECIDIU quando a conta de 128 bits nao decide sozinha: subnormal, estouro ou empate ambiguo.
+proc eisel_lemire(man: u64, exp10: int) -> u64 {
+    let clz = leading_zeros(man) as int
+    let normal = man << (clz as u64)
+    let exp2 = (LOG2_DE_10_NUM * exp10 + LOG2_DE_10_DESVIO) / 65536 - LOG2_DE_10_DESVIO_BLOCOS + 64 + EXPOENTE_F64_VIES - clz
+    let indice = exp10 - EXP10_MINIMO
+    var alto = mul_hi_u64(normal, b = POTENCIAS_ALTA[indice])
+    var baixo = wrapping_mul(normal, b = POTENCIAS_ALTA[indice])
+    if not ampliar_produto(normal, indice, alto = &alto, baixo = &baixo) {
+        return NAO_DECIDIU
+    }
+    return arredondar_eisel_lemire(alto, baixo, exp2)
+}
+
+// Aproximacao mais larga do Eisel-Lemire: quando os 9 bits de baixo de alto sao todos 1, soma o produto com a palavra baixa da potencia em (alto, baixo); false se ainda assim nao decide.
+proc ampliar_produto(normal: u64, indice: int, alto: ^u64, baixo: ^u64) -> bool {
+    if (alto^ & MASCARA_9_BITS) != MASCARA_9_BITS or wrapping_add(baixo^, b = normal) >= normal {
+        return true
+    }
+    let y_alto = mul_hi_u64(normal, b = POTENCIAS_BAIXA[indice])
+    let y_baixo = wrapping_mul(normal, b = POTENCIAS_BAIXA[indice])
+    let fundido_baixo = wrapping_add(baixo^, b = y_alto)
+    if fundido_baixo < baixo^ {
+        alto^ += 1
+    }
+    baixo^ = fundido_baixo
+    return not ((alto^ & MASCARA_9_BITS) == MASCARA_9_BITS and wrapping_add(fundido_baixo, b = 1) == 0 and wrapping_add(y_baixo, b = normal) < normal)
+}
+
+// Ultimo passo do Eisel-Lemire: os 54 bits de cima do produto de 128 bits (alto, baixo), arredondados para 53 (meio para o par) e montados com o expoente exp2; NAO_DECIDIU em empate ambiguo, subnormal ou estouro.
+proc arredondar_eisel_lemire(alto: u64, baixo: u64, exp2: int) -> u64 {
+    let bit_alto = alto >> 63
+    var mantissa = alto >> (bit_alto + 9)
+    var expoente = exp2 - 1 + (bit_alto as int)
+    if baixo == 0 and (alto & MASCARA_9_BITS) == 0 and (mantissa & 3) == 1 {
+        return NAO_DECIDIU
+    }
+    mantissa += mantissa & 1
+    mantissa = mantissa >> 1
+    if (mantissa >> 53) > 0 {
+        mantissa = mantissa >> 1
+        expoente += 1
+    }
+    if expoente < 1 or expoente >= EXPOENTE_F64_INF {
+        return NAO_DECIDIU
+    }
+    return ((expoente as u64) << 52) | (mantissa & MASCARA_FRACAO)
+}
+
+// ---- Caminho exato: inteiros grandes sem sinal em palavras de 32 bits (a menos significativa primeiro).
+
+// n = palavras em uso, sem zero na ponta. 192 palavras = 6144 bits: cabem 800 algarismos (2659 bits) vezes 5^308 e o desvio ate o ponto medio de um f64.
+struct Grande {
+    palavras: [192]u32 = {}
+    n: int = 0
+}
+
+// O que o caminho exato leu da mantissa: quantos algarismos significativos (ate 800), o expoente decimal que vai com eles e se sobrou algarismo diferente de zero.
+struct Exato {
+    digitos: int = 0
+    expoente: int = 0
+    truncada: bool = false
+}
+
+// Tira as palavras zero da ponta de g.
+proc grande_aparar(g: ^Grande) {
+    while g.n > 0 and g.palavras[g.n - 1] == 0 {
+        g.n -= 1
+    }
+}
+
+// g = valor.
+proc grande_de_u64(g: ^Grande, valor: u64) {
+    g.palavras[0] = (valor & MASCARA_PALAVRA) as u32
+    g.palavras[1] = (valor >> 32) as u32
+    g.n = 2
+    grande_aparar(g)
+}
+
+// g = g * fator + soma, com fator de ate 31 bits e soma de ate 32 bits.
+proc grande_multiplicar(g: ^Grande, fator: u64, soma: u64) {
+    var vai = soma
+    for i in 0..<g.n {
+        let produto = (g.palavras[i] as u64) * fator + vai
+        g.palavras[i] = (produto & MASCARA_PALAVRA) as u32
+        vai = produto >> 32
+    }
+    if vai != 0 {
+        g.palavras[g.n] = vai as u32
+        g.n += 1
+    }
+}
+
+// g = g * 5^e (e >= 0), de 13 em 13 (5^13 cabe em 31 bits).
+proc grande_vezes_potencia_de_5(g: ^Grande, e: int) {
+    var resto = e
+    while resto >= PASSO_POTENCIA_5 {
+        grande_multiplicar(g, CINCO_ELEVADO_13, soma = 0)
+        resto -= PASSO_POTENCIA_5
+    }
+    var fator: u64 = 1
+    for _passo in 0..<resto {
+        fator = fator * 5
+    }
+    if fator > 1 {
+        grande_multiplicar(g, fator, soma = 0)
+    }
+}
+
+// g = g * 2^bits (bits >= 0).
+proc grande_deslocar(g: ^Grande, bits: int) {
+    if g.n == 0 or bits == 0 {
+        return
+    }
+    let inteiras = bits / 32
+    let resto = (bits % 32) as u64
+    var saida = Grande{}
+    for i in 0..<g.n {
+        let valor = (g.palavras[i] as u64) << resto
+        saida.palavras[i + inteiras] = saida.palavras[i + inteiras] | ((valor & MASCARA_PALAVRA) as u32)
+        saida.palavras[i + inteiras + 1] = (valor >> 32) as u32
+    }
+    saida.n = g.n + inteiras + 1
+    grande_aparar(&saida)
+    g^ = saida
+}
+
+// -1, 0 ou 1 conforme a < b, a == b ou a > b.
+proc grande_comparar(a: ^Grande, b: ^Grande) -> int {
+    if a.n != b.n {
+        if a.n < b.n {
+            return -1
+        }
+        return 1
+    }
+    var i = a.n - 1
+    while i >= 0 {
+        if a.palavras[i] != b.palavras[i] {
+            if a.palavras[i] < b.palavras[i] {
+                return -1
+            }
+            return 1
+        }
+        i -= 1
+    }
+    return 0
+}
+
+// Sinal de (n * 10^e10) - (b2 * 2^e2) em inteiros exatos: multiplica os dois lados por 5^-e10 se e10 < 0 (ou n por 5^e10 se e10 >= 0), de modo que cada lado vira palavra grande vezes uma potencia de 2 (e10 e e2), e desloca o de menor potencia para igualar.
+proc comparar_exato(n: ^Grande, e10: int, b2: u64, e2: int) -> int {
+    var esquerda = n^
+    var direita = Grande{}
+    grande_de_u64(&direita, b2)
+    if e10 >= 0 {
+        grande_vezes_potencia_de_5(&esquerda, e10)
+    } else {
+        grande_vezes_potencia_de_5(&direita, -e10)
+    }
+    let menor = min(e10, e2)
+    grande_deslocar(&esquerda, e10 - menor)
+    grande_deslocar(&direita, e2 - menor)
+    return grande_comparar(&esquerda, &direita)
+}
+
+// Sinal de (valor exato) - (ponto medio entre o f64 de bits b e o de bits b + 1; b < BITS_INFINITO). Os bits sao monotonicos: o medio e (2f + 1) * 2^(k - 1) com b = f * 2^k, mesmo na virada de expoente. truncada: o valor real e MAIOR que o lido, entao empate vira 1.
+proc comparar_ponto_medio(b: u64, n: ^Grande, e: ^Exato) -> int {
+    let campo_expoente = (b >> 52) as int
+    var fracao = b & MASCARA_FRACAO
+    var k = -1074
+    if campo_expoente > 0 {
+        fracao = fracao | BIT_IMPLICITO
+        k = campo_expoente - 1075
+    }
+    let sinal = comparar_exato(n, e.expoente, fracao * 2 + 1, k - 1)
+    if sinal == 0 and e.truncada {
+        return 1
+    }
+    return sinal
+}
+
+// Anda de b0 (estimativa) um f64 de cada vez, para cima e depois para baixo, ate que o valor exato fique entre os dois pontos medios vizinhos (empate: o de mantissa par).
+proc corrigir_bits(b0: u64, n: ^Grande, e: ^Exato) -> u64 {
+    var b = b0
+    while b < BITS_INFINITO {
+        let sinal = comparar_ponto_medio(b, n, e)
+        if sinal > 0 or (sinal == 0 and (b & 1) == 1) {
+            b += 1
+        } else {
+            break
+        }
+    }
+    while b > 0 {
+        let sinal = comparar_ponto_medio(b - 1, n, e)
+        if sinal < 0 or (sinal == 0 and (b & 1) == 1) {
+            b -= 1
+        } else {
+            break
+        }
+    }
+    return b
+}
+
+// Soma um digito ao inteiro grande n (as mesmas regras de acumular_digito, com ate 800 significativos); e guarda o expoente, a contagem e o resto nao nulo.
+proc acumular_digito_exato(n: ^Grande, e: ^Exato, digito: int, depois_do_ponto: bool) {
+    if n.n == 0 and digito == 0 {
+        if depois_do_ponto {
+            e.expoente -= 1
+        }
+        return
+    }
+    if e.digitos < DIGITOS_EXATOS_MAX {
+        grande_multiplicar(n, 10, soma = digito as u64)
+        e.digitos += 1
+        if depois_do_ponto {
+            e.expoente -= 1
+        }
+        return
+    }
+    if digito != 0 {
+        e.truncada = true
+    }
+    if not depois_do_ponto {
+        e.expoente += 1
+    }
+}
+
+// Rele os algarismos da mantissa de s (ate 800 significativos) em n; e recebe o expoente decimal que vai com eles, quantos foram lidos e se sobrou algarismo diferente de zero.
+proc ler_algarismos_exatos(s: str, d: ^Decimal, n: ^Grande, e: ^Exato) {
+    var depois_do_ponto = false
+    e.expoente = d.literal
+    for i in d.inicio..<d.fim {
+        if s[i] == PONTO {
+            depois_do_ponto = true
+            continue
+        }
+        acumular_digito_exato(n, e, digito_de(s[i]), depois_do_ponto)
+    }
+}
+
+// Bits do f64 positivo mais proximo do valor exato do texto: estoura ou zera pela grandeza, senao parte de uma estimativa em ponto flutuante (erra por poucos ulps) e corrige pela comparacao exata com os pontos medios.
+proc bits_exatos(s: str, d: ^Decimal) -> u64 {
+    var n = Grande{}
+    var e = Exato{}
+    ler_algarismos_exatos(s, d, n = &n, e = &e)
+    let grandeza = e.digitos + e.expoente
+    if grandeza >= GRANDEZA_ESTOURO {
+        return BITS_INFINITO
+    }
+    if grandeza <= GRANDEZA_ZERO {
+        return 0
+    }
+    let estimativa = escalar(d.mantissa as f64, d.expoente)
+    var b: u64 = transmute(estimativa, to = u64)
+    if b > BITS_MAIOR_FINITO {
+        b = BITS_MAIOR_FINITO
+    }
+    return corrigir_bits(b, n = &n, e = &e)
+}
+
+// Bits do f64 positivo (0x7FF0... = infinito) do decimal d: zero e fora da faixa sem conta; Clinger; Eisel-Lemire (com truncada, a mantissa e a seguinte tem de dar o mesmo); senao o caminho exato.
+proc bits_do_decimal(s: str, d: ^Decimal) -> u64 {
+    if d.mantissa == 0 or d.expoente < EXP10_MINIMO {
+        return 0
+    }
+    if d.expoente > EXP10_MAXIMO {
+        return BITS_INFINITO
+    }
+    if not d.truncada and d.mantissa <= MANTISSA_EXATA_MAX and d.expoente >= -POTENCIA_EXATA_MAX and d.expoente <= POTENCIA_EXATA_MAX {
+        return transmute(escalar(d.mantissa as f64, d.expoente), to = u64)
+    }
+    let achado = eisel_lemire(d.mantissa, d.expoente)
+    if achado != NAO_DECIDIU and (not d.truncada or eisel_lemire(d.mantissa + 1, d.expoente) == achado) {
+        return achado
+    }
+    return bits_exatos(s, d)
+}
+
+// Real de s, com arredondamento correto (o f64 mais proximo do valor exato do texto, empate para o par; IEEE 754, igual ao strtod do C): ParseError.empty, invalid (fora da forma) ou overflow (passa de f64; o limite e o ponto medio entre o maior f64 e 2^1024). Abaixo do menor subnormal, ate o ponto medio dele, vira 0 (com o sinal: "-0" e "-1e-400" dao -0).
+pub proc parse_float(s: str) -> f64 ! ParseError {
+    if len(s) == 0 {
+        return ParseError.empty
+    }
+    var d = Decimal{}
+    let inicio = pular_sinal(s, negativo = &d.negativo)
+    let fim_mantissa = ler_mantissa(s, inicio, d = &d)
+    if fim_mantissa < 0 {
+        return ParseError.invalid
+    }
+    if not ler_expoente(s, fim_mantissa, d = &d) {
+        return ParseError.invalid
+    }
+    let bits = bits_do_decimal(s, d = &d)
+    if bits >= BITS_INFINITO {
+        return ParseError.overflow
+    }
+    if d.negativo {
+        return transmute(bits | BIT_SINAL, to = f64)
+    }
+    return transmute(bits, to = f64)
+}

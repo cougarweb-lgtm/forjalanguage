@@ -1,0 +1,115 @@
+// teste_matriz.fj 0.1.0 (10/11/2026) - M0-c: a 3x4 de mundo_matriz.transformacao_para_matriz3x4 contra a matriz do cubo do G15 (testes_graficos\f2_cubo\cubo.fj, cubo_rotacao + cubo_constantes).
+// O cubo monta modelo = T(pos - camera) * (O * Ry(ay) * Rx(ax)) por produto de matrizes 4x4 (matriz.fj/camera.fj) e copia as colunas 0..3 x linhas 0..2. Aqui a mesma rotacao vem do
+//   quat qO * qy * qx (qy = {y = sin(a/2), w = cos(a/2)}, qx = {x = sin(a/2), w = cos(a/2)}) e a 3x4 de engine:mundo_matriz. Cada caso imprime "caso ...: bits_iguais=N/12 iguais_float=N/12 dif_max_nano=N" (dif_max_nano = maior |diferenca| nas 9 entradas da rotacao x 1e9);
+//   o teste exige |diferenca| <= 5e-7 (cerca de 4 ulp de f32 em valores perto de 1; medido: ate 3e-7) nas 9 entradas da rotacao e IGUALDADE EXATA na translacao (col3, mesma conta em f64). Rotacao calculada por quat nao reproduz o produto de matrizes
+//   bit a bit em geral: a diferenca medida fica registrada na saida e no contrato (dourado proprio se o G18 comparar hashes de imagem).
+// Roda por `forja test` (sem janela nem GPU). O proc main so existe porque o forja test exige um programa.
+// Changelog: 0.1.0 - M0-c da trilha M0 (engine:mundo_matriz).
+// Verificar: $env:FORJA_ENGINE='C:\ENGINE_GAME3D\engine'; & "$env:TEMP\forja_f2_fim\forja.exe" test C:\ENGINE_GAME3D\testes_mundo\teste_matriz.fj
+import "motor/mundo" as mundo
+import "motor/mundo_matriz" as mm
+import "motor/matriz" as mat
+import "motor/camera" as cam
+
+const TM_FASE_Y: f32 = 0.6
+const TM_FASE_X: f32 = 0.45
+const TM_PASSO_Y: f32 = 0.02
+const TM_PASSO_X: f32 = 0.013
+const TM_DIF_MAX: f32 = 0.0000005
+const TM_MEIA_PI: f32 = 1.5707964
+
+struct Medida {
+    bits_iguais: int
+    floats_iguais: int
+    dif_max: f32
+    translacao_igual: bool
+}
+
+proc main() {
+    print(0)
+}
+
+proc quat_y(angulo: f32) -> quat {
+    return quat{y = mat.mat_seno(angulo * 0.5), w = mat.mat_cosseno(angulo * 0.5)}
+}
+
+proc quat_x(angulo: f32) -> quat {
+    return quat{x = mat.mat_seno(angulo * 0.5), w = mat.mat_cosseno(angulo * 0.5)}
+}
+
+// Diferenca absoluta (ulp perto de zero engana: 1e-9 contra 3e-9 e muitos ulps e nada de erro).
+proc diferenca(a: f32, b: f32) -> f32 {
+    return abs(a - b)
+}
+
+// Linha j (0..2) da coluna k (0..3) da 4x4 do cubo: indice [k * 3 + j] do vetor de 12.
+proc esperado_do_cubo(c: ^cam.Camera, pos: [3]f64, rotacao: matrix[4, 4]f32) -> [12]f32 {
+    let modelo = cam.cam_matriz_modelo(c, pos_objeto = pos, rotacao = rotacao)
+    var v: [12]f32 = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0}
+    for k in 0..<4 {
+        for j in 0..<3 {
+            v[k * 3 + j] = modelo[j, k]
+        }
+    }
+    return v
+}
+
+proc medir(esp: [12]f32, obtido: [12]f32) -> Medida {
+    var r = Medida{bits_iguais = 0, floats_iguais = 0, dif_max = 0.0, translacao_igual = true}
+    for i in 0..<12 {
+        let u = diferenca(esp[i], b = obtido[i])
+        if transmute(esp[i], to = u32) == transmute(obtido[i], to = u32) {
+            r.bits_iguais = r.bits_iguais + 1
+        }
+        if esp[i] == obtido[i] {
+            r.floats_iguais = r.floats_iguais + 1
+        }
+        if i >= 9 and u != 0.0 {
+            r.translacao_igual = false
+        }
+        if i < 9 and u > r.dif_max {
+            r.dif_max = u
+        }
+    }
+    return r
+}
+
+// Um quadro do cubo: yaw da camera (O), pos do objeto e da camera, numero do quadro (a partir de 1).
+proc caso(nome: cstr, numero: i32, yaw: f32, pos: [3]f64, camera: [3]f64) -> Medida {
+    let ay = TM_FASE_Y + (numero as f32) * TM_PASSO_Y
+    let ax = TM_FASE_X + (numero as f32) * TM_PASSO_X
+    var c = cam.Camera{posicao = camera, yaw = yaw, pitch = 0.0, fov_y = 0.7853982}
+    let giro = mat.mat_multiplicar(mat.mat_rotacao_y(ay), b = mat.mat_rotacao_x(ax))
+    let rotacao = mat.mat_multiplicar(cam.cam_orientacao(&c), b = giro)
+    let esp = esperado_do_cubo(&c, pos = pos, rotacao = rotacao)
+    let q = quat_y(yaw) * quat_y(ay) * quat_x(ax)
+    let t = mundo.Transformacao{pos = pos, rot = q, escala = {1.0, 1.0, 1.0}}
+    let med = medir(esp, obtido = mm.transformacao_para_matriz3x4(t, origem = camera))
+    print(f"caso {nome} quadro {numero}: bits_iguais={med.bits_iguais}/12 iguais_float={med.floats_iguais}/12 dif_max_nano={(med.dif_max * 1000000000.0) as int}")
+    return med
+}
+
+proc aceita(m: Medida) -> bool {
+    return m.dif_max <= TM_DIF_MAX and m.translacao_igual
+}
+
+test "3x4 do quat = matriz do cubo (camera em +Z, yaw 0): rotacao ate 5e-7, translacao exata" {
+    expect(aceita(caso("perto", numero = 1, yaw = 0.0, pos = {0.0, 0.0, 0.0}, camera = {0.0, 0.0, 5.0})))
+    expect(aceita(caso("perto", numero = 90, yaw = 0.0, pos = {0.0, 0.0, 0.0}, camera = {0.0, 0.0, 5.0})))
+    expect(aceita(caso("perto", numero = 240, yaw = 0.0, pos = {0.0, 0.0, 0.0}, camera = {0.0, 0.0, 5.0})))
+}
+
+test "3x4 do quat = matriz do cubo (--longe: objeto a 63660 m, camera a 63665 m, yaw 90 graus)" {
+    expect(aceita(caso("longe", numero = 1, yaw = TM_MEIA_PI, pos = {63660.0, 0.0, 0.0}, camera = {63665.0, 0.0, 0.0})))
+    expect(aceita(caso("longe", numero = 90, yaw = TM_MEIA_PI, pos = {63660.0, 0.0, 0.0}, camera = {63665.0, 0.0, 0.0})))
+    expect(aceita(caso("longe", numero = 240, yaw = TM_MEIA_PI, pos = {63660.0, 0.0, 0.0}, camera = {63665.0, 0.0, 0.0})))
+}
+
+test "3x4: escala multiplica as colunas da rotacao e a translacao e relativa a origem em f64" {
+    let t = mundo.Transformacao{pos = {1000000.5, 2.0, -3.0}, rot = quat{w = 1.0}, escala = {2.0, 3.0, 4.0}}
+    let m = mm.transformacao_para_matriz3x4(t, origem = {1000000.0, 0.0, 0.0})
+    expect(m[0] == 2.0 and m[1] == 0.0 and m[2] == 0.0)
+    expect(m[3] == 0.0 and m[4] == 3.0 and m[5] == 0.0)
+    expect(m[6] == 0.0 and m[7] == 0.0 and m[8] == 4.0)
+    expect(m[9] == 0.5 and m[10] == 2.0 and m[11] == -3.0)
+}

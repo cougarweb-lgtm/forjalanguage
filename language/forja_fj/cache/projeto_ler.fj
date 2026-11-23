@@ -1,0 +1,616 @@
+// cache/projeto_ler.fj - porte de compiler/cache/projeto_ler.c, compiler/cache/projeto_ler.h
+// sha256 de cache/projeto_ler.c: 7ab7cbe88555c5a25df87ca385ab14f9021fa04ec0bc1d27754717780b8ca8b9
+// sha256 de cache/projeto_ler.h: a6fc5dcb456411b36aac4ba462171d2bd3477005775123a001aecde21fb77422
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.2.0
+// Changelog: 0.2.0 - G3 V4-W9: corpo real. Dividir/LimparLinha/ZerarBrancos trabalham em [] u8 com NUL no lugar (como o C), palavras viram vistas cstr -> str depois da zeragem; _fullpath -> os.abs_path com o teto de PROJETO_CAMINHO_MAX; qsort -> sort_by (nomes unicos: ordem total); textos guardados em alloc = frame.
+
+import "std:file"
+import "std:os"
+import "common"
+
+pub struct Produto {
+    nome: ?str
+    tipo: i32
+    entrada: ?str
+    saida: ?str
+    cabecalho: ?str
+    nomes_dep: [32]str
+    dep: [32]u32
+    ndep: u32
+    linha: u32
+}
+
+pub struct Projeto {
+    pasta: ?str
+    saida: ?str
+    produtos: [dynamic]Produto
+}
+
+struct Leitor {
+    projeto: ?^Projeto
+    erro: ?^common.Diag
+    caminho: ?str
+    saida_declarada: bool
+    saida_texto: ?str
+}
+
+// C: Dividir. Palavras de uma linha: inicio de cada uma (depois que os brancos viram NUL) e quantas; n = LEITOR_MAX_PALAVRAS + 1 se passou do maximo.
+struct Divisao {
+    inicios: [37]int
+    n: int
+}
+
+const PRODUTO_EXE: i32 = 0
+pub const PRODUTO_DLL: i32 = 1
+pub const PROJETO_NOME_MAX: i32 = 64
+pub const PROJETO_CAMINHO_MAX: i32 = 1100
+pub const PROJETO_DEPENDE_MAX: i32 = 32
+const LEITOR_LINHA_MAX: i32 = 1024
+const LEITOR_SAIDA_PADRAO: str = "bin"
+const LEITOR_MAX_PALAVRAS: i32 = 37
+
+// C: Invalido. Relata B0005 "<caminho> linha N: <causa> '<detalhe>'" (sem linha se 0, sem detalhe se none). Sempre false.
+proc invalido(l: ^Leitor, linha: u32, causa: str, detalhe: ?str) -> bool {
+    let caminho = l.caminho or_else ""
+    var onde: str = caminho
+    if linha > 0 {
+        onde = format(f"{caminho} linha {linha}", alloc = frame)
+    }
+    var msg: str = format(f"{onde}: {causa}", alloc = frame)
+    if detalhe != none {
+        let det = detalhe or_else ""
+        msg = format(f"{onde}: {causa} '{det}'", alloc = frame)
+    }
+    let erro = l.erro as ^common.Diag
+    _ = common.diag_relatar(erro, common.B0005, 0, msg)
+    return false
+}
+
+// C: EhBranco
+proc eh_branco(c: u8) -> bool {
+    return (c == 32) or (c == 9) // ' ' '\t'
+}
+
+// C: PularBrancos. Passa os brancos do inicio sem alterar o texto.
+proc pular_brancos(texto: str) -> str {
+    var k: int = 0
+    while k < len(texto) and eh_branco(texto[k]) {
+        k += 1
+    }
+    return texto[k..<len(texto)]
+}
+
+// C: ZerarBrancos. Troca os brancos a partir de i por NUL e devolve o indice do 1o caractere depois deles.
+proc zerar_brancos(p: []u8, i: int) -> int {
+    var k: int = i
+    while k < len(p) and eh_branco(p[k]) {
+        p[k] = 0
+        k += 1
+    }
+    return k
+}
+
+// C: FimDaPalavra. Indice do 1o branco ou NUL a partir de i.
+proc fim_da_palavra(p: []u8, i: int) -> int {
+    var k: int = i
+    while k < len(p) and p[k] != 0 and not eh_branco(p[k]) {
+        k += 1
+    }
+    return k
+}
+
+// C: Dividir. Zera os brancos (NUL no lugar, como o C) e anota o inicio de cada palavra; n = LEITOR_MAX_PALAVRAS + 1 se passou do maximo.
+proc dividir(util: []u8) -> Divisao {
+    var div = Divisao{}
+    var p: int = 0
+    while p < len(util) and util[p] != 0 {
+        p = zerar_brancos(util, p)
+        if p >= len(util) or util[p] == 0 {
+            break
+        }
+        if div.n == (LEITOR_MAX_PALAVRAS as int) {
+            div.n = (LEITOR_MAX_PALAVRAS as int) + 1
+            return div
+        }
+        div.inicios[div.n] = p
+        div.n += 1
+        p = fim_da_palavra(util, p)
+    }
+    return div
+}
+
+// Palavra que comeca em ini: vista cstr ate o proximo NUL (depois de dividir, o NUL e o branco seguinte).
+proc palavra_de(util: []u8, ini: int) -> str {
+    return texto_c_de_bytes(util[ini..<len(util)])
+}
+
+// C: LimparLinha. Corta no '#', tira o branco do fim (e o \r) e devolve o indice do 1o caractere util.
+proc limpar_linha(texto: []u8) -> int {
+    var tam: int = common.c2f_strlen_b(texto)
+    for k in 0..<tam {
+        if texto[k] == 35 { // '#'
+            tam = k
+            texto[k] = 0
+            break
+        }
+    }
+    while tam > 0 and branco_do_fim(texto[tam - 1]) {
+        tam -= 1
+        texto[tam] = 0
+    }
+    var inicio: int = 0
+    while inicio < tam and eh_branco(texto[inicio]) {
+        inicio += 1
+    }
+    return inicio
+}
+
+// C: BrancoDoFim
+proc branco_do_fim(c: u8) -> bool {
+    return (common.c2f_b2i32(eh_branco(c)) != 0) or (c == 13) // '\r'
+}
+
+// C: EhDeclaracaoSaida. A linha comeca pela palavra 'saida' seguida de branco ou '='.
+proc eh_declaracao_saida(texto: str) -> bool {
+    if len(texto) <= 5 {
+        return false
+    }
+    return (texto[0..<5] == "saida") and (eh_branco(texto[5]) or (texto[5] == 61)) // '='
+}
+
+// C: CaractereDeNome
+proc caractere_de_nome(c: u8) -> bool {
+    return (((common.c2f_char_i32(c) >= 97) and (common.c2f_char_i32(c) <= 122)) or ((common.c2f_char_i32(c) >= 48) and (common.c2f_char_i32(c) <= 57))) or (c == 95) // 'a' 'z' '0' '9' '_'
+}
+
+// C: NomeValido
+proc nome_valido(nome: str) -> bool {
+    let tam: u64 = len(nome) as u64
+    if (tam == 0) or (tam >= (PROJETO_NOME_MAX as u64)) {
+        return false
+    }
+    for k in (0 as u64)..<tam {
+        if not caractere_de_nome(nome[k]) {
+            return false
+        }
+    }
+    return true
+}
+
+// C: IndiceDoProduto. Indice do produto de nome (-1 = nao existe).
+proc indice_do_produto(p: ^Projeto, nome: str) -> i64 {
+    for k in (0 as u64)..<(len(p.produtos) as u64) {
+        if (p.produtos[k].nome or_else "") == nome {
+            return transmute(k, to = i64)
+        }
+    }
+    return -1
+}
+
+// C: CaminhoJaAbsoluto. Barra no inicio ou letra de unidade (X:).
+proc caminho_ja_absoluto(resto: str) -> bool {
+    if len(resto) == 0 {
+        return false
+    }
+    if (resto[0] == 47) or (resto[0] == 92) { // '/' '\\'
+        return true
+    }
+    return (len(resto) >= 2) and (resto[1] == 58) // ':'
+}
+
+// C: CaminhoAbsoluto. resto relativo a pasta (ou ja absoluto) -> caminho absoluto normalizado (_fullpath); none = nao coube no teto.
+proc caminho_absoluto(pasta: str, resto: str) -> ?str {
+    var bruto: str = resto
+    if not caminho_ja_absoluto(resto) {
+        bruto = format(f"{pasta}\\{resto}", alloc = frame)
+    }
+    if len(bruto) >= (PROJETO_CAMINHO_MAX as int) {
+        return none
+    }
+    switch absoluto in os.abs_path(bruto, alloc = frame) {
+    case str:
+        if len(absoluto) >= (PROJETO_CAMINHO_MAX as int) {
+            return none
+        }
+        return absoluto
+    case os.OsError:
+        return none
+    }
+    return none
+}
+
+// C: ArquivoExiste. Existe e nao e pasta.
+proc arquivo_existe(caminho: str) -> bool {
+    switch info in file.stat(caminho) {
+    case file.FileInfo:
+        return info.kind != file.FileKind.dir
+    case file.FileError:
+        return false
+    }
+    return false
+}
+
+// C: ConferirForma. Forma do 'produto': palavras, 'depende' e limite de dependencias.
+proc conferir_forma(l: ^Leitor, linha: u32, pal: []str) -> bool {
+    if ((len(pal) as u64) < 4) or (((len(pal) as u64) > 4) and ((pal[4] != "depende") or ((len(pal) as u64) < 6))) {
+        return invalido(l, linha, "esperado: produto <nome> <exe|dll> <entrada.fj> [depende <nome> ...]", none)
+    }
+    if (len(pal) as u64) > (LEITOR_MAX_PALAVRAS as u64) {
+        return invalido(l, linha, "produto depende de produtos demais", none)
+    }
+    return true
+}
+
+// C: ConferirIdentidade. Nome, repeticao e tipo do 'produto'.
+proc conferir_identidade(l: ^Leitor, linha: u32, pal: []str) -> bool {
+    if not nome_valido(pal[1]) {
+        return invalido(l, linha, "nome de produto invalido (use [a-z0-9_]+)", pal[1])
+    }
+    if indice_do_produto(l.projeto as ^Projeto, pal[1]) >= 0 {
+        return invalido(l, linha, "nome repetido", pal[1])
+    }
+    if (pal[2] != "exe") and (pal[2] != "dll") {
+        return invalido(l, linha, "tipo desconhecido (use exe ou dll)", pal[2])
+    }
+    return true
+}
+
+// C: ConferirDependencias
+proc conferir_dependencias(l: ^Leitor, linha: u32, pal: []str) -> bool {
+    for k in (5 as u64)..<(len(pal) as u64) {
+        if not nome_valido(pal[k]) {
+            return invalido(l, linha, "nome de dependencia invalido", pal[k])
+        }
+    }
+    return true
+}
+
+// C: ConferirProduto. Forma, nome, repeticao, tipo e dependencias do 'produto'.
+proc conferir_produto(l: ^Leitor, linha: u32, pal: []str) -> bool {
+    return conferir_forma(l, linha, pal) and conferir_identidade(l, linha, pal) and conferir_dependencias(l, linha, pal)
+}
+
+// C: PreencherProduto. Textos com alloc = frame (o Produto nao tem dono do texto).
+proc preencher_produto(pr: ^Produto, pal: []str, entrada: str) {
+    let nome_lido = pal[1]
+    pr.nome = format(f"{nome_lido}", alloc = frame)
+    pr.tipo = PRODUTO_EXE
+    if pal[2] == "dll" {
+        pr.tipo = PRODUTO_DLL
+    }
+    pr.entrada = format(f"{entrada}", alloc = frame)
+    pr.ndep = 0
+    if len(pal) > 5 {
+        pr.ndep = (len(pal) - 5) as u32
+    }
+    for k in (5 as u64)..<(len(pal) as u64) {
+        let nome_dep = pal[k]
+        pr.nomes_dep[k - 5] = format(f"{nome_dep}", alloc = frame)
+    }
+}
+
+// C: TratarProduto. Confere, resolve a entrada (caminho absoluto e arquivo existente) e acrescenta o produto.
+proc tratar_produto(l: ^Leitor, linha: u32, pal: []str) -> bool {
+    if not conferir_produto(l, linha, pal) {
+        return false
+    }
+    let projeto = l.projeto as ^Projeto
+    let entrada = caminho_absoluto(projeto.pasta or_else "", pal[3])
+    if entrada == none {
+        return invalido(l, linha, "caminho de entrada longo demais", pal[3])
+    }
+    let entrada_txt = entrada or_else ""
+    if not arquivo_existe(entrada_txt) {
+        return invalido(l, linha, "entrada ausente", pal[3])
+    }
+    let k: u64 = len(projeto.produtos) as u64
+    append(&projeto.produtos, item = Produto{})
+    let pr: ^Produto = &projeto.produtos[k]
+    preencher_produto(pr, pal, entrada_txt)
+    pr.linha = linha
+    return true
+}
+
+// C: TratarSaida. "saida = <pasta>" (o texto comeca depois da palavra saida).
+proc tratar_saida(l: ^Leitor, linha: u32, texto: str) -> bool {
+    let sem_branco = pular_brancos(texto)
+    if (len(sem_branco) == 0) or (sem_branco[0] != 61) { // '='
+        return invalido(l, linha, "esperado: saida = <pasta>", none)
+    }
+    let pasta_lida = pular_brancos(sem_branco[1..<len(sem_branco)])
+    if len(pasta_lida) == 0 {
+        return invalido(l, linha, "saida sem pasta", none)
+    }
+    if l.saida_declarada {
+        return invalido(l, linha, "saida declarada duas vezes", none)
+    }
+    if len(pasta_lida) >= (PROJETO_CAMINHO_MAX as int) {
+        return invalido(l, linha, "pasta de saida longa demais", none)
+    }
+    l.saida_texto = format(f"{pasta_lida}", alloc = frame)
+    l.saida_declarada = true
+    return true
+}
+
+// C: TratarLinha. Uma linha ja lida (bruto, NUL no fim): comentario, saida ou produto.
+proc tratar_linha(l: ^Leitor, linha: u32, bruto: []u8) -> bool {
+    let inicio = limpar_linha(bruto)
+    let util = bruto[inicio..<len(bruto)]
+    let primeiro = texto_c_de_bytes(util)
+    if len(primeiro) == 0 {
+        return true
+    }
+    if eh_declaracao_saida(primeiro) {
+        return tratar_saida(l, linha, primeiro[5..<len(primeiro)])
+    }
+    let div = dividir(util)
+    if div.n > (LEITOR_MAX_PALAVRAS as int) {
+        return invalido(l, linha, "produto depende de produtos demais", none)
+    }
+    var pal: [37]str = {}
+    for k in 0..<div.n {
+        pal[k] = palavra_de(util, div.inicios[k])
+    }
+    if pal[0] == "produto" {
+        return tratar_produto(l, linha, pal[0..<div.n])
+    }
+    return invalido(l, linha, "declaracao desconhecida", pal[0])
+}
+
+// C: LerLinhas. Cada linha vai para um buffer de LEITOR_LINHA_MAX bytes com NUL no fim; a ultima pode nao ter '\n'.
+proc ler_linhas(l: ^Leitor, fonte: ^common.Fonte) -> bool {
+    let texto = texto_c_de_bytes(fonte.texto)
+    var inicio: int = 0
+    var linha: u32 = 1
+    while inicio < len(texto) {
+        let fim = fim_da_linha(texto, inicio)
+        var fim_util: int = len(texto)
+        var proximo: int = len(texto)
+        if fim >= 0 {
+            fim_util = fim
+            proximo = fim + 1
+        }
+        let tam = fim_util - inicio
+        if tam >= (LEITOR_LINHA_MAX as int) {
+            return invalido(l, linha, "linha longa demais", none)
+        }
+        var bruto: [1024]u8 = {}
+        for k in 0..<tam {
+            bruto[k] = texto[inicio + k]
+        }
+        if not tratar_linha(l, linha, bruto[..]) {
+            return false
+        }
+        if fim < 0 {
+            return true
+        }
+        inicio = proximo
+        linha += 1
+    }
+    return true
+}
+
+// C: InserirDependencia. Poe o indice em dep[] em ordem crescente (= ordem de nome); repetido nao entra.
+proc inserir_dependencia(pr: ^Produto, indice: u32) {
+    var pos: u32 = 0
+    while (pos < pr.ndep) and (pr.dep[pos] < indice) {
+        pos += 1
+    }
+    if (pos < pr.ndep) and (pr.dep[pos] == indice) {
+        return
+    }
+    var k: u32 = pr.ndep
+    while k > pos {
+        pr.dep[k] = pr.dep[k - 1]
+        k -= 1
+    }
+    pr.dep[pos] = indice
+    pr.ndep += 1
+}
+
+// C: ResolverDependencias. Nomes de dependencia viram indices (produto inexistente = B0005).
+proc resolver_dependencias(l: ^Leitor) -> bool {
+    let projeto = l.projeto as ^Projeto
+    var k: u64 = 0
+    while k < (len(projeto.produtos) as u64) {
+        let pr: ^Produto = &projeto.produtos[k]
+        let nomes = pr.ndep
+        pr.ndep = 0
+        var j: u32 = 0
+        while j < nomes {
+            let indice = indice_do_produto(projeto, pr.nomes_dep[j])
+            if indice < 0 {
+                return invalido(l, pr.linha, "depende de produto inexistente", pr.nomes_dep[j])
+            }
+            inserir_dependencia(pr, indice as u32)
+            j += 1
+        }
+        k += 1
+    }
+    return true
+}
+
+// C: CompararPorNome. Nomes sao unicos (repetido e recusado antes), entao a ordem e total.
+proc menor_por_nome(a: ^Produto, b: ^Produto) -> bool {
+    return common.c2f_strcmp(a.nome or_else "", b.nome or_else "") < 0
+}
+
+// C: CabeEm. snprintf devolveu n e coube em cap bytes (n == 0 cabe).
+proc cabe_em(n: i32, cap: u64) -> bool {
+    return (n >= 0) and (common.c2f_s2u_64(n as i64) < cap)
+}
+
+// C: MontarSaidaDoProduto. <saida>\<nome>.exe|.dll (+ <nome>.h na dll). false = caminho longo demais.
+proc montar_saida_do_produto(p: ^Projeto, pr: ^Produto) -> bool {
+    let pasta_saida = p.saida or_else ""
+    let nome = pr.nome or_else ""
+    var extensao: str = "exe"
+    if pr.tipo == PRODUTO_DLL {
+        extensao = "dll"
+    }
+    let saida_produto = format(f"{pasta_saida}\\{nome}.{extensao}", alloc = frame)
+    if not cabe_em(len(saida_produto) as i32, PROJETO_CAMINHO_MAX as u64) {
+        return false
+    }
+    pr.saida = saida_produto
+    if pr.tipo == PRODUTO_DLL {
+        let cabecalho = format(f"{pasta_saida}\\{nome}.h", alloc = frame)
+        if not cabe_em(len(cabecalho) as i32, PROJETO_CAMINHO_MAX as u64) {
+            return false
+        }
+        pr.cabecalho = cabecalho
+    }
+    return true
+}
+
+// C: MontarSaidas. <saida>\<nome>.exe|.dll (+ <nome>.h na dll) de cada produto.
+proc montar_saidas(l: ^Leitor) -> bool {
+    let p: ?^Projeto = l.projeto
+    var k: u64 = 0
+    while k < (len((p as ^Projeto).produtos) as u64) {
+        let pr: ^Produto = &(p as ^Projeto).produtos[k]
+        if not montar_saida_do_produto(p as ^Projeto, pr) {
+            return invalido(l, pr.linha, "caminho de saida longo demais", pr.nome)
+        }
+        k += 1
+    }
+    return true
+}
+
+// C: Finalizar. Depois da ultima linha: pasta de saida, ordem por nome, dependencias em indices e caminhos de saida.
+proc finalizar(l: ^Leitor) -> bool {
+    let projeto = l.projeto as ^Projeto
+    var saida_lida: str = LEITOR_SAIDA_PADRAO
+    if l.saida_declarada {
+        saida_lida = l.saida_texto or_else ""
+    }
+    if len(projeto.produtos) == 0 {
+        return invalido(l, 0, "nenhum produto declarado", none)
+    }
+    let saida_abs = caminho_absoluto(projeto.pasta or_else "", saida_lida)
+    if saida_abs == none {
+        return invalido(l, 0, "pasta de saida longa demais", saida_lida)
+    }
+    projeto.saida = saida_abs
+    sort_by(projeto.produtos[..], less = menor_por_nome)
+    return resolver_dependencias(l) and montar_saidas(l)
+}
+
+// C: PastaDoManifesto (absoluto). _fullpath do caminho do manifesto; none = nao coube no teto de PROJETO_CAMINHO_MAX.
+proc absoluto_do_manifesto(caminho: str) -> ?str {
+    switch absoluto in os.abs_path(caminho, alloc = frame) {
+    case str:
+        if len(absoluto) >= (PROJETO_CAMINHO_MAX as int) {
+            return none
+        }
+        return absoluto
+    case os.OsError:
+        return none
+    }
+    return none
+}
+
+// C: PastaDoManifesto (pasta). Tudo antes da ultima barra do caminho absoluto; none = sem barra.
+proc pasta_do_manifesto(absoluto: str) -> ?str {
+    var k: int = len(absoluto)
+    while k > 0 {
+        k -= 1
+        if absoluto[k] == 92 { // '\\'
+            return absoluto[0..<k]
+        }
+    }
+    return none
+}
+
+// C: ProjetoLer. Le o manifesto; false com erro->tem = true (B0005) ou com a mensagem de FonteLer (o arquivo nao abriu).
+pub proc projeto_ler(caminho: str, saida: ^Projeto, erro: ^common.Diag) -> bool {
+    var l = Leitor{projeto = saida, erro = erro, caminho = caminho, saida_declarada = false}
+    saida.produtos = make([dynamic]Produto, alloc = heap)
+    erro.tem = false
+    let absoluto = absoluto_do_manifesto(caminho)
+    let pasta = pasta_do_manifesto(absoluto or_else "")
+    if pasta == none {
+        projeto_liberar(saida)
+        return invalido(&l, 0, "caminho do manifesto longo demais", none)
+    }
+    saida.pasta = pasta
+    var fonte = common.Fonte{}
+    if not common.fonte_ler(&fonte, absoluto or_else "") {
+        projeto_liberar(saida)
+        return false
+    }
+    let ok = ler_linhas(&l, &fonte) and finalizar(&l)
+    common.fonte_liberar(&fonte)
+    if not ok {
+        projeto_liberar(saida)
+    }
+    return ok
+}
+
+// C: ProjetoLiberar
+pub proc projeto_liberar(p: ^Projeto) {
+    delete(p.produtos)
+}
+
+// C: ProjetoProduto
+pub proc projeto_produto(p: ^Projeto, k: u32) -> ^Produto {
+    return &p.produtos[k as u64]
+}
+
+// Testes dirigidos (C: LimparLinha, Dividir, EhDeclaracaoSaida, NomeValido, CaminhoJaAbsoluto, PastaDoManifesto, Invalido); valores conferidos a mao contra o C.
+test "projeto: limpar linha tira comentario e brancos" {
+    var b: [32]u8 = {}
+    let s = "  saida = x  # nota"
+    for k in 0..<len(s) {
+        b[k] = s[k]
+    }
+    let inicio = limpar_linha(b[..])
+    expect(inicio == 2)
+    expect(texto_c_de_bytes(b[inicio..<32]) == "saida = x")
+}
+
+test "projeto: dividir zera brancos e anota o inicio de cada palavra" {
+    var b: [32]u8 = {}
+    let s = "produto  a\tb"
+    for k in 0..<len(s) {
+        b[k] = s[k]
+    }
+    let div = dividir(b[..])
+    expect(div.n == 3)
+    expect(palavra_de(b[..], div.inicios[0]) == "produto")
+    expect(palavra_de(b[..], div.inicios[1]) == "a")
+    expect(palavra_de(b[..], div.inicios[2]) == "b")
+}
+
+test "projeto: declaracao saida, nomes e caminho absoluto" {
+    expect(eh_declaracao_saida("saida=x"))
+    expect(eh_declaracao_saida("saida x"))
+    expect(not eh_declaracao_saida("saidax"))
+    expect(not eh_declaracao_saida("saida"))
+    expect(nome_valido("a_1"))
+    expect(not nome_valido("A"))
+    expect(not nome_valido(""))
+    expect(caminho_ja_absoluto("C:x"))
+    expect(caminho_ja_absoluto("\\rede"))
+    expect(not caminho_ja_absoluto("a\\b"))
+    expect(not caminho_ja_absoluto("C"))
+}
+
+test "projeto: pasta do manifesto e linha de forma errada e B0005" {
+    expect((pasta_do_manifesto("C:\\a\\b.forja") or_else "") == "C:\\a")
+    expect(pasta_do_manifesto("semBarra") == none)
+    var p = Projeto{}
+    p.produtos = make([dynamic]Produto, alloc = heap)
+    defer delete(p.produtos)
+    var d = common.Diag{}
+    var l = Leitor{projeto = &p, erro = &d, caminho = "f.forja", saida_declarada = false}
+    var b: [64]u8 = {}
+    let s = "produto so"
+    for k in 0..<len(s) {
+        b[k] = s[k]
+    }
+    expect(not tratar_linha(&l, 3, b[..]))
+    expect(d.tem)
+    expect(d.codigo == common.B0005)
+}

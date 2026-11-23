@@ -1,0 +1,296 @@
+// runtime/wasm/rt_wasm_teste.fj - executor de testes (forja test) do alvo wasm32-wasip1
+// Versao: 0.1.0
+// Contrato: os simbolos forja_teste_registrar, forja_testes_rodar e forja_expect do BIR de teste sao atendidos pelos procs pub teste_registrar,
+// testes_rodar e esperar deste modulo; o driver o injeta so no alvo wasm e so em `forja test`. O formato de saida e o do rt_teste.c do x64.
+// Queda dentro de um teste (R-code, panic, assert) termina o modulo com proc_exit(101): o executor JS (executor_wasm.mjs) reinstancia o modulo, devolve o
+// estado deste bloco e retoma no teste seguinte. expect falho so relata e o teste segue, como no x64.
+// Estado em [384,496) da memoria linear (u64 cada; o runtime em bytecode usa [0,369) e o heap [512,1024)) e o filtro em [832,1024):
+//   384 tabela (endereco do vetor de entradas de 16 B) | 392 total | 400 capacidade | 408 proximo teste | 416 falhas | 424 filtrados | 432 json (0/1)
+//   440 em teste (indice+1; 0 fora) | 448 falhou | 456 falha anotada | 464 arquivo | 472 linha | 480 texto do expect | 488 tamanho do filtro
+// O executor escreve proximo, falhas, filtrados, json e o filtro antes de _start e le o resto depois da queda.
+
+import "std:wasm_rt"
+
+struct Entrada {
+    nome: uint
+    funcao: proc()
+}
+
+const E_TABELA: uint = 384
+const E_TOTAL: uint = 392
+const E_CAP: uint = 400
+const E_PROXIMO: uint = 408
+const E_FALHAS: uint = 416
+const E_FILTRADOS: uint = 424
+const E_JSON: uint = 432
+const E_EM_TESTE: uint = 440
+const E_FALHOU: uint = 448
+const E_ANOTADA: uint = 456
+const E_ARQUIVO: uint = 464
+const E_LINHA: uint = 472
+const E_TEXTO: uint = 480
+const E_FILTRO_TAM: uint = 488
+const FILTRO_BASE: uint = 832
+const FALHA_VAZAMENTO: uint = 2 // valor de E_FALHOU para o teste que passou e vazou heap (1 = expect falho)
+const TESTES_MAX: uint = 4096
+const CAP_INICIAL: uint = 16
+const ENTRADA_BYTES: uint = 16
+const FMT_HEX2: u32 = 24578 // hexa (16384) + zeros (8192) + largura 2
+
+proc ler(endereco: uint) -> uint {
+    return wasm_rt.memoria_ler_u64(endereco)
+}
+
+proc gravar(endereco: uint, valor: uint) {
+    wasm_rt.memoria_escrever_u64(endereco, valor)
+}
+
+proc entrada_do_teste(indice: uint) -> ^Entrada {
+    return wasm_rt.ponteiro_de(ler(E_TABELA) + (indice * ENTRADA_BYTES)) as ^Entrada
+}
+
+// bytes do cstr no endereco, sem o NUL
+proc cstr_tam(origem: uint) -> uint {
+    var n: uint = 0
+    while wasm_rt.memoria_ler_u8(origem + n) != 0 {
+        n += 1
+    }
+    return n
+}
+
+// teste_registrar(nome, funcao): acrescenta ao vetor; estourar os 4096 testes e R0003, como o FORJA_TESTES_MAX do x64
+pub proc teste_registrar(nome: uint, funcao: proc()) {
+    let total: uint = ler(E_TOTAL)
+    var capacidade: uint = ler(E_CAP)
+    if total >= TESTES_MAX {
+        wasm_rt.panico("limite de testes excedido (FORJA_TESTES_MAX)", "std:wasm_teste", 0)
+    }
+    if total == capacidade {
+        var nova: uint = capacidade * 2
+        if nova == 0 {
+            nova = CAP_INICIAL
+        }
+        gravar(E_TABELA, wasm_rt.heap_realocar(ler(E_TABELA), capacidade * ENTRADA_BYTES, nova * ENTRADA_BYTES))
+        gravar(E_CAP, nova)
+        capacidade = nova
+    }
+    let e: ^Entrada = entrada_do_teste(total)
+    e.nome = nome
+    e.funcao = funcao
+    gravar(E_TOTAL, total + 1)
+}
+
+// ---- texto: stdout e stderr pelo buffer de formatacao do std:wasm_rt ----
+
+// texto cstr do endereco no buffer de formatacao, escapado para JSON (aspas, barra, \n, \r, \t; outro byte de controle vira \u00XX)
+proc json_texto(origem: uint) {
+    var i: uint = 0
+    while wasm_rt.memoria_ler_u8(origem + i) != 0 {
+        let b: uint = wasm_rt.memoria_ler_u8(origem + i)
+        if b == 34 {
+            wasm_rt.fmt_cstr("\\\"", 0)
+        } else if b == 92 {
+            wasm_rt.fmt_cstr("\\\\", 0)
+        } else if b == 10 {
+            wasm_rt.fmt_cstr("\\n", 0)
+        } else if b == 13 {
+            wasm_rt.fmt_cstr("\\r", 0)
+        } else if b == 9 {
+            wasm_rt.fmt_cstr("\\t", 0)
+        } else if b < 32 {
+            wasm_rt.fmt_cstr("\\u00", 0)
+            wasm_rt.fmt_u64(b, FMT_HEX2)
+        } else {
+            wasm_rt.fmt_bytes(origem + i, 1, 0)
+        }
+        i += 1
+    }
+}
+
+// "  expect falhou: <texto> (<arq>:<linha>)" no stderr: o expect dentro de teste so relata
+proc expect_relatar(texto: uint, arquivo: uint, linha: int) {
+    wasm_rt.fmt_inicio()
+    wasm_rt.fmt_cstr("  expect falhou: ", 0)
+    wasm_rt.fmt_bytes(texto, cstr_tam(texto), 0)
+    wasm_rt.fmt_cstr(" (", 0)
+    wasm_rt.fmt_bytes(arquivo, cstr_tam(arquivo), 0)
+    wasm_rt.fmt_cstr(":", 0)
+    wasm_rt.fmt_i64(linha, 0)
+    wasm_rt.fmt_cstr(")", 0)
+    wasm_rt.fmt_imprimir_erro()
+}
+
+// expect(cond): falso marca o teste como falho, anota a 1a falha para o --json e segue
+pub proc esperar(cond: bool, texto: cstr, arquivo: cstr, linha: i32) {
+    if cond {
+        return
+    }
+    let t: uint = wasm_rt.endereco_de(texto as rawptr)
+    let a: uint = wasm_rt.endereco_de(arquivo as rawptr)
+    gravar(E_FALHOU, 1)
+    if ler(E_ANOTADA) == 0 {
+        gravar(E_ANOTADA, 1)
+        gravar(E_ARQUIVO, a)
+        gravar(E_LINHA, linha as uint)
+        gravar(E_TEXTO, t)
+    }
+    expect_relatar(t, a, linha as int)
+}
+
+// ---- --filtro: o titulo contem o trecho (sensivel a caixa); trecho vazio casa tudo ----
+
+proc trecho_no_titulo(titulo: uint, a_partir: uint, tam: uint) -> bool {
+    var k: uint = 0
+    while k < tam {
+        if wasm_rt.memoria_ler_u8(titulo + a_partir + k) != wasm_rt.memoria_ler_u8(FILTRO_BASE + k) {
+            return false
+        }
+        k += 1
+    }
+    return true
+}
+
+proc titulo_casa(titulo: uint) -> bool {
+    let tam: uint = ler(E_FILTRO_TAM)
+    if tam == 0 {
+        return true
+    }
+    let tam_titulo: uint = cstr_tam(titulo)
+    if tam > tam_titulo {
+        return false
+    }
+    var inicio: uint = 0
+    while inicio + tam <= tam_titulo {
+        if trecho_no_titulo(titulo, inicio, tam) {
+            return true
+        }
+        inicio += 1
+    }
+    return false
+}
+
+// ---- saida de cada teste e do resumo (texto igual ao rt_teste.c) ----
+
+// {"teste": "<titulo>", "resultado": "ok"} ou, em falha, mais codigo, arquivo, linha e causa da 1a falha (so o expect passa por aqui)
+proc saida_json(titulo: uint, falhou: bool) {
+    wasm_rt.fmt_inicio()
+    wasm_rt.fmt_cstr("{\"teste\": \"", 0)
+    json_texto(titulo)
+    if not falhou {
+        wasm_rt.fmt_cstr("\", \"resultado\": \"ok\"}", 0)
+        wasm_rt.fmt_imprimir()
+        return
+    }
+    if ler(E_FALHOU) == FALHA_VAZAMENTO {
+        wasm_rt.fmt_cstr("\", \"resultado\": \"falhou\", \"codigo\": \"R0009\", \"arquivo\": \"", 0)
+    } else {
+        wasm_rt.fmt_cstr("\", \"resultado\": \"falhou\", \"codigo\": \"R0003\", \"arquivo\": \"", 0)
+    }
+    json_texto(ler(E_ARQUIVO))
+    wasm_rt.fmt_cstr("\", \"linha\": ", 0)
+    wasm_rt.fmt_i64(ler(E_LINHA) as int, 0)
+    if ler(E_FALHOU) == FALHA_VAZAMENTO {
+        wasm_rt.fmt_cstr(", \"causa\": \"vazamento: ", 0)
+        wasm_rt.fmt_u64(wasm_rt.rastro_primeiro(2), 0)
+        wasm_rt.fmt_cstr(" blocos (", 0)
+        wasm_rt.fmt_u64(wasm_rt.rastro_primeiro(3), 0)
+        wasm_rt.fmt_cstr(" bytes) alocados aqui seguem vivos no fim do teste", 0)
+    } else {
+        wasm_rt.fmt_cstr(", \"causa\": \"expect falhou: ", 0)
+        json_texto(ler(E_TEXTO))
+    }
+    wasm_rt.fmt_cstr("\"}", 0)
+    wasm_rt.fmt_imprimir()
+}
+
+// 0.36.0 (dev): teste que passou e deixou bloco de heap vivo falha, como no x64: uma linha R0009 por ponto de alocacao no stderr e o 1o ponto vira a falha do --json
+proc vazamento_do_teste(serie_antes: uint) {
+    if ler(E_FALHOU) != 0 {
+        return
+    }
+    if wasm_rt.rastro_relatar(serie_antes, true) == 0 {
+        return
+    }
+    gravar(E_FALHOU, FALHA_VAZAMENTO)
+    gravar(E_ARQUIVO, wasm_rt.rastro_primeiro(0))
+    gravar(E_LINHA, wasm_rt.rastro_primeiro(1))
+}
+
+proc saida_do_teste(titulo: uint, falhou: bool) {
+    if ler(E_JSON) != 0 {
+        saida_json(titulo, falhou)
+        return
+    }
+    wasm_rt.fmt_inicio()
+    if falhou {
+        wasm_rt.fmt_cstr("FALHOU ", 0)
+    } else {
+        wasm_rt.fmt_cstr("ok   ", 0)
+    }
+    wasm_rt.fmt_bytes(titulo, cstr_tam(titulo), 0)
+    wasm_rt.fmt_imprimir()
+}
+
+// "<rodados> testes, <f> falharam[, <k> filtrados]" ou {"resumo": {...}} (total = todos os registrados)
+proc resumo() {
+    let total: uint = ler(E_TOTAL)
+    let falhas: uint = ler(E_FALHAS)
+    let filtrados: uint = ler(E_FILTRADOS)
+    wasm_rt.fmt_inicio()
+    if ler(E_JSON) != 0 {
+        wasm_rt.fmt_cstr("{\"resumo\": {\"total\": ", 0)
+        wasm_rt.fmt_u64(total, 0)
+        wasm_rt.fmt_cstr(", \"ok\": ", 0)
+        wasm_rt.fmt_u64(total - filtrados - falhas, 0)
+        wasm_rt.fmt_cstr(", \"falhou\": ", 0)
+        wasm_rt.fmt_u64(falhas, 0)
+        wasm_rt.fmt_cstr(", \"filtrados\": ", 0)
+        wasm_rt.fmt_u64(filtrados, 0)
+        wasm_rt.fmt_cstr("}}", 0)
+    } else {
+        wasm_rt.fmt_u64(total - filtrados, 0)
+        wasm_rt.fmt_cstr(" testes, ", 0)
+        wasm_rt.fmt_u64(falhas, 0)
+        wasm_rt.fmt_cstr(" falharam", 0)
+        if filtrados > 0 {
+            wasm_rt.fmt_cstr(", ", 0)
+            wasm_rt.fmt_u64(filtrados, 0)
+            wasm_rt.fmt_cstr(" filtrados", 0)
+        }
+    }
+    wasm_rt.fmt_imprimir()
+}
+
+// Roda os testes de `proximo` ate o fim (todos, ou so os do filtro); devolve 0 se nenhum falhou, 1 se algum falhou (contando os que o executor ja anotou)
+pub proc testes_rodar() -> i32 {
+    let total: uint = ler(E_TOTAL)
+    var i: uint = ler(E_PROXIMO)
+    while i < total {
+        let e: ^Entrada = entrada_do_teste(i)
+        gravar(E_PROXIMO, i)
+        if not titulo_casa(e.nome) {
+            gravar(E_FILTRADOS, ler(E_FILTRADOS) + 1)
+            i += 1
+            continue
+        }
+        gravar(E_FALHOU, 0)
+        gravar(E_ANOTADA, 0)
+        gravar(E_EM_TESTE, i + 1)
+        let serie_antes: uint = wasm_rt.rastro_serie()
+        e.funcao()
+        gravar(E_EM_TESTE, 0)
+        vazamento_do_teste(serie_antes)
+        let falhou: bool = ler(E_FALHOU) != 0
+        if falhou {
+            gravar(E_FALHAS, ler(E_FALHAS) + 1)
+        }
+        saida_do_teste(e.nome, falhou)
+        i += 1
+    }
+    gravar(E_PROXIMO, total)
+    resumo()
+    if ler(E_FALHAS) != 0 {
+        return 1
+    }
+    return 0
+}

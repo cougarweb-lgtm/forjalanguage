@@ -1,0 +1,261 @@
+// nativo/bir/analises_cfg.fj - porte de compiler/nativo/bir/analises_cfg.c
+// sha256 de nativo/bir/analises_cfg.c: 7a0639817b2a03ae6eafc8e0400590955902517b2c7389ed214bc564c97162d1
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "common"
+
+struct MontagemArestas {
+    nblocos: u32
+    n: u32
+    marca: ?[]u32
+    suc: ?[]u32
+}
+
+struct PilhaDfs {
+    visitado: []u32 // C2F-INDECIDIVEL
+    prox: []u32 // C2F-INDECIDIVEL
+    pilha: []u32 // C2F-INDECIDIVEL
+}
+
+// C: nativo/bir/analises_cfg.c:12
+proc eh_conta_ov(op: u8) -> bool {
+    return (((op == (BIR_ADD_OV as u8)) or (op == (BIR_SUB_OV as u8))) or (op == (BIR_MUL_OV as u8))) or (op == (BIR_NEG_OV as u8))
+}
+
+// C: nativo/bir/analises_cfg.c:20
+proc nova_aresta(m: ^MontagemArestas, de: u32, para: u32) {
+    if (para >= m.nblocos) or ((m.marca or_else {})[para] == (de + 1)) {
+        return
+    }
+    let p_1 = m.marca or_else {}
+    p_1[para] = de + 1
+    let antes_1: u32 = m.n
+    m.n += 1
+    let p_2 = m.suc or_else {}
+    p_2[antes_1] = para
+}
+
+// C: nativo/bir/analises_cfg.c:29
+proc arestas_do_bloco(m: ^MontagemArestas, f: ^BirFuncao, b: u32) {
+    let blk: ^BirBloco = &f.blocos[b]
+    var k: u32 = 0
+    while k < blk.n {
+        let i: ^BirInstr = &blk.instrs[k]
+        if ((common.c2f_b2i32(eh_conta_ov(i.op)) != 0) or (i.op == (BIR_SALTA as u8))) or (i.op == (BIR_DESVIA as u8)) {
+            nova_aresta(m, b, i.alvo[0])
+        }
+        if i.op == (BIR_DESVIA as u8) {
+            nova_aresta(m, b, i.alvo[1])
+        }
+        k += 1
+    }
+}
+
+// C: nativo/bir/analises_cfg.c:44
+// C2F-INDECIDIVEL: ini
+// C2F-13: cont fundido em n (len)
+proc somar_prefixos(ini: []u32, cont: []u32) {
+    ini[0] = 0
+    for b in (0 as u32)..<(len(cont) as u32) {
+        ini[b + 1] = ini[b] + cont[b]
+    }
+}
+
+// C: nativo/bir/analises_cfg.c:52
+proc montar_predecessores(a: ^AnalisesBir) {
+    let cont: []u32 = analises_vetor32(a, a.nblocos as u64)
+    let suc_ini: []u32 = a.suc_ini or_else {}
+    let suc: []u32 = a.suc or_else {}
+    for k in (0 as u32)..<suc_ini[a.nblocos] {
+        cont[suc[k]] += 1
+    }
+    a.pred_ini = analises_vetor32(a, (a.nblocos + 1) as u64)
+    let pred_ini: []u32 = a.pred_ini or_else {}
+    somar_prefixos(pred_ini, cont[0..<(a.nblocos as int)])
+    a.pred = analises_vetor32(a, pred_ini[a.nblocos] as u64)
+    let pred: []u32 = a.pred or_else {}
+    for k in (0 as u32)..<(len(cont) as u32) {
+        cont[k] = 0
+    }
+    for b in (0 as u32)..<a.nblocos {
+        var k: u32 = suc_ini[b]
+        while k < suc_ini[b + 1] {
+            let s: u32 = suc[k]
+            pred[pred_ini[s] + cont[s]] = b
+            cont[s] += 1
+            k += 1
+        }
+    }
+}
+
+// C: nativo/bir/analises_cfg.c:68
+proc analises_montar_arestas(a: ^AnalisesBir, f: ^BirFuncao) {
+    var m = MontagemArestas{nblocos = a.nblocos, marca = analises_vetor32(a, a.nblocos as u64)}
+    var total: u64 = 0
+    for b in (0 as u32)..<a.nblocos {
+        total += f.blocos[b].n as u64
+    }
+    a.suc_ini = analises_vetor32(a, (a.nblocos + 1) as u64)
+    a.suc = analises_vetor32(a, 2 * total)
+    m.suc = a.suc
+    let suc_ini: []u32 = a.suc_ini or_else {}
+    for b in (0 as u32)..<a.nblocos {
+        suc_ini[b] = m.n
+        arestas_do_bloco(&m, f, b)
+    }
+    suc_ini[a.nblocos] = m.n
+    montar_predecessores(a)
+}
+
+// C: nativo/bir/analises_cfg.c:89
+// C2F-INDECIDIVEL: ordem
+proc pos_ordem(a: ^AnalisesBir, ordem: []u32, d: ^PilhaDfs) -> u32 {
+    let suc_ini: []u32 = a.suc_ini or_else {}
+    let suc: []u32 = a.suc or_else {}
+    var topo: u32 = 1
+    var n: u32 = 0
+    for b in (0 as u32)..<a.nblocos {
+        d.prox[b] = suc_ini[b]
+    }
+    d.pilha[0] = 0
+    d.visitado[0] = 1
+    while topo > 0 {
+        let b: u32 = d.pilha[topo - 1]
+        if d.prox[b] == suc_ini[b + 1] {
+            ordem[n] = b
+            n += 1
+            topo -= 1
+            continue
+        }
+        let s: u32 = suc[d.prox[b]]
+        d.prox[b] += 1
+        if d.visitado[s] == 0 {
+            d.visitado[s] = 1
+            d.pilha[topo] = s
+            topo += 1
+        }
+    }
+    return n
+}
+
+// C: nativo/bir/analises_cfg.c:115
+proc analises_calcular_rpo(a: ^AnalisesBir) {
+    let ordem: []u32 = analises_vetor32(a, a.nblocos as u64)
+    var d = PilhaDfs{visitado = analises_vetor32(a, a.nblocos as u64), prox = analises_vetor32(a, a.nblocos as u64), pilha = analises_vetor32(a, a.nblocos as u64)}
+    a.rpo = analises_vetor32(a, a.nblocos as u64)
+    a.pos_rpo = analises_vetor32(a, a.nblocos as u64)
+    let pos_rpo: []u32 = a.pos_rpo or_else {}
+    for b in (0 as u32)..<a.nblocos {
+        pos_rpo[b] = BIR_SEM_BLOCO
+    }
+    if a.nblocos == 0 {
+        return
+    }
+    a.nrpo = pos_ordem(a, ordem, &d)
+    let rpo: []u32 = a.rpo or_else {}
+    for i in (0 as u32)..<a.nrpo {
+        rpo[i] = ordem[a.nrpo - 1 - i]
+        pos_rpo[rpo[i]] = i
+    }
+}
+
+// C: nativo/bir/analises_cfg.c:134
+proc intersectar(a: ^AnalisesBir, x: u32, y: u32) -> u32 {
+    var x_v: u32 = x
+    var y_v: u32 = y
+    while x_v != y_v {
+        while (a.pos_rpo or_else {})[x_v] > (a.pos_rpo or_else {})[y_v] {
+            x_v = (a.idom or_else {})[x_v]
+        }
+        while (a.pos_rpo or_else {})[y_v] > (a.pos_rpo or_else {})[x_v] {
+            y_v = (a.idom or_else {})[y_v]
+        }
+    }
+    return x_v
+}
+
+// C: nativo/bir/analises_cfg.c:146
+proc idom_candidato(a: ^AnalisesBir, b: u32) -> u32 {
+    var novo: u32 = BIR_SEM_BLOCO
+    var k: u32 = (a.pred_ini or_else {})[b]
+    while k < (a.pred_ini or_else {})[b + 1] {
+        let p: u32 = (a.pred or_else {})[k]
+        if ((a.pos_rpo or_else {})[p] == BIR_SEM_BLOCO) or ((a.idom or_else {})[p] == BIR_SEM_BLOCO) {
+            k += 1
+            continue
+        }
+        var tern_1: u32 = 0
+        if novo == BIR_SEM_BLOCO {
+            tern_1 = p
+        } else {
+            tern_1 = intersectar(a, novo, p)
+        }
+        novo = tern_1
+        k += 1
+    }
+    return novo
+}
+
+// C: nativo/bir/analises_cfg.c:162
+proc numerar_dominadores(a: ^AnalisesBir) {
+    let proximo: []u32 = analises_vetor32(a, a.nblocos as u64)
+    a.dom_pre = analises_vetor32(a, a.nblocos as u64)
+    a.dom_tam = analises_vetor32(a, a.nblocos as u64)
+    let rpo: []u32 = a.rpo or_else {}
+    let idom: []u32 = a.idom or_else {}
+    let dom_pre: []u32 = a.dom_pre or_else {}
+    let dom_tam: []u32 = a.dom_tam or_else {}
+    for i in (0 as u32)..<a.nrpo {
+        dom_tam[rpo[i]] = 1
+    }
+    // C: for (i = nrpo; i-- > 1;): i desce de nrpo-1 ate 1
+    var i: u32 = a.nrpo
+    while i > 1 {
+        i -= 1
+        dom_tam[idom[rpo[i]]] += dom_tam[rpo[i]]
+    }
+    if a.nrpo > 0 {
+        proximo[0] = 1
+    }
+    for i_rpo in (1 as u32)..<a.nrpo {
+        let b: u32 = rpo[i_rpo]
+        let pai: u32 = idom[b]
+        dom_pre[b] = proximo[pai]
+        proximo[pai] += dom_tam[b]
+        proximo[b] = dom_pre[b] + 1
+    }
+}
+
+// C: nativo/bir/analises_cfg.c:183
+proc analises_calcular_idom(a: ^AnalisesBir) {
+    var mudou: bool = a.nrpo > 0
+    a.idom = analises_vetor32(a, a.nblocos as u64)
+    let idom: []u32 = a.idom or_else {}
+    for b in (0 as u32)..<a.nblocos {
+        idom[b] = BIR_SEM_BLOCO
+    }
+    if a.nrpo > 0 {
+        idom[0] = 0
+    }
+    while mudou {
+        mudou = false
+        for i in (1 as u32)..<a.nrpo {
+            let rpo: []u32 = a.rpo or_else {}
+            let novo: u32 = idom_candidato(a, rpo[i])
+            if novo != idom[rpo[i]] {
+                idom[rpo[i]] = novo
+                mudou = true
+            }
+        }
+    }
+    numerar_dominadores(a)
+}
+
+// C: nativo/bir/analises_cfg.c:206
+pub proc analises_domina(a: ^AnalisesBir, x: u32, y: u32) -> bool {
+    if (((x >= a.nblocos) or (y >= a.nblocos)) or ((a.pos_rpo or_else {})[y] == BIR_SEM_BLOCO)) or ((a.pos_rpo or_else {})[x] == BIR_SEM_BLOCO) {
+        return false
+    }
+    return ((a.dom_pre or_else {})[y] >= (a.dom_pre or_else {})[x]) and ((a.dom_pre or_else {})[y] < ((a.dom_pre or_else {})[x] + (a.dom_tam or_else {})[x]))
+}

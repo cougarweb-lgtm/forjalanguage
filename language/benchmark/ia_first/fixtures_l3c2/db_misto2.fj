@@ -1,0 +1,96 @@
+// L3c2: caminho ANTIGO do pacote (import vendor:banco/banco) com apelido `as db` e os nomes NOVOS de proc, tipo, membro e rotulo; a saida e a de db_novo.fj. Precisa de vendor\ ao lado.
+import "vendor:banco/banco" as db
+
+proc nome_do_erro(e: db.DbError) -> str {
+    switch e {
+    case db.DbError.not_opened:
+        return "not_opened"
+    case db.DbError.invalid_sql:
+        return "invalid_sql"
+    case db.DbError.execution:
+        return "execution"
+    case db.DbError.parameter:
+        return "parameter"
+    case db.DbError.out_of_memory:
+        return "out_of_memory"
+    }
+    return "?"
+}
+
+proc preencher(bd: db.Db) -> ! db.DbError {
+    try db.exec(bd, sql = "CREATE TABLE t(id INTEGER PRIMARY KEY, nome TEXT, peso REAL, extra TEXT)")
+    let q = try db.prepare(bd, sql = "INSERT INTO t(nome, peso, extra) VALUES (?, ?, ?)")
+    defer db.finalize(q)
+    try db.bind_text(q, index = 1, value = "aguia")
+    try db.bind_float(q, index = 2, value = 2.5)
+    try db.bind_null(q, index = 3)
+    _ = try db.next(q)
+    db.reset(q)
+    try db.bind_text(q, index = 1, value = "leao")
+    try db.bind_float(q, index = 2, value = 190.0)
+    try db.bind_text(q, index = 3, value = "x")
+    _ = try db.next(q)
+}
+
+proc listar(bd: db.Db) -> ! db.DbError {
+    let q = try db.prepare(bd, sql = "SELECT id, nome, peso FROM t ORDER BY id")
+    defer db.finalize(q)
+    print(f"colunas {db.columns(q)}")
+    while try db.next(q) {
+        print(f"  #{db.column_int(q, index = 0)} {db.column_text(q, index = 1)} peso={db.column_float(q, index = 2) as int}")
+    }
+}
+
+proc fora_da_faixa(bd: db.Db) -> ! db.DbError {
+    let q = try db.prepare(bd, sql = "SELECT id FROM t WHERE id > ?")
+    defer db.finalize(q)
+    try db.bind_int(q, index = 9, value = 1)
+}
+
+proc main() {
+    print(f"SQLite {db.version()}")
+    switch aberto in db.open(path = ":memory:") {
+    case db.Db:
+        switch r in preencher(aberto) {
+        case db.DbError:
+            print(f"preencher: {nome_do_erro(r)}")
+        default:
+            print("preencher ok")
+        }
+        print(f"ultimo id {db.last_id(aberto)}, alteradas {db.changes(aberto)}")
+        switch r in listar(aberto) {
+        case db.DbError:
+            print(f"listar: {nome_do_erro(r)}")
+        default:
+            print("listar ok")
+        }
+        switch r in fora_da_faixa(aberto) {
+        case db.DbError:
+            print(f"fora da faixa: {nome_do_erro(r)} {r == db.DbError.parameter}")
+        default:
+            print("inesperado")
+        }
+        switch r in db.exec(aberto, sql = "SELEC 1") {
+        case db.DbError:
+            print(f"exec: {nome_do_erro(r)} {r == db.DbError.execution}: {db.message(aberto)}")
+        default:
+            print("inesperado")
+        }
+        switch q in db.prepare(aberto, sql = "SELEC 2") {
+        case db.Query:
+            print("inesperado")
+        case db.DbError:
+            print(f"prepare: {nome_do_erro(q)} {q == db.DbError.invalid_sql}")
+        }
+        db.close(aberto)
+    case db.DbError:
+        print("nao abriu")
+    }
+    switch falha in db.open(path = "pasta_que_nao_existe/x/y.db") {
+    case db.Db:
+        print("inesperado")
+    case db.DbError:
+        print(f"open: {nome_do_erro(falha)} {falha == db.DbError.not_opened}")
+    }
+    print(nome_do_erro(db.DbError.out_of_memory))
+}

@@ -1,0 +1,956 @@
+// nativo/bir/bir_construir_soa_mapa.fj - porte de compiler/nativo/bir/bir_construir_soa_mapa.c
+// sha256 de nativo/bir/bir_construir_soa_mapa.c: ba50439e553905d5737d4f846a1586dee1e018d7240e81b19d2af01c8036228c
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "common"
+import "ir"
+import "semantic"
+
+struct SoaRef {
+    endereco: u32
+    tipo: u32 // TipoId
+    fixa: bool
+    estrutura: ?^ir.IrStruct
+}
+
+struct LinhaSoa {
+    ref: SoaRef
+    indice: BirOperando
+}
+
+struct Movimento {
+    linha: ?^LinhaSoa
+    estrutura: u32
+    tipo_estrutura: u32 // TipoId
+    espalha: bool
+}
+
+struct ItemSoa {
+    endereco: u32
+    tipo: u32 // TipoId
+}
+
+struct PedidoCriaSoa {
+    cap: BirOperando
+    alocador: BirOperando
+}
+
+struct PedidoCriaMapa {
+    alocador: BirOperando
+    cap: BirOperando
+}
+
+struct Desvio {
+    sim: u32
+    nao: u32
+    fim: u32
+}
+
+const SOA_MEMBRO_LEN: u32 = 1
+const SOA_MEMBRO_CAP: u32 = 2
+const SOA_MEMBRO_ALOCADOR: u32 = 3
+const SOA_MEMBRO_EPOCA: u32 = 4
+const SOA_BYTES_POR_COLUNA: u32 = 8
+const FATIA_CAMPO_PTR_2: u32 = 0
+const FATIA_CAMPO_LEN_2: u32 = 1
+const MAPA_AUX_ITEM_CHAVE: u32 = 0
+const MAPA_AUX_ITEM_VALOR: u32 = 1
+const MAPA_AUX_ITEM_ENDERECO: u32 = 2
+// C2F:? tabela ACHAR (const ServicoMapa): ponteiro nao nulo
+// C2F:? tabela INSERIR (const ServicoMapa): ponteiro nao nulo
+// C2F:? tabela REMOVER (const ServicoMapa): ponteiro nao nulo
+
+// C: nativo/bir/bir_construir_soa_mapa.c:30
+// Saida por fatia (a copia por valor do [2] perdia a escrita do C: saida[0]/saida[1] gravam no argumento do chamador).
+proc arquivo_e_linha_3(c: ^BirCtx, i: ^ir.IrInstr, saida: []BirOperando) {
+    var linha: u32 = 0
+    saida[0] = bir_vreg_do_arquivo(c, i.pos, &linha)
+    saida[1] = op_imed(linha as i64, BC_I32 as u8)
+}
+
+// C: nativo/bir/bir_construir_soa_mapa.c:39
+proc carregar(c: ^BirCtx, base: u32, offset: u32, classe: u8) -> u32 {
+    let dst: u32 = bir_novo_vreg(c, classe)
+    bir_emitir_carrega(c, dst, base, transmute(offset, to = i32))
+    return dst
+}
+
+// C: nativo/bir/bir_construir_soa_mapa.c:48
+proc somar_item(c: ^BirCtx, base: u32, indice: BirOperando, tam: u32) -> u32 {
+    var deslocamento: BirOperando = BirOperando{}
+    if indice.tipo == (BO_IMED as u8) {
+        deslocamento = op_imed(indice.imed * (tam as i64), BC_I64 as u8)
+    } else if tam == 1 {
+        deslocamento = indice
+    } else {
+        deslocamento = op_vreg(bir_conta_nova(c, BC_I64 as u8, BirPedido{op = BIR_MUL as u8, a = indice, b = op_imed(tam as i64, BC_I64 as u8)}), BC_I64 as u8)
+    }
+    if (deslocamento.tipo == (BO_IMED as u8)) and (deslocamento.imed == 0) {
+        return base
+    }
+    return bir_conta_nova(c, BC_I64 as u8, BirPedido{op = BIR_ADD as u8, a = op_vreg(base, BC_I64 as u8), b = deslocamento})
+}
+
+// C: nativo/bir/bir_construir_soa_mapa.c:64
+proc copiar_membro(c: ^BirCtx, i: ^ir.IrInstr, tipo: u32, enderecos: [2]u32) -> bool {
+    var classe: u8 = BC_NADA as u8
+    var forma: BirSlot = BirSlot{}
+    var valor: u32 = 0
+    if bir_eh_agregado((c.e as ^BirEntrada).tipos as ^semantic.Tipos, tipo) {
+        if not bir_forma(c, tipo, &forma) {
+            return false
+        }
+        bir_copia_bloco(c, enderecos[0], enderecos[1], forma.tam)
+        return true
+    }
+    if not bir_classe_do_tipo((c.e as ^BirEntrada).tipos as ^semantic.Tipos, tipo, &classe) {
+        return bir_falha_tipo(c, i, "-", tipo)
+    }
+    valor = carregar(c, enderecos[1], 0, classe)
+    let arg_1: BirOperando = op_vreg(valor, classe)
+    let arg_2: u32 = enderecos[0]
+    let arg_3: ^BirCtx = c
+    bir_emitir_grava(arg_3, arg_2, 0, arg_1)
+    return true
+}
+
+// C: nativo/bir/bir_construir_soa_mapa.c:91
+proc offset_da_soa(c: ^BirCtx, r: ^SoaRef, membro: u32) -> u32 {
+    let arg_1: u32 = membro
+    let arg_2: u32 = r.tipo
+    let arg_3: ^ir.Layouts = bir_layouts(c)
+    return ir.layout_offset_campo(arg_3, arg_2, arg_1)
+}
+
+// C: nativo/bir/bir_construir_soa_mapa.c:97
+proc soa_do_tipo(c: ^BirCtx, i: ^ir.IrInstr, tipo: u32, ref: ^SoaRef) -> bool {
+    let tipos: ?^semantic.Tipos = (c.e as ^BirEntrada).tipos
+    var colunas: u32 = 0
+    if common.c2f_s2u_32(semantic.tipo_classe_de(tipos as ^semantic.Tipos, tipo)) != (semantic.TC_SOA as u32) {
+        return bir_falha_tipo(c, i, "-", tipo)
+    }
+    colunas = semantic.tipo_de(tipos as ^semantic.Tipos, tipo).a
+    ref.tipo = tipo
+    ref.fixa = common.c2f_s2u_32(semantic.tipo_classe_de(tipos as ^semantic.Tipos, colunas)) == (semantic.TC_ARRAY as u32)
+    let arg_1: u32 = semantic.tipo_de(tipos as ^semantic.Tipos, colunas).a
+    let arg_2: ^ir.IrPrograma = (c.e as ^BirEntrada).ir as ^ir.IrPrograma
+    let arg_3: ^semantic.Tipos = tipos as ^semantic.Tipos
+    ref.estrutura = ir.layout_estrutura(arg_3, arg_2, arg_1)
+    return (ref.estrutura != none) or (common.c2f_b2i32(bir_falha_inconsistente(c, "soa sem a struct dos itens na IR")) != 0)
+}
+
+// C: nativo/bir/bir_construir_soa_mapa.c:112
+proc soa_de(c: ^BirCtx, i: ^ir.IrInstr, v: ^ir.Valor, ref: ^SoaRef) -> bool {
+    let tipos: ?^semantic.Tipos = (c.e as ^BirEntrada).tipos
+    var ponteiro: BirOperando = BirOperando{}
+    if common.c2f_s2u_32(semantic.tipo_classe_de(tipos as ^semantic.Tipos, v.tipo)) != (semantic.TC_PONTEIRO as u32) {
+        return (common.c2f_b2i32(soa_do_tipo(c, i, v.tipo, ref)) != 0) and (common.c2f_b2i32(bir_endereco_de(c, i, v, &ref.endereco)) != 0)
+    }
+    if not soa_do_tipo(c, i, semantic.tipo_de(tipos as ^semantic.Tipos, v.tipo).a, ref) {
+        return false
+    }
+    if (not bir_operando_de(c, i, v, &ponteiro)) or (not bir_operando_vreg(c, ponteiro, &ponteiro)) {
+        return false
+    }
+    ref.endereco = ponteiro.id
+    return true
+}
+
+// C: nativo/bir/bir_construir_soa_mapa.c:128
+proc base_da_coluna(c: ^BirCtx, r: ^SoaRef, k: u32) -> u32 {
+    if r.fixa {
+        let arg_1: u32 = offset_da_soa(c, r, k)
+        let arg_2: u32 = r.endereco
+        let arg_3: ^BirCtx = c
+        return bir_endereco_mais(arg_3, arg_2, arg_1)
+    }
+    return carregar(c, r.endereco, k * SOA_BYTES_POR_COLUNA, BC_I64 as u8)
+}
+
+// C: nativo/bir/bir_construir_soa_mapa.c:136
+proc indice_lista_dev(c: ^BirCtx, i: ^ir.IrInstr, r: ^SoaRef, indice: BirOperando) -> BirOperando {
+    var args: []BirOperando = arena_fatia_bir_operando(&(c.p as ^BirPrograma).arena, 5)
+    var linha: u32 = 0
+    args[0] = indice
+    args[1] = op_vreg(carregar(c, r.endereco, offset_da_soa(c, r, SOA_MEMBRO_LEN), BC_I64 as u8), BC_I64 as u8)
+    args[2] = op_vreg(carregar(c, r.endereco, offset_da_soa(c, r, SOA_MEMBRO_EPOCA), BC_I32 as u8), BC_I32 as u8)
+    args[3] = bir_vreg_do_arquivo(c, i.pos, &linha)
+    args[4] = op_imed(linha as i64, BC_I32 as u8)
+    var lit_1 = BirChamadaRt{funcao = "forja_indice_lista", retorno = BC_I64 as u8, nargs = 5}
+    return op_vreg(bir_chamar_runtime(c, &lit_1, args), BC_I64 as u8)
+}
+
+// C: nativo/bir/bir_construir_soa_mapa.c:150
+proc indice_da_soa(c: ^BirCtx, i: ^ir.IrInstr, r: ^SoaRef, indice: ^BirOperando) -> bool {
+    let tipos: ^semantic.Tipos = (c.e as ^BirEntrada).tipos as ^semantic.Tipos
+    let colunas: u32 = semantic.tipo_de(tipos, r.tipo).a
+    if not bir_inteiro64(c, i, &i.b, indice) {
+        return false
+    }
+    // BirConfereLimites do C (macro): dev ou checagem ligada
+    if not (((c.p as ^BirPrograma).modo == (BM_DEV as u8)) or (c.p as ^BirPrograma).checagem) {
+        return true
+    }
+    if not bir_operando_vreg(c, indice^, indice) {
+        return false
+    }
+    // release (ou soa fixa): confere pelo limite; dev dinamica: forja_indice_lista pela epoca (R0008)
+    if r.fixa or ((c.p as ^BirPrograma).modo != (BM_DEV as u8)) {
+        var limite: BirOperando = BirOperando{}
+        if r.fixa {
+            limite = op_imed(semantic.tipo_de(tipos, colunas).b as i64, BC_I64 as u8)
+        } else {
+            limite = op_vreg(carregar(c, r.endereco, offset_da_soa(c, r, SOA_MEMBRO_LEN), BC_I64 as u8), BC_I64 as u8)
+        }
+        bir_conferir_indice(c, i, indice^, limite)
+    } else {
+        indice^ = indice_lista_dev(c, i, r, indice^)
+    }
+    return true
+}
+
+// C: nativo/bir/bir_construir_soa_mapa.c:167
+proc abrir_linha(c: ^BirCtx, i: ^ir.IrInstr, linha: ^LinhaSoa) -> bool {
+    return (common.c2f_b2i32(soa_de(c, i, &i.a, &linha.ref)) != 0) and (common.c2f_b2i32(indice_da_soa(c, i, &linha.ref, &linha.indice)) != 0)
+}
+
+// C: nativo/bir/bir_construir_soa_mapa.c:173
+proc endereco_do_item(c: ^BirCtx, linha: ^LinhaSoa, k: u32, endereco: ^u32) -> bool {
+    var forma: BirSlot = BirSlot{}
+    if not bir_forma(c, ((linha.ref.estrutura as ^ir.IrStruct).campos or_else {})[k].tipo, &forma) {
+        return false
+    }
+    let arg_1: u32 = forma.tam
+    let arg_2: BirOperando = linha.indice
+    let arg_3: u32 = base_da_coluna(c, &linha.ref, k)
+    let arg_4: ^BirCtx = c
+    endereco^ = somar_item(arg_4, arg_3, arg_2, arg_1)
+    return true
+}
+
+// C: nativo/bir/bir_construir_soa_mapa.c:184
+proc posicao_do_campo(c: ^BirCtx, r: ^SoaRef, nome: i32, posicao: ^u32) -> bool {
+    var k: u32 = 0
+    while k < (r.estrutura as ^ir.IrStruct).ncampos {
+        if ((r.estrutura as ^ir.IrStruct).campos or_else {})[k].nome == nome {
+            posicao^ = k
+            return true
+        }
+        k += 1
+    }
+    return bir_falha_inconsistente(c, "campo de soa inexistente na struct")
+}
+
+// C: nativo/bir/bir_construir_soa_mapa.c:198
+proc mover_linha(c: ^BirCtx, i: ^ir.IrInstr, m: ^Movimento) -> bool {
+    let linha: ^LinhaSoa = m.linha as ^LinhaSoa
+    var k: u32 = 0
+    while k < (linha.ref.estrutura as ^ir.IrStruct).ncampos {
+        var item: u32 = 0
+        var membro: u32 = 0
+        var enderecos: [2]u32 = {0, 0}
+        if not endereco_do_item(c, linha, k, &item) {
+            return false
+        }
+        membro = bir_endereco_mais(c, m.estrutura, ir.layout_offset_campo(bir_layouts(c), m.tipo_estrutura, k))
+        if m.espalha {
+            enderecos[0] = item
+            enderecos[1] = membro
+        } else {
+            enderecos[0] = membro
+            enderecos[1] = item
+        }
+        if not copiar_membro(c, i, ((linha.ref.estrutura as ^ir.IrStruct).campos or_else {})[k].tipo, enderecos) {
+            return false
+        }
+        k += 1
+    }
+    return true
+}
+
+// C: nativo/bir/bir_construir_soa_mapa.c:217
+proc bir_regra_soa_elemento(c: ^BirCtx, i: ^ir.IrInstr) -> bool {
+    var pedido: BirPedidoSlot = BirPedidoSlot{temporario = true, id = i.destino}
+    var linha: LinhaSoa = LinhaSoa{}
+    var destino: u32 = 0
+    if ((not abrir_linha(c, i, &linha)) or (not bir_forma(c, i.tipo, &pedido.forma))) or (not bir_definir_slot(c, &pedido, &destino)) {
+        return false
+    }
+    var lit_1 = Movimento{linha = &linha, estrutura = destino, tipo_estrutura = i.tipo, espalha = false}
+    return mover_linha(c, i, &lit_1)
+}
+
+// C: nativo/bir/bir_construir_soa_mapa.c:231
+proc item_do_campo(c: ^BirCtx, i: ^ir.IrInstr, item: ^ItemSoa) -> bool {
+    var linha: LinhaSoa = LinhaSoa{}
+    var k: u32 = 0
+    if (not abrir_linha(c, i, &linha)) or (not posicao_do_campo(c, &linha.ref, i.nome, &k)) {
+        return false
+    }
+    item.tipo = ((linha.ref.estrutura as ^ir.IrStruct).campos or_else {})[k].tipo
+    return endereco_do_item(c, &linha, k, &item.endereco)
+}
+
+// C: nativo/bir/bir_construir_soa_mapa.c:243
+proc bir_regra_soa_campo(c: ^BirCtx, i: ^ir.IrInstr) -> bool {
+    var item: ItemSoa = ItemSoa{}
+    if not item_do_campo(c, i, &item) {
+        return false
+    }
+    var lit_1 = BirCampoInfo{offset = 0, tipo = item.tipo}
+    let arg_1: ^BirCampoInfo = &lit_1
+    let arg_2: u32 = item.endereco
+    let arg_3: ^ir.IrInstr = i
+    let arg_4: ^BirCtx = c
+    return bir_temp_do_campo(arg_4, arg_3, arg_2, arg_1)
+}
+
+// C: nativo/bir/bir_construir_soa_mapa.c:253
+proc bir_regra_soa_end_campo(c: ^BirCtx, i: ^ir.IrInstr) -> bool {
+    var item: ItemSoa = ItemSoa{}
+    var dst: u32 = 0
+    if (not item_do_campo(c, i, &item)) or (not bir_definir_destino(c, BC_I64 as u8, &dst)) {
+        return false
+    }
+    _ = bir_emitir_pedido(c, BirPedido{op = BIR_COPIA as u8, dst = dst, a = op_vreg(item.endereco, BC_I64 as u8)})
+    return true
+}
+
+// C: nativo/bir/bir_construir_soa_mapa.c:265
+proc bir_regra_soa_grava(c: ^BirCtx, i: ^ir.IrInstr) -> bool {
+    var linha: LinhaSoa = LinhaSoa{}
+    var valor: u32 = 0
+    if (not abrir_linha(c, i, &linha)) or (not bir_endereco_de(c, i, &(i.args or_else {})[0], &valor)) {
+        return false
+    }
+    var lit_1 = Movimento{linha = &linha, estrutura = valor, tipo_estrutura = (i.args or_else {})[0].tipo, espalha = true}
+    return mover_linha(c, i, &lit_1)
+}
+
+// C: nativo/bir/bir_construir_soa_mapa.c:278
+proc len_da_coluna(c: ^BirCtx, r: ^SoaRef) -> BirOperando {
+    if r.fixa {
+        let arg_1: u32 = semantic.tipo_de((c.e as ^BirEntrada).tipos as ^semantic.Tipos, r.tipo).a
+        let arg_2: ^semantic.Tipos = (c.e as ^BirEntrada).tipos as ^semantic.Tipos
+        return op_imed(semantic.tipo_de(arg_2, arg_1).b as i64, BC_I64 as u8)
+    }
+    let arg_3: u32 = offset_da_soa(c, r, SOA_MEMBRO_LEN)
+    let arg_4: u32 = r.endereco
+    let arg_5: ^BirCtx = c
+    return op_vreg(carregar(arg_5, arg_4, arg_3, BC_I64 as u8), BC_I64 as u8)
+}
+
+// C: nativo/bir/bir_construir_soa_mapa.c:286
+proc bir_regra_soa_coluna(c: ^BirCtx, i: ^ir.IrInstr) -> bool {
+    var pedido: BirPedidoSlot = BirPedidoSlot{temporario = true, id = i.destino}
+    let lay: ^ir.Layouts = bir_layouts(c)
+    var r: SoaRef = SoaRef{}
+    var k: u32 = 0
+    var fatia: u32 = 0
+    var ptr: BirOperando = BirOperando{}
+    var len_c: BirOperando = BirOperando{}
+    if (not soa_de(c, i, &i.a, &r)) or (not posicao_do_campo(c, &r, i.nome, &k)) {
+        return false
+    }
+    if (not r.fixa) and ((c.p as ^BirPrograma).modo == (BM_DEV as u8)) {
+        let arg_1: u32 = offset_da_soa(c, &r, SOA_MEMBRO_EPOCA)
+        let arg_2: u32 = r.endereco
+        let arg_3: ^BirCtx = c
+        bir_chamar_lista_viva(c, i, carregar(arg_3, arg_2, arg_1, BC_I32 as u8))
+    }
+    ptr = op_vreg(base_da_coluna(c, &r, k), BC_I64 as u8)
+    len_c = len_da_coluna(c, &r)
+    if (not bir_forma(c, i.tipo, &pedido.forma)) or (not bir_definir_slot(c, &pedido, &fatia)) {
+        return false
+    }
+    bir_emitir_grava(c, fatia, transmute(ir.layout_offset_campo(lay, i.tipo, FATIA_CAMPO_PTR_2), to = i32), ptr)
+    bir_emitir_grava(c, fatia, transmute(ir.layout_offset_campo(lay, i.tipo, FATIA_CAMPO_LEN_2), to = i32), len_c)
+    return true
+}
+
+// C: nativo/bir/bir_construir_soa_mapa.c:310
+proc tamanhos_das_colunas(c: ^BirCtx, r: ^SoaRef, tams: ^u32) -> bool {
+    let ncol: u32 = (r.estrutura as ^ir.IrStruct).ncampos
+    let arg_1: u32 = bir_novo_vreg(c, BC_I64 as u8)
+    let arg_2: u32 = bir_novo_slot(c, SOA_BYTES_POR_COLUNA * ncol, SOA_BYTES_POR_COLUNA)
+    let arg_3: ^BirCtx = c
+    tams^ = bir_emitir_end_slot(arg_3, arg_2, arg_1)
+    for k in (0 as u32)..<ncol {
+        var forma: BirSlot = BirSlot{}
+        if not bir_forma(c, ((r.estrutura as ^ir.IrStruct).campos or_else {})[k].tipo, &forma) {
+            return false
+        }
+        let arg_4: BirOperando = op_imed(forma.tam as i64, BC_I64 as u8)
+        let arg_5: i32 = transmute(k * SOA_BYTES_POR_COLUNA, to = i32)
+        let arg_6: u32 = tams^
+        let arg_7: ^BirCtx = c
+        bir_emitir_grava(arg_7, arg_6, arg_5, arg_4)
+    }
+    return true
+}
+
+// C: nativo/bir/bir_construir_soa_mapa.c:329
+proc chamar_soa_criar(c: ^BirCtx, i: ^ir.IrInstr, r: ^SoaRef, pedido: ^PedidoCriaSoa) -> bool {
+    var args: []BirOperando = arena_fatia_bir_operando(&(c.p as ^BirPrograma).arena, 8)
+    var tams: u32 = 0
+    if not tamanhos_das_colunas(c, r, &tams) {
+        return false
+    }
+    args[0] = op_vreg(r.endereco, BC_I64 as u8)
+    args[1] = op_vreg(tams, BC_I64 as u8)
+    args[2] = op_imed((r.estrutura as ^ir.IrStruct).ncampos as i64, BC_I32 as u8)
+    args[3] = pedido.cap
+    args[4] = pedido.alocador
+    args[5] = op_vreg(bir_endereco_mais(c, r.endereco, offset_da_soa(c, r, SOA_MEMBRO_EPOCA)), BC_I64 as u8)
+    arquivo_e_linha_3(c, i, args[6..<8])
+    var lit_1 = BirChamadaRt{funcao = "forja_soa_criar", retorno = BC_NADA as u8, nargs = 8}
+    _ = bir_chamar_runtime(c, &lit_1, args)
+    return true
+}
+
+// C: nativo/bir/bir_construir_soa_mapa.c:348
+proc bir_regra_soa_cria(c: ^BirCtx, i: ^ir.IrInstr) -> bool {
+    var pedido: PedidoCriaSoa = PedidoCriaSoa{}
+    var r: SoaRef = SoaRef{}
+    var forma: BirSlot = BirSlot{}
+    if ((not soa_do_tipo(c, i, i.tipo, &r)) or (not bir_alocador_de(c, i, &i.a, &pedido.alocador))) or (not bir_inteiro64(c, i, &i.b, &pedido.cap)) {
+        return false
+    }
+    if (not bir_forma(c, i.tipo, &forma)) or (not bir_slot_do_destino(c, i, &r.endereco)) {
+        return false
+    }
+    bir_zera_bloco(c, r.endereco, forma.tam)
+    if not chamar_soa_criar(c, i, &r, &pedido) {
+        return false
+    }
+    let arg_1: BirOperando = pedido.cap
+    let arg_2: i32 = transmute(offset_da_soa(c, &r, SOA_MEMBRO_CAP), to = i32)
+    let arg_3: u32 = r.endereco
+    let arg_4: ^BirCtx = c
+    bir_emitir_grava(arg_4, arg_3, arg_2, arg_1)
+    let arg_5: BirOperando = pedido.alocador
+    let arg_6: i32 = transmute(offset_da_soa(c, &r, SOA_MEMBRO_ALOCADOR), to = i32)
+    let arg_7: u32 = r.endereco
+    let arg_8: ^BirCtx = c
+    bir_emitir_grava(arg_8, arg_7, arg_6, arg_5)
+    return true
+}
+
+// C: nativo/bir/bir_construir_soa_mapa.c:367
+proc crescer_soa(c: ^BirCtx, i: ^ir.IrInstr, r: ^SoaRef) -> bool {
+    var args: []BirOperando = arena_fatia_bir_operando(&(c.p as ^BirPrograma).arena, 9)
+    var tams: u32 = 0
+    if not tamanhos_das_colunas(c, r, &tams) {
+        return false
+    }
+    args[0] = op_vreg(r.endereco, BC_I64 as u8)
+    args[1] = op_vreg(tams, BC_I64 as u8)
+    args[2] = op_imed((r.estrutura as ^ir.IrStruct).ncampos as i64, BC_I32 as u8)
+    args[3] = op_vreg(carregar(c, r.endereco, offset_da_soa(c, r, SOA_MEMBRO_LEN), BC_I64 as u8), BC_I64 as u8)
+    args[4] = op_vreg(bir_endereco_mais(c, r.endereco, offset_da_soa(c, r, SOA_MEMBRO_CAP)), BC_I64 as u8)
+    args[5] = op_vreg(carregar(c, r.endereco, offset_da_soa(c, r, SOA_MEMBRO_ALOCADOR), BC_I32 as u8), BC_I32 as u8)
+    args[6] = op_vreg(bir_endereco_mais(c, r.endereco, offset_da_soa(c, r, SOA_MEMBRO_EPOCA)), BC_I64 as u8)
+    arquivo_e_linha_3(c, i, args[7..<9])
+    var lit_1 = BirChamadaRt{funcao = "forja_soa_crescer", retorno = BC_NADA as u8, nargs = 9}
+    _ = bir_chamar_runtime(c, &lit_1, args)
+    return true
+}
+
+// C: nativo/bir/bir_construir_soa_mapa.c:387
+proc crescer_se_cheia(c: ^BirCtx, i: ^ir.IrInstr, r: ^SoaRef) -> bool {
+    let arg_1: u32 = offset_da_soa(c, r, SOA_MEMBRO_LEN)
+    let arg_2: u32 = r.endereco
+    let arg_3: ^BirCtx = c
+    let len_c: u32 = carregar(arg_3, arg_2, arg_1, BC_I64 as u8)
+    let arg_4: u32 = offset_da_soa(c, r, SOA_MEMBRO_CAP)
+    let arg_5: u32 = r.endereco
+    let arg_6: ^BirCtx = c
+    let cap: u32 = carregar(arg_6, arg_5, arg_4, BC_I64 as u8)
+    let arg_7: BirOperando = op_vreg(cap, BC_I64 as u8)
+    let arg_8: BirOperando = op_vreg(len_c, BC_I64 as u8)
+    let arg_9: ^BirCtx = c
+    let cheia: u32 = bir_comparar(arg_9, BCOND_EQ as u8, arg_8, arg_7)
+    let cresce: u32 = bir_novo_bloco(c, false)
+    let segue: u32 = bir_novo_bloco(c, false)
+    bir_desvia(c, op_vreg(cheia, BC_I8 as u8), cresce, segue)
+    c.cur = cresce
+    if not crescer_soa(c, i, r) {
+        return false
+    }
+    bir_salta(c, segue)
+    c.cur = segue
+    return true
+}
+
+// C: nativo/bir/bir_construir_soa_mapa.c:404
+proc preparar_anexa(c: ^BirCtx, i: ^ir.IrInstr, ref: ^SoaRef) -> bool {
+    if common.c2f_s2u_32(semantic.tipo_classe_de((c.e as ^BirEntrada).tipos as ^semantic.Tipos, i.a.tipo)) != (semantic.TC_PONTEIRO as u32) {
+        return bir_falha_tipo(c, i, "-", i.a.tipo)
+    }
+    if not soa_de(c, i, &i.a, ref) {
+        return false
+    }
+    if ref.fixa {
+        return bir_falha_tipo(c, i, "-", i.a.tipo)
+    }
+    if (c.p as ^BirPrograma).modo == (BM_DEV as u8) {
+        let arg_1: u32 = offset_da_soa(c, ref, SOA_MEMBRO_EPOCA)
+        let arg_2: u32 = ref.endereco
+        let arg_3: ^BirCtx = c
+        bir_chamar_lista_viva(c, i, carregar(arg_3, arg_2, arg_1, BC_I32 as u8))
+    }
+    return true
+}
+
+// C: nativo/bir/bir_construir_soa_mapa.c:418
+proc gravar_no_fim(c: ^BirCtx, i: ^ir.IrInstr, linha: ^LinhaSoa, valor: u32) -> bool {
+    let len_offset: u32 = offset_da_soa(c, &linha.ref, SOA_MEMBRO_LEN)
+    var novo_len: u32 = 0
+    linha.indice = op_vreg(carregar(c, linha.ref.endereco, len_offset, BC_I64 as u8), BC_I64 as u8)
+    var lit_1 = Movimento{linha = linha, estrutura = valor, tipo_estrutura = i.b.tipo, espalha = true}
+    if not mover_linha(c, i, &lit_1) {
+        return false
+    }
+    novo_len = bir_conta_nova(c, BC_I64 as u8, BirPedido{op = BIR_ADD as u8, a = linha.indice, b = op_imed(1, BC_I64 as u8)})
+    let arg_1: BirOperando = op_vreg(novo_len, BC_I64 as u8)
+    let arg_2: i32 = transmute(len_offset, to = i32)
+    let arg_3: u32 = linha.ref.endereco
+    let arg_4: ^BirCtx = c
+    bir_emitir_grava(arg_4, arg_3, arg_2, arg_1)
+    return true
+}
+
+// C: nativo/bir/bir_construir_soa_mapa.c:432
+proc bir_regra_soa_anexa(c: ^BirCtx, i: ^ir.IrInstr) -> bool {
+    var linha: LinhaSoa = LinhaSoa{}
+    var valor: u32 = 0
+    if ((not preparar_anexa(c, i, &linha.ref)) or (not crescer_se_cheia(c, i, &linha.ref))) or (not bir_endereco_de(c, i, &i.b, &valor)) {
+        return false
+    }
+    return gravar_no_fim(c, i, &linha, valor)
+}
+
+// C: nativo/bir/bir_construir_soa_mapa.c:443
+proc bir_libera_soa(c: ^BirCtx, i: ^ir.IrInstr) -> bool {
+    var args: []BirOperando = arena_fatia_bir_operando(&(c.p as ^BirPrograma).arena, 4)
+    var r: SoaRef = SoaRef{}
+    var forma: BirSlot = BirSlot{}
+    var alocador: u32 = 0
+    if (not soa_de(c, i, &i.a, &r)) or (not bir_forma(c, r.tipo, &forma)) {
+        return false
+    }
+    alocador = carregar(c, r.endereco, offset_da_soa(c, &r, SOA_MEMBRO_ALOCADOR), BC_I32 as u8)
+    args[0] = op_vreg(r.endereco, BC_I64 as u8)
+    args[1] = op_vreg(alocador, BC_I32 as u8)
+    arquivo_e_linha_3(c, i, args[2..<4])
+    var lit_1 = BirChamadaRt{funcao = "forja_soa_liberar", retorno = BC_NADA as u8, nargs = 4}
+    _ = bir_chamar_runtime(c, &lit_1, args)
+    bir_zera_bloco(c, r.endereco, forma.tam)
+    bir_emitir_grava(c, r.endereco, transmute(offset_da_soa(c, &r, SOA_MEMBRO_ALOCADOR), to = i32), op_vreg(alocador, BC_I32 as u8))
+    return true
+}
+
+// C: nativo/bir/bir_construir_soa_mapa.c:464
+proc mapa_do_tipo(c: ^BirCtx, i: ^ir.IrInstr, tipo: u32, ref: ^MapaRef) -> bool {
+    let tipos: ?^semantic.Tipos = (c.e as ^BirEntrada).tipos
+    if common.c2f_s2u_32(semantic.tipo_classe_de(tipos as ^semantic.Tipos, tipo)) != (semantic.TC_MAPA as u32) {
+        return bir_falha_tipo(c, i, "-", tipo)
+    }
+    ref.tipo = tipo
+    ref.chave = semantic.tipo_de(tipos as ^semantic.Tipos, tipo).a
+    ref.valor = semantic.tipo_de(tipos as ^semantic.Tipos, tipo).b
+    ref.texto = common.c2f_s2u_32(semantic.tipo_classe_de(tipos as ^semantic.Tipos, ref.chave)) == (semantic.TC_TEXTO as u32)
+    return (common.c2f_b2i32(bir_forma(c, ref.chave, &ref.forma_chave)) != 0) and (common.c2f_b2i32(bir_forma(c, ref.valor, &ref.forma_valor)) != 0)
+}
+
+// C: nativo/bir/bir_construir_soa_mapa.c:478
+proc mapa_de(c: ^BirCtx, i: ^ir.IrInstr, v: ^ir.Valor, ref: ^MapaRef) -> bool {
+    let tipos: ?^semantic.Tipos = (c.e as ^BirEntrada).tipos
+    var ponteiro: BirOperando = BirOperando{}
+    if common.c2f_s2u_32(semantic.tipo_classe_de(tipos as ^semantic.Tipos, v.tipo)) != (semantic.TC_PONTEIRO as u32) {
+        return (common.c2f_b2i32(mapa_do_tipo(c, i, v.tipo, ref)) != 0) and (common.c2f_b2i32(bir_endereco_de(c, i, v, &ref.endereco)) != 0)
+    }
+    if not mapa_do_tipo(c, i, semantic.tipo_de(tipos as ^semantic.Tipos, v.tipo).a, ref) {
+        return false
+    }
+    if (not bir_operando_de(c, i, v, &ponteiro)) or (not bir_operando_vreg(c, ponteiro, &ponteiro)) {
+        return false
+    }
+    ref.endereco = ponteiro.id
+    return true
+}
+
+// C: nativo/bir/bir_construir_soa_mapa.c:494
+proc endereco_do_valor(c: ^BirCtx, r: ^MapaRef, indice: BirOperando) -> u32 {
+    let arg_1: u32 = r.forma_valor.tam
+    let arg_2: BirOperando = indice
+    let arg_3: u32 = carregar(c, r.endereco, ir.LAYOUT_MAPA_OFF_VALORES, BC_I64 as u8)
+    let arg_4: ^BirCtx = c
+    return somar_item(arg_4, arg_3, arg_2, arg_1)
+}
+
+// C: nativo/bir/bir_construir_soa_mapa.c:499
+proc endereco_da_chave(c: ^BirCtx, r: ^MapaRef, indice: BirOperando) -> u32 {
+    let arg_1: u32 = r.forma_chave.tam
+    let arg_2: BirOperando = indice
+    let arg_3: u32 = carregar(c, r.endereco, ir.LAYOUT_MAPA_OFF_CHAVES, BC_I64 as u8)
+    let arg_4: ^BirCtx = c
+    return somar_item(arg_4, arg_3, arg_2, arg_1)
+}
+
+// C: nativo/bir/bir_construir_soa_mapa.c:505
+proc chave_em_slot(c: ^BirCtx, i: ^ir.IrInstr, r: ^MapaRef, endereco: ^u32) -> bool {
+    let arg_1: u32 = bir_novo_vreg(c, BC_I64 as u8)
+    let arg_2: u32 = bir_novo_slot(c, r.forma_chave.tam, r.forma_chave.alinhamento)
+    let arg_3: ^BirCtx = c
+    endereco^ = bir_emitir_end_slot(arg_3, arg_2, arg_1)
+    var lit_1 = BirAlvoMem{base = endereco^, offset = 0, tipo = r.chave}
+    let arg_4: ^ir.Valor = &i.b
+    let arg_5: ^BirAlvoMem = &lit_1
+    let arg_6: ^ir.IrInstr = i
+    let arg_7: ^BirCtx = c
+    return bir_gravar_em(arg_7, arg_6, arg_5, arg_4)
+}
+
+// C: nativo/bir/bir_construir_soa_mapa.c:517
+// Tabelas const ServicoMapa do C (ACHAR/INSERIR/REMOVER): a Forja nao tem const de struct, entao a funcao devolve o registro e o chamador o guarda em var (ponteiro nao nulo).
+proc servico_achar() -> ServicoMapa {
+    return ServicoMapa{funcao = "forja_mapa_achar", funcao_k4 = "forja_mapa_achar_k4", funcao_k8 = "forja_mapa_achar_k8", retorno = BC_I64 as u8, com_valor = false}
+}
+
+proc servico_inserir() -> ServicoMapa {
+    return ServicoMapa{funcao = "forja_mapa_inserir", funcao_k4 = "forja_mapa_inserir_k4", funcao_k8 = "forja_mapa_inserir_k8", retorno = BC_I64 as u8, com_valor = true}
+}
+
+proc servico_remover() -> ServicoMapa {
+    return ServicoMapa{funcao = "forja_mapa_remover", funcao_k4 = "forja_mapa_remover_k4", funcao_k8 = "forja_mapa_remover_k8", retorno = BC_NADA as u8, com_valor = true}
+}
+
+// C: nativo/bir/bir_construir_soa_mapa.c:517
+proc chamar_mapa(c: ^BirCtx, p: ^PedidoMapa, resultado: ^u32) -> bool {
+    let mapa: ^MapaRef = p.mapa as ^MapaRef
+    let servico: ^ServicoMapa = p.servico as ^ServicoMapa
+    let i: ^ir.IrInstr = p.i as ^ir.IrInstr
+    var nargs: u32 = 6
+    var k: u32 = 4
+    var chave: u32 = 0
+    var texto: i64 = 0
+    if servico.com_valor {
+        nargs = 7
+    }
+    if chave_eh_por_valor(c, mapa) {
+        return chamar_mapa_por_valor(c, p, resultado)
+    }
+    var args: []BirOperando = arena_fatia_bir_operando(&(c.p as ^BirPrograma).arena, nargs as int)
+    if not chave_em_slot(c, i, mapa, &chave) {
+        return false
+    }
+    args[0] = op_vreg(mapa.endereco, BC_I64 as u8)
+    args[1] = op_vreg(chave, BC_I64 as u8)
+    args[2] = op_imed(mapa.forma_chave.tam as i64, BC_I64 as u8)
+    if mapa.texto {
+        texto = 1
+    }
+    args[3] = op_imed(texto, BC_I8 as u8)
+    if servico.com_valor {
+        args[k] = op_imed(mapa.forma_valor.tam as i64, BC_I64 as u8)
+        k += 1
+    }
+    arquivo_e_linha_3(c, i, args[k as int..<nargs as int])
+    var lit_1 = BirChamadaRt{funcao = servico.funcao, retorno = servico.retorno, nargs = nargs}
+    resultado^ = bir_chamar_runtime(c, &lit_1, args)
+    return true
+}
+
+// C: nativo/bir/bir_construir_soa_mapa.c:543
+proc preparar_cria_mapa(c: ^BirCtx, i: ^ir.IrInstr, r: ^MapaRef, pedido: ^PedidoCriaMapa) -> bool {
+    var forma: BirSlot = BirSlot{}
+    if ((not mapa_do_tipo(c, i, i.tipo, r)) or (not bir_alocador_de(c, i, &i.a, &pedido.alocador))) or (not bir_inteiro64(c, i, &i.b, &pedido.cap)) {
+        return false
+    }
+    if (not bir_forma(c, i.tipo, &forma)) or (not bir_slot_do_destino(c, i, &r.endereco)) {
+        return false
+    }
+    bir_zera_bloco(c, r.endereco, forma.tam)
+    return true
+}
+
+// C: nativo/bir/bir_construir_soa_mapa.c:556
+proc bir_regra_mapa_cria(c: ^BirCtx, i: ^ir.IrInstr) -> bool {
+    var args: []BirOperando = arena_fatia_bir_operando(&(c.p as ^BirPrograma).arena, 7)
+    var pedido: PedidoCriaMapa = PedidoCriaMapa{}
+    var r: MapaRef = MapaRef{}
+    if not preparar_cria_mapa(c, i, &r, &pedido) {
+        return false
+    }
+    args[0] = op_vreg(r.endereco, BC_I64 as u8)
+    args[1] = pedido.alocador
+    args[2] = pedido.cap
+    args[3] = op_imed(r.forma_chave.tam as i64, BC_I64 as u8)
+    args[4] = op_imed(r.forma_valor.tam as i64, BC_I64 as u8)
+    arquivo_e_linha_3(c, i, args[5..<7])
+    var lit_1 = BirChamadaRt{funcao = "forja_mapa_criar", retorno = BC_NADA as u8, nargs = 7}
+    _ = bir_chamar_runtime(c, &lit_1, args)
+    return true
+}
+
+// C: nativo/bir/bir_construir_soa_mapa.c:575
+proc bir_libera_mapa(c: ^BirCtx, i: ^ir.IrInstr) -> bool {
+    var args: []BirOperando = arena_fatia_bir_operando(&(c.p as ^BirPrograma).arena, 3)
+    var r: MapaRef = MapaRef{}
+    if not mapa_de(c, i, &i.a, &r) {
+        return false
+    }
+    args[0] = op_vreg(r.endereco, BC_I64 as u8)
+    arquivo_e_linha_3(c, i, args[1..<3])
+    var lit_1 = BirChamadaRt{funcao = "forja_mapa_liberar", retorno = BC_NADA as u8, nargs = 3}
+    _ = bir_chamar_runtime(c, &lit_1, args)
+    return true
+}
+
+// C: nativo/bir/bir_construir_soa_mapa.c:591
+proc bir_regra_mapa_insere(c: ^BirCtx, i: ^ir.IrInstr) -> bool {
+    var r: MapaRef = MapaRef{}
+    var indice: u32 = 0
+    var destino: u32 = 0
+    var servico: ServicoMapa = servico_inserir()
+    var pedido: PedidoMapa = PedidoMapa{i = i, mapa = &r, servico = &servico}
+    if not mapa_de(c, i, &i.a, &r) {
+        return false
+    }
+    if not chamar_mapa(c, &pedido, &indice) {
+        return false
+    }
+    destino = endereco_do_valor(c, &r, op_vreg(indice, BC_I64 as u8))
+    var alvo: BirAlvoMem = BirAlvoMem{base = destino, offset = 0, tipo = r.valor}
+    return bir_gravar_em(c, i, &alvo, &(i.args or_else {})[0])
+}
+
+// C: nativo/bir/bir_construir_soa_mapa.c:603
+proc bir_regra_mapa_remove(c: ^BirCtx, i: ^ir.IrInstr) -> bool {
+    var r: MapaRef = MapaRef{}
+    var sem_resultado: u32 = 0
+    var servico: ServicoMapa = servico_remover()
+    var pedido: PedidoMapa = PedidoMapa{i = i, mapa = &r, servico = &servico}
+    if not mapa_de(c, i, &i.a, &r) {
+        return false
+    }
+    return chamar_mapa(c, &pedido, &sem_resultado)
+}
+
+// C: nativo/bir/bir_construir_soa_mapa.c:612
+proc bir_regra_mapa_tem(c: ^BirCtx, i: ^ir.IrInstr) -> bool {
+    var r: MapaRef = MapaRef{}
+    var indice: u32 = 0
+    var dst: u32 = 0
+    var servico: ServicoMapa = servico_achar()
+    var pedido: PedidoMapa = PedidoMapa{i = i, mapa = &r, servico = &servico}
+    if (not mapa_de(c, i, &i.a, &r)) or (not chamar_mapa(c, &pedido, &indice)) or (not bir_definir_destino(c, BC_I8 as u8, &dst)) {
+        return false
+    }
+    _ = bir_emitir_pedido(c, BirPedido{op = BIR_CMP as u8, aux = BCOND_GE_S as u8, dst = dst, a = op_vreg(indice, BC_I64 as u8), b = op_imed(0, BC_I64 as u8)})
+    return true
+}
+
+// C: nativo/bir/bir_construir_soa_mapa.c:628
+proc abrir_desvio(c: ^BirCtx, indice: u32) -> Desvio {
+    let d: Desvio = Desvio{sim = bir_novo_bloco(c, false), nao = bir_novo_bloco(c, false), fim = bir_novo_bloco(c, false)}
+    let arg_1: BirOperando = op_imed(0, BC_I64 as u8)
+    let arg_2: BirOperando = op_vreg(indice, BC_I64 as u8)
+    let arg_3: ^BirCtx = c
+    let achou: u32 = bir_comparar(arg_3, BCOND_GE_S as u8, arg_2, arg_1)
+    let arg_4: u32 = d.nao
+    let arg_5: u32 = d.sim
+    let arg_6: BirOperando = op_vreg(achou, BC_I8 as u8)
+    let arg_7: ^BirCtx = c
+    bir_desvia(arg_7, arg_6, arg_5, arg_4)
+    c.cur = d.sim
+    return d
+}
+
+// C: nativo/bir/bir_construir_soa_mapa.c:639
+proc passar_ao_nao(c: ^BirCtx, d: ^Desvio) {
+    bir_salta(c, d.fim)
+    c.cur = d.nao
+}
+
+// C: nativo/bir/bir_construir_soa_mapa.c:646
+proc fechar_desvio(c: ^BirCtx, d: ^Desvio) {
+    bir_salta(c, d.fim)
+    c.cur = d.fim
+}
+
+// C: nativo/bir/bir_construir_soa_mapa.c:653
+proc acha_nicho(c: ^BirCtx, r: ^MapaRef, indice: u32) -> bool {
+    var dst: u32 = 0
+    var d: Desvio = Desvio{}
+    if not bir_definir_destino(c, BC_I64 as u8, &dst) {
+        return false
+    }
+    d = abrir_desvio(c, indice)
+    bir_emitir_carrega(c, dst, endereco_do_valor(c, r, op_vreg(indice, BC_I64 as u8)), 0)
+    passar_ao_nao(c, &d)
+    bir_mover(c, dst, op_imed(0, BC_I64 as u8))
+    fechar_desvio(c, &d)
+    return true
+}
+
+// C: nativo/bir/bir_construir_soa_mapa.c:669
+proc acha_struct(c: ^BirCtx, i: ^ir.IrInstr, r: ^MapaRef, indice: u32) -> bool {
+    var forma: BirSlot = BirSlot{}
+    var base: u32 = 0
+    var enderecos: [2]u32 = {0, 0}
+    var d: Desvio = Desvio{}
+    if (not bir_slot_do_destino(c, i, &base)) or (not bir_forma(c, i.tipo, &forma)) {
+        return false
+    }
+    d = abrir_desvio(c, indice)
+    bir_emitir_grava(c, base, transmute(ir.layout_offset_campo(bir_layouts(c), i.tipo, OPC_MEMBRO_TEM), to = i32), op_imed(1, BC_I8 as u8))
+    enderecos[0] = bir_endereco_mais(c, base, ir.layout_offset_campo(bir_layouts(c), i.tipo, OPC_MEMBRO_VALOR))
+    enderecos[1] = endereco_do_valor(c, r, op_vreg(indice, BC_I64 as u8))
+    if not copiar_membro(c, i, r.valor, enderecos) {
+        return false
+    }
+    passar_ao_nao(c, &d)
+    bir_zera_bloco(c, base, forma.tam)
+    fechar_desvio(c, &d)
+    return true
+}
+
+// C: nativo/bir/bir_construir_soa_mapa.c:690
+proc bir_regra_mapa_acha(c: ^BirCtx, i: ^ir.IrInstr) -> bool {
+    var r: MapaRef = MapaRef{}
+    var indice: u32 = 0
+    var servico: ServicoMapa = servico_achar()
+    var pedido: PedidoMapa = PedidoMapa{i = i, mapa = &r, servico = &servico}
+    if (not mapa_de(c, i, &i.a, &r)) or (not chamar_mapa(c, &pedido, &indice)) {
+        return false
+    }
+    let tipos: ^semantic.Tipos = (c.e as ^BirEntrada).tipos as ^semantic.Tipos
+    if bir_eh_ponteiro_opcional(tipos, i.tipo) {
+        return acha_nicho(c, &r, indice)
+    }
+    return acha_struct(c, i, &r, indice)
+}
+
+// C: nativo/bir/bir_construir_soa_mapa.c:703
+proc bir_regra_mapa_ponteiro(c: ^BirCtx, i: ^ir.IrInstr) -> bool {
+    var r: MapaRef = MapaRef{}
+    var indice: u32 = 0
+    var dst: u32 = 0
+    var d: Desvio = Desvio{}
+    var servico: ServicoMapa = servico_achar()
+    var pedido: PedidoMapa = PedidoMapa{i = i, mapa = &r, servico = &servico}
+    if (not mapa_de(c, i, &i.a, &r)) or (not chamar_mapa(c, &pedido, &indice)) or (not bir_definir_destino(c, BC_I64 as u8, &dst)) {
+        return false
+    }
+    d = abrir_desvio(c, indice)
+    bir_mover(c, dst, op_vreg(endereco_do_valor(c, &r, op_vreg(indice, BC_I64 as u8)), BC_I64 as u8))
+    passar_ao_nao(c, &d)
+    bir_mover(c, dst, op_imed(0, BC_I64 as u8))
+    fechar_desvio(c, &d)
+    return true
+}
+
+// C: nativo/bir/bir_construir_soa_mapa.c:721
+proc item_endereco(c: ^BirCtx, item: u32) -> bool {
+    var dst: u32 = 0
+    if not bir_definir_destino(c, BC_I64 as u8, &dst) {
+        return false
+    }
+    _ = bir_emitir_pedido(c, BirPedido{op = BIR_COPIA as u8, dst = dst, a = op_vreg(item, BC_I64 as u8)})
+    return true
+}
+
+// C: nativo/bir/bir_construir_soa_mapa.c:732
+proc bir_regra_mapa_item(c: ^BirCtx, i: ^ir.IrInstr) -> bool {
+    var indice: BirOperando = BirOperando{}
+    var r: MapaRef = MapaRef{}
+    let aux: u32 = i.op_aux as u32
+    if aux > MAPA_AUX_ITEM_ENDERECO {
+        return bir_falha_inconsistente(c, "IR_MAPA_ITEM com op_aux desconhecido")
+    }
+    if (not mapa_de(c, i, &i.a, &r)) or (not bir_inteiro64(c, i, &i.b, &indice)) {
+        return false
+    }
+    // op_aux 0: chave (dev confere a epoca); 2: endereco do valor; 1 (demais): valor
+    if aux == MAPA_AUX_ITEM_CHAVE {
+        if (c.p as ^BirPrograma).modo == (BM_DEV as u8) {
+            bir_chamar_lista_viva(c, i, carregar(c, r.endereco, ir.LAYOUT_MAPA_OFF_EPOCA, BC_I32 as u8))
+        }
+        var membro_chave: BirCampoInfo = BirCampoInfo{offset = 0, tipo = r.chave}
+        return bir_temp_do_campo(c, i, endereco_da_chave(c, &r, indice), &membro_chave)
+    }
+    if aux == MAPA_AUX_ITEM_ENDERECO {
+        return item_endereco(c, endereco_do_valor(c, &r, indice))
+    }
+    var membro_valor: BirCampoInfo = BirCampoInfo{offset = 0, tipo = r.valor}
+    return bir_temp_do_campo(c, i, endereco_do_valor(c, &r, indice), &membro_valor)
+}
+
+// C: nativo/bir/bir_construir_soa_mapa.c:756
+proc tamanho_do_mapa(c: ^BirCtx, i: ^ir.IrInstr) -> bool {
+    var r: MapaRef = MapaRef{}
+    var dst: u32 = 0
+    if (not mapa_de(c, i, &i.a, &r)) or (not bir_definir_destino(c, BC_I64 as u8, &dst)) {
+        return false
+    }
+    bir_emitir_carrega(c, dst, r.endereco, ir.LAYOUT_MAPA_OFF_LEN as i32)
+    return true
+}
+
+// C: nativo/bir/bir_construir_soa_mapa.c:768
+proc tamanho_da_soa(c: ^BirCtx, i: ^ir.IrInstr) -> bool {
+    var r: SoaRef = SoaRef{}
+    var dst: u32 = 0
+    if not soa_de(c, i, &i.a, &r) {
+        return false
+    }
+    if r.fixa {
+        return bir_falha_tipo(c, i, "-", i.a.tipo)
+    }
+    if not bir_definir_destino(c, BC_I64 as u8, &dst) {
+        return false
+    }
+    let arg_1: i32 = transmute(offset_da_soa(c, &r, SOA_MEMBRO_LEN), to = i32)
+    let arg_2: u32 = r.endereco
+    let arg_3: u32 = dst
+    let arg_4: ^BirCtx = c
+    bir_emitir_carrega(arg_4, arg_3, arg_2, arg_1)
+    return true
+}
+
+// C: nativo/bir/bir_construir_soa_mapa.c:784
+proc bir_tamanho_de_colecao(c: ^BirCtx, i: ^ir.IrInstr) -> bool {
+    let tipos: ?^semantic.Tipos = (c.e as ^BirEntrada).tipos
+    var base: u32 = i.a.tipo
+    if common.c2f_s2u_32(semantic.tipo_classe_de(tipos as ^semantic.Tipos, base)) == (semantic.TC_PONTEIRO as u32) {
+        base = semantic.tipo_de(tipos as ^semantic.Tipos, base).a
+    }
+    if common.c2f_s2u_32(semantic.tipo_classe_de(tipos as ^semantic.Tipos, base)) == (semantic.TC_MAPA as u32) {
+        return tamanho_do_mapa(c, i)
+    }
+    if common.c2f_s2u_32(semantic.tipo_classe_de(tipos as ^semantic.Tipos, base)) == (semantic.TC_SOA as u32) {
+        return tamanho_da_soa(c, i)
+    }
+    return bir_tamanho_de_lista(c, i)
+}
+
+test "bir_construir_soa_mapa: tabela de servicos do mapa" {
+    let achar = servico_achar()
+    let inserir = servico_inserir()
+    let remover = servico_remover()
+    expect((achar.funcao or_else "") == "forja_mapa_achar")
+    expect(achar.com_valor == false)
+    expect((inserir.funcao or_else "") == "forja_mapa_inserir")
+    expect(inserir.com_valor == true)
+    expect(remover.retorno == (BC_NADA as u8))
+}
+
+test "bir_construir_soa_mapa: saida por fatia grava no argumento" {
+    var args: [3]BirOperando = {BirOperando{}, BirOperando{}, BirOperando{}}
+    let meio: []BirOperando = args[1..<3]
+    meio[0] = op_imed(7, BC_I64 as u8)
+    expect(args[1].imed == 7)
+}

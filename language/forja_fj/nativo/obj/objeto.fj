@@ -1,0 +1,231 @@
+// nativo/obj/objeto.fj - porte de compiler/nativo/obj/objeto.c, compiler/nativo/obj/objeto.h
+// sha256 de nativo/obj/objeto.c: 6bf8f88319d0543672700b8dbd4403279f62183fba13de8422a342ea8839102f
+// sha256 de nativo/obj/objeto.h: f1491738252e18c878a7085ab0d0a75c192686e0918abe2bfb592a0c840602d2
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.2.0
+// Changelog: 0.2.0 - A4.3: OR_A64_GOT_PAGE e OR_A64_LD64_GOT_LO12 (chamada para fora pela GOT do alvo android)
+
+import "common"
+
+pub struct ObjSecao {
+    nome: ?str
+    tipo: i32
+    alinhamento: u32
+    bytes: [dynamic]u8
+    tam_bss: u32
+}
+
+pub struct ObjSimbolo {
+    nome: ?str
+    secao: i32
+    off: u32
+    global: bool
+    fraco: bool
+}
+
+pub struct ObjAlvoReloc {
+    secao: u32
+    off: u32
+}
+
+pub struct ObjCorrecao {
+    tipo: i32
+    simbolo: u32
+    adendo: i64
+}
+
+pub struct ObjReloc {
+    alvo: ObjAlvoReloc
+    correcao: ObjCorrecao
+}
+
+pub struct Objeto {
+    nomes: common.Arena
+    secoes: [dynamic]ObjSecao
+    simbolos: [dynamic]ObjSimbolo
+    relocs: [dynamic]ObjReloc
+    indice: common.Interner
+}
+
+pub const OS_TEXTO: i32 = 0
+pub const OS_RDATA: i32 = 1
+pub const OS_DATA: i32 = 2
+const OS_BSS: i32 = 3
+pub const OS_PDATA: i32 = 4
+pub const OS_XDATA: i32 = 5
+const OS_TDATA: i32 = 6
+const OS_TBSS: i32 = 7
+const OS_INIT_ARRAY: i32 = 8
+pub const OS_DEBUG_ABBREV: i32 = 9
+pub const OS_DEBUG_INFO: i32 = 10
+pub const OS_DEBUG_LINE: i32 = 11
+pub const OS_DEBUG_FRAME: i32 = 12
+pub const OR_REL32: i32 = 0
+pub const OR_ADDR64: i32 = 1
+pub const OR_ADDR32NB: i32 = 2
+const OR_SECTION: i32 = 3
+const OR_SECREL: i32 = 4
+const OR_ABS32: i32 = 5
+const OR_ABS32S: i32 = 6
+pub const OR_GOTPCREL: i32 = 7
+pub const OR_GOTPCRELX: i32 = 8
+const OR_TPOFF32: i32 = 9
+const OR_GOTTPOFF: i32 = 10
+// A64 (contrato_a64 1.3): so o ligador ELF com maquina AArch64 os entende; o PE recusa
+pub const OR_A64_CALL26: i32 = 11 // BL: imm26 = (S+A-P)>>2
+pub const OR_A64_JUMP26: i32 = 12 // B
+pub const OR_A64_CONDBR19: i32 = 13 // B.cond / CBZ / CBNZ (imm19)
+pub const OR_A64_ADR_PAGE: i32 = 14 // ADRP: pagina de S+A menos pagina de P, em 21 bits
+pub const OR_A64_ADD_LO12: i32 = 15 // ADD imm12 = (S+A) & 0xFFF
+pub const OR_A64_LDST8: i32 = 16 // LDR/STR byte: imm12 = (S+A) & 0xFFF
+pub const OR_A64_LDST16: i32 = 17 // escala 2
+pub const OR_A64_LDST32: i32 = 18 // escala 4
+pub const OR_A64_LDST64: i32 = 19 // escala 8
+pub const OR_A64_LDST128: i32 = 20 // escala 16
+pub const OR_A64_PREL32: i32 = 21 // S+A-P em 32 bits
+pub const OR_A64_GOT_PAGE: i32 = 22 // A4.3: ADRP da celula da GOT do simbolo (R_AARCH64_ADR_GOT_PAGE, 311)
+pub const OR_A64_LD64_GOT_LO12: i32 = 23 // A4.3: LDR x,[x,:got_lo12:S] (R_AARCH64_LD64_GOT_LO12_NC, 312)
+pub const OBJ_SECAO_INDEFINIDA: i32 = -1
+
+// C: nativo/obj/objeto.c:11
+proc obj_e_potencia_de_dois(v: u32) -> bool {
+    return (v != 0) and ((v & (v - 1)) == 0)
+}
+
+// C: nativo/obj/objeto.c:16
+// C2F: memset(o, 0) vira zerar a arena e o interner; VecIniciar vira make(alloc = heap); InternerIniciar ja e interner_iniciar
+pub proc obj_iniciar(o: ^Objeto) {
+    o.nomes = common.Arena{}
+    o.indice = common.Interner{}
+    o.secoes = make([dynamic]ObjSecao, alloc = heap)
+    o.simbolos = make([dynamic]ObjSimbolo, alloc = heap)
+    o.relocs = make([dynamic]ObjReloc, alloc = heap)
+    common.interner_iniciar(&o.indice, &o.nomes)
+}
+
+// C: nativo/obj/objeto.c:25
+// C2F: BufLiberar de cada secao vira delete(bytes); VecLiberar vira delete; a arena do objeto fecha por arena_liberar
+pub proc obj_liberar(o: ^Objeto) {
+    for k in (0 as u64)..<(len(o.secoes) as u64) {
+        delete(o.secoes[k].bytes)
+    }
+    delete(o.secoes)
+    delete(o.simbolos)
+    delete(o.relocs)
+    common.interner_liberar(&o.indice)
+    common.arena_liberar(&o.nomes)
+}
+
+// C: nativo/obj/objeto.c:36
+// C2F: FalhaInterna com o nome da secao; ArenaCopiarTexto vira from_bytes na arena do objeto
+pub proc obj_secao_abrir(o: ^Objeto, nome: ?str, tipo: i32, alinhamento: u32) -> u32 {
+    if not obj_e_potencia_de_dois(alinhamento) {
+        let txt_1 = nome or_else "(null)"
+        let msg_1 = format(f"objeto: alinhamento de secao '{txt_1}' nao e potencia de 2 ({alinhamento})", alloc = heap)
+        defer delete(msg_1)
+        common.falha_interna(msg_1)
+    }
+    // C2F: o Buf do C cresce sozinho; a lista da Forja precisa nascer com alocador (R0007 com valor zero)
+    append(&o.secoes, item = ObjSecao{bytes = make([dynamic]u8, alloc = heap)})
+    let s: ^ObjSecao = &o.secoes[len(o.secoes) - 1]
+    let nome_txt: str = nome or_else ""
+    s.nome = from_bytes(as_bytes(nome_txt)[0..<len(nome_txt)], alloc = common.arena_mem(&o.nomes))
+    s.tipo = tipo
+    s.alinhamento = alinhamento
+    return ((len(o.secoes) as u64) - 1) as u32
+}
+
+// C: nativo/obj/objeto.c:47
+pub proc obj_achar_simbolo(o: ^Objeto, nome: ?str) -> i64 {
+    let arg_1: u32 = (len((nome or_else "")) as u64) as u32
+    let arg_2: ?str = nome
+    let arg_3: ^common.Interner = &o.indice
+    return common.interner_achar(arg_3, arg_2, arg_1) as i64
+}
+
+// C: nativo/obj/objeto.c:53
+proc obj_novo_simbolo(o: ^Objeto, nome: ?str, secao: i32, off: u32) -> u32 {
+    o.indice.arena = &o.nomes
+    let arg_1: u32 = (len((nome or_else "")) as u64) as u32
+    let arg_2: ?str = nome
+    let arg_3: ^common.Interner = &o.indice
+    let id: i32 = common.internar(arg_3, arg_2, arg_1)
+    if common.c2f_s2u_64(id as i64) != (len(o.simbolos) as u64) {
+        let txt_1 = nome or_else "(null)"
+        let msg_1 = format(f"objeto: indice de nomes fora de sincronia no simbolo '{txt_1}' (id {id}, simbolos {len(o.simbolos) as u64})", alloc = heap)
+        defer delete(msg_1)
+        common.falha_interna(msg_1)
+    }
+    append(&o.simbolos, item = ObjSimbolo{})
+    let s: ^ObjSimbolo = &o.simbolos[len(o.simbolos) - 1]
+    s.nome = common.interner_texto(&o.indice, id)
+    s.secao = secao
+    s.off = off
+    s.global = (nome or_else "")[0] != 46 // '.'
+    s.fraco = false
+    return ((len(o.simbolos) as u64) - 1) as u32
+}
+
+// C: nativo/obj/objeto.c:68
+pub proc obj_simbolo_definir(o: ^Objeto, nome: ?str, secao: i32, off: u32) -> u32 {
+    let i: i64 = obj_achar_simbolo(o, nome)
+    if i < 0 {
+        return obj_novo_simbolo(o, nome, secao, off)
+    }
+    let s: ^ObjSimbolo = &o.simbolos[common.c2f_s2u_64(i)]
+    if s.secao != OBJ_SECAO_INDEFINIDA {
+        let txt_1 = nome or_else "(null)"
+        let msg_1 = format(f"objeto: simbolo '{txt_1}' definido duas vezes", alloc = heap)
+        defer delete(msg_1)
+        common.falha_interna(msg_1)
+    }
+    s.secao = secao
+    s.off = off
+    return i as u32
+}
+
+// C: nativo/obj/objeto.c:81
+pub proc obj_simbolo_referir(o: ^Objeto, nome: ?str) -> u32 {
+    let i: i64 = obj_achar_simbolo(o, nome)
+    if i >= 0 {
+        return i as u32
+    }
+    return obj_novo_simbolo(o, nome, OBJ_SECAO_INDEFINIDA, 0)
+}
+
+// C: nativo/obj/objeto.c:89
+pub proc obj_relocar(o: ^Objeto, alvo: ObjAlvoReloc, correcao: ObjCorrecao) {
+    if (alvo.secao as u64) >= (len(o.secoes) as u64) {
+        let msg_1 = format(f"objeto: relocacao numa secao inexistente ({alvo.secao})", alloc = heap)
+        defer delete(msg_1)
+        common.falha_interna(msg_1)
+    }
+    if (correcao.simbolo as u64) >= (len(o.simbolos) as u64) {
+        let msg_2 = format(f"objeto: relocacao para um simbolo inexistente ({correcao.simbolo})", alloc = heap)
+        defer delete(msg_2)
+        common.falha_interna(msg_2)
+    }
+    append(&o.relocs, item = ObjReloc{})
+    let r: ^ObjReloc = &o.relocs[len(o.relocs) - 1]
+    r.alvo = alvo
+    r.correcao = correcao
+}
+
+test "obj_potencia_de_dois" {
+    expect(obj_e_potencia_de_dois(1))
+    expect(obj_e_potencia_de_dois(16))
+    expect(not obj_e_potencia_de_dois(0))
+    expect(not obj_e_potencia_de_dois(6))
+}
+
+test "obj_secao_e_simbolo" {
+    var o = Objeto{}
+    obj_iniciar(&o)
+    defer obj_liberar(&o)
+    expect(obj_secao_abrir(&o, "texto", OS_TEXTO, 16) == 0)
+    expect(obj_secao_abrir(&o, "dados", OS_DATA, 8) == 1)
+    expect(obj_simbolo_definir(&o, "f", 0, 4) == 0)
+    expect(obj_simbolo_referir(&o, "f") == 0)
+    expect(obj_simbolo_referir(&o, "g") == 1)
+    expect(obj_achar_simbolo(&o, "h") == -1)
+}

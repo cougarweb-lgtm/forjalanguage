@@ -1,0 +1,455 @@
+// semantic/sem_fuga_expr.fj - porte de compiler/semantic/sem_fuga_expr.c
+// sha256 de semantic/sem_fuga_expr.c: ea540eed44f3ae9993b3a5e7200b499da66449dee42dd22364cc5c6d2f509d99
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "common"
+import "frontend"
+
+struct Visita {
+    pilha: [16]u32 // TipoId
+    n: u32
+}
+
+const VISITA_MAX: i32 = 16
+
+// C: semantic/sem_fuga_expr.c:21
+proc campos_tem_ponteiro(s: ^Semantica, d: ?^frontend.Decl, v: ^Visita) -> bool {
+    if d == none {
+        return false
+    }
+    var i: u32 = 0
+    while i < (d as ^frontend.Decl).ncampos {
+        if tem_ponteiro(s, ((d as ^frontend.Decl).campos or_else {})[i].tipo.tipo, v) {
+            return true
+        }
+        i += 1
+    }
+    return false
+}
+
+// C: semantic/sem_fuga_expr.c:30
+proc tupla_tem_ponteiro(s: ^Semantica, t: u32, v: ^Visita) -> bool {
+    let qtd: u32 = tipo_tupla_qtd(&s.tipos, t)
+    for k in (0 as u32)..<qtd {
+        if tem_ponteiro(s, tipo_tupla_elemento(&s.tipos, t, k), v) {
+            return true
+        }
+    }
+    return false
+}
+
+// C: semantic/sem_fuga_expr.c:39
+proc estrutura_tem_ponteiro(s: ^Semantica, t: u32, v: ^Visita) -> bool {
+    for i in (0 as u32)..<v.n {
+        if v.pilha[i] == t {
+            return false
+        }
+    }
+    if v.n == (VISITA_MAX as u32) {
+        return false
+    }
+    let antes_1: u32 = v.n
+    v.n += 1
+    v.pilha[antes_1] = t
+    let tem: bool = campos_tem_ponteiro(s, (s.globais or_else {})[tipo_de(&s.tipos, t).a].decl, v)
+    v.n -= 1
+    return tem
+}
+
+// C: semantic/sem_fuga_expr.c:51
+proc tem_ponteiro(s: ^Semantica, t: u32, v: ^Visita) -> bool {
+    let k: ^TipoInfo = tipo_de(&s.tipos, t)
+    let sw_1 = k.classe as i32
+    if sw_1 == TC_PONTEIRO or sw_1 == TC_ANULAVEL or sw_1 == TC_RAWPTR or sw_1 == TC_FATIA {
+        return true
+    } else if sw_1 == TC_OPCIONAL or sw_1 == TC_ARRAY or sw_1 == TC_RESULTADO or sw_1 == TC_DINAMICO or sw_1 == TC_SOA {
+        return tem_ponteiro(s, k.a, v)
+    } else if sw_1 == TC_MAPA {
+        return (common.c2f_b2i32(tem_ponteiro(s, k.a, v)) != 0) or (common.c2f_b2i32(tem_ponteiro(s, k.b, v)) != 0)
+    } else if sw_1 == TC_STRUCT or sw_1 == TC_UNIAO {
+        return estrutura_tem_ponteiro(s, t, v)
+    } else if sw_1 == TC_TUPLA {
+        return tupla_tem_ponteiro(s, t, v)
+    } else {
+        return false
+    }
+    return false
+}
+
+// C: semantic/sem_fuga_expr.c:65
+proc sem_fuga_tipo_tem_ponteiro(s: ^Semantica, t: u32) -> bool {
+    var v: Visita = Visita{}
+    v.n = 0
+    return tem_ponteiro(s, t, &v)
+}
+
+// C: semantic/sem_fuga_expr.c:74
+proc base_eh_ponteiro(f: ^Fuga, x: ?^frontend.Expr) -> bool {
+    return common.c2f_s2u_32(tipo_classe_de(&(f.s as ^Semantica).tipos, ((x as ^frontend.Expr).a as ^frontend.Expr).tipo)) == (TC_PONTEIRO as u32)
+}
+
+// C: semantic/sem_fuga_expr.c:79
+proc endereco_do_nome(f: ^Fuga, x: ?^frontend.Expr, dst: []u64) {
+    let nome: ^frontend.Expr = x as ^frontend.Expr
+    let local: bool = ((nome.ref == (frontend.REF_LOCAL as u8)) or (nome.ref == (frontend.REF_PARAM as u8))) and (common.c2f_s2u_32(nome.ref_id) < f.nl)
+    if local {
+        fuga_ligar(dst, common.c2f_s2u_32(nome.ref_id))
+    } else {
+        fuga_ligar(dst, fuga_bit_flag(f, FUGA_DESC))
+    }
+}
+
+// C: semantic/sem_fuga_expr.c:86
+proc passo_campo(f: ^Fuga, x: ?^frontend.Expr, dst: []u64) -> ?^frontend.Expr {
+    if not base_eh_ponteiro(f, x) {
+        return (x as ^frontend.Expr).a
+    }
+    fuga_avaliar(f, (x as ^frontend.Expr).a, dst)
+    return none
+}
+
+// C: semantic/sem_fuga_expr.c:94
+proc passo_indice(f: ^Fuga, x: ?^frontend.Expr, dst: []u64) -> ?^frontend.Expr {
+    var forma: i32 = FORMA_NENHUMA
+    _ = sem_elemento_de(f.s as ^Semantica, ((x as ^frontend.Expr).a as ^frontend.Expr).tipo, &forma)
+    if common.c2f_s2u_32(forma) == (FORMA_ARRAY as u32) {
+        return (x as ^frontend.Expr).a
+    }
+    if (common.c2f_s2u_32(forma) == (FORMA_FATIA as u32)) or (common.c2f_s2u_32(forma) == (FORMA_PONTEIRO_ARRAY as u32)) {
+        fuga_avaliar(f, (x as ^frontend.Expr).a, dst)
+    } else {
+        var tern_1: i32 = FUGA_DESC
+        if (common.c2f_s2u_32(forma) == (FORMA_DINAMICO as u32)) or (common.c2f_s2u_32(forma) == (FORMA_PONTEIRO_DINAMICO as u32)) {
+            tern_1 = FUGA_HEAP
+        }
+        fuga_ligar_flag(f, dst, tern_1)
+    }
+    return none
+}
+
+// C: semantic/sem_fuga_expr.c:105
+proc passo_endereco(f: ^Fuga, x: ?^frontend.Expr, dst: []u64) -> ?^frontend.Expr {
+    if (x as ^frontend.Expr).tipo_no == (frontend.EX_NOME as u8) {
+        endereco_do_nome(f, x, dst)
+        return none
+    }
+    if (x as ^frontend.Expr).tipo_no == (frontend.EX_CAMPO as u8) {
+        return passo_campo(f, x, dst)
+    }
+    if (x as ^frontend.Expr).tipo_no == (frontend.EX_INDICE as u8) {
+        return passo_indice(f, x, dst)
+    }
+    if ((x as ^frontend.Expr).tipo_no == (frontend.EX_UNARIO as u8)) and ((x as ^frontend.Expr).op == (frontend.OP_DEREF as u8)) {
+        fuga_avaliar(f, (x as ^frontend.Expr).a, dst)
+    } else {
+        fuga_ligar_flag(f, dst, FUGA_DESC)
+    }
+    return none
+}
+
+// C: semantic/sem_fuga_expr.c:118
+proc fuga_endereco(f: ^Fuga, x: ?^frontend.Expr, dst: []u64) {
+    var p: ?^frontend.Expr = x
+    while p != none {
+        p = passo_endereco(f, p, dst)
+    }
+}
+
+// C: semantic/sem_fuga_expr.c:125
+// C2F-INDECIDIVEL: dst, src
+proc unir_conj(f: ^Fuga, dst: []u64, src: []u64) {
+    for w in (0 as u32)..<f.pal {
+        dst[w] = dst[w] | src[w]
+    }
+}
+
+// C: semantic/sem_fuga_expr.c:130
+proc avaliar_nome(f: ^Fuga, e: ?^frontend.Expr, dst: []u64) {
+    let nome: ^frontend.Expr = e as ^frontend.Expr
+    if ((nome.ref == (frontend.REF_LOCAL as u8)) or (nome.ref == (frontend.REF_PARAM as u8))) and (common.c2f_s2u_32(nome.ref_id) < f.nl) {
+        unir_conj(f, dst, fuga_conj_de(f, common.c2f_s2u_32(nome.ref_id)))
+    } else if nome.ref == (frontend.REF_CONST as u8) {
+        fuga_ligar_flag(f, dst, FUGA_GLOBAL)
+    }
+}
+
+// C: semantic/sem_fuga_expr.c:136
+proc avaliar_args(f: ^Fuga, e: ?^frontend.Expr, dst: []u64) {
+    for i in (0 as u32)..<(e as ^frontend.Expr).nargs {
+        fuga_avaliar(f, ((e as ^frontend.Expr).args or_else {})[i].valor, dst)
+    }
+}
+
+// C: semantic/sem_fuga_expr.c:142
+proc avaliar_indice(f: ^Fuga, e: ?^frontend.Expr, dst: []u64) {
+    if fuga_contem_por_valor(f, ((e as ^frontend.Expr).a as ^frontend.Expr).tipo) {
+        fuga_avaliar(f, (e as ^frontend.Expr).a, dst)
+    } else {
+        fuga_ligar_flag(f, dst, FUGA_DESC)
+    }
+}
+
+// C: semantic/sem_fuga_expr.c:150
+proc avaliar_campo(f: ^Fuga, e: ?^frontend.Expr, dst: []u64) {
+    let tipos: ^Tipos = &(f.s as ^Semantica).tipos
+    let base: i32 = tipo_classe_de(tipos, ((e as ^frontend.Expr).a as ^frontend.Expr).tipo)
+    var tern_1: u32 = TC_VAZIO as u32
+    if common.c2f_s2u_32(base) == (TC_SOA as u32) {
+        tern_1 = common.c2f_s2u_32(tipo_classe_de(tipos, tipo_de(tipos, ((e as ^frontend.Expr).a as ^frontend.Expr).tipo).a))
+    }
+    let corpo: i32 = transmute(tern_1, to = i32)
+    if common.c2f_s2u_32(base) == (TC_PONTEIRO as u32) {
+        fuga_ligar_flag(f, dst, FUGA_DESC)
+    } else if common.c2f_s2u_32(corpo) == (TC_DINAMICO as u32) {
+        fuga_ligar_flag(f, dst, FUGA_HEAP)
+    } else if common.c2f_s2u_32(corpo) == (TC_ARRAY as u32) {
+        fuga_endereco(f, (e as ^frontend.Expr).a, dst)
+    } else {
+        fuga_avaliar(f, (e as ^frontend.Expr).a, dst)
+    }
+}
+
+// C: semantic/sem_fuga_expr.c:162
+proc avaliar_fatia(f: ^Fuga, e: ?^frontend.Expr, dst: []u64) {
+    var forma: i32 = FORMA_NENHUMA
+    _ = sem_elemento_de(f.s as ^Semantica, ((e as ^frontend.Expr).a as ^frontend.Expr).tipo, &forma)
+    if common.c2f_s2u_32(forma) == (FORMA_ARRAY as u32) {
+        fuga_endereco(f, (e as ^frontend.Expr).a, dst)
+    } else if (common.c2f_s2u_32(forma) == (FORMA_FATIA as u32)) or (common.c2f_s2u_32(forma) == (FORMA_PONTEIRO_ARRAY as u32)) {
+        fuga_avaliar(f, (e as ^frontend.Expr).a, dst)
+    } else {
+        var tern_1: i32 = FUGA_DESC
+        if (common.c2f_s2u_32(forma) == (FORMA_DINAMICO as u32)) or (common.c2f_s2u_32(forma) == (FORMA_PONTEIRO_DINAMICO as u32)) {
+            tern_1 = FUGA_HEAP
+        }
+        fuga_ligar_flag(f, dst, tern_1)
+    }
+}
+
+// C: semantic/sem_fuga_expr.c:171
+proc avaliar_unario(f: ^Fuga, e: ?^frontend.Expr, dst: []u64) {
+    if (e as ^frontend.Expr).op == (frontend.OP_ENDERECO as u8) {
+        fuga_endereco(f, (e as ^frontend.Expr).a, dst)
+    } else if (e as ^frontend.Expr).op == (frontend.OP_DEREF as u8) {
+        fuga_ligar_flag(f, dst, FUGA_DESC)
+    }
+}
+
+// C: semantic/sem_fuga_expr.c:178
+proc avaliar_slice_from(f: ^Fuga, e: ?^frontend.Expr, dst: []u64) {
+    var i: u32 = 0
+    while i < (e as ^frontend.Expr).nargs {
+        if ((e as ^frontend.Expr).args or_else {})[i].indice == 0 {
+            fuga_avaliar(f, ((e as ^frontend.Expr).args or_else {})[i].valor, dst)
+        }
+        i += 1
+    }
+}
+
+// C: semantic/sem_fuga_expr.c:185
+proc avaliar_embutido(f: ^Fuga, e: ?^frontend.Expr, dst: []u64) {
+    let sw_1 = (e as ^frontend.Expr).ref_id
+    if sw_1 == frontend.EMB_NEW or sw_1 == frontend.EMB_MAKE or sw_1 == frontend.EMB_FORMAT or sw_1 == frontend.EMB_FORMAT_C or sw_1 == frontend.EMB_GET_PTR or sw_1 == frontend.EMB_CLONE {
+        fuga_ligar_flag(f, dst, FUGA_HEAP)
+    } else if sw_1 == frontend.EMB_KEYS or sw_1 == frontend.EMB_VALUES or sw_1 == frontend.EMB_FROM_BYTES or sw_1 == frontend.EMB_TO_STR {
+        fuga_ligar_flag(f, dst, FUGA_HEAP)
+    } else if sw_1 == frontend.EMB_SLICE_FROM or sw_1 == frontend.EMB_AS_BYTES {
+        avaliar_slice_from(f, e, dst)
+    } else {
+        fuga_ligar_flag(f, dst, FUGA_DESC)
+    }
+}
+
+// C: semantic/sem_fuga_expr.c:196
+proc avaliar_chamada(f: ^Fuga, e: ?^frontend.Expr, dst: []u64) {
+    if (e as ^frontend.Expr).ref == (frontend.REF_EMBUTIDO as u8) {
+        avaliar_embutido(f, e, dst)
+    } else {
+        fuga_resultado_da_chamada(f, e, dst)
+    }
+}
+
+// C: semantic/sem_fuga_expr.c:202
+proc avaliar_composto(f: ^Fuga, e: ?^frontend.Expr, dst: []u64) {
+    let sw_1 = (e as ^frontend.Expr).tipo_no as i32
+    if sw_1 == frontend.EX_BINARIO or sw_1 == frontend.EX_OR_ELSE {
+        fuga_avaliar(f, (e as ^frontend.Expr).a, dst)
+        fuga_avaliar(f, (e as ^frontend.Expr).b, dst)
+    } else if sw_1 == frontend.EX_CONVERSAO or sw_1 == frontend.EX_TRY or sw_1 == frontend.EX_EMBRULHA {
+        fuga_avaliar(f, (e as ^frontend.Expr).a, dst)
+    } else if sw_1 == frontend.EX_LITERAL_STRUCT or sw_1 == frontend.EX_LITERAL_ARRAY or sw_1 == frontend.EX_TUPLA {
+        avaliar_args(f, e, dst)
+    } else {
+    }
+}
+
+// C: semantic/sem_fuga_expr.c:212
+proc fuga_avaliar(f: ^Fuga, e: ?^frontend.Expr, dst: []u64) {
+    if not fuga_rastreia(f, (e as ^frontend.Expr).tipo) {
+        return
+    }
+    let sw_1 = (e as ^frontend.Expr).tipo_no as i32
+    if sw_1 == frontend.EX_NOME {
+        avaliar_nome(f, e, dst)
+    } else if sw_1 == frontend.EX_CAMPO {
+        avaliar_campo(f, e, dst)
+    } else if sw_1 == frontend.EX_INDICE {
+        avaliar_indice(f, e, dst)
+    } else if sw_1 == frontend.EX_FATIA {
+        avaliar_fatia(f, e, dst)
+    } else if sw_1 == frontend.EX_UNARIO {
+        avaliar_unario(f, e, dst)
+    } else if sw_1 == frontend.EX_CHAMADA {
+        avaliar_chamada(f, e, dst)
+    } else {
+        avaliar_composto(f, e, dst)
+    }
+}
+
+// ---------------------------------------------------------------- G3 S6: testes da avaliacao de origens
+
+// expressao generica (a e b opcionais)
+proc s6_ex_gen(s: ^Semantica, tipo_no: i32, a: ?^frontend.Expr, b: ?^frontend.Expr, tipo: u32) -> ^frontend.Expr {
+    let e = s4_novo_expr(s)
+    e.tipo_no = tipo_no as u8
+    e.a = a
+    e.b = b
+    e.tipo = tipo
+    return e
+}
+
+// palavra do conjunto de origens avaliado (f.nl + f.np + 4 <= 64)
+proc s6_avalia(f: ^Fuga, e: ^frontend.Expr) -> u64 {
+    fuga_zerar(f, f.v)
+    fuga_avaliar(f, e, f.v)
+    return f.v[0]
+}
+
+test "sem_fuga_expr: fuga_avaliar (nome, &x, deref, const, embutidos, campo, indice, fatia, binario, conversao)" {
+    let c = s6_cen_novo("proc g(a: ^int, b: ^int) {}\n")
+    defer s6_cen_liberar(c)
+    let s: ^Semantica = &c.s
+    let d = s6_decl_g(c)
+    var tab: FugaTabela = FugaTabela{}
+    tab.rascunho = make([dynamic]u64, alloc = heap)
+    defer delete(tab.rascunho)
+    var f: Fuga = Fuga{}
+    fuga_iniciar(&f, s, d, &tab)
+    defer delete(f.prov)
+    let t_p: u32 = tipo_ponteiro(&s.tipos, TIPO_INT as u32)
+    let t_dp: u32 = tipo_dinamico(&s.tipos, t_p)
+    let t_fp: u32 = tipo_fatia(&s.tipos, t_p)
+    let t_ap: u32 = tipo_array(&s.tipos, t_p, 2)
+    let nome_x = s6_ex_nome(s, s6_nome(c, "x"), 2, TIPO_INT as u32, 0)
+    let nome_a = s6_ex_nome(s, s6_nome(c, "a"), 0, t_p, 0)
+    let end_x = s6_ex_unario(s, frontend.OP_ENDERECO, nome_x, t_p, 0)
+    // bits: LOCAL x = 1<<2 ; PARAM a = 1<<4 ; GLOBAL 1<<6 ; HEAP 1<<7 ; DESC 1<<9
+    expect(s6_avalia(&f, end_x) == 4)
+    expect(s6_avalia(&f, nome_a) == 16) // o parametro nasce ligado ao proprio bit PARAM
+    expect(s6_avalia(&f, nome_x) == 0) // int: nao rastreia
+    expect(s6_avalia(&f, s6_ex_int(s, 0)) == 0)
+    expect(s6_avalia(&f, s6_ex_unario(s, frontend.OP_DEREF, nome_a, t_p, 0)) == 512)
+    let k = s6_ex_nome(s, s6_nome(c, "K"), 0, t_p, 0)
+    k.ref = frontend.REF_CONST as u8
+    expect(s6_avalia(&f, k) == 64) // constante: GLOBAL
+    let fora = s6_ex_nome(s, s6_nome(c, "w"), 99, t_p, 0)
+    expect(s6_avalia(&f, fora) == 0) // local fora da faixa e nao-const: nada
+    // embutidos: new/make/format/get_ptr/clone/keys/values/from_bytes/to_str = HEAP; slice_from/as_bytes = args; o resto = DESC
+    let emb = s6_ex_embutido2(s, frontend.EMB_NEW, s6_nome(c, "new"), 0, end_x, nome_a)
+    emb.tipo = t_p
+    expect(s6_avalia(&f, emb) == 128)
+    emb.ref_id = frontend.EMB_GET_PTR
+    expect(s6_avalia(&f, emb) == 128)
+    emb.ref_id = frontend.EMB_CLEAR
+    expect(s6_avalia(&f, emb) == 512)
+    emb.ref_id = frontend.EMB_SLICE_FROM
+    expect(s6_avalia(&f, emb) == 4) // slice_from: so o argumento de indice 0 (&x)
+    // chamada de proc sem resumo (nem decl): DESC
+    emb.ref = frontend.REF_PROC as u8
+    expect(s6_avalia(&f, emb) == 512)
+    // campo: base ponteiro = DESC; base valor = avalia a base
+    let campo = s6_ex_gen(s, frontend.EX_CAMPO, nome_a, none, t_p)
+    expect(s6_avalia(&f, campo) == 512)
+    // indice: base dinamica avalia a base (conj de y = {x}); base fatia = DESC
+    fuga_zerar(&f, f.v)
+    fuga_ligar(f.v, 2)
+    fuga_unir_em(&f, 3, f.v, none)
+    let nome_y = s6_ex_nome(s, s6_nome(c, "y"), 3, t_dp, 0)
+    expect(s6_avalia(&f, s6_ex_gen(s, frontend.EX_INDICE, nome_y, s6_ex_int(s, 0), t_p)) == 4)
+    let nome_fatia = s6_ex_nome(s, s6_nome(c, "y"), 3, t_fp, 0)
+    expect(s6_avalia(&f, s6_ex_gen(s, frontend.EX_INDICE, nome_fatia, s6_ex_int(s, 0), t_p)) == 512)
+    // fatia: de array = endereco do array (bit LOCAL y), de dinamico = HEAP, de fatia = avalia a base
+    let nome_arr = s6_ex_nome(s, s6_nome(c, "y"), 3, t_ap, 0)
+    expect(s6_avalia(&f, s6_ex_gen(s, frontend.EX_FATIA, nome_arr, none, t_fp)) == 8)
+    expect(s6_avalia(&f, s6_ex_gen(s, frontend.EX_FATIA, nome_y, none, t_fp)) == 128)
+    expect(s6_avalia(&f, s6_ex_gen(s, frontend.EX_FATIA, nome_fatia, none, t_fp)) == 4)
+    // composto: binario une os dois lados; conversao/try/embrulha seguem o operando
+    expect(s6_avalia(&f, s6_ex_gen(s, frontend.EX_BINARIO, end_x, nome_a, t_p)) == 20)
+    expect(s6_avalia(&f, s6_ex_gen(s, frontend.EX_CONVERSAO, end_x, none, t_p)) == 4)
+    expect(s6_avalia(&f, s6_ex_gen(s, frontend.EX_TRY, nome_a, none, t_p)) == 16)
+    expect(s6_avalia(&f, s6_ex_gen(s, frontend.EX_LITERAL_ARRAY, none, none, t_p)) == 0)
+}
+
+test "sem_fuga_expr: sem_fuga_tipo_tem_ponteiro (escalares, ponteiro, colecoes, mapa, tupla, struct, recursao)" {
+    let c = s6_cen_novo("struct S { p: ^int }\n")
+    defer s6_cen_liberar(c)
+    let s: ^Semantica = &c.s
+    let t_p: u32 = tipo_ponteiro(&s.tipos, TIPO_INT as u32)
+    expect(not sem_fuga_tipo_tem_ponteiro(s, TIPO_INT as u32))
+    expect(sem_fuga_tipo_tem_ponteiro(s, t_p))
+    expect(sem_fuga_tipo_tem_ponteiro(s, tipo_anulavel(&s.tipos, TIPO_INT as u32))) // ?^T
+    expect(not sem_fuga_tipo_tem_ponteiro(s, tipo_dinamico(&s.tipos, TIPO_INT as u32)))
+    expect(sem_fuga_tipo_tem_ponteiro(s, tipo_dinamico(&s.tipos, t_p)))
+    expect(not sem_fuga_tipo_tem_ponteiro(s, tipo_array(&s.tipos, TIPO_INT as u32, 3)))
+    expect(sem_fuga_tipo_tem_ponteiro(s, tipo_array(&s.tipos, t_p, 3)))
+    expect(sem_fuga_tipo_tem_ponteiro(s, tipo_fatia(&s.tipos, TIPO_INT as u32))) // fatia sempre aponta
+    expect(sem_fuga_tipo_tem_ponteiro(s, tipo_mapa(&s.tipos, TIPO_INT as u32, t_p)))
+    expect(sem_fuga_tipo_tem_ponteiro(s, tipo_mapa(&s.tipos, t_p, TIPO_INT as u32)))
+    expect(not sem_fuga_tipo_tem_ponteiro(s, tipo_mapa(&s.tipos, TIPO_INT as u32, TIPO_INT as u32)))
+    var so_int: [2]u32 = {TIPO_INT as u32, TIPO_INT as u32}
+    var com_ptr: [2]u32 = {TIPO_INT as u32, t_p}
+    expect(not sem_fuga_tipo_tem_ponteiro(s, tipo_tupla(&s.tipos, so_int[..])))
+    expect(sem_fuga_tipo_tem_ponteiro(s, tipo_tupla(&s.tipos, com_ptr[..])))
+    // struct S { p: ^int } , struct T { n: int, s: S } (por valor), struct R { r: R } (recursiva), struct Q { n: int } (sem ponteiro)
+    let n_s = s6_nome(c, "S")
+    let n_t = s6_nome(c, "T")
+    let n_r = s6_nome(c, "R")
+    let n_q = s6_nome(c, "Q")
+    let t_s: u32 = tipo_struct(&s.tipos, n_s)
+    let t_t: u32 = tipo_struct(&s.tipos, n_t)
+    let t_r: u32 = tipo_struct(&s.tipos, n_r)
+    let t_q: u32 = tipo_struct(&s.tipos, n_q)
+    let arena: ^common.Arena = s.arena as ^common.Arena
+    var cs = make([dynamic]frontend.Campo, alloc = common.arena_mem(arena), cap = 1)
+    append(&cs, item = frontend.Campo{nome = s6_nome(c, "p"), tipo = frontend.TipoRef{tipo = t_p}})
+    var ct = make([dynamic]frontend.Campo, alloc = common.arena_mem(arena), cap = 2)
+    append(&ct, item = frontend.Campo{nome = s6_nome(c, "n"), tipo = frontend.TipoRef{tipo = TIPO_INT as u32}})
+    append(&ct, item = frontend.Campo{nome = s6_nome(c, "s"), tipo = frontend.TipoRef{tipo = t_s}})
+    var cr = make([dynamic]frontend.Campo, alloc = common.arena_mem(arena), cap = 1)
+    append(&cr, item = frontend.Campo{nome = s6_nome(c, "r"), tipo = frontend.TipoRef{tipo = t_r}})
+    var cq = make([dynamic]frontend.Campo, alloc = common.arena_mem(arena), cap = 1)
+    append(&cq, item = frontend.Campo{nome = s6_nome(c, "n"), tipo = frontend.TipoRef{tipo = TIPO_INT as u32}})
+    let ds = s4_novo_decl(s)
+    ds.campos = cs[..]
+    ds.ncampos = 1
+    let dt = s4_novo_decl(s)
+    dt.campos = ct[..]
+    dt.ncampos = 2
+    let dr = s4_novo_decl(s)
+    dr.campos = cr[..]
+    dr.ncampos = 1
+    let dq = s4_novo_decl(s)
+    dq.campos = cq[..]
+    dq.ncampos = 1
+    let globais: []Simbolo = s.globais or_else {}
+    globais[n_s].decl = ds
+    globais[n_t].decl = dt
+    globais[n_r].decl = dr
+    globais[n_q].decl = dq
+    expect(sem_fuga_tipo_tem_ponteiro(s, t_s))
+    expect(sem_fuga_tipo_tem_ponteiro(s, t_t)) // contem S por valor
+    expect(not sem_fuga_tipo_tem_ponteiro(s, t_r)) // recursiva: o tipo ja na pilha da visita nao conta de novo (termina)
+    expect(not sem_fuga_tipo_tem_ponteiro(s, t_q))
+    expect(sem_fuga_tipo_tem_ponteiro(s, tipo_dinamico(&s.tipos, t_s)))
+}

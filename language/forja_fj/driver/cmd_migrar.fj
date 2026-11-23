@@ -1,0 +1,331 @@
+// driver/cmd_migrar.fj - porte de compiler/driver/cmd_migrar.c, compiler/driver/cmd_migrar.h
+// sha256 de driver/cmd_migrar.c: 29b8a014a3a6ae631509e444f7580c5196e502e4d34a30fd52ad63db83709c1c
+// sha256 de driver/cmd_migrar.h: 7383af5ea70c4f6e7e202d06b61abbc531b0c75219db61aa7559607a726586ae
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "cache"
+import "common"
+import "nativo"
+
+struct Pedido4 {
+    entradas: ?[]str
+    nentradas: i32
+    aplicar: bool
+    dry_run: bool
+    comentarios: bool
+}
+
+struct Totais {
+    trocas: u32
+    alterados: u32
+    nao_analisados: u32
+    comentarios_reescritos: u32
+    comentarios_revisao: u32
+    linhas_iguais: bool
+}
+
+const SAIDA_OK_4: i32 = 0
+const SAIDA_NAO_ANALISADO: i32 = 1
+const SAIDA_USO_4: i32 = 2
+
+// C: driver/cmd_migrar.c:36
+proc uso_errado_7(motivo: ?str) -> i32 {
+    let txt_1 = motivo or_else "(null)"
+    let msg_1 = format(f"forja: migrar: {txt_1}\n", alloc = heap)
+    defer delete(msg_1)
+    common.c2f_saida_formatar(common.c2f_saida_stderr(), msg_1)
+    common.c2f_saida_escrever_texto(common.c2f_saida_stderr(), "uso: forja migrar <arquivo.fj | pasta> ... [--dry-run | --aplicar] [--comentarios] [--json]\n")
+    return SAIDA_USO_4
+}
+
+// C: driver/cmd_migrar.c:43 (LerArgumentos)
+// As entradas vao para 'entradas' (dono: quem chama, que faz delete); none = argumentos validos, senao o motivo do uso errado.
+proc ler_argumentos_6(argc: i32, argv: []str, p: ^Pedido4, entradas: ^[dynamic]str) -> ?str {
+    p^ = Pedido4{}
+    var k: i32 = 0
+    while k < argc {
+        let arg: str = argv[k as int]
+        k += 1
+        if arg == "--json" {
+            continue
+        }
+        if arg == "--aplicar" {
+            p.aplicar = true
+        } else if arg == "--dry-run" {
+            p.dry_run = true
+        } else if arg == "--comentarios" {
+            p.comentarios = true
+        } else if (len(arg) > 0) and (as_bytes(arg)[0] == 45) {
+            return "opcao desconhecida (valem --dry-run, --aplicar, --comentarios e --json)"
+        } else {
+            append(entradas, item = arg)
+        }
+    }
+    if p.aplicar and p.dry_run {
+        return "--dry-run e --aplicar nao valem juntos"
+    }
+    p.entradas = entradas[..]
+    p.nentradas = len(entradas) as i32
+    if p.nentradas == 0 {
+        return "falta o arquivo .fj ou a pasta"
+    }
+    return none
+}
+
+// C: driver/cmd_migrar.c:62
+proc emitir_detalhe(b: ^[dynamic]u8, t: ^MigrarTroca) {
+    format(f"{{\"linha\": {t.linha}, \"coluna\": {t.coluna}, \"coluna_fim\": {t.coluna_fim}, \"classe\": \"{common.renomeado_classe_texto(t.classe)}\", \"antigo\": ", into = b)
+    let arg_1: u64 = len((t.antigo or_else "")) as u64
+    let arg_2: ?str = t.antigo
+    let arg_3: ^[dynamic]u8 = b
+    edicoes_json_texto(arg_3, arg_2, arg_1)
+    append(b, item = ", \"novo\": ")
+    let arg_4: u64 = len((t.novo or_else "")) as u64
+    let arg_5: ?str = t.novo
+    let arg_6: ^[dynamic]u8 = b
+    edicoes_json_texto(arg_6, arg_5, arg_4)
+    if t.comentario {
+        append(b, item = ", \"origem\": \"comentario\"")
+    }
+    append(b, item = "}")
+}
+
+// C: driver/cmd_migrar.c:72
+proc emitir_revisao(b: ^[dynamic]u8, r: ^MigrarRevisao) {
+    format(f"{{\"estado\": \"revisao_comentario\", \"linha\": {r.linha}, \"coluna\": {r.coluna}, \"trecho\": ", into = b)
+    let arg_1: u64 = len((r.trecho or_else "")) as u64
+    let arg_2: ?str = r.trecho
+    let arg_3: ^[dynamic]u8 = b
+    edicoes_json_texto(arg_3, arg_2, arg_1)
+    append(b, item = ", \"formas_antigas_encontradas\": [")
+    var k: u32 = 0
+    while k < r.nformas {
+        if k > 0 {
+            append(b, item = ", ")
+        }
+        let arg_4: u64 = len((r.formas or_else {})[k]) as u64
+        let arg_5: str = (r.formas or_else {})[k]
+        let arg_6: ^[dynamic]u8 = b
+        edicoes_json_texto(arg_6, arg_5, arg_4)
+        k += 1
+    }
+    append(b, item = "]}")
+}
+
+// C: driver/cmd_migrar.c:84
+proc emitir_revisoes(b: ^[dynamic]u8, r: ^MigrarResultado) {
+    append(b, item = ", \"comentarios_revisao\": [")
+    var k: u32 = 0
+    while k < r.nrevisoes {
+        if k > 0 {
+            append(b, item = ", ")
+        }
+        emitir_revisao(b, &(r.revisoes or_else {})[k])
+        k += 1
+    }
+    append(b, item = "]")
+}
+
+// C: driver/cmd_migrar.c:94
+proc emitir_arquivo(b: ^[dynamic]u8, caminho: str, r: ^MigrarResultado, comentarios: bool) {
+    append(b, item = "  {\"arquivo\": ")
+    nativo.json_caminho(b, caminho)
+    format(f", \"trocas\": {r.ntrocas}, \"detalhes\": [", into = b)
+    var k: u32 = 0
+    while k < r.ntrocas {
+        if k > 0 {
+            append(b, item = ", ")
+        }
+        emitir_detalhe(b, &(r.trocas or_else {})[k])
+        k += 1
+    }
+    format(f"], \"estado\": \"{migrar_estado_texto(r.estado)}\", \"diagnostico\": ", into = b)
+    edicoes_json_texto_ou_nulo(b, r.diagnostico)
+    append(b, item = ", \"motivo\": ")
+    edicoes_json_texto_ou_nulo(b, r.motivo)
+    if comentarios {
+        emitir_revisoes(b, r)
+    }
+    append(b, item = "}")
+}
+
+// C: driver/cmd_migrar.c:112
+proc emitir_rodape(b: ^[dynamic]u8, t: ^Totais, comentarios: bool) {
+    var tern_1: str = "false"
+    if common.c2f_b2i32(t.linhas_iguais) != 0 {
+        tern_1 = "true"
+    }
+    format(f"\n], \"total_trocas\": {t.trocas}, \"arquivos_alterados\": {t.alterados}, \"linhas_iguais\": {tern_1}", into = b)
+    if comentarios {
+        format(f", \"comentarios_reescritos\": {t.comentarios_reescritos}, \"comentarios_revisao\": {t.comentarios_revisao}", into = b)
+    }
+    append(b, item = "}\n")
+}
+
+// C: driver/cmd_migrar.c:121 (GravarMigrado): gravacao atomica do arquivo migrado; falha = mensagem no stderr
+proc gravar_migrado(caminho: str, r: ^MigrarResultado) -> bool {
+    var erro: i32 = 0
+    let texto: str = from_bytes(r.novo[..], alloc = heap)
+    defer delete(texto)
+    if common.arquivo_gravar_atomico(caminho, texto, len(texto) as u64, &erro) {
+        return true
+    }
+    let msg = format(f"forja: migrar: nao consegui gravar '{caminho}' (errno {erro})\n", alloc = heap)
+    defer delete(msg)
+    common.c2f_saida_formatar(common.c2f_saida_stderr(), msg)
+    return false
+}
+
+// C: driver/cmd_migrar.c:130
+proc somar_totais(t: ^Totais, r: ^MigrarResultado, gravou: bool) {
+    t.trocas += r.ntrocas
+    var tern_1: i32 = 0
+    if common.c2f_b2i32(gravou) != 0 {
+        tern_1 = 1
+    }
+    t.alterados += common.c2f_s2u_32(tern_1)
+    var tern_2: i32 = 0
+    if common.c2f_s2u_32(r.estado) == (MIGRAR_NAO_ANALISADO as u32) {
+        tern_2 = 1
+    }
+    t.nao_analisados += common.c2f_s2u_32(tern_2)
+    t.linhas_iguais = (common.c2f_b2i32(t.linhas_iguais) != 0) and (common.c2f_b2i32(r.linhas_iguais) != 0)
+    t.comentarios_revisao += r.nrevisoes
+    for k in (0 as u32)..<r.ntrocas {
+        var tern_3: i32 = 0
+        if common.c2f_b2i32((r.trocas or_else {})[k].comentario) != 0 {
+            tern_3 = 1
+        }
+        t.comentarios_reescritos += common.c2f_s2u_32(tern_3)
+    }
+}
+
+// C: driver/cmd_migrar.c:141 (ProcessarArquivo): le, analisa, grava (com --aplicar) e acrescenta o arquivo ao documento. false = erro de leitura ou gravacao.
+proc processar_arquivo(caminho: str, p: ^Pedido4, json_c: ^[dynamic]u8, tot: ^Totais) -> bool {
+    var dados: [dynamic]u8 = make([dynamic]u8, alloc = heap)
+    defer delete(dados)
+    if not cache.arquivo_ler_inteiro(caminho, &dados) {
+        let msg = format(f"forja: migrar: nao consegui ler '{caminho}'\n", alloc = heap)
+        defer delete(msg)
+        common.c2f_saida_formatar(common.c2f_saida_stderr(), msg)
+        return false
+    }
+    let tam: u64 = (len(dados) - 1) as u64
+    let original: str = from_bytes(dados[0..<(tam as int)], alloc = heap)
+    defer delete(original)
+    var arena: common.Arena = common.Arena{}
+    defer common.arena_liberar(&arena)
+    var entrada: MigrarEntrada = MigrarEntrada{caminho = caminho, original = original, tam = tam, comentarios = p.comentarios}
+    var r: MigrarResultado = MigrarResultado{}
+    migrar_arquivo(&entrada, &arena, &r)
+    var ok: bool = true
+    var gravou: bool = false
+    if p.aplicar and (r.ntrocas > 0) {
+        ok = gravar_migrado(caminho, &r)
+        gravou = ok
+    }
+    if ok {
+        if len(json_c^) > 0 {
+            append(json_c, items = as_bytes(",\n"))
+        }
+        emitir_arquivo(json_c, caminho, &r, p.comentarios)
+        somar_totais(tot, &r, gravou)
+    }
+    delete(r.novo)
+    return ok
+}
+
+// C: driver/cmd_migrar.c:172
+proc listar_arquivos_2(p: ^Pedido4, arena: ^common.Arena, arquivos: ^[dynamic]str) -> bool {
+    var k: i32 = 0
+    while k < p.nentradas {
+        if migrar_coletar((p.entradas or_else {})[k], arena, arquivos) {
+            k += 1
+            continue
+        }
+        let fmt_1: str = (p.entradas or_else {})[k]
+        let msg_1 = format(f"forja: migrar: nao achei '{fmt_1}'\n", alloc = heap)
+        defer delete(msg_1)
+        common.c2f_saida_formatar(common.c2f_saida_stderr(), msg_1)
+        return false
+    }
+    return true
+}
+
+// C: driver/cmd_migrar.c:182 (Executar): lista os arquivos, processa cada um e imprime o documento JSON so se tudo deu certo
+proc executar_3(p: ^Pedido4) -> i32 {
+    var arena: common.Arena = common.Arena{}
+    defer common.arena_liberar(&arena)
+    var arquivos: [dynamic]str = make([dynamic]str, alloc = heap)
+    defer delete(arquivos)
+    var json: [dynamic]u8 = make([dynamic]u8, alloc = heap)
+    defer delete(json)
+    var tot: Totais = Totais{linhas_iguais = true}
+    var codigo: i32 = SAIDA_OK_4
+    if not listar_arquivos_2(p, &arena, &arquivos) {
+        codigo = SAIDA_USO_4
+    }
+    var k: int = 0
+    while (codigo == SAIDA_OK_4) and (k < len(arquivos)) {
+        if not processar_arquivo(arquivos[k], p, &json, &tot) {
+            codigo = SAIDA_USO_4
+        }
+        k += 1
+    }
+    if codigo != SAIDA_OK_4 {
+        return codigo
+    }
+    var doc: [dynamic]u8 = make([dynamic]u8, alloc = heap)
+    defer delete(doc)
+    append(&doc, items = as_bytes("{\"arquivos\": [\n"))
+    append(&doc, items = json[..])
+    emitir_rodape(&doc, &tot, p.comentarios)
+    common.c2f_saida_escrever(common.c2f_saida_stdout(), doc[..])
+    if tot.nao_analisados > 0 {
+        return SAIDA_NAO_ANALISADO
+    }
+    return SAIDA_OK_4
+}
+
+// C: driver/cmd_migrar.c:208
+proc rodar_migrar(argc: i32, argv: []str) -> i32 {
+    // RenomeadoTolerarAntiga(true/false) do C: sem global na Forja, o modo vale enquanto o Diag tem d.trocas (so o migrar o liga; renomeado_recusa_em, C2F-70).
+    var entradas: [dynamic]str = make([dynamic]str, alloc = heap)
+    defer delete(entradas)
+    var pedido: Pedido4 = Pedido4{}
+    let erro: ?str = ler_argumentos_6(argc, argv, &pedido, &entradas)
+    if erro != none {
+        return uso_errado_7(erro)
+    }
+    return executar_3(&pedido)
+}
+
+test "cmd_migrar: ler_argumentos aceita flags, pula --json e guarda as entradas na ordem" {
+    var entradas: [dynamic]str = make([dynamic]str, alloc = heap)
+    defer delete(entradas)
+    var p: Pedido4 = Pedido4{}
+    var argv: [4]str = {"--json", "--aplicar", "a.fj", "pasta"}
+    expect((ler_argumentos_6(4, argv[..], &p, &entradas) or_else "") == "")
+    expect(p.aplicar)
+    expect(not p.dry_run)
+    expect(p.nentradas == 2)
+}
+
+test "cmd_migrar: ler_argumentos recusa opcao desconhecida, --dry-run com --aplicar e falta de entrada" {
+    var e1: [dynamic]str = make([dynamic]str, alloc = heap)
+    defer delete(e1)
+    var p1: Pedido4 = Pedido4{}
+    var a1: [1]str = {"-x"}
+    expect((ler_argumentos_6(1, a1[..], &p1, &e1) or_else "") == "opcao desconhecida (valem --dry-run, --aplicar, --comentarios e --json)")
+    var e2: [dynamic]str = make([dynamic]str, alloc = heap)
+    defer delete(e2)
+    var p2: Pedido4 = Pedido4{}
+    var a2: [2]str = {"--aplicar", "--dry-run"}
+    expect((ler_argumentos_6(2, a2[..], &p2, &e2) or_else "") == "--dry-run e --aplicar nao valem juntos")
+    var e3: [dynamic]str = make([dynamic]str, alloc = heap)
+    defer delete(e3)
+    var p3: Pedido4 = Pedido4{}
+    var a3: [1]str = {"--json"}
+    expect((ler_argumentos_6(1, a3[..], &p3, &e3) or_else "") == "falta o arquivo .fj ou a pasta")
+}

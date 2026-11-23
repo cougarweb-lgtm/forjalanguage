@@ -1,0 +1,62 @@
+// I6 CANARIO: igual ao app_ola.fj, mas imprime "forja: canario" em vez de "forja: subiu" (o CI tem de reprovar este app no item stdout).
+// I6: app iOS minimo em Forja puro. main imprime "forja: subiu", registra a classe ForjaDelegate pela API C do runtime ObjC
+// (UIResponder + application:didFinishLaunchingWithOptions: com IMP = proc Forja) e entrega o controle ao UIApplicationMain.
+// No didFinishLaunching cria UIWindow + UIViewController com a view laranja e torna a janela visivel.
+// Limite conhecido: sem rotulo de texto (exigiria CGRect por valor, HFA de 4 doubles, em objc_msgSend); o app mostra so a cor.
+// Ponteiro nulo = `uint` 0 (mesma ABI de 64 bits). Frameworks ligados por `link`; cada simbolo vai ao dylib pelo prefixo do nome.
+
+foreign {
+    link "c"
+    link "objc"
+    link "UIKit"
+    link "CoreFoundation"
+    proc fflush(arquivo: uint) -> i32
+    proc objc_getClass(nome: cstr) -> rawptr
+    proc sel_registerName(nome: cstr) -> rawptr
+    proc objc_allocateClassPair(super_classe: rawptr, nome: cstr, extra: uint) -> rawptr
+    proc objc_registerClassPair(classe: rawptr)
+    proc class_addMethod(classe: rawptr, seletor: rawptr, imp: proc(a: rawptr, b: rawptr, c: rawptr, d: rawptr) -> i32, tipos: cstr) -> i32
+    proc CFStringCreateWithCString(alocador: uint, texto: cstr, codificacao: u32) -> rawptr
+    proc UIApplicationMain(argc: i32, argv: uint, principal: uint, delegado: rawptr) -> i32
+    proc msg_um = "objc_msgSend"(alvo: rawptr, sel: rawptr, a: rawptr) -> rawptr
+}
+
+const UTF8_CF: u32 = 134217984 // kCFStringEncodingUTF8
+
+// objc_msgSend sem argumento: o 3o registrador (x2) leva o seletor e o metodo o ignora. Um alias so, porque o mesmo simbolo C exige a mesma aridade e ABI.
+proc msg_zero(alvo: rawptr, sel: rawptr) -> rawptr {
+    return msg_um(alvo, sel, sel)
+}
+
+// [[Classe alloc] init]
+proc novo_objeto(classe: rawptr) -> rawptr {
+    let cru = msg_zero(classe, sel_registerName("alloc"))
+    return msg_zero(cru, sel_registerName("init"))
+}
+
+// view do controlador com fundo laranja (UIColor orangeColor: objc_msgSend com f64 e outro alias do mesmo simbolo, E0202)
+proc pintar_view(controlador: rawptr) {
+    let cor = msg_zero(objc_getClass("UIColor"), sel_registerName("orangeColor"))
+    let visao = msg_zero(controlador, sel_registerName("view"))
+    _ = msg_um(visao, sel_registerName("setBackgroundColor:"), cor)
+}
+
+// IMP de application:didFinishLaunchingWithOptions: (self, _cmd, application, options) -> BOOL
+proc app_subiu(eu: rawptr, cmd: rawptr, aplicacao: rawptr, opcoes: rawptr) -> i32 {
+    let janela = novo_objeto(objc_getClass("UIWindow"))
+    let controlador = novo_objeto(objc_getClass("UIViewController"))
+    pintar_view(controlador)
+    _ = msg_um(janela, sel_registerName("setRootViewController:"), controlador)
+    _ = msg_zero(janela, sel_registerName("makeKeyAndVisible"))
+    return 1
+}
+
+proc main() {
+    print("forja: canario")
+    _ = fflush(0) // o app nao sai: sem isto o print fica no buffer quando o stdout e um arquivo
+    let classe = objc_allocateClassPair(objc_getClass("UIResponder"), "ForjaDelegate", 0)
+    _ = class_addMethod(classe, sel_registerName("application:didFinishLaunchingWithOptions:"), app_subiu, "B@:@@")
+    objc_registerClassPair(classe)
+    let nome = CFStringCreateWithCString(0, "ForjaDelegate", UTF8_CF)
+    _ = UIApplicationMain(0, 0, 0, nome)
+}

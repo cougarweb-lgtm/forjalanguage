@@ -1,0 +1,1544 @@
+// semantic/sem_clong.fj - porte de compiler/semantic/sem_clong.c
+// sha256 de semantic/sem_clong.c: efa8309b6517c0b18bc695d7fc2a8973ca12a9f2133801329d41e39280616a2a
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "common"
+import "frontend"
+
+struct CLLocal {
+    nome: i32
+    kind: u8
+}
+
+struct CLCtx {
+    s: ?^Semantica
+    locais: [dynamic]CLLocal
+    proc_c: ?^frontend.Decl
+}
+
+const K_NENHUM: i32 = 0
+const K_LONG: i32 = 1
+const K_ULONG: i32 = 2
+const K_PTR_LONG: i32 = 3
+const K_PTR_ULONG: i32 = 4
+const DEST_LIVRE: i32 = 0
+const DEST_CONV: i32 = 1
+const DEST_VALOR: i32 = 2
+const DEST_PTR: i32 = 3
+const DEST_PTR_OUTRO: i32 = 4
+const CAMPO_DISCORDA: i32 = 255
+const TRECHO_MAX: i32 = 96
+const FORMA_MAX: i32 = 384
+const CAUSA_TIPO: str = "c_long e c_ulong so valem na fronteira com o C (parametro e retorno de proc foreign, campo de struct, let/var e ^c_long): aqui o tamanho mudaria por alvo (32 bits no Windows, 64 no Linux)"
+
+// C: semantic/sem_clong.c:32
+proc eh_nome_c_long(s: ^Semantica, t: ?^frontend.TipoRef) -> bool {
+    if (((t as ^frontend.TipoRef).forma != (frontend.TR_NOME as u8)) or ((t as ^frontend.TipoRef).modulo != 0)) or ((t as ^frontend.TipoRef).nome < 0) {
+        return false
+    }
+    if ((t as ^frontend.TipoRef).nome != s.nome_clong) and ((t as ^frontend.TipoRef).nome != s.nome_culong) {
+        return false
+    }
+    return sem_achar_simbolo(s, (t as ^frontend.TipoRef).nome, 0).categoria == (SIM_NENHUM as u8)
+}
+
+// C: semantic/sem_clong.c:39
+proc kind_do_tipo(s: ^Semantica, t: ?^frontend.TipoRef) -> i32 {
+    let tr: ^frontend.TipoRef = t as ^frontend.TipoRef
+    if eh_nome_c_long(s, t) {
+        if tr.erro >= 0 {
+            return K_NENHUM
+        }
+        if tr.nome == s.nome_clong {
+            return K_LONG
+        }
+        return K_ULONG
+    }
+    if ((tr.forma == (frontend.TR_PONTEIRO as u8)) or (tr.forma == (frontend.TR_ANULAVEL as u8))) and (tr.alvo != none) {
+        let alvo: ?^frontend.TipoRef = &(tr.alvo or_else {})[0]
+        if eh_nome_c_long(s, alvo) {
+            if (alvo as ^frontend.TipoRef).nome == s.nome_clong {
+                return K_PTR_LONG
+            }
+            return K_PTR_ULONG
+        }
+    }
+    return K_NENHUM
+}
+
+// C: semantic/sem_clong.c:50
+// C2F-13: lista fundido em n (len)
+proc proibido_em_varios(s: ^Semantica, lista: ?[]frontend.TipoRef) -> ?^frontend.TipoRef {
+    for k in (0 as u32)..<(len((lista or_else {})) as u32) {
+        let r: ?^frontend.TipoRef = c_long_proibido(s, &(lista or_else {})[k], false)
+        if r != none {
+            return r
+        }
+    }
+    return none
+}
+
+// C: semantic/sem_clong.c:60
+proc c_long_proibido(s: ^Semantica, t: ?^frontend.TipoRef, topo_ok: bool) -> ?^frontend.TipoRef {
+    let tr: ^frontend.TipoRef = t as ^frontend.TipoRef
+    if tr.forma == (frontend.TR_NOME as u8) {
+        if eh_nome_c_long(s, t) and not (topo_ok and (tr.erro < 0)) {
+            return t
+        }
+        return none
+    }
+    if tr.alvo == none {
+        return none
+    }
+    let alvo: []frontend.TipoRef = tr.alvo or_else {}
+    if (tr.forma == (frontend.TR_PONTEIRO as u8)) or (tr.forma == (frontend.TR_ANULAVEL as u8)) {
+        if topo_ok and eh_nome_c_long(s, &alvo[0]) {
+            return none
+        }
+        return c_long_proibido(s, &alvo[0], false)
+    }
+    if tr.forma == (frontend.TR_PROC as u8) { // alvo[0] = retorno (se pos_tamanho == 1); alvo[1..nome] = parametros
+        var r: ?^frontend.TipoRef = none
+        if tr.pos_tamanho == 1 {
+            r = c_long_proibido(s, &alvo[0], false)
+        }
+        if r != none {
+            return r
+        }
+        return proibido_em_varios(s, alvo[1..<(1 + (tr.nome as int))])
+    }
+    if tr.forma == (frontend.TR_MAPA as u8) {
+        return proibido_em_varios(s, alvo[0..<2])
+    }
+    return c_long_proibido(s, &alvo[0], false)
+}
+
+// C: semantic/sem_clong.c:76
+proc nome_do_tipo_ref(s: ^Semantica, t: ?^frontend.TipoRef) -> ?str {
+    if (t != none) and ((t as ^frontend.TipoRef).forma == (frontend.TR_NOME as u8)) and ((t as ^frontend.TipoRef).nome >= 0) {
+        return sem_nome_texto(s, (t as ^frontend.TipoRef).nome)
+    }
+    return none
+}
+
+// C: semantic/sem_clong.c:83
+proc erro_c_long(s: ^Semantica, pos: u32, causa: str, forma: str) -> bool {
+    let msg_1 = format(f"{causa}", alloc = heap)
+    defer delete(msg_1)
+    _ = sem_erro(s, common.E0342, pos, msg_1)
+    if (common.c2f_b2i32((s.diag as ^common.Diag).tem) != 0) and (common.c2f_s2u_32((s.diag as ^common.Diag).codigo) == (common.E0342 as u32)) {
+        common.diag_forma(s.diag as ^common.Diag, none, forma)
+    }
+    return false
+}
+
+// C: semantic/sem_clong.c:90
+proc erro_tipo(s: ^Semantica, t: ?^frontend.TipoRef) -> bool {
+    return erro_c_long(s, (t as ^frontend.TipoRef).pos, CAUSA_TIPO, "use i32, int ou i64 dentro da Forja e converta so na ponta: x as c_long")
+}
+
+// C: semantic/sem_clong.c:96
+// G3: `t` virou []u8 (o texto da fonte); byte fora da fatia le 0, como o NUL do C.
+proc fim_do_grupo(t: []u8, i: u64) -> u64 {
+    var fundo: i32 = 0
+    var j: int = i as int
+    while (common.c2f_nul_em_b(t, j) != 0) and (common.c2f_nul_em_b(t, j) != 10) { // '\0' '\n'
+        let ch: u8 = t[j]
+        if (ch == 40) or (ch == 91) { // '(' '['
+            fundo += 1
+        } else if (ch == 41) or (ch == 93) { // ')' ']'
+            fundo -= 1
+            if fundo == 0 {
+                return (j + 1) as u64
+            }
+        }
+        j += 1
+    }
+    return j as u64
+}
+
+// C: semantic/sem_clong.c:106
+// G3: `t` virou []u8 (o texto da fonte).
+proc fim_do_primario(t: []u8, i: u64) -> u64 {
+    var j: int = i as int
+    while true {
+        let ch: u8 = common.c2f_nul_em_b(t, j)
+        if char_de_nome(ch) or (ch == 46) or (ch == 94) { // '.' '^'
+            j += 1
+        } else if (ch == 40) or (ch == 91) { // '(' '['
+            j = fim_do_grupo(t, j as u64) as int
+        } else {
+            break
+        }
+    }
+    var k: int = j
+    while common.c2f_nul_em_b(t, k) == 32 {
+        k += 1
+    }
+    // strncmp(t + k, "as ", 3) != 0
+    if (common.c2f_nul_em_b(t, k) != 97) or (common.c2f_nul_em_b(t, k + 1) != 115) or (common.c2f_nul_em_b(t, k + 2) != 32) {
+        return j as u64
+    }
+    k += 3
+    while common.c2f_nul_em_b(t, k) == 32 {
+        k += 1
+    }
+    while char_de_nome(common.c2f_nul_em_b(t, k)) or (common.c2f_nul_em_b(t, k) == 94) or (common.c2f_nul_em_b(t, k) == 63) { // '^' '?'
+        k += 1
+    }
+    return k as u64
+}
+
+// snprintf(buf, cap, "%.*s", n, t + pos): grava no maximo cap - 1 bytes e o NUL.
+proc copiar_trecho(buf: []u8, cap: u64, t: []u8, pos: int, n: int) {
+    if cap == 0 {
+        return
+    }
+    let k: int = min(n, (cap as int) - 1)
+    for i in 0..<k {
+        buf[i] = t[pos + i]
+    }
+    buf[k] = 0
+}
+
+// C: semantic/sem_clong.c:122
+proc trecho_da_expr(s: ^Semantica, pos: u32, buf: []u8, cap: u64) {
+    let t: []u8 = (s.fonte as ^common.Fonte).texto
+    let fim: u64 = fim_do_primario(t, pos as u64)
+    copiar_trecho(buf, cap, t, pos as int, (fim as int) - (pos as int))
+}
+
+// C: semantic/sem_clong.c:129
+proc trecho_da_linha(s: ^Semantica, pos: u32, buf: []u8, cap: u64) {
+    let t: []u8 = (s.fonte as ^common.Fonte).texto
+    var fim: int = pos as int
+    while (common.c2f_nul_em_b(t, fim) != 0) and (common.c2f_nul_em_b(t, fim) != 10) and (common.c2f_nul_em_b(t, fim) != 13) and not ((common.c2f_nul_em_b(t, fim) == 47) and (common.c2f_nul_em_b(t, fim + 1) == 47)) { // '\0' '\n' '\r' "//"
+        fim += 1
+    }
+    while (fim > (pos as int)) and (t[fim - 1] == 32) {
+        fim -= 1
+    }
+    copiar_trecho(buf, cap, t, pos as int, fim - (pos as int))
+}
+
+// O trecho de buf ate o NUL, como str de heap (o chamador faz delete).
+proc texto_do_trecho(buf: []u8) -> str {
+    return from_bytes(buf[0..<common.c2f_strlen_b(buf)], alloc = heap)
+}
+
+// C: semantic/sem_clong.c:140
+proc buscar_local(c: ^CLCtx, nome: i32) -> i32 {
+    var i: u64 = len(c.locais) as u64
+    while i > 0 {
+        let l: ^CLLocal = &c.locais[i - 1]
+        if l.nome == nome {
+            return l.kind as i32
+        }
+        i -= 1
+    }
+    return K_NENHUM
+}
+
+// C: semantic/sem_clong.c:149
+proc empurrar_local(c: ^CLCtx, nome: i32, k: i32) {
+    append(&c.locais, item = CLLocal{})
+    let l: ^CLLocal = &c.locais[len(c.locais) - 1]
+    l.nome = nome
+    l.kind = k as u8
+}
+
+// C: semantic/sem_clong.c:156
+proc proc_da_chamada(c: ^CLCtx, e: ?^frontend.Expr) -> ?^frontend.Decl {
+    if (e as ^frontend.Expr).nome < 0 {
+        return none
+    }
+    let y: ^Simbolo = sem_achar_simbolo(c.s as ^Semantica, (e as ^frontend.Expr).nome, (e as ^frontend.Expr).modulo)
+    var tern_1: ?^frontend.Decl = none
+    if y.categoria == (SIM_PROC as u8) {
+        tern_1 = y.decl
+    }
+    return tern_1
+}
+
+// C: semantic/sem_clong.c:163
+proc proc_externo(c: ^CLCtx, e: ?^frontend.Expr) -> ?^frontend.Decl {
+    if (e as ^frontend.Expr).nome < 0 {
+        return none
+    }
+    let y: ^Simbolo = sem_achar_simbolo(c.s as ^Semantica, (e as ^frontend.Expr).nome, (e as ^frontend.Expr).modulo)
+    var tern_1: ?^frontend.Decl = none
+    if (y.categoria == (SIM_PROC as u8)) and (common.c2f_b2i32((y.decl as ^frontend.Decl).externo) != 0) {
+        tern_1 = y.decl
+    }
+    return tern_1
+}
+
+// C: semantic/sem_clong.c:173
+proc eh_letra_de_vetor(s: ^Semantica, nome: i32) -> bool {
+    if nome < 0 {
+        return false
+    }
+    let t: str = sem_nome_texto(s, nome)
+    let c0: u8 = common.c2f_nul_em(t, 0)
+    if (c0 == 0) or (common.c2f_nul_em(t, 1) != 0) {
+        return false
+    }
+    // strchr("xyzwrgba", c0)
+    return (c0 == 120) or (c0 == 121) or (c0 == 122) or (c0 == 119) or (c0 == 114) or (c0 == 103) or (c0 == 98) or (c0 == 97)
+}
+
+// C: semantic/sem_clong.c:180
+proc kind_de_unario(c: ^CLCtx, e: ?^frontend.Expr) -> i32 {
+    let ex: ^frontend.Expr = e as ^frontend.Expr
+    if (ex.op != (frontend.OP_ENDERECO as u8)) and (ex.op != (frontend.OP_DEREF as u8)) {
+        return K_NENHUM
+    }
+    let k: i32 = kind_de_expr(c, ex.a)
+    if ex.op == (frontend.OP_ENDERECO as u8) {
+        if k == K_LONG {
+            return K_PTR_LONG
+        }
+        if k == K_ULONG {
+            return K_PTR_ULONG
+        }
+        return K_NENHUM
+    }
+    if k == K_PTR_LONG {
+        return K_LONG
+    }
+    if k == K_PTR_ULONG {
+        return K_ULONG
+    }
+    return K_NENHUM
+}
+
+// C: semantic/sem_clong.c:188
+proc kind_de_expr(c: ^CLCtx, e: ?^frontend.Expr) -> i32 {
+    let s: ^Semantica = c.s as ^Semantica
+    let ex: ^frontend.Expr = e as ^frontend.Expr
+    let sw_1 = ex.tipo_no as i32
+    if sw_1 == frontend.EX_CONVERSAO {
+        if ex.alvo != none {
+            return kind_do_tipo(s, ex.alvo)
+        }
+        return K_NENHUM
+    } else if sw_1 == frontend.EX_NOME {
+        if ex.modulo == 0 {
+            return buscar_local(c, ex.nome)
+        }
+        return K_NENHUM
+    } else if sw_1 == frontend.EX_CAMPO {
+        if eh_letra_de_vetor(s, ex.nome) { // v.x de vetor builtin e indistinguivel de um campo c_long 'x' antes de tipar
+            return K_NENHUM
+        }
+        var v: u8 = 0
+        if (ex.nome >= 0) and ((ex.nome as u32) < s.qtd_nomes) {
+            v = (s.clong_campos or_else {})[ex.nome]
+        }
+        if (v == 0) or (v == (CAMPO_DISCORDA as u8)) {
+            return K_NENHUM
+        }
+        return (v as i32) - 1
+    } else if sw_1 == frontend.EX_CHAMADA {
+        let d: ?^frontend.Decl = proc_externo(c, e)
+        if (d != none) and ((d as ^frontend.Decl).tem_retorno) {
+            return kind_do_tipo(s, &(d as ^frontend.Decl).retorno)
+        }
+        return K_NENHUM
+    } else if sw_1 == frontend.EX_UNARIO {
+        return kind_de_unario(c, e)
+    }
+    return K_NENHUM
+}
+
+// C: semantic/sem_clong.c:208
+proc eh_valor(k: i32) -> bool {
+    return (common.c2f_s2u_32(k) == (K_LONG as u32)) or (common.c2f_s2u_32(k) == (K_ULONG as u32))
+}
+
+// C: semantic/sem_clong.c:213
+proc destino_de(k: i32) -> i32 {
+    if eh_valor(k) {
+        return DEST_VALOR
+    }
+    if (k == K_PTR_LONG) or (k == K_PTR_ULONG) {
+        return DEST_PTR
+    }
+    return DEST_LIVRE
+}
+
+// C: semantic/sem_clong.c:219
+proc destino_do_tipo(s: ^Semantica, t: ^frontend.TipoRef) -> i32 {
+    let k: i32 = kind_do_tipo(s, t)
+    if common.c2f_s2u_32(k) != (K_NENHUM as u32) {
+        return destino_de(k)
+    }
+    var tern_1: i32 = DEST_LIVRE
+    if (t.forma == (frontend.TR_PONTEIRO as u8)) or (t.forma == (frontend.TR_ANULAVEL as u8)) {
+        tern_1 = DEST_PTR_OUTRO
+    }
+    return tern_1
+}
+
+// C: semantic/sem_clong.c:227
+proc eh_literal_inteiro(e: ?^frontend.Expr) -> bool {
+    if (e as ^frontend.Expr).tipo_no == (frontend.EX_INT as u8) {
+        return true
+    }
+    if (e as ^frontend.Expr).tipo_no == (frontend.EX_UNARIO as u8) {
+        return ((e as ^frontend.Expr).op == (frontend.OP_NEGAR as u8)) and (common.c2f_b2i32(eh_literal_inteiro((e as ^frontend.Expr).a)) != 0)
+    }
+    return (((e as ^frontend.Expr).tipo_no == (frontend.EX_BINARIO as u8)) and (common.c2f_b2i32(eh_literal_inteiro((e as ^frontend.Expr).a)) != 0)) and (common.c2f_b2i32(eh_literal_inteiro((e as ^frontend.Expr).b)) != 0)
+}
+
+// C: semantic/sem_clong.c:236
+proc erro_leitura(c: ^CLCtx, e: ?^frontend.Expr, k: i32, destino: ?str) -> bool {
+    var trecho: [96]u8 = {} // TRECHO_MAX
+    trecho_da_expr(c.s as ^Semantica, (e as ^frontend.Expr).pos, trecho[..], TRECHO_MAX as u64)
+    let texto_trecho = texto_do_trecho(trecho[..])
+    defer delete(texto_trecho)
+    var padrao: str = "int"
+    if k == K_ULONG {
+        padrao = "uint"
+    }
+    let alvo_texto: str = destino or_else padrao
+    let forma_inteira = format(f"{texto_trecho} as {alvo_texto}", alloc = heap)
+    defer delete(forma_inteira)
+    let forma = common.c2f_cortar(forma_inteira, (FORMA_MAX as int) - 1) // snprintf(forma, FORMA_MAX, ...)
+    defer delete(forma)
+    return erro_c_long(c.s as ^Semantica, (e as ^frontend.Expr).pos, "um c_long so passa por 'as', por argumento de parametro c_long ou por let/var declarado c_long: ler ou misturar com i32/int daria tamanho diferente por alvo", forma)
+}
+
+// C: semantic/sem_clong.c:245
+proc erro_destino_valor(c: ^CLCtx, e: ?^frontend.Expr, destino: ?str) -> bool {
+    var trecho: [96]u8 = {} // TRECHO_MAX
+    trecho_da_expr(c.s as ^Semantica, (e as ^frontend.Expr).pos, trecho[..], TRECHO_MAX as u64)
+    let texto_trecho = texto_do_trecho(trecho[..])
+    defer delete(texto_trecho)
+    let alvo_texto: str = destino or_else "c_long"
+    let forma_inteira = format(f"{texto_trecho} as {alvo_texto}", alloc = heap)
+    defer delete(forma_inteira)
+    let forma = common.c2f_cortar(forma_inteira, (FORMA_MAX as int) - 1) // snprintf(forma, FORMA_MAX, ...)
+    defer delete(forma)
+    return erro_c_long(c.s as ^Semantica, (e as ^frontend.Expr).pos, "um c_long so recebe literal inteiro, 'x as c_long' ou outro c_long", forma)
+}
+
+// C: semantic/sem_clong.c:253
+proc erro_destino_ptr(c: ^CLCtx, e: ?^frontend.Expr) -> bool {
+    return erro_c_long(c.s as ^Semantica, (e as ^frontend.Expr).pos, "um ^c_long so recebe '&x' de um c_long ou none", "passe &x de um local declarado c_long (ou none em ?^c_long)")
+}
+
+// C: semantic/sem_clong.c:258
+proc erro_endereco_outro(c: ^CLCtx, e: ?^frontend.Expr) -> bool {
+    var trecho: [96]u8 = {} // TRECHO_MAX
+    trecho_da_expr(c.s as ^Semantica, ((e as ^frontend.Expr).a as ^frontend.Expr).pos, trecho[..], TRECHO_MAX as u64)
+    let texto_trecho = texto_do_trecho(trecho[..])
+    defer delete(texto_trecho)
+    let forma_inteira = format(f"so um ^c_long recebe &{texto_trecho}: declare o destino ^c_long ou guarde o valor em i32/int e converta com 'as'", alloc = heap)
+    defer delete(forma_inteira)
+    let forma = common.c2f_cortar(forma_inteira, (FORMA_MAX as int) - 1) // snprintf(forma, FORMA_MAX, ...)
+    defer delete(forma)
+    return erro_c_long(c.s as ^Semantica, (e as ^frontend.Expr).pos, "'&x' de um c_long e um ^c_long: ^i32 (ou outro ^T) leria o tamanho errado em um dos alvos (4 bytes no Windows, 8 no Linux)", forma)
+}
+
+// C: semantic/sem_clong.c:266
+proc erro_conta(c: ^CLCtx, st: ?^frontend.Stmt, k: i32) -> bool {
+    let sm: ^frontend.Stmt = st as ^frontend.Stmt
+    var alvo: [96]u8 = {} // TRECHO_MAX
+    var direita: [96]u8 = {} // TRECHO_MAX
+    trecho_da_expr(c.s as ^Semantica, (sm.alvo as ^frontend.Expr).pos, alvo[..], TRECHO_MAX as u64)
+    trecho_da_linha(c.s as ^Semantica, (sm.expr as ^frontend.Expr).pos, direita[..], TRECHO_MAX as u64)
+    let texto_alvo = texto_do_trecho(alvo[..])
+    defer delete(texto_alvo)
+    let texto_direita = texto_do_trecho(direita[..])
+    defer delete(texto_direita)
+    var com_espaco: bool = false // strchr(direita, ' ') != NULL
+    for i in 0..<len(texto_direita) {
+        if texto_direita[i] == 32 {
+            com_espaco = true
+        }
+    }
+    var tipo_conta: str = "uint"
+    var tipo_c: str = "c_ulong"
+    if k == K_LONG {
+        tipo_conta = "int"
+        tipo_c = "c_long"
+    }
+    var operador: str = "-"
+    if sm.op == (frontend.ATRIB_SOMA as u8) {
+        operador = "+"
+    }
+    var abre: str = ""
+    var fecha: str = ""
+    if com_espaco {
+        abre = "("
+        fecha = ")"
+    }
+    let forma_inteira = format(f"{texto_alvo} = ({texto_alvo} as {tipo_conta} {operador} {abre}{texto_direita}{fecha}) as {tipo_c}", alloc = heap)
+    defer delete(forma_inteira)
+    let forma = common.c2f_cortar(forma_inteira, (FORMA_MAX as int) - 1) // snprintf(forma, FORMA_MAX, ...)
+    defer delete(forma)
+    return erro_c_long(c.s as ^Semantica, (sm.alvo as ^frontend.Expr).pos, "um c_long nao faz conta: '+=' e '-=' somariam i32 no Windows e int no Linux", forma)
+}
+
+// C: semantic/sem_clong.c:281
+proc visitar_args(c: ^CLCtx, e: ?^frontend.Expr) -> bool {
+    var i: u32 = 0
+    while i < (e as ^frontend.Expr).nargs {
+        if not visitar(c, ((e as ^frontend.Expr).args or_else {})[i].valor, DEST_LIVRE, none) {
+            return false
+        }
+        i += 1
+    }
+    return true
+}
+
+// C: semantic/sem_clong.c:289
+proc tipo_livre(c: ^CLCtx, t: ?^frontend.TipoRef) -> bool {
+    let p: ?^frontend.TipoRef = c_long_proibido(c.s as ^Semantica, t, true)
+    return (p == none) or (common.c2f_b2i32(erro_tipo(c.s as ^Semantica, p)) != 0)
+}
+
+// C: semantic/sem_clong.c:295
+proc param_do_arg(d: ?^frontend.Decl, a: ^frontend.Arg, i: u32) -> ?^frontend.Param {
+    if a.nome < 0 {
+        var tern_1: ?^frontend.Param = none
+        if i < (d as ^frontend.Decl).nparams {
+            tern_1 = &((d as ^frontend.Decl).params or_else {})[i]
+        }
+        return tern_1
+    }
+    for k in (0 as u32)..<(d as ^frontend.Decl).nparams {
+        if ((d as ^frontend.Decl).params or_else {})[k].nome == a.nome {
+            return &((d as ^frontend.Decl).params or_else {})[k]
+        }
+    }
+    return none
+}
+
+// C: semantic/sem_clong.c:305
+proc filhos_chamada(c: ^CLCtx, e: ?^frontend.Expr) -> bool {
+    var d: ?^frontend.Decl = none
+    if (e as ^frontend.Expr).tipo_no == (frontend.EX_CHAMADA as u8) {
+        d = proc_da_chamada(c, e)
+    }
+    for i in (0 as u32)..<(e as ^frontend.Expr).nargs {
+        var p: ?^frontend.Param = none
+        var dest: i32 = DEST_LIVRE
+        var destino: ?str = none
+        if d != none {
+            p = param_do_arg(d, &((e as ^frontend.Expr).args or_else {})[i], i)
+        }
+        if p != none {
+            dest = destino_do_tipo(c.s as ^Semantica, &(p as ^frontend.Param).tipo)
+            destino = nome_do_tipo_ref(c.s as ^Semantica, &(p as ^frontend.Param).tipo)
+        }
+        if not visitar(c, ((e as ^frontend.Expr).args or_else {})[i].valor, dest, destino) {
+            return false
+        }
+    }
+    return true
+}
+
+// C: semantic/sem_clong.c:315
+proc campo_do_arg(d: ?^frontend.Decl, a: ^frontend.Arg, i: u32) -> ?^frontend.Campo {
+    if a.nome < 0 {
+        var tern_1: ?^frontend.Campo = none
+        if i < (d as ^frontend.Decl).ncampos {
+            tern_1 = &((d as ^frontend.Decl).campos or_else {})[i]
+        }
+        return tern_1
+    }
+    for k in (0 as u32)..<(d as ^frontend.Decl).ncampos {
+        if ((d as ^frontend.Decl).campos or_else {})[k].nome == a.nome {
+            return &((d as ^frontend.Decl).campos or_else {})[k]
+        }
+    }
+    return none
+}
+
+// C: semantic/sem_clong.c:324
+proc filhos_literal_struct(c: ^CLCtx, e: ?^frontend.Expr) -> bool {
+    var y: ?^Simbolo = none
+    if (e as ^frontend.Expr).nome >= 0 {
+        y = sem_achar_simbolo(c.s as ^Semantica, (e as ^frontend.Expr).nome, (e as ^frontend.Expr).modulo)
+    }
+    var d: ?^frontend.Decl = none
+    if (y != none) and ((y as ^Simbolo).categoria == (SIM_STRUCT as u8)) {
+        d = (y as ^Simbolo).decl
+    }
+    for i in (0 as u32)..<(e as ^frontend.Expr).nargs {
+        var f: ?^frontend.Campo = none
+        var dest: i32 = DEST_LIVRE
+        var destino: ?str = none
+        if d != none {
+            f = campo_do_arg(d, &((e as ^frontend.Expr).args or_else {})[i], i)
+        }
+        if f != none {
+            dest = destino_do_tipo(c.s as ^Semantica, &(f as ^frontend.Campo).tipo)
+            destino = nome_do_tipo_ref(c.s as ^Semantica, &(f as ^frontend.Campo).tipo)
+        }
+        if not visitar(c, ((e as ^frontend.Expr).args or_else {})[i].valor, dest, destino) {
+            return false
+        }
+    }
+    return true
+}
+
+// C: semantic/sem_clong.c:336
+proc eh_chamada_de_layout(e: ?^frontend.Expr) -> bool {
+    return (((e as ^frontend.Expr).tipo_no == (frontend.EX_CHAMADA as u8)) and ((e as ^frontend.Expr).modulo == 0)) and ((((e as ^frontend.Expr).nome == frontend.SYM_SIZE_OF) or ((e as ^frontend.Expr).nome == frontend.SYM_ALIGN_OF)) or ((e as ^frontend.Expr).nome == frontend.SYM_OFFSET_OF))
+}
+
+// C: semantic/sem_clong.c:341
+proc filhos(c: ^CLCtx, e: ?^frontend.Expr) -> bool {
+    let sw_1 = (e as ^frontend.Expr).tipo_no as i32
+    if sw_1 == frontend.EX_INT or sw_1 == frontend.EX_REAL or sw_1 == frontend.EX_BOOL or sw_1 == frontend.EX_TEXTO or sw_1 == frontend.EX_NOME or sw_1 == frontend.EX_NONE {
+        return true
+    } else if sw_1 == frontend.EX_CONVERSAO {
+        return (common.c2f_b2i32(tipo_livre(c, (e as ^frontend.Expr).alvo)) != 0) and (common.c2f_b2i32(visitar(c, (e as ^frontend.Expr).a, DEST_CONV, none)) != 0)
+    } else if sw_1 == frontend.EX_TIPO {
+        return tipo_livre(c, (e as ^frontend.Expr).alvo)
+    } else if sw_1 == frontend.EX_CHAMADA {
+        return (common.c2f_b2i32(eh_chamada_de_layout(e)) != 0) or (common.c2f_b2i32(filhos_chamada(c, e)) != 0)
+    } else if sw_1 == frontend.EX_LITERAL_STRUCT {
+        return filhos_literal_struct(c, e)
+    } else if sw_1 == frontend.EX_UNARIO {
+        var tern_1: i32 = DEST_LIVRE
+        if ((e as ^frontend.Expr).op == (frontend.OP_ENDERECO as u8)) or ((e as ^frontend.Expr).op == (frontend.OP_DEREF as u8)) {
+            tern_1 = DEST_CONV
+        }
+        return visitar(c, (e as ^frontend.Expr).a, tern_1, none)
+    } else if sw_1 == frontend.EX_LITERAL_ARRAY or sw_1 == frontend.EX_TUPLA or sw_1 == frontend.EX_FTEXTO {
+        return visitar_args(c, e)
+    } else if sw_1 == frontend.EX_FATIA or sw_1 == frontend.EX_INDICE {
+        return ((common.c2f_b2i32(visitar(c, (e as ^frontend.Expr).a, DEST_LIVRE, none)) != 0) and (common.c2f_b2i32(visitar(c, (e as ^frontend.Expr).b, DEST_LIVRE, none)) != 0)) and (common.c2f_b2i32(visitar_args(c, e)) != 0)
+    } else if sw_1 == frontend.EX_CHAMADA_IND {
+        return (common.c2f_b2i32(visitar(c, (e as ^frontend.Expr).a, DEST_LIVRE, none)) != 0) and (common.c2f_b2i32(filhos_chamada(c, e)) != 0)
+    } else {
+        return (common.c2f_b2i32(visitar(c, (e as ^frontend.Expr).a, DEST_LIVRE, none)) != 0) and (common.c2f_b2i32(visitar(c, (e as ^frontend.Expr).b, DEST_LIVRE, none)) != 0)
+    }
+    return false
+}
+
+// C: semantic/sem_clong.c:357
+proc visitar(c: ^CLCtx, e: ?^frontend.Expr, dest: i32, destino: ?str) -> bool {
+    if e == none {
+        return true
+    }
+    let k: i32 = kind_de_expr(c, e)
+    if (common.c2f_s2u_32(dest) == (DEST_LIVRE as u32)) and (common.c2f_b2i32(eh_valor(k)) != 0) {
+        return erro_leitura(c, e, k, destino)
+    }
+    if ((common.c2f_s2u_32(dest) == (DEST_VALOR as u32)) and (not eh_valor(k))) and (not eh_literal_inteiro(e)) {
+        return erro_destino_valor(c, e, destino)
+    }
+    if (((common.c2f_s2u_32(dest) == (DEST_PTR_OUTRO as u32)) and ((e as ^frontend.Expr).tipo_no == (frontend.EX_UNARIO as u8))) and ((e as ^frontend.Expr).op == (frontend.OP_ENDERECO as u8))) and ((common.c2f_s2u_32(k) == (K_PTR_LONG as u32)) or (common.c2f_s2u_32(k) == (K_PTR_ULONG as u32))) {
+        return erro_endereco_outro(c, e)
+    }
+    if (((common.c2f_s2u_32(dest) == (DEST_PTR as u32)) and (common.c2f_s2u_32(k) != (K_PTR_LONG as u32))) and (common.c2f_s2u_32(k) != (K_PTR_ULONG as u32))) and ((e as ^frontend.Expr).tipo_no != (frontend.EX_NONE as u8)) {
+        return erro_destino_ptr(c, e)
+    }
+    return filhos(c, e)
+}
+
+// C: semantic/sem_clong.c:373
+proc declaracao(c: ^CLCtx, st: ?^frontend.Stmt) -> bool {
+    var k: i32 = K_NENHUM
+    var dest: i32 = DEST_CONV
+    var destino: ?str = none
+    if (st as ^frontend.Stmt).tem_tipo {
+        let p: ?^frontend.TipoRef = c_long_proibido(c.s as ^Semantica, &(st as ^frontend.Stmt).tipo, true)
+        if p != none {
+            return erro_tipo(c.s as ^Semantica, p)
+        }
+        k = kind_do_tipo(c.s as ^Semantica, &(st as ^frontend.Stmt).tipo)
+        dest = destino_do_tipo(c.s as ^Semantica, &(st as ^frontend.Stmt).tipo)
+        destino = nome_do_tipo_ref(c.s as ^Semantica, &(st as ^frontend.Stmt).tipo)
+    }
+    if not visitar(c, (st as ^frontend.Stmt).expr, dest, destino) {
+        return false
+    }
+    if (not (st as ^frontend.Stmt).tem_tipo) and ((st as ^frontend.Stmt).expr != none) {
+        k = kind_de_expr(c, (st as ^frontend.Stmt).expr)
+    }
+    empurrar_local(c, (st as ^frontend.Stmt).nome, k)
+    return true
+}
+
+// C: semantic/sem_clong.c:391
+proc atribuicao(c: ^CLCtx, st: ?^frontend.Stmt) -> bool {
+    let alvo: ?^frontend.Expr = (st as ^frontend.Stmt).alvo
+    let k: i32 = kind_de_expr(c, alvo)
+    let descarte: bool = ((alvo as ^frontend.Expr).tipo_no == (frontend.EX_NOME as u8)) and ((alvo as ^frontend.Expr).modulo == 0) and ((alvo as ^frontend.Expr).nome == (c.s as ^Semantica).nome_descarte)
+    if not filhos(c, alvo) {
+        return false
+    }
+    if eh_valor(k) and ((st as ^frontend.Stmt).op != (frontend.ATRIB_SIMPLES as u8)) {
+        return erro_conta(c, st, k)
+    }
+    var dest: i32 = destino_de(k)
+    if descarte {
+        dest = DEST_CONV
+    }
+    var destino: ?str = none
+    if k == K_LONG {
+        destino = "c_long"
+    } else if k == K_ULONG {
+        destino = "c_ulong"
+    }
+    return visitar(c, (st as ^frontend.Stmt).expr, dest, destino)
+}
+
+// C: semantic/sem_clong.c:401
+proc corpo_do_caso(c: ^CLCtx, st: ?^frontend.Stmt) -> bool {
+    for i in (0 as u32)..<(st as ^frontend.Stmt).ncasos {
+        let caso: ^frontend.Caso = &((st as ^frontend.Stmt).casos or_else {})[i]
+        if (caso.tipo_escrito != none) and (not tipo_livre(c, caso.tipo_escrito)) {
+            return false
+        }
+        let marca: int = len(c.locais)
+        empurrar_local(c, (st as ^frontend.Stmt).nome, K_NENHUM)
+        let ok: bool = corpo(c, caso.corpo)
+        truncate(&c.locais, marca)
+        if not ok {
+            return false
+        }
+    }
+    return true
+}
+
+// C: semantic/sem_clong.c:415
+proc corpo_do_for(c: ^CLCtx, st: ?^frontend.Stmt) -> bool {
+    if (not visitar(c, (st as ^frontend.Stmt).expr, DEST_LIVRE, none)) or (not visitar(c, (st as ^frontend.Stmt).expr2, DEST_LIVRE, none)) {
+        return false
+    }
+    let marca: int = len(c.locais)
+    empurrar_local(c, (st as ^frontend.Stmt).nome, K_NENHUM)
+    if (st as ^frontend.Stmt).nome_indice >= 0 {
+        empurrar_local(c, (st as ^frontend.Stmt).nome_indice, K_NENHUM)
+    }
+    let ok: bool = corpo(c, (st as ^frontend.Stmt).corpo)
+    truncate(&c.locais, marca)
+    return ok
+}
+
+// C: semantic/sem_clong.c:426
+proc comando(c: ^CLCtx, st: ?^frontend.Stmt) -> bool {
+    let sw_1 = (st as ^frontend.Stmt).tipo_no as i32
+    if sw_1 == frontend.ST_LET or sw_1 == frontend.ST_VAR {
+        return declaracao(c, st)
+    } else if sw_1 == frontend.ST_ATRIBUICAO {
+        return atribuicao(c, st)
+    } else if sw_1 == frontend.ST_IF or sw_1 == frontend.ST_WHILE {
+        return ((common.c2f_b2i32(visitar(c, (st as ^frontend.Stmt).expr, DEST_LIVRE, none)) != 0) and (common.c2f_b2i32(corpo(c, (st as ^frontend.Stmt).corpo)) != 0)) and (common.c2f_b2i32(corpo(c, (st as ^frontend.Stmt).senao)) != 0)
+    } else if sw_1 == frontend.ST_FOR {
+        return corpo_do_for(c, st)
+    } else if sw_1 == frontend.ST_RETURN {
+        var tern_1: u32 = DEST_LIVRE as u32
+        if (common.c2f_b2i32((c.proc_c as ^frontend.Decl).tem_retorno) != 0) and ((c.proc_c as ^frontend.Decl).retorno.forma != (frontend.TR_TUPLA as u8)) {
+            tern_1 = common.c2f_s2u_32(destino_do_tipo(c.s as ^Semantica, &(c.proc_c as ^frontend.Decl).retorno))
+        }
+        return visitar(c, (st as ^frontend.Stmt).expr, transmute(tern_1, to = i32), none)
+    } else if sw_1 == frontend.ST_EXPECT {
+        return visitar(c, (st as ^frontend.Stmt).expr, DEST_LIVRE, none)
+    } else if sw_1 == frontend.ST_CHAMADA {
+        return visitar(c, (st as ^frontend.Stmt).expr, DEST_CONV, none)
+    } else if sw_1 == frontend.ST_DEFER {
+        return corpo(c, (st as ^frontend.Stmt).corpo)
+    } else if sw_1 == frontend.ST_SWITCH {
+        return (common.c2f_b2i32(visitar(c, (st as ^frontend.Stmt).expr, DEST_LIVRE, none)) != 0) and (common.c2f_b2i32(corpo_do_caso(c, st)) != 0)
+    } else if sw_1 == frontend.ST_LET_MULTIPLO {
+        if not visitar(c, (st as ^frontend.Stmt).expr, DEST_LIVRE, none) {
+            return false
+        }
+        for i in (0 as u32)..<(st as ^frontend.Stmt).ncasos {
+            empurrar_local(c, ((st as ^frontend.Stmt).nomes or_else {})[i].nome, K_NENHUM)
+        }
+        return true
+    } else {
+        return true
+    }
+    return false
+}
+
+// C: semantic/sem_clong.c:447
+proc corpo(c: ^CLCtx, st: ?^frontend.Stmt) -> bool {
+    let marca: int = len(c.locais)
+    var ok: bool = true
+    var atual: ?^frontend.Stmt = st
+    while (atual != none) and ok {
+        ok = comando(c, atual)
+        atual = (atual as ^frontend.Stmt).prox
+    }
+    truncate(&c.locais, marca)
+    return ok
+}
+
+// C: semantic/sem_clong.c:456
+proc sem_c_long_corpo(s: ^Semantica, d: ?^frontend.Decl) -> bool {
+    var c: CLCtx = CLCtx{s = s, proc_c = d}
+    c.locais = make([dynamic]CLLocal, alloc = heap)
+    for i in (0 as u32)..<(d as ^frontend.Decl).nparams {
+        empurrar_local(&c, ((d as ^frontend.Decl).params or_else {})[i].nome, kind_do_tipo(s, &((d as ^frontend.Decl).params or_else {})[i].tipo))
+    }
+    let ok: bool = corpo(&c, (d as ^frontend.Decl).corpo)
+    delete(c.locais)
+    return ok
+}
+
+// C: semantic/sem_clong.c:468
+proc proibido_no_proc(s: ^Semantica, d: ?^frontend.Decl) -> ?^frontend.TipoRef {
+    var i: u32 = 0
+    while i < (d as ^frontend.Decl).nparams {
+        let r: ?^frontend.TipoRef = c_long_proibido(s, &((d as ^frontend.Decl).params or_else {})[i].tipo, (d as ^frontend.Decl).externo)
+        if r != none {
+            return r
+        }
+        i += 1
+    }
+    if (common.c2f_b2i32((d as ^frontend.Decl).tem_retorno) != 0) and ((d as ^frontend.Decl).retorno.forma != (frontend.TR_TUPLA as u8)) {
+        return c_long_proibido(s, &(d as ^frontend.Decl).retorno, (d as ^frontend.Decl).externo)
+    }
+    var i_2: u32 = 0
+    while (common.c2f_b2i32((d as ^frontend.Decl).tem_retorno) != 0) and (i_2 < (d as ^frontend.Decl).nretornos) {
+        let r: ?^frontend.TipoRef = c_long_proibido(s, &((d as ^frontend.Decl).retornos or_else {})[i_2].tipo, false)
+        if r != none {
+            return r
+        }
+        i_2 += 1
+    }
+    return none
+}
+
+// C: semantic/sem_clong.c:482
+proc proibido_nos_campos(s: ^Semantica, d: ?^frontend.Decl, topo_ok: bool) -> ?^frontend.TipoRef {
+    var i: u32 = 0
+    while i < (d as ^frontend.Decl).ncampos {
+        let r: ?^frontend.TipoRef = c_long_proibido(s, &((d as ^frontend.Decl).campos or_else {})[i].tipo, topo_ok)
+        if r != none {
+            return r
+        }
+        i += 1
+    }
+    return none
+}
+
+// C: semantic/sem_clong.c:491
+proc proibido_na_decl(s: ^Semantica, d: ?^frontend.Decl) -> ?^frontend.TipoRef {
+    let sw_1 = (d as ^frontend.Decl).tipo_no as i32
+    if sw_1 == frontend.D_PROC {
+        return proibido_no_proc(s, d)
+    } else if sw_1 == frontend.D_STRUCT {
+        return proibido_nos_campos(s, d, true)
+    } else if sw_1 == frontend.D_UNIAO {
+        return proibido_nos_campos(s, d, false)
+    } else if sw_1 == frontend.D_CONST {
+        return c_long_proibido(s, &(d as ^frontend.Decl).tipo, false)
+    } else {
+        return none
+    }
+    return none
+}
+
+// C: semantic/sem_clong.c:503
+proc registrar_campos(s: ^Semantica) {
+    s.clong_campos = common.arena_fatia_u8(s.arena as ^common.Arena, s.qtd_nomes as int) // ja zerado (memset do C)
+    var d: ?^frontend.Decl = (s.programa as ^frontend.Programa).primeira
+    while d != none {
+        if (d as ^frontend.Decl).tipo_no == (frontend.D_STRUCT as u8) {
+            for i in (0 as u32)..<(d as ^frontend.Decl).ncampos {
+                let campo: ^frontend.Campo = &((d as ^frontend.Decl).campos or_else {})[i]
+                let novo: u8 = (kind_do_tipo(s, &campo.tipo) + 1) as u8
+                let atual: ^u8 = &(s.clong_campos or_else {})[campo.nome]
+                if (atual^ == 0) or (atual^ == novo) {
+                    atual^ = novo
+                } else {
+                    atual^ = CAMPO_DISCORDA as u8
+                }
+            }
+        }
+        d = (d as ^frontend.Decl).prox
+    }
+}
+
+// C: semantic/sem_clong.c:517
+proc sem_c_long_decls(s: ^Semantica) -> bool {
+    s.nome_clong = common.interner_achar(nomes_da_sem(s), "c_long", 6)
+    s.nome_culong = common.interner_achar(nomes_da_sem(s), "c_ulong", 7)
+    s.usa_clong = (s.nome_clong >= 0) or (s.nome_culong >= 0)
+    if not s.usa_clong {
+        return true
+    }
+    registrar_campos(s)
+    var ok: bool = true
+    var d: ?^frontend.Decl = (s.programa as ^frontend.Programa).primeira
+    while (d != none) and (not s.lista.cortado) {
+        let proibido: ?^frontend.TipoRef = proibido_na_decl(s, d)
+        let dd: ^frontend.Decl = d as ^frontend.Decl
+        if proibido != none {
+            ok = false
+            dd.com_erro = true
+            sem_entrar_na_decl(s, d)
+            _ = erro_tipo(s, proibido)
+            if not sem_guardar_erro(s, dd.modulo) {
+                break
+            }
+        }
+        d = dd.prox
+    }
+    return ok
+}
+
+// G3 S7: classificadores e texto puros (valores do C a mao): tabelas de kind/destino, literal inteiro, layout, fim do grupo e do primario, copia de trecho
+test "sem_clong: tabelas, literal inteiro, grupo, primario e trecho" {
+    expect(eh_valor(K_LONG) and eh_valor(K_ULONG) and not eh_valor(K_NENHUM) and not eh_valor(K_PTR_LONG) and not eh_valor(K_PTR_ULONG))
+    expect(destino_de(K_NENHUM) == DEST_LIVRE and destino_de(K_LONG) == DEST_VALOR and destino_de(K_ULONG) == DEST_VALOR)
+    expect(destino_de(K_PTR_LONG) == DEST_PTR and destino_de(K_PTR_ULONG) == DEST_PTR)
+    var li: frontend.Expr = frontend.Expr{tipo_no = frontend.EX_INT as u8}
+    var neg: frontend.Expr = frontend.Expr{tipo_no = frontend.EX_UNARIO as u8, op = frontend.OP_NEGAR as u8, a = &li}
+    var mul: frontend.Expr = frontend.Expr{tipo_no = frontend.EX_BINARIO as u8, a = &li, b = &neg}
+    var nm: frontend.Expr = frontend.Expr{tipo_no = frontend.EX_NOME as u8}
+    var neg_nm: frontend.Expr = frontend.Expr{tipo_no = frontend.EX_UNARIO as u8, op = frontend.OP_NEGAR as u8, a = &nm}
+    var endr: frontend.Expr = frontend.Expr{tipo_no = frontend.EX_UNARIO as u8, op = frontend.OP_ENDERECO as u8, a = &li}
+    var bin_nm: frontend.Expr = frontend.Expr{tipo_no = frontend.EX_BINARIO as u8, a = &li, b = &nm}
+    var real: frontend.Expr = frontend.Expr{tipo_no = frontend.EX_REAL as u8}
+    expect(eh_literal_inteiro(&li) and eh_literal_inteiro(&neg) and eh_literal_inteiro(&mul))
+    expect(not eh_literal_inteiro(&nm) and not eh_literal_inteiro(&neg_nm) and not eh_literal_inteiro(&endr) and not eh_literal_inteiro(&bin_nm) and not eh_literal_inteiro(&real))
+    var lay: frontend.Expr = frontend.Expr{tipo_no = frontend.EX_CHAMADA as u8, nome = frontend.SYM_SIZE_OF}
+    expect(eh_chamada_de_layout(&lay))
+    lay.nome = frontend.SYM_ALIGN_OF
+    expect(eh_chamada_de_layout(&lay))
+    lay.nome = frontend.SYM_OFFSET_OF
+    expect(eh_chamada_de_layout(&lay))
+    lay.nome = frontend.SYM_PRINT
+    expect(not eh_chamada_de_layout(&lay))
+    lay.nome = frontend.SYM_SIZE_OF
+    lay.modulo = 1
+    expect(not eh_chamada_de_layout(&lay))
+    lay.modulo = 0
+    lay.tipo_no = frontend.EX_NOME as u8
+    expect(not eh_chamada_de_layout(&lay))
+    expect(fim_do_grupo(as_bytes("(a(b)c) d"), 0) == 7)
+    expect(fim_do_grupo(as_bytes("(a\nb)"), 0) == 2)
+    expect(fim_do_grupo(as_bytes("(ab"), 0) == 3)
+    expect(fim_do_grupo(as_bytes("[x)"), 0) == 3)
+    expect(fim_do_grupo(as_bytes("))"), 0) == 2)
+    expect(fim_do_grupo(as_bytes("xx[1]"), 2) == 5)
+    expect(fim_do_primario(as_bytes("abc.def + 1"), 0) == 7)
+    expect(fim_do_primario(as_bytes("f(a, b)[2]^ x"), 0) == 11)
+    expect(fim_do_primario(as_bytes("n as int + 1"), 0) == 8)
+    expect(fim_do_primario(as_bytes("n as  ^?i32 x"), 0) == 11)
+    expect(fim_do_primario(as_bytes("x as"), 0) == 1)
+    expect(fim_do_primario(as_bytes("x"), 0) == 1)
+    expect(fim_do_primario(as_bytes(""), 0) == 0)
+    expect(fim_do_primario(as_bytes("(a"), 0) == 2)
+    expect(fim_do_primario(as_bytes("x.y^\n as int"), 0) == 4)
+    expect(fim_do_primario(as_bytes("a_1 as c_long;"), 0) == 13)
+    var buf: [4]u8 = {9, 9, 9, 9}
+    copiar_trecho(buf[..], 4, as_bytes("abcdef"), 0, 6)
+    expect(buf[0] == 97 and buf[1] == 98 and buf[2] == 99 and buf[3] == 0)
+    copiar_trecho(buf[..], 4, as_bytes("abcdef"), 2, 1)
+    let tc = texto_do_trecho(buf[..])
+    defer delete(tc)
+    expect(tc == "c")
+    var f1: common.Fonte = sem_allocator_teste_fonte("total as int + 1\nrest")
+    defer delete(f1.dono_texto)
+    var sv: Semantica = Semantica{}
+    sv.fonte = &f1
+    var grande: [96]u8 = {}
+    trecho_da_expr(&sv, 0, grande[..], 96)
+    let t0 = texto_do_trecho(grande[..])
+    defer delete(t0)
+    expect(t0 == "total as int")
+    trecho_da_expr(&sv, 6, grande[..], 96)
+    let t1 = texto_do_trecho(grande[..])
+    defer delete(t1)
+    expect(t1 == "as")
+    var pequeno: [5]u8 = {}
+    trecho_da_expr(&sv, 0, pequeno[..], 5)
+    let t2 = texto_do_trecho(pequeno[..])
+    defer delete(t2)
+    expect(t2 == "tota")
+    var f2: common.Fonte = sem_allocator_teste_fonte("n += a + b  // coment\nlinha2")
+    defer delete(f2.dono_texto)
+    sv.fonte = &f2
+    trecho_da_linha(&sv, 5, grande[..], 96)
+    let t3 = texto_do_trecho(grande[..])
+    defer delete(t3)
+    expect(t3 == "a + b")
+    var f3: common.Fonte = sem_allocator_teste_fonte("x = 1\r\ny")
+    defer delete(f3.dono_texto)
+    sv.fonte = &f3
+    trecho_da_linha(&sv, 4, grande[..], 96)
+    let t4 = texto_do_trecho(grande[..])
+    defer delete(t4)
+    expect(t4 == "1")
+    var f4: common.Fonte = sem_allocator_teste_fonte("a   ")
+    defer delete(f4.dono_texto)
+    sv.fonte = &f4
+    trecho_da_linha(&sv, 0, grande[..], 96)
+    let t5 = texto_do_trecho(grande[..])
+    defer delete(t5)
+    expect(t5 == "a")
+    var longo = make([dynamic]u8, alloc = heap)
+    defer delete(longo)
+    for _k in 0..<100 {
+        append(&longo, item = 97)
+    }
+    let texto_longo = from_bytes(longo[..], alloc = heap)
+    defer delete(texto_longo)
+    var f5: common.Fonte = sem_allocator_teste_fonte(texto_longo)
+    defer delete(f5.dono_texto)
+    sv.fonte = &f5
+    trecho_da_linha(&sv, 0, grande[..], 96)
+    expect(common.c2f_strlen_b(grande[..]) == 95)
+    trecho_da_expr(&sv, 0, grande[..], 96)
+    expect(common.c2f_strlen_b(grande[..]) == 95)
+}
+
+// G3 S7: kind/destino/proibido pelo tipo escrito, proibido por decl e kind de expressao (Semantica montada a mao: interner, globais, campos); pos identifica o tipo devolvido
+test "sem_clong: tipo escrito, proibido, campos e kind de expressao" {
+    var arenas = make([dynamic]common.Arena, alloc = heap) // E0706: a arena do interner sobrevive a chamada, entao nao pode ser local
+    defer delete(arenas)
+    append(&arenas, item = common.Arena{})
+    let arena: ^common.Arena = &arenas[0]
+    defer common.arena_liberar(arena)
+    var ins = make([dynamic]common.Interner, alloc = heap)
+    defer delete(ins)
+    append(&ins, item = common.Interner{})
+    common.interner_iniciar(&ins[0], arena)
+    defer common.interner_liberar(&ins[0])
+    let n_clong = common.internar(&ins[0], "c_long", 6)
+    let n_culong = common.internar(&ins[0], "c_ulong", 7)
+    let n_foo = common.internar(&ins[0], "foo", 3)
+    let n_x = common.internar(&ins[0], "x", 1)
+    let n_a = common.internar(&ins[0], "a", 1)
+    let n_w = common.internar(&ins[0], "w", 1)
+    let n_xy = common.internar(&ins[0], "xy", 2)
+    let n_q = common.internar(&ins[0], "q", 1)
+    let n_val = common.internar(&ins[0], "val", 3)
+    let n_alt = common.internar(&ins[0], "alt", 3)
+    let n_peso = common.internar(&ins[0], "peso", 4)
+    let n_f = common.internar(&ins[0], "f", 1)
+    var gl = make([dynamic]Simbolo, alloc = heap)
+    defer delete(gl)
+    for _k in 0..<32 {
+        append(&gl, item = Simbolo{})
+    }
+    var sv: Semantica = Semantica{}
+    sv.arena = arena
+    sv.nomes = ins[0..<1]
+    sv.globais = gl[0..<len(gl)]
+    sv.qtd_nomes = 32
+    sv.nome_clong = n_clong
+    sv.nome_culong = n_culong
+    expect(eh_letra_de_vetor(&sv, n_x) and eh_letra_de_vetor(&sv, n_a) and eh_letra_de_vetor(&sv, n_w))
+    expect(not eh_letra_de_vetor(&sv, n_xy) and not eh_letra_de_vetor(&sv, n_q) and not eh_letra_de_vetor(&sv, n_foo) and not eh_letra_de_vetor(&sv, -1))
+    let todas_as_letras: str = "xyzwrgba" // strchr("xyzwrgba", c0): cada uma das 8 vale
+    var todas_valem: bool = true
+    for k in 0..<len(todas_as_letras) {
+        if not eh_letra_de_vetor(&sv, common.internar(&ins[0], todas_as_letras[k..<(k + 1)], 1)) {
+            todas_valem = false
+        }
+    }
+    expect(todas_valem)
+    expect(not eh_letra_de_vetor(&sv, common.internar(&ins[0], "s", 1)) and not eh_letra_de_vetor(&sv, common.internar(&ins[0], "h", 1)) and not eh_letra_de_vetor(&sv, common.internar(&ins[0], "c", 1)))
+    let t_long: frontend.TipoRef = frontend.TipoRef{forma = frontend.TR_NOME as u8, nome = n_clong, erro = -1, pos = 11}
+    let t_ulong: frontend.TipoRef = frontend.TipoRef{forma = frontend.TR_NOME as u8, nome = n_culong, erro = -1, pos = 12}
+    var t_foo: frontend.TipoRef = frontend.TipoRef{forma = frontend.TR_NOME as u8, nome = n_foo, erro = -1, pos = 13}
+    var t_err: frontend.TipoRef = frontend.TipoRef{forma = frontend.TR_NOME as u8, nome = n_clong, erro = 0, pos = 14}
+    var t_mod: frontend.TipoRef = frontend.TipoRef{forma = frontend.TR_NOME as u8, nome = n_clong, erro = -1, modulo = 1, pos = 15}
+    var t_sem_nome: frontend.TipoRef = frontend.TipoRef{forma = frontend.TR_NOME as u8, nome = -1, erro = -1}
+    var par_l: [1]frontend.TipoRef = {t_long}
+    var par_u: [1]frontend.TipoRef = {t_ulong}
+    var par_f: [1]frontend.TipoRef = {t_foo}
+    var tl: frontend.TipoRef = t_long
+    var tu: frontend.TipoRef = t_ulong
+    var ptr_l: frontend.TipoRef = frontend.TipoRef{forma = frontend.TR_PONTEIRO as u8, alvo = par_l[..], pos = 21}
+    var ptr_u: frontend.TipoRef = frontend.TipoRef{forma = frontend.TR_PONTEIRO as u8, alvo = par_u[..], pos = 22}
+    var ptr_f: frontend.TipoRef = frontend.TipoRef{forma = frontend.TR_PONTEIRO as u8, alvo = par_f[..], pos = 23}
+    var anu_l: frontend.TipoRef = frontend.TipoRef{forma = frontend.TR_ANULAVEL as u8, alvo = par_l[..], pos = 24}
+    var anu_f: frontend.TipoRef = frontend.TipoRef{forma = frontend.TR_ANULAVEL as u8, alvo = par_f[..], pos = 25}
+    var fat_l: frontend.TipoRef = frontend.TipoRef{forma = frontend.TR_FATIA as u8, alvo = par_l[..], pos = 26}
+    expect(eh_nome_c_long(&sv, &tl) and eh_nome_c_long(&sv, &tu) and eh_nome_c_long(&sv, &t_err) and not eh_nome_c_long(&sv, &t_foo) and not eh_nome_c_long(&sv, &t_mod) and not eh_nome_c_long(&sv, &t_sem_nome) and not eh_nome_c_long(&sv, &ptr_l))
+    expect(kind_do_tipo(&sv, &tl) == K_LONG and kind_do_tipo(&sv, &tu) == K_ULONG)
+    expect(kind_do_tipo(&sv, &t_foo) == K_NENHUM and kind_do_tipo(&sv, &t_err) == K_NENHUM and kind_do_tipo(&sv, &t_mod) == K_NENHUM)
+    expect(kind_do_tipo(&sv, &ptr_l) == K_PTR_LONG and kind_do_tipo(&sv, &ptr_u) == K_PTR_ULONG and kind_do_tipo(&sv, &anu_l) == K_PTR_LONG)
+    expect(kind_do_tipo(&sv, &ptr_f) == K_NENHUM and kind_do_tipo(&sv, &anu_f) == K_NENHUM and kind_do_tipo(&sv, &fat_l) == K_NENHUM)
+    expect(destino_do_tipo(&sv, &tl) == DEST_VALOR and destino_do_tipo(&sv, &tu) == DEST_VALOR and destino_do_tipo(&sv, &ptr_l) == DEST_PTR and destino_do_tipo(&sv, &anu_l) == DEST_PTR)
+    expect(destino_do_tipo(&sv, &ptr_f) == DEST_PTR_OUTRO and destino_do_tipo(&sv, &anu_f) == DEST_PTR_OUTRO and destino_do_tipo(&sv, &t_foo) == DEST_LIVRE and destino_do_tipo(&sv, &fat_l) == DEST_LIVRE)
+    let g_clong: ^Simbolo = &gl[n_clong] // um simbolo com o nome c_long: deixa de ser o apelido
+    g_clong.categoria = SIM_STRUCT as u8
+    expect(not eh_nome_c_long(&sv, &tl) and kind_do_tipo(&sv, &tl) == K_NENHUM and kind_do_tipo(&sv, &ptr_l) == K_NENHUM)
+    g_clong.categoria = SIM_NENHUM as u8
+    let nome_foo: str = nome_do_tipo_ref(&sv, &t_foo) or_else "?"
+    let nome_long: str = nome_do_tipo_ref(&sv, &tl) or_else "?"
+    expect(nome_foo == "foo" and nome_long == "c_long")
+    expect(nome_do_tipo_ref(&sv, none) == none and nome_do_tipo_ref(&sv, &ptr_l) == none and nome_do_tipo_ref(&sv, &t_sem_nome) == none)
+    // c_long_proibido
+    expect(c_long_proibido(&sv, &tl, true) == none and c_long_proibido(&sv, &t_foo, false) == none and c_long_proibido(&sv, &ptr_f, false) == none)
+    expect((c_long_proibido(&sv, &tl, false) as ^frontend.TipoRef).pos == 11 and (c_long_proibido(&sv, &t_err, true) as ^frontend.TipoRef).pos == 14)
+    expect(c_long_proibido(&sv, &ptr_l, true) == none and c_long_proibido(&sv, &anu_l, true) == none)
+    expect((c_long_proibido(&sv, &ptr_l, false) as ^frontend.TipoRef).pos == 11 and (c_long_proibido(&sv, &anu_l, false) as ^frontend.TipoRef).pos == 11)
+    expect((c_long_proibido(&sv, &fat_l, true) as ^frontend.TipoRef).pos == 11 and (c_long_proibido(&sv, &fat_l, false) as ^frontend.TipoRef).pos == 11)
+    var par_m1: [2]frontend.TipoRef = {t_foo, t_ulong}
+    var par_m2: [2]frontend.TipoRef = {t_long, t_foo}
+    var par_m3: [2]frontend.TipoRef = {t_foo, t_foo}
+    var mapa1: frontend.TipoRef = frontend.TipoRef{forma = frontend.TR_MAPA as u8, alvo = par_m1[..]}
+    var mapa2: frontend.TipoRef = frontend.TipoRef{forma = frontend.TR_MAPA as u8, alvo = par_m2[..]}
+    var mapa3: frontend.TipoRef = frontend.TipoRef{forma = frontend.TR_MAPA as u8, alvo = par_m3[..]}
+    expect((c_long_proibido(&sv, &mapa1, true) as ^frontend.TipoRef).pos == 12 and (c_long_proibido(&sv, &mapa2, true) as ^frontend.TipoRef).pos == 11 and c_long_proibido(&sv, &mapa3, true) == none)
+    var par_p1: [5]frontend.TipoRef = {t_foo, t_foo, t_ulong, t_foo, t_foo} // retorno, 2 parametros, 2 nomes
+    var par_p2: [5]frontend.TipoRef = {t_long, t_foo, t_foo, t_foo, t_foo}
+    var par_p3: [1]frontend.TipoRef = {t_long}
+    var proc1: frontend.TipoRef = frontend.TipoRef{forma = frontend.TR_PROC as u8, alvo = par_p1[..], nome = 2, pos_tamanho = 1}
+    var proc2: frontend.TipoRef = frontend.TipoRef{forma = frontend.TR_PROC as u8, alvo = par_p2[..], nome = 2, pos_tamanho = 1}
+    var proc3: frontend.TipoRef = frontend.TipoRef{forma = frontend.TR_PROC as u8, alvo = par_p2[..], nome = 2, pos_tamanho = 0}
+    var proc4: frontend.TipoRef = frontend.TipoRef{forma = frontend.TR_PROC as u8, alvo = par_p3[..], nome = 0, pos_tamanho = 0}
+    expect((c_long_proibido(&sv, &proc1, true) as ^frontend.TipoRef).pos == 12 and (c_long_proibido(&sv, &proc2, true) as ^frontend.TipoRef).pos == 11)
+    expect(c_long_proibido(&sv, &proc3, true) == none and c_long_proibido(&sv, &proc4, true) == none)
+    // proibido por decl
+    var ps_l: [1]frontend.Param = {frontend.Param{tipo = t_long}}
+    var ps_f: [1]frontend.Param = {frontend.Param{tipo = fat_l}}
+    var rt_l: [1]frontend.Param = {frontend.Param{tipo = t_long}}
+    var dproc: frontend.Decl = frontend.Decl{tipo_no = frontend.D_PROC as u8, params = ps_l[..], nparams = 1}
+    expect((proibido_na_decl(&sv, &dproc) as ^frontend.TipoRef).pos == 11)
+    dproc.externo = true
+    expect(proibido_na_decl(&sv, &dproc) == none)
+    dproc.params = ps_f[..]
+    expect((proibido_na_decl(&sv, &dproc) as ^frontend.TipoRef).pos == 11)
+    dproc.params = ps_l[..]
+    dproc.nparams = 0
+    dproc.tem_retorno = true
+    dproc.retorno = t_ulong
+    expect(proibido_na_decl(&sv, &dproc) == none)
+    dproc.externo = false
+    expect((proibido_na_decl(&sv, &dproc) as ^frontend.TipoRef).pos == 12)
+    dproc.externo = true
+    dproc.retorno = frontend.TipoRef{forma = frontend.TR_TUPLA as u8}
+    dproc.retornos = rt_l[..]
+    dproc.nretornos = 1
+    expect((proibido_na_decl(&sv, &dproc) as ^frontend.TipoRef).pos == 11)
+    dproc.tem_retorno = false
+    expect(proibido_na_decl(&sv, &dproc) == none)
+    var cp: [1]frontend.Campo = {frontend.Campo{tipo = t_long}}
+    var dstruct: frontend.Decl = frontend.Decl{tipo_no = frontend.D_STRUCT as u8, campos = cp[..], ncampos = 1}
+    var duniao: frontend.Decl = frontend.Decl{tipo_no = frontend.D_UNIAO as u8, campos = cp[..], ncampos = 1}
+    var dconst: frontend.Decl = frontend.Decl{tipo_no = frontend.D_CONST as u8, tipo = t_long}
+    var denum: frontend.Decl = frontend.Decl{tipo_no = frontend.D_ENUM as u8, campos = cp[..], ncampos = 1}
+    expect(proibido_na_decl(&sv, &dstruct) == none and (proibido_na_decl(&sv, &duniao) as ^frontend.TipoRef).pos == 11)
+    expect((proibido_na_decl(&sv, &dconst) as ^frontend.TipoRef).pos == 11 and proibido_na_decl(&sv, &denum) == none)
+    // campos: val discorda entre 2 structs, peso e c_ulong, alt e foo, x e letra de vetor
+    var cs1: [3]frontend.Campo = {frontend.Campo{nome = n_val, tipo = t_long}, frontend.Campo{nome = n_alt, tipo = t_foo}, frontend.Campo{nome = n_peso, tipo = t_ulong}}
+    var cs2: [2]frontend.Campo = {frontend.Campo{nome = n_val, tipo = t_foo}, frontend.Campo{nome = n_x, tipo = t_long}}
+    var s2: frontend.Decl = frontend.Decl{tipo_no = frontend.D_STRUCT as u8, campos = cs2[..], ncampos = 2}
+    var s1: frontend.Decl = frontend.Decl{tipo_no = frontend.D_STRUCT as u8, campos = cs1[..], ncampos = 3, prox = &s2}
+    var no_struct: frontend.Decl = frontend.Decl{tipo_no = frontend.D_CONST as u8, tipo = t_long, prox = &s1}
+    var prog: frontend.Programa = frontend.Programa{primeira = &no_struct, ultima = &s2}
+    sv.programa = &prog
+    registrar_campos(&sv)
+    let cc: []u8 = sv.clong_campos or_else {}
+    expect(len(cc) == 32 and cc[n_val] == (CAMPO_DISCORDA as u8) and cc[n_alt] == 1 and cc[n_peso] == 3 and cc[n_x] == 2 and cc[n_q] == 0)
+    var c: CLCtx = CLCtx{s = &sv}
+    c.locais = make([dynamic]CLLocal, alloc = heap)
+    defer delete(c.locais)
+    var e_val: frontend.Expr = frontend.Expr{tipo_no = frontend.EX_CAMPO as u8, nome = n_val}
+    var e_alt: frontend.Expr = frontend.Expr{tipo_no = frontend.EX_CAMPO as u8, nome = n_alt}
+    var e_peso: frontend.Expr = frontend.Expr{tipo_no = frontend.EX_CAMPO as u8, nome = n_peso}
+    var e_x: frontend.Expr = frontend.Expr{tipo_no = frontend.EX_CAMPO as u8, nome = n_x}
+    var e_neg: frontend.Expr = frontend.Expr{tipo_no = frontend.EX_CAMPO as u8, nome = -1}
+    expect(kind_de_expr(&c, &e_val) == K_NENHUM and kind_de_expr(&c, &e_alt) == K_NENHUM and kind_de_expr(&c, &e_peso) == K_ULONG)
+    expect(kind_de_expr(&c, &e_x) == K_NENHUM and kind_de_expr(&c, &e_neg) == K_NENHUM)
+    cc[n_alt] = 2 // c_long de verdade: so agora o campo conta
+    expect(kind_de_expr(&c, &e_alt) == K_LONG)
+    // locais: o mais recente vence; truncar devolve o anterior
+    empurrar_local(&c, n_a, K_LONG)
+    empurrar_local(&c, n_q, K_ULONG)
+    empurrar_local(&c, n_a, K_PTR_LONG)
+    empurrar_local(&c, n_w, K_PTR_ULONG)
+    expect(buscar_local(&c, n_a) == K_PTR_LONG and buscar_local(&c, n_q) == K_ULONG and buscar_local(&c, n_foo) == K_NENHUM)
+    var e_a: frontend.Expr = frontend.Expr{tipo_no = frontend.EX_NOME as u8, nome = n_a}
+    var e_q: frontend.Expr = frontend.Expr{tipo_no = frontend.EX_NOME as u8, nome = n_q}
+    var e_w: frontend.Expr = frontend.Expr{tipo_no = frontend.EX_NOME as u8, nome = n_w}
+    var e_foo: frontend.Expr = frontend.Expr{tipo_no = frontend.EX_NOME as u8, nome = n_foo}
+    var e_a_mod: frontend.Expr = frontend.Expr{tipo_no = frontend.EX_NOME as u8, nome = n_a, modulo = 1}
+    expect(kind_de_expr(&c, &e_a) == K_PTR_LONG and kind_de_expr(&c, &e_q) == K_ULONG and kind_de_expr(&c, &e_foo) == K_NENHUM and kind_de_expr(&c, &e_a_mod) == K_NENHUM and kind_de_expr(&c, &e_w) == K_PTR_ULONG)
+    truncate(&c.locais, 2)
+    expect(buscar_local(&c, n_a) == K_LONG and buscar_local(&c, n_w) == K_NENHUM)
+    // conversao, endereco e deref
+    var conv_l: frontend.Expr = frontend.Expr{tipo_no = frontend.EX_CONVERSAO as u8, alvo = &tl}
+    var conv_u: frontend.Expr = frontend.Expr{tipo_no = frontend.EX_CONVERSAO as u8, alvo = &tu}
+    var conv_f: frontend.Expr = frontend.Expr{tipo_no = frontend.EX_CONVERSAO as u8, alvo = &t_foo}
+    var conv_n: frontend.Expr = frontend.Expr{tipo_no = frontend.EX_CONVERSAO as u8}
+    expect(kind_de_expr(&c, &conv_l) == K_LONG and kind_de_expr(&c, &conv_u) == K_ULONG and kind_de_expr(&c, &conv_f) == K_NENHUM and kind_de_expr(&c, &conv_n) == K_NENHUM)
+    var end_a: frontend.Expr = frontend.Expr{tipo_no = frontend.EX_UNARIO as u8, op = frontend.OP_ENDERECO as u8, a = &e_a}
+    var end_q: frontend.Expr = frontend.Expr{tipo_no = frontend.EX_UNARIO as u8, op = frontend.OP_ENDERECO as u8, a = &e_q}
+    var end_foo: frontend.Expr = frontend.Expr{tipo_no = frontend.EX_UNARIO as u8, op = frontend.OP_ENDERECO as u8, a = &e_foo}
+    var neg_a: frontend.Expr = frontend.Expr{tipo_no = frontend.EX_UNARIO as u8, op = frontend.OP_NEGAR as u8, a = &e_a}
+    expect(kind_de_expr(&c, &end_a) == K_PTR_LONG and kind_de_expr(&c, &end_q) == K_PTR_ULONG and kind_de_expr(&c, &end_foo) == K_NENHUM and kind_de_expr(&c, &neg_a) == K_NENHUM)
+    var der_end_a: frontend.Expr = frontend.Expr{tipo_no = frontend.EX_UNARIO as u8, op = frontend.OP_DEREF as u8, a = &end_a}
+    var der_end_q: frontend.Expr = frontend.Expr{tipo_no = frontend.EX_UNARIO as u8, op = frontend.OP_DEREF as u8, a = &end_q}
+    var der_a: frontend.Expr = frontend.Expr{tipo_no = frontend.EX_UNARIO as u8, op = frontend.OP_DEREF as u8, a = &e_a}
+    expect(kind_de_expr(&c, &der_end_a) == K_LONG and kind_de_expr(&c, &der_end_q) == K_ULONG and kind_de_expr(&c, &der_a) == K_NENHUM)
+    // chamada de proc foreign com retorno c_long/c_ulong
+    var dfor: frontend.Decl = frontend.Decl{tipo_no = frontend.D_PROC as u8, externo = true, tem_retorno = true, retorno = t_ulong}
+    gl[n_f] = Simbolo{categoria = SIM_PROC as u8, decl = &dfor}
+    var ch_f: frontend.Expr = frontend.Expr{tipo_no = frontend.EX_CHAMADA as u8, nome = n_f}
+    var ch_foo: frontend.Expr = frontend.Expr{tipo_no = frontend.EX_CHAMADA as u8, nome = n_foo}
+    var ch_neg: frontend.Expr = frontend.Expr{tipo_no = frontend.EX_CHAMADA as u8, nome = -1}
+    expect(kind_de_expr(&c, &ch_f) == K_ULONG and kind_de_expr(&c, &ch_foo) == K_NENHUM and kind_de_expr(&c, &ch_neg) == K_NENHUM)
+    expect(proc_da_chamada(&c, &ch_f) != none and proc_externo(&c, &ch_f) != none and proc_da_chamada(&c, &ch_foo) == none and proc_externo(&c, &ch_neg) == none)
+    dfor.externo = false
+    expect(kind_de_expr(&c, &ch_f) == K_NENHUM and proc_da_chamada(&c, &ch_f) != none and proc_externo(&c, &ch_f) == none)
+    dfor.externo = true
+    dfor.tem_retorno = false
+    expect(kind_de_expr(&c, &ch_f) == K_NENHUM)
+    // parametro/campo do argumento: posicional pelo indice, nomeado pelo nome
+    var pr: [2]frontend.Param = {frontend.Param{nome = n_a}, frontend.Param{nome = n_x}}
+    var dp: frontend.Decl = frontend.Decl{params = pr[..], nparams = 2, campos = cs2[..], ncampos = 2}
+    var arg_pos: frontend.Arg = frontend.Arg{nome = -1}
+    var arg_x: frontend.Arg = frontend.Arg{nome = n_x}
+    var arg_q: frontend.Arg = frontend.Arg{nome = n_q}
+    expect((param_do_arg(&dp, &arg_pos, 1) as ^frontend.Param).nome == n_x and param_do_arg(&dp, &arg_pos, 2) == none)
+    expect((param_do_arg(&dp, &arg_x, 0) as ^frontend.Param).nome == n_x and param_do_arg(&dp, &arg_q, 0) == none)
+    expect((campo_do_arg(&dp, &arg_pos, 0) as ^frontend.Campo).nome == n_val and campo_do_arg(&dp, &arg_pos, 2) == none)
+    expect((campo_do_arg(&dp, &arg_x, 0) as ^frontend.Campo).nome == n_x and campo_do_arg(&dp, &arg_q, 0) == none)
+}
+
+// G3 S7: o ultimo diagnostico e E0342 na posicao, com a causa e a forma esperadas (textos do C copiados a mao)
+proc sem_clong_teste_diag(dg: ^common.Diag, off: u32, causa: str, forma: str) -> bool {
+    return dg.tem and (dg.codigo == common.E0342) and (dg.off == off) and ((dg.causa or_else "") == causa) and ((dg.forma or_else "") == forma)
+}
+
+// G3 S7: visitar, filhos, comandos e os 5 diagnosticos E0342 com Semantica montada a mao (texto de causa e forma conferidos byte a byte)
+test "sem_clong: visitar, comandos e diagnosticos E0342" {
+    let causa_leitura: str = "um c_long so passa por 'as', por argumento de parametro c_long ou por let/var declarado c_long: ler ou misturar com i32/int daria tamanho diferente por alvo"
+    let causa_valor: str = "um c_long so recebe literal inteiro, 'x as c_long' ou outro c_long"
+    let causa_ptr: str = "um ^c_long so recebe '&x' de um c_long ou none"
+    let forma_ptr: str = "passe &x de um local declarado c_long (ou none em ?^c_long)"
+    let causa_endereco: str = "'&x' de um c_long e um ^c_long: ^i32 (ou outro ^T) leria o tamanho errado em um dos alvos (4 bytes no Windows, 8 no Linux)"
+    let causa_conta: str = "um c_long nao faz conta: '+=' e '-=' somariam i32 no Windows e int no Linux"
+    let forma_tipo: str = "use i32, int ou i64 dentro da Forja e converta so na ponta: x as c_long"
+    var arenas = make([dynamic]common.Arena, alloc = heap) // E0706: a arena do interner sobrevive a chamada, entao nao pode ser local
+    defer delete(arenas)
+    append(&arenas, item = common.Arena{})
+    let arena: ^common.Arena = &arenas[0]
+    defer common.arena_liberar(arena)
+    var ins = make([dynamic]common.Interner, alloc = heap)
+    defer delete(ins)
+    append(&ins, item = common.Interner{})
+    common.interner_iniciar(&ins[0], arena)
+    defer common.interner_liberar(&ins[0])
+    let n_clong = common.internar(&ins[0], "c_long", 6)
+    let n_culong = common.internar(&ins[0], "c_ulong", 7)
+    let n_foo = common.internar(&ins[0], "foo", 3)
+    let n_q = common.internar(&ins[0], "q", 1)
+    let n_u = common.internar(&ins[0], "u", 1)
+    let n_n = common.internar(&ins[0], "n", 1)
+    let n_us = common.internar(&ins[0], "_", 1)
+    let n_g = common.internar(&ins[0], "G", 1)
+    let n_f = common.internar(&ins[0], "f", 1)
+    let n_val = common.internar(&ins[0], "val", 3)
+    let n_a = common.internar(&ins[0], "a", 1)
+    let n_b = common.internar(&ins[0], "b", 1)
+    var gl = make([dynamic]Simbolo, alloc = heap)
+    defer delete(gl)
+    for _k in 0..<128 { // os ids de SYM_* vao ate 63: o simbolo de size_of/offset_of precisa existir
+        append(&gl, item = Simbolo{})
+    }
+    var dg: common.Diag = common.Diag{}
+    var sv: Semantica = Semantica{}
+    sv.arena = arena
+    sv.nomes = ins[0..<1]
+    sv.globais = gl[0..<len(gl)]
+    sv.qtd_nomes = 32
+    sv.nome_clong = n_clong
+    sv.nome_culong = n_culong
+    sv.nome_descarte = n_us
+    sv.diag = &dg
+    var f1: common.Fonte = sem_allocator_teste_fonte("q")
+    defer delete(f1.dono_texto)
+    var f2: common.Fonte = sem_allocator_teste_fonte("q as int + 1")
+    defer delete(f2.dono_texto)
+    var f3: common.Fonte = sem_allocator_teste_fonte("n += a + b // c")
+    defer delete(f3.dono_texto)
+    var f4: common.Fonte = sem_allocator_teste_fonte("u -= 2 \nz")
+    defer delete(f4.dono_texto)
+    sv.fonte = &f1
+    var tl: frontend.TipoRef = frontend.TipoRef{forma = frontend.TR_NOME as u8, nome = n_clong, erro = -1, pos = 11}
+    let tu: frontend.TipoRef = frontend.TipoRef{forma = frontend.TR_NOME as u8, nome = n_culong, erro = -1, pos = 12}
+    let t_foo: frontend.TipoRef = frontend.TipoRef{forma = frontend.TR_NOME as u8, nome = n_foo, erro = -1, pos = 13}
+    var par_l: [1]frontend.TipoRef = {tl}
+    var par_f: [1]frontend.TipoRef = {t_foo}
+    let ptr_l: frontend.TipoRef = frontend.TipoRef{forma = frontend.TR_PONTEIRO as u8, alvo = par_l[..], pos = 21}
+    let ptr_f: frontend.TipoRef = frontend.TipoRef{forma = frontend.TR_PONTEIRO as u8, alvo = par_f[..], pos = 23}
+    var fat_l: frontend.TipoRef = frontend.TipoRef{forma = frontend.TR_FATIA as u8, alvo = par_l[..], pos = 26}
+    var c: CLCtx = CLCtx{s = &sv}
+    c.locais = make([dynamic]CLLocal, alloc = heap)
+    defer delete(c.locais)
+    empurrar_local(&c, n_q, K_LONG)
+    empurrar_local(&c, n_u, K_ULONG)
+    empurrar_local(&c, n_n, K_LONG)
+    var e_q: frontend.Expr = frontend.Expr{tipo_no = frontend.EX_NOME as u8, nome = n_q}
+    var e_u: frontend.Expr = frontend.Expr{tipo_no = frontend.EX_NOME as u8, nome = n_u}
+    var e_foo: frontend.Expr = frontend.Expr{tipo_no = frontend.EX_NOME as u8, nome = n_foo}
+    var e_lit: frontend.Expr = frontend.Expr{tipo_no = frontend.EX_INT as u8}
+    var e_none: frontend.Expr = frontend.Expr{tipo_no = frontend.EX_NONE as u8}
+    // erro_leitura: DEST_LIVRE com valor c_long (int / uint / destino dado / o trecho leva o 'as' do texto)
+    expect(not visitar(&c, &e_q, DEST_LIVRE, none) and sem_clong_teste_diag(&dg, 0, causa_leitura, "q as int"))
+    expect(not visitar(&c, &e_u, DEST_LIVRE, none) and sem_clong_teste_diag(&dg, 0, causa_leitura, "q as uint"))
+    expect(not visitar(&c, &e_q, DEST_LIVRE, "foo") and sem_clong_teste_diag(&dg, 0, causa_leitura, "q as foo"))
+    sv.fonte = &f2
+    expect(not visitar(&c, &e_q, DEST_LIVRE, none) and sem_clong_teste_diag(&dg, 0, causa_leitura, "q as int as int"))
+    sv.fonte = &f1
+    expect(visitar(&c, &e_foo, DEST_LIVRE, none) and visitar(&c, &e_q, DEST_CONV, none) and visitar(&c, &e_lit, DEST_LIVRE, none) and visitar(&c, &e_foo, DEST_CONV, none))
+    expect(visitar(&c, none, DEST_LIVRE, none))
+    // erro_destino_valor
+    expect(not visitar(&c, &e_foo, DEST_VALOR, none) and sem_clong_teste_diag(&dg, 0, causa_valor, "q as c_long"))
+    expect(not visitar(&c, &e_foo, DEST_VALOR, "foo") and sem_clong_teste_diag(&dg, 0, causa_valor, "q as foo"))
+    expect(visitar(&c, &e_lit, DEST_VALOR, none) and visitar(&c, &e_q, DEST_VALOR, none) and visitar(&c, &e_u, DEST_VALOR, none))
+    // erro_destino_ptr e erro_endereco_outro
+    expect(not visitar(&c, &e_foo, DEST_PTR, none) and sem_clong_teste_diag(&dg, 0, causa_ptr, forma_ptr))
+    var end_q: frontend.Expr = frontend.Expr{tipo_no = frontend.EX_UNARIO as u8, op = frontend.OP_ENDERECO as u8, a = &e_q}
+    expect(visitar(&c, &e_none, DEST_PTR, none) and visitar(&c, &end_q, DEST_PTR, none))
+    expect(not visitar(&c, &end_q, DEST_PTR_OUTRO, none) and sem_clong_teste_diag(&dg, 0, causa_endereco, "so um ^c_long recebe &q: declare o destino ^c_long ou guarde o valor em i32/int e converta com 'as'"))
+    expect(visitar(&c, &e_foo, DEST_PTR_OUTRO, none) and visitar(&c, &e_q, DEST_PTR_OUTRO, none))
+    // filhos: conversao, tipo, unario, binario, argumentos, indice
+    var conv_q: frontend.Expr = frontend.Expr{tipo_no = frontend.EX_CONVERSAO as u8, alvo = &tl, a = &e_q}
+    var conv_fat: frontend.Expr = frontend.Expr{tipo_no = frontend.EX_CONVERSAO as u8, alvo = &fat_l, a = &e_foo}
+    var ex_tipo: frontend.Expr = frontend.Expr{tipo_no = frontend.EX_TIPO as u8, alvo = &fat_l}
+    var ex_tipo_ok: frontend.Expr = frontend.Expr{tipo_no = frontend.EX_TIPO as u8, alvo = &tl}
+    expect(visitar(&c, &conv_q, DEST_CONV, none) and visitar(&c, &ex_tipo_ok, DEST_LIVRE, none))
+    expect(not visitar(&c, &conv_q, DEST_LIVRE, none) and sem_clong_teste_diag(&dg, 0, causa_leitura, "q as int"))
+    expect(not visitar(&c, &conv_fat, DEST_CONV, none) and sem_clong_teste_diag(&dg, 11, "c_long e c_ulong so valem na fronteira com o C (parametro e retorno de proc foreign, campo de struct, let/var e ^c_long): aqui o tamanho mudaria por alvo (32 bits no Windows, 64 no Linux)", forma_tipo))
+    expect(not visitar(&c, &ex_tipo, DEST_LIVRE, none) and sem_clong_teste_diag(&dg, 11, CAUSA_TIPO, forma_tipo))
+    var neg_q: frontend.Expr = frontend.Expr{tipo_no = frontend.EX_UNARIO as u8, op = frontend.OP_NEGAR as u8, a = &e_q}
+    var neg_foo: frontend.Expr = frontend.Expr{tipo_no = frontend.EX_UNARIO as u8, op = frontend.OP_NEGAR as u8, a = &e_foo}
+    var der_q: frontend.Expr = frontend.Expr{tipo_no = frontend.EX_UNARIO as u8, op = frontend.OP_DEREF as u8, a = &e_q}
+    expect(not visitar(&c, &neg_q, DEST_LIVRE, none) and visitar(&c, &neg_foo, DEST_LIVRE, none) and visitar(&c, &der_q, DEST_LIVRE, none))
+    var soma_q: frontend.Expr = frontend.Expr{tipo_no = frontend.EX_BINARIO as u8, a = &e_q, b = &e_lit}
+    var soma_ok: frontend.Expr = frontend.Expr{tipo_no = frontend.EX_BINARIO as u8, a = &e_foo, b = &e_lit}
+    var soma_b: frontend.Expr = frontend.Expr{tipo_no = frontend.EX_BINARIO as u8, a = &e_foo, b = &e_u}
+    expect(not visitar(&c, &soma_q, DEST_LIVRE, none) and visitar(&c, &soma_ok, DEST_LIVRE, none) and not visitar(&c, &soma_b, DEST_LIVRE, none))
+    var args_q: [1]frontend.Arg = {frontend.Arg{nome = -1, valor = &e_q}}
+    var args_foo: [1]frontend.Arg = {frontend.Arg{nome = -1, valor = &e_foo}}
+    var ftexto_q: frontend.Expr = frontend.Expr{tipo_no = frontend.EX_FTEXTO as u8, args = args_q[..], nargs = 1}
+    var ftexto_foo: frontend.Expr = frontend.Expr{tipo_no = frontend.EX_FTEXTO as u8, args = args_foo[..], nargs = 1}
+    var tupla_q: frontend.Expr = frontend.Expr{tipo_no = frontend.EX_TUPLA as u8, args = args_q[..], nargs = 1}
+    var indice_q: frontend.Expr = frontend.Expr{tipo_no = frontend.EX_INDICE as u8, a = &e_foo, b = &e_foo, args = args_q[..], nargs = 1}
+    var indice_ok: frontend.Expr = frontend.Expr{tipo_no = frontend.EX_INDICE as u8, a = &e_foo, b = &e_foo, args = args_foo[..], nargs = 1}
+    var fatia_a: frontend.Expr = frontend.Expr{tipo_no = frontend.EX_FATIA as u8, a = &e_q, b = &e_foo}
+    expect(not visitar(&c, &ftexto_q, DEST_LIVRE, none) and visitar(&c, &ftexto_foo, DEST_LIVRE, none) and not visitar(&c, &tupla_q, DEST_LIVRE, none))
+    expect(not visitar(&c, &indice_q, DEST_LIVRE, none) and visitar(&c, &indice_ok, DEST_LIVRE, none) and not visitar(&c, &fatia_a, DEST_LIVRE, none))
+    // chamada: parametro c_long de proc foreign vira DEST_VALOR com o nome do tipo; chamada indireta e proc da Forja ficam LIVRE
+    var ps_f: [1]frontend.Param = {frontend.Param{nome = n_a, tipo = tl}}
+    var dfor: frontend.Decl = frontend.Decl{tipo_no = frontend.D_PROC as u8, externo = true, params = ps_f[..], nparams = 1}
+    gl[n_f] = Simbolo{categoria = SIM_PROC as u8, decl = &dfor}
+    var ch_foo: frontend.Expr = frontend.Expr{tipo_no = frontend.EX_CHAMADA as u8, nome = n_f, args = args_foo[..], nargs = 1}
+    var ch_q: frontend.Expr = frontend.Expr{tipo_no = frontend.EX_CHAMADA as u8, nome = n_f, args = args_q[..], nargs = 1}
+    var args_lit: [1]frontend.Arg = {frontend.Arg{nome = n_a, valor = &e_lit}}
+    var ch_lit: frontend.Expr = frontend.Expr{tipo_no = frontend.EX_CHAMADA as u8, nome = n_f, args = args_lit[..], nargs = 1}
+    expect(not visitar(&c, &ch_foo, DEST_LIVRE, none) and sem_clong_teste_diag(&dg, 0, causa_valor, "q as c_long"))
+    expect(visitar(&c, &ch_q, DEST_CONV, none) and visitar(&c, &ch_lit, DEST_CONV, none))
+    var ind_foo: frontend.Expr = frontend.Expr{tipo_no = frontend.EX_CHAMADA_IND as u8, a = &e_foo, args = args_q[..], nargs = 1}
+    expect(not visitar(&c, &ind_foo, DEST_CONV, none) and sem_clong_teste_diag(&dg, 0, causa_leitura, "q as int"))
+    var ch_layout: frontend.Expr = frontend.Expr{tipo_no = frontend.EX_CHAMADA as u8, nome = frontend.SYM_OFFSET_OF, args = args_q[..], nargs = 1}
+    expect(visitar(&c, &ch_layout, DEST_CONV, none))
+    // literal de struct: o campo c_long da struct vira DEST_VALOR
+    var cs_g: [1]frontend.Campo = {frontend.Campo{nome = n_val, tipo = tl}}
+    var dg_struct: frontend.Decl = frontend.Decl{tipo_no = frontend.D_STRUCT as u8, campos = cs_g[..], ncampos = 1}
+    gl[n_g] = Simbolo{categoria = SIM_STRUCT as u8, decl = &dg_struct}
+    var args_val: [1]frontend.Arg = {frontend.Arg{nome = n_val, valor = &e_foo}}
+    var lit_struct: frontend.Expr = frontend.Expr{tipo_no = frontend.EX_LITERAL_STRUCT as u8, nome = n_g, args = args_val[..], nargs = 1}
+    var lit_sem_struct: frontend.Expr = frontend.Expr{tipo_no = frontend.EX_LITERAL_STRUCT as u8, nome = n_foo, args = args_q[..], nargs = 1}
+    expect(not visitar(&c, &lit_struct, DEST_CONV, none) and sem_clong_teste_diag(&dg, 0, causa_valor, "q as c_long"))
+    expect(not visitar(&c, &lit_sem_struct, DEST_CONV, none) and sem_clong_teste_diag(&dg, 0, causa_leitura, "q as int"))
+    // erro_conta: '+=' com direita de varias palavras leva parenteses; K_ULONG e '-=' usam uint e c_ulong
+    var alvo_n: frontend.Expr = frontend.Expr{tipo_no = frontend.EX_NOME as u8, nome = n_n, pos = 0}
+    var dir_ab: frontend.Expr = frontend.Expr{tipo_no = frontend.EX_NOME as u8, nome = n_foo, pos = 5}
+    var st_soma: frontend.Stmt = frontend.Stmt{tipo_no = frontend.ST_ATRIBUICAO as u8, op = frontend.ATRIB_SOMA as u8, alvo = &alvo_n, expr = &dir_ab}
+    sv.fonte = &f3
+    expect(not atribuicao(&c, &st_soma) and sem_clong_teste_diag(&dg, 0, causa_conta, "n = (n as int + (a + b)) as c_long"))
+    var alvo_u: frontend.Expr = frontend.Expr{tipo_no = frontend.EX_NOME as u8, nome = n_u, pos = 0}
+    var dir_2: frontend.Expr = frontend.Expr{tipo_no = frontend.EX_INT as u8, pos = 5}
+    var st_sub: frontend.Stmt = frontend.Stmt{tipo_no = frontend.ST_ATRIBUICAO as u8, op = (frontend.ATRIB_SOMA as u8) + 1, alvo = &alvo_u, expr = &dir_2}
+    sv.fonte = &f4
+    expect(not atribuicao(&c, &st_sub) and sem_clong_teste_diag(&dg, 0, causa_conta, "u = (u as uint - 2) as c_ulong"))
+    // atribuicao simples: destino pelo kind do alvo (c_long / c_ulong), descarte `_ = x` vale como conversao
+    sv.fonte = &f1
+    var st_simples: frontend.Stmt = frontend.Stmt{tipo_no = frontend.ST_ATRIBUICAO as u8, op = frontend.ATRIB_SIMPLES as u8, alvo = &alvo_n, expr = &e_foo}
+    expect(not atribuicao(&c, &st_simples) and sem_clong_teste_diag(&dg, 0, causa_valor, "q as c_long"))
+    st_simples.alvo = &alvo_u
+    expect(not atribuicao(&c, &st_simples) and sem_clong_teste_diag(&dg, 0, causa_valor, "q as c_ulong"))
+    st_simples.expr = &e_lit
+    expect(atribuicao(&c, &st_simples))
+    var alvo_descarte: frontend.Expr = frontend.Expr{tipo_no = frontend.EX_NOME as u8, nome = n_us}
+    st_simples.alvo = &alvo_descarte
+    st_simples.expr = &e_q
+    expect(atribuicao(&c, &st_simples))
+    st_simples.alvo = &e_foo
+    expect(not atribuicao(&c, &st_simples) and sem_clong_teste_diag(&dg, 0, causa_leitura, "q as int"))
+    // declaracao: com tipo o destino e o tipo; sem tipo o local herda o kind do valor
+    let base: int = len(c.locais)
+    var let_lit: frontend.Stmt = frontend.Stmt{tipo_no = frontend.ST_LET as u8, tem_tipo = true, tipo = tl, nome = n_a, expr = &e_lit}
+    expect(comando(&c, &let_lit) and len(c.locais) == base + 1 and buscar_local(&c, n_a) == K_LONG)
+    var let_q: frontend.Stmt = frontend.Stmt{tipo_no = frontend.ST_VAR as u8, nome = n_b, expr = &e_u}
+    expect(comando(&c, &let_q) and len(c.locais) == base + 2 and buscar_local(&c, n_b) == K_ULONG)
+    var let_foo: frontend.Stmt = frontend.Stmt{tipo_no = frontend.ST_LET as u8, tem_tipo = true, tipo = tl, nome = n_val, expr = &e_foo}
+    expect(not comando(&c, &let_foo) and sem_clong_teste_diag(&dg, 0, causa_valor, "q as c_long") and len(c.locais) == base + 2)
+    var let_leitura: frontend.Stmt = frontend.Stmt{tipo_no = frontend.ST_LET as u8, tem_tipo = true, tipo = t_foo, nome = n_val, expr = &e_q}
+    expect(not comando(&c, &let_leitura) and sem_clong_teste_diag(&dg, 0, causa_leitura, "q as foo"))
+    var let_fatia: frontend.Stmt = frontend.Stmt{tipo_no = frontend.ST_LET as u8, tem_tipo = true, tipo = fat_l, nome = n_val, expr = &e_foo}
+    expect(not comando(&c, &let_fatia) and sem_clong_teste_diag(&dg, 11, CAUSA_TIPO, forma_tipo))
+    var let_ptr: frontend.Stmt = frontend.Stmt{tipo_no = frontend.ST_LET as u8, tem_tipo = true, tipo = ptr_l, nome = n_val, expr = &end_q}
+    expect(comando(&c, &let_ptr) and buscar_local(&c, n_val) == K_PTR_LONG)
+    var let_ptr_outro: frontend.Stmt = frontend.Stmt{tipo_no = frontend.ST_LET as u8, tem_tipo = true, tipo = ptr_f, nome = n_val, expr = &end_q}
+    expect(not comando(&c, &let_ptr_outro) and sem_clong_teste_diag(&dg, 0, causa_endereco, "so um ^c_long recebe &q: declare o destino ^c_long ou guarde o valor em i32/int e converta com 'as'"))
+    var let_tu: frontend.Stmt = frontend.Stmt{tipo_no = frontend.ST_LET as u8, tem_tipo = true, tipo = tu, nome = n_val, expr = &e_u}
+    expect(comando(&c, &let_tu) and buscar_local(&c, n_val) == K_ULONG)
+    // comandos: if/while, return pelo retorno do proc, expect, chamada, defer, let multiplo, break
+    var st_if_foo: frontend.Stmt = frontend.Stmt{tipo_no = frontend.ST_IF as u8, expr = &e_foo}
+    var st_if_q: frontend.Stmt = frontend.Stmt{tipo_no = frontend.ST_WHILE as u8, expr = &e_q}
+    expect(comando(&c, &st_if_foo) and not comando(&c, &st_if_q) and sem_clong_teste_diag(&dg, 0, causa_leitura, "q as int"))
+    var dret: frontend.Decl = frontend.Decl{tipo_no = frontend.D_PROC as u8, tem_retorno = true, retorno = tl}
+    c.proc_c = &dret
+    var st_ret_foo: frontend.Stmt = frontend.Stmt{tipo_no = frontend.ST_RETURN as u8, expr = &e_foo}
+    var st_ret_lit: frontend.Stmt = frontend.Stmt{tipo_no = frontend.ST_RETURN as u8, expr = &e_lit}
+    var st_ret_q: frontend.Stmt = frontend.Stmt{tipo_no = frontend.ST_RETURN as u8, expr = &e_q}
+    expect(not comando(&c, &st_ret_foo) and sem_clong_teste_diag(&dg, 0, causa_valor, "q as c_long") and comando(&c, &st_ret_lit) and comando(&c, &st_ret_q))
+    dret.retorno = t_foo
+    expect(comando(&c, &st_ret_foo) and not comando(&c, &st_ret_q) and sem_clong_teste_diag(&dg, 0, causa_leitura, "q as int")) // o return nao passa destino
+    dret.retorno = frontend.TipoRef{forma = frontend.TR_TUPLA as u8}
+    expect(comando(&c, &st_ret_foo) and not comando(&c, &st_ret_q))
+    dret.tem_retorno = false
+    expect(comando(&c, &st_ret_foo) and not comando(&c, &st_ret_q))
+    var st_expect: frontend.Stmt = frontend.Stmt{tipo_no = frontend.ST_EXPECT as u8, expr = &e_q}
+    var st_chamada: frontend.Stmt = frontend.Stmt{tipo_no = frontend.ST_CHAMADA as u8, expr = &e_q}
+    expect(not comando(&c, &st_expect) and comando(&c, &st_chamada))
+    var st_defer: frontend.Stmt = frontend.Stmt{tipo_no = frontend.ST_DEFER as u8, corpo = &st_ret_q}
+    expect(not comando(&c, &st_defer))
+    var st_break: frontend.Stmt = frontend.Stmt{tipo_no = frontend.ST_BREAK as u8, expr = &e_q}
+    expect(comando(&c, &st_break))
+    var nomes_lm: [2]frontend.NomeLet = {frontend.NomeLet{nome = n_a}, frontend.NomeLet{nome = n_b}}
+    var st_lm: frontend.Stmt = frontend.Stmt{tipo_no = frontend.ST_LET_MULTIPLO as u8, expr = &e_foo, nomes = nomes_lm[..], ncasos = 2}
+    let antes_lm: int = len(c.locais)
+    expect(comando(&c, &st_lm) and len(c.locais) == antes_lm + 2 and buscar_local(&c, n_a) == K_NENHUM and buscar_local(&c, n_b) == K_NENHUM)
+    st_lm.expr = &e_q
+    expect(not comando(&c, &st_lm) and len(c.locais) == antes_lm + 2)
+    // corpo: cadeia de comandos, os locais do bloco saem no fim e o 1o erro corta a cadeia
+    let antes_corpo: int = len(c.locais)
+    var cor_b: frontend.Stmt = frontend.Stmt{tipo_no = frontend.ST_LET as u8, nome = n_val, expr = &e_q}
+    var cor_a: frontend.Stmt = frontend.Stmt{tipo_no = frontend.ST_LET as u8, tem_tipo = true, tipo = tl, nome = n_val, expr = &e_lit, prox = &cor_b}
+    expect(corpo(&c, &cor_a) and len(c.locais) == antes_corpo)
+    var cor_erro: frontend.Stmt = frontend.Stmt{tipo_no = frontend.ST_EXPECT as u8, expr = &e_q, prox = &cor_b}
+    var cor_ini: frontend.Stmt = frontend.Stmt{tipo_no = frontend.ST_LET as u8, tem_tipo = true, tipo = tl, nome = n_val, expr = &e_lit, prox = &cor_erro}
+    expect(not corpo(&c, &cor_ini) and len(c.locais) == antes_corpo)
+    expect(corpo(&c, none) and len(c.locais) == antes_corpo)
+    // for: laco e indice entram no escopo do corpo; expr/expr2 sao LIVRE
+    var st_for: frontend.Stmt = frontend.Stmt{tipo_no = frontend.ST_FOR as u8, nome = n_val, nome_indice = n_a, expr = &e_foo, expr2 = &e_foo, corpo = &cor_a}
+    expect(comando(&c, &st_for) and len(c.locais) == antes_corpo)
+    st_for.expr2 = &e_q
+    expect(not comando(&c, &st_for) and len(c.locais) == antes_corpo)
+    st_for.expr2 = &e_foo
+    st_for.corpo = &cor_erro
+    expect(not comando(&c, &st_for) and len(c.locais) == antes_corpo)
+    // switch: expr LIVRE, tipo escrito do caso vira erro de tipo, o nome do switch entra como K_NENHUM em cada caso
+    var casos: [2]frontend.Caso = {frontend.Caso{corpo = &cor_a}, frontend.Caso{corpo = &cor_a, tipo_escrito = &tl}}
+    var st_sw: frontend.Stmt = frontend.Stmt{tipo_no = frontend.ST_SWITCH as u8, nome = n_val, expr = &e_foo, casos = casos[..], ncasos = 2}
+    expect(comando(&c, &st_sw) and len(c.locais) == antes_corpo)
+    casos[1].tipo_escrito = &fat_l
+    expect(not comando(&c, &st_sw) and sem_clong_teste_diag(&dg, 11, CAUSA_TIPO, forma_tipo) and len(c.locais) == antes_corpo)
+    casos[1].tipo_escrito = &tl
+    casos[1].corpo = &cor_erro
+    expect(not comando(&c, &st_sw) and len(c.locais) == antes_corpo)
+    st_sw.expr = &e_q
+    expect(not comando(&c, &st_sw))
+}
+
+// G3 S7: pontas do verificador: sem_c_long_corpo (parametros entram como locais, lista liberada) e sem_c_long_decls (programa sem c_long, erros por decl, com_erro e corte da lista)
+test "sem_clong: sem_c_long_corpo e sem_c_long_decls" {
+    var arenas = make([dynamic]common.Arena, alloc = heap) // E0706: a arena do interner sobrevive a chamada, entao nao pode ser local
+    defer delete(arenas)
+    append(&arenas, item = common.Arena{})
+    let arena: ^common.Arena = &arenas[0]
+    defer common.arena_liberar(arena)
+    var ins = make([dynamic]common.Interner, alloc = heap)
+    defer delete(ins)
+    append(&ins, item = common.Interner{})
+    append(&ins, item = common.Interner{})
+    common.interner_iniciar(&ins[0], arena)
+    common.interner_iniciar(&ins[1], arena)
+    defer common.interner_liberar(&ins[0])
+    defer common.interner_liberar(&ins[1])
+    let n_foo = common.internar(&ins[0], "foo", 3)
+    let n_q = common.internar(&ins[0], "q", 1)
+    let n_p = common.internar(&ins[0], "p", 1)
+    let n_clong = common.internar(&ins[0], "c_long", 6)
+    let n_culong = common.internar(&ins[0], "c_ulong", 7)
+    let n_outro = common.internar(&ins[1], "foo", 3)
+    var gl = make([dynamic]Simbolo, alloc = heap)
+    defer delete(gl)
+    for _k in 0..<32 {
+        append(&gl, item = Simbolo{})
+    }
+    var dg: common.Diag = common.Diag{}
+    var f1: common.Fonte = sem_allocator_teste_fonte("q += 1")
+    defer delete(f1.dono_texto)
+    var sv: Semantica = Semantica{}
+    sv.arena = arena
+    sv.nomes = ins[1..<2] // programa sem c_long nem c_ulong
+    sv.globais = gl[0..<len(gl)]
+    sv.qtd_nomes = 32
+    sv.diag = &dg
+    sv.fonte = &f1
+    var prog: frontend.Programa = frontend.Programa{}
+    sv.programa = &prog
+    expect(n_outro == 0 and sem_c_long_decls(&sv) and sv.nome_clong < 0 and sv.nome_culong < 0 and not sv.usa_clong and sv.clong_campos == none)
+    sv.nomes = ins[0..<1] // agora com c_long e c_ulong
+    let tl: frontend.TipoRef = frontend.TipoRef{forma = frontend.TR_NOME as u8, nome = n_clong, erro = -1, pos = 11}
+    let tu: frontend.TipoRef = frontend.TipoRef{forma = frontend.TR_NOME as u8, nome = n_culong, erro = -1, pos = 12}
+    var par_l: [1]frontend.TipoRef = {tl}
+    let fat_l: frontend.TipoRef = frontend.TipoRef{forma = frontend.TR_FATIA as u8, alvo = par_l[..], pos = 26}
+    var c_ok: [1]frontend.Campo = {frontend.Campo{nome = n_foo, tipo = tl}}
+    var d_ok: frontend.Decl = frontend.Decl{tipo_no = frontend.D_STRUCT as u8, campos = c_ok[..], ncampos = 1}
+    var d_uniao: frontend.Decl = frontend.Decl{tipo_no = frontend.D_UNIAO as u8, campos = c_ok[..], ncampos = 1}
+    var d_const: frontend.Decl = frontend.Decl{tipo_no = frontend.D_CONST as u8, tipo = tu}
+    var ps: [1]frontend.Param = {frontend.Param{nome = n_p, tipo = fat_l}}
+    var d_proc: frontend.Decl = frontend.Decl{tipo_no = frontend.D_PROC as u8, params = ps[..], nparams = 1}
+    var d_corte: frontend.Decl = frontend.Decl{tipo_no = frontend.D_CONST as u8, tipo = tl}
+    var d_depois: frontend.Decl = frontend.Decl{tipo_no = frontend.D_CONST as u8, tipo = tl}
+    d_corte.prox = &d_depois
+    d_proc.prox = &d_corte
+    d_const.prox = &d_proc
+    d_uniao.prox = &d_const
+    d_ok.prox = &d_uniao
+    prog.primeira = &d_ok
+    sv.lista.teto = 3
+    expect(not sem_c_long_decls(&sv) and sv.usa_clong and sv.nome_clong == n_clong and sv.nome_culong == n_culong)
+    expect(not d_ok.com_erro and d_uniao.com_erro and d_const.com_erro and d_proc.com_erro and d_corte.com_erro and not d_depois.com_erro)
+    expect(sv.lista.n == 3 and sv.lista.cortado and len(sv.clong_campos or_else {}) == 32)
+    expect(sv.lista.itens[0].codigo == common.E0342 and sv.lista.itens[0].off == 11 and sv.lista.itens[1].off == 12 and sv.lista.itens[2].off == 11)
+    expect((sv.lista.itens[2].forma or_else "") == "use i32, int ou i64 dentro da Forja e converta so na ponta: x as c_long")
+    // programa limpo: so a struct com campo c_long, retorna true e registra o campo
+    d_ok.prox = none
+    d_ok.com_erro = false
+    sv.lista = common.DiagLista{}
+    expect(sem_c_long_decls(&sv) and sv.lista.n == 0 and (sv.clong_campos or_else {})[n_foo] == 2)
+    // sem_c_long_corpo: o parametro c_long entra como local e `q += 1` e erro de conta; a lista do contexto e liberada (R0009)
+    var ps_q: [2]frontend.Param = {frontend.Param{nome = n_q, tipo = tl}, frontend.Param{nome = n_p, tipo = tu}}
+    var alvo_q: frontend.Expr = frontend.Expr{tipo_no = frontend.EX_NOME as u8, nome = n_q, pos = 0}
+    var dir_1: frontend.Expr = frontend.Expr{tipo_no = frontend.EX_INT as u8, pos = 5}
+    var st_soma: frontend.Stmt = frontend.Stmt{tipo_no = frontend.ST_ATRIBUICAO as u8, op = frontend.ATRIB_SOMA as u8, alvo = &alvo_q, expr = &dir_1}
+    var d_corpo: frontend.Decl = frontend.Decl{tipo_no = frontend.D_PROC as u8, params = ps_q[..], nparams = 2, corpo = &st_soma}
+    expect(not sem_c_long_corpo(&sv, &d_corpo) and dg.tem and dg.codigo == common.E0342 and (dg.forma or_else "") == "q = (q as int + 1) as c_long")
+    var alvo_p: frontend.Expr = frontend.Expr{tipo_no = frontend.EX_NOME as u8, nome = n_p, pos = 0}
+    st_soma.alvo = &alvo_p
+    expect(not sem_c_long_corpo(&sv, &d_corpo) and (dg.forma or_else "") == "q = (q as uint + 1) as c_ulong")
+    var alvo_foo: frontend.Expr = frontend.Expr{tipo_no = frontend.EX_NOME as u8, nome = n_foo, pos = 0}
+    st_soma.alvo = &alvo_foo
+    expect(sem_c_long_corpo(&sv, &d_corpo))
+    d_corpo.corpo = none
+    expect(sem_c_long_corpo(&sv, &d_corpo))
+}

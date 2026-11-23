@@ -1,0 +1,918 @@
+// frontend/parser_stmt.fj - porte de compiler/frontend/parser_stmt.c
+// sha256 de frontend/parser_stmt.c: 1eeb19dd242b32d429a299550be94dd778d85083a97ccb449e0c416553815a37
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "common"
+
+const PROFUNDIDADE_MAX_PONTEIRO: i32 = 8
+const PARAMS_MAX_CALLBACK: i32 = 16
+// C2F-A0 + C2F-80: COMANDOS[TK_QTD] guarda a tag do despachante (0 = NULL), indexada pelo tipo do token (82 entradas). Preenchidos (indice = tag): 2 TK_IDENT = 8 (por_nome),
+// 7 KW_LET = 1, 8 KW_VAR = 1 (let_var), 20 KW_IF = 2, 22 KW_FOR = 4, 24 KW_WHILE = 3, 25 KW_SWITCH = 10, 28 KW_BREAK = 6, 29 KW_CONTINUE = 6 (sem_argumentos), 30 KW_RETURN = 5,
+// 31 KW_DEFER = 9, 32 KW_TRY = 7 (try_comando); const nao referencia const (E0301), entao os valores sao os literais das constantes ANALISA_COMANDO_* abaixo.
+const COMANDOS: [82]u16 = {
+    0, 0, 8, 0, 0, 0, 0, 1, 1, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    2, 0, 4, 0, 3, 10, 0, 0, 6, 6,
+    5, 9, 7, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0
+}
+
+pub const ANALISA_COMANDO_ANALISAR_LET_VAR: u16 = 1
+pub const ANALISA_COMANDO_ANALISAR_IF: u16 = 2
+pub const ANALISA_COMANDO_ANALISAR_WHILE: u16 = 3
+pub const ANALISA_COMANDO_ANALISAR_FOR: u16 = 4
+pub const ANALISA_COMANDO_ANALISAR_RETURN: u16 = 5
+pub const ANALISA_COMANDO_ANALISAR_SEM_ARGUMENTOS: u16 = 6
+pub const ANALISA_COMANDO_ANALISAR_TRY_COMANDO: u16 = 7
+pub const ANALISA_COMANDO_ANALISAR_POR_NOME: u16 = 8
+pub const ANALISA_COMANDO_ANALISAR_DEFER: u16 = 9
+pub const ANALISA_COMANDO_ANALISAR_SWITCH: u16 = 10
+// C: frontend/parser_stmt.c:625 (COMANDOS[TK_QTD]; o NULL do C vira none aqui, e analisar_comando ja trata a ausencia)
+pub proc chamar_analisa_comando(tag: u16, p: ^Parser) -> ?^Stmt {
+    if tag == 1 {
+        return analisar_let_var(p)
+    }
+    if tag == 2 {
+        return analisar_if(p)
+    }
+    if tag == 3 {
+        return analisar_while(p)
+    }
+    if tag == 4 {
+        return analisar_for(p)
+    }
+    if tag == 5 {
+        return analisar_return(p)
+    }
+    if tag == 6 {
+        return analisar_sem_argumentos(p)
+    }
+    if tag == 7 {
+        return analisar_try_comando(p)
+    }
+    if tag == 8 {
+        return analisar_por_nome(p)
+    }
+    if tag == 9 {
+        return analisar_defer(p)
+    }
+    if tag == 10 {
+        return analisar_switch(p)
+    }
+    return none
+}
+
+// C: frontend/parser_stmt.c:34
+proc novo_stmt(p: ^Parser, tipo: i32, pos: u32) -> ^Stmt {
+    let s: ^Stmt = new(Stmt, alloc = common.arena_mem(p.arena as ^common.Arena))
+    s.tipo_no = tipo as u8
+    s.pos = pos
+    s.nome = -1
+    return s
+}
+
+// C: frontend/parser_stmt.c:44
+proc comeca_chamada_qualificada(p: ^Parser) -> bool {
+    return (p.napelidos != 0) and (tipo_seguinte(p) == TK_DOT) and (modulos_apelido(p.modulos, p.arquivo_atual, token_atual(p).sym) != 0)
+}
+
+// C: frontend/parser_stmt.c:55
+proc analisar_alvo_do_ponteiro(p: ^Parser, t: ^TipoRef, nivel: u32) -> bool {
+    if nivel >= (PROFUNDIDADE_MAX_PONTEIRO as u32) {
+        return erro_sintaxe(p, "ponteiro aninhado demais (maximo 8 niveis de '^')")
+    }
+    var alvo: []TipoRef = arena_fatia_tipo_ref(p.arena as ^common.Arena, 1)
+    t.alvo = alvo
+    return analisar_tipo_ref_nivel(p, &alvo[0], nivel + 1)
+}
+
+// C: frontend/parser_stmt.c:63
+proc ler_tamanho_do_colchete(p: ^Parser, t: ^TipoRef, esperado: str) -> bool {
+    let k: i32 = tipo_atual(p)
+    if (k != TK_INT) and (k != TK_IDENT) {
+        return erro_sintaxe(p, esperado)
+    }
+    if (k == TK_IDENT) and (p.napelidos != 0) and (tipo_seguinte(p) == TK_DOT) and (modulos_apelido(p.modulos, p.arquivo_atual, token_atual(p).sym) != 0) {
+        return common.diag_relatar(p.diag as ^common.Diag, common.E0101, token_atual(p).off, "tamanho de array com nome de outro modulo chega depois: use literal ou const deste arquivo")
+    }
+    t.pos_tamanho = token_atual(p).off
+    if k == TK_IDENT {
+        t.nome = token_atual(p).sym
+    }
+    p.cur += 1
+    return true
+}
+
+// C: frontend/parser_stmt.c:78
+proc analisar_lista_fixa(p: ^Parser, t: ^TipoRef, nivel: u32) -> bool {
+    p.cur += 1
+    t.forma = TR_LISTA_FIXA as u8
+    if not ler_tamanho_do_colchete(p, t, "capacidade da lista fixa: literal inteiro ou nome de const ('[dynamic, 64]T', '[dynamic, N]T')") {
+        return false
+    }
+    if not esperar(p, TK_RCOLCHETE, "']'") {
+        return false
+    }
+    return analisar_alvo_do_ponteiro(p, t, nivel)
+}
+
+// C: frontend/parser_stmt.c:88
+proc analisar_tipo_colchete(p: ^Parser, t: ^TipoRef, nivel: u32) -> bool {
+    p.cur += 1
+    t.nome = -1
+    if (common.c2f_s2u_32(tipo_atual(p)) == (TK_IDENT as u32)) and (token_atual(p).sym == SYM_DYNAMIC) {
+        t.forma = TR_DINAMICO as u8
+        t.pos_tamanho = token_atual(p).off
+        p.cur += 1
+        if common.c2f_s2u_32(tipo_atual(p)) == (TK_COMMA as u32) {
+            return analisar_lista_fixa(p, t, nivel)
+        }
+        if not esperar(p, TK_RCOLCHETE, "']'") {
+            return false
+        }
+        return analisar_alvo_do_ponteiro(p, t, nivel)
+    }
+    if common.c2f_s2u_32(tipo_atual(p)) == (TK_RCOLCHETE as u32) {
+        p.cur += 1
+        t.forma = TR_FATIA as u8
+        return analisar_alvo_do_ponteiro(p, t, nivel)
+    }
+    t.forma = TR_ARRAY as u8
+    if not ler_tamanho_do_colchete(p, t, "tamanho do array: literal inteiro ou nome de const ('[4]T', '[N]T') ou ']' para fatia") {
+        return false
+    }
+    if not esperar(p, TK_RCOLCHETE, "']'") {
+        return false
+    }
+    return analisar_alvo_do_ponteiro(p, t, nivel)
+}
+
+// C: frontend/parser_stmt.c:114
+proc analisar_param_do_tipo_proc(p: ^Parser, t: ^TipoRef, nome: ^TipoRef, nivel: u32) -> bool {
+    if not ler_nome_2(p, &nome.nome, &nome.pos, "nome do parametro do callback (nome: T)") {
+        return false
+    }
+    if not esperar(p, TK_COLON, "':'") {
+        return false
+    }
+    return analisar_tipo_ref_nivel(p, t, nivel + 1)
+}
+
+// C: frontend/parser_stmt.c:122
+proc analisar_tipo_proc(p: ^Parser, t: ^TipoRef, nivel: u32) -> bool {
+    var tmp: [17]TipoRef = {} // PARAMS_MAX_CALLBACK + 1
+    var nomes: [17]TipoRef = {} // PARAMS_MAX_CALLBACK + 1
+    var n: u32 = 0
+    t.pos = token_atual(p).off
+    t.forma = TR_PROC as u8
+    t.erro = -1
+    t.pos_tamanho = 0
+    p.cur += 1
+    if not esperar(p, TK_LPAREN, "'(' depois de proc no tipo") {
+        return false
+    }
+    while tipo_atual(p) != TK_RPAREN {
+        if n == (PARAMS_MAX_CALLBACK as u32) {
+            return common.diag_relatar(p.diag as ^common.Diag, common.E0101, token_atual(p).off, "callback com mais de 16 parametros")
+        }
+        if not analisar_param_do_tipo_proc(p, &tmp[n + 1], &nomes[n + 1], nivel) {
+            return false
+        }
+        n += 1
+        if tipo_atual(p) != TK_COMMA {
+            break
+        }
+        p.cur += 1
+    }
+    if not esperar(p, TK_RPAREN, "')'") {
+        return false
+    }
+    if tipo_atual(p) == TK_ARROW {
+        p.cur += 1
+        t.pos_tamanho = 1
+        if not analisar_tipo_ref_nivel(p, &tmp[0], nivel + 1) {
+            return false
+        }
+    }
+    t.nome = n as i32
+    var alvo: []TipoRef = arena_fatia_tipo_ref(p.arena as ^common.Arena, ((2 * n) + 1) as int)
+    for i in 0..<((n + 1) as int) {
+        alvo[i] = tmp[i]
+    }
+    for i in 0..<(n as int) {
+        alvo[(n as int) + 1 + i] = nomes[1 + i]
+    }
+    t.alvo = alvo
+    return true
+}
+
+// C: frontend/parser_stmt.c:155
+proc analisar_tipo_mapa(p: ^Parser, t: ^TipoRef, nivel: u32) -> bool {
+    p.cur += 1
+    if not esperar(p, TK_LCOLCHETE, "'['") {
+        return false
+    }
+    t.forma = TR_MAPA as u8
+    var alvo: []TipoRef = arena_fatia_tipo_ref(p.arena as ^common.Arena, 2)
+    t.alvo = alvo
+    if not analisar_tipo_ref_nivel(p, &alvo[0], nivel + 1) {
+        return false
+    }
+    if not esperar(p, TK_RCOLCHETE, "']'") {
+        return false
+    }
+    return analisar_tipo_ref_nivel(p, &alvo[1], nivel + 1)
+}
+
+// C: frontend/parser_stmt.c:167
+proc analisar_tipo_bit_set(p: ^Parser, t: ^TipoRef, nivel: u32) -> bool {
+    p.cur += 1
+    if not esperar(p, TK_LCOLCHETE, "'['") {
+        return false
+    }
+    t.forma = TR_BIT_SET as u8
+    var alvo: []TipoRef = arena_fatia_tipo_ref(p.arena as ^common.Arena, 1)
+    t.alvo = alvo
+    if not analisar_tipo_ref_nivel(p, &alvo[0], nivel + 1) {
+        return false
+    }
+    return esperar(p, TK_RCOLCHETE, "']'")
+}
+
+// C: frontend/parser_stmt.c:178
+proc analisar_tipo_soa(p: ^Parser, t: ^TipoRef, nivel: u32) -> bool {
+    p.cur += 1
+    t.forma = TR_SOA as u8
+    var alvo: []TipoRef = arena_fatia_tipo_ref(p.arena as ^common.Arena, 1)
+    t.alvo = alvo
+    alvo[0].erro = -1
+    alvo[0].pos = token_atual(p).off
+    return analisar_tipo_colchete(p, &alvo[0], nivel + 1)
+}
+
+// C: frontend/parser_stmt.c:189
+proc ler_dimensao_da_matriz(p: ^Parser, v: ^u32) -> bool {
+    let tk: ^Token = token_atual(p)
+    if tk.tipo != (TK_INT as u8) {
+        let msg_1 = format(f"matrix[R, C]T: R e C sao literais inteiros de 2 a 4", alloc = heap)
+        defer delete(msg_1)
+        return common.diag_relatar(p.diag as ^common.Diag, common.E0101, tk.off, msg_1)
+    }
+    let digito: u8 = (p.fonte as ^common.Fonte).texto[tk.off]
+    let depois: u8 = (p.fonte as ^common.Fonte).texto[tk.off + 1]
+    let continua: bool = ((((common.c2f_char_i32(depois) >= 48) and (common.c2f_char_i32(depois) <= 57)) or ((common.c2f_char_i32(depois) >= 97) and (common.c2f_char_i32(depois) <= 122))) or ((common.c2f_char_i32(depois) >= 65) and (common.c2f_char_i32(depois) <= 90))) or (depois == 95) // '0' '9' 'a' 'z' 'A' 'Z' '_'
+    if ((common.c2f_char_i32(digito) < 50) or (common.c2f_char_i32(digito) > 52)) or (common.c2f_b2i32(continua) != 0) { // '2' '4'
+        let msg_2 = format(f"matrix[R, C]T: R e C vao de 2 a 4", alloc = heap)
+        defer delete(msg_2)
+        return common.diag_relatar(p.diag as ^common.Diag, common.E0321, tk.off, msg_2)
+    }
+    v^ = common.c2f_s2u_32((common.c2f_char_i32(digito) - 48)) // '0'
+    p.cur += 1
+    return true
+}
+
+// C: frontend/parser_stmt.c:203
+proc analisar_tipo_matriz(p: ^Parser, t: ^TipoRef, nivel: u32) -> bool {
+    var r: u32 = 0
+    var c: u32 = 0
+    p.cur += 1
+    if not esperar(p, TK_LCOLCHETE, "'['") {
+        return false
+    }
+    t.forma = TR_MATRIZ as u8
+    t.pos_tamanho = token_atual(p).off
+    if not ler_dimensao_da_matriz(p, &r) {
+        return false
+    }
+    if not esperar(p, TK_COMMA, "','") {
+        return false
+    }
+    if not ler_dimensao_da_matriz(p, &c) {
+        return false
+    }
+    if not esperar(p, TK_RCOLCHETE, "']'") {
+        return false
+    }
+    t.nome = ((r << 4) | c) as i32
+    var alvo: []TipoRef = arena_fatia_tipo_ref(p.arena as ^common.Arena, 1)
+    t.alvo = alvo
+    return analisar_tipo_ref_nivel(p, &alvo[0], nivel + 1)
+}
+
+// C: frontend/parser_stmt.c:220
+proc analisar_tipo_v19(p: ^Parser, t: ^TipoRef, nivel: u32) -> bool {
+    if nivel >= (PROFUNDIDADE_MAX_PONTEIRO as u32) {
+        return erro_sintaxe(p, "ponteiro aninhado demais (maximo 8 niveis de '^')")
+    }
+    let sym: i32 = token_atual(p).sym
+    t.pos = token_atual(p).off
+    t.nome = -1
+    if sym == SYM_MAP {
+        return analisar_tipo_mapa(p, t, nivel)
+    }
+    if sym == SYM_BIT_SET {
+        return analisar_tipo_bit_set(p, t, nivel)
+    }
+    if sym == SYM_SOA {
+        return analisar_tipo_soa(p, t, nivel)
+    }
+    return analisar_tipo_matriz(p, t, nivel)
+}
+
+// C: frontend/parser_stmt.c:232
+proc analisar_tipo_ref_nivel(p: ^Parser, t: ^TipoRef, nivel: u32) -> bool {
+    t.erro = -1
+    t.alvo = none
+    t.pos = token_atual(p).off
+    if common.c2f_s2u_32(tipo_atual(p)) == (TK_LCOLCHETE as u32) {
+        return analisar_tipo_colchete(p, t, nivel)
+    }
+    if common.c2f_s2u_32(tipo_atual(p)) == (TK_INTERROGA as u32) {
+        p.cur += 1
+        if common.c2f_s2u_32(tipo_atual(p)) != (TK_CARET as u32) {
+            t.forma = TR_OPCIONAL as u8
+            return analisar_alvo_do_ponteiro(p, t, nivel)
+        }
+        p.cur += 1
+        t.forma = TR_ANULAVEL as u8
+        return analisar_alvo_do_ponteiro(p, t, nivel)
+    }
+    if common.c2f_s2u_32(tipo_atual(p)) == (TK_CARET as u32) {
+        p.cur += 1
+        t.forma = TR_PONTEIRO as u8
+        return analisar_alvo_do_ponteiro(p, t, nivel)
+    }
+    if common.c2f_b2i32(common.c2f_s2u_32(tipo_atual(p)) == (KW_PROC as u32)) != 0 {
+        return analisar_tipo_proc(p, t, nivel)
+    }
+    if ((common.c2f_b2i32(common.c2f_s2u_32((token_atual(p).sym - SYM_MAP)) <= common.c2f_s2u_32((SYM_MATRIX - SYM_MAP))) != 0) and (common.c2f_s2u_32(tipo_atual(p)) == (TK_IDENT as u32))) and (common.c2f_s2u_32(tipo_seguinte(p)) == (TK_LCOLCHETE as u32)) {
+        return analisar_tipo_v19(p, t, nivel)
+    }
+    t.forma = TR_NOME as u8
+    if p.napelidos == 0 {
+        return ler_nome_2(p, &t.nome, &t.pos, "nome de tipo")
+    }
+    var pos_nome: u32 = 0
+    t.modulo = ler_apelido(p, &pos_nome)
+    if not ler_nome_2(p, &t.nome, &pos_nome, "nome de tipo") {
+        return false
+    }
+    if t.modulo != 0 {
+        t.pos_tamanho = pos_nome
+    } else {
+        t.pos = pos_nome
+    }
+    return true
+}
+
+// C: frontend/parser_stmt.c:267
+proc analisar_tipo_ref(p: ^Parser, t: ?^TipoRef) -> bool {
+    return analisar_tipo_ref_nivel(p, t as ^TipoRef, 0)
+}
+
+// C: frontend/parser_stmt.c:272
+proc analisar_bloco(p: ^Parser, primeiro: ^?^Stmt, ate_caso: bool) -> bool {
+    var ultimo: ?^Stmt = none
+    primeiro^ = none
+    while true {
+        let t: i32 = tipo_atual(p)
+        if (common.c2f_s2u_32(t) == (TK_RBRACE as u32)) or ((common.c2f_b2i32(ate_caso) != 0) and ((common.c2f_s2u_32(t) == (KW_CASE as u32)) or (common.c2f_s2u_32(t) == (KW_DEFAULT as u32)))) {
+            return true
+        }
+        let ini: u32 = p.cur
+        let s: ?^Stmt = analisar_comando(p)
+        if s == none {
+            if not parser_recuperar_comando(p, ini) {
+                return false
+            }
+            continue
+        }
+        if ultimo == none {
+            primeiro^ = s
+        } else {
+            let ptr_1: ^Stmt = ultimo as ^Stmt
+            ptr_1.prox = s
+        }
+        ultimo = s
+    }
+    return false
+}
+
+// C: frontend/parser_stmt.c:290
+proc analisar_corpo_com_chaves(p: ^Parser, corpo: ^?^Stmt, pos_fecha: ^u32) -> bool {
+    if (not esperar_abre_bloco(p)) or (not analisar_bloco(p, corpo, false)) {
+        return false
+    }
+    pos_fecha^ = token_atual(p).off
+    p.cur += 1
+    return true
+}
+
+// C: frontend/parser_stmt.c:299
+// O C acumula em p->pilha_membros (Membro {nome, pos}) e converte para NomeLet na arena; aqui o acumulador e uma lista local de NomeLet (o resultado e o mesmo; a pilha
+// compartilhada tem tipo de elemento unico em Forja e a de membros e de Arg em parser.fj).
+proc ler_nomes_do_let_multiplo(p: ^Parser, s: ^Stmt, primeiro: i32, pos_primeiro: u32) -> bool {
+    var lidos = make([dynamic]NomeLet, alloc = heap)
+    defer delete(lidos)
+    var nome: i32 = primeiro
+    var pos: u32 = pos_primeiro
+    append(&lidos, item = NomeLet{nome = nome, pos = pos, local_id = -1})
+    while tipo_atual(p) == TK_COMMA {
+        p.cur += 1
+        if not ler_nome_2(p, &nome, &pos, "nome da variavel") {
+            return false
+        }
+        append(&lidos, item = NomeLet{nome = nome, pos = pos, local_id = -1})
+    }
+    s.ncasos = len(lidos) as u32 // C: s->nnomes (a uniao com ncasos: C2F-06)
+    var destino: []NomeLet = arena_fatia_nome_let(p.arena as ^common.Arena, len(lidos))
+    for i in 0..<len(lidos) {
+        destino[i] = lidos[i]
+    }
+    s.nomes = destino
+    return true
+}
+
+// C: frontend/parser_stmt.c:319
+proc analisar_let_multiplo(p: ^Parser, s: ^Stmt, pos_primeiro: u32) -> ?^Stmt {
+    s.op = common.c2f_b2i32(s.tipo_no == (ST_VAR as u8)) as u8
+    s.tipo_no = ST_LET_MULTIPLO as u8
+    if (not ler_nomes_do_let_multiplo(p, s, s.nome, pos_primeiro)) or (not esperar(p, TK_ASSIGN, "'='")) {
+        return none
+    }
+    s.nome = -1
+    s.expr = analisar_expr(p)
+    var tern_1: ?^Stmt = none
+    if (s.expr != none) and (common.c2f_b2i32(esperar_fim_de_linha(p)) != 0) {
+        tern_1 = s
+    }
+    return tern_1
+}
+
+// C: frontend/parser_stmt.c:329
+proc analisar_let_var(p: ^Parser) -> ?^Stmt {
+    var tern_1: i32 = ST_VAR
+    if common.c2f_s2u_32(tipo_atual(p)) == (KW_LET as u32) {
+        tern_1 = ST_LET
+    }
+    let arg_1: u32 = token_atual(p).off
+    let arg_2: i32 = tern_1
+    let arg_3: ^Parser = p
+    let s: ^Stmt = novo_stmt(arg_3, arg_2, arg_1)
+    var pos_nome: u32 = 0
+    p.cur += 1
+    if not ler_nome_2(p, &s.nome, &pos_nome, "nome da variavel") {
+        return none
+    }
+    if common.c2f_s2u_32(tipo_atual(p)) == (TK_COMMA as u32) {
+        return analisar_let_multiplo(p, s, pos_nome)
+    }
+    if common.c2f_s2u_32(tipo_atual(p)) == (TK_COLON as u32) {
+        p.cur += 1
+        s.tem_tipo = true
+        if not analisar_tipo_ref(p, &s.tipo) {
+            return none
+        }
+    }
+    if not esperar(p, TK_ASSIGN, "'='") {
+        return none
+    }
+    s.expr = analisar_expr(p)
+    var tern_2: ?^Stmt = none
+    if (s.expr != none) and (common.c2f_b2i32(esperar_fim_de_linha(p)) != 0) {
+        tern_2 = s
+    }
+    return tern_2
+}
+
+// C: frontend/parser_stmt.c:346
+proc analisar_if(p: ^Parser) -> ?^Stmt {
+    let s: ^Stmt = novo_stmt(p, ST_IF, token_atual(p).off)
+    p.cur += 1
+    s.expr = analisar_cabecalho(p)
+    if (s.expr == none) or (not analisar_corpo_com_chaves(p, &s.corpo, &s.pos_fim)) {
+        return none
+    }
+    if common.c2f_s2u_32(tipo_atual(p)) != (KW_ELSE as u32) {
+        var tern_1: ?^Stmt = none
+        if common.c2f_b2i32(esperar_fim_de_linha(p)) != 0 {
+            tern_1 = s
+        }
+        return tern_1
+    }
+    p.cur += 1
+    if common.c2f_s2u_32(tipo_atual(p)) == (KW_IF as u32) {
+        s.senao = analisar_if(p)
+        var tern_2: ?^Stmt = none
+        if s.senao != none {
+            tern_2 = s
+        }
+        return tern_2
+    }
+    var pos_fecha: u32 = 0
+    if not analisar_corpo_com_chaves(p, &s.senao, &pos_fecha) {
+        return none
+    }
+    var tern_3: ?^Stmt = none
+    if common.c2f_b2i32(esperar_fim_de_linha(p)) != 0 {
+        tern_3 = s
+    }
+    return tern_3
+}
+
+// C: frontend/parser_stmt.c:363
+proc analisar_while(p: ^Parser) -> ?^Stmt {
+    let s: ^Stmt = novo_stmt(p, ST_WHILE, token_atual(p).off)
+    p.cur += 1
+    s.expr = analisar_cabecalho(p)
+    if (s.expr == none) or (not analisar_corpo_com_chaves(p, &s.corpo, &s.pos_fim)) {
+        return none
+    }
+    var tern_1: ?^Stmt = none
+    if common.c2f_b2i32(esperar_fim_de_linha(p)) != 0 {
+        tern_1 = s
+    }
+    return tern_1
+}
+
+// C: frontend/parser_stmt.c:373
+proc ler_nome_do_for(p: ^Parser, nome: ^i32, ref: ^bool) -> bool {
+    var pos_nome: u32 = 0
+    ref^ = common.c2f_s2u_32(tipo_atual(p)) == (TK_AMP as u32)
+    if ref^ {
+        p.cur += 1
+    }
+    return ler_nome_2(p, nome, &pos_nome, "nome da variavel do laco")
+}
+
+// C: frontend/parser_stmt.c:382
+proc analisar_nomes_do_for(p: ^Parser, s: ^Stmt) -> bool {
+    let inicio: u32 = p.cur
+    var primeiro: i32 = 0
+    var ref_primeiro: bool = false
+    s.nome_indice = -1
+    s.local_indice = -1
+    if not ler_nome_do_for(p, &primeiro, &ref_primeiro) {
+        return false
+    }
+    if common.c2f_s2u_32(tipo_atual(p)) != (TK_COMMA as u32) {
+        s.nome = primeiro
+        s.item_ref = ref_primeiro
+        return true
+    }
+    if ref_primeiro {
+        p.cur = inicio
+        return erro_sintaxe(p, "o indice do for e um inteiro; '&' vai no item")
+    }
+    p.cur += 1
+    s.nome_indice = primeiro
+    return ler_nome_do_for(p, &s.nome, &s.item_ref)
+}
+
+// C: frontend/parser_stmt.c:405
+proc analisar_fim_do_for(p: ^Parser, s: ^Stmt) -> bool {
+    let t: i32 = tipo_atual(p)
+    if (t != TK_DOTDOTLT) and (t != TK_DOTDOTEQ) {
+        return true
+    }
+    if (s.nome_indice >= 0) or s.item_ref {
+        return common.diag_relatar(p.diag as ^common.Diag, common.E0101, token_atual(p).off, "for com indice ou '&' percorre array ou fatia, nao faixa: for i in a..<b")
+    }
+    s.faixa_excl = t == TK_DOTDOTLT
+    p.cur += 1
+    s.expr2 = analisar_cabecalho(p)
+    return s.expr2 != none
+}
+
+// C: frontend/parser_stmt.c:420
+proc analisar_for(p: ^Parser) -> ?^Stmt {
+    let s: ^Stmt = novo_stmt(p, ST_FOR, token_atual(p).off)
+    p.cur += 1
+    if (not analisar_nomes_do_for(p, s)) or (not esperar(p, KW_IN, "'in'")) {
+        return none
+    }
+    s.expr = analisar_cabecalho(p)
+    if (s.expr == none) or (not analisar_fim_do_for(p, s)) {
+        return none
+    }
+    if not analisar_corpo_com_chaves(p, &s.corpo, &s.pos_fim) {
+        return none
+    }
+    var tern_1: ?^Stmt = none
+    if common.c2f_b2i32(esperar_fim_de_linha(p)) != 0 {
+        tern_1 = s
+    }
+    return tern_1
+}
+
+// C: frontend/parser_stmt.c:432
+proc analisar_tupla_do_return(p: ^Parser, primeiro: ?^Expr) -> ?^Expr {
+    let base: int = len(p.pilha_args)
+    let t: ^Expr = nova_expr(p, EX_TUPLA, (primeiro as ^Expr).pos)
+    var a: Arg = Arg{nome = -1, indice = -1, valor = primeiro}
+    append(&p.pilha_args, item = a)
+    while tipo_atual(p) == TK_COMMA {
+        p.cur += 1
+        a.valor = analisar_expr(p)
+        if a.valor == none {
+            return none
+        }
+        append(&p.pilha_args, item = a)
+    }
+    t.nargs = (len(p.pilha_args) - base) as u32
+    t.args = copiar_args(p, base)
+    return t
+}
+
+// C: frontend/parser_stmt.c:449
+proc analisar_return(p: ^Parser) -> ?^Stmt {
+    let s: ^Stmt = novo_stmt(p, ST_RETURN, token_atual(p).off)
+    p.cur += 1
+    if (common.c2f_s2u_32(tipo_atual(p)) != (TK_NL as u32)) and (common.c2f_s2u_32(tipo_atual(p)) != (TK_EOF as u32)) {
+        s.expr = analisar_expr(p)
+        if (s.expr != none) and (common.c2f_s2u_32(tipo_atual(p)) == (TK_COMMA as u32)) {
+            s.expr = analisar_tupla_do_return(p, s.expr)
+        }
+        if s.expr == none {
+            return none
+        }
+    }
+    var tern_1: ?^Stmt = none
+    if common.c2f_b2i32(esperar_fim_de_linha(p)) != 0 {
+        tern_1 = s
+    }
+    return tern_1
+}
+
+// C: frontend/parser_stmt.c:461
+proc analisar_sem_argumentos(p: ^Parser) -> ?^Stmt {
+    var tern_1: i32 = ST_CONTINUE
+    if common.c2f_s2u_32(tipo_atual(p)) == (KW_BREAK as u32) {
+        tern_1 = ST_BREAK
+    }
+    let arg_1: u32 = token_atual(p).off
+    let arg_2: i32 = tern_1
+    let arg_3: ^Parser = p
+    let s: ^Stmt = novo_stmt(arg_3, arg_2, arg_1)
+    p.cur += 1
+    var tern_2: ?^Stmt = none
+    if common.c2f_b2i32(esperar_fim_de_linha(p)) != 0 {
+        tern_2 = s
+    }
+    return tern_2
+}
+
+// C: frontend/parser_stmt.c:468
+proc analisar_chamada(p: ^Parser) -> ?^Stmt {
+    let s: ^Stmt = novo_stmt(p, ST_CHAMADA, token_atual(p).off)
+    s.expr = analisar_posfixo(p)
+    if s.expr == none {
+        return none
+    }
+    if ((s.expr as ^Expr).tipo_no != (EX_CHAMADA as u8)) and ((s.expr as ^Expr).tipo_no != (EX_CHAMADA_IND as u8)) {
+        _ = erro_sintaxe(p, "chamada de proc")
+        return none
+    }
+    var tern_1: ?^Stmt = none
+    if common.c2f_b2i32(esperar_fim_de_linha(p)) != 0 {
+        tern_1 = s
+    }
+    return tern_1
+}
+
+// C: frontend/parser_stmt.c:478
+proc analisar_try_comando(p: ^Parser) -> ?^Stmt {
+    let s: ^Stmt = novo_stmt(p, ST_CHAMADA, token_atual(p).off)
+    let t: ^Expr = nova_expr(p, EX_TRY, token_atual(p).off)
+    p.cur += 1
+    if common.c2f_s2u_32(tipo_atual(p)) == (TK_LBRACE as u32) {
+        parser_idioma_try_bloco(p)
+        return none
+    }
+    t.a = analisar_posfixo(p)
+    if t.a == none {
+        return none
+    }
+    if (t.a as ^Expr).tipo_no != (EX_CHAMADA as u8) {
+        _ = erro_sintaxe(p, "chamada de proc depois de try")
+        return none
+    }
+    s.expr = t
+    var tern_1: ?^Stmt = none
+    if common.c2f_b2i32(esperar_fim_de_linha(p)) != 0 {
+        tern_1 = s
+    }
+    return tern_1
+}
+
+// C: frontend/parser_stmt.c:495
+proc cadeia_de_lvalor(e: ?^Expr) -> bool {
+    var e_v: ?^Expr = e
+    while ((((e_v as ^Expr).tipo_no == (EX_CAMPO as u8)) or ((e_v as ^Expr).tipo_no == (EX_INDICE as u8))) or ((e_v as ^Expr).tipo_no == (EX_FATIA as u8))) or (((e_v as ^Expr).tipo_no == (EX_UNARIO as u8)) and ((e_v as ^Expr).op == (OP_DEREF as u8))) {
+        e_v = (e_v as ^Expr).a
+    }
+    return (e_v as ^Expr).tipo_no == (EX_NOME as u8)
+}
+
+// C: frontend/parser_stmt.c:505
+proc analisar_atribuicao(p: ^Parser) -> ?^Stmt {
+    let s: ^Stmt = novo_stmt(p, ST_ATRIBUICAO, token_atual(p).off)
+    s.alvo = analisar_posfixo(p)
+    if s.alvo == none {
+        return none
+    }
+    if (s.alvo as ^Expr).tipo_no == (EX_CHAMADA_IND as u8) { // v1.12: 'obj.campo(a)' solto (e apos defer) e a chamada indireta como comando
+        s.tipo_no = ST_CHAMADA as u8
+        s.expr = s.alvo
+        s.alvo = none
+        if esperar_fim_de_linha(p) {
+            return s
+        }
+        return none
+    }
+    let lvalor: bool = cadeia_de_lvalor(s.alvo)
+    let t: i32 = tipo_atual(p)
+    if (not lvalor) or ((t != TK_ASSIGN) and (t != TK_PLUSEQ) and (t != TK_MINUSEQ)) {
+        _ = erro_sintaxe(p, "'=', '+=' ou '-='")
+        return none
+    }
+    if t == TK_ASSIGN {
+        s.op = 0
+    } else if t == TK_PLUSEQ {
+        s.op = 1
+    } else {
+        s.op = 2
+    }
+    p.cur += 1
+    s.expr = analisar_expr(p)
+    if (s.expr != none) and esperar_fim_de_linha(p) {
+        return s
+    }
+    return none
+}
+
+// C: frontend/parser_stmt.c:529
+proc analisar_expect(p: ^Parser) -> ?^Stmt {
+    let s: ^Stmt = novo_stmt(p, ST_EXPECT, token_atual(p).off)
+    p.cur += 2
+    s.expr = analisar_expr(p)
+    if s.expr == none {
+        return none
+    }
+    s.pos_fim = token_atual(p).off
+    if not esperar(p, TK_RPAREN, "')' (expect recebe so a condicao)") {
+        return none
+    }
+    var tern_1: ?^Stmt = none
+    if common.c2f_b2i32(esperar_fim_de_linha(p)) != 0 {
+        tern_1 = s
+    }
+    return tern_1
+}
+
+// C: frontend/parser_stmt.c:541
+proc analisar_por_nome(p: ^Parser) -> ?^Stmt {
+    if common.c2f_s2u_32(tipo_seguinte(p)) != (TK_LPAREN as u32) {
+        var tern_1: ?^Stmt = none
+        if common.c2f_b2i32(comeca_chamada_qualificada(p)) != 0 {
+            tern_1 = analisar_chamada(p)
+        } else {
+            tern_1 = analisar_atribuicao(p)
+        }
+        return tern_1
+    }
+    if token_atual(p).sym == SYM_EXPECT {
+        return analisar_expect(p)
+    }
+    return analisar_chamada(p)
+}
+
+// C: frontend/parser_stmt.c:549
+proc analisar_defer(p: ^Parser) -> ?^Stmt {
+    let s: ^Stmt = novo_stmt(p, ST_DEFER, token_atual(p).off)
+    p.cur += 1
+    if (common.c2f_s2u_32(tipo_atual(p)) != (TK_IDENT as u32)) or (token_atual(p).sym == SYM_EXPECT) {
+        _ = erro_sintaxe(p, "chamada ou atribuicao na mesma linha (defer nao aceita bloco)")
+        return none
+    }
+    var tern_1: ?^Stmt = none
+    if (common.c2f_s2u_32(tipo_seguinte(p)) == (TK_LPAREN as u32)) or (common.c2f_b2i32(comeca_chamada_qualificada(p)) != 0) {
+        tern_1 = analisar_chamada(p)
+    } else {
+        tern_1 = analisar_atribuicao(p)
+    }
+    s.corpo = tern_1
+    var tern_2: ?^Stmt = none
+    if s.corpo != none {
+        tern_2 = s
+    }
+    return tern_2
+}
+
+// C: frontend/parser_stmt.c:562
+proc analisar_alvo_do_caso(p: ^Parser, c: ^Caso) -> bool {
+    var pos_nome: u32 = 0
+    let k: i32 = tipo_atual(p)
+    if common.c2f_s2u_32(k) == (KW_NONE as u32) {
+        c.tipo_nome = KW_NONE - KW_CONST
+        p.cur += 1
+        return true
+    }
+    if ((common.c2f_s2u_32(k) == (TK_CARET as u32)) or (common.c2f_s2u_32(k) == (TK_LCOLCHETE as u32))) or (common.c2f_s2u_32(k) == (TK_INTERROGA as u32)) {
+        c.tipo_escrito = new(TipoRef, alloc = common.arena_mem(p.arena as ^common.Arena))
+        return analisar_tipo_ref(p, c.tipo_escrito)
+    }
+    if p.napelidos != 0 {
+        c.modulo = ler_apelido(p, &pos_nome)
+    }
+    if not ler_nome_2(p, &c.tipo_nome, &pos_nome, "tipo ou enum do case") {
+        return false
+    }
+    if common.c2f_s2u_32(tipo_atual(p)) != (TK_DOT as u32) {
+        return true
+    }
+    p.cur += 1
+    return ler_nome_2(p, &c.membro, &c.pos_membro, "membro do enum")
+}
+
+// C: frontend/parser_stmt.c:583
+proc analisar_caso(p: ^Parser, c: ^Caso) -> bool {
+    c.pos = token_atual(p).off
+    c.tipo_nome = -1
+    c.membro = -1
+    c.padrao = tipo_atual(p) == KW_DEFAULT
+    if (not c.padrao) and (tipo_atual(p) != KW_CASE) {
+        return erro_sintaxe(p, "'case', 'default' ou '}'")
+    }
+    p.cur += 1
+    if (not c.padrao) and (not analisar_alvo_do_caso(p, c)) {
+        return false
+    }
+    if not esperar(p, TK_COLON, "':'") {
+        return false
+    }
+    if tipo_atual(p) == TK_NL {
+        p.cur += 1
+    }
+    return analisar_bloco(p, &c.corpo, true)
+}
+
+// C: frontend/parser_stmt.c:596
+// O C empilha em p->pilha_casos (compartilhada, com base) e copia para a arena (CopiarLista); aqui a lista e local a cada switch (a pilha de Parser tem elemento de Arg em
+// parser.fj) e a copia para a arena e inline: o resultado (Stmt.casos/ncasos) e o mesmo, com casos de switch aninhado em listas separadas.
+proc analisar_casos(p: ^Parser, s: ^Stmt) -> bool {
+    var lidos = make([dynamic]Caso, alloc = heap)
+    defer delete(lidos)
+    while tipo_atual(p) != TK_RBRACE {
+        var c: Caso = Caso{}
+        if not analisar_caso(p, &c) {
+            return false
+        }
+        append(&lidos, item = c)
+    }
+    s.ncasos = len(lidos) as u32
+    if len(lidos) > 0 {
+        var destino = make([dynamic]Caso, alloc = common.arena_mem(p.arena as ^common.Arena), cap = len(lidos))
+        for i in 0..<len(lidos) {
+            append(&destino, item = lidos[i])
+        }
+        s.casos = destino[..]
+    }
+    return true
+}
+
+// C: frontend/parser_stmt.c:610
+proc analisar_switch(p: ^Parser) -> ?^Stmt {
+    let s: ^Stmt = novo_stmt(p, ST_SWITCH, token_atual(p).off)
+    p.cur += 1
+    if (common.c2f_s2u_32(tipo_atual(p)) == (TK_IDENT as u32)) and (common.c2f_s2u_32(tipo_seguinte(p)) == (KW_IN as u32)) {
+        s.nome = token_atual(p).sym
+        p.cur += 2
+    }
+    s.expr = analisar_cabecalho(p)
+    if ((s.expr == none) or (not esperar_abre_bloco(p))) or (not analisar_casos(p, s)) {
+        return none
+    }
+    s.pos_fim = token_atual(p).off
+    p.cur += 1
+    var tern_1: ?^Stmt = none
+    if common.c2f_b2i32(esperar_fim_de_linha(p)) != 0 {
+        tern_1 = s
+    }
+    return tern_1
+}
+
+// C: frontend/parser_stmt.c:632
+proc analisar_comando(p: ^Parser) -> ?^Stmt {
+    let analisa: u16 = COMANDOS[tipo_atual(p)]
+    if analisa == 0 {
+        _ = erro_sintaxe(p, "comando")
+        return none
+    }
+    return chamar_analisa_comando(analisa, p)
+}

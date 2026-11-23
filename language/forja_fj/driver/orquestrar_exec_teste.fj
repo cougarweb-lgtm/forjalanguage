@@ -1,0 +1,438 @@
+// driver/orquestrar_exec_teste.fj - testes de driver/orquestrar_exec.fj (G3 V5-O2): so o que nao depende do orquestrar.fj (O1) nem de filho real.
+// Versao: 0.1.0
+
+import "std:os"
+import "std:file"
+import "cache"
+
+proc oe_produto_de_teste(nome: str, saida: str) -> cache.Produto {
+    return cache.Produto{nome = nome, tipo = 0, entrada = "x.fj", saida = saida}
+}
+
+// 'n' produtos a, b, c, d, e, f e depois todos "p" (saida C:\o\<nome>.dll); dependencias a gosto de quem chama (dep/ndep).
+proc oe_plano_de_teste(pl: ^Plano2, n: int) {
+    let nomes: [6]str = {"a", "b", "c", "d", "e", "f"}
+    pl.projeto.produtos = make([dynamic]cache.Produto, alloc = heap)
+    for k in 0..<n {
+        var nome: str = "p"
+        if k < 6 {
+            nome = nomes[k]
+        }
+        let saida = format(f"C:\\o\\{nome}.dll", alloc = heap)
+        append(&pl.projeto.produtos, item = oe_produto_de_teste(nome, saida))
+    }
+}
+
+proc oe_plano_liberar(pl: ^Plano2) {
+    for k in 0..<len(pl.projeto.produtos) {
+        delete(pl.projeto.produtos[k].saida or_else "")
+    }
+    delete(pl.projeto.produtos)
+}
+
+// Execucao2 com uma Corrida por produto, todas PENDENTE.
+proc oe_execucao_de_teste(ex: ^Execucao2, pl: ^Plano2) {
+    ex.pl = pl
+    let n: int = len(pl.projeto.produtos)
+    ex.corrida_dono = make([dynamic]Corrida, alloc = heap, cap = n)
+    for _i in 0..<n {
+        append(&ex.corrida_dono, item = Corrida{})
+    }
+    ex.corrida = ex.corrida_dono[..]
+}
+
+// Pasta nova e vazia em %TEMP% (quem chama faz delete do texto e remove_dir all).
+proc oe_pasta_nova(nome: str) -> str {
+    var caminho: str = ""
+    switch temp in os.temp_dir(alloc = heap) {
+    case str:
+        caminho = format(f"{temp}\\forja_orq_exec_{os.pid()}_{nome}", alloc = heap)
+        delete(temp)
+    case os.OsError:
+        caminho = format(f"C:\\Windows\\Temp\\forja_orq_exec_{os.pid()}_{nome}", alloc = heap)
+    }
+    _ = file.remove_dir(caminho, all = true)
+    _ = file.make_dir(caminho, all = true)
+    return caminho
+}
+
+test "exec_texto_emprestado, exec_copiar_no_buffer e exec_truncar_texto: como snprintf e %s de buffer menor" {
+    var b: [6]u8 = {}
+    exec_copiar_no_buffer(b[..], "abc")
+    expect(exec_texto_emprestado(b[..]) == "abc")
+    exec_copiar_no_buffer(b[..], "abcdefgh")
+    expect(exec_texto_emprestado(b[..]) == "abcde")
+    exec_copiar_no_buffer(b[..], "")
+    expect(exec_texto_emprestado(b[..]) == "")
+    expect(b[0] == 0)
+    expect(exec_truncar_texto("abcdef", 3) == "abc")
+    expect(exec_truncar_texto("ab", 3) == "ab")
+}
+
+test "sufixo_de_processo: .tmp<pid> e .velho<pid> so com digitos ate o fim" {
+    var pid: u32 = 0
+    expect(sufixo_de_processo("x.dll.tmp1234", &pid))
+    expect(pid == 1234)
+    expect(sufixo_de_processo("x.dll.velho77", &pid))
+    expect(pid == 77)
+    expect(sufixo_de_processo(".velho3", &pid))
+    expect(pid == 3)
+    expect(sufixo_de_processo("a.b.tmp5", &pid))
+    expect(pid == 5)
+    expect(sufixo_de_processo("x.tmp99999999999", &pid))
+    expect(pid == 4294967295)
+    expect(not sufixo_de_processo("x.tmp", &pid))
+    expect(not sufixo_de_processo("x.velho", &pid))
+    expect(not sufixo_de_processo("x.tmp12a", &pid))
+    expect(not sufixo_de_processo("x.tmpx1", &pid))
+    expect(not sufixo_de_processo("x.dll", &pid))
+    expect(not sufixo_de_processo("tmp12", &pid))
+    expect(not sufixo_de_processo("x.tm12", &pid))
+    expect(not sufixo_de_processo("x.velh12", &pid))
+}
+
+test "largura_maxima: a maior camada, limitada a 64; jobs_padrao entre 1 e 64" {
+    var pl: Plano2 = Plano2{opcoes = none}
+    oe_plano_de_teste(&pl, 3)
+    var camadas: [3]u32 = {0, 1, 1}
+    pl.camada = camadas[..]
+    expect(largura_maxima(&pl) == 2)
+    camadas[1] = 0
+    camadas[2] = 0
+    expect(largura_maxima(&pl) == 3)
+    camadas[0] = 2
+    camadas[1] = 1
+    camadas[2] = 0
+    expect(largura_maxima(&pl) == 1)
+    let jobs: u32 = jobs_padrao(&pl)
+    expect(jobs >= 1)
+    expect(jobs <= 64)
+    oe_plano_liberar(&pl)
+    var pl2: Plano2 = Plano2{opcoes = none}
+    oe_plano_de_teste(&pl2, 70)
+    var camada2 = make([dynamic]u32, alloc = heap, len = 70)
+    defer delete(camada2)
+    pl2.camada = camada2[..]
+    expect(largura_maxima(&pl2) == 64)
+    oe_plano_liberar(&pl2)
+}
+
+test "resolver_jobs: --jobs vence FORJA_JOBS, que vence o padrao; FORJA_JOBS invalida = false" {
+    var pl: Plano2 = Plano2{opcoes = none}
+    oe_plano_de_teste(&pl, 1)
+    var camadas: [1]u32 = {0}
+    pl.camada = camadas[..]
+    var o: Opcoes = Opcoes{}
+    pl.opcoes = &o
+    var jobs: u32 = 0
+    _ = os.unset_env(EXEC_VARIAVEL_JOBS)
+    expect(resolver_jobs(&pl, &jobs))
+    expect(jobs == 1) // so 1 produto: a camada mais larga tem 1
+    _ = os.set_env(EXEC_VARIAVEL_JOBS, "5")
+    expect(resolver_jobs(&pl, &jobs))
+    expect(jobs == 5)
+    _ = os.set_env(EXEC_VARIAVEL_JOBS, "65")
+    expect(not resolver_jobs(&pl, &jobs))
+    _ = os.set_env(EXEC_VARIAVEL_JOBS, "abc")
+    expect(not resolver_jobs(&pl, &jobs))
+    _ = os.set_env(EXEC_VARIAVEL_JOBS, "")
+    expect(not resolver_jobs(&pl, &jobs))
+    o.jobs = "3"
+    _ = os.set_env(EXEC_VARIAVEL_JOBS, "abc")
+    expect(resolver_jobs(&pl, &jobs))
+    expect(jobs == 3)
+    o.jobs = "0"
+    expect(not resolver_jobs(&pl, &jobs))
+    _ = os.unset_env(EXEC_VARIAVEL_JOBS)
+    oe_plano_liberar(&pl)
+}
+
+test "pasta_garantir e faxinar_pasta: cria os pais; apaga so *.tmp<pid morto> e *.velho<pid morto>" {
+    let raiz = oe_pasta_nova("pastas")
+    defer delete(raiz)
+    let fundo = format(f"{raiz}\\a\\b\\c", alloc = heap)
+    defer delete(fundo)
+    expect(pasta_garantir(fundo))
+    expect(file.is_dir(fundo))
+    expect(pasta_garantir(fundo)) // ja existe
+    let arq_ocupado = format(f"{raiz}\\x.txt", alloc = heap)
+    defer delete(arq_ocupado)
+    _ = file.write_all(arq_ocupado, as_bytes("oi"))
+    let sob_arquivo = format(f"{arq_ocupado}\\z", alloc = heap)
+    defer delete(sob_arquivo)
+    expect(not pasta_garantir(sob_arquivo))
+    let nomes: [6]str = {"morto.dll.tmp2999999999", "morto.dll.velho2999999998", "x.dll", "x.tmp", "x.dll.tmp1b", "vivo.dll.tmp"}
+    for k in 0..<5 {
+        let p = format(f"{raiz}\\{nomes[k]}", alloc = heap)
+        _ = file.write_all(p, as_bytes("."))
+        delete(p)
+    }
+    let vivo = format(f"{raiz}\\vivo.dll.tmp{os.pid()}", alloc = heap)
+    defer delete(vivo)
+    _ = file.write_all(vivo, as_bytes("."))
+    let pasta_tmp = format(f"{raiz}\\pasta.tmp2999999997", alloc = heap)
+    defer delete(pasta_tmp)
+    _ = file.make_dir(pasta_tmp)
+    faxinar_pasta(raiz)
+    let morto1 = format(f"{raiz}\\{nomes[0]}", alloc = heap)
+    defer delete(morto1)
+    let morto2 = format(f"{raiz}\\{nomes[1]}", alloc = heap)
+    defer delete(morto2)
+    expect(not file.exists(morto1))
+    expect(not file.exists(morto2))
+    let fica1 = format(f"{raiz}\\{nomes[2]}", alloc = heap)
+    defer delete(fica1)
+    let fica2 = format(f"{raiz}\\{nomes[3]}", alloc = heap)
+    defer delete(fica2)
+    let fica3 = format(f"{raiz}\\{nomes[4]}", alloc = heap)
+    defer delete(fica3)
+    expect(file.exists(fica1))
+    expect(file.exists(fica2))
+    expect(file.exists(fica3))
+    expect(file.exists(vivo)) // pid vivo (o deste teste) nao sai
+    expect(file.is_dir(pasta_tmp)) // pasta nunca e apagada
+    faxinar_pasta("C:\\nao\\existe\\forja_orq_exec") // pasta ausente: so volta
+    _ = file.remove_dir(raiz, all = true)
+}
+
+test "trava_tentar: a 2a abertura da mesma trava e TRAVA_OCUPADA; solta ao fechar e abre de novo" {
+    let raiz = oe_pasta_nova("trava")
+    defer delete(raiz)
+    var a: Execucao2 = Execucao2{pl = none}
+    var b: Execucao2 = Execucao2{pl = none}
+    a.cache = format(f"{raiz}", alloc = heap)
+    b.cache = format(f"{raiz}", alloc = heap)
+    var esperas: i64 = 0
+    expect(trava_tentar(&a, &esperas) == TRAVA_OK)
+    expect(trava_tentar(&b, &esperas) == TRAVA_OCUPADA)
+    expect(esperas == 0)
+    let trava = format(f"{raiz}\\trava", alloc = heap)
+    defer delete(trava)
+    expect(file.exists(trava))
+    finalizar_execucao(&a)
+    expect(not file.exists(trava)) // apagada ao fechar
+    expect(trava_tentar(&b, &esperas) == TRAVA_OK)
+    finalizar_execucao(&b)
+    // pasta do cache inexistente: 4 tentativas com Sleep(10) e TRAVA_ERRO
+    var c: Execucao2 = Execucao2{pl = none}
+    c.cache = format(f"{raiz}\\nao_existe", alloc = heap)
+    var esperas2: i64 = 0
+    expect(trava_tentar(&c, &esperas2) == TRAVA_ERRO)
+    expect(esperas2 == 4)
+    finalizar_execucao(&c)
+    _ = file.remove_dir(raiz, all = true)
+}
+
+test "prontidao_de e tratar_produto: dependente de falho ou pulado vira PULADO; independente nao mexe" {
+    var pl: Plano2 = Plano2{opcoes = none}
+    oe_plano_de_teste(&pl, 4)
+    pl.projeto.produtos[1].dep[0] = 0
+    pl.projeto.produtos[1].ndep = 1
+    pl.projeto.produtos[2].dep[0] = 1
+    pl.projeto.produtos[2].ndep = 1
+    var ex: Execucao2 = Execucao2{pl = none}
+    oe_execucao_de_teste(&ex, &pl)
+    let c: []Corrida = ex.corrida or_else {}
+    var causa: u32 = 99
+    c[0].situacao = SIT_RODANDO
+    expect(prontidao_de(&ex, 1, &causa) == DEPS_ESPERA)
+    c[0].situacao = SIT_RECOMPILADO
+    expect(prontidao_de(&ex, 1, &causa) == DEPS_LIVRES)
+    c[0].situacao = SIT_REUSADO
+    expect(prontidao_de(&ex, 1, &causa) == DEPS_LIVRES)
+    c[1].situacao = SIT_PRONTO // PRONTO ja avaliado: livre sem olhar as dependencias
+    c[0].situacao = SIT_RODANDO
+    expect(prontidao_de(&ex, 1, &causa) == DEPS_LIVRES)
+    c[1].situacao = SIT_PENDENTE
+    c[0].situacao = SIT_FALHOU
+    expect(prontidao_de(&ex, 1, &causa) == DEPS_FALHAS)
+    expect(causa == 0)
+    expect(tratar_produto(&ex, 1))
+    expect(c[1].situacao == SIT_PULADO)
+    expect(c[1].causa == 0)
+    expect(tratar_produto(&ex, 2)) // o neto: a causa e o produto pulado, nao a raiz
+    expect(c[2].situacao == SIT_PULADO)
+    expect(c[2].causa == 1)
+    expect(c[3].situacao == SIT_PENDENTE) // 'd' nao depende de ninguem
+    oe_execucao_liberar(&ex)
+    oe_plano_liberar(&pl)
+}
+
+proc oe_execucao_liberar(ex: ^Execucao2) {
+    delete(ex.corrida_dono)
+}
+
+test "contar, codigo_agregado, acao_de e nome_da_causa" {
+    var pl: Plano2 = Plano2{opcoes = none}
+    oe_plano_de_teste(&pl, 6)
+    var ex: Execucao2 = Execucao2{pl = none}
+    oe_execucao_de_teste(&ex, &pl)
+    let c: []Corrida = ex.corrida or_else {}
+    c[0].situacao = SIT_RECOMPILADO
+    c[1].situacao = SIT_REUSADO
+    c[2].situacao = SIT_FALHOU
+    c[2].saida = 2
+    c[3].situacao = SIT_FALHOU
+    c[3].saida = 101 // queda do processo: conta como 3
+    c[4].situacao = SIT_PULADO
+    c[4].saida = 9 // pulado nao conta
+    c[4].causa = 2
+    c[5].situacao = SIT_FALHOU
+    c[5].saida = 0 // falhou sem exit 1..3 (disparo): conta como 3
+    let n: Contagem = contar(&ex)
+    expect(n.recompilados == 1)
+    expect(n.reusados == 1)
+    expect(n.falharam == 3)
+    expect(n.pulados == 1)
+    expect(codigo_agregado(&ex) == 3)
+    c[3].situacao = SIT_PULADO
+    c[5].situacao = SIT_REUSADO
+    expect(codigo_agregado(&ex) == 2)
+    c[2].situacao = SIT_REUSADO
+    expect(codigo_agregado(&ex) == 0)
+    c[0].situacao = SIT_FALHOU
+    c[0].saida = 1
+    expect(codigo_agregado(&ex) == 1)
+    expect(nome_da_causa(&ex, &c[4]) == "c")
+    expect(acao_de(SIT_RECOMPILADO) == "recompilado")
+    expect(acao_de(SIT_REUSADO) == "reusado")
+    expect(acao_de(SIT_FALHOU) == "falhou")
+    expect(acao_de(SIT_PULADO) == "pulado")
+    oe_execucao_liberar(&ex)
+    oe_plano_liberar(&pl)
+}
+
+test "dono_nao_declarado e achar_violacao: B0006 so para a saida de produto fora do 'depende', sem caixa" {
+    var pl: Plano2 = Plano2{opcoes = none}
+    oe_plano_de_teste(&pl, 3)
+    pl.projeto.produtos[1].dep[0] = 0
+    pl.projeto.produtos[1].ndep = 1
+    expect(dono_nao_declarado(&pl, 1, "C:\\o\\a.DLL") == EXEC_SEM_DONO) // B declara A
+    expect(dono_nao_declarado(&pl, 2, "c:\\O\\a.dll") == 0) // C nao declara A; _stricmp
+    expect(dono_nao_declarado(&pl, 0, "C:\\o\\A.dll") == EXEC_SEM_DONO) // a propria saida nao conta
+    expect(dono_nao_declarado(&pl, 2, "C:\\o\\C.dll") == EXEC_SEM_DONO)
+    expect(dono_nao_declarado(&pl, 2, "C:\\o\\z.dll") == EXEC_SEM_DONO)
+    var gravadas: [3]cache.EntradaGravada = {}
+    gravadas[0] = cache.EntradaGravada{tipo = "src", caminho = "C:\\o\\A.dll"}
+    gravadas[1] = cache.EntradaGravada{tipo = "lib", caminho = "C:\\o\\z.dll"}
+    gravadas[2] = cache.EntradaGravada{tipo = "lib", caminho = "C:\\o\\b.dll"}
+    var lista = make([dynamic]cache.EntradaGravada, alloc = heap)
+    defer delete(lista)
+    for k in 0..<3 {
+        append(&lista, item = gravadas[k])
+    }
+    var v: Violacao = Violacao{linha = none, dono = EXEC_SEM_DONO}
+    expect(achar_violacao(&pl, 2, &lista, &v))
+    expect(v.dono == 1)
+    expect(((v.linha as ^cache.EntradaGravada).caminho or_else "") == "C:\\o\\b.dll")
+    var v2: Violacao = Violacao{linha = none, dono = EXEC_SEM_DONO}
+    expect(not achar_violacao(&pl, 1, &lista, &v2)) // B declara A; so lib z (ninguem) e b (a propria)
+    expect(v2.dono == EXEC_SEM_DONO)
+    oe_plano_liberar(&pl)
+}
+
+test "guardar_linha: troca a linha do mesmo nome e acrescenta a nova" {
+    var e: cache.Estado = cache.Estado{}
+    e.linhas = make([dynamic]cache.EstadoLinha, alloc = heap)
+    defer delete(e.linhas)
+    var l1: cache.EstadoLinha = cache.EstadoLinha{nome = "a", chave = 1}
+    guardar_linha(&e, &l1)
+    var l2: cache.EstadoLinha = cache.EstadoLinha{nome = "b", chave = 2}
+    guardar_linha(&e, &l2)
+    expect(len(e.linhas) == 2)
+    var l3: cache.EstadoLinha = cache.EstadoLinha{nome = "a", chave = 9}
+    guardar_linha(&e, &l3)
+    expect(len(e.linhas) == 2)
+    expect(e.linhas[0].chave == 9)
+    expect(e.linhas[1].chave == 2)
+}
+
+test "montar_args: build --backend x64 [--modo dll] [--release] <entrada> -o <saida> --entradas <arq> --lib-pasta <saida>" {
+    var pl: Plano2 = Plano2{opcoes = none}
+    oe_plano_de_teste(&pl, 1)
+    pl.projeto.saida = "C:\\o"
+    var o: Opcoes = Opcoes{}
+    pl.opcoes = &o
+    var ex: Execucao2 = Execucao2{pl = none}
+    ex.pl = &pl
+    var a: ArgsFilho = ArgsFilho{}
+    montar_args(&ex, &pl.projeto.produtos[0], "E.entradas", &a)
+    expect(a.n == 10)
+    let esperado: [10]str = {"build", "--backend", "x64", "x.fj", "-o", "C:\\o\\a.dll", "--entradas", "E.entradas", "--lib-pasta", "C:\\o"}
+    for k in 0..<10 {
+        expect(a.v[k] == esperado[k])
+    }
+    pl.projeto.produtos[0].tipo = cache.PRODUTO_DLL
+    o.release = true
+    var b: ArgsFilho = ArgsFilho{}
+    montar_args(&ex, &pl.projeto.produtos[0], "E.entradas", &b)
+    expect(b.n == 13)
+    expect(b.v[3] == "--modo")
+    expect(b.v[4] == "dll")
+    expect(b.v[5] == "--release")
+    expect(b.v[6] == "x.fj")
+    expect(b.v[12] == "C:\\o")
+    oe_plano_liberar(&pl)
+}
+
+test "ler_injecao e aplicar_injecao: so o filho do produto nomeado recebe FORJA_TESTE_INJETAR; os outros a perdem" {
+    _ = os.set_env(EXEC_INJETAR_PRODUTO, "alvo")
+    _ = os.set_env(EXEC_INJETAR, "E0001")
+    var ex: Execucao2 = Execucao2{pl = none}
+    ler_injecao(&ex)
+    expect(ex.injetar_produto == "alvo")
+    expect(ex.injetar == "E0001")
+    aplicar_injecao(&ex, "outro")
+    expect(os.env(EXEC_INJETAR) == none) // _putenv_s(nome, "") remove
+    aplicar_injecao(&ex, "alvo")
+    expect((os.env(EXEC_INJETAR) or_else "") == "E0001")
+    aplicar_injecao(&ex, "outro")
+    expect(os.env(EXEC_INJETAR) == none)
+    finalizar_execucao(&ex)
+    // injecao sem FORJA_TESTE_INJETAR_PRODUTO: nao mexe na variavel
+    _ = os.unset_env(EXEC_INJETAR_PRODUTO)
+    _ = os.set_env(EXEC_INJETAR, "X")
+    var ex2: Execucao2 = Execucao2{pl = none}
+    ler_injecao(&ex2)
+    expect(len(ex2.injetar_produto) == 0)
+    aplicar_injecao(&ex2, "qualquer")
+    expect((os.env(EXEC_INJETAR) or_else "") == "X")
+    finalizar_execucao(&ex2)
+    // codigo longo corta em 31 bytes (injetar[32]) e nome em 63 (PROJETO_NOME_MAX 64)
+    _ = os.set_env(EXEC_INJETAR_PRODUTO, "p")
+    _ = os.set_env(EXEC_INJETAR, "0123456789012345678901234567890123456789")
+    var ex3: Execucao2 = Execucao2{pl = none}
+    ler_injecao(&ex3)
+    expect(ex3.injetar == "0123456789012345678901234567890")
+    finalizar_execucao(&ex3)
+    _ = os.unset_env(EXEC_INJETAR_PRODUTO)
+    _ = os.unset_env(EXEC_INJETAR)
+}
+
+test "iniciar_execucao_2 e finalizar_execucao: jobs, exe, cache, uma Corrida por produto, sem vazamento" {
+    var pl: Plano2 = Plano2{opcoes = none}
+    oe_plano_de_teste(&pl, 2)
+    pl.projeto.pasta = "C:\\proj"
+    var camadas: [2]u32 = {0, 0}
+    pl.camada = camadas[..]
+    var o: Opcoes = Opcoes{}
+    o.jobs = "2"
+    pl.opcoes = &o
+    var ex: Execucao2 = Execucao2{pl = none}
+    expect(iniciar_execucao_2(&ex, &pl))
+    expect(ex.jobs == 2)
+    expect(len(ex.exe) > 0)
+    expect(ex.cache == "C:\\proj\\.forja_cache")
+    expect(len(ex.corrida or_else {}) == 2)
+    expect(ex.job.ativo)
+    expect(ex.rodando == 0)
+    expect(ex.filhos == 0)
+    finalizar_execucao(&ex)
+    expect(not ex.job.ativo)
+    // --jobs invalido: iniciar devolve false e finalizar nao tem o que soltar
+    o.jobs = "0"
+    var ex2: Execucao2 = Execucao2{pl = none}
+    expect(not iniciar_execucao_2(&ex2, &pl))
+    finalizar_execucao(&ex2)
+    oe_plano_liberar(&pl)
+}

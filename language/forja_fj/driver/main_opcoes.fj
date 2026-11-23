@@ -1,0 +1,166 @@
+// driver/main_opcoes.fj - porte de compiler/driver/main_opcoes.c, compiler/driver/main_opcoes.h
+// sha256 de driver/main_opcoes.c: b17bea8af999fe22ffc9d738ca3a9e91f71914016d0e6bb66caca93c0201049b
+// sha256 de driver/main_opcoes.h: 08f67ab25b7f24f03555553ce1b499d70a278fc8ce440f7e878b30d75a18db24
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.3.0
+// Changelog: 0.3.0 - A4.2: NativoPedido.runpath = --runpath.
+//            0.2.0 - G3 P-driver DA: corpo real. PastasDeLigacao guarda texto (str no alocador frame: nenhum dono o libera, o compilador nunca chama frame_reset) em vez de
+//            char[600]/char[2][620]; pasta_do_fonte devolve str (era buffer de saida); caminho_do_cabecalho devolve str de heap (o chamador faz delete); dll_sem_exportados
+//            recebe o SaidaDiag unico (C2F-70).
+
+import "std:os"
+import "common"
+import "frontend"
+import "backend"
+import "nativo"
+import "nativo/bir"
+
+// raiz[600] e extra[2][620] do C viram texto do alocador frame; extras[k] e o mesmo texto de extra[k] (o C guardava o ponteiro do buffer)
+struct PastasDeLigacao {
+    raiz: str
+    extra: [2]str
+    extras: [2]str
+    nextras: u32
+}
+
+const PASTA_RAIZ_MAX: int = 600
+const PASTA_EXTRA_MAX: int = 620
+const CABECALHO_CAMINHO_MAX: int = 600
+
+// Os n primeiros bytes de s (o snprintf com cap n + 1) no alocador frame: texto sem dono que o libere (vive ate o fim do processo).
+proc cortar_em_frame(s: str, n: int) -> str {
+    return from_bytes(as_bytes(s)[0..<min(max(n, 0), len(s))], alloc = frame)
+}
+
+// C: driver/main_opcoes.c:24
+// Pasta absoluta do .fj (sem a barra final): o -L da ligacao e o inicio do PATH do forja run/test.
+// _fullpath em buffer de 600: falha (ou resultado de 600 bytes ou mais) cai em ".\x"; o corte e na ultima '\' (strrchr), sem ela fica o texto todo; o destino e de 599 bytes.
+proc pasta_do_fonte(c: ?^Compilacao) -> str {
+    switch r in os.abs_path((c as ^Compilacao).fonte.caminho or_else "", alloc = heap) {
+    case str:
+        var pasta: str = ""
+        if len(r) < PASTA_RAIZ_MAX {
+            pasta = pasta_do_absoluto(r)
+        } else {
+            pasta = pasta_do_absoluto(".\\x")
+        }
+        delete(r)
+        return pasta
+    case os.OsError:
+        return pasta_do_absoluto(".\\x")
+    }
+    return pasta_do_absoluto(".\\x")
+}
+
+// o texto ate a ultima '\' (strrchr), sem ela o texto todo; no alocador frame, cortado em 599 bytes
+proc pasta_do_absoluto(absoluto: str) -> str {
+    var corte: int = len(absoluto)
+    for i in 0..<len(absoluto) {
+        if absoluto[i] == 92 { // '\\'
+            corte = i
+        }
+    }
+    return cortar_em_frame(absoluto[0..<corte], PASTA_RAIZ_MAX - 1)
+}
+
+// C: driver/main_opcoes.c:35
+proc acrescentar_pasta_extra(p: ^PastasDeLigacao, base: str, sub: str) {
+    let texto = format(f"{base}\\{sub}", alloc = heap)
+    defer delete(texto)
+    p.extra[p.nextras] = cortar_em_frame(texto, PASTA_EXTRA_MAX - 1)
+    p.extras[p.nextras] = p.extra[p.nextras]
+    p.nextras += 1
+}
+
+// C: driver/main_opcoes.c:43
+// A pasta extra da origem entra uma vez so: 'vistos' tem 1 bit por origem ja tratada.
+proc pasta_extra_da_origem(p: ^PastasDeLigacao, origem: u8, vistos: ^u32) {
+    let bit: u32 = (1 as u32) << ((origem as u32) & 31)
+    if ((origem != (frontend.MOD_VENDOR as u8)) and (origem != (frontend.MOD_ENGINE as u8))) or ((vistos^ & bit) != 0) {
+        return
+    }
+    vistos^ = vistos^ | bit
+    if origem == (frontend.MOD_VENDOR as u8) {
+        // copia no C: a origem do texto nao pode ser o proprio PastasDeLigacao que recebe o resultado; aqui o texto e imutavel (vista)
+        acrescentar_pasta_extra(p, p.raiz, "vendor")
+        return
+    }
+    let engine: str = os.env("FORJA_ENGINE") or_else ""
+    if len(engine) > 0 {
+        acrescentar_pasta_extra(p, engine, "lib")
+    }
+}
+
+// C: driver/main_opcoes.c:57
+proc pastas_do_programa(c: ?^Compilacao, p: ^PastasDeLigacao) {
+    var vistos: u32 = 0
+    p.raiz = pasta_do_fonte(c)
+    p.nextras = 0
+    var k: u32 = 1
+    while k < (c as ^Compilacao).modulos.n {
+        pasta_extra_da_origem(p, (c as ^Compilacao).modulos.itens[k].origem, &vistos)
+        k += 1
+    }
+}
+
+// C: driver/main_opcoes.c:66
+proc pedido_nativo(o: ^Opcoes, c: ?^Compilacao, saida: ?str) -> nativo.NativoPedido {
+    var tern_1: i32 = bir.BM_DEV
+    if common.c2f_b2i32(o.release) != 0 {
+        tern_1 = bir.BM_RELEASE
+    }
+    return nativo.NativoPedido{ir = &(c as ^Compilacao).ir, tipos = &(c as ^Compilacao).sem.tipos, nomes = &(c as ^Compilacao).nomes, fonte = &(c as ^Compilacao).fonte, modo = tern_1 as u8, saida = saida, alvo = o.target, versao = FORJA_VERSAO, debug_code = o.debug_code, tempos = &(c as ^Compilacao).tempos, comando = o.linha, teste = comando_eh(o, "test"), traco = o.traco, dll = modo_eh_dll(o), lib_pasta = o.lib_pasta, entradas = o.entradas, cargas = &(c as ^Compilacao).resolvidos, pacotes = &(c as ^Compilacao).pastas_carregadas, rastreio = o.rastreio, guarda_memoria = o.guarda_memoria, perfil = o.perfil, pie = o.pie, runpath = o.runpath, simbolos = opcoes_simbolos(o), checagem = opcoes_checagem(o), sem_otim = o.sem_otim}
+}
+
+// C: driver/main_opcoes.c:75
+// "x.dll" -> "x.h" (troca a extensao do nome do arquivo; sem extensao, acrescenta ".h"). Devolve texto de heap (o chamador faz delete), cortado em 599 bytes como o snprintf de 600.
+proc caminho_do_cabecalho(arq_dll: str) -> str {
+    var ponto: int = -1
+    var barra: int = -1 // ultima '/' ou '\\'
+    for i in 0..<len(arq_dll) {
+        if arq_dll[i] == 46 { // '.'
+            ponto = i
+        }
+        if (arq_dll[i] == 47) or (arq_dll[i] == 92) { // '/' '\\'
+            barra = i
+        }
+    }
+    var base: int = len(arq_dll)
+    if (ponto >= 0) and (ponto > barra) {
+        base = ponto
+    }
+    let completo = format(f"{arq_dll[0..<base]}.h", alloc = heap)
+    defer delete(completo)
+    return from_bytes(as_bytes(completo)[0..<min(len(completo), CABECALHO_CAMINHO_MAX - 1)], alloc = heap)
+}
+
+// C: driver/main_opcoes.c:88
+// Cabecalho C da DLL ao lado dela (<saida>.h): um prototipo por 'pub export proc'. No backend x64 a gravacao e atomica, como a da DLL.
+proc gravar_cabecalho(o: ^Opcoes, arq_dll: str, c: ?^Compilacao) -> i32 {
+    var texto = make([dynamic]u8, alloc = heap)
+    var codigo: i32 = nativo.SAIDA_OK
+    let arq_h: str = caminho_do_cabecalho(arq_dll)
+    defer delete(arq_h)
+    backend.emitir_cabecalho(&(c as ^Compilacao).ir, &(c as ^Compilacao).sem.tipos, &(c as ^Compilacao).nomes, &texto)
+    let conteudo: str = to_str(&texto)
+    defer delete(conteudo)
+    var gravou: bool = false
+    if backend_eh_x64(o) {
+        gravou = common.arquivo_gravar_atomico_aviso(arq_h, conteudo, len(conteudo) as u64)
+    } else {
+        gravou = common.arquivo_gravar(arq_h, conteudo, len(conteudo) as u64)
+    }
+    if not gravou {
+        codigo = nativo.SAIDA_USO
+    }
+    return codigo
+}
+
+// C: driver/main_opcoes.c:102
+// DLL sem nenhum 'pub export proc' nao teria simbolo para chamar: B0003 (diagnostico, exit 1).
+proc dll_sem_exportados(sd: ^common.SaidaDiag) -> i32 {
+    let erro = common.c2f_saida_stderr()
+    common.diag_imprimir_json_sem_fonte(common.B0003, "o build --modo dll nao achou nenhum 'pub export proc' no arquivo", erro, sd)
+    _ = common.c2f_saida_fechar(erro)
+    return nativo.SAIDA_DIAGNOSTICO
+}

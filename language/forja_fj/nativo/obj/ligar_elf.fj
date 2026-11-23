@@ -1,0 +1,1177 @@
+// nativo/obj/ligar_elf.fj - porte de compiler/nativo/obj/ligar_elf.c, compiler/nativo/obj/ligar_elf.h
+// sha256 de nativo/obj/ligar_elf.c: 96838972adb80091f81c112bc8e0018dba8b607cf2c9dccaf7a8cda5f417985e
+// sha256 de nativo/obj/ligar_elf.h: 77f59d2a136d611504bfa1d8c9e8b3544dee017a58f49a2339aecbe407c8564d
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.2.0
+// Changelog: 0.2.0 - A4.2/A4.3: celula .got para OR_A64_GOT_PAGE/LD64_GOT_LO12; indefinido da ligacao dinamica vira import (GLOB_DAT).
+
+import "common"
+import "nativo/fmt" as pefmt
+
+struct LigarElfAplicacao {
+    objeto: i32
+    reloc: ?^ObjReloc
+    p: u64
+    // C2F: campo (uint8_t *, aponta para o disp32 na secao de saida) vira a secao (dono: Imagem.secoes[].bytes) + o offset do campo nela; o C escreve campo[-2], campo[-1]
+    sec_saida: ?^[dynamic]u8
+    campo: u64
+}
+
+struct LigarElfCursorTls {
+    fim: u32
+    alinhamento: u32
+}
+
+const ELF_FORMA_NENHUMA: i32 = 0
+const ELF_FORMA_MOV: i32 = 1
+const ELF_FORMA_CALL: i32 = 2
+const ELF_FORMA_JMP: i32 = 3
+const ELF_TAM_CELULA: u32 = 8
+const ELF_TAM_CAMPO_ABS64: u32 = 8
+const ELF_TAM_CAMPO_32: u32 = 4
+const ELF_BITS_BYTE: u32 = 8
+const ELF_FIM_CAMPO_PC: i32 = 4
+const ELF_OP_FF: u32 = 255
+const ELF_OP_MOV: u32 = 139
+const ELF_OP_LEA: u32 = 141
+const ELF_OP_NOP: u32 = 144
+const ELF_OP_CALL: u32 = 232
+const ELF_OP_JMP: u32 = 233
+const ELF_MODRM_CALL: u32 = 21
+const ELF_MODRM_JMP: u32 = 37
+const ELF_MODRM_RIP: u32 = 5
+const ELF_MODRM_MASCARA: u32 = 199
+const ELF_SIMB_INIT_INI: i32 = 0
+const ELF_SIMB_INIT_FIM: i32 = 1
+const ELF_SIMB_FINI_INI: i32 = 2
+const ELF_SIMB_FINI_FIM: i32 = 3
+const ELF_SIMB_EHDR: i32 = 4
+const ELF_SIMB_GOT: i32 = 5
+const ELF_SIMB_DYNAMIC: i32 = 6
+const ELF_OP_ADD: u32 = 3
+const ELF_OP_MOV_IMM: u32 = 199
+const ELF_OP_ADD_IMM: u32 = 129
+const ELF_MODRM_DIRETO: u32 = 192
+const ELF_MODRM_REG_SHIFT: i32 = 3
+const ELF_MODRM_REG: u32 = 7
+const ELF_REX_R: u32 = 68
+const ELF_REX_R_MASCARA: u32 = 244
+
+// C: nativo/obj/ligar_elf.c:69
+proc ligar_elf_simbolo(l: ^LigacaoEstado, o: i32, i: u32) -> ^ObjSimbolo {
+    return &((l.obj or_else {})[o] as ^Objeto).simbolos[i as u64]
+}
+
+// C: nativo/obj/ligar_elf.c:74
+proc ligar_elf_definido_fora(l: ^LigacaoEstado, o: i32, nome: str) -> bool {
+    for outro in (0 as i32)..<LIGAR_QTD_OBJETOS {
+        var tern_1: i64 = 0
+        if outro == o {
+            tern_1 = -1
+        } else {
+            tern_1 = obj_achar_simbolo((l.obj or_else {})[outro] as ^Objeto, nome)
+        }
+        let j: i64 = tern_1
+        if j < 0 {
+            continue
+        }
+        let d: ^ObjSimbolo = &((l.obj or_else {})[outro] as ^Objeto).simbolos[common.c2f_s2u_64(j)]
+        if (common.c2f_b2i32(d.global) != 0) and (d.secao != OBJ_SECAO_INDEFINIDA) {
+            return true
+        }
+    }
+    return false
+}
+
+// C: nativo/obj/ligar_elf.c:88
+proc ligar_elf_definido(l: ^LigacaoEstado, o: i32, i: u32) -> bool {
+    let s: ^ObjSimbolo = ligar_elf_simbolo(l, o, i)
+    if s.secao != OBJ_SECAO_INDEFINIDA {
+        return true
+    }
+    return (common.c2f_b2i32(s.global) != 0) and (common.c2f_b2i32(ligar_elf_definido_fora(l, o, (s.nome or_else ""))) != 0)
+}
+
+// C: nativo/obj/ligar_elf.c:97
+proc ligar_elf_forma_de(s: ^ObjSecao, off: u32) -> i32 {
+    // C2F: off + 4 sai em u64 (o C soma em u32; so difere para off perto de 2^32, onde o C ja le fora do buffer)
+    let tam: u64 = len(s.bytes) as u64
+    let pos: u64 = off as u64
+    if (pos < 2) or ((pos + (ELF_TAM_CAMPO_32 as u64)) > tam) {
+        return ELF_FORMA_NENHUMA
+    }
+    let opcode: u32 = s.bytes[pos - 2] as u32
+    let modrm: u32 = s.bytes[pos - 1] as u32
+    if (opcode == ELF_OP_MOV) and ((modrm & ELF_MODRM_MASCARA) == ELF_MODRM_RIP) {
+        return ELF_FORMA_MOV
+    }
+    if (opcode == ELF_OP_FF) and (modrm == ELF_MODRM_CALL) {
+        return ELF_FORMA_CALL
+    }
+    if (opcode == ELF_OP_FF) and (modrm == ELF_MODRM_JMP) {
+        return ELF_FORMA_JMP
+    }
+    return ELF_FORMA_NENHUMA
+}
+
+// C: nativo/obj/ligar_elf.c:112
+proc ligar_elf_relaxavel(l: ^LigacaoEstado, o: i32, r: ^ObjReloc) -> bool {
+    let s: ^ObjSecao = &((l.obj or_else {})[o] as ^Objeto).secoes[r.alvo.secao as u64]
+    return (common.c2f_b2i32(ligar_elf_definido(l, o, r.correcao.simbolo)) != 0) and (common.c2f_s2u_32(ligar_elf_forma_de(s, r.alvo.off)) != (ELF_FORMA_NENHUMA as u32))
+}
+
+// C: nativo/obj/ligar_elf.c:119
+// C2F: campo (uint8_t *) vira secao de saida + offset do disp32 nela (campo >= 2 garantido por ligar_elf_forma_de)
+proc ligar_elf_relaxar(sec: ^[dynamic]u8, campo: u64, forma: i32) {
+    if forma == ELF_FORMA_MOV {
+        sec[campo - 2] = ELF_OP_LEA as u8
+        return
+    }
+    sec[campo - 2] = ELF_OP_NOP as u8
+    if forma == ELF_FORMA_CALL {
+        sec[campo - 1] = ELF_OP_CALL as u8
+    } else {
+        sec[campo - 1] = ELF_OP_JMP as u8
+    }
+}
+
+// C2F: texto de %x/%llx (hexadecimal minusculo, sem enchimento; 0 sai "0"); texto de heap, o chamador faz delete
+proc ligar_elf_hex_minusc(x: u64) -> str {
+    var tmp: [16]u8 = {}
+    var n = 0
+    var v = x
+    while v > 0 {
+        let d = (v & 15) as u8
+        if d < 10 {
+            tmp[n] = 48 + d
+        } else {
+            tmp[n] = 87 + d
+        }
+        n += 1
+        v = v >> 4
+    }
+    if n == 0 {
+        tmp[0] = 48
+        n = 1
+    }
+    var out = make([dynamic]u8, alloc = heap, cap = 16)
+    defer delete(out)
+    var k = n
+    while k > 0 {
+        k -= 1
+        append(&out, item = tmp[k])
+    }
+    let texto = to_str(&out)
+    return texto
+}
+
+// C: nativo/obj/ligar_elf.c:129
+// C2F-13: p fundido em n (len)
+proc ligar_elf_escrever(p: []u8, v: u64) {
+    for k in (0 as u32)..<(len(p) as u32) {
+        p[k] = common.c2f_trunc_u8(v >> (((k * ELF_BITS_BYTE) as u64) & 63))
+    }
+}
+
+// C: nativo/obj/ligar_elf.c:138
+proc ligar_elf_fraco_zero(l: ^LigacaoEstado, o: i32, i: u32) -> bool {
+    let s: ^ObjSimbolo = ligar_elf_simbolo(l, o, i)
+    return (l.rva_sim[o][i as u64] == LIGAR_SEM_RVA) and s.fraco and (s.secao == OBJ_SECAO_INDEFINIDA)
+}
+
+// C: nativo/obj/ligar_elf.c:145
+proc ligar_elf_relativa(l: ^LigacaoEstado, rva: u32, valor: u64) -> bool {
+    append(&(l.im as ^pefmt.Imagem).relativos, item = pefmt.ImagemRelativa{})
+    let r: ^pefmt.ImagemRelativa = &(l.im as ^pefmt.Imagem).relativos[len((l.im as ^pefmt.Imagem).relativos) - 1]
+    r.rva = rva
+    r.valor = valor
+    return true
+}
+
+// C: nativo/obj/ligar_elf.c:155
+proc ligar_elf_pie_addr64(l: ^LigacaoEstado, ap: ^LigarElfAplicacao, saida: i32, valor: u64) -> bool {
+    let r: ^ObjReloc = ap.reloc as ^ObjReloc
+    if (not (l.pedido as ^LigarPedido).pie) or (r.correcao.tipo != OR_ADDR64) or ligar_elf_fraco_zero(l, ap.objeto, r.correcao.simbolo) {
+        return true
+    }
+    if saida == LIGAR_SAIDA_TEXTO {
+        let txt_1 = ligar_elf_simbolo(l, ap.objeto, r.correcao.simbolo).nome or_else "(null)"
+        let msg_1 = format(f"ELF pie: ADDR64 do simbolo '{txt_1}' cai em .text (TEXTREL), que o static-pie nao aceita", alloc = heap)
+        defer delete(msg_1)
+        return common.diag_relatar(l.erro as ^common.Diag, common.X0112, 0, msg_1)
+    }
+    return ligar_elf_relativa(l, common.c2f_trunc_u32(wrapping_sub(ap.p, pefmt.pe_base_da_imagem(l.im))), valor)
+}
+
+// C: nativo/obj/ligar_elf.c:169
+proc ligar_elf_mesma_celula(l: ^LigacaoEstado, c: ^LigarCelula, o: i32, i: u32) -> bool {
+    let a: ^ObjSimbolo = ligar_elf_simbolo(l, c.objeto, c.simbolo)
+    let b: ^ObjSimbolo = ligar_elf_simbolo(l, o, i)
+    if (common.c2f_b2i32(a.global) != 0) and (common.c2f_b2i32(b.global) != 0) {
+        return (a.nome or_else "") == (b.nome or_else "")
+    }
+    return (c.objeto == o) and (c.simbolo == i)
+}
+
+// C: nativo/obj/ligar_elf.c:180
+proc ligar_elf_indice_celula(l: ^LigacaoEstado, o: i32, i: u32) -> i64 {
+    var k: u64 = 0
+    while k < (len(l.celulas) as u64) {
+        if ligar_elf_mesma_celula(l, &l.celulas[k], o, i) {
+            return transmute(k, to = i64)
+        }
+        k += 1
+    }
+    return -1
+}
+
+// C: nativo/obj/ligar_elf.c:190
+proc ligar_elf_precisa_celula(l: ^LigacaoEstado, o: i32, r: ^ObjReloc) -> bool {
+    if common.c2f_s2u_32(r.correcao.tipo) == (OR_GOTPCREL as u32) {
+        return true
+    }
+    if (r.correcao.tipo == OR_A64_GOT_PAGE) or (r.correcao.tipo == OR_A64_LD64_GOT_LO12) {
+        return true // A4.3: a celula da GOT de um simbolo local (RELATIVE) ou importado (GLOB_DAT)
+    }
+    return (common.c2f_s2u_32(r.correcao.tipo) == (OR_GOTPCRELX as u32)) and (not ligar_elf_relaxavel(l, o, r))
+}
+
+// C: nativo/obj/ligar_elf.c:197
+proc ligar_elf_viva(l: ^LigacaoEstado, o: i32, r: ^ObjReloc) -> bool {
+    return l.contrib[o][r.alvo.secao as u64].saida != LIGAR_SEM_SAIDA
+}
+
+// C: nativo/obj/ligar_elf.c:202
+proc ligar_elf_planejar_objeto(l: ^LigacaoEstado, o: i32) {
+    let rels: ^[dynamic]ObjReloc = &((l.obj or_else {})[o] as ^Objeto).relocs
+    var i: u64 = 0
+    while i < (len(rels^) as u64) {
+        let r: ^ObjReloc = &rels[i]
+        if ((not ligar_elf_viva(l, o, r)) or (not ligar_elf_precisa_celula(l, o, r))) or (ligar_elf_indice_celula(l, o, r.correcao.simbolo) >= 0) {
+            i += 1
+            continue
+        }
+        append(&l.celulas, item = LigarCelula{})
+        let nova: ^LigarCelula = &l.celulas[len(l.celulas) - 1]
+        nova.objeto = o
+        nova.simbolo = r.correcao.simbolo
+        i += 1
+    }
+}
+
+// C: nativo/obj/ligar_elf.c:216
+proc ligar_elf_planejar_got(l: ^LigacaoEstado) {
+    if common.c2f_s2u_32((l.pedido as ^LigarPedido).formato) != (pefmt.IMAGEM_ELF as u32) {
+        return
+    }
+    for o in (0 as i32)..<LIGAR_QTD_OBJETOS {
+        ligar_elf_planejar_objeto(l, o)
+    }
+    l.tam[LIGAR_SAIDA_GOT] = common.c2f_trunc_u32((len(l.celulas) as u64) * (ELF_TAM_CELULA as u64))
+}
+
+// A4.2: simbolo indefinido (nao fraco) numa ligacao dinamica vira import: registra a celula para o GLOB_DAT do escritor
+proc ligar_elf_import_din(l: ^LigacaoEstado, c: ^LigarCelula, rva_celula: u32) -> bool {
+    let sim: ^ObjSimbolo = ligar_elf_simbolo(l, c.objeto, c.simbolo)
+    if (not (l.pedido as ^LigarPedido).dinamico) or (sim.secao != OBJ_SECAO_INDEFINIDA) or sim.fraco {
+        return false
+    }
+    append(&(l.im as ^pefmt.Imagem).imports_din, item = pefmt.ImagemImportDin{nome = sim.nome, rva = rva_celula})
+    return true
+}
+
+// C: nativo/obj/ligar_elf.c:225
+proc ligar_elf_preencher_got(l: ^LigacaoEstado) {
+    if l.tam[LIGAR_SAIDA_GOT] == 0 {
+        return
+    }
+    let im: ^pefmt.Imagem = l.im as ^pefmt.Imagem
+    let ps: ^pefmt.PeSecao = &im.secoes[l.idx_im[LIGAR_SAIDA_GOT] as u64]
+    var k: u64 = 0
+    while k < (len(l.celulas) as u64) {
+        let c: ^LigarCelula = &l.celulas[k]
+        let rva: u32 = l.rva_sim[c.objeto][c.simbolo as u64]
+        var endereco: u64 = 0 // fraco indefinido = 0 (D-R6)
+        if (rva == LIGAR_SEM_RVA) and ligar_elf_import_din(l, c, wrapping_add(l.rva[LIGAR_SAIDA_GOT], common.c2f_trunc_u32(k * (ELF_TAM_CELULA as u64)))) {
+            k += 1
+            continue // A4.2: a celula e do carregador (GLOB_DAT), nao ha endereco para gravar
+        }
+        if rva != LIGAR_SEM_RVA {
+            endereco = wrapping_add(pefmt.pe_base_da_imagem(l.im), rva as u64)
+        }
+        let ini: u64 = k * (ELF_TAM_CELULA as u64)
+        ligar_elf_escrever(ps.bytes[ini..<(ini + (ELF_TAM_CELULA as u64))], endereco)
+        if (l.pedido as ^LigarPedido).pie and (endereco != 0) {
+            _ = ligar_elf_relativa(l, wrapping_add(l.rva[LIGAR_SAIDA_GOT], common.c2f_trunc_u32(ini)), endereco)
+        }
+        k += 1
+    }
+}
+
+// C: nativo/obj/ligar_elf.c:243
+proc ligar_elf_alvo_abs(l: ^LigacaoEstado, o: i32, i: u32, s: ^u64) -> bool {
+    let rva: u32 = l.rva_sim[o][i as u64]
+    let sim: ^ObjSimbolo = ligar_elf_simbolo(l, o, i)
+    if (rva == LIGAR_SEM_RVA) and sim.fraco and (sim.secao == OBJ_SECAO_INDEFINIDA) {
+        s^ = 0
+        return true
+    }
+    if rva == LIGAR_SEM_RVA {
+        let txt_1 = sim.nome or_else "(null)"
+        let msg_1 = format(f"ELF: relocacao aponta para o simbolo '{txt_1}', que cai numa secao vazia", alloc = heap)
+        defer delete(msg_1)
+        return common.diag_relatar(l.erro as ^common.Diag, common.X0903, 0, msg_1)
+    }
+    s^ = wrapping_add(pefmt.pe_base_da_imagem(l.im), rva as u64)
+    return true
+}
+
+// C: nativo/obj/ligar_elf.c:258
+proc ligar_elf_abs32(l: ^LigacaoEstado, ap: ^LigarElfAplicacao, v: i64, valor: ^u64) -> bool {
+    let r: ^ObjReloc = ap.reloc as ^ObjReloc
+    let minimo: i64 = -2147483648
+    var cabe: bool = false
+    if r.correcao.tipo == OR_ABS32 {
+        cabe = (v >= 0) and (v <= 4294967295)
+    } else {
+        cabe = (v >= minimo) and (v <= 2147483647)
+    }
+    if (l.pedido as ^LigarPedido).pie {
+        let txt_1 = ligar_elf_simbolo(l, ap.objeto, r.correcao.simbolo).nome or_else "(null)"
+        let msg_1 = format(f"ELF pie: relocacao absoluta de 32 bits do simbolo '{txt_1}' nao cabe em PIE (o campo nao recebe a base)", alloc = heap)
+        defer delete(msg_1)
+        return common.diag_relatar(l.erro as ^common.Diag, common.X0112, 0, msg_1)
+    }
+    if not cabe {
+        let txt_2 = ligar_elf_simbolo(l, ap.objeto, r.correcao.simbolo).nome or_else "(null)"
+        let hex_2 = ligar_elf_hex_minusc(common.c2f_s2u_64(v))
+        defer delete(hex_2)
+        let msg_2 = format(f"ELF: relocacao absoluta de 32 bits do simbolo '{txt_2}' nao cabe no endereco 0x{hex_2}", alloc = heap)
+        defer delete(msg_2)
+        return common.diag_relatar(l.erro as ^common.Diag, common.X0903, 0, msg_2)
+    }
+    valor^ = common.c2f_s2u_64(v)
+    return true
+}
+
+// C: nativo/obj/ligar_elf.c:274
+proc ligar_elf_valor_got(l: ^LigacaoEstado, ap: ^LigarElfAplicacao, s: u64, v: ^i64) -> bool {
+    let r: ^ObjReloc = ap.reloc as ^ObjReloc
+    let a: i64 = r.correcao.adendo
+    var alvo: u64 = s
+    if ligar_elf_relaxavel(l, ap.objeto, r) {
+        let sec: ^ObjSecao = &((l.obj or_else {})[ap.objeto] as ^Objeto).secoes[r.alvo.secao as u64]
+        ligar_elf_relaxar(ap.sec_saida as ^[dynamic]u8, ap.campo, ligar_elf_forma_de(sec, r.alvo.off))
+    } else {
+        let k: i64 = ligar_elf_indice_celula(l, ap.objeto, r.correcao.simbolo)
+        if k < 0 {
+            let msg_1 = format(f"ligar: celula .got de um simbolo do objeto {ap.objeto} nao foi planejada", alloc = heap)
+            defer delete(msg_1)
+            common.falha_interna(msg_1)
+        }
+        alvo = wrapping_add(wrapping_add(pefmt.pe_base_da_imagem(l.im), l.rva[LIGAR_SAIDA_GOT] as u64), common.c2f_s2u_64(k) * (ELF_TAM_CELULA as u64))
+    }
+    v^ = wrapping_sub(wrapping_add(transmute(alvo, to = i64), a), transmute(ap.p + (ELF_FIM_CAMPO_PC as u64), to = i64))
+    return true
+}
+
+// C: nativo/obj/ligar_elf.c:294
+proc ligar_elf_offset_tls(l: ^LigacaoEstado, ap: ^LigarElfAplicacao, s: ^i64) -> bool {
+    let r: ^ObjReloc = ap.reloc as ^ObjReloc
+    let rva: u32 = l.rva_sim[ap.objeto][r.correcao.simbolo as u64]
+    let ini: u32 = l.rva[LIGAR_SAIDA_TLS]
+    let sim: ^ObjSimbolo = ligar_elf_simbolo(l, ap.objeto, r.correcao.simbolo)
+    if (rva == LIGAR_SEM_RVA) or (rva < ini) or ((rva - ini) >= l.tam[LIGAR_SAIDA_TLS]) {
+        let txt_1 = sim.nome or_else "(null)"
+        let msg_1 = format(f"ELF: relocacao de TLS do simbolo '{txt_1}' fora do bloco TLS (indefinido ou sem __thread)", alloc = heap)
+        defer delete(msg_1)
+        return common.diag_relatar(l.erro as ^common.Diag, common.X0111, 0, msg_1)
+    }
+    s^ = (rva - ini) as i64
+    return true
+}
+
+// C: nativo/obj/ligar_elf.c:307
+proc ligar_elf_forma_tls(s: ^ObjSecao, off: u32) -> i32 {
+    // C2F: devolve o opcode (8b ou 03) ou 0 quando o LE nao relaxa; off + 4 em u64 (ver ligar_elf_forma_de)
+    let tam: u64 = len(s.bytes) as u64
+    let pos: u64 = off as u64
+    if (pos < 2) or ((pos + (ELF_TAM_CAMPO_32 as u64)) > tam) {
+        return 0
+    }
+    if (pos >= 3) and ((s.bytes[pos - 3] as u32) & ELF_REX_R_MASCARA) == ELF_REX_R {
+        return 0
+    }
+    if ((s.bytes[pos - 1] as u32) & ELF_MODRM_MASCARA) != ELF_MODRM_RIP {
+        return 0
+    }
+    let opcode: u32 = s.bytes[pos - 2] as u32
+    if (opcode == ELF_OP_MOV) or (opcode == ELF_OP_ADD) {
+        return opcode as i32
+    }
+    return 0
+}
+
+// C: nativo/obj/ligar_elf.c:323
+proc ligar_elf_relaxar_tls(l: ^LigacaoEstado, ap: ^LigarElfAplicacao) -> bool {
+    let r: ^ObjReloc = ap.reloc as ^ObjReloc
+    let sec: ^ObjSecao = &((l.obj or_else {})[ap.objeto] as ^Objeto).secoes[r.alvo.secao as u64]
+    let op: i32 = ligar_elf_forma_tls(sec, r.alvo.off)
+    if op == 0 {
+        let txt_1 = ligar_elf_simbolo(l, ap.objeto, r.correcao.simbolo).nome or_else "(null)"
+        let msg_1 = format(f"ELF: GOTTPOFF do simbolo '{txt_1}' com forma que o LE nao relaxa (so mov ou add com [rip+d], sem REX.R)", alloc = heap)
+        defer delete(msg_1)
+        return common.diag_relatar(l.erro as ^common.Diag, common.X0114, 0, msg_1)
+    }
+    let bytes: ^[dynamic]u8 = ap.sec_saida as ^[dynamic]u8
+    let modrm: u32 = bytes[ap.campo - 1] as u32
+    if (op as u32) == ELF_OP_MOV {
+        bytes[ap.campo - 2] = ELF_OP_MOV_IMM as u8
+    } else {
+        bytes[ap.campo - 2] = ELF_OP_ADD_IMM as u8
+    }
+    bytes[ap.campo - 1] = (ELF_MODRM_DIRETO | ((modrm >> (ELF_MODRM_REG_SHIFT as u32)) & ELF_MODRM_REG)) as u8
+    return true
+}
+
+// C: nativo/obj/ligar_elf.c:337
+proc ligar_elf_valor_tls(l: ^LigacaoEstado, ap: ^LigarElfAplicacao, valor: ^u64) -> bool {
+    var s: i64 = 0
+    var tpoff: i64 = 0
+    if not ligar_elf_offset_tls(l, ap, &s) {
+        return false
+    }
+    tpoff = s - (l.tls_bloco as i64)
+    if common.c2f_s2u_32((ap.reloc as ^ObjReloc).correcao.tipo) == (OR_TPOFF32 as u32) {
+        tpoff += (ap.reloc as ^ObjReloc).correcao.adendo
+    } else if not ligar_elf_relaxar_tls(l, ap) {
+        return false
+    }
+    valor^ = common.c2f_s2u_64(tpoff)
+    return true
+}
+
+// C: nativo/obj/ligar_elf.c:353
+proc ligar_elf_valor(l: ^LigacaoEstado, ap: ^LigarElfAplicacao, valor: ^u64) -> bool {
+    let r: ?^ObjReloc = ap.reloc
+    var s: u64 = 0
+    var v: i64 = 0
+    if (common.c2f_s2u_32((r as ^ObjReloc).correcao.tipo) == (OR_TPOFF32 as u32)) or (common.c2f_s2u_32((r as ^ObjReloc).correcao.tipo) == (OR_GOTTPOFF as u32)) {
+        return ligar_elf_valor_tls(l, ap, valor)
+    }
+    if not ligar_elf_alvo_abs(l, ap.objeto, (r as ^ObjReloc).correcao.simbolo, &s) {
+        return false
+    }
+    let sw_1 = common.c2f_s2u_32((r as ^ObjReloc).correcao.tipo)
+    if sw_1 == (OR_ADDR64 as u32) {
+        valor^ = common.c2f_s2u_64((transmute(s, to = i64) + (r as ^ObjReloc).correcao.adendo))
+        return true
+    } else if sw_1 == (OR_ABS32 as u32) or sw_1 == (OR_ABS32S as u32) {
+        return ligar_elf_abs32(l, ap, transmute(s, to = i64) + (r as ^ObjReloc).correcao.adendo, valor)
+    } else if sw_1 == (OR_REL32 as u32) {
+        v = (transmute(s, to = i64) + (r as ^ObjReloc).correcao.adendo) - transmute(ap.p + (ELF_FIM_CAMPO_PC as u64), to = i64)
+        valor^ = common.c2f_s2u_64(v)
+        return true
+    } else if sw_1 == (OR_GOTPCREL as u32) or sw_1 == (OR_GOTPCRELX as u32) {
+        if not ligar_elf_valor_got(l, ap, s, &v) {
+            return false
+        }
+        valor^ = common.c2f_s2u_64(v)
+        return true
+    } else {
+        let msg_1 = format(f"ligar: relocacao ELF de tipo {(r as ^ObjReloc).correcao.tipo} sem tratamento", alloc = heap)
+        defer delete(msg_1)
+        common.falha_interna(msg_1)
+    }
+    return false
+}
+
+// C: nativo/obj/ligar_elf.c:385
+proc ligar_elf_relocar(l: ^LigacaoEstado, o: i32, r: ^ObjReloc) -> bool {
+    let c: ^LigarContrib = &l.contrib[o][r.alvo.secao as u64]
+    var tam: u32 = ELF_TAM_CAMPO_32
+    if r.correcao.tipo == OR_ADDR64 {
+        tam = ELF_TAM_CAMPO_ABS64
+    }
+    let sec_off: u32 = wrapping_add(c.off, r.alvo.off)
+    let ps: ^pefmt.PeSecao = &(l.im as ^pefmt.Imagem).secoes[l.idx_im[c.saida] as u64]
+    var valor: u64 = 0
+    if (l.tam[c.saida] == 0) or ((wrapping_add(sec_off, tam) as u64) > (len(ps.bytes) as u64)) {
+        let hex_1 = ligar_elf_hex_minusc(sec_off as u64)
+        defer delete(hex_1)
+        let msg_1 = format(f"ligar: relocacao ELF em 0x{hex_1} fora da secao de saida {c.saida}", alloc = heap)
+        defer delete(msg_1)
+        common.falha_interna(msg_1)
+    }
+    var ap: LigarElfAplicacao = LigarElfAplicacao{objeto = o, reloc = r, p = wrapping_add(wrapping_add(pefmt.pe_base_da_imagem(l.im), l.rva[c.saida] as u64), sec_off as u64), sec_saida = &ps.bytes, campo = sec_off as u64}
+    // A64 (A1.2): relocacao de instrucao AArch64 faz OR na palavra; so existe no alvo aarch64-linux
+    if (r.correcao.tipo >= OR_A64_CALL26) and (r.correcao.tipo <= OR_A64_LD64_GOT_LO12) {
+        return ligar_a64_relocar(l, &ap, ps.bytes[..])
+    }
+    if not ligar_elf_valor(l, &ap, &valor) {
+        return false
+    }
+    ligar_elf_escrever(ps.bytes[(sec_off as u64)..<((sec_off as u64) + (tam as u64))], valor)
+    return ligar_elf_pie_addr64(l, &ap, c.saida, valor)
+}
+
+// C: nativo/obj/ligar_elf.c:403
+proc ligar_elf_indice_debug(tipo: i32) -> i32 {
+    var tern_1: i32 = -1
+    if common.c2f_s2u_32(tipo) >= (OS_DEBUG_ABBREV as u32) {
+        tern_1 = tipo - OS_DEBUG_ABBREV
+    }
+    return tern_1
+}
+
+// C: nativo/obj/ligar_elf.c:410
+// C2F: campo (uint8_t * para 8 bytes no buffer de debug) vira a fatia de 8 bytes do buffer (a escrita grava em len(campo) = 8 bytes)
+proc ligar_elf_debug_reloc(l: ^LigacaoEstado, campo: []u8, r: ^ObjReloc) {
+    let rva: u32 = l.rva_sim[LIGAR_PROGRAMA][r.correcao.simbolo as u64]
+    let valor: u64 = wrapping_add(wrapping_add(pefmt.pe_base_da_imagem(l.im), rva as u64), common.c2f_s2u_64(r.correcao.adendo))
+    if (r.correcao.tipo != OR_ADDR64) or (rva == LIGAR_SEM_RVA) {
+        common.falha_interna("ligar: relocacao de debug fora do ADDR64 ou simbolo sem RVA")
+    }
+    ligar_elf_escrever(campo, valor)
+}
+
+// C: nativo/obj/ligar_elf.c:421
+// C2F: BufAnexarN vira append(items =) sobre Imagem.dbg[k] (precisa de make feito por quem inicia a Imagem)
+proc ligar_elf_debug(l: ^LigacaoEstado) {
+    let o: ^Objeto = (l.obj or_else {})[LIGAR_PROGRAMA] as ^Objeto
+    let im: ^pefmt.Imagem = l.im as ^pefmt.Imagem
+    var s: u64 = 0
+    while s < (len(o.secoes) as u64) {
+        let sec: ^ObjSecao = &o.secoes[s]
+        let k: i32 = ligar_elf_indice_debug(sec.tipo)
+        if k < 0 {
+            s += 1
+            continue
+        }
+        let dst: ^[dynamic]u8 = &im.dbg[k as u64]
+        append(dst, items = sec.bytes[0..<len(sec.bytes)])
+        var i: u64 = 0
+        while i < (len(o.relocs) as u64) {
+            let r: ^ObjReloc = &o.relocs[i]
+            if (r.alvo.secao as u64) == s {
+                let ini: u64 = r.alvo.off as u64
+                ligar_elf_debug_reloc(l, dst[ini..<(ini + 8)], r)
+            }
+            i += 1
+        }
+        s += 1
+    }
+}
+
+// C: nativo/obj/ligar_elf.c:445
+proc ligar_elf_simbolo_do_ligador(l: ^LigacaoEstado, nome: str, rva: ^u32) -> bool {
+    var tern_1: u32 = 0
+    if l.tam[LIGAR_SAIDA_INIT_ARRAY] > 0 {
+        tern_1 = l.rva[LIGAR_SAIDA_INIT_ARRAY]
+    }
+    let ini: u32 = tern_1
+    let fim: u32 = ini + l.tam[LIGAR_SAIDA_INIT_ARRAY]
+    let k: i32 = alcance_indice_simbolo_do_ligador(nome)
+    if (k < 0) or (common.c2f_s2u_32((l.pedido as ^LigarPedido).formato) != (pefmt.IMAGEM_ELF as u32)) {
+        return false
+    }
+    if k == ELF_SIMB_DYNAMIC {
+        if not (l.pedido as ^LigarPedido).pie {
+            return false
+        }
+        rva^ = pefmt.elf_inicio_dinamico(l.im) as u32
+        return true
+    }
+    if k == ELF_SIMB_INIT_INI {
+        rva^ = ini
+    } else if k == ELF_SIMB_EHDR {
+        rva^ = 0
+    } else if k == ELF_SIMB_GOT {
+        if l.tam[LIGAR_SAIDA_GOT] == 0 {
+            return false
+        }
+        rva^ = l.rva[LIGAR_SAIDA_GOT]
+    } else {
+        rva^ = fim
+    }
+    return true
+}
+
+// C: nativo/obj/ligar_elf.c:474
+proc ligar_elf_simbolo_na_imagem(l: ^LigacaoEstado, o: i32, s: ^ObjSimbolo, k: ^i32) -> bool {
+    if s.secao < 0 {
+        return false
+    }
+    let nome: str = s.nome or_else ""
+    if (len(nome) > 0) and (nome[0] == 46) { // '.'
+        return false
+    }
+    k^ = l.contrib[o][s.secao as u64].saida
+    return (k^ != LIGAR_SEM_SAIDA) and (l.tam[k^] > 0)
+}
+
+// C: nativo/obj/ligar_elf.c:482
+proc ligar_elf_coletar_simbolos(l: ^LigacaoEstado) {
+    let im: ^pefmt.Imagem = l.im as ^pefmt.Imagem
+    for o in (0 as i32)..<LIGAR_QTD_OBJETOS {
+        let obj: ^Objeto = (l.obj or_else {})[o] as ^Objeto
+        var j: u64 = 0
+        while j < (len(obj.simbolos) as u64) {
+            let s: ^ObjSimbolo = &obj.simbolos[j]
+            var k: i32 = 0
+            if ligar_elf_simbolo_na_imagem(l, o, s, &k) {
+                append(&im.simbolos, item = pefmt.ImagemSimbolo{nome = s.nome, rva = l.rva_sim[o][j], secao = l.idx_im[k]})
+            }
+            j += 1
+        }
+    }
+}
+
+// C: nativo/obj/ligar_elf.c:495
+proc ligar_elf_conferir_formato(pedido: ^LigarPedido, erro: ^common.Diag) -> bool {
+    if common.c2f_s2u_32(pedido.formato) != (pefmt.IMAGEM_ELF as u32) {
+        return true
+    }
+    if ((common.c2f_b2i32(pedido.dll) != 0) and (not pedido.dinamico)) or (pedido.qtd_tabelas > 0) {
+        let msg_1 = format(f"o alvo ELF nao liga DLL nem tabelas de imports ({pedido.qtd_tabelas} pedidas)", alloc = heap)
+        defer delete(msg_1)
+        return common.diag_relatar(erro, common.X0903, 0, msg_1)
+    }
+    return true
+}
+
+// C: nativo/obj/ligar_elf.c:506
+proc ligar_saida_elf(s: ^ObjSecao) -> i32 {
+    let sw_1 = common.c2f_s2u_32(s.tipo)
+    if sw_1 == (OS_TEXTO as u32) {
+        return LIGAR_SAIDA_TEXTO
+    } else if sw_1 == (OS_RDATA as u32) {
+        return LIGAR_SAIDA_RDATA
+    } else if sw_1 == (OS_DATA as u32) {
+        return LIGAR_SAIDA_DATA
+    } else if sw_1 == (OS_BSS as u32) {
+        return LIGAR_SAIDA_BSS
+    } else if sw_1 == (OS_INIT_ARRAY as u32) {
+        return LIGAR_SAIDA_INIT_ARRAY
+    } else if sw_1 == (OS_PDATA as u32) {
+        return LIGAR_SAIDA_PDATA
+    } else if sw_1 == (OS_XDATA as u32) {
+        return LIGAR_SAIDA_XDATA
+    } else if sw_1 == (OS_TDATA as u32) or sw_1 == (OS_TBSS as u32) {
+        return LIGAR_SAIDA_TLS
+    } else {
+        return LIGAR_SEM_SAIDA
+    }
+    return 0
+}
+
+// C: nativo/obj/ligar_elf.c:523
+proc ligar_elf_sem_saida(l: ^LigacaoEstado, s: ^ObjSecao) -> bool {
+    let txt_1 = s.nome or_else "(null)"
+    let msg_1 = format(f"ELF: secao '{txt_1}' (tipo {s.tipo}) sem saida no ligador", alloc = heap)
+    defer delete(msg_1)
+    return common.diag_relatar(l.erro as ^common.Diag, common.X0903, 0, msg_1)
+}
+
+// C: nativo/obj/ligar_elf.c:530
+proc ligar_elf_tls_permitido(l: ^LigacaoEstado, s: ^ObjSecao) -> bool {
+    if (l.pedido as ^LigarPedido).semente != none {
+        return true
+    }
+    let txt_1 = s.nome or_else "(null)"
+    let msg_1 = format(f"ELF: a secao TLS '{txt_1}' liga so com a libc (musl): a ligacao crua nao monta o bloco TLS", alloc = heap)
+    defer delete(msg_1)
+    return common.diag_relatar(l.erro as ^common.Diag, common.X0113, 0, msg_1)
+}
+
+// C: nativo/obj/ligar_elf.c:543
+proc ligar_elf_tls_por(c: ^LigarContrib, s: ^ObjSecao, cur: ^LigarElfCursorTls) {
+    var tern_1: u32 = (len(s.bytes) as u64) as u32
+    if common.c2f_s2u_32(s.tipo) == (OS_TBSS as u32) {
+        tern_1 = s.tam_bss
+    }
+    let tam: u32 = tern_1
+    c.off = (((cur.fim + s.alinhamento) - 1) / s.alinhamento) * s.alinhamento
+    cur.fim = c.off + tam
+    if s.alinhamento > cur.alinhamento {
+        cur.alinhamento = s.alinhamento
+    }
+}
+
+// C: nativo/obj/ligar_elf.c:554
+proc ligar_elf_tls_passar(l: ^LigacaoEstado, tipo: i32, cur: ^LigarElfCursorTls) {
+    for o in (0 as i32)..<LIGAR_QTD_OBJETOS {
+        let obj: ^Objeto = (l.obj or_else {})[o] as ^Objeto
+        var sec: u64 = 0
+        while sec < (len(obj.secoes) as u64) {
+            let s: ^ObjSecao = &obj.secoes[sec]
+            let c: ^LigarContrib = &l.contrib[o][sec]
+            if (s.tipo == tipo) and (c.saida == LIGAR_SAIDA_TLS) {
+                ligar_elf_tls_por(c, s, cur)
+            }
+            sec += 1
+        }
+    }
+}
+
+// C: nativo/obj/ligar_elf.c:567
+proc ligar_elf_planejar_tls(l: ^LigacaoEstado) {
+    var cur: LigarElfCursorTls = LigarElfCursorTls{fim = 0, alinhamento = 1}
+    if common.c2f_s2u_32((l.pedido as ^LigarPedido).formato) != (pefmt.IMAGEM_ELF as u32) {
+        return
+    }
+    ligar_elf_tls_passar(l, OS_TDATA, &cur)
+    ligar_elf_tls_passar(l, OS_TBSS, &cur)
+    l.tam[LIGAR_SAIDA_TLS] = cur.fim
+    l.tls_alinhamento = cur.alinhamento
+    l.tls_bloco = (((cur.fim + cur.alinhamento) - 1) / cur.alinhamento) * cur.alinhamento
+}
+
+// C: nativo/obj/ligar_elf.c:581
+proc ligar_elf_marcar_tls(l: ^LigacaoEstado) {
+    if l.tam[LIGAR_SAIDA_TLS] == 0 {
+        return
+    }
+    let ptr_1: ^pefmt.Imagem = l.im as ^pefmt.Imagem
+    ptr_1.tls = true
+    let ptr_2: ^pefmt.Imagem = l.im as ^pefmt.Imagem
+    ptr_2.tls_secao = l.idx_im[LIGAR_SAIDA_TLS]
+    let ptr_3: ^pefmt.Imagem = l.im as ^pefmt.Imagem
+    ptr_3.tls_alinhamento = l.tls_alinhamento
+}
+
+// ---------------------------------------------------------------- testes (V4-W3b)
+// Fixture: 16 objetos; o objeto 0 tem .text(16), .rdata(16), .tdata(8, TLS), debug(16) e os simbolos f, d, u (fraco, indefinido), t, .L.
+// Saidas: TEXTO rva 0x1000, RDATA 0x2000, GOT 0x3000 (8 bytes), TLS 0x4000 (8 bytes). Base ELF nao-pie = 0x400000.
+
+struct LigarElfFixture {
+    objs: [16]Objeto
+    im: pefmt.Imagem
+    ped: LigarPedido
+    erro: common.Diag
+    l: LigacaoEstado
+}
+
+proc ligar_elf_teste_zeros(v: ^[dynamic]u8, n: u64) {
+    var k: u64 = 0
+    while k < n {
+        append(v, item = 0 as u8)
+        k += 1
+    }
+}
+
+proc ligar_elf_teste_secao(fx: ^LigarElfFixture, o: i32, tipo: i32, n: u64, alin: u32, saida: i32) {
+    let s: u32 = obj_secao_abrir(&fx.objs[o], "s", tipo, alin)
+    ligar_elf_teste_zeros(&fx.objs[o].secoes[s as u64].bytes, n)
+    append(&fx.l.contrib[o], item = LigarContrib{saida = saida, off = 0})
+}
+
+proc ligar_elf_teste_simbolo(fx: ^LigarElfFixture, nome: str, secao: i32, rva: u32) {
+    _ = obj_simbolo_definir(&fx.objs[0], nome, secao, 0)
+    append(&fx.l.rva_sim[0], item = rva)
+}
+
+proc ligar_elf_teste_montar(fx: ^LigarElfFixture) {
+    var tabela: [16]?^Objeto = {}
+    for o in (0 as i32)..<LIGAR_QTD_OBJETOS {
+        obj_iniciar(&fx.objs[o])
+        tabela[o] = &fx.objs[o]
+        fx.l.contrib[o] = make([dynamic]LigarContrib, alloc = heap)
+        fx.l.rva_sim[o] = make([dynamic]u32, alloc = heap)
+    }
+    fx.l.obj = tabela
+    fx.l.im = &fx.im
+    fx.l.erro = &fx.erro
+    fx.l.pedido = &fx.ped
+    fx.l.celulas = make([dynamic]LigarCelula, alloc = heap)
+    fx.im.formato = pefmt.IMAGEM_ELF
+    fx.ped.formato = pefmt.IMAGEM_ELF
+    fx.im.relativos = make([dynamic]pefmt.ImagemRelativa, alloc = heap)
+    fx.im.simbolos = make([dynamic]pefmt.ImagemSimbolo, alloc = heap)
+    for s in (0 as u64)..<(13 as u64) {
+        fx.im.secoes[s].bytes = make([dynamic]u8, alloc = heap)
+    }
+    for k in (0 as u64)..<(4 as u64) {
+        fx.im.dbg[k] = make([dynamic]u8, alloc = heap)
+    }
+    ligar_elf_teste_secao(fx, 0, OS_TEXTO, 16, 4, LIGAR_SAIDA_TEXTO)
+    ligar_elf_teste_secao(fx, 0, OS_RDATA, 16, 4, LIGAR_SAIDA_RDATA)
+    ligar_elf_teste_secao(fx, 0, OS_TDATA, 8, 4, LIGAR_SAIDA_TLS)
+    ligar_elf_teste_secao(fx, 0, OS_DEBUG_ABBREV, 16, 1, LIGAR_SEM_SAIDA)
+    ligar_elf_teste_simbolo(fx, "f", 0, 4104)
+    ligar_elf_teste_simbolo(fx, "d", 1, 8192)
+    ligar_elf_teste_simbolo(fx, "u", OBJ_SECAO_INDEFINIDA, LIGAR_SEM_RVA)
+    ligar_elf_teste_simbolo(fx, "t", 2, 16388)
+    ligar_elf_teste_simbolo(fx, ".L", 0, 4096)
+    fx.objs[0].simbolos[2].fraco = true
+    fx.l.tam[LIGAR_SAIDA_TEXTO] = 16
+    fx.l.tam[LIGAR_SAIDA_RDATA] = 16
+    fx.l.rva[LIGAR_SAIDA_TEXTO] = 4096
+    fx.l.rva[LIGAR_SAIDA_RDATA] = 8192
+    fx.l.rva[LIGAR_SAIDA_GOT] = 12288
+    fx.l.rva[LIGAR_SAIDA_TLS] = 16384
+    fx.l.idx_im[LIGAR_SAIDA_TEXTO] = 0
+    fx.l.idx_im[LIGAR_SAIDA_RDATA] = 1
+    fx.l.idx_im[LIGAR_SAIDA_GOT] = 2
+    fx.l.idx_im[LIGAR_SAIDA_TLS] = 3
+    ligar_elf_teste_zeros(&fx.im.secoes[0].bytes, 16)
+    ligar_elf_teste_zeros(&fx.im.secoes[1].bytes, 16)
+    ligar_elf_teste_zeros(&fx.im.secoes[2].bytes, 8)
+    ligar_elf_teste_zeros(&fx.im.secoes[3].bytes, 8)
+}
+
+proc ligar_elf_teste_liberar(fx: ^LigarElfFixture) {
+    for o in (0 as i32)..<LIGAR_QTD_OBJETOS {
+        delete(fx.l.contrib[o])
+        delete(fx.l.rva_sim[o])
+        obj_liberar(&fx.objs[o])
+    }
+    delete(fx.l.celulas)
+    delete(fx.im.relativos)
+    delete(fx.im.simbolos)
+    for s in (0 as u64)..<(13 as u64) {
+        delete(fx.im.secoes[s].bytes)
+    }
+    for k in (0 as u64)..<(4 as u64) {
+        delete(fx.im.dbg[k])
+    }
+}
+
+proc ligar_elf_teste_reloc(secao: u32, off: u32, tipo: i32, simbolo: u32, adendo: i64) -> ObjReloc {
+    return ObjReloc{alvo = ObjAlvoReloc{secao = secao, off = off}, correcao = ObjCorrecao{tipo = tipo, simbolo = simbolo, adendo = adendo}}
+}
+
+proc ligar_elf_teste_causa(fx: ^LigarElfFixture) -> str {
+    return fx.erro.causa or_else ""
+}
+
+test "ligar_elf_relaxar reescreve o opcode nas 3 formas" {
+    var v = make([dynamic]u8, alloc = heap)
+    defer delete(v)
+    ligar_elf_teste_zeros(&v, 8)
+    ligar_elf_relaxar(&v, 4, ELF_FORMA_MOV)
+    expect(v[2] == 0x8d)
+    expect(v[3] == 0)
+    ligar_elf_relaxar(&v, 4, ELF_FORMA_CALL)
+    expect(v[2] == 0x90)
+    expect(v[3] == 0xe8)
+    ligar_elf_relaxar(&v, 5, ELF_FORMA_JMP)
+    expect(v[3] == 0x90)
+    expect(v[4] == 0xe9)
+}
+
+test "ligar_elf_escrever grava little-endian em n bytes" {
+    var b: [8]u8 = {0, 0, 0, 0, 0, 0, 0, 0}
+    ligar_elf_escrever(b[..], 0x0807060504030201)
+    expect(b[0] == 1)
+    expect(b[7] == 8)
+    var c: [8]u8 = {9, 9, 9, 9, 9, 9, 9, 9}
+    ligar_elf_escrever(c[0..<4], 0x11223344)
+    expect(c[0] == 0x44)
+    expect(c[3] == 0x11)
+    expect(c[4] == 9)
+}
+
+test "ligar_elf_hex_minusc" {
+    let a = ligar_elf_hex_minusc(0)
+    defer delete(a)
+    expect(a == "0")
+    let b = ligar_elf_hex_minusc(255)
+    defer delete(b)
+    expect(b == "ff")
+    let c = ligar_elf_hex_minusc(0xFFFFFFFFFFF02000)
+    defer delete(c)
+    expect(c == "fffffffffff02000")
+    let d = ligar_elf_hex_minusc(0xDEADBEEF)
+    defer delete(d)
+    expect(d == "deadbeef")
+}
+
+test "ligar_elf_forma_de e ligar_elf_forma_tls leem opcode e modrm" {
+    var s = ObjSecao{bytes = make([dynamic]u8, alloc = heap)}
+    defer delete(s.bytes)
+    ligar_elf_teste_zeros(&s.bytes, 8)
+    s.bytes[2] = 0x8b
+    s.bytes[3] = 0x05
+    expect(ligar_elf_forma_de(&s, 4) == ELF_FORMA_MOV)
+    expect(ligar_elf_forma_de(&s, 5) == ELF_FORMA_NENHUMA)
+    expect(ligar_elf_forma_de(&s, 1) == ELF_FORMA_NENHUMA)
+    expect(ligar_elf_forma_de(&s, 5) == ELF_FORMA_NENHUMA)
+    expect(ligar_elf_forma_tls(&s, 4) == 0x8b)
+    s.bytes[2] = 0xff
+    s.bytes[3] = 0x15
+    expect(ligar_elf_forma_de(&s, 4) == ELF_FORMA_CALL)
+    s.bytes[3] = 0x25
+    expect(ligar_elf_forma_de(&s, 4) == ELF_FORMA_JMP)
+    expect(ligar_elf_forma_de(&s, 5) == ELF_FORMA_NENHUMA)
+    s.bytes[2] = 0x03
+    s.bytes[3] = 0x0d
+    expect(ligar_elf_forma_tls(&s, 4) == 0x03)
+    s.bytes[1] = 0x4c
+    expect(ligar_elf_forma_tls(&s, 4) == 0)
+    s.bytes[1] = 0x48
+    expect(ligar_elf_forma_tls(&s, 4) == 0x03)
+    s.bytes[3] = 0x45
+    expect(ligar_elf_forma_tls(&s, 4) == 0)
+    expect(ligar_elf_forma_tls(&s, 6) == 0)
+}
+
+test "ligar_elf_tls_por e planejar_tls alinham tdata e tbss" {
+    var cur = LigarElfCursorTls{fim = 6, alinhamento = 4}
+    var c = LigarContrib{saida = LIGAR_SAIDA_TLS, off = 0}
+    var bss = ObjSecao{tipo = OS_TBSS, alinhamento = 8, tam_bss = 10}
+    ligar_elf_tls_por(&c, &bss, &cur)
+    expect(c.off == 8)
+    expect(cur.fim == 18)
+    expect(cur.alinhamento == 8)
+    var fx = LigarElfFixture{}
+    ligar_elf_teste_montar(&fx)
+    defer ligar_elf_teste_liberar(&fx)
+    ligar_elf_teste_secao(&fx, 0, OS_TBSS, 0, 8, LIGAR_SAIDA_TLS)
+    fx.objs[0].secoes[4].tam_bss = 10
+    ligar_elf_planejar_tls(&fx.l)
+    expect(fx.l.contrib[0][2].off == 0)
+    expect(fx.l.contrib[0][4].off == 8)
+    expect(fx.l.tam[LIGAR_SAIDA_TLS] == 18)
+    expect(fx.l.tls_alinhamento == 8)
+    expect(fx.l.tls_bloco == 24)
+    ligar_elf_marcar_tls(&fx.l)
+    expect(fx.im.tls)
+    expect(fx.im.tls_secao == 3)
+    expect(fx.im.tls_alinhamento == 8)
+}
+
+test "ligar_elf relocar REL32, ADDR64 e ABS32 (nao-pie)" {
+    var fx = LigarElfFixture{}
+    ligar_elf_teste_montar(&fx)
+    defer ligar_elf_teste_liberar(&fx)
+    var r1 = ligar_elf_teste_reloc(0, 4, OR_REL32, 0, 4)
+    expect(ligar_elf_relocar(&fx.l, 0, &r1))
+    expect(fx.im.secoes[0].bytes[4] == 4)
+    expect(fx.im.secoes[0].bytes[5] == 0)
+    expect(fx.im.secoes[0].bytes[8] == 0)
+    var r2 = ligar_elf_teste_reloc(1, 8, OR_ADDR64, 0, 16)
+    expect(ligar_elf_relocar(&fx.l, 0, &r2))
+    expect(fx.im.secoes[1].bytes[8] == 0x18)
+    expect(fx.im.secoes[1].bytes[9] == 0x10)
+    expect(fx.im.secoes[1].bytes[10] == 0x40)
+    expect(fx.im.secoes[1].bytes[11] == 0)
+    expect(fx.im.secoes[1].bytes[15] == 0)
+    expect(len(fx.im.relativos) == 0)
+    var r3 = ligar_elf_teste_reloc(1, 0, OR_ABS32, 1, 0)
+    expect(ligar_elf_relocar(&fx.l, 0, &r3))
+    expect(fx.im.secoes[1].bytes[1] == 0x20)
+    expect(fx.im.secoes[1].bytes[2] == 0x40)
+    var r4 = ligar_elf_teste_reloc(1, 4, OR_ABS32, 1, -5242880)
+    expect(not ligar_elf_relocar(&fx.l, 0, &r4))
+    expect(fx.erro.codigo == common.X0903)
+    expect(ligar_elf_teste_causa(&fx) == "ELF: relocacao absoluta de 32 bits do simbolo 'd' nao cabe no endereco 0xfffffffffff02000")
+    expect(fx.im.secoes[1].bytes[5] == 0)
+    var r5 = ligar_elf_teste_reloc(1, 4, OR_ABS32S, 1, -5242880)
+    expect(ligar_elf_relocar(&fx.l, 0, &r5))
+    expect(fx.im.secoes[1].bytes[5] == 0x20)
+    expect(fx.im.secoes[1].bytes[6] == 0xf0)
+    expect(fx.im.secoes[1].bytes[7] == 0xff)
+}
+
+test "ligar_elf relocar recusa campo fora da secao e simbolo vazio" {
+    var fx = LigarElfFixture{}
+    ligar_elf_teste_montar(&fx)
+    defer ligar_elf_teste_liberar(&fx)
+    var r1 = ligar_elf_teste_reloc(1, 8, OR_ADDR64, 2, 7)
+    expect(ligar_elf_relocar(&fx.l, 0, &r1))
+    expect(fx.im.secoes[1].bytes[8] == 7)
+    var r2 = ligar_elf_teste_reloc(1, 8, OR_ADDR64, 1, 0)
+    fx.l.rva_sim[0][1] = LIGAR_SEM_RVA
+    expect(not ligar_elf_relocar(&fx.l, 0, &r2))
+    expect(fx.erro.codigo == common.X0903)
+    expect(ligar_elf_teste_causa(&fx) == "ELF: relocacao aponta para o simbolo 'd', que cai numa secao vazia")
+}
+
+test "ligar_elf GOTPCRELX relaxa para lea e GOTPCREL usa a celula .got" {
+    var fx = LigarElfFixture{}
+    ligar_elf_teste_montar(&fx)
+    defer ligar_elf_teste_liberar(&fx)
+    fx.im.secoes[0].bytes[2] = 0x8b
+    fx.im.secoes[0].bytes[3] = 0x05
+    fx.objs[0].secoes[0].bytes[2] = 0x8b // a forma e lida no objeto; a relaxacao grava na secao de saida
+    fx.objs[0].secoes[0].bytes[3] = 0x05
+    obj_relocar(&fx.objs[0], ObjAlvoReloc{secao = 0, off = 4}, ObjCorrecao{tipo = OR_GOTPCRELX, simbolo = 0, adendo = -4})
+    ligar_elf_planejar_got(&fx.l)
+    expect(len(fx.l.celulas) == 0)
+    expect(fx.l.tam[LIGAR_SAIDA_GOT] == 0)
+    var r1 = ligar_elf_teste_reloc(0, 4, OR_GOTPCRELX, 0, -4)
+    fx.im.secoes[0].bytes[2] = 0x8b
+    expect(ligar_elf_relocar(&fx.l, 0, &r1))
+    expect(fx.im.secoes[0].bytes[2] == 0x8d)
+    expect(fx.im.secoes[0].bytes[4] == 0xfc)
+    expect(fx.im.secoes[0].bytes[5] == 0xff)
+    expect(fx.im.secoes[0].bytes[7] == 0xff)
+    // GOTPCREL pede celula sempre; duas relocacoes ao mesmo simbolo, uma celula
+    obj_relocar(&fx.objs[0], ObjAlvoReloc{secao = 0, off = 8}, ObjCorrecao{tipo = OR_GOTPCREL, simbolo = 1, adendo = -4})
+    obj_relocar(&fx.objs[0], ObjAlvoReloc{secao = 0, off = 12}, ObjCorrecao{tipo = OR_GOTPCREL, simbolo = 1, adendo = -4})
+    ligar_elf_planejar_got(&fx.l)
+    expect(len(fx.l.celulas) == 1)
+    expect(fx.l.celulas[0].objeto == 0)
+    expect(fx.l.celulas[0].simbolo == 1)
+    expect(fx.l.tam[LIGAR_SAIDA_GOT] == 8)
+    var r2 = ligar_elf_teste_reloc(0, 8, OR_GOTPCREL, 1, -4)
+    expect(ligar_elf_relocar(&fx.l, 0, &r2))
+    expect(fx.im.secoes[0].bytes[8] == 0xf0)
+    expect(fx.im.secoes[0].bytes[9] == 0x1f)
+    expect(fx.im.secoes[0].bytes[10] == 0)
+    ligar_elf_preencher_got(&fx.l)
+    expect(fx.im.secoes[2].bytes[0] == 0x00)
+    expect(fx.im.secoes[2].bytes[1] == 0x20)
+    expect(fx.im.secoes[2].bytes[2] == 0x40)
+    expect(fx.im.secoes[2].bytes[3] == 0)
+    expect(len(fx.im.relativos) == 0)
+}
+
+test "ligar_elf GOTPCREL sem celula planejada e fraco indefinido na celula" {
+    var fx = LigarElfFixture{}
+    ligar_elf_teste_montar(&fx)
+    defer ligar_elf_teste_liberar(&fx)
+    fx.l.tam[LIGAR_SAIDA_GOT] = 8
+    append(&fx.l.celulas, item = LigarCelula{objeto = 0, simbolo = 2})
+    ligar_elf_preencher_got(&fx.l)
+    expect(fx.im.secoes[2].bytes[0] == 0)
+    expect(fx.im.secoes[2].bytes[1] == 0)
+    expect(len(fx.im.relativos) == 0)
+    expect(ligar_elf_indice_celula(&fx.l, 0, 2) == 0)
+    expect(ligar_elf_indice_celula(&fx.l, 0, 1) == -1)
+    expect(ligar_elf_fraco_zero(&fx.l, 0, 2))
+    expect(not ligar_elf_fraco_zero(&fx.l, 0, 1))
+}
+
+test "ligar_elf pie: ADDR64 vira RELATIVE, em .text vira X0112, ABS32 vira X0112" {
+    var fx = LigarElfFixture{}
+    ligar_elf_teste_montar(&fx)
+    defer ligar_elf_teste_liberar(&fx)
+    fx.im.pie = true
+    fx.ped.pie = true
+    var r1 = ligar_elf_teste_reloc(1, 8, OR_ADDR64, 0, 0)
+    expect(ligar_elf_relocar(&fx.l, 0, &r1))
+    expect(fx.im.secoes[1].bytes[8] == 0x08)
+    expect(fx.im.secoes[1].bytes[9] == 0x10)
+    expect(fx.im.secoes[1].bytes[10] == 0)
+    expect(len(fx.im.relativos) == 1)
+    expect(fx.im.relativos[0].rva == 0x2008)
+    expect(fx.im.relativos[0].valor == 0x1008)
+    var r2 = ligar_elf_teste_reloc(1, 0, OR_ADDR64, 2, 5)
+    expect(ligar_elf_relocar(&fx.l, 0, &r2))
+    expect(fx.im.secoes[1].bytes[0] == 5)
+    expect(len(fx.im.relativos) == 1)
+    var r3 = ligar_elf_teste_reloc(0, 8, OR_ADDR64, 0, 0)
+    expect(not ligar_elf_relocar(&fx.l, 0, &r3))
+    expect(fx.erro.codigo == common.X0112)
+    expect(ligar_elf_teste_causa(&fx) == "ELF pie: ADDR64 do simbolo 'f' cai em .text (TEXTREL), que o static-pie nao aceita")
+    var r4 = ligar_elf_teste_reloc(1, 4, OR_ABS32, 1, 0)
+    expect(not ligar_elf_relocar(&fx.l, 0, &r4))
+    expect(ligar_elf_teste_causa(&fx) == "ELF pie: relocacao absoluta de 32 bits do simbolo 'd' nao cabe em PIE (o campo nao recebe a base)")
+    fx.l.tam[LIGAR_SAIDA_GOT] = 8
+    append(&fx.l.celulas, item = LigarCelula{objeto = 0, simbolo = 1})
+    ligar_elf_preencher_got(&fx.l)
+    expect(fx.im.secoes[2].bytes[1] == 0x20)
+    expect(len(fx.im.relativos) == 2)
+    expect(fx.im.relativos[1].rva == 0x3000)
+    expect(fx.im.relativos[1].valor == 0x2000)
+}
+
+test "ligar_elf TLS: TPOFF32 e GOTTPOFF relaxado (mov e add), erros X0111 e X0114" {
+    var fx = LigarElfFixture{}
+    ligar_elf_teste_montar(&fx)
+    defer ligar_elf_teste_liberar(&fx)
+    ligar_elf_planejar_tls(&fx.l)
+    expect(fx.l.tam[LIGAR_SAIDA_TLS] == 8)
+    expect(fx.l.tls_bloco == 8)
+    fx.im.secoes[0].bytes[2] = 0x8b
+    fx.im.secoes[0].bytes[3] = 0x0d
+    fx.objs[0].secoes[0].bytes[2] = 0x8b
+    fx.objs[0].secoes[0].bytes[3] = 0x0d
+    var r1 =ligar_elf_teste_reloc(0, 4, OR_GOTTPOFF, 3, -4)
+    expect(ligar_elf_relocar(&fx.l, 0, &r1))
+    expect(fx.im.secoes[0].bytes[2] == 0xc7)
+    expect(fx.im.secoes[0].bytes[3] == 0xc1)
+    expect(fx.im.secoes[0].bytes[4] == 0xfc)
+    expect(fx.im.secoes[0].bytes[7] == 0xff)
+    fx.im.secoes[0].bytes[2] = 0x03
+    fx.im.secoes[0].bytes[3] = 0x15
+    fx.objs[0].secoes[0].bytes[2] = 0x03
+    fx.objs[0].secoes[0].bytes[3] = 0x15
+    expect(ligar_elf_relocar(&fx.l, 0, &r1))
+    expect(fx.im.secoes[0].bytes[2] == 0x81)
+    expect(fx.im.secoes[0].bytes[3] == 0xc2)
+    var r2 = ligar_elf_teste_reloc(0, 4, OR_TPOFF32, 3, 1)
+    expect(ligar_elf_relocar(&fx.l, 0, &r2))
+    expect(fx.im.secoes[0].bytes[4] == 0xfd)
+    expect(fx.im.secoes[0].bytes[5] == 0xff)
+    fx.objs[0].secoes[0].bytes[2] = 0
+    expect(not ligar_elf_relocar(&fx.l, 0, &r1))
+    expect(fx.erro.codigo == common.X0114)
+    expect(ligar_elf_teste_causa(&fx) == "ELF: GOTTPOFF do simbolo 't' com forma que o LE nao relaxa (so mov ou add com [rip+d], sem REX.R)")
+    var r3 = ligar_elf_teste_reloc(0, 4, OR_TPOFF32, 1, 0)
+    expect(not ligar_elf_relocar(&fx.l, 0, &r3))
+    expect(fx.erro.codigo == common.X0111)
+    expect(ligar_elf_teste_causa(&fx) == "ELF: relocacao de TLS do simbolo 'd' fora do bloco TLS (indefinido ou sem __thread)")
+}
+
+test "ligar_elf debug copia as secoes de debug e aplica o ADDR64 absoluto" {
+    var fx = LigarElfFixture{}
+    ligar_elf_teste_montar(&fx)
+    defer ligar_elf_teste_liberar(&fx)
+    fx.objs[0].secoes[3].bytes[0] = 0x77
+    obj_relocar(&fx.objs[0], ObjAlvoReloc{secao = 3, off = 8}, ObjCorrecao{tipo = OR_ADDR64, simbolo = 0, adendo = 2})
+    obj_relocar(&fx.objs[0], ObjAlvoReloc{secao = 0, off = 0}, ObjCorrecao{tipo = OR_ADDR64, simbolo = 0, adendo = 0})
+    expect(ligar_elf_indice_debug(OS_DEBUG_ABBREV) == 0)
+    expect(ligar_elf_indice_debug(OS_DEBUG_FRAME) == 3)
+    expect(ligar_elf_indice_debug(OS_TEXTO) == -1)
+    ligar_elf_debug(&fx.l)
+    expect(len(fx.im.dbg[0]) == 16)
+    expect(fx.im.dbg[0][0] == 0x77)
+    expect(fx.im.dbg[0][8] == 0x0a)
+    expect(fx.im.dbg[0][9] == 0x10)
+    expect(fx.im.dbg[0][10] == 0x40)
+    expect(fx.im.dbg[0][11] == 0)
+    expect(len(fx.im.dbg[1]) == 0)
+}
+
+test "ligar_elf coletar_simbolos pula indefinido, nome com ponto e secao sem saida" {
+    var fx = LigarElfFixture{}
+    ligar_elf_teste_montar(&fx)
+    defer ligar_elf_teste_liberar(&fx)
+    fx.l.tam[LIGAR_SAIDA_TLS] = 8
+    ligar_elf_coletar_simbolos(&fx.l)
+    expect(len(fx.im.simbolos) == 3)
+    expect((fx.im.simbolos[0].nome or_else "") == "f")
+    expect(fx.im.simbolos[0].rva == 4104)
+    expect(fx.im.simbolos[0].secao == 0)
+    expect((fx.im.simbolos[1].nome or_else "") == "d")
+    expect(fx.im.simbolos[1].secao == 1)
+    expect((fx.im.simbolos[2].nome or_else "") == "t")
+    expect(fx.im.simbolos[2].secao == 3)
+    var k: i32 = 0
+    expect(not ligar_elf_simbolo_na_imagem(&fx.l, 0, &fx.objs[0].simbolos[2], &k))
+    expect(not ligar_elf_simbolo_na_imagem(&fx.l, 0, &fx.objs[0].simbolos[4], &k))
+    expect(ligar_elf_simbolo_na_imagem(&fx.l, 0, &fx.objs[0].simbolos[0], &k))
+    expect(k == LIGAR_SAIDA_TEXTO)
+    fx.l.tam[LIGAR_SAIDA_TLS] = 0
+    expect(not ligar_elf_simbolo_na_imagem(&fx.l, 0, &fx.objs[0].simbolos[3], &k))
+}
+
+test "ligar_elf definido: na secao, ou global definido em outro objeto" {
+    var fx = LigarElfFixture{}
+    ligar_elf_teste_montar(&fx)
+    defer ligar_elf_teste_liberar(&fx)
+    expect(ligar_elf_definido(&fx.l, 0, 0))
+    expect(not ligar_elf_definido(&fx.l, 0, 2))
+    _ = obj_secao_abrir(&fx.objs[1], "x", OS_TEXTO, 4)
+    _ = obj_simbolo_definir(&fx.objs[1], "u", 0, 0)
+    expect(ligar_elf_definido(&fx.l, 0, 2))
+    expect(ligar_elf_definido_fora(&fx.l, 0, "u"))
+    expect(not ligar_elf_definido_fora(&fx.l, 1, "u"))
+    var viva = ligar_elf_teste_reloc(0, 0, OR_REL32, 0, 0)
+    var morta = ligar_elf_teste_reloc(3, 0, OR_REL32, 0, 0)
+    expect(ligar_elf_viva(&fx.l, 0, &viva))
+    expect(not ligar_elf_viva(&fx.l, 0, &morta))
+}

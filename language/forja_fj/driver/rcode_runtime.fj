@@ -1,0 +1,526 @@
+// driver/rcode_runtime.fj - porte de compiler/driver/rcode_runtime.c, compiler/driver/rcode_runtime.h
+// sha256 de driver/rcode_runtime.c: dad9b9dc7f43ba3017b486270799d63a3df7501d7309a3d5472f47b2bb9c7fa1
+// sha256 de driver/rcode_runtime.h: 8776cdf0c3a19f715839355e2fedb0fdfb2335cd1dae5a0e35f3f9ea00b45d04
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.2.0
+// Changelog: 0.2.0 - G3 V5-P2: corpo real. Buf -> [dynamic]u8; RcodeFiltro.linha de ?[4096]u8 para [4096]u8 (a Forja nao tem ponteiro nulo de array); dados do filtro de str para []u8
+//            (os bytes crus do pipe); as formas (forma_do_r0009/r0008) seguem gravando no buffer do chamador com a mesma truncagem do snprintf (c2f_snprintf).
+
+import "common"
+
+struct RcodeFiltro {
+    linha: [4096]u8
+    n: u64
+    passando: bool
+}
+
+const RCODE_LINHA_MAX: i32 = 4096
+const PREFIXO_RCODE: str = "{\"codigo\": \"R"
+const PREFIXO_TAM: i32 = 13
+const CODIGO_INICIO: i32 = 12
+const CODIGO_TAM: i32 = 5
+
+// bytes ate o 1o NUL do buffer, como texto de heap (quem chama faz delete)
+proc rc_texto_do_buffer(b: []u8) -> str {
+    return from_bytes(b[0..<common.c2f_strlen_b(b)], alloc = heap)
+}
+
+// 'trecho' esta em 'dados' exatamente na posicao i (o chamador garante que cabe).
+proc igual_em(dados: str, i: int, trecho: str) -> bool {
+    for k in 0..<len(trecho) {
+        if dados[i + k] != trecho[k] {
+            return false
+        }
+    }
+    return true
+}
+
+// C: driver/rcode_runtime.c:24
+// Texto JSON entre aspas em b: aspas, barra e controles escapados; os bytes UTF-8 passam como vieram.
+proc anexar_texto_json(b: ^[dynamic]u8, s: str) {
+    let digitos: str = "0123456789abcdef"
+    append(b, item = "\"")
+    for i in 0..<len(s) {
+        let c: u8 = s[i]
+        if (c == 34) or (c == 92) {
+            append(b, item = "\\")
+            append(b, item = c)
+        } else if c == 10 {
+            append(b, item = "\\n")
+        } else if c < 32 {
+            append(b, item = "\\u00")
+            append(b, item = digitos[(c / 16) as int])
+            append(b, item = digitos[(c % 16) as int])
+        } else {
+            append(b, item = c)
+        }
+    }
+    append(b, item = "\"")
+}
+
+// C: driver/rcode_runtime.c:36
+proc contem(dados: str, n: u64, trecho: str) -> bool {
+    let m = len(trecho)
+    var i = 0
+    while (i + m) <= (n as int) {
+        if igual_em(dados, i, trecho) {
+            return true
+        }
+        i += 1
+    }
+    return false
+}
+
+// C: driver/rcode_runtime.c:47
+// O codigo do catalogo que a linha abre (R + 4 digitos entre aspas), ou -1 se a linha nao e JSON de R-code do catalogo.
+proc codigo_da_linha(linha: []u8, fim: u64) -> i32 {
+    let prefixo: str = PREFIXO_RCODE
+    if fim < ((PREFIXO_TAM + 6) as u64) {
+        return -1
+    }
+    for k in 0..<(PREFIXO_TAM as int) {
+        if linha[k] != prefixo[k] {
+            return -1
+        }
+    }
+    let fecha: int = (CODIGO_INICIO + CODIGO_TAM) as int
+    if (linha[fecha] != 34) or (linha[(fim as int) - 1] != 125) {
+        return -1
+    }
+    let codigo = from_bytes(linha[(CODIGO_INICIO as int)..<fecha], alloc = heap)
+    defer delete(codigo)
+    return common.diag_codigo_por_texto(codigo)
+}
+
+// C: driver/rcode_runtime.c:59
+// O texto entre aspas que vem logo depois de 'chave' na linha, copiado em dest (tam bytes); false se a chave nao esta ou o texto nao cabe.
+proc texto_depois(linha: str, fim: u64, chave: str, dest: []u8, tam: u64) -> bool {
+    let m = len(chave)
+    let f = fim as int
+    var i = 0
+    while (i + m) < f {
+        if not igual_em(linha, i, chave) {
+            i += 1
+            continue
+        }
+        var n = 0
+        while ((i + m + n) < f) and (linha[i + m + n] != 34) {
+            n += 1
+        }
+        if ((n + 1) > (tam as int)) or ((i + m + n) >= f) {
+            return false
+        }
+        for k in 0..<n {
+            dest[k] = linha[i + m + k]
+        }
+        dest[n] = 0
+        return true
+    }
+    return false
+}
+
+// "tipo": "handle" do R0009 (M6c P88 / M6d P92f): destruidor declarado, ou o proc destroys da lib, ou untrack_handle.
+proc forma_handle_do_r0009(linha: str, fim: u64, forma: []u8, tam: u64) {
+    var kind: [48]u8 = {}
+    var destruidor: [48]u8 = {}
+    let alvo: []u8 = forma[0..<(tam as int)]
+    if not texto_depois(linha, fim, "\"kind\": \"", kind[..], 48) {
+        _ = common.c2f_snprintf(kind[..], "handle")
+    }
+    let kind_txt = rc_texto_do_buffer(kind[..])
+    defer delete(kind_txt)
+    if kind_txt == "forja_fs_abrir" { // M6d P92f: tabela literal de 1 entrada (std:file)
+        _ = common.c2f_snprintf(alvo, "feche com file.close(&f) (ou defer file.close(&f) logo depois do open)")
+        return
+    }
+    if contem(linha, fim, "falta fechar (destroys)") { // M6c P88: rastreio automatico do foreign com clausula
+        if texto_depois(linha, fim, "\"destruidor\": \"", destruidor[..], 48) {
+            let d = rc_texto_do_buffer(destruidor[..])
+            defer delete(d)
+            let msg = format(f"chame {d}(h) antes de sair do proc que abriu o handle, ou defer {d}(h) logo depois de {kind_txt}", alloc = heap)
+            defer delete(msg)
+            _ = common.c2f_snprintf(alvo, msg)
+        } else {
+            let msg = format(f"chame o proc da lib que fecha o handle de {kind_txt} (o que declara destroys), ou defer essa chamada logo depois dela", alloc = heap)
+            defer delete(msg)
+            _ = common.c2f_snprintf(alvo, msg)
+        }
+        return
+    }
+    let msg = format(f"mem.untrack_handle(h) quando liberar {kind_txt} (depois do free ou do close da lib C), ou defer mem.untrack_handle(h) logo depois do mem.track_handle()", alloc = heap)
+    defer delete(msg)
+    _ = common.c2f_snprintf(alvo, msg)
+}
+
+// C: driver/rcode_runtime.c:76
+// D-IA1-14 / M6 P70: forma_certa do R0009 conforme o que vazou. Bloco de heap com pilha: "delete(p) antes de sair de <proc>, ou defer delete(p)"; Arena/Pool vivo: destroy.
+proc forma_do_r0009(linha: str, fim: u64, forma: []u8, tam: u64) -> bool {
+    let alvo: []u8 = forma[0..<(tam as int)]
+    var proc_nome: [96]u8 = {}
+    if contem(linha, fim, "\"tipo\": \"arena\"") {
+        _ = common.c2f_snprintf(alvo, "mem.arena_destroy(a) antes de sair do programa, ou defer mem.arena_destroy(a) logo depois do mem.arena_create()")
+        return true
+    }
+    if contem(linha, fim, "\"tipo\": \"pool\"") {
+        _ = common.c2f_snprintf(alvo, "mem.pool_destroy(p) antes de sair do programa, ou defer mem.pool_destroy(p) logo depois do mem.pool_create()")
+        return true
+    }
+    if contem(linha, fim, "\"tipo\": \"handle\"") {
+        forma_handle_do_r0009(linha, fim, forma, tam)
+        return true
+    }
+    if contem(linha, fim, "\"tipo\": \"lib\"") { // M6d P92d: memoria de lib estatica (dev)
+        var lib: [48]u8 = {}
+        if not texto_depois(linha, fim, "\"lib\": \"", lib[..], 48) {
+            _ = common.c2f_snprintf(lib[..], "da lib")
+        }
+        let lib_txt = rc_texto_do_buffer(lib[..])
+        defer delete(lib_txt)
+        let msg = format(f"libere o que {lib_txt} devolveu nesta linha com o proc da lib que o destroi (destroys)", alloc = heap)
+        defer delete(msg)
+        _ = common.c2f_snprintf(alvo, msg)
+        return true
+    }
+    if not texto_depois(linha, fim, "\"pilha\": [{\"proc\": \"", proc_nome[..], 96) {
+        return false
+    }
+    let nome = rc_texto_do_buffer(proc_nome[..])
+    defer delete(nome)
+    let msg = format(f"delete(p) antes de sair de {nome} (onde o bloco nasceu), ou defer delete(p) logo depois do new; se o bloco sai do proc, entregue o ponteiro a quem o apaga", alloc = heap)
+    defer delete(msg)
+    _ = common.c2f_snprintf(alvo, msg)
+    return true
+}
+
+// C: driver/rcode_runtime.c:121
+// M6e P93c (D-M6e-4, ERRATA E2/E3): forma_certa do R0008 pelo campo "bloco" (heap|lista|arena); sem o campo (pool, frame) vale a do catalogo.
+proc forma_do_r0008(linha: str, fim: u64, forma: []u8, tam: u64) -> bool {
+    let alvo: []u8 = forma[0..<(tam as int)]
+    if contem(linha, fim, "acesso alem do fim do bloco") { // P93k: guarda, bloco VIVO: nao e uso depois do delete
+        _ = common.c2f_snprintf(alvo, "o acesso passou do fim do bloco: confira o indice ou o tamanho (len) antes de ler ou escrever, ou aumente o bloco")
+        return true
+    }
+    if contem(linha, fim, "\"bloco\": \"heap\"") {
+        _ = common.c2f_snprintf(alvo, "o bloco ja foi liberado por outro caminho (campo de estrutura ou outro proc); libere em um lugar so, depois do ultimo uso; delete(p) so zera o nome p")
+        return true
+    }
+    if contem(linha, fim, "\"bloco\": \"lista\"") {
+        _ = common.c2f_snprintf(alvo, "guarde o indice, nao ^T, de lista que cresce: o append moveu o buffer")
+        return true
+    }
+    if contem(linha, fim, "\"bloco\": \"arena\"") {
+        _ = common.c2f_snprintf(alvo, "o objeto morreu no arena_destroy: copie para o heap antes, ou destrua a arena depois do ultimo uso")
+        return true
+    }
+    return false
+}
+
+// C: driver/rcode_runtime.c:142
+// Acrescenta a 'saida' a linha (com o \n do fim, se veio) enriquecida com explicacao, forma_certa e spec; false se a linha ficou como veio.
+proc rcode_enriquecer_linha(linha: str, tam: u64, saida: ^[dynamic]u8) -> bool {
+    var fim: int = tam as int
+    var spec: [2048]u8 = {}
+    var forma: [256]u8 = {}
+    while (fim > 0) and ((linha[fim - 1] == 10) or (linha[fim - 1] == 13)) {
+        fim -= 1
+    }
+    let indice = codigo_da_linha(as_bytes(linha), fim as u64)
+    if (indice < 0) or contem(linha, fim as u64, "\"forma_certa\"") {
+        append(saida, item = linha[0..<(tam as int)])
+        return false
+    }
+    let codigo_txt = common.diag_codigo_texto(indice)
+    common.diag_spec_texto(codigo_txt, spec[..], 2048)
+    append(saida, item = linha[0..<(fim - 1)])
+    append(saida, item = ", \"explicacao\": ")
+    anexar_texto_json(saida, common.diag_codigo_explicacao(indice))
+    append(saida, item = ", \"forma_certa\": ")
+    var achou = false
+    if codigo_txt == "R0009" {
+        achou = forma_do_r0009(linha, fim as u64, forma[..], 256)
+    } else if codigo_txt == "R0008" {
+        achou = forma_do_r0008(linha, fim as u64, forma[..], 256)
+    }
+    if achou {
+        let forma_txt = rc_texto_do_buffer(forma[..])
+        defer delete(forma_txt)
+        anexar_texto_json(saida, forma_txt)
+    } else {
+        anexar_texto_json(saida, common.diag_codigo_forma(indice))
+    }
+    append(saida, item = ", \"spec\": ")
+    let spec_txt = rc_texto_do_buffer(spec[..])
+    defer delete(spec_txt)
+    anexar_texto_json(saida, spec_txt)
+    append(saida, item = "}")
+    append(saida, item = linha[fim..<(tam as int)])
+    return true
+}
+
+// C: driver/rcode_runtime.c:173
+proc rcode_filtro_iniciar(f: ^RcodeFiltro) {
+    f.n = 0
+    f.passando = false
+}
+
+// C: driver/rcode_runtime.c:180
+// A linha candidata deixou de ser: o que ficou retido sai como veio e o resto da linha passa direto (a menos que este byte tenha fechado a linha).
+proc soltar_retido(f: ^RcodeFiltro, c: u8, saida: ^[dynamic]u8) {
+    append(saida, items = f.linha[0..<(f.n as int)])
+    f.n = 0
+    f.passando = c != 10
+}
+
+// C: driver/rcode_runtime.c:187
+proc alimentar_byte(f: ^RcodeFiltro, c: u8, saida: ^[dynamic]u8) {
+    let prefixo: str = PREFIXO_RCODE
+    if f.passando {
+        append(saida, item = c)
+        f.passando = c != 10
+        return
+    }
+    f.linha[f.n as int] = c
+    f.n += 1
+    if (f.n <= (PREFIXO_TAM as u64)) and (c != prefixo[(f.n as int) - 1]) {
+        soltar_retido(f, c, saida)
+        return
+    }
+    if c == 10 {
+        let linha = from_bytes(f.linha[0..<(f.n as int)], alloc = heap)
+        defer delete(linha)
+        _ = rcode_enriquecer_linha(linha, f.n, saida)
+        f.n = 0
+    } else if f.n == (RCODE_LINHA_MAX as u64) {
+        soltar_retido(f, c, saida)
+    }
+}
+
+// C: driver/rcode_runtime.c:207
+proc rcode_filtro_alimentar(f: ^RcodeFiltro, dados: []u8, n: u64, saida: ^[dynamic]u8) {
+    for k in (0 as u64)..<n {
+        alimentar_byte(f, dados[k], saida)
+    }
+}
+
+// C: driver/rcode_runtime.c:212
+proc rcode_filtro_fechar(f: ^RcodeFiltro, saida: ^[dynamic]u8) {
+    append(saida, items = f.linha[0..<(f.n as int)])
+    f.n = 0
+}
+
+// ---------------------------------------------------------------- testes (G3 V5-P2)
+
+const LINHA_R0003: str = "{\"codigo\": \"R0003\", \"causa\": \"x\"}\n"
+
+// os bytes do buffer ate o 1o NUL sao iguais a 'esperado'
+proc buffer_igual(b: []u8, esperado: str) -> bool {
+    let t = rc_texto_do_buffer(b)
+    defer delete(t)
+    return t == esperado
+}
+
+test "anexar_texto_json: aspas, barra, \\n, controle e UTF-8" {
+    var b = make([dynamic]u8, alloc = heap)
+    defer delete(b)
+    anexar_texto_json(&b, "a\"b\\c\nd")
+    let t = from_bytes(b[..], alloc = heap)
+    defer delete(t)
+    expect(t == "\"a\\\"b\\\\c\\nd\"")
+    // controles (9 e 1) viram \u00XX e o byte 200 (UTF-8 em geral) passa como veio
+    var bytes: [4]u8 = {97, 9, 1, 200}
+    let s = from_bytes(bytes[..], alloc = heap)
+    defer delete(s)
+    clear(&b)
+    anexar_texto_json(&b, s)
+    expect(len(b) == 16)
+    let ate_o_200 = from_bytes(b[0..<14], alloc = heap)
+    defer delete(ate_o_200)
+    expect(ate_o_200 == "\"a\\u0009\\u0001")
+    expect(b[14] == 200)
+    expect(b[15] == 34)
+}
+
+test "contem e codigo_da_linha: prefixo, fecha aspas, chave e catalogo" {
+    expect(contem("abcdef", 6, "cde"))
+    expect(not contem("abcdef", 4, "cde"))
+    expect(contem("abc", 3, "abc"))
+    let l: str = LINHA_R0003
+    let n: u64 = (len(l) - 1) as u64
+    expect(codigo_da_linha(as_bytes(l), n) == common.diag_codigo_por_texto("R0003"))
+    expect(codigo_da_linha(as_bytes(l), n) >= 0)
+    expect(codigo_da_linha(as_bytes(l), n - 1) == -1)
+    expect(codigo_da_linha(as_bytes("{\"codigo\": \"R9999\"}"), 18) == -1)
+    expect(codigo_da_linha(as_bytes("{\"codigo\": \"R0003\""), 18) == -1)
+    expect(codigo_da_linha(as_bytes("{\"x\": \"R0003\", \"a\":1}"), 21) == -1)
+}
+
+test "texto_depois: copia ate a aspa, falta de chave, nao cabe e sem aspa de fecho" {
+    var d: [16]u8 = {}
+    let l: str = "{\"a\": \"xyz\", \"kind\": \"abc\"}"
+    expect(texto_depois(l, len(l) as u64, "\"kind\": \"", d[..], 16))
+    expect(buffer_igual(d[..], "abc"))
+    expect(not texto_depois(l, len(l) as u64, "\"nao\": \"", d[..], 16))
+    expect(not texto_depois(l, len(l) as u64, "\"kind\": \"", d[..], 3))
+    expect(texto_depois(l, len(l) as u64, "\"kind\": \"", d[..], 4))
+    expect(not texto_depois("{\"kind\": \"abc", 13, "\"kind\": \"", d[..], 16))
+}
+
+test "forma_do_r0009: ramos e truncagem pelo tam" {
+    var f: [256]u8 = {}
+    let a: str = "{\"codigo\": \"R0009\", \"tipo\": \"arena\"}"
+    expect(forma_do_r0009(a, len(a) as u64, f[..], 256))
+    expect(buffer_igual(f[..], "mem.arena_destroy(a) antes de sair do programa, ou defer mem.arena_destroy(a) logo depois do mem.arena_create()"))
+    let p: str = "{\"tipo\": \"pool\"}"
+    expect(forma_do_r0009(p, len(p) as u64, f[..], 256))
+    expect(buffer_igual(f[..], "mem.pool_destroy(p) antes de sair do programa, ou defer mem.pool_destroy(p) logo depois do mem.pool_create()"))
+    let h: str = "{\"codigo\": \"R0009\", \"tipo\": \"handle\", \"kind\": \"forja_fs_abrir\"}"
+    expect(forma_do_r0009(h, len(h) as u64, f[..], 256))
+    expect(buffer_igual(f[..], "feche com file.close(&f) (ou defer file.close(&f) logo depois do open)"))
+    let h2: str = "{\"tipo\": \"handle\", \"kind\": \"k1\", \"causa\": \"falta fechar (destroys)\", \"destruidor\": \"fecha\"}"
+    expect(forma_do_r0009(h2, len(h2) as u64, f[..], 256))
+    expect(buffer_igual(f[..], "chame fecha(h) antes de sair do proc que abriu o handle, ou defer fecha(h) logo depois de k1"))
+    let h3: str = "{\"tipo\": \"handle\", \"kind\": \"k1\", \"causa\": \"falta fechar (destroys)\"}"
+    expect(forma_do_r0009(h3, len(h3) as u64, f[..], 256))
+    expect(buffer_igual(f[..], "chame o proc da lib que fecha o handle de k1 (o que declara destroys), ou defer essa chamada logo depois dela"))
+    let h4: str = "{\"tipo\": \"handle\"}"
+    expect(forma_do_r0009(h4, len(h4) as u64, f[..], 256))
+    expect(buffer_igual(f[..], "mem.untrack_handle(h) quando liberar handle (depois do free ou do close da lib C), ou defer mem.untrack_handle(h) logo depois do mem.track_handle()"))
+    let li: str = "{\"tipo\": \"lib\", \"lib\": \"zlib\"}"
+    expect(forma_do_r0009(li, len(li) as u64, f[..], 256))
+    expect(buffer_igual(f[..], "libere o que zlib devolveu nesta linha com o proc da lib que o destroi (destroys)"))
+    let li2: str = "{\"tipo\": \"lib\"}"
+    expect(forma_do_r0009(li2, len(li2) as u64, f[..], 256))
+    expect(buffer_igual(f[..], "libere o que da lib devolveu nesta linha com o proc da lib que o destroi (destroys)"))
+    let pi: str = "{\"pilha\": [{\"proc\": \"meu\", \"x\": 1}]}"
+    expect(forma_do_r0009(pi, len(pi) as u64, f[..], 256))
+    expect(buffer_igual(f[..], "delete(p) antes de sair de meu (onde o bloco nasceu), ou defer delete(p) logo depois do new; se o bloco sai do proc, entregue o ponteiro a quem o apaga"))
+    expect(forma_do_r0009(pi, len(pi) as u64, f[..], 20))
+    expect(buffer_igual(f[..], "delete(p) antes de "))
+    expect(not forma_do_r0009("{\"x\": 1}", 8, f[..], 256))
+}
+
+test "forma_do_r0008: ramos pelo campo bloco e pela guarda" {
+    var f: [256]u8 = {}
+    let b1: str = "{\"bloco\": \"heap\"}"
+    expect(forma_do_r0008(b1, len(b1) as u64, f[..], 256))
+    expect(buffer_igual(f[..], "o bloco ja foi liberado por outro caminho (campo de estrutura ou outro proc); libere em um lugar so, depois do ultimo uso; delete(p) so zera o nome p"))
+    let b2: str = "{\"bloco\": \"lista\"}"
+    expect(forma_do_r0008(b2, len(b2) as u64, f[..], 256))
+    expect(buffer_igual(f[..], "guarde o indice, nao ^T, de lista que cresce: o append moveu o buffer"))
+    let b3: str = "{\"bloco\": \"arena\"}"
+    expect(forma_do_r0008(b3, len(b3) as u64, f[..], 256))
+    expect(buffer_igual(f[..], "o objeto morreu no arena_destroy: copie para o heap antes, ou destrua a arena depois do ultimo uso"))
+    let b4: str = "{\"acesso alem do fim do bloco\", \"bloco\": \"heap\"}"
+    expect(forma_do_r0008(b4, len(b4) as u64, f[..], 256))
+    expect(buffer_igual(f[..], "o acesso passou do fim do bloco: confira o indice ou o tamanho (len) antes de ler ou escrever, ou aumente o bloco"))
+    expect(not forma_do_r0008("{\"bloco\": \"pool\"}", 17, f[..], 256))
+}
+
+// A linha enriquecida por rcode_enriquecer_linha, como texto de heap (quem chama faz delete).
+proc enriquecida(linha: str, mudou: ^bool) -> str {
+    var b = make([dynamic]u8, alloc = heap)
+    defer delete(b)
+    mudou^ = rcode_enriquecer_linha(linha, len(linha) as u64, &b)
+    return from_bytes(b[..], alloc = heap)
+}
+
+test "rcode_enriquecer_linha: acrescenta explicacao, forma_certa e spec do catalogo; o resto da linha fica" {
+    var mudou = false
+    let r = enriquecida(LINHA_R0003, &mudou)
+    defer delete(r)
+    expect(mudou)
+    let ind = common.diag_codigo_por_texto("R0003")
+    var esperado = make([dynamic]u8, alloc = heap)
+    defer delete(esperado)
+    append(&esperado, item = "{\"codigo\": \"R0003\", \"causa\": \"x\", \"explicacao\": ")
+    anexar_texto_json(&esperado, common.diag_codigo_explicacao(ind))
+    append(&esperado, item = ", \"forma_certa\": ")
+    anexar_texto_json(&esperado, common.diag_codigo_forma(ind))
+    append(&esperado, item = ", \"spec\": ")
+    var spec: [2048]u8 = {}
+    common.diag_spec_texto(common.diag_codigo_texto(ind), spec[..], 2048)
+    let spec_txt = rc_texto_do_buffer(spec[..])
+    defer delete(spec_txt)
+    anexar_texto_json(&esperado, spec_txt)
+    append(&esperado, item = "}\n")
+    let e = from_bytes(esperado[..], alloc = heap)
+    defer delete(e)
+    expect(r == e)
+    // CRLF no fim fica depois do }
+    let crlf: str = "{\"codigo\": \"R0003\", \"causa\": \"x\"}\r\n"
+    let r2 = enriquecida(crlf, &mudou)
+    defer delete(r2)
+    expect(mudou)
+    expect(r2[(len(r2) - 3)..<len(r2)] == "}\r\n")
+    // ja traz forma_certa, codigo fora do catalogo, nao e JSON: a mesma linha
+    let ja: str = "{\"codigo\": \"R0003\", \"forma_certa\": \"x\"}\n"
+    let r3 = enriquecida(ja, &mudou)
+    defer delete(r3)
+    expect((not mudou) and (r3 == ja))
+    let fora: str = "{\"codigo\": \"R9999\", \"a\": 1}\n"
+    let r4 = enriquecida(fora, &mudou)
+    defer delete(r4)
+    expect((not mudou) and (r4 == fora))
+    let livre: str = "texto qualquer\n"
+    let r5 = enriquecida(livre, &mudou)
+    defer delete(r5)
+    expect((not mudou) and (r5 == livre))
+}
+
+// Alimenta o filtro com 'dados' em pedacos de 'passo' bytes, fecha e devolve tudo como texto de heap.
+proc filtrada(dados: str, passo: int) -> str {
+    var f = RcodeFiltro{}
+    var b = make([dynamic]u8, alloc = heap)
+    defer delete(b)
+    rcode_filtro_iniciar(&f)
+    var i = 0
+    while i < len(dados) {
+        let fim = min(i + passo, len(dados))
+        rcode_filtro_alimentar(&f, as_bytes(dados)[i..<fim], (fim - i) as u64, &b)
+        i = fim
+    }
+    rcode_filtro_fechar(&f, &b)
+    return from_bytes(b[..], alloc = heap)
+}
+
+test "filtro de stderr: enriquece so a linha R-code, em qualquer fatiamento; o resto passa byte a byte" {
+    let entrada: str = "antes\n{\"codigo\": \"R0003\", \"causa\": \"x\"}\n{\"outro\": 1}\nfim sem quebra"
+    var mudou = false
+    let linha_rica = enriquecida(LINHA_R0003, &mudou)
+    defer delete(linha_rica)
+    let esperado = format(f"antes\n{linha_rica}{{\"outro\": 1}}\nfim sem quebra", alloc = heap)
+    defer delete(esperado)
+    for passo in 1..=7 {
+        let r = filtrada(entrada, passo)
+        expect(r == esperado)
+        delete(r)
+    }
+    let tudo = filtrada(entrada, 1000)
+    expect(tudo == esperado)
+    delete(tudo)
+    // linha R-code sem \n no fim sai como veio (retida ate o fechar)
+    let sem_fim = filtrada("{\"codigo\": \"R0003\", \"causa\": \"x\"}", 5)
+    expect(sem_fim == "{\"codigo\": \"R0003\", \"causa\": \"x\"}")
+    delete(sem_fim)
+    // prefixo quebrado no meio: o retido sai e o resto da linha passa direto; a linha seguinte volta a ser candidata
+    let quebrado = filtrada("{\"codigo\": \"X1\n{\"codigo\": \"R0003\", \"causa\": \"x\"}\n", 3)
+    let esperado_q = format(f"{{\"codigo\": \"X1\n{linha_rica}", alloc = heap)
+    defer delete(esperado_q)
+    expect(quebrado == esperado_q)
+    delete(quebrado)
+}
+
+test "filtro de stderr: linha de 4096 bytes sem \\n comeca a passar direto" {
+    var longa = make([dynamic]u8, alloc = heap)
+    defer delete(longa)
+    append(&longa, item = "{\"codigo\": \"R0003\", ")
+    while len(longa) < 5000 {
+        append(&longa, item = 120)
+    }
+    append(&longa, item = "\n")
+    let entrada = from_bytes(longa[..], alloc = heap)
+    defer delete(entrada)
+    let r = filtrada(entrada, 100)
+    expect(r == entrada)
+    delete(r)
+}

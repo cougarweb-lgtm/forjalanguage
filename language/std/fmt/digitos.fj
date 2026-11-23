@@ -1,0 +1,308 @@
+// std:fmt, pedaco digitos (parte do modulo std:fmt: veja fmt.fj)
+// Versao: 0.1.1. Changelog: 0.1.1 - Ryu P2: f"{v}" agora e o Display curto (posicional, sem expoente, ate 17 significativos e ate ~330 caracteres): read_float_text guarda no maximo 24 algarismos (o resto de um valor grande e zero). 0.1.0 - IA1-S2e: motor de digitos decimais exato (sem Ryu): le o texto do f"{v}" (%.17g), reduz a 15 algarismos significativos (half_even), arredonda em `decimals` no modo pedido com vai-um, agrupa e emite.
+// Semantica oficial (D-FMT): "o valor e reduzido a 15 algarismos significativos (como o Excel) e depois arredondado em `decimals` casas com o modo pedido". Por isso 1.005 vira "1,01" e 0.1 + 0.2 vira "0,3". Valor de 15 ou mais algarismos inteiros nao usa notacao cientifica: o que passa do 15o algarismo vira 0.
+// O numero e guardado como 0,D1 D2 ... Dn x 10^point (D1 nunca e 0; n = 0 e o zero). Sem alocacao de lista: o texto do %.17g vive no escopo de load_float_digits.
+const MINUS_SIGN: u8 = 45
+const PLUS_SIGN: u8 = 43
+const DOT: u8 = 46
+const DIGIT_ZERO: u8 = 48
+const LETTER_E: u8 = 101
+const LETTER_N: u8 = 110
+const LETTER_I: u8 = 105
+const DECIMAL_BASE: int = 10
+const SIGNIFICANT_DIGITS: int = 15
+const MAX_DECIMALS: int = 15
+const MAX_STORED_DIGITS: int = 24 // tamanho de Digits.digits; o texto mais curto traz ate 17 significativos, o que passa disso (valor grande) so tem zeros
+const KIND_FINITE: int = 0
+const KIND_NAN: int = 1
+const KIND_INF: int = 2
+// Resto do que foi cortado: nada (ou so zeros), abaixo da metade, exatamente a metade, acima da metade.
+const TAIL_ZERO: int = 0
+const TAIL_BELOW_HALF: int = 1
+const TAIL_HALF: int = 2
+const TAIL_ABOVE_HALF: int = 3
+const PERCENT_SHIFT: int = 2
+
+// Algarismos decimais de um valor (0 a 9 por byte; o %.17g traz ate 17, o vai-um nao passa disso; um int traz ate 19).
+struct Digits {
+    digits: [24]u8 = {}
+    n: int = 0
+    point: int = 0
+    negative: bool = false
+}
+
+// O que as procs de saida precisam de uma regiao e do pedido: copiado de Locale (os textos sao vistas) para nao passar os ~700 bytes do Locale pelos pedacos internos.
+struct Spec {
+    decimals: int
+    rounding: Rounding
+    shift: int
+    decimal_sep: str
+    group_sep: str
+    group_size: int
+    min_group_digits: int
+}
+
+// Monta o Spec de um pedido. decimals fora de 0..15 e erro de quem chama: panic (R0003), igual a parse_int_base com base ruim.
+proc make_spec(loc: Locale, decimals: int, rounding: Rounding, shift: int) -> Spec {
+    if decimals < 0 or decimals > MAX_DECIMALS {
+        panic("fmt: decimals fora de 0..15")
+    }
+    return Spec{decimals = decimals, rounding = rounding, shift = shift, decimal_sep = loc.decimal_sep, group_sep = loc.group_sep, group_size = loc.group_size, min_group_digits = loc.min_group_digits}
+}
+
+// Algarismo na posicao index (0 = o primeiro); 0 fora do que foi guardado.
+proc digit_at(dg: ^Digits, index: int) -> u8 {
+    if index < 0 or index >= dg.n {
+        return 0
+    }
+    return dg.digits[index]
+}
+
+// true se algum algarismo de dg, de from em diante, e diferente de 0.
+proc has_nonzero_from(dg: ^Digits, from: int) -> bool {
+    var i = from
+    if i < 0 {
+        i = 0
+    }
+    while i < dg.n {
+        if dg.digits[i] != 0 {
+            return true
+        }
+        i += 1
+    }
+    return false
+}
+
+// Expoente decimal do texto do %.17g, depois do 'e': sinal opcional e algarismos ("+22", "-07").
+proc read_exponent(text: str, from: int) -> int {
+    var i = from
+    var negative = false
+    if text[i] == MINUS_SIGN {
+        negative = true
+        i += 1
+    } else if text[i] == PLUS_SIGN {
+        i += 1
+    }
+    var value = 0
+    while i < len(text) {
+        value = value * DECIMAL_BASE + (text[i] - DIGIT_ZERO) as int
+        i += 1
+    }
+    if negative {
+        return -value
+    }
+    return value
+}
+
+// Preenche dg com a mantissa e o expoente do texto finito do %.17g a partir de start (depois do '-'): "1.0049999999999999", "1e+21", "1.2345e-07", "0".
+proc read_float_text(text: str, start: int, dg: ^Digits) {
+    var i = start
+    var int_digits = 0
+    var leading_zeros = 0
+    var seen_dot = false
+    while i < len(text) and text[i] != LETTER_E {
+        let b = text[i]
+        i += 1
+        if b == DOT {
+            seen_dot = true
+        } else if dg.n == 0 and b == DIGIT_ZERO {
+            if seen_dot {
+                leading_zeros += 1
+            }
+        } else {
+            if dg.n < MAX_STORED_DIGITS {
+                dg.digits[dg.n] = b - DIGIT_ZERO
+                dg.n += 1
+            }
+            if not seen_dot {
+                int_digits += 1
+            }
+        }
+    }
+    dg.point = int_digits - leading_zeros
+    if i < len(text) {
+        dg.point += read_exponent(text, from = i + 1)
+    }
+}
+
+// Carrega os algarismos de v (KIND_FINITE) ou diz que e NaN ou infinito. shift desloca o expoente decimal sem multiplicar o f64 (percent: +2). O sinal fica em dg.negative.
+proc load_float_digits(v: f64, shift: int, dg: ^Digits) -> int {
+    let text = format(f"{v}", alloc = scope)
+    var start = 0
+    if text[0] == MINUS_SIGN {
+        dg.negative = true
+        start = 1
+    }
+    if text[start] == LETTER_N {
+        return KIND_NAN
+    }
+    if text[start] == LETTER_I {
+        return KIND_INF
+    }
+    read_float_text(text, start, dg)
+    if dg.n > 0 {
+        dg.point += shift
+    }
+    return KIND_FINITE
+}
+
+// Carrega os algarismos de um int sem estourar no menor int: acumula o resto pelo modulo (o resto de um negativo e negativo).
+proc load_int_digits(v: int, dg: ^Digits) {
+    var rest = v
+    dg.negative = v < 0
+    while rest != 0 {
+        var last = rest % DECIMAL_BASE
+        if last < 0 {
+            last = -last
+        }
+        dg.digits[dg.n] = last as u8
+        dg.n += 1
+        rest = rest / DECIMAL_BASE
+    }
+    for i in 0..<(dg.n / 2) {
+        let other = dg.n - 1 - i
+        let kept = dg.digits[i]
+        dg.digits[i] = dg.digits[other]
+        dg.digits[other] = kept
+    }
+    dg.point = dg.n
+}
+
+// Como o resto cortado (algarismos de keep em diante) se compara com a metade da casa. keep < 0: so sobram zeros implicitos na frente, o valor e menor que a metade.
+proc classify_tail(dg: ^Digits, keep: int) -> int {
+    if dg.n == 0 or keep >= dg.n {
+        return TAIL_ZERO
+    }
+    if keep < 0 {
+        return TAIL_BELOW_HALF
+    }
+    let first = dg.digits[keep]
+    let rest = has_nonzero_from(dg, from = keep + 1)
+    if first > 5 or (first == 5 and rest) {
+        return TAIL_ABOVE_HALF
+    }
+    if first == 5 {
+        return TAIL_HALF
+    }
+    if first > 0 or rest {
+        return TAIL_BELOW_HALF
+    }
+    return TAIL_ZERO
+}
+
+// true se o modo manda somar 1 ao ultimo algarismo mantido. odd = esse algarismo e impar (so o half_even olha).
+proc rounds_up(tail: int, rounding: Rounding, odd: bool) -> bool {
+    if tail == TAIL_ZERO {
+        return false
+    }
+    if rounding == Rounding.up {
+        return true
+    }
+    if rounding == Rounding.half_up {
+        return tail != TAIL_BELOW_HALF
+    }
+    if rounding == Rounding.half_down {
+        return tail == TAIL_ABOVE_HALF
+    }
+    if rounding == Rounding.half_even {
+        return tail == TAIL_ABOVE_HALF or (tail == TAIL_HALF and odd)
+    }
+    return false
+}
+
+// Soma 1 ao ultimo algarismo de dg com vai-um; se todos eram 9 o resultado e 1 seguido de zeros e o expoente sobe.
+proc carry_up(dg: ^Digits) {
+    var i = dg.n - 1
+    while i >= 0 and dg.digits[i] == 9 {
+        dg.digits[i] = 0
+        i -= 1
+    }
+    if i < 0 {
+        dg.digits[0] = 1
+        dg.point += 1
+    } else {
+        dg.digits[i] += 1
+    }
+}
+
+// Mantem os keep primeiros algarismos de dg; up soma 1 ao ultimo. keep <= 0: nada fica; subindo, o valor vira 1 unidade da ultima casa pedida (0,1 x 10^(point - keep + 1)).
+proc cut_digits(dg: ^Digits, keep: int, up: bool) {
+    if keep <= 0 {
+        if up {
+            dg.digits[0] = 1
+            dg.n = 1
+            dg.point = dg.point - keep + 1
+        } else {
+            dg.n = 0
+        }
+        return
+    }
+    if keep < dg.n {
+        dg.n = keep
+    }
+    if up {
+        carry_up(dg)
+    }
+}
+
+// Arredonda dg para os keep primeiros algarismos significativos, no modo pedido.
+proc round_digits(dg: ^Digits, keep: int, rounding: Rounding) {
+    let tail = classify_tail(dg, keep)
+    let odd = keep > 0 and keep <= dg.n and dg.digits[keep - 1] % 2 == 1
+    cut_digits(dg, keep, up = rounds_up(tail, rounding, odd))
+}
+
+// Parte inteira de dg com o agrupamento da regiao ("0" quando o valor e menor que 1).
+proc write_integer_part(dg: ^Digits, buf: ^[dynamic]u8, spec: Spec) {
+    var count = dg.point
+    if count < 1 {
+        count = 1
+    }
+    let grouped = spec.group_size > 0 and count >= spec.group_size + spec.min_group_digits
+    for i in 0..<count {
+        var digit: u8 = 0
+        if dg.point > 0 {
+            digit = digit_at(dg, index = i)
+        }
+        append(buf, item = DIGIT_ZERO + digit)
+        let remaining = count - 1 - i
+        if grouped and remaining > 0 and remaining % spec.group_size == 0 {
+            append(buf, item = spec.group_sep)
+        }
+    }
+}
+
+// Escreve dg ja arredondado: sinal (so se sobrou algum algarismo diferente de 0), parte inteira agrupada e as spec.decimals casas.
+proc write_digits(dg: ^Digits, buf: ^[dynamic]u8, spec: Spec) {
+    if dg.negative and has_nonzero_from(dg, from = 0) {
+        append(buf, item = "-")
+    }
+    write_integer_part(dg, buf, spec)
+    if spec.decimals > 0 {
+        append(buf, item = spec.decimal_sep)
+        for j in 0..<spec.decimals {
+            append(buf, item = DIGIT_ZERO + digit_at(dg, index = dg.point + j))
+        }
+    }
+}
+
+// Escreve v em buf no pedido de spec. NaN sai "NaN" e infinito "∞"/"-∞" (sem panic). Devolve false para esses dois (nao ha numero: percent nao poe o "%").
+proc write_decimal(v: f64, buf: ^[dynamic]u8, spec: Spec) -> bool {
+    var dg = Digits{}
+    let kind = load_float_digits(v, spec.shift, &dg)
+    if kind == KIND_NAN {
+        append(buf, item = "NaN")
+        return false
+    }
+    if kind == KIND_INF {
+        if dg.negative {
+            append(buf, item = "-")
+        }
+        append(buf, item = "∞")
+        return false
+    }
+    round_digits(&dg, keep = SIGNIFICANT_DIGITS, rounding = Rounding.half_even)
+    round_digits(&dg, keep = dg.point + spec.decimals, rounding = spec.rounding)
+    write_digits(&dg, buf, spec)
+    return true
+}

@@ -1,0 +1,600 @@
+// nativo/optimizer/selecao.fj - porte de compiler/nativo/optimizer/selecao.c, compiler/nativo/optimizer/selecao.h
+// sha256 de nativo/optimizer/selecao.c: bdb1f36879936e46bfe1f51d1c3021228e01d042588315ec7110db852dd1bb10
+// sha256 de nativo/optimizer/selecao.h: 4a210928d3a55b66390d8d89f9f2e8bc2d40b89b71383333151ec46a662f797e
+// gerado por c2forja esqueleto 0.3.2; stubs portados e linhas do gerado conferidas contra o C (O7)
+// Versao: 0.1.2
+
+import "common"
+import "nativo/bir"
+
+// Vetores de Selecao: as vistas (entradas, usos, morto) sao tiradas dos [dynamic] *_mem, que sao os donos (liberar_2 os apaga).
+struct Selecao {
+    p: ?^bir.BirPrograma
+    f: ?^bir.BirFuncao
+    entradas: ?[]u32
+    usos: ?[]u32
+    morto: ?[]u8
+    nvregs_ini: u32
+    entradas_mem: [dynamic]u32
+    usos_mem: [dynamic]u32
+    morto_mem: [dynamic]u8
+}
+
+// vreg escrito no braco -> operando que ele vale no fim do braco.
+struct MapaBraco {
+    n: u32
+    dst: [4]u32
+    valor: [4]bir.BirOperando
+}
+
+struct Plano2 {
+    sobe: [8]bir.BirInstr
+    sel: [8]bir.BirInstr
+    classe_novo: [8]u8
+    nsobe: u32
+    nsel: u32
+    nnovos: u32
+    base_vreg: u32
+    cmp: [2]bir.BirOperando
+}
+
+struct Forma {
+    cabeca: u32
+    alvo_t: u32
+    alvo_f: u32
+    juncao: u32
+    braco_t: bool
+    braco_f: bool
+}
+
+struct Montagem2 {
+    s: ?^Selecao
+    pl: ?^Plano2
+    cmp: ?^bir.BirInstr
+    mt: ?^MapaBraco
+    mf: ?^MapaBraco
+}
+
+const BRACO_MAX: u32 = 4
+const PLANO_MAX: u32 = 8
+
+// C: nativo/optimizer/selecao.c:47
+proc eh_conta_ov_5(op: u8) -> bool {
+    return (((op == (bir.BIR_ADD_OV as u8)) or (op == (bir.BIR_SUB_OV as u8))) or (op == (bir.BIR_MUL_OV as u8))) or (op == (bir.BIR_NEG_OV as u8))
+}
+
+// C: nativo/optimizer/selecao.c:52
+proc contar_uso_2(s: ^Selecao, o: ^bir.BirOperando) {
+    if (o.tipo == (bir.BO_VREG as u8)) and (o.id < s.nvregs_ini) {
+        let usos: []u32 = s.usos or_else {}
+        usos[o.id] += 1
+    }
+}
+
+// C: nativo/optimizer/selecao.c:58
+proc contar_instrucao(s: ^Selecao, i: ^bir.BirInstr) {
+    let entradas: []u32 = s.entradas or_else {}
+    if (i.op == (bir.BIR_SALTA as u8)) or (i.op == (bir.BIR_DESVIA as u8)) or eh_conta_ov_5(i.op) {
+        entradas[i.alvo[0]] += 1
+    }
+    if i.op == (bir.BIR_DESVIA as u8) {
+        entradas[i.alvo[1]] += 1
+    }
+    contar_uso_2(s, &i.a)
+    contar_uso_2(s, &i.b)
+    var k: u32 = 0
+    while k < i.nargs {
+        contar_uso_2(s, &(i.args or_else {})[k])
+        k += 1
+    }
+}
+
+// C: nativo/optimizer/selecao.c:70
+// Zera as tres tabelas (C: calloc). A Forja nao tem falta de memoria observavel aqui: o make aborta, o C chama FalhaInterna.
+proc alocar_2(s: ^Selecao) -> bool {
+    let f: ^bir.BirFuncao = s.f as ^bir.BirFuncao
+    s.nvregs_ini = f.nvregs
+    let nb: int = (f.nblocos as int) + 1
+    let nu: int = (f.nvregs as int) + 1
+    s.entradas_mem = make([dynamic]u32, alloc = heap, cap = nb + 1)
+    s.usos_mem = make([dynamic]u32, alloc = heap, cap = nu + 1)
+    s.morto_mem = make([dynamic]u8, alloc = heap, cap = nb + 1)
+    var k: int = 0
+    while k < nb {
+        append(&s.entradas_mem, item = 0)
+        append(&s.morto_mem, item = 0)
+        k += 1
+    }
+    k = 0
+    while k < nu {
+        append(&s.usos_mem, item = 0)
+        k += 1
+    }
+    s.entradas = s.entradas_mem[..]
+    s.usos = s.usos_mem[..]
+    s.morto = s.morto_mem[..]
+    return true
+}
+
+// C: nativo/optimizer/selecao.c:79
+// So chamada depois de alocar_2 (os [dynamic] existem).
+proc liberar_2(s: ^Selecao) {
+    delete(s.entradas_mem)
+    delete(s.usos_mem)
+    delete(s.morto_mem)
+}
+
+// C: nativo/optimizer/selecao.c:89
+// O bloco b e um braco da cabeca: entrada unica, quente, ate BRACO_MAX instrucoes e termina em SALTA (a juncao sai em *juncao).
+proc eh_braco(s: ^Selecao, b: u32, cabeca: u32, juncao: ^u32) -> bool {
+    let f: ^bir.BirFuncao = s.f as ^bir.BirFuncao
+    let k: ^bir.BirBloco = &f.blocos[b]
+    let entradas: []u32 = s.entradas or_else {}
+    if (b == 0) or (b == cabeca) or (entradas[b] != 1) or k.frio or (k.n > (BRACO_MAX + 1)) or (k.instrs[k.n - 1].op != (bir.BIR_SALTA as u8)) {
+        return false
+    }
+    juncao^ = k.instrs[k.n - 1].alvo[0]
+    return true
+}
+
+// C: nativo/optimizer/selecao.c:99
+proc cabeca_valida(s: ^Selecao, h: u32) -> bool {
+    let f: ^bir.BirFuncao = s.f as ^bir.BirFuncao
+    let b: ^bir.BirBloco = &f.blocos[h]
+    if b.frio or (b.n < 2) or ((s.morto or_else {})[h] != 0) {
+        return false
+    }
+    let desvia: ^bir.BirInstr = &b.instrs[b.n - 1]
+    let cmp: ^bir.BirInstr = &b.instrs[b.n - 2]
+    let usos: []u32 = s.usos or_else {}
+    return (desvia.op == (bir.BIR_DESVIA as u8)) and (cmp.op == (bir.BIR_CMP as u8)) and (desvia.a.tipo == (bir.BO_VREG as u8)) and (cmp.dst == desvia.a.id) and (cmp.dst < s.nvregs_ini) and (usos[cmp.dst] == 1) and (desvia.alvo[0] != desvia.alvo[1])
+}
+
+// C: nativo/optimizer/selecao.c:112
+proc reconhecer_forma(s: ^Selecao, h: u32, fm: ^Forma) -> bool {
+    if not cabeca_valida(s, h) {
+        return false
+    }
+    let f: ^bir.BirFuncao = s.f as ^bir.BirFuncao
+    let desvia: ^bir.BirInstr = &f.blocos[h].instrs[f.blocos[h].n - 1]
+    var jt: u32 = 0
+    var jf: u32 = 0
+    fm^ = Forma{cabeca = h, alvo_t = desvia.alvo[0], alvo_f = desvia.alvo[1]}
+    fm.braco_t = eh_braco(s, fm.alvo_t, h, &jt)
+    fm.braco_f = eh_braco(s, fm.alvo_f, h, &jf)
+    if fm.braco_t and fm.braco_f {
+        fm.juncao = jt
+        return (jt == jf) and (jt != fm.alvo_t) and (jt != fm.alvo_f) and (jt != h)
+    }
+    if fm.braco_t {
+        fm.juncao = fm.alvo_f
+        return (jt == fm.alvo_f) and (fm.alvo_f != h)
+    }
+    if fm.braco_f {
+        fm.juncao = fm.alvo_t
+        return (jf == fm.alvo_t) and (fm.alvo_t != h)
+    }
+    return false
+}
+
+// C: nativo/optimizer/selecao.c:140
+proc operando_simples_3(o: ^bir.BirOperando) -> bool {
+    return ((o.tipo == (bir.BO_VREG as u8)) or (o.tipo == (bir.BO_IMED as u8))) and (o.tam == 0) and (o.extensao == (bir.BE_NENHUMA as u8))
+}
+
+// C: nativo/optimizer/selecao.c:146
+// Instrucao que pode subir para a cabeca: sem trap, sem memoria, sem chamada (real: so as contas que nao trapam). Vetor e opaco (BC_V128).
+proc instrucao_pura(f: ^bir.BirFuncao, i: ^bir.BirInstr) -> bool {
+    let real: bool = bir.bir_classe_eh_real(i.classe as i32)
+    if (i.dst == bir.BIR_SEM_VREG) or (i.dst >= f.nvregs) or (i.nargs != 0) or (i.a.tam != 0) or (i.b.tam != 0) or (i.classe == (bir.BC_V128 as u8)) {
+        return false
+    }
+    let sw_1 = i.op as i32
+    if sw_1 == bir.BIR_CONST or sw_1 == bir.BIR_COPIA or sw_1 == bir.BIR_ADD or sw_1 == bir.BIR_SUB or sw_1 == bir.BIR_MUL or sw_1 == bir.BIR_NEG {
+        return true
+    } else if sw_1 == bir.BIR_AND or sw_1 == bir.BIR_OR or sw_1 == bir.BIR_XOR or sw_1 == bir.BIR_NOT or sw_1 == bir.BIR_EXT_S or sw_1 == bir.BIR_EXT_Z or sw_1 == bir.BIR_TRUNC {
+        return not real
+    }
+    return false
+}
+
+// C: nativo/optimizer/selecao.c:163
+// Troca um operando vreg pelo valor que o braco ja lhe deu; imediato so onde a instrucao aceita (pode_imed).
+proc substituir(m: ^MapaBraco, o: ^bir.BirOperando, pode_imed: bool) -> bool {
+    if o.tipo != (bir.BO_VREG as u8) {
+        return true
+    }
+    var k: u32 = 0
+    while k < m.n {
+        if m.dst[k] == o.id {
+            if (m.valor[k].tipo == (bir.BO_IMED as u8)) and (not pode_imed) {
+                return false
+            }
+            o^ = m.valor[k]
+            return true
+        }
+        k += 1
+    }
+    return true
+}
+
+// C: nativo/optimizer/selecao.c:178
+proc registrar(m: ^MapaBraco, dst: u32, valor: ^bir.BirOperando) -> bool {
+    var k: u32 = 0
+    while k < m.n {
+        if m.dst[k] == dst {
+            m.valor[k] = valor^
+            return true
+        }
+        k += 1
+    }
+    if m.n >= BRACO_MAX {
+        return false
+    }
+    let antes: u32 = m.n
+    m.dst[antes] = dst
+    m.valor[antes] = valor^
+    m.n += 1
+    return true
+}
+
+// C: nativo/optimizer/selecao.c:194
+// Copia e constante nao geram instrucao (o mapa guarda o operando); o resto sobe com o dst novo.
+proc simular(s: ^Selecao, pl: ^Plano2, m: ^MapaBraco, i: ^bir.BirInstr) -> bool {
+    var h: bir.BirInstr = i^
+    if (not substituir(m, &h.a, i.op == (bir.BIR_COPIA as u8))) or (not substituir(m, &h.b, true)) or (not operando_simples_3(&h.a)) {
+        return false
+    }
+    if (h.b.tipo != (bir.BO_NADA as u8)) and (h.b.tipo != (bir.BO_SIMBOLO as u8)) and (not operando_simples_3(&h.b)) {
+        return false
+    }
+    if (i.op == (bir.BIR_CONST as u8)) or (i.op == (bir.BIR_COPIA as u8)) {
+        return registrar(m, i.dst, &h.a)
+    }
+    if pl.nsobe >= PLANO_MAX {
+        return false
+    }
+    let f: ^bir.BirFuncao = s.f as ^bir.BirFuncao
+    let novo: u32 = pl.base_vreg + pl.nnovos
+    h.dst = novo
+    pl.classe_novo[pl.nnovos] = (f.classe_vreg or_else {})[i.dst]
+    pl.nnovos += 1
+    pl.sobe[pl.nsobe] = h
+    pl.nsobe += 1
+    var valor = bir.BirOperando{tipo = (bir.BO_VREG as u8), classe = i.classe, id = novo}
+    return registrar(m, i.dst, &valor)
+}
+
+// C: nativo/optimizer/selecao.c:212
+proc montar_braco(s: ^Selecao, pl: ^Plano2, bloco: u32, m: ^MapaBraco) -> bool {
+    let f: ^bir.BirFuncao = s.f as ^bir.BirFuncao
+    let b: ^bir.BirBloco = &f.blocos[bloco]
+    var k: u32 = 0
+    while (k + 1) < b.n {
+        if (not instrucao_pura(f, &b.instrs[k])) or (not simular(s, pl, m, &b.instrs[k])) {
+            return false
+        }
+        k += 1
+    }
+    return true
+}
+
+// C: nativo/optimizer/selecao.c:225
+proc achar_valor(m: ^MapaBraco, dst: u32, saida: ^bir.BirOperando) -> bool {
+    var k: u32 = 0
+    while k < m.n {
+        if m.dst[k] == dst {
+            saida^ = m.valor[k]
+            return true
+        }
+        k += 1
+    }
+    return false
+}
+
+// C: nativo/optimizer/selecao.c:239
+// Um SELECIONA por vreg escrito: o args aponta para o par da comparacao (a copia da arena vem em aplicar).
+proc acrescentar_selecao(m: ^Montagem2, dst: u32) {
+    let s: ^Selecao = m.s as ^Selecao
+    let f: ^bir.BirFuncao = s.f as ^bir.BirFuncao
+    let pl: ^Plano2 = m.pl as ^Plano2
+    let cmp: ^bir.BirInstr = m.cmp as ^bir.BirInstr
+    let antes: u32 = pl.nsel
+    pl.nsel += 1
+    let classe_dst: u8 = (f.classe_vreg or_else {})[dst]
+    let antigo = bir.BirOperando{tipo = (bir.BO_VREG as u8), classe = classe_dst, id = dst}
+    pl.sel[antes] = bir.BirInstr{op = (bir.BIR_SELECIONA as u8), aux = cmp.aux, classe = classe_dst, dst = dst, a = antigo, b = antigo, args = pl.cmp[..], nargs = 2, pos = cmp.pos}
+    _ = achar_valor(m.mt as ^MapaBraco, dst, &pl.sel[antes].a)
+    _ = achar_valor(m.mf as ^MapaBraco, dst, &pl.sel[antes].b)
+}
+
+// C: nativo/optimizer/selecao.c:249
+proc montar_selecoes(m: ^Montagem2) {
+    var ignorado = bir.BirOperando{}
+    let mt: ^MapaBraco = m.mt as ^MapaBraco
+    let mf: ^MapaBraco = m.mf as ^MapaBraco
+    var k: u32 = 0
+    while k < mt.n {
+        acrescentar_selecao(m, mt.dst[k])
+        k += 1
+    }
+    k = 0
+    while k < mf.n {
+        if not achar_valor(mt, mf.dst[k], &ignorado) {
+            acrescentar_selecao(m, mf.dst[k])
+        }
+        k += 1
+    }
+}
+
+// C: nativo/optimizer/selecao.c:261
+proc le_vreg_2(o: ^bir.BirOperando, vreg: u32) -> bool {
+    return (o.tipo == (bir.BO_VREG as u8)) and (o.id == vreg)
+}
+
+// C: nativo/optimizer/selecao.c:267
+// O SELECIONA x escreve um vreg que outro SELECIONA (ou, havendo varios, a comparacao) le: a ordem dos dois mudaria o resultado.
+proc conflita_com_outros(pl: ^Plano2, x: u32) -> bool {
+    let dst: u32 = pl.sel[x].dst
+    var y: u32 = 0
+    while y < pl.nsel {
+        if (y != x) and (le_vreg_2(&pl.sel[y].a, dst) or le_vreg_2(&pl.sel[y].b, dst)) {
+            return true
+        }
+        y += 1
+    }
+    return (pl.nsel > 1) and (le_vreg_2(&pl.cmp[0], dst) or le_vreg_2(&pl.cmp[1], dst))
+}
+
+// C: nativo/optimizer/selecao.c:279
+// Inteiro pede comparacao inteira, real pede o padrao minss/maxss (e portanto comparacao real).
+proc plano_aceitavel(pl: ^Plano2) -> bool {
+    var maximo: bool = false
+    var primeiro: ?^bir.BirOperando = none
+    var segundo: ?^bir.BirOperando = none
+    if pl.nsel == 0 {
+        return false
+    }
+    let real_cmp: bool = bir.bir_classe_eh_real(pl.cmp[0].classe as i32)
+    var x: u32 = 0
+    while x < pl.nsel {
+        let i: ^bir.BirInstr = &pl.sel[x]
+        let real_sel: bool = bir.bir_classe_eh_real(i.classe as i32)
+        if (real_sel != real_cmp) or conflita_com_outros(pl, x) {
+            return false
+        }
+        if real_sel and (not bir.bir_seleciona_min_max(i, &maximo, &primeiro, &segundo)) {
+            return false
+        }
+        x += 1
+    }
+    return true
+}
+
+// C: nativo/optimizer/selecao.c:299
+// Garante a capacidade do bloco (C: realloc). Convencao da BIR: b.cap = cap(instrs).
+proc garantir_capacidade_2(b: ^bir.BirBloco, n: u32) {
+    if n <= b.cap {
+        return
+    }
+    reserve(&b.instrs, n as int)
+    b.cap = (cap(b.instrs) as u64) as u32
+}
+
+// C: nativo/optimizer/selecao.c:312
+// Cresce classe_vreg por fatia da arena do programa (como bir_novo_vreg): o vetor antigo e copiado e os classes novos entram no fim.
+proc crescer_vregs(s: ^Selecao, pl: ^Plano2) {
+    let f: ^bir.BirFuncao = s.f as ^bir.BirFuncao
+    let total: u32 = f.nvregs + pl.nnovos
+    let nova: []u8 = common.arena_fatia_u8(&(s.p as ^bir.BirPrograma).arena, (total + 1) as int)
+    let velha: []u8 = f.classe_vreg or_else {}
+    var k: u32 = 0
+    while k < f.nvregs {
+        nova[k] = velha[k]
+        k += 1
+    }
+    k = 0
+    while k < pl.nnovos {
+        nova[f.nvregs + k] = pl.classe_novo[k]
+        k += 1
+    }
+    f.classe_vreg = nova
+    f.nvregs = total
+}
+
+// C: nativo/optimizer/selecao.c:324
+proc matar_braco(s: ^Selecao, bloco: u32) {
+    let morto: []u8 = s.morto or_else {}
+    let entradas: []u32 = s.entradas or_else {}
+    morto[bloco] = 1
+    entradas[bloco] = 0
+}
+
+// C: nativo/optimizer/selecao.c:331
+// A cabeca perde CMP e DESVIA e ganha: instrucoes que subiram, SELECIONA, SALTA para a juncao. Os bracos morrem.
+proc aplicar(s: ^Selecao, pl: ^Plano2, fm: ^Forma) {
+    let f: ^bir.BirFuncao = s.f as ^bir.BirFuncao
+    let h: ^bir.BirBloco = &f.blocos[fm.cabeca]
+    let salta_original: bir.BirInstr = h.instrs[h.n - 1]
+    crescer_vregs(s, pl)
+    garantir_capacidade_2(h, ((h.n - 2) + pl.nsobe) + pl.nsel + 1)
+    truncate(&h.instrs, (h.n - 2) as int)
+    h.n -= 2
+    var k: u32 = 0
+    while k < pl.nsobe {
+        append(&h.instrs, item = pl.sobe[k])
+        h.n += 1
+        k += 1
+    }
+    k = 0
+    while k < pl.nsel {
+        var x: bir.BirInstr = pl.sel[k]
+        let par: []bir.BirOperando = bir.arena_fatia_bir_operando(&(s.p as ^bir.BirPrograma).arena, 2)
+        par[0] = pl.cmp[0]
+        par[1] = pl.cmp[1]
+        x.args = par
+        append(&h.instrs, item = x)
+        h.n += 1
+        k += 1
+    }
+    var salta: bir.BirInstr = salta_original
+    salta.op = (bir.BIR_SALTA as u8)
+    salta.a = bir.BirOperando{}
+    salta.alvo[0] = fm.juncao
+    salta.alvo[1] = 0
+    append(&h.instrs, item = salta)
+    h.n += 1
+    h.cap = (cap(h.instrs) as u64) as u32
+    if fm.braco_t {
+        matar_braco(s, fm.alvo_t)
+    }
+    if fm.braco_f {
+        matar_braco(s, fm.alvo_f)
+    }
+    let entradas: []u32 = s.entradas or_else {}
+    entradas[fm.juncao] -= 1
+}
+
+// C: nativo/optimizer/selecao.c:361
+// Simula os bracos e monta o plano; false = a cabeca fica como esta (nada foi alterado).
+proc montar_plano(s: ^Selecao, fm: ^Forma, cmp: ^bir.BirInstr, pl: ^Plano2) -> bool {
+    var mt = MapaBraco{}
+    var mf = MapaBraco{}
+    pl.cmp[0] = cmp.a
+    pl.cmp[1] = cmp.b
+    if (fm.braco_t and (not montar_braco(s, pl, fm.alvo_t, &mt))) or (fm.braco_f and (not montar_braco(s, pl, fm.alvo_f, &mf))) {
+        return false
+    }
+    var m = Montagem2{s = s, pl = pl, cmp = cmp, mt = &mt, mf = &mf}
+    montar_selecoes(&m)
+    return plano_aceitavel(pl)
+}
+
+// C: nativo/optimizer/selecao.c:374
+// Operando de valor conhecido na cabeca: imediato, ou vreg cuja definicao anterior ao CMP, no mesmo bloco, e uma CONST.
+proc operando_constante_na_cabeca(b: ^bir.BirBloco, o: ^bir.BirOperando) -> bool {
+    if o.tipo == (bir.BO_IMED as u8) {
+        return true
+    }
+    if o.tipo != (bir.BO_VREG as u8) {
+        return false
+    }
+    var k: u32 = 0
+    while (k + 2) < b.n {
+        if (b.instrs[k].dst == o.id) and (b.instrs[k].op == (bir.BIR_CONST as u8)) {
+            return true
+        }
+        k += 1
+    }
+    return false
+}
+
+// C: nativo/optimizer/selecao.c:387
+// Condicao com os dois lados constantes ja tem desvio resolvivel; a selecao a deixaria como cmp+cmov de constantes.
+proc condicao_constante(b: ^bir.BirBloco, cmp: ^bir.BirInstr) -> bool {
+    return operando_constante_na_cabeca(b, &cmp.a) and operando_constante_na_cabeca(b, &cmp.b)
+}
+
+// C: nativo/optimizer/selecao.c:392
+proc tentar_cabeca(s: ^Selecao, h: u32) -> bool {
+    var fm = Forma{}
+    if not reconhecer_forma(s, h, &fm) {
+        return false
+    }
+    let f: ^bir.BirFuncao = s.f as ^bir.BirFuncao
+    let b: ^bir.BirBloco = &f.blocos[h]
+    let cmp: ^bir.BirInstr = &b.instrs[b.n - 2]
+    if condicao_constante(b, cmp) {
+        return false
+    }
+    if operando_simples_3(&cmp.a) and operando_simples_3(&cmp.b) {
+        var pl = Plano2{base_vreg = f.nvregs}
+        if montar_plano(s, &fm, cmp, &pl) {
+            aplicar(s, &pl, &fm)
+            return true
+        }
+    }
+    return false
+}
+
+// C: nativo/optimizer/selecao.c:414
+// Fica com os blocos vivos na ordem de id (cfg_aplicar_ordem remonta a funcao).
+proc compactar_4(s: ^Selecao) {
+    let f: ^bir.BirFuncao = s.f as ^bir.BirFuncao
+    let morto: []u8 = s.morto or_else {}
+    var ordem_mem = make([dynamic]u32, alloc = heap, cap = (f.nblocos as int) + 1)
+    defer delete(ordem_mem)
+    var b: u32 = 0
+    while b < f.nblocos {
+        if morto[b] == 0 {
+            append(&ordem_mem, item = b)
+        }
+        b += 1
+    }
+    cfg_aplicar_ordem(f, ordem_mem[..])
+}
+
+// C: nativo/optimizer/selecao.c:428
+proc selecao_funcao(p: ^bir.BirPrograma, f: ^bir.BirFuncao) {
+    var s = Selecao{p = p, f = f}
+    if not cfg_elegivel(p, f) {
+        return
+    }
+    if not alocar_2(&s) {
+        return
+    }
+    defer liberar_2(&s)
+    var b: u32 = 0
+    while b < f.nblocos {
+        var k: u32 = 0
+        while k < f.blocos[b].n {
+            contar_instrucao(&s, &f.blocos[b].instrs[k])
+            k += 1
+        }
+        b += 1
+    }
+    var convertidas: u32 = 0
+    b = 0
+    while b < f.nblocos {
+        if tentar_cabeca(&s, b) {
+            convertidas += 1
+        }
+        b += 1
+    }
+    if convertidas > 0 {
+        compactar_4(&s)
+    }
+}
+
+// C: nativo/optimizer/selecao.c:448
+// `relato` nao e usado pelo C (void); fica o parametro para casar com passes.fj.
+proc otim_selecao_aplicar(programa: ^bir.BirPrograma, relato: ^[dynamic]u8) {
+    var i: u32 = 0
+    while i < programa.nfuncoes {
+        selecao_funcao(programa, &(programa.funcoes or_else {})[i])
+        i += 1
+    }
+}
+
+// ---- testes dirigidos (funcoes puras e de tabela do selecao.c; valores conferidos a mao)
+test "selecao_operando_simples_e_tabela_do_braco" {
+    var o = bir.BirOperando{tipo = (bir.BO_VREG as u8)}
+    expect(operando_simples_3(&o))
+    o.tam = 8
+    expect(not operando_simples_3(&o))
+    var m = MapaBraco{}
+    var v = bir.BirOperando{tipo = (bir.BO_IMED as u8), imed = 7}
+    expect(registrar(&m, 5, &v))
+    expect(m.n == 1)
+    var x = bir.BirOperando{tipo = (bir.BO_VREG as u8), id = 5}
+    expect(not substituir(&m, &x, false))
+    expect(substituir(&m, &x, true))
+    expect(x.tipo == (bir.BO_IMED as u8) and x.imed == 7)
+    var k: u32 = 1
+    while k < 4 {
+        expect(registrar(&m, k, &v))
+        k += 1
+    }
+    expect(not registrar(&m, 9, &v))
+    expect(m.n == 4)
+}

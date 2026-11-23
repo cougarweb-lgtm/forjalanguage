@@ -1,0 +1,272 @@
+// std:file no Linux (M5 P28b-1) - handle: open nos 4 modos, read/write/seek/tell/flush/close, pasta aberta em qualquer modo, limite de 32 handles e geracao. Roda na pasta de trabalho
+// ($D, em /tmp) com caminhos relativos; o mesmo programa roda no Windows (erros tipados iguais).
+import "std:file" as fs
+
+proc erro_texto(e: fs.FileError) -> str {
+    var t: str = "other"
+    switch e {
+    case fs.FileError.not_found:
+        t = "not_found"
+    case fs.FileError.no_permission:
+        t = "no_permission"
+    case fs.FileError.other:
+        t = "other"
+    case fs.FileError.already_exists:
+        t = "already_exists"
+    case fs.FileError.is_directory:
+        t = "is_directory"
+    case fs.FileError.not_directory:
+        t = "not_directory"
+    case fs.FileError.not_empty:
+        t = "not_empty"
+    case fs.FileError.closed:
+        t = "closed"
+    case fs.FileError.unsupported:
+        t = "unsupported"
+    case fs.FileError.locked:
+        t = "locked"
+    }
+    return t
+}
+
+// Imprime o rotulo e o resultado (ok ou o erro tipado) de uma operacao.
+proc passo(rotulo: str, erro: ?fs.FileError) {
+    switch e in erro {
+    case fs.FileError:
+        print(f"{rotulo} {erro_texto(e)}")
+    case none:
+        print(f"{rotulo} ok")
+    }
+}
+
+proc mostrar_posicao(rotulo: str, f: ^fs.File) {
+    switch r in fs.tell(f) {
+    case i64:
+        print(f"{rotulo} pos={r}")
+    case fs.FileError:
+        print(f"{rotulo} {erro_texto(r)}")
+    }
+}
+
+proc mostrar_seek(rotulo: str, f: ^fs.File, desloc: i64, de: fs.SeekFrom) {
+    switch r in fs.seek(f, desloc, from = de) {
+    case i64:
+        print(f"{rotulo} pos={r}")
+    case fs.FileError:
+        print(f"{rotulo} {erro_texto(r)}")
+    }
+}
+
+proc mostrar_leitura(rotulo: str, f: ^fs.File, n: int) {
+    var buf: [64]u8 = {}
+    switch r in fs.read(f, into = buf[0..<n]) {
+    case int:
+        var soma: int = 0
+        for i in 0..<r {
+            soma += buf[i] as int
+        }
+        print(f"{rotulo} lidos={r} soma={soma}")
+    case fs.FileError:
+        print(f"{rotulo} {erro_texto(r)}")
+    }
+}
+
+proc mostrar_tamanho(rotulo: str, caminho: str) {
+    switch r in fs.stat(caminho) {
+    case fs.FileInfo:
+        print(f"{rotulo} size={r.size}")
+    case fs.FileError:
+        print(f"{rotulo} {erro_texto(r)}")
+    }
+}
+
+proc gravar_e_fechar() {
+    switch r in fs.open("h.bin", mode = fs.OpenMode.write) {
+    case fs.File:
+        var f = r
+        passo("write abcdef", fs.write_str(&f, "abcdef"))
+        passo("flush", fs.flush(&f))
+        mostrar_posicao("apos gravar", &f)
+        mostrar_leitura("ler em handle so de gravacao", &f, 4)
+        fs.close(&f)
+        passo("write depois de fechar", fs.write_str(&f, "x"))
+        mostrar_posicao("tell depois de fechar", &f)
+        fs.close(&f)
+    case fs.FileError:
+        print(f"open write {erro_texto(r)}")
+    }
+}
+
+proc anexar() {
+    switch r in fs.open("h.bin", mode = fs.OpenMode.append) {
+    case fs.File:
+        var f = r
+        mostrar_seek("seek inicio no append", &f, 0, fs.SeekFrom.start)
+        passo("write XYZ", fs.write_str(&f, "XYZ"))
+        mostrar_posicao("apos anexar", &f)
+        fs.close(&f)
+    case fs.FileError:
+        print(f"open append {erro_texto(r)}")
+    }
+    mostrar_tamanho("tamanho apos anexar", "h.bin")
+}
+
+proc ler_e_posicionar() {
+    switch r in fs.open("h.bin", mode = fs.OpenMode.read) {
+    case fs.File:
+        var f = r
+        mostrar_leitura("ler 4", &f, 4)
+        mostrar_posicao("pos", &f)
+        mostrar_seek("seek 2 do inicio", &f, 2, fs.SeekFrom.start)
+        mostrar_leitura("ler 3", &f, 3)
+        mostrar_seek("seek -3 do fim", &f, -3, fs.SeekFrom.end)
+        mostrar_leitura("ler 10 no fim", &f, 10)
+        mostrar_leitura("ler no EOF", &f, 10)
+        mostrar_seek("seek 0 do atual", &f, 0, fs.SeekFrom.current)
+        mostrar_seek("seek antes do inicio", &f, -100, fs.SeekFrom.start)
+        mostrar_leitura("ler 0 bytes", &f, 0)
+        passo("write em handle so de leitura", fs.write_str(&f, "q"))
+        passo("flush em handle so de leitura", fs.flush(&f))
+        fs.close(&f)
+    case fs.FileError:
+        print(f"open read {erro_texto(r)}")
+    }
+}
+
+proc criar_exclusivo() {
+    switch r in fs.open("c.bin", mode = fs.OpenMode.create) {
+    case fs.File:
+        var f = r
+        print("create novo ok")
+        fs.close(&f)
+    case fs.FileError:
+        print(f"create novo {erro_texto(r)}")
+    }
+    switch r in fs.open("c.bin", mode = fs.OpenMode.create) {
+    case fs.File:
+        var f = r
+        print("create existente ok")
+        fs.close(&f)
+    case fs.FileError:
+        print(f"create existente {erro_texto(r)}")
+    }
+}
+
+proc tentar_abrir(rotulo: str, caminho: str, modo: fs.OpenMode) {
+    switch r in fs.open(caminho, mode = modo) {
+    case fs.File:
+        var f = r
+        print(f"{rotulo} aberto")
+        fs.close(&f)
+    case fs.FileError:
+        print(f"{rotulo} {erro_texto(r)}")
+    }
+}
+
+// Abre 33 handles de leitura: o 33o passa do limite de 32 (other); depois de fechar todos, abre de novo.
+proc limite_de_handles() {
+    var abertos: [33]fs.File = {}
+    var quantos: int = 0
+    for i in 0..<33 {
+        switch r in fs.open("h.bin", mode = fs.OpenMode.read) {
+        case fs.File:
+            abertos[i] = r
+            quantos += 1
+        case fs.FileError:
+            print(f"handle {i} {erro_texto(r)}")
+        }
+    }
+    print(f"abertos={quantos}")
+    for i in 0..<33 {
+        fs.close(&abertos[i])
+    }
+    tentar_abrir("depois de fechar todos", "h.bin", fs.OpenMode.read)
+}
+
+// Handle antigo (geracao velha) nao casa com a posicao reusada.
+proc geracao_velha() {
+    var velho = fs.File{id = 0}
+    switch r in fs.open("h.bin", mode = fs.OpenMode.read) {
+    case fs.File:
+        velho.id = r.id
+        var f = r
+        fs.close(&f)
+    case fs.FileError:
+        print(f"geracao {erro_texto(r)}")
+    }
+    switch r in fs.open("h.bin", mode = fs.OpenMode.read) {
+    case fs.File:
+        var novo = r
+        mostrar_leitura("handle velho com a posicao reusada", &velho, 2)
+        mostrar_leitura("handle novo", &novo, 2)
+        fs.close(&novo)
+    case fs.FileError:
+        print(f"geracao {erro_texto(r)}")
+    }
+}
+
+// 3 MiB gravados em pedacos de 1000 bytes e relidos em pedacos de 4096: soma e tamanho conferem.
+proc volume_grande() {
+    var pedaco: [1000]u8 = {}
+    for i in 0..<1000 {
+        pedaco[i] = (i % 253) as u8
+    }
+    switch r in fs.open("v.bin", mode = fs.OpenMode.write) {
+    case fs.File:
+        var f = r
+        var erros: int = 0
+        for _k in 0..<3000 {
+            if fs.write(&f, pedaco[..]) != none {
+                erros += 1
+            }
+        }
+        fs.close(&f)
+        print(f"volume gravado erros={erros}")
+    case fs.FileError:
+        print(f"volume open {erro_texto(r)}")
+    }
+    mostrar_tamanho("volume", "v.bin")
+    var total: int = 0
+    var soma: int = 0
+    var leitura: [4096]u8 = {}
+    switch r in fs.open("v.bin", mode = fs.OpenMode.read) {
+    case fs.File:
+        var f = r
+        var lidos: int = 1
+        while lidos > 0 {
+            lidos = 0
+            switch q in fs.read(&f, into = leitura[..]) {
+            case int:
+                lidos = q
+                total += q
+                for i in 0..<q {
+                    soma += leitura[i] as int
+                }
+            case fs.FileError:
+                print(f"volume read {erro_texto(q)}")
+            }
+        }
+        fs.close(&f)
+    case fs.FileError:
+        print(f"volume reabrir {erro_texto(r)}")
+    }
+    print(f"volume lido total={total} soma={soma}")
+}
+
+proc main() {
+    gravar_e_fechar()
+    anexar()
+    ler_e_posicionar()
+    criar_exclusivo()
+    tentar_abrir("pasta em leitura", ".", fs.OpenMode.read)
+    tentar_abrir("pasta em escrita", ".", fs.OpenMode.write)
+    tentar_abrir("pasta em append", ".", fs.OpenMode.append)
+    tentar_abrir("pasta em create", ".", fs.OpenMode.create)
+    tentar_abrir("ausente em leitura", "nao_existe.bin", fs.OpenMode.read)
+    tentar_abrir("pai inexistente", "nao_existe/x.bin", fs.OpenMode.write)
+    tentar_abrir("caminho vazio", "", fs.OpenMode.read)
+    tentar_abrir("sob arquivo", "h.bin/x", fs.OpenMode.write)
+    limite_de_handles()
+    geracao_velha()
+    volume_grande()
+}

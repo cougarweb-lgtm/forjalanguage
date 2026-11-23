@@ -1,0 +1,299 @@
+// nativo/x64/x64_rastro.fj - porte de compiler/nativo/x64/x64_rastro.c
+// sha256 de nativo/x64/x64_rastro.c: edf46b1496a631e47962b434d18dfb5758d2f240646c22fe9c0481baff839ab5
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "common"
+import "nativo/bir"
+import "nativo/dbg"
+import "nativo/obj"
+
+struct RastroArquivo {
+    caminho: ?str
+    off: u32
+}
+
+struct RastroTabela {
+    palavras: [dynamic]u8
+    textos: [dynamic]u8
+    arquivos: [dynamic]RastroArquivo
+    base: u32
+}
+
+const RASTRO_MAGIA: u32 = 827609670
+const RASTRO_CABECALHO_PALAVRAS: u32 = 12
+const RASTRO_PALAVRAS_FUNCAO: u32 = 2
+const RASTRO_PALAVRAS_CHAMADA: u32 = 4
+const RASTRO_PALAVRAS_LINHA: u32 = 4
+const RASTRO_FLAG_GUARDA: u32 = 1
+const RASTRO_ALINHAMENTO: u32 = 8
+const RASTRO_SIMBOLO_TABELA: str = "forja_rastro_tabela"
+const RASTRO_SIMBOLO_TEXTO: str = "forja_rastro_texto"
+
+// C: nativo/x64/x64_rastro.c:34
+proc call_de_proc_fj(c: ^X64Ctx, mi: ^MInstr) -> bool {
+    let chamada: bool = (mi.forma == (FX_CALL_REL32 as u16)) or (mi.forma == (FX_CALL_M64 as u16)) or (mi.forma == (FX_CALL_R64 as u16))
+    if not chamada {
+        return false
+    }
+    // c.instr vazio = sem BirInstr corrente (o C usa NULL)
+    if len(c.instr) == 0 {
+        return false
+    }
+    if c.instr[0].pos == bir.BIR_SEM_POS {
+        return false
+    }
+    if (c.f as ^bir.BirFuncao).sintetica {
+        return false
+    }
+    return (c.p as ^bir.BirPrograma).fonte != none
+}
+
+// C: nativo/x64/x64_rastro.c:42
+proc x64_rastro_chamada(c: ^X64Ctx, mi: ^MInstr) {
+    if call_de_proc_fj(c, mi) {
+        dbg.dbg_chamada_vista(c.dbg, x64_offset(c), c.instr[0].pos)
+    }
+}
+
+// C: nativo/x64/x64_rastro.c:48
+proc palavra(t: ^RastroTabela, v: u32) {
+    // little endian, como o memcpy do C no x86
+    for k in (0 as u32)..<4 {
+        append(&t.palavras, item = (((v >> (k * 8)) & 0xff) as u8))
+    }
+}
+
+// C: nativo/x64/x64_rastro.c:54
+proc texto_adicionar(t: ^RastroTabela, s: ?str) -> u32 {
+    let txt: str = s or_else ""
+    let off: u32 = t.base + ((len(t.textos) as u64) as u32)
+    append(&t.textos, items = as_bytes(txt))
+    append(&t.textos, item = (0 as u8))
+    return off
+}
+
+// C: nativo/x64/x64_rastro.c:62
+proc caminho_offset(t: ^RastroTabela, caminho: ?str) -> u32 {
+    var novo: ?^RastroArquivo = none
+    for k in (0 as u64)..<(len(t.arquivos) as u64) {
+        let a: ^RastroArquivo = &t.arquivos[k]
+        if (a.caminho or_else "") == (caminho or_else "") {
+            return a.off
+        }
+    }
+    append(&t.arquivos, item = RastroArquivo{})
+    novo = &t.arquivos[len(t.arquivos) - 1]
+    let ptr_1: ^RastroArquivo = novo as ^RastroArquivo
+    ptr_1.caminho = caminho
+    let ptr_2: ^RastroArquivo = novo as ^RastroArquivo
+    ptr_2.off = texto_adicionar(t, caminho)
+    return (novo as ^RastroArquivo).off
+}
+
+// C: nativo/x64/x64_rastro.c:78
+proc escrever_funcoes(c: ^X64Ctx, t: ^RastroTabela) {
+    var k: u64 = 0
+    while k < (len((c.dbg as ^dbg.DbgPrograma).procs) as u64) {
+        let f: ^dbg.DbgProc = &(c.dbg as ^dbg.DbgPrograma).procs[k]
+        palavra(t, f.inicio)
+        palavra(t, texto_adicionar(t, f.nome))
+        k += 1
+    }
+}
+
+// C: nativo/x64/x64_rastro.c:88
+proc escrever_chamadas(c: ^X64Ctx, t: ^RastroTabela) {
+    var k: u64 = 0
+    while k < (len((c.dbg as ^dbg.DbgPrograma).chamadas) as u64) {
+        let ch: ^dbg.DbgChamada = &(c.dbg as ^dbg.DbgPrograma).chamadas[k]
+        let p: common.FontePosicao = common.fonte_localizar_no_arquivo((c.p as ^bir.BirPrograma).fonte, ch.pos)
+        palavra(t, ch.ra)
+        palavra(t, caminho_offset(t, p.caminho))
+        palavra(t, p.linha)
+        palavra(t, p.coluna)
+        k += 1
+    }
+}
+
+// C: nativo/x64/x64_rastro.c:102
+proc escrever_linhas(c: ^X64Ctx, t: ^RastroTabela) {
+    var dica: u32 = 0
+    palavra(t, (len((c.dbg as ^dbg.DbgPrograma).linhas) as u64) as u32)
+    var k: u64 = 0
+    while k < (len((c.dbg as ^dbg.DbgPrograma).linhas) as u64) {
+        let l: ^dbg.DbgLinha = &(c.dbg as ^dbg.DbgPrograma).linhas[k]
+        let p: common.FontePosicao = dbg.dbg_posicao_com_dica((c.p as ^bir.BirPrograma).fonte, l.pos, &dica)
+        palavra(t, l.off)
+        palavra(t, caminho_offset(t, p.caminho))
+        palavra(t, p.linha)
+        palavra(t, p.coluna)
+        k += 1
+    }
+}
+
+// C: nativo/x64/x64_rastro.c:119
+proc cabecalho_do_main(c: ^X64Ctx, t: ^RastroTabela, destino: [4]u32) -> [4]u32 {
+    // C grava em destino[] por ponteiro: aqui o array volta de retorno (o parametro por valor perdia a escrita)
+    var _destino_v: [4]u32 = destino
+    var p: common.FontePosicao = common.FontePosicao{}
+    if (c.dbg as ^dbg.DbgPrograma).main_pos == bir.BIR_SEM_POS {
+        return _destino_v
+    }
+    p = common.fonte_localizar_no_arquivo((c.p as ^bir.BirPrograma).fonte, (c.dbg as ^dbg.DbgPrograma).main_pos)
+    _destino_v[0] = texto_adicionar(t, "main")
+    _destino_v[1] = caminho_offset(t, p.caminho)
+    _destino_v[2] = p.linha
+    _destino_v[3] = p.coluna
+    return _destino_v
+}
+
+// C: nativo/x64/x64_rastro.c:133
+proc anexar_em_rdata(c: ^X64Ctx, t: ^RastroTabela, secao: ^i32) -> u32 {
+    let o: ^obj.Objeto = c.o as ^obj.Objeto
+    var rdata: u32 = 4294967295
+    var k: u32 = 0
+    while (k < (len(o.secoes) as u32)) and (rdata == 4294967295) {
+        if (o.secoes[k as u64].nome or_else "") == ".rdata" {
+            rdata = k
+        }
+        k += 1
+    }
+    if rdata == 4294967295 {
+        rdata = obj.obj_secao_abrir(o, ".rdata", obj.OS_RDATA, RASTRO_ALINHAMENTO)
+    }
+    let s: ^obj.ObjSecao = &o.secoes[rdata as u64]
+    if s.alinhamento < RASTRO_ALINHAMENTO {
+        s.alinhamento = RASTRO_ALINHAMENTO
+    }
+    while ((len(s.bytes) as u64) % (RASTRO_ALINHAMENTO as u64)) != 0 {
+        append(&s.bytes, item = (0 as u8))
+    }
+    secao^ = rdata as i32
+    append(&s.bytes, items = t.palavras[0..<len(t.palavras)])
+    append(&s.bytes, items = t.textos[0..<len(t.textos)])
+    return ((len(s.bytes) as u64) - (len(t.palavras) as u64) - (len(t.textos) as u64)) as u32
+}
+
+// C: nativo/x64/x64_rastro.c:156
+// C2F: VecIniciar/BufLiberar viram make (alloc = heap) e delete; R0007 pede o make antes do 1o append
+proc rastro_tabela_iniciar(t: ^RastroTabela) {
+    t.palavras = make([dynamic]u8, alloc = heap)
+    t.textos = make([dynamic]u8, alloc = heap)
+    t.arquivos = make([dynamic]RastroArquivo, alloc = heap)
+}
+
+proc rastro_tabela_liberar(t: ^RastroTabela) {
+    delete(t.palavras)
+    delete(t.textos)
+    delete(t.arquivos)
+}
+
+proc x64_rastro_fechar(c: ^X64Ctx) {
+    let dbgp: ^dbg.DbgPrograma = c.dbg as ^dbg.DbgPrograma
+    let guarda: bool = c.guarda
+    let nf: u32 = (len(dbgp.procs) as u64) as u32
+    let nc: u32 = (len(dbgp.chamadas) as u64) as u32
+    var t: RastroTabela = RastroTabela{}
+    rastro_tabela_iniciar(&t)
+    let off_funcoes: u32 = RASTRO_CABECALHO_PALAVRAS * 4
+    let off_chamadas: u32 = off_funcoes + (nf * RASTRO_PALAVRAS_FUNCAO * 4)
+    var off_linhas: u32 = 0
+    var nl: u32 = 0
+    t.base = off_chamadas + (nc * RASTRO_PALAVRAS_CHAMADA * 4)
+    if guarda {
+        nl = (len(dbgp.linhas) as u64) as u32
+        off_linhas = off_chamadas + (nc * RASTRO_PALAVRAS_CHAMADA * 4)
+        t.base += 4 + (nl * RASTRO_PALAVRAS_LINHA * 4)
+    }
+    let zero: [4]u32 = {0, 0, 0, 0}
+    let cab_main: [4]u32 = cabecalho_do_main(c, &t, zero)
+    var flags: u32 = 0
+    if guarda {
+        flags = RASTRO_FLAG_GUARDA
+    }
+    palavra(&t, RASTRO_MAGIA)
+    palavra(&t, x64_offset(c))
+    palavra(&t, nf)
+    palavra(&t, nc)
+    palavra(&t, off_funcoes)
+    palavra(&t, off_chamadas)
+    for k in (0 as u32)..<4 {
+        palavra(&t, cab_main[k])
+    }
+    palavra(&t, flags)
+    palavra(&t, off_linhas)
+    escrever_funcoes(c, &t)
+    escrever_chamadas(c, &t)
+    if guarda {
+        escrever_linhas(c, &t)
+    }
+    var secao: i32 = 0
+    let off: u32 = anexar_em_rdata(c, &t, &secao)
+    _ = obj.obj_simbolo_definir(c.o as ^obj.Objeto, RASTRO_SIMBOLO_TABELA, secao, off)
+    _ = obj.obj_simbolo_definir(c.o as ^obj.Objeto, RASTRO_SIMBOLO_TEXTO, c.texto as i32, 0)
+    rastro_tabela_liberar(&t)
+}
+
+test "x64_rastro_palavra_little_endian_frt1" {
+    var t: RastroTabela = RastroTabela{}
+    rastro_tabela_iniciar(&t)
+    palavra(&t, RASTRO_MAGIA)
+    expect(len(t.palavras) == 4)
+    expect(t.palavras[0] == (0x46 as u8))
+    expect(t.palavras[1] == (0x52 as u8))
+    expect(t.palavras[2] == (0x54 as u8))
+    expect(t.palavras[3] == (0x31 as u8))
+    rastro_tabela_liberar(&t)
+}
+
+test "x64_rastro_texto_adicionar_base_e_nul" {
+    var t: RastroTabela = RastroTabela{}
+    rastro_tabela_iniciar(&t)
+    t.base = 100
+    expect(texto_adicionar(&t, "ab") == 100)
+    expect(texto_adicionar(&t, "c") == 103)
+    expect(len(t.textos) == 5)
+    expect(t.textos[2] == (0 as u8))
+    rastro_tabela_liberar(&t)
+}
+
+test "x64_rastro_caminho_offset_reusa_entrada" {
+    var t: RastroTabela = RastroTabela{}
+    rastro_tabela_iniciar(&t)
+    t.base = 10
+    expect(caminho_offset(&t, "a.fj") == 10)
+    expect(caminho_offset(&t, "b.fj") == 15)
+    expect(caminho_offset(&t, "a.fj") == 10)
+    expect(len(t.arquivos) == 2)
+    rastro_tabela_liberar(&t)
+}
+
+test "x64_rastro_nomes_de_simbolo" {
+    expect(RASTRO_SIMBOLO_TABELA == "forja_rastro_tabela")
+    expect(RASTRO_SIMBOLO_TEXTO == "forja_rastro_texto")
+}
+
+test "x64_rastro_chamada_sem_instr_nao_grava" {
+    var c: X64Ctx = X64Ctx{}
+    var mi: MInstr = MInstr{}
+    mi.forma = (FX_CALL_REL32 as u16)
+    expect(not call_de_proc_fj(&c, &mi))
+    mi.forma = (FX_MOV64_RR as u16)
+    expect(not call_de_proc_fj(&c, &mi))
+}
+
+test "x64_rastro_cabecalho_do_main_sem_main_devolve_destino" {
+    var dp: dbg.DbgPrograma = dbg.DbgPrograma{}
+    dp.main_pos = bir.BIR_SEM_POS
+    var c: X64Ctx = X64Ctx{}
+    c.dbg = &dp
+    var t: RastroTabela = RastroTabela{}
+    rastro_tabela_iniciar(&t)
+    let zero: [4]u32 = {0, 0, 0, 0}
+    let cab: [4]u32 = cabecalho_do_main(&c, &t, zero)
+    expect(cab[0] == 0)
+    expect(cab[3] == 0)
+    expect(len(t.textos) == 0)
+    rastro_tabela_liberar(&t)
+}

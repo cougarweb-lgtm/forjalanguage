@@ -1,0 +1,69 @@
+// hash_sim.fj - M5 P51: lockstep de 100 passos; em cada passo, 12 tarefas do Group cuidam de fatias DISJUNTAS de 1200 entidades; o hash sai em ordem fixa (0..N-1) depois do wait (saida: "hash=<n>").
+// Versao: 0.1.0. Changelog: 0.1.0 - M5 P51: prova de simulacao igual com 1 e 6 workers (o verificador compara as duas linhas hash=).
+// Verificacao: forja run hash_sim.fj -- 1  e  forja run hash_sim.fj -- 6 (mesma linha hash=).
+import "std:async" as asy
+import "std:os"
+import "std:text"
+
+const N: int = 1200
+const FATIAS: int = 12
+const PASSOS: int = 100
+
+struct Fatia {
+    mundo: ^[N]int
+    inicio: int = 0
+    fim: int = 0
+    passo: int = 0
+}
+
+// Atualiza so a fatia [inicio, fim) do mundo: nenhuma outra tarefa toca esses indices.
+proc avanca(q: rawptr) -> u32 {
+    let f = q as ^Fatia
+    for i in f.inicio..<f.fim {
+        f.mundo^[i] = (f.mundo^[i] * 31 + f.passo + i) % 1000003
+    }
+    return 0
+}
+
+proc tick_paralelo(p: ^asy.Pool, mundo: ^[N]int, passo: int) {
+    let g = asy.group_new(p)
+    var fatias = make([dynamic]Fatia, alloc = heap, cap = FATIAS)
+    for k in 0..<FATIAS {
+        append(&fatias, item = Fatia{mundo = mundo, inicio = k * (N / FATIAS), fim = (k + 1) * (N / FATIAS), passo = passo})
+    }
+    for k in 0..<FATIAS {
+        asy.group_spawn(g, avanca, &fatias[k] as rawptr)
+    }
+    asy.group_wait(g)
+    delete(fatias)
+}
+
+// Hash em ordem fixa 0..N-1: so depende do estado final, nao de quem rodou primeiro.
+proc hash_do(mundo: ^[N]int) -> int {
+    var h = 0
+    for i in 0..<N {
+        h = (h * 131 + mundo^[i]) % 1000000007
+    }
+    return h
+}
+
+proc main() {
+    let workers = text.parse_int(os.args()[1]) or_else 1
+    let mundo = new([N]int, alloc = heap)
+    defer delete(mundo)
+    for i in 0..<N {
+        mundo^[i] = i * 3 + 1
+    }
+    switch p in asy.pool_new(workers) {
+    case ^asy.Pool:
+        for passo in 0..<PASSOS {
+            tick_paralelo(p, mundo, passo)
+        }
+        asy.pool_close(p)
+        delete(p)
+    case asy.AsyncError:
+        print("falhou")
+    }
+    let h = hash_do(mundo)
+    print(f"hash={h}")
+}

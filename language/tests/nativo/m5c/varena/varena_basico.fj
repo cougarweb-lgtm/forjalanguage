@@ -1,0 +1,147 @@
+// Fixture do std:mem VirtualArena (M5 P52): reserva de 4 GiB sem commit, commit de 64 MiB com leitura de volta, erros tipados e release.
+import "std:mem"
+import "std:os"
+
+const QUATRO_GIB: int = 4294967296
+const BLOCO: int = 1048576
+const TOTAL: int = 67108864
+const LIMITE_PICO: int = 16777216
+
+proc pico() -> int {
+    switch p in os.peak_memory() {
+    case u64:
+        return p as int
+    case os.OsError:
+        return -1
+    }
+    return -1
+}
+
+proc reservar_em(va: ^mem.VirtualArena, bytes: int) -> bool {
+    switch r in mem.va_reserve(bytes) {
+    case mem.VirtualArena:
+        va.base = r.base
+        va.reservado = r.reservado
+        return true
+    case mem.VarenaError:
+        return false
+    }
+    return false
+}
+
+// Padrao por indice: o byte no deslocamento i do bloco vale (base + i) % 251.
+proc escrever_bloco(s: []u8, base: int) {
+    var i = 0
+    while i < BLOCO {
+        s[i] = ((base + i) % 251) as u8
+        i += 1
+    }
+}
+
+proc conferir_bloco(s: []u8, base: int) -> int {
+    var i = 0
+    var erros = 0
+    while i < BLOCO {
+        let esperado = ((base + i) % 251) as u8
+        if s[i] != esperado {
+            erros += 1
+        }
+        i += 1
+    }
+    return erros
+}
+
+// Aloca TOTAL bytes em blocos de 1 MiB, escreve o padrao e le de volta cada bloco; devolve os erros de leitura ou -1 se uma alocacao falhou.
+proc preencher_e_conferir(va: ^mem.VirtualArena) -> int {
+    var feito = 0
+    var erros = 0
+    while feito < TOTAL {
+        switch p in mem.va_alloc(va, BLOCO, 8) {
+        case rawptr:
+            let s = slice_from(p as ^u8, len = BLOCO)
+            escrever_bloco(s, feito)
+            erros += conferir_bloco(s, feito)
+            feito += BLOCO
+        case mem.VarenaError:
+            return -1
+        }
+    }
+    return erros
+}
+
+// Devolve 0 se a alocacao deu certo; senao o codigo do erro tipado (2 esgotada, 3 invalido, 9 outro).
+proc classificar_alloc(va: ^mem.VirtualArena, bytes: int, align: int) -> int {
+    switch p in mem.va_alloc(va, bytes, align) {
+    case rawptr:
+        return 0
+    case mem.VarenaError:
+        if p == mem.VarenaError.esgotada {
+            return 2
+        }
+        if p == mem.VarenaError.invalido {
+            return 3
+        }
+        return 9
+    }
+    return 9
+}
+
+proc main() {
+    var va = mem.VirtualArena{base = 0}
+    let pico_antes = pico()
+    if not reservar_em(&va, QUATRO_GIB) {
+        print("FALHA reserva de 4 GiB recusada")
+        return
+    }
+    let delta_reserva = pico() - pico_antes
+    if mem.va_committed(va) != 0 or delta_reserva > LIMITE_PICO {
+        print(f"FALHA reserva com commit ou pico subiu delta={delta_reserva}")
+        return
+    }
+    print("reserva sem commit OK")
+
+    let erros = preencher_e_conferir(&va)
+    if erros != 0 {
+        print(f"FALHA leitura de volta erros={erros}")
+        return
+    }
+    let commit = mem.va_committed(va)
+    if commit != TOTAL {
+        print(f"FALHA commit={commit} (esperado {TOTAL})")
+        return
+    }
+    print(f"commit 64MiB OK committed={commit}")
+
+    var zero = mem.VirtualArena{base = 0}
+    if classificar_alloc(&zero, 16, 8) != 3 {
+        print("FALHA alloc sem reserva deveria ser invalido")
+        return
+    }
+    var pequena = mem.VirtualArena{base = 0}
+    if not reservar_em(&pequena, 4096) {
+        print("FALHA reserva pequena")
+        return
+    }
+    if classificar_alloc(&pequena, 65537, 8) != 2 {
+        print("FALHA alloc alem do reservado deveria ser esgotada")
+        return
+    }
+    if classificar_alloc(&pequena, 65536, 8) != 0 {
+        print("FALHA alloc dentro do reservado deveria dar certo")
+        return
+    }
+    var sem_reserva = mem.VirtualArena{base = 0}
+    if reservar_em(&sem_reserva, 1125899906842624 * 1024) {
+        print("FALHA reserva de 1 PiB deveria ser recusada")
+        return
+    }
+    print("erros tipados OK")
+    mem.va_release(&pequena)
+    mem.va_release(&va)
+    if mem.va_committed(va) != 0 or va.base != 0 {
+        print("FALHA release nao zerou a arena")
+        return
+    }
+    print("release OK")
+    print("varena basico OK")
+}

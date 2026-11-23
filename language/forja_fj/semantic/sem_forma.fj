@@ -1,0 +1,947 @@
+// semantic/sem_forma.fj - porte de compiler/semantic/sem_forma.c
+// sha256 de semantic/sem_forma.c: 746bf213686910f9b99ef23729b889a175f6fa74599a7a6db211897cce036387
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "common"
+import "frontend"
+
+struct Cena2 {
+    onde: ?str
+    quem: ?str
+    esperado: ?str
+    recebido: ?str
+    trecho: ?str
+    dentro: ?str
+    ctx: ContextoDoTipo
+}
+
+struct Varredura {
+    fundo: i32
+    texto: bool
+    ate_espaco: bool
+}
+
+const TRECHO_MAX_2: i32 = 80
+const TIPO_TEXTO_MAX: i32 = 96
+const ONDE_MAX: i32 = 160
+const NOME_MAX: i32 = 64
+const PEDIDO_MAX: i32 = 160
+const DENTRO_MAX: i32 = 96
+const TEXTO_LOCAL_2: i32 = 1024
+const LINHA_MAX: i32 = 160
+const OPERADORES_DE_CONTA: str = "+-*/%<>=!&|^~" // o conjunto do strchr de TextoDoOperador
+const QUEBRA_DE_F_TEXTO: str = "{}\\\"" // o conjunto do strchr de PedacoDoFTexto: '{' '}' '\\' '"'
+
+// C: semantic/sem_forma.c:31
+proc termina_trecho(v: ^Varredura, antes: u8, c: u8, depois: u8) -> bool {
+    if v.texto {
+        return false
+    }
+    if (c == 47) and (depois == 47) { // '/' '/'
+        return true
+    }
+    if v.fundo > 0 {
+        return false
+    }
+    if (((c == 44) or (c == 41)) or (c == 93)) or (c == 125) { // ',' ')' ']' '}'
+        return true
+    }
+    if (common.c2f_b2i32(v.ate_espaco) != 0) and ((c == 32) or (c == 9)) { // ' ' '\t'
+        return true
+    }
+    return (c == 123) and ((antes == 32) or (antes == 9)) // '{' ' ' '\t'
+}
+
+// C: semantic/sem_forma.c:41
+proc avancar_varredura(v: ^Varredura, c: u8) {
+    if c == 34 { // '"'
+        v.texto = not v.texto
+    } else if v.texto {
+        return
+    } else if ((c == 40) or (c == 91)) or (c == 123) { // '(' '[' '{'
+        v.fundo += 1
+    } else if ((c == 41) or (c == 93)) or (c == 125) { // ')' ']' '}'
+        v.fundo -= 1
+    }
+}
+
+// C: semantic/sem_forma.c:50
+proc sem_trecho_do_fonte(s: ^Semantica, pos: u32, ate_espaco: bool, saida: []u8) {
+    let t: []u8 = (s.fonte as ^common.Fonte).texto
+    var v: Varredura = Varredura{fundo = 0, texto = false, ate_espaco = ate_espaco}
+    var n: u32 = 0
+    var i: u32 = pos
+    while (((t[i] != 0) and (t[i] != 10)) and (t[i] != 13)) and (n < common.c2f_s2u_32((TRECHO_MAX_2 - 1))) {
+        var antes_c: u8 = 32 // ' '
+        if i > pos {
+            antes_c = t[i - 1] // o byte como esta (o C passa char; c2f_char_i32 daria negativo para >= 0x80 e `as u8` trapa em dev)
+        }
+        if termina_trecho(&v, antes_c, t[i], t[i + 1]) {
+            break
+        }
+        avancar_varredura(&v, t[i])
+        let antes_1: u32 = n
+        n += 1
+        saida[antes_1] = t[i]
+        i += 1 // '\0' '\n' '\r'
+    }
+    while (n > 0) and ((saida[n - 1] == 32) or (saida[n - 1] == 9)) { // ' ' '\t'
+        n -= 1
+    }
+    saida[n] = 0 // '\0'
+}
+
+// C: semantic/sem_forma.c:66
+proc linha_corrigida(s: ^Semantica, c: ^Conversao, saida: []u8, cap: u64) -> bool {
+    let t: []u8 = (s.fonte as ^common.Fonte).texto
+    let ini: u32 = c.ini
+    let fim: u32 = c.fim
+    var inicio: u32 = ini
+    var final: u32 = fim
+    for k in ini..<fim { // memchr(t + ini, '\n', fim - ini)
+        if t[k] == 10 {
+            return false
+        }
+    }
+    while (inicio > 0) and (t[inicio - 1] != 10) { // '\n'
+        inicio -= 1
+    }
+    while (inicio < ini) and ((t[inicio] == 32) or (t[inicio] == 9)) { // ' ' '\t'
+        inicio += 1
+    }
+    while ((t[final] != 0) and (t[final] != 10)) and (t[final] != 13) { // '\0' '\n' '\r'
+        final += 1
+    }
+    let novo: []u8 = as_bytes(c.novo or_else "")
+    let total: u64 = ((ini - inicio) as u64) + (common.c2f_strlen_b(novo) as u64) + ((final - fim) as u64) // o retorno de snprintf
+    if (total == 0) or (total >= cap) {
+        return false
+    }
+    var n: u32 = 0
+    for k in inicio..<ini {
+        saida[n] = t[k]
+        n += 1
+    }
+    for k in 0..<common.c2f_strlen_b(novo) {
+        saida[n] = novo[k]
+        n += 1
+    }
+    for k in fim..<final {
+        saida[n] = t[k]
+        n += 1
+    }
+    saida[n] = 0
+    return true
+}
+
+// G3 S7 (sem par no C): o texto de um char[] ate o 1o NUL, sem dono que o libere (frame), para os campos ?str de Cena2 e os %s das frases.
+proc str_do_buffer(buf: []u8) -> str {
+    return from_bytes(buf[0..<common.c2f_strlen_b(buf)], alloc = frame)
+}
+
+// C: semantic/sem_forma.c:82
+proc nome_ou_interrogacao(s: ^Semantica, nome: i32) -> str {
+    var tern_1: str = "?"
+    if nome >= 0 {
+        tern_1 = sem_nome_texto(s, nome)
+    }
+    return tern_1
+}
+
+// C: semantic/sem_forma.c:88
+proc dentro_do_proc(s: ^Semantica, pos: u32, saida: []u8) {
+    let proc_atual: ?^frontend.Decl = s.proc_c
+    saida[0] = 0
+    if proc_atual == none {
+        return
+    }
+    let p: ^frontend.Decl = proc_atual as ^frontend.Decl
+    if (p.tipo_no != (frontend.D_PROC as u8)) or (p.nome < 0) or (pos < p.pos) or (pos > p.pos_fim) {
+        return
+    }
+    let nome = common.c2f_cortar(sem_nome_texto(s, p.nome), (NOME_MAX - 1) as int) // %.*s com NOME_MAX - 1
+    defer delete(nome)
+    let texto = format(f" (dentro do proc '{nome}')", alloc = heap)
+    defer delete(texto)
+    _ = common.c2f_snprintf(saida[0..<(DENTRO_MAX as int)], texto)
+}
+
+// C: semantic/sem_forma.c:98
+proc quem_pede(s: ^Semantica, c: ^ContextoDoTipo, saida: []u8) {
+    let nome: str = nome_ou_interrogacao(s, c.nome)
+    let dono: str = nome_ou_interrogacao(s, c.dono)
+    let onde: i32 = c.onde as i32
+    var texto: str = "esta expressao"
+    if onde == CTX_DECLARACAO {
+        texto = format(f"a declaracao de '{nome}'", alloc = frame)
+    } else if onde == CTX_ATRIBUICAO {
+        if c.nome >= 0 {
+            texto = format(f"a atribuicao a '{nome}'", alloc = frame)
+        } else {
+            texto = "a atribuicao"
+        }
+    } else if onde == CTX_ARGUMENTO {
+        texto = format(f"o argumento '{nome}' da chamada de '{dono}'", alloc = frame)
+    } else if onde == CTX_RETORNO {
+        texto = format(f"o return do proc '{dono}'", alloc = frame)
+    } else if onde == CTX_CAMPO {
+        texto = format(f"o campo '{nome}' do literal '{dono}'", alloc = frame)
+    }
+    _ = common.c2f_snprintf(saida[0..<(PEDIDO_MAX as int)], texto)
+}
+
+// C: semantic/sem_forma.c:112
+// Cena2 (char[] no C) guarda cada campo como str de frame, ja cortado no tamanho do buffer do C (cap - 1)
+proc montar_cena_2(s: ^Semantica, valor: ?^frontend.Expr, esperado: u32, c: ^Cena2) {
+    let v: ^frontend.Expr = valor as ^frontend.Expr
+    var onde: [160]u8 = {}
+    var quem: [160]u8 = {}
+    var tipo_esperado: [96]u8 = {}
+    var tipo_recebido: [96]u8 = {}
+    var trecho: [80]u8 = {}
+    var dentro: [96]u8 = {}
+    c^ = Cena2{}
+    if s.ctx_tipo.valor == valor { // contexto de outra expressao nao vale
+        c.ctx = s.ctx_tipo
+    }
+    common.diag_descrever_onde(s.fonte, v.pos, onde[..], ONDE_MAX as u64)
+    quem_pede(s, &c.ctx, quem[..])
+    sem_descrever(s, esperado, tipo_esperado[..], TIPO_TEXTO_MAX as u64)
+    sem_descrever(s, v.tipo, tipo_recebido[..], TIPO_TEXTO_MAX as u64)
+    sem_trecho_do_fonte(s, v.pos, false, trecho[..])
+    if (c.ctx.onde as i32) != CTX_RETORNO { // o return ja diz o proc
+        dentro_do_proc(s, v.pos, dentro[..])
+    }
+    c.onde = str_do_buffer(onde[..])
+    c.quem = str_do_buffer(quem[..])
+    c.esperado = str_do_buffer(tipo_esperado[..])
+    c.recebido = str_do_buffer(tipo_recebido[..])
+    c.trecho = str_do_buffer(trecho[..])
+    c.dentro = str_do_buffer(dentro[..])
+}
+
+// C: semantic/sem_forma.c:126
+proc por_que_nao_converte(s: ^Semantica, esperado: u32, recebido: u32) -> str {
+    let numeros: bool = (common.c2f_b2i32(tipo_eh_numerico(&s.tipos, esperado)) != 0) and (common.c2f_b2i32(tipo_eh_numerico(&s.tipos, recebido)) != 0)
+    if (common.c2f_b2i32(numeros) != 0) and (common.c2f_b2i32(tipo_eh_inteiro(esperado)) != common.c2f_b2i32(tipo_eh_inteiro(recebido))) {
+        return "A Forja nao converte inteiro em real nem real em inteiro sozinha."
+    }
+    if numeros {
+        return "A Forja nao mistura numeros de tipos diferentes sem 'as'."
+    }
+    if (esperado == (TIPO_BOOL as u32)) or (recebido == (TIPO_BOOL as u32)) {
+        return "bool nao vira numero e numero nao vira bool: compare com ==, != ou <."
+    }
+    return "Os dois tipos sao de categorias diferentes e nao ha conversao automatica."
+}
+
+// C: semantic/sem_forma.c:136
+proc efeito_do_as(s: ^Semantica, esperado: u32, recebido: u32) -> str {
+    if (common.c2f_b2i32(tipo_eh_inteiro(esperado)) != 0) and (common.c2f_b2i32(tipo_eh_real(&s.tipos, recebido)) != 0) {
+        return "o 'as' trunca a parte fracionaria"
+    }
+    if (common.c2f_b2i32(tipo_eh_real(&s.tipos, esperado)) != 0) and (common.c2f_b2i32(tipo_eh_inteiro(recebido)) != 0) {
+        return "o 'as' pode perder precisao em inteiro muito grande"
+    }
+    return "confira se o valor cabe no tipo novo"
+}
+
+// C: semantic/sem_forma.c:144
+proc forma_com_conversao(s: ^Semantica, valor: ?^frontend.Expr, esperado: u32, forma: []u8) -> bool {
+    var c: Conversao = Conversao{}
+    var linha: [160]u8 = {}
+    if (not sem_conversao_obvia(s, valor, esperado, &c)) or (not linha_corrigida(s, &c, linha[..], LINHA_MAX as u64)) {
+        return false
+    }
+    let linha_texto: str = str_do_buffer(linha[..])
+    let efeito: str = efeito_do_as(s, esperado, (valor as ^frontend.Expr).tipo)
+    let texto = format(f"Troque a linha por: {linha_texto} ({efeito}).", alloc = heap)
+    defer delete(texto)
+    _ = common.c2f_snprintf(forma[0..<(TEXTO_LOCAL_2 as int)], texto)
+    return true
+}
+
+// C: semantic/sem_forma.c:155
+proc forma_sem_conversao(s: ^Semantica, c: ^Cena2, forma: []u8) {
+    let nome: str = nome_ou_interrogacao(s, c.ctx.nome)
+    let dono: str = nome_ou_interrogacao(s, c.ctx.dono)
+    let esperado: str = c.esperado or_else ""
+    let recebido: str = c.recebido or_else ""
+    let trecho: str = c.trecho or_else ""
+    let onde: i32 = c.ctx.onde as i32
+    var texto: str = ""
+    if onde == CTX_DECLARACAO {
+        texto = format(f"Escreva em '{nome}' um valor {esperado}, ou troque o tipo declarado de '{nome}' para {recebido}.", alloc = frame)
+    } else if onde == CTX_ATRIBUICAO {
+        var variavel: str = ""
+        if c.ctx.nome >= 0 {
+            variavel = " a variavel"
+        }
+        texto = format(f"Atribua{variavel} um valor {esperado}, ou declare a variavel com o tipo {recebido}.", alloc = frame)
+    } else if onde == CTX_ARGUMENTO {
+        texto = format(f"Passe em '{nome}' um valor {esperado} (a chamada de '{dono}' recebeu {recebido}).", alloc = frame)
+    } else if onde == CTX_RETORNO {
+        texto = format(f"Devolva um valor {esperado} em '{dono}', ou troque o tipo de retorno do proc para {recebido}.", alloc = frame)
+    } else if onde == CTX_CAMPO {
+        texto = format(f"Escreva no campo '{nome}' um valor {esperado} no lugar de '{trecho}'.", alloc = frame)
+    } else {
+        texto = format(f"Use um valor {esperado} no lugar de '{trecho}' ({recebido}).", alloc = frame)
+    }
+    _ = common.c2f_snprintf(forma[0..<(TEXTO_LOCAL_2 as int)], texto)
+}
+
+// C: semantic/sem_forma.c:181
+// O corte do explicacao[TEXTO_LOCAL] em 1023 nao muda o resultado: diag_forma corta o texto em 255 bytes.
+proc sem_forma_tipo_diferente(s: ^Semantica, valor: ?^frontend.Expr, esperado: u32) {
+    let v: ^frontend.Expr = valor as ^frontend.Expr
+    var c: Cena2 = Cena2{}
+    var forma: [1024]u8 = {}
+    montar_cena_2(s, valor, esperado, &c)
+    let onde: str = c.onde or_else ""
+    let quem: str = c.quem or_else ""
+    let dentro: str = c.dentro or_else ""
+    let tipo_esperado: str = c.esperado or_else ""
+    let trecho: str = c.trecho or_else ""
+    let recebido: str = c.recebido or_else ""
+    let porque: str = por_que_nao_converte(s, esperado, v.tipo)
+    let explicacao = format(f"Na {onde}, {quem}{dentro} pede {tipo_esperado} mas o valor '{trecho}' e {recebido}. {porque}", alloc = heap)
+    defer delete(explicacao)
+    if not forma_com_conversao(s, valor, esperado, forma[..]) {
+        forma_sem_conversao(s, &c, forma[..])
+    }
+    common.diag_forma(s.diag as ^common.Diag, explicacao, str_do_buffer(forma[..]))
+}
+
+// C: semantic/sem_forma.c:195
+proc sem_forma_do_valor(s: ^Semantica, valor: ?^frontend.Expr, esperado: u32, papel: str) {
+    let v: ^frontend.Expr = valor as ^frontend.Expr
+    var c: Cena2 = Cena2{}
+    var forma: [1024]u8 = {}
+    montar_cena_2(s, valor, esperado, &c)
+    let onde: str = c.onde or_else ""
+    let dentro: str = c.dentro or_else ""
+    let trecho: str = c.trecho or_else ""
+    let recebido: str = c.recebido or_else ""
+    var pede: str = c.esperado or_else ""
+    if tipo_eh_inteiro(esperado) {
+        pede = "inteiro"
+    }
+    let porque: str = por_que_nao_converte(s, esperado, v.tipo)
+    let explicacao = format(f"Na {onde}, {papel} precisa ser {pede}, mas '{trecho}' e {recebido}{dentro}. {porque}", alloc = heap)
+    defer delete(explicacao)
+    if not forma_com_conversao(s, valor, esperado, forma[..]) {
+        var texto: str = ""
+        if esperado == (TIPO_BOOL as u32) {
+            texto = format(f"Escreva uma comparacao (==, !=, <, >) ou um valor bool no lugar de '{trecho}' ({recebido}).", alloc = frame)
+        } else {
+            texto = format(f"Use um valor {pede} no lugar de '{trecho}' ({recebido}).", alloc = frame)
+        }
+        _ = common.c2f_snprintf(forma[..], texto)
+    }
+    common.diag_forma(s.diag as ^common.Diag, explicacao, str_do_buffer(forma[..]))
+}
+
+// C: semantic/sem_forma.c:212
+proc sem_erro_do_inteiro(s: ^Semantica, valor: ?^frontend.Expr, papel: str) -> bool {
+    let msg_1 = format(f"{papel} precisa ser inteiro", alloc = heap)
+    defer delete(msg_1)
+    _ = sem_erro(s, common.E0301, (valor as ^frontend.Expr).pos, msg_1)
+    sem_forma_do_valor(s, valor, TIPO_INT as u32, papel)
+    return false
+}
+
+// C: semantic/sem_forma.c:222
+proc texto_do_operador(s: ^Semantica, pos: u32, saida: []u8) {
+    let t: []u8 = (s.fonte as ^common.Fonte).texto
+    let palavra: bool = (t[pos] >= 97) and (t[pos] <= 122) // 'a' 'z'
+    var n: u32 = 0
+    while n < 8 {
+        let c: u8 = t[pos + n]
+        let letra: bool = (c >= 97) and (c <= 122)
+        var simbolo: bool = false
+        if (n < 3) and (c != 0) { // strchr("+-*/%<>=!&|^~", c)
+            for k in 0..<len(OPERADORES_DE_CONTA) {
+                if c == OPERADORES_DE_CONTA[k] {
+                    simbolo = true
+                }
+            }
+        }
+        var vale: bool = simbolo
+        if palavra {
+            vale = letra
+        }
+        if not vale {
+            break
+        }
+        saida[n] = c
+        n += 1
+    }
+    saida[n] = 0 // '\0'
+}
+
+// C: semantic/sem_forma.c:237
+// O corte do forma[TEXTO_LOCAL] em 1023 nao muda o resultado: diag_forma corta o texto em 255 bytes.
+proc sem_forma_operandos(s: ^Semantica, e: ^frontend.Expr) {
+    var onde: [160]u8 = {}
+    var op: [12]u8 = {}
+    var esq: [80]u8 = {}
+    var dir: [80]u8 = {}
+    var ta: [96]u8 = {}
+    var tb: [96]u8 = {}
+    var linha: [160]u8 = {}
+    var c: Conversao = Conversao{}
+    let a: ^frontend.Expr = e.a as ^frontend.Expr
+    let b: ^frontend.Expr = e.b as ^frontend.Expr
+    common.diag_descrever_onde(s.fonte, e.pos_op, onde[..], ONDE_MAX as u64)
+    texto_do_operador(s, e.pos_op, op[..])
+    sem_trecho_do_fonte(s, a.pos, true, esq[..])
+    sem_trecho_do_fonte(s, b.pos, true, dir[..])
+    sem_descrever(s, a.tipo, ta[..], TIPO_TEXTO_MAX as u64)
+    sem_descrever(s, b.tipo, tb[..], TIPO_TEXTO_MAX as u64)
+    let t_onde: str = str_do_buffer(onde[..])
+    let t_op: str = str_do_buffer(op[..])
+    let t_esq: str = str_do_buffer(esq[..])
+    let t_dir: str = str_do_buffer(dir[..])
+    let t_ta: str = str_do_buffer(ta[..])
+    let t_tb: str = str_do_buffer(tb[..])
+    let porque: str = por_que_nao_converte(s, a.tipo, b.tipo)
+    let explicacao = format(f"Na {t_onde} a conta '{t_esq} {t_op} {t_dir}' junta {t_ta} com {t_tb}, e o operador '{t_op}' pede os dois lados do mesmo tipo. {porque}", alloc = heap)
+    defer delete(explicacao)
+    var forma: str = ""
+    if sem_conversao_obvia(s, e.b, a.tipo, &c) and linha_corrigida(s, &c, linha[..], LINHA_MAX as u64) {
+        let t_linha: str = str_do_buffer(linha[..])
+        forma = format(f"Converta o lado direito para {t_ta}: troque a linha por: {t_linha} (ou converta '{t_esq}' para {t_tb}).", alloc = frame)
+    } else {
+        forma = format(f"Deixe '{t_esq}' e '{t_dir}' com o mesmo tipo ({t_ta} ou {t_tb}) antes de usar '{t_op}'.", alloc = frame)
+    }
+    common.diag_forma(s.diag as ^common.Diag, explicacao, forma)
+}
+
+// C: semantic/sem_forma.c:261
+proc sem_forma_do_print(s: ^Semantica, valor: ?^frontend.Expr) {
+    let v: ^frontend.Expr = valor as ^frontend.Expr
+    var onde: [160]u8 = {}
+    var trecho: [80]u8 = {}
+    var tipo: [96]u8 = {}
+    common.diag_descrever_onde(s.fonte, v.pos, onde[..], ONDE_MAX as u64)
+    sem_trecho_do_fonte(s, v.pos, false, trecho[..])
+    sem_descrever(s, v.tipo, tipo[..], TIPO_TEXTO_MAX as u64)
+    let t_onde: str = str_do_buffer(onde[..])
+    let t_trecho: str = str_do_buffer(trecho[..])
+    let t_tipo: str = str_do_buffer(tipo[..])
+    let explicacao = format(f"Na {t_onde} o print recebeu '{t_trecho}', que e {t_tipo}; print so imprime inteiro (i8..u64, int, uint), real, bool, str ou cstr.", alloc = heap)
+    defer delete(explicacao)
+    var forma: str = ""
+    if tipo_classe_de(&s.tipos, v.tipo) == TC_RESULTADO {
+        forma = format(f"Tire o valor do resultado antes de imprimir: escreva 'or_else' e um valor padrao depois de '{t_trecho}' (ou use 'try' num proc que devolve erro).", alloc = frame)
+    } else {
+        forma = format(f"Imprima um inteiro, bool, str ou cstr: troque '{t_trecho}' ({t_tipo}) por um desses ou por um campo dele.", alloc = frame)
+    }
+    common.diag_forma(s.diag as ^common.Diag, explicacao, forma)
+}
+
+// C: semantic/sem_forma.c:278
+proc sem_linha_do_fonte(s: ^Semantica, pos: u32, saida: []u8) {
+    let t: []u8 = (s.fonte as ^common.Fonte).texto
+    var i: u32 = pos
+    var n: u32 = 0
+    while (i > 0) and (t[i - 1] != 10) { // '\n'
+        i -= 1
+    }
+    while (t[i] == 32) or (t[i] == 9) { // ' ' '\t'
+        i += 1
+    }
+    while (((t[i] != 0) and (t[i] != 10)) and (t[i] != 13)) and (n < common.c2f_s2u_32((TRECHO_MAX_2 - 1))) {
+        if (t[i] == 47) and (t[i + 1] == 47) { // '/' '/'
+            break
+        }
+        let antes_1: u32 = n
+        n += 1
+        saida[antes_1] = t[i]
+        i += 1 // '\0' '\n' '\r'
+    }
+    while (n > 0) and ((saida[n - 1] == 32) or (saida[n - 1] == 9)) { // ' ' '\t'
+        n -= 1
+    }
+    saida[n] = 0 // '\0'
+}
+
+// C: semantic/sem_forma.c:293
+proc sem_forma_da_regra(s: ^Semantica) {
+    var onde: [160]u8 = {}
+    var linha: [80]u8 = {}
+    let dg: ^common.Diag = s.diag as ^common.Diag
+    let causa: str = dg.causa or_else ""
+    var regra: int = -1 // strstr(causa, ": ")
+    for k in 0..<len(causa) {
+        if regra < 0 and k + 1 < len(causa) and causa[k] == 58 and causa[k + 1] == 32 { // ':' ' '
+            regra = k
+        }
+    }
+    common.diag_descrever_onde(s.fonte, dg.off, onde[..], ONDE_MAX as u64)
+    sem_linha_do_fonte(s, dg.off, linha[..])
+    let t_onde: str = str_do_buffer(onde[..])
+    let t_linha: str = str_do_buffer(linha[..])
+    let causa_100 = common.c2f_cortar(causa, 100) // %.100s
+    defer delete(causa_100)
+    let explicacao = format(f"Na {t_onde} a Forja recusou a linha '{t_linha}' porque a regra deste ponto e: {causa_100}.", alloc = heap)
+    defer delete(explicacao)
+    var forma: str = ""
+    if regra >= 0 {
+        let resto = common.c2f_cortar(causa[(regra + 2)..<len(causa)], 120) // %.120s de regra + 2
+        defer delete(resto)
+        forma = format(f"Ajuste a linha '{t_linha}' conforme a regra: {resto}.", alloc = frame)
+    } else {
+        let causa_120 = common.c2f_cortar(causa, 120)
+        defer delete(causa_120)
+        forma = format(f"Reescreva a linha '{t_linha}' de modo que obedeca a regra: {causa_120}.", alloc = frame)
+    }
+    common.diag_forma(dg, explicacao, forma)
+}
+
+// C: semantic/sem_forma.c:309
+proc eh_texto_na_conta(x: ?^frontend.Expr) -> bool {
+    return (((x as ^frontend.Expr).tipo_no == (frontend.EX_TEXTO as u8)) or ((x as ^frontend.Expr).tipo == (TIPO_TEXTO as u32))) or ((x as ^frontend.Expr).tipo == (TIPO_CSTR as u32))
+}
+
+// C: semantic/sem_forma.c:315
+proc pedaco_do_f_texto(x: ?^frontend.Expr, trecho: str, saida: []u8, cap: u64) {
+    let n: int = len(trecho)
+    var literal: bool = ((x as ^frontend.Expr).tipo_no == (frontend.EX_TEXTO as u8)) and (n >= 2) and (trecho[0] == 34) and (trecho[n - 1] == 34) // '"'
+    var i: int = 1
+    while literal and (i + 1 < n) {
+        for k in 0..<len(QUEBRA_DE_F_TEXTO) {
+            if trecho[i] == QUEBRA_DE_F_TEXTO[k] {
+                literal = false
+            }
+        }
+        i += 1
+    }
+    if literal {
+        _ = common.c2f_snprintf(saida[0..<(cap as int)], trecho[1..<(n - 1)]) // %.*s de n - 2 bytes
+    } else {
+        let texto = format(f"{{{trecho}}}", alloc = heap)
+        defer delete(texto)
+        _ = common.c2f_snprintf(saida[0..<(cap as int)], texto)
+    }
+}
+
+// C: semantic/sem_forma.c:325
+proc sem_forma_conta_de_texto(s: ^Semantica, e: ^frontend.Expr) {
+    var onde: [160]u8 = {}
+    var op: [12]u8 = {}
+    var esq: [80]u8 = {}
+    var dir: [80]u8 = {}
+    var ta: [96]u8 = {}
+    var tb: [96]u8 = {}
+    var pa: [82]u8 = {}
+    var pb: [82]u8 = {}
+    let a: ^frontend.Expr = e.a as ^frontend.Expr
+    let b: ^frontend.Expr = e.b as ^frontend.Expr
+    if (not eh_texto_na_conta(e.a)) and (not eh_texto_na_conta(e.b)) { // ponteiro de verdade: vale a forma da tabela
+        return
+    }
+    common.diag_descrever_onde(s.fonte, e.pos_op, onde[..], ONDE_MAX as u64)
+    texto_do_operador(s, e.pos_op, op[..])
+    sem_trecho_do_fonte(s, a.pos, true, esq[..])
+    sem_trecho_do_fonte(s, b.pos, true, dir[..])
+    sem_descrever(s, a.tipo, ta[..], TIPO_TEXTO_MAX as u64)
+    sem_descrever(s, b.tipo, tb[..], TIPO_TEXTO_MAX as u64)
+    let t_onde: str = str_do_buffer(onde[..])
+    let t_op: str = str_do_buffer(op[..])
+    let t_esq: str = str_do_buffer(esq[..])
+    let t_dir: str = str_do_buffer(dir[..])
+    let t_ta: str = str_do_buffer(ta[..])
+    let t_tb: str = str_do_buffer(tb[..])
+    let explicacao = format(f"Na {t_onde} a conta '{t_esq} {t_op} {t_dir}' junta {t_ta} com {t_tb}: texto (str, cstr ou literal) nao faz conta, e a Forja nao converte o numero em texto sozinha.", alloc = heap)
+    defer delete(explicacao)
+    pedaco_do_f_texto(e.a, t_esq, pa[..], 82) // TRECHO_MAX + 2
+    pedaco_do_f_texto(e.b, t_dir, pb[..], 82)
+    let t_pa: str = str_do_buffer(pa[..])
+    let t_pb: str = str_do_buffer(pb[..])
+    var forma: str = ""
+    if e.op == (frontend.OP_SOMA as u8) {
+        forma = format(f"Troque a conta por f\"...\": print(f\"{t_pa}{t_pb}\") em print, ou format(f\"{t_pa}{t_pb}\", alloc = heap) para guardar o texto (e delete depois).", alloc = frame)
+    } else {
+        forma = format(f"Texto nao tem o operador '{t_op}': monte o texto com f\"...\" ou converta o outro lado antes da conta com '{t_op}'.", alloc = frame)
+    }
+    common.diag_forma(s.diag as ^common.Diag, explicacao, forma)
+}
+
+// G3 S7: varredura de trecho, trecho/linha do fonte, linha corrigida, operador, f-texto, nome do proc, quem pede, frases fixas e formas sem conversao (valores calculados a mao sobre o C)
+test "sem_forma: trecho, linha, operador, f-texto e frases" {
+    var arena: common.Arena = common.Arena{}
+    var nomes: common.Interner = common.Interner{}
+    var dims: DimTabela = DimTabela{}
+    var dg: common.Diag = common.Diag{}
+    var sv: Semantica = Semantica{}
+    common.interner_iniciar(&nomes, &arena)
+    dim_iniciar(&dims)
+    sv.nomes = slice_from(&nomes, len = 1)
+    sv.arena = &arena
+    sv.diag = &dg
+    tipos_iniciar(&sv.tipos, &nomes, &dims)
+    let n_x = common.internar(&nomes, "x", 1)
+    let n_f = common.internar(&nomes, "f", 1)
+    let n_p = common.internar(&nomes, "p", 1)
+    let n_longo = common.internar(&nomes, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", 200)
+    // varredura
+    var v: Varredura = Varredura{fundo = 0, texto = false, ate_espaco = false}
+    expect(termina_trecho(&v, 32, 44, 32) and termina_trecho(&v, 32, 41, 32) and termina_trecho(&v, 32, 93, 32) and termina_trecho(&v, 32, 125, 32) and termina_trecho(&v, 32, 47, 47))
+    expect(not termina_trecho(&v, 32, 32, 32) and not termina_trecho(&v, 32, 47, 32) and termina_trecho(&v, 32, 123, 32) and termina_trecho(&v, 9, 123, 32) and not termina_trecho(&v, 97, 123, 32))
+    v.ate_espaco = true
+    expect(termina_trecho(&v, 97, 32, 98) and termina_trecho(&v, 97, 9, 98))
+    v.fundo = 1
+    expect(not termina_trecho(&v, 97, 44, 32) and not termina_trecho(&v, 97, 32, 98) and termina_trecho(&v, 97, 47, 47))
+    v.texto = true
+    expect(not termina_trecho(&v, 97, 47, 47) and not termina_trecho(&v, 97, 44, 32))
+    var w: Varredura = Varredura{fundo = 0, texto = false, ate_espaco = false}
+    avancar_varredura(&w, 40)
+    avancar_varredura(&w, 91)
+    avancar_varredura(&w, 123)
+    expect(w.fundo == 3 and not w.texto)
+    avancar_varredura(&w, 41)
+    expect(w.fundo == 2)
+    avancar_varredura(&w, 34)
+    expect(w.texto and w.fundo == 2)
+    avancar_varredura(&w, 40)
+    avancar_varredura(&w, 93)
+    expect(w.fundo == 2 and w.texto)
+    avancar_varredura(&w, 34)
+    avancar_varredura(&w, 93)
+    avancar_varredura(&w, 125)
+    expect(not w.texto and w.fundo == 0)
+    // trecho e linha do fonte
+    var f1: common.Fonte = sem_allocator_teste_fonte("  foo(a, (b + 1), \"x,y\") // fim\nbar")
+    defer delete(f1.dono_texto)
+    sv.fonte = &f1
+    var saida: [80]u8 = {}
+    sem_trecho_do_fonte(&sv, 2, false, saida[..])
+    expect(str_do_buffer(saida[..]) == "foo(a, (b + 1), \"x,y\")")
+    sem_trecho_do_fonte(&sv, 6, false, saida[..])
+    expect(str_do_buffer(saida[..]) == "a")
+    sem_trecho_do_fonte(&sv, 9, false, saida[..])
+    expect(str_do_buffer(saida[..]) == "(b + 1)")
+    sem_trecho_do_fonte(&sv, 10, true, saida[..])
+    expect(str_do_buffer(saida[..]) == "b")
+    sem_trecho_do_fonte(&sv, 9, true, saida[..])
+    expect(str_do_buffer(saida[..]) == "(b + 1)")
+    sem_trecho_do_fonte(&sv, 18, false, saida[..])
+    expect(str_do_buffer(saida[..]) == "\"x,y\"")
+    sem_trecho_do_fonte(&sv, 33, false, saida[..])
+    expect(str_do_buffer(saida[..]) == "ar")
+    sem_linha_do_fonte(&sv, 20, saida[..])
+    expect(str_do_buffer(saida[..]) == "foo(a, (b + 1), \"x,y\")")
+    sem_linha_do_fonte(&sv, 33, saida[..])
+    expect(str_do_buffer(saida[..]) == "bar")
+    var f2: common.Fonte = sem_allocator_teste_fonte("   xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx  \n")
+    defer delete(f2.dono_texto)
+    sv.fonte = &f2
+    sem_linha_do_fonte(&sv, 5, saida[..])
+    expect(len(str_do_buffer(saida[..])) == 79)
+    sem_trecho_do_fonte(&sv, 3, false, saida[..])
+    expect(len(str_do_buffer(saida[..])) == 79)
+    // linha corrigida
+    var f3: common.Fonte = sem_allocator_teste_fonte("    let x: i32 = 3.5 // c\nz")
+    defer delete(f3.dono_texto)
+    sv.fonte = &f3
+    var linha: [160]u8 = {}
+    var conv: Conversao = Conversao{ini = 17, fim = 20, novo = "3.5 as i32"}
+    expect(linha_corrigida(&sv, &conv, linha[..], 160) and str_do_buffer(linha[..]) == "let x: i32 = 3.5 as i32 // c")
+    expect(linha_corrigida(&sv, &conv, linha[..], 29) and not linha_corrigida(&sv, &conv, linha[..], 28))
+    conv.ini = 17
+    conv.fim = 26
+    expect(not linha_corrigida(&sv, &conv, linha[..], 160))
+    // operador
+    var f4: common.Fonte = sem_allocator_teste_fonte("a and b; x <= y; x <<= y; x ==== y; +1; abcdefghijk; and2")
+    defer delete(f4.dono_texto)
+    sv.fonte = &f4
+    var op: [12]u8 = {}
+    texto_do_operador(&sv, 2, op[..])
+    expect(str_do_buffer(op[..]) == "and")
+    texto_do_operador(&sv, 11, op[..])
+    expect(str_do_buffer(op[..]) == "<=")
+    texto_do_operador(&sv, 19, op[..])
+    expect(str_do_buffer(op[..]) == "<<=")
+    texto_do_operador(&sv, 28, op[..])
+    expect(str_do_buffer(op[..]) == "===")
+    texto_do_operador(&sv, 36, op[..])
+    expect(str_do_buffer(op[..]) == "+")
+    texto_do_operador(&sv, 40, op[..])
+    expect(str_do_buffer(op[..]) == "abcdefgh")
+    texto_do_operador(&sv, 53, op[..])
+    expect(str_do_buffer(op[..]) == "and")
+    texto_do_operador(&sv, 10, op[..])
+    expect(str_do_buffer(op[..]) == "")
+    texto_do_operador(&sv, 3, op[..])
+    expect(str_do_buffer(op[..]) == "nd")
+    // f-texto
+    var ex_txt: frontend.Expr = frontend.Expr{tipo_no = frontend.EX_TEXTO as u8}
+    var ex_nome: frontend.Expr = frontend.Expr{tipo_no = frontend.EX_NOME as u8}
+    var ped: [82]u8 = {}
+    pedaco_do_f_texto(&ex_txt, "\"abc\"", ped[..], 82)
+    expect(str_do_buffer(ped[..]) == "abc")
+    pedaco_do_f_texto(&ex_txt, "\"a{b\"", ped[..], 82)
+    expect(str_do_buffer(ped[..]) == "{\"a{b\"}")
+    pedaco_do_f_texto(&ex_txt, "\"a\\b\"", ped[..], 82)
+    expect(str_do_buffer(ped[..]) == "{\"a\\b\"}")
+    pedaco_do_f_texto(&ex_txt, "\"a}b\"", ped[..], 82)
+    expect(str_do_buffer(ped[..]) == "{\"a}b\"}")
+    pedaco_do_f_texto(&ex_txt, "\"\"", ped[..], 82)
+    expect(str_do_buffer(ped[..]) == "")
+    pedaco_do_f_texto(&ex_txt, "\"", ped[..], 82)
+    expect(str_do_buffer(ped[..]) == "{\"}")
+    pedaco_do_f_texto(&ex_txt, "a\"", ped[..], 82)
+    expect(str_do_buffer(ped[..]) == "{a\"}")
+    pedaco_do_f_texto(&ex_nome, "\"abc\"", ped[..], 82)
+    expect(str_do_buffer(ped[..]) == "{\"abc\"}")
+    pedaco_do_f_texto(&ex_nome, "x", ped[..], 82)
+    expect(str_do_buffer(ped[..]) == "{x}")
+    pedaco_do_f_texto(&ex_txt, "\"abcd\"", ped[..], 3)
+    expect(str_do_buffer(ped[..]) == "ab")
+    expect(eh_texto_na_conta(&ex_txt) and not eh_texto_na_conta(&ex_nome))
+    ex_nome.tipo = TIPO_TEXTO as u32
+    expect(eh_texto_na_conta(&ex_nome))
+    ex_nome.tipo = TIPO_CSTR as u32
+    expect(eh_texto_na_conta(&ex_nome))
+    ex_nome.tipo = TIPO_INT as u32
+    expect(not eh_texto_na_conta(&ex_nome))
+    // dentro do proc
+    var dentro: [96]u8 = {}
+    var pr: frontend.Decl = frontend.Decl{tipo_no = frontend.D_PROC as u8, nome = n_p, pos = 10, pos_fim = 50}
+    dentro_do_proc(&sv, 20, dentro[..])
+    expect(str_do_buffer(dentro[..]) == "")
+    sv.proc_c = &pr
+    dentro_do_proc(&sv, 5, dentro[..])
+    expect(str_do_buffer(dentro[..]) == "")
+    dentro_do_proc(&sv, 10, dentro[..])
+    expect(str_do_buffer(dentro[..]) == " (dentro do proc 'p')")
+    dentro_do_proc(&sv, 50, dentro[..])
+    expect(str_do_buffer(dentro[..]) == " (dentro do proc 'p')")
+    dentro_do_proc(&sv, 51, dentro[..])
+    expect(str_do_buffer(dentro[..]) == "")
+    pr.nome = n_longo
+    dentro_do_proc(&sv, 20, dentro[..])
+    expect(len(str_do_buffer(dentro[..])) == 18 + 63 + 2)
+    pr.nome = -1
+    dentro_do_proc(&sv, 20, dentro[..])
+    expect(str_do_buffer(dentro[..]) == "")
+    pr.nome = n_p
+    pr.tipo_no = frontend.D_STRUCT as u8
+    dentro_do_proc(&sv, 20, dentro[..])
+    expect(str_do_buffer(dentro[..]) == "")
+    // quem pede
+    var quem: [160]u8 = {}
+    var cx: ContextoDoTipo = ContextoDoTipo{onde = CTX_DECLARACAO as u8, nome = n_x, dono = n_f}
+    quem_pede(&sv, &cx, quem[..])
+    expect(str_do_buffer(quem[..]) == "a declaracao de 'x'")
+    cx.onde = CTX_ATRIBUICAO as u8
+    quem_pede(&sv, &cx, quem[..])
+    expect(str_do_buffer(quem[..]) == "a atribuicao a 'x'")
+    cx.nome = -1
+    quem_pede(&sv, &cx, quem[..])
+    expect(str_do_buffer(quem[..]) == "a atribuicao")
+    cx.onde = CTX_ARGUMENTO as u8
+    quem_pede(&sv, &cx, quem[..])
+    expect(str_do_buffer(quem[..]) == "o argumento '?' da chamada de 'f'")
+    cx.nome = n_x
+    cx.onde = CTX_RETORNO as u8
+    quem_pede(&sv, &cx, quem[..])
+    expect(str_do_buffer(quem[..]) == "o return do proc 'f'")
+    cx.onde = CTX_CAMPO as u8
+    quem_pede(&sv, &cx, quem[..])
+    expect(str_do_buffer(quem[..]) == "o campo 'x' do literal 'f'")
+    cx.onde = CTX_NENHUM as u8
+    quem_pede(&sv, &cx, quem[..])
+    expect(str_do_buffer(quem[..]) == "esta expressao")
+    cx.onde = CTX_DECLARACAO as u8
+    cx.nome = n_longo
+    quem_pede(&sv, &cx, quem[..])
+    expect(len(str_do_buffer(quem[..])) == 159)
+    expect(nome_ou_interrogacao(&sv, -1) == "?" and nome_ou_interrogacao(&sv, n_x) == "x")
+    // frases fixas
+    let ti: u32 = TIPO_INT as u32
+    let tf: u32 = TIPO_F64 as u32
+    let t32: u32 = TIPO_I32 as u32
+    expect(por_que_nao_converte(&sv, ti, tf) == "A Forja nao converte inteiro em real nem real em inteiro sozinha." and por_que_nao_converte(&sv, tf, ti) == "A Forja nao converte inteiro em real nem real em inteiro sozinha.")
+    expect(por_que_nao_converte(&sv, ti, t32) == "A Forja nao mistura numeros de tipos diferentes sem 'as'." and por_que_nao_converte(&sv, tf, TIPO_F32 as u32) == "A Forja nao mistura numeros de tipos diferentes sem 'as'.")
+    expect(por_que_nao_converte(&sv, TIPO_BOOL as u32, ti) == "bool nao vira numero e numero nao vira bool: compare com ==, != ou <." and por_que_nao_converte(&sv, TIPO_TEXTO as u32, TIPO_BOOL as u32) == "bool nao vira numero e numero nao vira bool: compare com ==, != ou <.")
+    expect(por_que_nao_converte(&sv, TIPO_TEXTO as u32, ti) == "Os dois tipos sao de categorias diferentes e nao ha conversao automatica.")
+    expect(efeito_do_as(&sv, ti, tf) == "o 'as' trunca a parte fracionaria" and efeito_do_as(&sv, tf, ti) == "o 'as' pode perder precisao em inteiro muito grande")
+    expect(efeito_do_as(&sv, ti, t32) == "confira se o valor cabe no tipo novo" and efeito_do_as(&sv, tf, TIPO_F32 as u32) == "confira se o valor cabe no tipo novo")
+    // forma sem conversao (Cena2 montada a mao)
+    var forma: [1024]u8 = {}
+    var ce: Cena2 = Cena2{esperado = "int", recebido = "str", trecho = "t"}
+    ce.ctx = ContextoDoTipo{onde = CTX_DECLARACAO as u8, nome = n_x, dono = n_f}
+    forma_sem_conversao(&sv, &ce, forma[..])
+    expect(str_do_buffer(forma[..]) == "Escreva em 'x' um valor int, ou troque o tipo declarado de 'x' para str.")
+    ce.ctx.onde = CTX_ATRIBUICAO as u8
+    forma_sem_conversao(&sv, &ce, forma[..])
+    expect(str_do_buffer(forma[..]) == "Atribua a variavel um valor int, ou declare a variavel com o tipo str.")
+    ce.ctx.nome = -1
+    forma_sem_conversao(&sv, &ce, forma[..])
+    expect(str_do_buffer(forma[..]) == "Atribua um valor int, ou declare a variavel com o tipo str.")
+    ce.ctx.onde = CTX_ARGUMENTO as u8
+    forma_sem_conversao(&sv, &ce, forma[..])
+    expect(str_do_buffer(forma[..]) == "Passe em '?' um valor int (a chamada de 'f' recebeu str).")
+    ce.ctx.onde = CTX_RETORNO as u8
+    forma_sem_conversao(&sv, &ce, forma[..])
+    expect(str_do_buffer(forma[..]) == "Devolva um valor int em 'f', ou troque o tipo de retorno do proc para str.")
+    ce.ctx.onde = CTX_CAMPO as u8
+    forma_sem_conversao(&sv, &ce, forma[..])
+    expect(str_do_buffer(forma[..]) == "Escreva no campo '?' um valor int no lugar de 't'.")
+    ce.ctx.onde = CTX_NENHUM as u8
+    forma_sem_conversao(&sv, &ce, forma[..])
+    expect(str_do_buffer(forma[..]) == "Use um valor int no lugar de 't' (str).")
+    tipos_liberar(&sv.tipos)
+    dim_liberar(&dims)
+    common.interner_liberar(&nomes)
+    common.arena_liberar(&arena)
+}
+
+// G3 S7: explicacao e forma do E0301 por ocorrencia (tipo diferente, valor com papel, operandos, print, conta de texto e regra) com Expr e Fonte montadas a mao.
+// sem_erro_do_inteiro nao roda aqui: o sem_erro do E0301 chama rel_do_uso (stub do S8); conferida por leitura.
+test "sem_forma: explicacao e forma por ocorrencia" {
+    var arena: common.Arena = common.Arena{}
+    var nomes: common.Interner = common.Interner{}
+    var dims: DimTabela = DimTabela{}
+    var dg: common.Diag = common.Diag{}
+    var sv: Semantica = Semantica{}
+    common.interner_iniciar(&nomes, &arena)
+    dim_iniciar(&dims)
+    sv.nomes = slice_from(&nomes, len = 1)
+    sv.arena = &arena
+    sv.diag = &dg
+    tipos_iniciar(&sv.tipos, &nomes, &dims)
+    let n_x = common.internar(&nomes, "x", 1)
+    let n_f = common.internar(&nomes, "f", 1)
+    let n_p = common.internar(&nomes, "p", 1)
+    let ti: u32 = TIPO_INT as u32
+    let tf: u32 = TIPO_F64 as u32
+    let tt: u32 = TIPO_TEXTO as u32
+    // declaracao com conversao obvia
+    var f1: common.Fonte = sem_allocator_teste_fonte("    let x: i32 = 3.5 // c\nz")
+    defer delete(f1.dono_texto)
+    sv.fonte = &f1
+    var real: frontend.Expr = frontend.Expr{tipo_no = frontend.EX_REAL as u8, pos = 17, pos_op = 17, tipo = tf}
+    sv.ctx_tipo = ContextoDoTipo{onde = CTX_DECLARACAO as u8, valor = &real, nome = n_x, dono = -1}
+    sem_forma_tipo_diferente(&sv, &real, TIPO_I32 as u32)
+    expect((dg.explicacao or_else "") == "Na linha 1, coluna 18, a declaracao de 'x' pede i32 mas o valor '3.5' e f64. A Forja nao converte inteiro em real nem real em inteiro sozinha.")
+    expect((dg.forma or_else "") == "Troque a linha por: let x: i32 = 3.5 as i32 // c (o 'as' trunca a parte fracionaria).")
+    // argumento sem conversao, depois contexto de outra expressao dentro de um proc
+    dg = common.Diag{}
+    var f2: common.Fonte = sem_allocator_teste_fonte("  f(\"a\")\n")
+    defer delete(f2.dono_texto)
+    sv.fonte = &f2
+    var lit: frontend.Expr = frontend.Expr{tipo_no = frontend.EX_TEXTO as u8, pos = 4, pos_op = 4, tipo = tt}
+    sv.ctx_tipo = ContextoDoTipo{onde = CTX_ARGUMENTO as u8, valor = &lit, nome = n_x, dono = n_f}
+    sem_forma_tipo_diferente(&sv, &lit, ti)
+    expect((dg.explicacao or_else "") == "Na linha 1, coluna 5, o argumento 'x' da chamada de 'f' pede int mas o valor '\"a\"' e str. Os dois tipos sao de categorias diferentes e nao ha conversao automatica.")
+    expect((dg.forma or_else "") == "Passe em 'x' um valor int (a chamada de 'f' recebeu str).")
+    dg = common.Diag{}
+    var pr: frontend.Decl = frontend.Decl{tipo_no = frontend.D_PROC as u8, nome = n_p, pos = 0, pos_fim = 100}
+    sv.proc_c = &pr
+    sv.ctx_tipo = ContextoDoTipo{onde = CTX_ARGUMENTO as u8, valor = &real, nome = n_x, dono = n_f} // de outra expressao: nao vale
+    sem_forma_tipo_diferente(&sv, &lit, ti)
+    expect((dg.explicacao or_else "") == "Na linha 1, coluna 5, esta expressao (dentro do proc 'p') pede int mas o valor '\"a\"' e str. Os dois tipos sao de categorias diferentes e nao ha conversao automatica.")
+    expect((dg.forma or_else "") == "Use um valor int no lugar de '\"a\"' (str).")
+    dg = common.Diag{}
+    sv.ctx_tipo = ContextoDoTipo{onde = CTX_RETORNO as u8, valor = &lit, nome = -1, dono = n_f} // o return ja diz o proc
+    sem_forma_tipo_diferente(&sv, &lit, ti)
+    expect((dg.explicacao or_else "") == "Na linha 1, coluna 5, o return do proc 'f' pede int mas o valor '\"a\"' e str. Os dois tipos sao de categorias diferentes e nao ha conversao automatica.")
+    expect((dg.forma or_else "") == "Devolva um valor int em 'f', ou troque o tipo de retorno do proc para str.")
+    // valor com papel: condicao (bool) e indice (inteiro, com e sem conversao)
+    dg = common.Diag{}
+    var f3: common.Fonte = sem_allocator_teste_fonte("  if 1 {\n  a[2.5]\n")
+    defer delete(f3.dono_texto)
+    sv.fonte = &f3
+    sv.proc_c = none
+    var um: frontend.Expr = frontend.Expr{tipo_no = frontend.EX_INT as u8, pos = 5, pos_op = 5, tipo = ti}
+    sem_forma_do_valor(&sv, &um, TIPO_BOOL as u32, "a condicao")
+    expect((dg.explicacao or_else "") == "Na linha 1, coluna 6, a condicao precisa ser bool, mas '1' e int. bool nao vira numero e numero nao vira bool: compare com ==, != ou <.")
+    expect((dg.forma or_else "") == "Escreva uma comparacao (==, !=, <, >) ou um valor bool no lugar de '1' (int).")
+    dg = common.Diag{}
+    var meio: frontend.Expr = frontend.Expr{tipo_no = frontend.EX_REAL as u8, pos = 13, pos_op = 13, tipo = tf}
+    sem_forma_do_valor(&sv, &meio, ti, "o indice")
+    expect((dg.explicacao or_else "") == "Na linha 1, coluna 14, o indice precisa ser inteiro, mas '2.5' e f64. A Forja nao converte inteiro em real nem real em inteiro sozinha.")
+    expect((dg.forma or_else "") == "Troque a linha por: a[2.5 as int] (o 'as' trunca a parte fracionaria).")
+    dg = common.Diag{}
+    var txt: frontend.Expr = frontend.Expr{tipo_no = frontend.EX_REAL as u8, pos = 13, pos_op = 13, tipo = tt}
+    sem_forma_do_valor(&sv, &txt, ti, "o limite")
+    expect((dg.explicacao or_else "") == "Na linha 1, coluna 14, o limite precisa ser inteiro, mas '2.5' e str. Os dois tipos sao de categorias diferentes e nao ha conversao automatica.")
+    expect((dg.forma or_else "") == "Use um valor inteiro no lugar de '2.5' (str).")
+    dg = common.Diag{}
+    sem_forma_do_valor(&sv, &txt, tt, "o texto")
+    expect((dg.explicacao or_else "") == "Na linha 1, coluna 14, o texto precisa ser str, mas '2.5' e str. Os dois tipos sao de categorias diferentes e nao ha conversao automatica.")
+    // operandos de uma conta
+    dg = common.Diag{}
+    var f4: common.Fonte = sem_allocator_teste_fonte("  x = a + 1.5\n")
+    defer delete(f4.dono_texto)
+    sv.fonte = &f4
+    var ea: frontend.Expr = frontend.Expr{tipo_no = frontend.EX_NOME as u8, pos = 6, pos_op = 6, tipo = ti}
+    var eb: frontend.Expr = frontend.Expr{tipo_no = frontend.EX_REAL as u8, pos = 10, pos_op = 10, tipo = tf}
+    var soma: frontend.Expr = frontend.Expr{tipo_no = frontend.EX_BINARIO as u8, pos = 6, pos_op = 8, a = &ea, b = &eb}
+    sem_forma_operandos(&sv, &soma)
+    expect((dg.explicacao or_else "") == "Na linha 1, coluna 9 a conta 'a + 1.5' junta int com f64, e o operador '+' pede os dois lados do mesmo tipo. A Forja nao converte inteiro em real nem real em inteiro sozinha.")
+    expect((dg.forma or_else "") == "Converta o lado direito para int: troque a linha por: x = a + 1.5 as int (ou converta 'a' para f64).")
+    dg = common.Diag{}
+    eb.tipo = tt
+    eb.tipo_no = frontend.EX_TEXTO as u8
+    sem_forma_operandos(&sv, &soma)
+    expect((dg.explicacao or_else "") == "Na linha 1, coluna 9 a conta 'a + 1.5' junta int com str, e o operador '+' pede os dois lados do mesmo tipo. Os dois tipos sao de categorias diferentes e nao ha conversao automatica.")
+    expect((dg.forma or_else "") == "Deixe 'a' e '1.5' com o mesmo tipo (int ou str) antes de usar '+'.")
+    // print
+    dg = common.Diag{}
+    var f5: common.Fonte = sem_allocator_teste_fonte("  print(x)\n")
+    defer delete(f5.dono_texto)
+    sv.fonte = &f5
+    var din: frontend.Expr = frontend.Expr{tipo_no = frontend.EX_NOME as u8, pos = 8, pos_op = 8, tipo = tipo_dinamico(&sv.tipos, ti)}
+    sem_forma_do_print(&sv, &din)
+    expect((dg.explicacao or_else "") == "Na linha 1, coluna 9 o print recebeu 'x', que e [dynamic]int; print so imprime inteiro (i8..u64, int, uint), real, bool, str ou cstr.")
+    expect((dg.forma or_else "") == "Imprima um inteiro, bool, str ou cstr: troque 'x' ([dynamic]int) por um desses ou por um campo dele.")
+    dg = common.Diag{}
+    din.tipo = tipo_resultado(&sv.tipos, ti, tt)
+    sem_forma_do_print(&sv, &din)
+    expect((dg.forma or_else "") == "Tire o valor do resultado antes de imprimir: escreva 'or_else' e um valor padrao depois de 'x' (ou use 'try' num proc que devolve erro).")
+    // conta de texto
+    dg = common.Diag{}
+    var f6: common.Fonte = sem_allocator_teste_fonte("  y = \"a\" + n\n")
+    defer delete(f6.dono_texto)
+    sv.fonte = &f6
+    var ta: frontend.Expr = frontend.Expr{tipo_no = frontend.EX_TEXTO as u8, pos = 6, pos_op = 6, tipo = tt}
+    var tb: frontend.Expr = frontend.Expr{tipo_no = frontend.EX_NOME as u8, pos = 12, pos_op = 12, tipo = ti}
+    var conta: frontend.Expr = frontend.Expr{tipo_no = frontend.EX_BINARIO as u8, op = frontend.OP_SOMA as u8, pos = 6, pos_op = 10, a = &ta, b = &tb}
+    sem_forma_conta_de_texto(&sv, &conta)
+    expect((dg.explicacao or_else "") == "Na linha 1, coluna 11 a conta '\"a\" + n' junta str com int: texto (str, cstr ou literal) nao faz conta, e a Forja nao converte o numero em texto sozinha.")
+    expect((dg.forma or_else "") == "Troque a conta por f\"...\": print(f\"a{n}\") em print, ou format(f\"a{n}\", alloc = heap) para guardar o texto (e delete depois).")
+    dg = common.Diag{}
+    conta.op = (frontend.OP_SOMA + 1) as u8
+    sem_forma_conta_de_texto(&sv, &conta)
+    expect((dg.forma or_else "") == "Texto nao tem o operador '+': monte o texto com f\"...\" ou converta o outro lado antes da conta com '+'.")
+    dg = common.Diag{}
+    ta.tipo_no = frontend.EX_NOME as u8
+    ta.tipo = ti
+    sem_forma_conta_de_texto(&sv, &conta)
+    expect(not dg.tem and dg.explicacao == none and dg.forma == none) // ponteiro de verdade: vale a forma da tabela
+    // E0301 sem forma propria: a regra e o trecho do fonte
+    dg = common.Diag{}
+    var f7: common.Fonte = sem_allocator_teste_fonte("   a b // x\n")
+    defer delete(f7.dono_texto)
+    sv.fonte = &f7
+    dg.off = 5
+    dg.causa = "tipo diferente: esperado int, recebido str"
+    sem_forma_da_regra(&sv)
+    expect((dg.explicacao or_else "") == "Na linha 1, coluna 6 a Forja recusou a linha 'a b' porque a regra deste ponto e: tipo diferente: esperado int, recebido str.")
+    expect((dg.forma or_else "") == "Ajuste a linha 'a b' conforme a regra: esperado int, recebido str.")
+    dg = common.Diag{}
+    dg.off = 3
+    dg.causa = "sem separador"
+    sem_forma_da_regra(&sv)
+    expect((dg.explicacao or_else "") == "Na linha 1, coluna 4 a Forja recusou a linha 'a b' porque a regra deste ponto e: sem separador.")
+    expect((dg.forma or_else "") == "Reescreva a linha 'a b' de modo que obedeca a regra: sem separador.")
+    tipos_liberar(&sv.tipos)
+    dim_liberar(&dims)
+    common.interner_liberar(&nomes)
+    common.arena_liberar(&arena)
+}

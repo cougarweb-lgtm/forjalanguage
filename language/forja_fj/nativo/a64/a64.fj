@@ -1,0 +1,114 @@
+// nativo/a64/a64.fj - backend AArch64 (aarch64-linux): BIR -> .text do Objeto, modo so-slots (contrato_a64 secoes 2-4)
+// Versao: 0.7.0
+// Changelog: 0.7.3 - I4f: a64_redirecionar_rastro (arquivo do R0009 com 64 bits no rastro do wasm_rt) junto do redirecionamento do eprint. 0.7.2 - I4: a64_redirecionar_erro_fmt antes do alcance (relato R0003/R0006... em dev com janela alta): sempre no iOS; nos Linux so com FORJA_A64_ERRO64=1.
+//            0.7.1 - I3: passa alvo.macho ao alcance (raiz entrada_main no iOS).
+//            0.7.0 - I2: a64_gerar recebe A64Alvo{dinamico, macho}; no alvo iOS o `_start` e o `main` que o dyld chama (a64_entrada.fj).
+//            0.6.0 - A4.3: a64_gerar recebe `dinamico` (alvo android); programa com exports (.so) nao gera `_start`.
+//            0.5.0 - A2.2(e): c.pilha = simbolo de falha_pilha (raiz do alcance) para a guarda de R0016 do prologo.
+//            0.4.0 - A2.2(b): so as funcoes vivas (a64_alcance.fj, poda tardia) entram no .text; _start com o runtime a64 quando ha entrada/fim.
+//           0.3.0 - A1.3(ii): dados de texto/dado em .rdata antes das funcoes (a64_definir_dados, a64_dados.fj); arquivos novos a64_dados e a64_isel_agregado.
+//           0.2.0 - A1.3(i): gerador real no lugar do esqueleto `sair42`. a64_gerar(programa, o, erro) (o contrato dizia a64_gerar(o), mas sem o
+//                    programa da BIR nao ha o que gerar; chamar_alvo_gerar passa os tres). Gera `_start` (a64_entrada.fj) e uma funcao por BirFuncao
+//                    (prologo/corpo/epilogo, so-slots). Ops sem emissao (reais, *_OV, agregados, vetor...) saem X0001 (A1.3 ii-iv).
+//           0.1.0 - A1.2: esqueleto que emitia `mov x0,#42 ; mov x8,#93 ; svc #0`.
+// Arquivos do pacote: a64_codificar (encoder), a64_emitir (contexto e primitivas), a64_quadro, a64_isel / _fluxo / _mem, a64_intr, a64_entrada.
+
+import "common"
+import "nativo/bir"
+import "nativo/obj"
+import "std:os"
+
+const A64_ALINHAMENTO_TEXTO: u32 = 16
+
+// o que o gerador precisa saber do alvo: android (foreign por GOT, .so) e Mach-O iOS (entrada = main chamado pelo dyld)
+pub struct A64Alvo {
+    dinamico: bool
+    macho: bool
+}
+
+// corpo da funcao: cada bloco na ordem de emissao, guardando o offset do bloco para os saltos
+proc a64_gerar_corpo(c: ^A64Ctx) -> bool {
+    c.pos_ordem = 0
+    while c.pos_ordem < c.f.nblocos {
+        let b = c.ordem[c.pos_ordem]
+        c.bloco_off[b] = a64_offset(c)
+        let bloco: ^bir.BirBloco = &c.f.blocos[b]
+        for k in (0 as u32)..<bloco.n {
+            if not a64_selecionar(c, &bloco.instrs[k]) {
+                return false
+            }
+        }
+        c.pos_ordem += 1
+    }
+    return true
+}
+
+// uma funcao da BIR: quadro, simbolo, prologo, blocos, correcao dos saltos
+proc a64_gerar_funcao(c: ^A64Ctx, f: ^bir.BirFuncao) -> bool {
+    var arena = common.Arena{}
+    defer common.arena_liberar(&arena)
+    c.f = f
+    c.pos = f.pos
+    c.slot_off = common.arena_fatia_u32(&arena, (f.nslots + 1) as int)
+    c.ordem = common.arena_fatia_u32(&arena, (f.nblocos + 1) as int)
+    c.bloco_off = common.arena_fatia_u32(&arena, (f.nblocos + 1) as int)
+    c.saltos = make([dynamic]A64Salto, alloc = heap, cap = 16)
+    defer delete(c.saltos)
+    if (not a64_assinatura_suportada(c)) or (not a64_calcular_quadro(c)) {
+        return false
+    }
+    a64_ordenar_blocos(f, c.ordem)
+    a64_alinhar_texto(c, 16)
+    _ = obj.obj_simbolo_definir(c.o, c.p.simbolos[f.simbolo].nome, c.texto as i32, a64_offset(c))
+    if (not a64_prologo(c)) or (not a64_gerar_corpo(c)) {
+        return false
+    }
+    return a64_corrigir_saltos(c)
+}
+
+// I4: FORJA_A64_ERRO64=1 liga o redirecionamento do eprint do rt_wasm tambem nos alvos Linux (ensaio com a janela alta forcada); o iOS sempre o usa.
+// Desligado, os bytes dos alvos aarch64-linux e android ficam iguais aos da 0.46.0
+proc a64_erro64_ligado() -> bool {
+    return (os.env("FORJA_A64_ERRO64") or_else "") == "1"
+}
+
+// Gera o texto do programa no Objeto (secao .text, `_start` e as funcoes); false = diagnostico X0001/X0003 ja relatado em `erro`
+pub proc a64_gerar(programa: ^bir.BirPrograma, o: ^obj.Objeto, erro: ^common.Diag, alvo: A64Alvo) -> bool {
+    var arena = common.Arena{}
+    defer common.arena_liberar(&arena)
+    let funcoes: []bir.BirFuncao = programa.funcoes or_else {}
+    if programa.nfuncoes == 0 {
+        common.falha_interna("a64_gerar: programa sem funcoes")
+    }
+    var c = A64Ctx{p = programa, o = o, erro = erro, f = &funcoes[0], dinamico = alvo.dinamico, macho = alvo.macho}
+    c.texto = obj.obj_secao_abrir(o, ".text", obj.OS_TEXTO, A64_ALINHAMENTO_TEXTO)
+    c.obj_sim = common.arena_fatia_u32(&arena, (programa.nsimbolos + 1) as int)
+    for k in 0..<len(c.obj_sim) {
+        c.obj_sim[k] = A64_SEM_SIMBOLO
+    }
+    if alvo.macho or a64_erro64_ligado() {
+        a64_redirecionar_erro_fmt(programa)
+        a64_redirecionar_rastro(programa)
+    }
+    a64_definir_dados(&c)
+    var vivas = make([dynamic]bool, alloc = heap)
+    defer delete(vivas)
+    var raizes = A64Raizes{}
+    a64_alcance_calcular(programa, &vivas, &raizes, alvo.macho)
+    c.pilha = A64_ALC_SEM
+    if raizes.pilha != A64_ALC_SEM {
+        c.pilha = funcoes[raizes.pilha].simbolo
+    }
+    // .so (--modo dll no android): sem _start, o carregador entra pelos exports (raizes do alcance)
+    if (programa.nexportados == 0) and (not a64_gerar_entrada(&c, &raizes)) {
+        return false
+    }
+    for k in (0 as u32)..<programa.nfuncoes {
+        if vivas[k] {
+            if not a64_gerar_funcao(&c, &funcoes[k]) {
+                return false
+            }
+        }
+    }
+    return true
+}

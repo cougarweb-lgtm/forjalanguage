@@ -1,0 +1,232 @@
+// nativo/bir/bir_construir_fluxo.fj - porte de compiler/nativo/bir/bir_construir_fluxo.c
+// sha256 de nativo/bir/bir_construir_fluxo.c: 31e7db76e1c0d0ba22ea38371a32a288b90305a987f7cab9cc4d48f0510bda85
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "common"
+import "ir"
+import "semantic"
+
+struct BirPara {
+    cnt: u32
+    fim: u32
+    ultimo: u32
+    corpo: u32
+    passo: BirRotulo
+    saida: BirRotulo
+}
+
+// C: nativo/bir/bir_construir_fluxo.c:14
+proc condicao_em_vreg(c: ^BirCtx, i: ^ir.IrInstr, cond: ^BirOperando) -> bool {
+    return (common.c2f_b2i32(bir_operando_de(c, i, &i.a, cond)) != 0) and (common.c2f_b2i32(bir_operando_vreg(c, cond^, cond)) != 0)
+}
+
+// C: nativo/bir/bir_construir_fluxo.c:20
+proc ramo_senao(c: ^BirCtx, i: ^ir.IrInstr, fim: ^BirRotulo, outro: u32) -> bool {
+    if i.senao.primeira == none {
+        return true
+    }
+    c.cur = outro
+    if not bir_construir_bloco(c, &i.senao) {
+        return false
+    }
+    bir_rotulo_salta(c, fim)
+    return true
+}
+
+// C: nativo/bir/bir_construir_fluxo.c:31
+proc bir_regra_se(c: ^BirCtx, i: ^ir.IrInstr) -> bool {
+    var fim: BirRotulo = BirRotulo{bloco = BIR_SEM_BLOCO}
+    var cond: BirOperando = BirOperando{}
+    let tem_senao: bool = i.senao.primeira != none
+    var entao: u32 = 0
+    var outro: u32 = 0
+    if (not bir_construir_bloco(c, &i.cond)) or (not condicao_em_vreg(c, i, &cond)) {
+        return false
+    }
+    entao = bir_novo_bloco(c, false)
+    var tern_1: u32 = 0
+    if common.c2f_b2i32(tem_senao) != 0 {
+        tern_1 = bir_novo_bloco(c, false)
+    } else {
+        tern_1 = bir_rotulo_alvo(c, &fim)
+    }
+    outro = tern_1
+    bir_desvia(c, cond, entao, outro)
+    c.cur = entao
+    if not bir_construir_bloco(c, &i.corpo) {
+        return false
+    }
+    bir_rotulo_salta(c, &fim)
+    if not ramo_senao(c, i, &fim, outro) {
+        return false
+    }
+    bir_rotulo_coloca(c, &fim)
+    return true
+}
+
+// C: nativo/bir/bir_construir_fluxo.c:53
+proc bir_regra_enquanto(c: ^BirCtx, i: ^ir.IrInstr) -> bool {
+    // Rotulos no heap: bir_entrar_laco guarda o endereco, e Forja recusa endereco de local guardado (E0706)
+    let topo: ^BirRotulo = new(BirRotulo, alloc = heap)
+    defer delete(topo)
+    let fim: ^BirRotulo = new(BirRotulo, alloc = heap)
+    defer delete(fim)
+    topo.bloco = BIR_SEM_BLOCO
+    fim.bloco = BIR_SEM_BLOCO
+    var cond: BirOperando = BirOperando{}
+    var corpo: u32 = 0
+    bir_rotulo_salta(c, topo)
+    c.cur = bir_rotulo_alvo(c, topo)
+    if (not bir_construir_bloco(c, &i.cond)) or (not condicao_em_vreg(c, i, &cond)) {
+        return false
+    }
+    corpo = bir_novo_bloco(c, false)
+    bir_desvia(c, cond, corpo, bir_rotulo_alvo(c, fim))
+    c.cur = corpo
+    bir_entrar_laco(c, topo, fim)
+    if not bir_construir_bloco(c, &i.corpo) {
+        return false
+    }
+    bir_sair_laco(c)
+    bir_rotulo_salta(c, topo)
+    bir_rotulo_coloca(c, fim)
+    return true
+}
+
+// C: nativo/bir/bir_construir_fluxo.c:81
+proc vreg64(c: ^BirCtx, i: ^ir.IrInstr, v: ^ir.Valor, vreg: ^u32) -> bool {
+    var o: BirOperando = BirOperando{}
+    if not bir_operando_de(c, i, v, &o) {
+        return false
+    }
+    vreg^ = bir_novo_vreg(c, BC_I64 as u8)
+    if (o.tipo == (BO_IMED as u8)) or (o.classe == (BC_I64 as u8)) {
+        o.classe = BC_I64 as u8
+        bir_mover(c, vreg^, o)
+        return true
+    }
+    var tern_1: i32 = BIR_EXT_S
+    if common.c2f_b2i32(semantic.tipo_eh_sem_sinal(v.tipo)) != 0 {
+        tern_1 = BIR_EXT_Z
+    }
+    _ = bir_emitir_pedido(c, BirPedido{op = tern_1 as u8, dst = vreg^, a = o})
+    return true
+}
+
+// C: nativo/bir/bir_construir_fluxo.c:98
+proc condicao_do_para(i: ^ir.IrInstr) -> u8 {
+    let sem_sinal: bool = semantic.tipo_eh_sem_sinal(i.tipo)
+    if i.faixa_excl {
+        var tern_1: i32 = BCOND_LT_S
+        if common.c2f_b2i32(sem_sinal) != 0 {
+            tern_1 = BCOND_LT_U
+        }
+        return tern_1 as u8
+    }
+    var tern_2: i32 = BCOND_LE_S
+    if common.c2f_b2i32(sem_sinal) != 0 {
+        tern_2 = BCOND_LE_U
+    }
+    return tern_2 as u8
+}
+
+// C: nativo/bir/bir_construir_fluxo.c:107
+proc iniciar_para(c: ^BirCtx, i: ^ir.IrInstr, p: ^BirPara) -> bool {
+    let cond: u8 = condicao_do_para(i)
+    var ativo: u32 = 0
+    if (not vreg64(c, i, &i.b, &p.fim)) or (not vreg64(c, i, &i.a, &p.cnt)) {
+        return false
+    }
+    p.ultimo = p.fim
+    if i.faixa_excl {
+        p.ultimo = bir_conta_nova(c, BC_I64 as u8, BirPedido{op = BIR_SUB as u8, a = op_vreg(p.fim, BC_I64 as u8), b = op_imed(1, BC_I64 as u8)})
+    }
+    ativo = bir_conta_nova(c, BC_I8 as u8, BirPedido{op = BIR_CMP as u8, aux = cond, a = op_vreg(p.cnt, BC_I64 as u8), b = op_vreg(p.fim, BC_I64 as u8)})
+    p.corpo = bir_novo_bloco(c, false)
+    let arg_1: u32 = bir_rotulo_alvo(c, &p.saida)
+    let arg_2: u32 = p.corpo
+    let arg_3: BirOperando = op_vreg(ativo, BC_I8 as u8)
+    let arg_4: ^BirCtx = c
+    bir_desvia(arg_4, arg_3, arg_2, arg_1)
+    return true
+}
+
+// C: nativo/bir/bir_construir_fluxo.c:124
+proc corpo_do_para(c: ^BirCtx, i: ^ir.IrInstr, p: ^BirPara) -> bool {
+    var classe: u8 = 0
+    var variavel: u32 = 0
+    if (not bir_classe_do_tipo((c.e as ^BirEntrada).tipos as ^semantic.Tipos, i.tipo, &classe)) or (not bir_vreg_declarar(c, i.destino, classe, &variavel)) {
+        return false
+    }
+    c.cur = p.corpo
+    var tern_1: i32 = BIR_COPIA
+    if (classe as i32) < BC_I64 {
+        tern_1 = BIR_TRUNC
+    }
+    _ = bir_emitir_pedido(c, BirPedido{op = tern_1 as u8, dst = variavel, a = op_vreg(p.cnt, BC_I64 as u8)})
+    bir_entrar_laco(c, &p.passo, &p.saida)
+    if not bir_construir_bloco(c, &i.corpo) {
+        return false
+    }
+    bir_sair_laco(c)
+    return true
+}
+
+// C: nativo/bir/bir_construir_fluxo.c:141
+proc passo_do_para(c: ^BirCtx, p: ^BirPara) {
+    var acabou: u32 = 0
+    var soma: u32 = 0
+    bir_rotulo_salta(c, &p.passo)
+    bir_rotulo_coloca(c, &p.passo)
+    if c.cur == BIR_SEM_BLOCO {
+        return
+    }
+    acabou = bir_conta_nova(c, BC_I8 as u8, BirPedido{op = BIR_CMP as u8, aux = BCOND_EQ as u8, a = op_vreg(p.cnt, BC_I64 as u8), b = op_vreg(p.ultimo, BC_I64 as u8)})
+    soma = bir_novo_bloco(c, false)
+    let arg_1: u32 = soma
+    let arg_2: u32 = bir_rotulo_alvo(c, &p.saida)
+    let arg_3: BirOperando = op_vreg(acabou, BC_I8 as u8)
+    let arg_4: ^BirCtx = c
+    bir_desvia(arg_4, arg_3, arg_2, arg_1)
+    c.cur = soma
+    _ = bir_emitir_pedido(c, BirPedido{op = BIR_ADD as u8, dst = p.cnt, a = op_vreg(p.cnt, BC_I64 as u8), b = op_imed(1, BC_I64 as u8)})
+    bir_salta(c, p.corpo)
+}
+
+// C: nativo/bir/bir_construir_fluxo.c:157
+proc bir_regra_para(c: ^BirCtx, i: ^ir.IrInstr) -> bool {
+    // BirPara no heap pelo mesmo motivo de bir_regra_enquanto (os rotulos de passo/saida entram na pilha de laços)
+    let p: ^BirPara = new(BirPara, alloc = heap)
+    defer delete(p)
+    p.passo.bloco = BIR_SEM_BLOCO
+    p.saida.bloco = BIR_SEM_BLOCO
+    var classe: u8 = 0
+    if not bir_classe_do_tipo((c.e as ^BirEntrada).tipos as ^semantic.Tipos, i.tipo, &classe) {
+        return bir_falha_tipo(c, i, "-", i.tipo)
+    }
+    if (not iniciar_para(c, i, p)) or (not corpo_do_para(c, i, p)) {
+        return false
+    }
+    passo_do_para(c, p)
+    bir_rotulo_coloca(c, &p.saida)
+    return true
+}
+
+// C: nativo/bir/bir_construir_fluxo.c:171
+proc bir_regra_pare(c: ^BirCtx, i: ^ir.IrInstr) -> bool {
+    if c.nlacos == 0 {
+        return bir_falha_inconsistente(c, "pare fora de laco")
+    }
+    bir_salta(c, bir_rotulo_alvo(c, c.lacos[c.nlacos - 1].pare as ^BirRotulo))
+    return true
+}
+
+// C: nativo/bir/bir_construir_fluxo.c:180
+proc bir_regra_continua(c: ^BirCtx, i: ^ir.IrInstr) -> bool {
+    if c.nlacos == 0 {
+        return bir_falha_inconsistente(c, "continua fora de laco")
+    }
+    bir_salta(c, bir_rotulo_alvo(c, c.lacos[c.nlacos - 1].continua as ^BirRotulo))
+    return true
+}

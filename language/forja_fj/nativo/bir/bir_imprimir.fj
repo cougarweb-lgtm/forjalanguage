@@ -1,0 +1,494 @@
+// nativo/bir/bir_imprimir.fj - porte de compiler/nativo/bir/bir_imprimir.c
+// sha256 de nativo/bir/bir_imprimir.c: f0fbacb261cf61ab758e537629c6da5f5d57e6dda188abc50e8e704f7394bf36
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "common"
+
+const NOMES_CLASSE: [8]str = {"-", "i8", "i16", "i32", "i64", "f32", "f64", "v128"}
+const NOMES_FORMA_VETOR: [4]str = {"4xf32", "2xf64", "4xi32", "2xi64"}
+// C: nativo/bir/bir_imprimir.c:39 (NOMES_OP, indexado pelo op de BIR_CONST a BIR_ZERA_MEM)
+const NOMES_OP: [39]str = {"const", "copia", "add", "sub", "mul", "and", "or", "xor", "neg", "cmp", "ext_s", "ext_z", "trunc", "add_ov", "sub_ov", "mul_ov", "neg_ov", "end", "chama", "salta", "desvia", "retorna", "armadilha", "div", "rem", "shl", "shr", "not", "i_para_f", "f_para_f", "raiz", "chama_ind", "seleciona", "splat", "end_slot", "carrega", "grava", "copia_mem", "zera_mem"}
+const NOMES_COND: [16]str = {"eq", "ne", "lt_s", "le_s", "gt_s", "ge_s", "lt_u", "le_u", "gt_u", "ge_u", "feq", "fne", "flt", "fle", "fgt", "fge"}
+
+// C: nativo/bir/bir_imprimir.c:53
+proc nome_da_classe_2(classe: u8) -> str {
+    var tern_1: str = "?"
+    if (classe as u64) < (64 / 8) {
+        tern_1 = NOMES_CLASSE[classe]
+    }
+    return tern_1 // C2F: sizeof NOMES_CLASSE C2F: sizeof NOMES_CLASSE [ 0 ]
+}
+
+// C: nativo/bir/bir_imprimir.c:58
+proc nome_do_op(op: u8) -> str {
+    if (op as i32) < BIR_QTD {
+        return NOMES_OP[op]
+    }
+    return "?"
+}
+
+// C: nativo/bir/bir_imprimir.c:63
+// Escapes: \" \\ \n \t \r; fora de 0x20..0x7e sai "\NNN" em octal de 3 digitos, formatado a mao (C2F-31 nao cobre %03o).
+proc imprimir_byte_escapado(ch: u8, saida: ^[dynamic]u8) {
+    if ch == 34 or ch == 92 { // '"' e '\'
+        append(saida, item = "\\")
+        append(saida, item = ch)
+        return
+    }
+    if ch == 10 {
+        append(saida, item = "\\n")
+        return
+    }
+    if ch == 9 {
+        append(saida, item = "\\t")
+        return
+    }
+    if ch == 13 {
+        append(saida, item = "\\r")
+        return
+    }
+    if ch < 32 or ch > 126 {
+        append(saida, item = "\\")
+        append(saida, item = 48 + (ch / 64))
+        append(saida, item = 48 + ((ch / 8) & 7))
+        append(saida, item = 48 + (ch & 7))
+        return
+    }
+    append(saida, item = ch)
+}
+
+// C: nativo/bir/bir_imprimir.c:79
+proc imprimir_texto_escapado(s: ^BirSimbolo, saida: ^[dynamic]u8) {
+    append(saida, item = "\""[0..<1])
+    for k in (0 as u32)..<s.tam {
+        imprimir_byte_escapado((s.bytes or_else "")[k], saida)
+    }
+    append(saida, item = "\""[0..<1])
+}
+
+// C: nativo/bir/bir_imprimir.c:87
+proc imprimir_simbolo(p: ^BirPrograma, indice: u32, saida: ^[dynamic]u8) {
+    var tern_1: ?^BirSimbolo = none
+    if indice < p.nsimbolos {
+        tern_1 = &p.simbolos[indice]
+    }
+    let s: ?^BirSimbolo = tern_1
+    if s == none {
+        append(saida, item = "@?")
+    } else if (s as ^BirSimbolo).tipo == (BS_TEXTO as u8) {
+        format(f"@s{(s as ^BirSimbolo).ordem}", into = saida)
+    } else if (s as ^BirSimbolo).tipo == (BS_DADO as u8) {
+        format(f"@d{(s as ^BirSimbolo).ordem}", into = saida)
+    } else {
+        let txt_1 = (s as ^BirSimbolo).nome or_else "(null)"
+        format(f"@{txt_1}", into = saida)
+    }
+}
+
+// C: nativo/bir/bir_imprimir.c:102
+proc imprimir_imediato_real(o: ^BirOperando, saida: ^[dynamic]u8) {
+    // Os bits do imediato saem de i64 para u64 pela transmute (o 'as' da Forja trava fora da faixa, R0002);
+    // o u32 do f32 e a parte baixa, pela mascara.
+    let bits64: u64 = transmute(o.imed, to = u64)
+    let bits32: u32 = (bits64 & 4294967295) as u32
+    append(saida, item = "#")
+    if o.classe == (BC_F32 as u8) {
+        let f32_valor: f32 = transmute(bits32, to = f32)
+        common.formatar_real_curto(saida, f32_valor as f64, true)
+        format(f":f32(0x{bits32:08x})", into = saida)
+        return
+    }
+    let f64_valor: f64 = transmute(bits64, to = f64)
+    common.formatar_real_curto(saida, f64_valor, false)
+    format(f":f64(0x{bits64:016x})", into = saida)
+}
+
+// C: nativo/bir/bir_imprimir.c:121
+proc imprimir_operando(p: ^BirPrograma, o: ^BirOperando, saida: ^[dynamic]u8) {
+    if o.tipo == (BO_VREG as u8) {
+        format(f"v{o.id}", into = saida)
+        if o.extensao == (BE_SINAL as u8) {
+            append(saida, item = ".sx")
+        } else if o.extensao == (BE_ZERO as u8) {
+            append(saida, item = ".zx")
+        }
+        if o.tam != 0 {
+            format(f"/{o.tam}", into = saida)
+        }
+        return
+    }
+    if o.tipo == (BO_IMED as u8) {
+        if bir_classe_eh_real(o.classe as i32) {
+            imprimir_imediato_real(o, saida)
+            return
+        }
+        let classe_imed: u8 = o.classe
+        format(f"#{o.imed}:{nome_da_classe_2(classe_imed)}", into = saida)
+        return
+    }
+    if o.tipo == (BO_SIMBOLO as u8) {
+        imprimir_simbolo(p, o.id, saida)
+        return
+    }
+    append(saida, item = "-")
+}
+
+// C: nativo/bir/bir_imprimir.c:140
+proc imprimir_args(p: ^BirPrograma, i: ^BirInstr, saida: ^[dynamic]u8) {
+    append(saida, item = "("[0..<1])
+    var k: u32 = 0
+    while k < i.nargs {
+        if k > 0 {
+            append(saida, item = ", "[0..<2])
+        }
+        imprimir_operando(p, &(i.args or_else {})[k], saida)
+        k += 1
+    }
+    append(saida, item = ")"[0..<1])
+}
+
+// C: nativo/bir/bir_imprimir.c:151
+proc tem_operando_b(i: ^BirInstr) -> bool {
+    return i.b.tipo != (BO_NADA as u8)
+}
+
+// C: nativo/bir/bir_imprimir.c:157
+proc imprimir_endereco_memoria(i: ^BirInstr, saida: ^[dynamic]u8) {
+    format(f" [v{i.a.id}", into = saida)
+    if (i.op == (BIR_CARREGA as u8)) or (i.op == (BIR_GRAVA as u8)) {
+        format(f"+{i.desloc}", into = saida)
+    }
+    append(saida, item = "]"[0..<1])
+}
+
+// C: nativo/bir/bir_imprimir.c:165
+proc imprimir_memoria(p: ^BirPrograma, i: ^BirInstr, saida: ^[dynamic]u8) {
+    if i.op == (BIR_END_SLOT as u8) {
+        format(f" k{i.a.imed as u32}", into = saida)
+        return
+    }
+    imprimir_endereco_memoria(i, saida)
+    if i.op == (BIR_GRAVA as u8) {
+        append(saida, item = ", ")
+        imprimir_operando(p, &i.b, saida)
+    }
+    if i.op == (BIR_COPIA_MEM as u8) {
+        format(f", [v{i.b.id}]", into = saida)
+    }
+    if (i.op == (BIR_COPIA_MEM as u8)) or (i.op == (BIR_ZERA_MEM as u8)) {
+        format(f" n={i.desloc}", into = saida)
+    }
+}
+
+// C: nativo/bir/bir_imprimir.c:183
+proc tem_sufixo_sinal(i: ^BirInstr) -> bool {
+    return ((((i.op as i32) >= BIR_ADD_OV) and ((i.op as i32) <= BIR_NEG_OV)) or (((i.op == (BIR_DIV as u8)) or (i.op == (BIR_REM as u8))) and (not bir_classe_eh_xmm(i.a.classe as i32)))) or (i.op == (BIR_I_PARA_F as u8))
+}
+
+// C: nativo/bir/bir_imprimir.c:189
+proc imprimir_sufixo(i: ^BirInstr, saida: ^[dynamic]u8) {
+    if (i.op == (BIR_CMP as u8)) or (i.op == (BIR_SELECIONA as u8)) {
+        var tern_1: str = "?"
+        if (i.aux as u64) < (128 / 8) {
+            tern_1 = NOMES_COND[i.aux]
+        }
+        format(f".{tern_1}", into = saida) // C2F: sizeof NOMES_COND C2F: sizeof NOMES_COND [ 0 ]
+    }
+    if tem_sufixo_sinal(i) {
+        var tern_2: str = ".u"
+        if i.aux == (BIR_SINAL as u8) {
+            tern_2 = ".s"
+        }
+        append(saida, item = tern_2)
+    }
+}
+
+// C: nativo/bir/bir_imprimir.c:198
+proc imprimir_destino_agregado(p: ^BirPrograma, i: ^BirInstr, saida: ^[dynamic]u8) {
+    if i.a.tipo == (BO_NADA as u8) {
+        return
+    }
+    append(saida, item = " => ")
+    imprimir_operando(p, &i.a, saida)
+}
+
+// C: nativo/bir/bir_imprimir.c:207
+proc imprimir_chamada(p: ^BirPrograma, i: ^BirInstr, saida: ^[dynamic]u8) {
+    append(saida, item = " "[0..<1])
+    if i.op == (BIR_CHAMA_IND as u8) {
+        imprimir_operando(p, &i.b, saida)
+    } else {
+        imprimir_simbolo(p, i.simbolo, saida)
+    }
+    imprimir_args(p, i, saida)
+    imprimir_destino_agregado(p, i, saida)
+}
+
+// C: nativo/bir/bir_imprimir.c:219
+proc imprimir_operandos_gerais(p: ^BirPrograma, i: ^BirInstr, saida: ^[dynamic]u8) {
+    if i.a.tipo != (BO_NADA as u8) {
+        append(saida, item = " "[0..<1])
+        imprimir_operando(p, &i.a, saida)
+    }
+    if tem_operando_b(i) {
+        append(saida, item = ", ")
+        imprimir_operando(p, &i.b, saida)
+    }
+    if i.op == (BIR_DESVIA as u8) {
+        format(f", b{i.alvo[0]}, b{i.alvo[1]}", into = saida)
+    }
+}
+
+// C: nativo/bir/bir_imprimir.c:234
+proc imprimir_corpo(p: ^BirPrograma, i: ^BirInstr, saida: ^[dynamic]u8) {
+    append(saida, item = nome_do_op(i.op))
+    if i.classe == (BC_V128 as u8) {
+        var tern_1: str = "?"
+        if (i.aux as i32) < BVEC_QTD {
+            tern_1 = NOMES_FORMA_VETOR[i.aux]
+        }
+        format(f".{tern_1}", into = saida)
+    }
+    if (i.op as i32) >= BIR_END_SLOT {
+        imprimir_memoria(p, i, saida)
+        return
+    }
+    imprimir_sufixo(i, saida)
+    if i.op == (BIR_SELECIONA as u8) {
+        imprimir_args(p, i, saida)
+        imprimir_operandos_gerais(p, i, saida)
+        return
+    }
+    if ((i.op == (BIR_CHAMA as u8)) or (i.op == (BIR_CHAMA_IND as u8))) or (i.op == (BIR_ARMADILHA as u8)) {
+        imprimir_chamada(p, i, saida)
+        return
+    }
+    if i.op == (BIR_SALTA as u8) {
+        format(f" b{i.alvo[0]}", into = saida)
+        return
+    }
+    imprimir_operandos_gerais(p, i, saida)
+}
+
+// C: nativo/bir/bir_imprimir.c:260
+proc imprimir_instr(p: ^BirPrograma, f: ^BirFuncao, i: ^BirInstr, saida: ^[dynamic]u8) {
+    append(saida, item = "  ")
+    if i.dst != BIR_SEM_VREG {
+        let classe_dst: u8 = (f.classe_vreg or_else {})[i.dst]
+        let nome_dst: str = nome_da_classe_2(classe_dst)
+        format(f"v{i.dst}:{nome_dst} = ", into = saida)
+    }
+    imprimir_corpo(p, i, saida)
+    if (i.op as i32) >= BIR_ADD_OV and (i.op as i32) <= BIR_NEG_OV {
+        format(f" ; frio b{i.alvo[0]}", into = saida)
+    }
+    if i.pos != BIR_SEM_POS and p.fonte != none {
+        let pos = common.fonte_localizar_no_arquivo(p.fonte, i.pos)
+        format(f" ; {pos.linha}:{pos.coluna}", into = saida)
+    }
+    append(saida, item = "\n")
+}
+
+// C: nativo/bir/bir_imprimir.c:276
+proc imprimir_parametros(f: ^BirFuncao, saida: ^[dynamic]u8) {
+    var k: u32 = 0
+    while k < f.nparams {
+        var sep: str = ""
+        if k > 0 {
+            sep = ", "
+        }
+        let classe_k: u8 = (f.classe_vreg or_else {})[k]
+        let nome_k: str = nome_da_classe_2(classe_k)
+        format(f"{sep}v{k}:{nome_k}", into = saida)
+        if f.param_tam != none {
+            let tam_k: u32 = (f.param_tam or_else {})[k]
+            if tam_k != 0 {
+                format(f"/{tam_k}", into = saida)
+            }
+        }
+        k += 1
+    }
+}
+
+// C: nativo/bir/bir_imprimir.c:285
+proc imprimir_cabecalho(p: ^BirPrograma, f: ^BirFuncao, saida: ^[dynamic]u8) {
+    let txt_1 = p.simbolos[f.simbolo].nome or_else "(null)"
+    format(f"funcao {txt_1}(", into = saida)
+    imprimir_parametros(f, saida)
+    var tern_1: str = ""
+    if f.retorno == (BC_NADA as u8) {
+        tern_1 = "vazio"
+    } else {
+        tern_1 = nome_da_classe_2(f.retorno)
+    }
+    format(f") -> {tern_1}", into = saida)
+    if f.retorno_tam != 0 {
+        format(f"/{f.retorno_tam}", into = saida)
+    }
+    append(saida, item = "\n"[0..<1])
+    for k in (0 as u32)..<f.nslots {
+        format(f"  slot k{k} tam={f.slots[k].tam} ali={f.slots[k].alinhamento}\n", into = saida)
+    }
+}
+
+// C: nativo/bir/bir_imprimir.c:297
+proc imprimir_funcao(p: ^BirPrograma, f: ^BirFuncao, saida: ^[dynamic]u8) {
+    imprimir_cabecalho(p, f, saida)
+    var b: u32 = 0
+    while b < f.nblocos {
+        let bloco: ^BirBloco = &f.blocos[b]
+        var tern_1: str = ""
+        if common.c2f_b2i32(bloco.frio) != 0 {
+            tern_1 = " frio"
+        }
+        format(f"b{b}{tern_1}:\n", into = saida)
+        for k in (0 as u32)..<bloco.n {
+            imprimir_instr(p, f, &bloco.instrs[k], saida)
+        }
+        b += 1
+    }
+}
+
+// C: nativo/bir/bir_imprimir.c:310
+proc imprimir_dado(s: ^BirSimbolo, saida: ^[dynamic]u8) {
+    format(f"  d{s.ordem} = align {s.alinhamento} x", into = saida)
+    append(saida, item = "\"")
+    for k in (0 as u32)..<s.tam {
+        var tern_1: str = ""
+        if k > 0 {
+            tern_1 = " "
+        }
+        let fmt_1: u32 = (s.bytes or_else "")[k] as u32
+        format(f"{tern_1}{fmt_1:02x}", into = saida)
+    }
+    append(saida, item = "\"\n")
+}
+
+// C: nativo/bir/bir_imprimir.c:318
+proc imprimir_simbolos(p: ^BirPrograma, saida: ^[dynamic]u8) {
+    var cabecalho: bool = false
+    var k: u32 = 0
+    while k < p.nsimbolos {
+        let s: ^BirSimbolo = &p.simbolos[k]
+        if (s.tipo != (BS_TEXTO as u8)) and (s.tipo != (BS_DADO as u8)) {
+            k += 1
+            continue
+        }
+        if not cabecalho {
+            append(saida, item = "simbolos:\n")
+        }
+        cabecalho = true
+        if s.tipo == (BS_DADO as u8) {
+            imprimir_dado(s, saida)
+            k += 1
+            continue
+        }
+        format(f"  s{s.ordem} = ", into = saida)
+        imprimir_texto_escapado(s, saida)
+        append(saida, item = "\n"[0..<1])
+        k += 1
+    }
+}
+
+// C: nativo/bir/bir_imprimir.c:340
+pub proc bir_imprimir(programa: ^BirPrograma, saida: ^[dynamic]u8) {
+    for k in (0 as u32)..<programa.nfuncoes {
+        imprimir_funcao(programa, &(programa.funcoes or_else {})[k], saida)
+    }
+    imprimir_simbolos(programa, saida)
+}
+
+// ---------------------------------------------------------------- testes do dump (valores do C: gcc, ver changelog do lote)
+
+// Texto do dump (heap, liberado aqui) igual ao esperado?
+proc teste_bir_imprimir_texto(saida: ^[dynamic]u8, esperado: str) -> bool {
+    let texto = to_str(saida)
+    let igual = texto == esperado
+    delete(texto)
+    return igual
+}
+
+proc teste_bir_byte_igual(ch: u8, esperado: str) -> bool {
+    var saida = make([dynamic]u8, alloc = heap, cap = 8)
+    defer delete(saida)
+    imprimir_byte_escapado(ch, &saida)
+    return teste_bir_imprimir_texto(&saida, esperado)
+}
+
+proc teste_bir_operando_igual(o: ^BirOperando, esperado: str) -> bool {
+    var prog = BirPrograma{}
+    var saida = make([dynamic]u8, alloc = heap, cap = 32)
+    defer delete(saida)
+    imprimir_operando(&prog, o, &saida)
+    return teste_bir_imprimir_texto(&saida, esperado)
+}
+
+test "bir_imprimir_nome_do_op" {
+    expect(nome_do_op(BIR_CONST as u8) == "const")
+    expect(nome_do_op(BIR_ADD as u8) == "add")
+    expect(nome_do_op(BIR_DIV as u8) == "div")
+    expect(nome_do_op(BIR_I_PARA_F as u8) == "i_para_f")
+    expect(nome_do_op(BIR_END_SLOT as u8) == "end_slot")
+    expect(nome_do_op(BIR_RAIZ as u8) == "raiz")
+    expect(nome_do_op(BIR_CHAMA_IND as u8) == "chama_ind")
+    expect(nome_do_op(BIR_SPLAT as u8) == "splat")
+    expect(nome_do_op(BIR_ZERA_MEM as u8) == "zera_mem")
+    expect(nome_do_op(BIR_QTD as u8) == "?")
+    expect(nome_do_op(255) == "?")
+}
+
+test "bir_imprimir_byte_escapado" {
+    expect(teste_bir_byte_igual(34, "\\\""))
+    expect(teste_bir_byte_igual(92, "\\\\"))
+    expect(teste_bir_byte_igual(10, "\\n"))
+    expect(teste_bir_byte_igual(9, "\\t"))
+    expect(teste_bir_byte_igual(13, "\\r"))
+    expect(teste_bir_byte_igual(0, "\\000"))
+    expect(teste_bir_byte_igual(7, "\\007"))
+    expect(teste_bir_byte_igual(8, "\\010"))
+    expect(teste_bir_byte_igual(31, "\\037"))
+    expect(teste_bir_byte_igual(32, " "))
+    expect(teste_bir_byte_igual(65, "A"))
+    expect(teste_bir_byte_igual(126, "~"))
+    expect(teste_bir_byte_igual(127, "\\177"))
+    expect(teste_bir_byte_igual(128, "\\200"))
+    expect(teste_bir_byte_igual(255, "\\377"))
+}
+
+test "bir_imprimir_operando" {
+    var vsinal = BirOperando{tipo = BO_VREG as u8, classe = BC_I64 as u8, extensao = BE_SINAL as u8, id = 7, imed = 0, tam = 0, sysv = none}
+    expect(teste_bir_operando_igual(&vsinal, "v7.sx"))
+    var vzero = BirOperando{tipo = BO_VREG as u8, classe = BC_I64 as u8, extensao = BE_ZERO as u8, id = 3, imed = 0, tam = 8, sysv = none}
+    expect(teste_bir_operando_igual(&vzero, "v3.zx/8"))
+    var inteiro = BirOperando{tipo = BO_IMED as u8, classe = BC_I32 as u8, extensao = BE_NENHUMA as u8, id = 0, imed = -5, tam = 0, sysv = none}
+    expect(teste_bir_operando_igual(&inteiro, "#-5:i32"))
+    var nada = BirOperando{tipo = BO_NADA as u8, classe = BC_NADA as u8, extensao = BE_NENHUMA as u8, id = 0, imed = 0, tam = 0, sysv = none}
+    expect(teste_bir_operando_igual(&nada, "-"))
+    var real32 = BirOperando{tipo = BO_IMED as u8, classe = BC_F32 as u8, extensao = BE_NENHUMA as u8, id = 0, imed = 1069547520, tam = 0, sysv = none}
+    expect(teste_bir_operando_igual(&real32, "#1.5:f32(0x3fc00000)"))
+    var negzero32 = BirOperando{tipo = BO_IMED as u8, classe = BC_F32 as u8, extensao = BE_NENHUMA as u8, id = 0, imed = 2147483648, tam = 0, sysv = none}
+    expect(teste_bir_operando_igual(&negzero32, "#-0:f32(0x80000000)"))
+    var real64 = BirOperando{tipo = BO_IMED as u8, classe = BC_F64 as u8, extensao = BE_NENHUMA as u8, id = 0, imed = 4591870180066957722, tam = 0, sysv = none}
+    expect(teste_bir_operando_igual(&real64, "#0.1:f64(0x3fb999999999999a)"))
+    var um64 = BirOperando{tipo = BO_IMED as u8, classe = BC_F64 as u8, extensao = BE_NENHUMA as u8, id = 0, imed = 4607182418800017408, tam = 0, sysv = none}
+    expect(teste_bir_operando_igual(&um64, "#1:f64(0x3ff0000000000000)"))
+    var negzero64 = BirOperando{tipo = BO_IMED as u8, classe = BC_F64 as u8, extensao = BE_NENHUMA as u8, id = 0, imed = -9223372036854775807 - 1, tam = 0, sysv = none}
+    expect(teste_bir_operando_igual(&negzero64, "#-0:f64(0x8000000000000000)"))
+}
+
+test "bir_imprimir_texto_escapado" {
+    var s = BirSimbolo{nome = none, tipo = BS_TEXTO as u8, tam = 4, bytes = "a\"\\\n", ordem = 0, alinhamento = 1, pos = 0}
+    var saida = make([dynamic]u8, alloc = heap, cap = 32)
+    defer delete(saida)
+    imprimir_texto_escapado(&s, &saida)
+    expect(teste_bir_imprimir_texto(&saida, "\"a\\\"\\\\\\n\""))
+}
+
+test "bir_imprimir_dado" {
+    var s = BirSimbolo{nome = none, tipo = BS_DADO as u8, tam = 2, bytes = "ab", ordem = 4, alinhamento = 8, pos = 0}
+    var saida = make([dynamic]u8, alloc = heap, cap = 64)
+    defer delete(saida)
+    imprimir_dado(&s, &saida)
+    expect(teste_bir_imprimir_texto(&saida, "  d4 = align 8 x\"61 62\"\n"))
+}

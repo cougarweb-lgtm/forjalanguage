@@ -1,0 +1,1262 @@
+// std:json (WIP, J08) - JSON RFC 8259 em Forja pura, sem foreign e sem cJSON.
+// Versao: 0.2.1. Changelog: 0.2.1 - 0.21.0 F4 residuo: so fim de linha (CRLF -> LF, forja fmt --aplicar). 0.2.0 - J1: first/next/key_of (percurso linear), uinteger, set_int/push_int (inteiro exato), parse_file/write_file/quote; `integer` devolve range em vez de cair (R0002) para numero nao inteiro fora de i64. 0.1.0 - parse com erro de linha/coluna/causa; limite de profundidade 500 (o cJSON aceita 1000, mas o backend x64 estoura a pilha entre 700 e 1000 niveis e sai com 127 sem mensagem).
+// Nomes da API iguais aos do vendor:json/json quando possivel, para trocar o import sem mexer no chamador.
+// Diferencas de assinatura (inevitaveis): parse, new_object e new_list recebem a Arena `alloc` (ultimo parametro);
+//   parse aceita `where: ?^JsonPos` para a posicao do erro; dump recebe a Arena para o texto de saida.
+//
+// DONO: o documento e da Arena passada ao parse/new_*. Liberar a Arena (mem.arena_destroy) libera tudo.
+//   close(doc) existe so para trocar o import: nao faz nada.
+// Textos devolvidos (text, key, field_text, path_text) sao vistas da Arena: valem ate mem.arena_destroy.
+//
+// Numeros guardam o lexema do texto original: round-trip parse -> dump e exato (sem perder digitos de inteiro grande).
+// Limite conhecido: parse_float (std:text) devolve 0 para expoente acima da faixa (1e400); cJSON devolve inf.
+
+import "std:file"
+import "std:mem"
+import "std:text" as tx
+
+pub enum JsonError {
+    invalid
+    missing
+    wrong_type
+    out_of_memory
+    file
+    invalid_path
+    too_deep
+    range
+}
+
+pub enum JsonKind {
+    null
+    boolean
+    number
+    text
+    list
+    object
+    outro
+}
+
+// Posicao de um erro de parse: linha e coluna comecam em 1; posicao em BYTES desde o inicio do texto; causa em portugues.
+pub struct JsonPos {
+    linha: int = 0
+    coluna: int = 0
+    posicao: int = 0
+    causa: str = ""
+}
+
+pub struct Json {
+    no: ^No
+    ar: mem.Arena
+    dono: bool
+}
+
+// No da arvore: filhos em lista ligada (primeiro/ultimo/proximo), como o cJSON.
+struct No {
+    tipo: JsonKind = JsonKind.outro
+    chave: str = ""
+    texto: str = ""
+    numero: f64 = 0.0
+    inteiro: bool = false
+    verdade: bool = false
+    primeiro: ?^No = none
+    ultimo: ?^No = none
+    proximo: ?^No = none
+    quantidade: int = 0
+}
+
+struct Parser {
+    texto: str
+    pos: int = 0
+    ar: mem.Arena
+    prof: int = 0
+    causa: str = ""
+    erro_pos: int = 0
+}
+
+const PROFUNDIDADE_MAXIMA: int = 500
+const ESPACO_BYTE: u8 = 32
+const TAB_BYTE: u8 = 9
+const QUEBRA_BYTE: u8 = 10
+const RETORNO_BYTE: u8 = 13
+const ASPAS_BYTE: u8 = 34
+const BARRA_INVERSA_BYTE: u8 = 92
+const BARRA_BYTE: u8 = 47
+const ABRE_OBJETO_BYTE: u8 = 123
+const FECHA_OBJETO_BYTE: u8 = 125
+const ABRE_LISTA_BYTE: u8 = 91
+const FECHA_LISTA_BYTE: u8 = 93
+const VIRGULA_BYTE: u8 = 44
+const DOIS_PONTOS_BYTE: u8 = 58
+const PONTO_BYTE: u8 = 46
+const MAIS_BYTE: u8 = 43
+const MENOS_BYTE: u8 = 45
+const ZERO_BYTE: u8 = 48
+const NOVE_BYTE: u8 = 57
+const UM_BYTE: u8 = 49
+const LETRA_E_BYTE: u8 = 101
+const LETRA_E_MAIUSCULA_BYTE: u8 = 69
+const LETRA_T_BYTE: u8 = 116
+const LETRA_F_BYTE: u8 = 102
+const LETRA_N_BYTE: u8 = 110
+const LETRA_U_BYTE: u8 = 117
+const LETRA_U_MAIUSCULA_BYTE: u8 = 85
+const CONTROLE_LIMITE_BYTE: u8 = 32
+const SUBSTITUTO_ALTO_INICIO: int = 55296
+const SUBSTITUTO_ALTO_FIM: int = 56319
+const SUBSTITUTO_BAIXO_INICIO: int = 56320
+const SUBSTITUTO_BAIXO_FIM: int = 57343
+
+// ---------------------------------------------------------------- parse
+
+// Texto JSON -> documento na Arena `alloc`. Erro: invalid (sintaxe, UTF-8, texto depois do valor), too_deep.
+// where (opcional) recebe linha, coluna, posicao e causa quando ha erro.
+pub proc parse(text: str, where: ?^JsonPos = none, alloc: mem.Arena) -> Json ! JsonError {
+    var p = Parser{texto = text, ar = alloc}
+    if not tx.valid_utf8(text) {
+        let erro = falha(&p, JsonError.invalid, "UTF-8 invalido", 0)
+        posicao_do_erro(text, 0, "UTF-8 invalido", where)
+        return erro
+    }
+    switch r in parse_documento(&p) {
+    case ^No:
+        return Json{no = r, ar = alloc, dono = true}
+    case JsonError:
+        posicao_do_erro(text, p.erro_pos, p.causa, where)
+        return r
+    }
+    return JsonError.invalid
+}
+
+// Fecha um documento. Nao faz nada: a memoria e da Arena (mem.arena_destroy). Existe so para trocar o import sem mexer no chamador.
+pub proc close(doc: Json) {
+}
+
+// Tipo do valor: null, boolean, number, text, list, object (outro = invalido).
+pub proc kind(j: Json) -> JsonKind {
+    return j.no.tipo
+}
+
+// Grava linha, coluna, posicao e causa em `where` (se foi pedido).
+proc posicao_do_erro(texto: str, offset: int, causa: str, where: ?^JsonPos) {
+    var linha = 1
+    var coluna = 1
+    var i = 0
+    while i < offset and i < len(texto) {
+        if texto[i] == QUEBRA_BYTE {
+            linha += 1
+            coluna = 1
+        } else {
+            coluna += 1
+        }
+        i += 1
+    }
+    switch w in where {
+    case ^JsonPos:
+        w.linha = linha
+        w.coluna = coluna
+        w.posicao = offset
+        w.causa = causa
+    case none:
+    }
+}
+
+// Marca a falha na posicao `at` e devolve o erro para o `return`.
+proc falha(p: ^Parser, erro: JsonError, causa: str, at: int) -> JsonError {
+    p.causa = causa
+    p.erro_pos = at
+    return erro
+}
+
+proc parse_documento(p: ^Parser) -> ^No ! JsonError {
+    let raiz = try parse_valor(p)
+    pula_espacos(p)
+    if p.pos < len(p.texto) {
+        return falha(p, JsonError.invalid, "texto depois do valor", p.pos)
+    }
+    return raiz
+}
+
+proc pula_espacos(p: ^Parser) {
+    while p.pos < len(p.texto) {
+        let c = p.texto[p.pos]
+        if c == ESPACO_BYTE or c == TAB_BYTE or c == QUEBRA_BYTE or c == RETORNO_BYTE {
+            p.pos += 1
+        } else {
+            break
+        }
+    }
+}
+
+// true se o byte na posicao atual e b (falso no fim do texto).
+proc tem_byte(p: ^Parser, b: u8) -> bool {
+    return p.pos < len(p.texto) and p.texto[p.pos] == b
+}
+
+// Conta digitos decimais a partir da posicao atual e os consome.
+proc consome_digitos(p: ^Parser) -> int {
+    var n = 0
+    while p.pos < len(p.texto) and p.texto[p.pos] >= ZERO_BYTE and p.texto[p.pos] <= NOVE_BYTE {
+        p.pos += 1
+        n += 1
+    }
+    return n
+}
+
+proc novo_no(p: ^Parser, tipo: JsonKind) -> ^No {
+    let n = new(No, alloc = p.ar)
+    n.tipo = tipo
+    return n
+}
+
+// Liga filho ao fim da lista de pai.
+proc anexa(pai: ^No, filho: ^No) {
+    switch u in pai.ultimo {
+    case ^No:
+        u.proximo = filho
+    case none:
+        pai.primeiro = filho
+    }
+    pai.ultimo = filho
+    pai.quantidade += 1
+}
+
+proc parse_valor(p: ^Parser) -> ^No ! JsonError {
+    pula_espacos(p)
+    if p.pos >= len(p.texto) {
+        return falha(p, JsonError.invalid, "fim do texto: valor esperado", p.pos)
+    }
+    let c = p.texto[p.pos]
+    if c == ABRE_OBJETO_BYTE {
+        return try parse_objeto(p)
+    }
+    if c == ABRE_LISTA_BYTE {
+        return try parse_lista(p)
+    }
+    if c == ASPAS_BYTE {
+        let s = try ler_string(p)
+        let n = novo_no(p, JsonKind.text)
+        n.texto = s
+        return n
+    }
+    if c == LETRA_T_BYTE {
+        return try ler_literal(p, "true", JsonKind.boolean, true)
+    }
+    if c == LETRA_F_BYTE {
+        return try ler_literal(p, "false", JsonKind.boolean, false)
+    }
+    if c == LETRA_N_BYTE {
+        return try ler_literal(p, "null", JsonKind.null, false)
+    }
+    if c == MENOS_BYTE or (c >= ZERO_BYTE and c <= NOVE_BYTE) {
+        return try ler_numero(p)
+    }
+    return falha(p, JsonError.invalid, "valor esperado", p.pos)
+}
+
+proc ler_literal(p: ^Parser, palavra: str, tipo: JsonKind, verdade: bool) -> ^No ! JsonError {
+    let fim = p.pos + len(palavra)
+    if fim > len(p.texto) or p.texto[p.pos..<fim] != palavra {
+        return falha(p, JsonError.invalid, "literal invalido (true, false ou null)", p.pos)
+    }
+    p.pos = fim
+    let n = novo_no(p, tipo)
+    n.verdade = verdade
+    return n
+}
+
+// Numero RFC: -? (0 | 1-9 digitos*) (. digitos+)? ([eE] [+-]? digitos+)?
+proc ler_numero(p: ^Parser) -> ^No ! JsonError {
+    let inicio = p.pos
+    var inteiro = true
+    if tem_byte(p, MENOS_BYTE) {
+        p.pos += 1
+    }
+    if tem_byte(p, ZERO_BYTE) {
+        p.pos += 1
+    } else if p.pos < len(p.texto) and p.texto[p.pos] >= UM_BYTE and p.texto[p.pos] <= NOVE_BYTE {
+        _ = consome_digitos(p)
+    } else {
+        return falha(p, JsonError.invalid, "digito esperado depois do sinal", p.pos)
+    }
+    if tem_byte(p, PONTO_BYTE) {
+        inteiro = false
+        p.pos += 1
+        if consome_digitos(p) == 0 {
+            return falha(p, JsonError.invalid, "digito esperado depois do ponto", p.pos)
+        }
+    }
+    if tem_byte(p, LETRA_E_BYTE) or tem_byte(p, LETRA_E_MAIUSCULA_BYTE) {
+        inteiro = false
+        p.pos += 1
+        if tem_byte(p, MAIS_BYTE) or tem_byte(p, MENOS_BYTE) {
+            p.pos += 1
+        }
+        if consome_digitos(p) == 0 {
+            return falha(p, JsonError.invalid, "digito esperado no expoente", p.pos)
+        }
+    }
+    let lexema = p.texto[inicio..<p.pos]
+    let n = novo_no(p, JsonKind.number)
+    n.inteiro = inteiro
+    n.texto = format(f"{lexema}", alloc = p.ar)
+    n.numero = tx.parse_float(lexema) or_else 0.0
+    return n
+}
+
+// String entre aspas, com escapes. Devolve o texto ja na Arena.
+proc ler_string(p: ^Parser) -> str ! JsonError {
+    p.pos += 1
+    var partes = make([dynamic]str, alloc = heap)
+    defer delete(partes)
+    var inicio = p.pos
+    while true {
+        if p.pos >= len(p.texto) {
+            return falha(p, JsonError.invalid, "string sem aspa de fecho", p.pos)
+        }
+        let c = p.texto[p.pos]
+        if c == ASPAS_BYTE {
+            append(&partes, item = p.texto[inicio..<p.pos])
+            p.pos += 1
+            break
+        }
+        if c == BARRA_INVERSA_BYTE {
+            append(&partes, item = p.texto[inicio..<p.pos])
+            let trecho = try ler_escape(p)
+            append(&partes, item = trecho)
+            inicio = p.pos
+        } else if c < CONTROLE_LIMITE_BYTE {
+            return falha(p, JsonError.invalid, "caractere de controle dentro da string", p.pos)
+        } else {
+            p.pos += 1
+        }
+    }
+    return tx.concat(partes[..], alloc = p.ar)
+}
+
+// Escape na posicao de '\': devolve o caractere decodificado (na Arena).
+proc ler_escape(p: ^Parser) -> str ! JsonError {
+    if p.pos + 1 >= len(p.texto) {
+        return falha(p, JsonError.invalid, "escape incompleto no fim do texto", p.pos)
+    }
+    let e = p.texto[p.pos + 1]
+    if e == LETRA_U_BYTE {
+        return try ler_escape_unicode(p)
+    }
+    let codigo = escape_simples(e)
+    if codigo < 0 {
+        return falha(p, JsonError.invalid, "escape invalido (use \\ \" / b f n r t u)", p.pos)
+    }
+    p.pos += 2
+    return tx.from_rune(codigo as i32, alloc = p.ar)
+}
+
+// Codigo do caractere de um escape simples (sem u), ou -1.
+proc escape_simples(e: u8) -> int {
+    if e == ASPAS_BYTE or e == BARRA_INVERSA_BYTE or e == BARRA_BYTE {
+        return e as int
+    }
+    if e == 98 {
+        return 8
+    }
+    if e == 102 {
+        return 12
+    }
+    if e == 110 {
+        return 10
+    }
+    if e == 114 {
+        return 13
+    }
+    if e == 116 {
+        return 9
+    }
+    return -1
+}
+
+// Valor de um digito hexadecimal, ou -1.
+proc valor_hex(c: u8) -> int {
+    if c >= ZERO_BYTE and c <= NOVE_BYTE {
+        return (c - ZERO_BYTE) as int
+    }
+    if c >= 97 and c <= 102 {
+        return (c - 97) as int + 10
+    }
+    if c >= 65 and c <= 70 {
+        return (c - 65) as int + 10
+    }
+    return -1
+}
+
+// Le 4 hex a partir de `de` (posicao do primeiro digito); -1 se faltar ou nao for hex.
+proc le_hex4(texto: str, de: int) -> int {
+    if de + 4 > len(texto) {
+        return -1
+    }
+    var valor = 0
+    var i = de
+    while i < de + 4 {
+        let d = valor_hex(texto[i])
+        if d < 0 {
+            return -1
+        }
+        valor = valor * 16 + d
+        i += 1
+    }
+    return valor
+}
+
+// \uXXXX ou par substituto \uD800-\uDBFF seguido de \uDC00-\uDFFF.
+proc ler_escape_unicode(p: ^Parser) -> str ! JsonError {
+    let alto = le_hex4(p.texto, p.pos + 2)
+    if alto < 0 {
+        return falha(p, JsonError.invalid, "\\u exige 4 digitos hexadecimais", p.pos)
+    }
+    p.pos += 6
+    var codigo = alto
+    if alto >= SUBSTITUTO_ALTO_INICIO and alto <= SUBSTITUTO_ALTO_FIM {
+        if p.pos + 1 >= len(p.texto) or p.texto[p.pos] != BARRA_INVERSA_BYTE or p.texto[p.pos + 1] != LETRA_U_BYTE {
+            return falha(p, JsonError.invalid, "substituto alto sem o substituto baixo que vem depois", p.pos)
+        }
+        let baixo = le_hex4(p.texto, p.pos + 2)
+        if baixo < SUBSTITUTO_BAIXO_INICIO or baixo > SUBSTITUTO_BAIXO_FIM {
+            return falha(p, JsonError.invalid, "substituto baixo fora de DC00-DFFF", p.pos)
+        }
+        p.pos += 6
+        codigo = 65536 + ((alto - SUBSTITUTO_ALTO_INICIO) * 1024) + (baixo - SUBSTITUTO_BAIXO_INICIO)
+    } else if alto >= SUBSTITUTO_BAIXO_INICIO and alto <= SUBSTITUTO_BAIXO_FIM {
+        return falha(p, JsonError.invalid, "substituto baixo sem alto antes", p.pos - 6)
+    }
+    return tx.from_rune(codigo as i32, alloc = p.ar)
+}
+
+proc parse_objeto(p: ^Parser) -> ^No ! JsonError {
+    p.prof += 1
+    if p.prof > PROFUNDIDADE_MAXIMA {
+        return falha(p, JsonError.too_deep, "aninhamento acima de 500", p.pos)
+    }
+    p.pos += 1
+    let obj = novo_no(p, JsonKind.object)
+    pula_espacos(p)
+    if tem_byte(p, FECHA_OBJETO_BYTE) {
+        p.pos += 1
+        p.prof -= 1
+        return obj
+    }
+    while true {
+        pula_espacos(p)
+        if not tem_byte(p, ASPAS_BYTE) {
+            return falha(p, JsonError.invalid, "nome de campo entre aspas esperado", p.pos)
+        }
+        let chave = try ler_string(p)
+        pula_espacos(p)
+        if not tem_byte(p, DOIS_PONTOS_BYTE) {
+            return falha(p, JsonError.invalid, "':' esperado depois do nome do campo", p.pos)
+        }
+        p.pos += 1
+        let valor = try parse_valor(p)
+        valor.chave = chave
+        anexa(obj, valor)
+        pula_espacos(p)
+        if tem_byte(p, VIRGULA_BYTE) {
+            p.pos += 1
+        } else if tem_byte(p, FECHA_OBJETO_BYTE) {
+            p.pos += 1
+            break
+        } else {
+            return falha(p, JsonError.invalid, "',' ou '}' esperado", p.pos)
+        }
+    }
+    p.prof -= 1
+    return obj
+}
+
+proc parse_lista(p: ^Parser) -> ^No ! JsonError {
+    p.prof += 1
+    if p.prof > PROFUNDIDADE_MAXIMA {
+        return falha(p, JsonError.too_deep, "aninhamento acima de 500", p.pos)
+    }
+    p.pos += 1
+    let lista = novo_no(p, JsonKind.list)
+    pula_espacos(p)
+    if tem_byte(p, FECHA_LISTA_BYTE) {
+        p.pos += 1
+        p.prof -= 1
+        return lista
+    }
+    while true {
+        let valor = try parse_valor(p)
+        anexa(lista, valor)
+        pula_espacos(p)
+        if tem_byte(p, VIRGULA_BYTE) {
+            p.pos += 1
+        } else if tem_byte(p, FECHA_LISTA_BYTE) {
+            p.pos += 1
+            break
+        } else {
+            return falha(p, JsonError.invalid, "',' ou ']' esperado", p.pos)
+        }
+    }
+    p.prof -= 1
+    return lista
+}
+
+// ---------------------------------------------------------------- ler
+
+// Vista do campo `name` de um objeto (o 1o com esse nome). Erros: wrong_type (nao e objeto), missing (nao tem o campo).
+pub proc field(j: Json, name: str) -> Json ! JsonError {
+    if j.no.tipo != JsonKind.object {
+        return JsonError.wrong_type
+    }
+    switch c in acha_filho(j.no, name) {
+    case ^No:
+        return Json{no = c, ar = j.ar, dono = false}
+    case none:
+        return JsonError.missing
+    }
+    return JsonError.missing
+}
+
+// true se o objeto tem o campo `name`.
+pub proc has_field(j: Json, name: str) -> bool {
+    if j.no.tipo != JsonKind.object {
+        return false
+    }
+    switch c in acha_filho(j.no, name) {
+    case ^No:
+        return true
+    case none:
+        return false
+    }
+    return false
+}
+
+// Primeiro filho de no com chave igual a nome.
+proc acha_filho(no: ^No, nome: str) -> ?^No {
+    var atual = no.primeiro
+    while true {
+        switch a in atual {
+        case ^No:
+            if a.chave == nome {
+                return a
+            }
+            atual = a.proximo
+        case none:
+            return none
+        }
+    }
+    return none
+}
+
+// Filho na posicao index (0..quantidade-1), ou none.
+proc filho_na_posicao(no: ^No, index: int) -> ?^No {
+    var atual = no.primeiro
+    var i = 0
+    while true {
+        switch a in atual {
+        case ^No:
+            if i == index {
+                return a
+            }
+            atual = a.proximo
+            i += 1
+        case none:
+            return none
+        }
+    }
+    return none
+}
+
+// Quantidade de elementos de uma lista (ou de campos de um objeto); 0 para outros tipos.
+pub proc size(j: Json) -> i32 {
+    if j.no.tipo == JsonKind.list or j.no.tipo == JsonKind.object {
+        return j.no.quantidade as i32
+    }
+    return 0
+}
+
+// Vista do elemento `index` (0..size-1) de uma lista. Erros: wrong_type (nao e lista), missing (indice fora).
+pub proc item(j: Json, index: i32) -> Json ! JsonError {
+    if j.no.tipo != JsonKind.list {
+        return JsonError.wrong_type
+    }
+    if index < 0 or index as int >= j.no.quantidade {
+        return JsonError.missing
+    }
+    switch c in filho_na_posicao(j.no, index as int) {
+    case ^No:
+        return Json{no = c, ar = j.ar, dono = false}
+    case none:
+        return JsonError.missing
+    }
+    return JsonError.missing
+}
+
+// Nome (chave) do campo `index` de um objeto: str da Arena. Erros: wrong_type, missing.
+pub proc key(j: Json, index: i32) -> str ! JsonError {
+    if j.no.tipo != JsonKind.object {
+        return JsonError.wrong_type
+    }
+    if index < 0 or index as int >= j.no.quantidade {
+        return JsonError.missing
+    }
+    switch c in filho_na_posicao(j.no, index as int) {
+    case ^No:
+        return c.chave
+    case none:
+        return JsonError.missing
+    }
+    return JsonError.missing
+}
+
+// Percurso linear (J1): item(j, i) e key(j, i) andam a lista ligada desde o inicio a cada chamada (O(i)); first/next andam 1 no por passo.
+// Uso: var c = first(j); while c != none { ...; c = next(v) } (v = o valor de c). Nao mude a lista durante o percurso.
+// Vista do 1o filho (elemento de lista ou campo de objeto); none se a lista/objeto esta vazio ou se `j` nao e lista nem objeto.
+pub proc first(j: Json) -> ?Json {
+    if j.no.tipo != JsonKind.list and j.no.tipo != JsonKind.object {
+        return none
+    }
+    switch c in j.no.primeiro {
+    case ^No:
+        return Json{no = c, ar = j.ar, dono = false}
+    case none:
+        return none
+    }
+    return none
+}
+
+// Vista do proximo irmao de uma vista devolvida por first/next; none no ultimo (e na raiz do documento).
+pub proc next(j: Json) -> ?Json {
+    switch c in j.no.proximo {
+    case ^No:
+        return Json{no = c, ar = j.ar, dono = false}
+    case none:
+        return none
+    }
+    return none
+}
+
+// Chave do campo para onde a vista aponta (vinda de first/next num objeto): str da Arena. "" em elemento de lista e na raiz.
+pub proc key_of(j: Json) -> str {
+    return j.no.chave
+}
+
+// Valor numerico (todo numero JSON e f64). Erro: wrong_type.
+pub proc number(j: Json) -> f64 ! JsonError {
+    if j.no.tipo != JsonKind.number {
+        return JsonError.wrong_type
+    }
+    return j.no.numero
+}
+
+// Valor inteiro. Numero escrito como inteiro: exato (i64); com ponto ou expoente: trunca. Erros: wrong_type; range (nao cabe em i64).
+pub proc integer(j: Json) -> i64 ! JsonError {
+    if j.no.tipo != JsonKind.number {
+        return JsonError.wrong_type
+    }
+    if j.no.inteiro {
+        switch r in tx.parse_int(j.no.texto) {
+        case int:
+            return r as i64
+        case tx.ParseError:
+            return JsonError.range
+        }
+        return JsonError.range
+    }
+    let baixo: f64 = -9223372036854775808.0
+    let alto: f64 = 9223372036854775808.0
+    if j.no.numero < baixo or j.no.numero >= alto {
+        return JsonError.range
+    }
+    return j.no.numero as i64
+}
+
+// Valor inteiro sem sinal. Numero escrito como inteiro: exato (u64); com ponto ou expoente: trunca. Erros: wrong_type; range (negativo ou nao cabe em u64).
+pub proc uinteger(j: Json) -> u64 ! JsonError {
+    if j.no.tipo != JsonKind.number {
+        return JsonError.wrong_type
+    }
+    if j.no.inteiro {
+        switch r in tx.parse_uint(j.no.texto) {
+        case u64:
+            return r
+        case tx.ParseError:
+            return JsonError.range
+        }
+        return JsonError.range
+    }
+    let alto: f64 = 18446744073709551616.0
+    if j.no.numero < 0.0 or j.no.numero >= alto {
+        return JsonError.range
+    }
+    return j.no.numero as u64
+}
+
+// Texto da Arena. Erro: wrong_type.
+pub proc text(j: Json) -> str ! JsonError {
+    if j.no.tipo != JsonKind.text {
+        return JsonError.wrong_type
+    }
+    return j.no.texto
+}
+
+// true/false. Erro: wrong_type.
+pub proc boolean(j: Json) -> bool ! JsonError {
+    if j.no.tipo != JsonKind.boolean {
+        return JsonError.wrong_type
+    }
+    return j.no.verdade
+}
+
+pub proc field_number(j: Json, name: str) -> f64 ! JsonError {
+    let c = try field(j, name = name)
+    return try number(c)
+}
+
+pub proc field_int(j: Json, name: str) -> i64 ! JsonError {
+    let c = try field(j, name = name)
+    return try integer(c)
+}
+
+pub proc field_text(j: Json, name: str) -> str ! JsonError {
+    let c = try field(j, name = name)
+    return try text(c)
+}
+
+pub proc field_bool(j: Json, name: str) -> bool ! JsonError {
+    let c = try field(j, name = name)
+    return try boolean(c)
+}
+
+// ---------------------------------------------------------------- caminho
+
+// Grava a posicao do erro em at (se foi pedido).
+proc marca_posicao(at: ?^int, offset: int) {
+    switch p in at {
+    case ^int:
+        p^ = offset
+    case none:
+    }
+}
+
+// Indice "[n]" que comeca em from (o '['). Devolve (valor, proxima posicao) ou (-1, -1) se a sintaxe esta errada. Numero gigante satura.
+proc caminho_indice(path: str, from: int) -> (valor: int, prox: int) {
+    var i = from + 1
+    var valor = 0
+    while i < len(path) and path[i] >= ZERO_BYTE and path[i] <= NOVE_BYTE {
+        if valor < 100000000000000 {
+            valor = valor * 10 + ((path[i] - ZERO_BYTE) as int)
+        }
+        i += 1
+    }
+    if i == from + 1 or i >= len(path) or path[i] != FECHA_LISTA_BYTE {
+        return -1, -1
+    }
+    return valor, i + 1
+}
+
+// Vista do valor em `path` ("a.b[2].c"; "" = o proprio j). Erros: wrong_type, missing, invalid_path (sintaxe).
+// at (se pedido) recebe, so quando ha erro, o byte onde o segmento que falhou comeca.
+pub proc get_path(j: Json, path: str, at: ?^int = none) -> Json ! JsonError {
+    var atual = j.no
+    var pos = 0
+    var nome_ok = true
+    var apos_ponto = false
+    while pos < len(path) {
+        let c = path[pos]
+        if c == PONTO_BYTE {
+            if pos == 0 or apos_ponto {
+                marca_posicao(at, pos)
+                return JsonError.invalid_path
+            }
+            apos_ponto = true
+            nome_ok = true
+            pos += 1
+        } else if c == ABRE_LISTA_BYTE {
+            if apos_ponto {
+                marca_posicao(at, pos)
+                return JsonError.invalid_path
+            }
+            let indice, proxima = caminho_indice(path, pos)
+            if indice < 0 {
+                marca_posicao(at, pos)
+                return JsonError.invalid_path
+            }
+            if atual.tipo != JsonKind.list {
+                marca_posicao(at, pos)
+                return JsonError.wrong_type
+            }
+            if indice >= atual.quantidade {
+                marca_posicao(at, pos)
+                return JsonError.missing
+            }
+            switch f in filho_na_posicao(atual, indice) {
+            case ^No:
+                atual = f
+            case none:
+                marca_posicao(at, pos)
+                return JsonError.missing
+            }
+            pos = proxima
+            nome_ok = false
+            apos_ponto = false
+        } else {
+            if not nome_ok {
+                marca_posicao(at, pos)
+                return JsonError.invalid_path
+            }
+            let inicio = pos
+            while pos < len(path) and path[pos] != PONTO_BYTE and path[pos] != ABRE_LISTA_BYTE {
+                pos += 1
+            }
+            if atual.tipo != JsonKind.object {
+                marca_posicao(at, inicio)
+                return JsonError.wrong_type
+            }
+            switch f in acha_filho(atual, path[inicio..<pos]) {
+            case ^No:
+                atual = f
+            case none:
+                marca_posicao(at, inicio)
+                return JsonError.missing
+            }
+            nome_ok = false
+            apos_ponto = false
+        }
+    }
+    if apos_ponto {
+        marca_posicao(at, len(path))
+        return JsonError.invalid_path
+    }
+    return Json{no = atual, ar = j.ar, dono = false}
+}
+
+// Inicio do ultimo segmento de path (usado para apontar erro de leitura do valor final).
+proc inicio_ultimo_segmento(path: str) -> int {
+    var i = len(path) - 1
+    while i >= 0 {
+        if path[i] == PONTO_BYTE {
+            return i + 1
+        }
+        if path[i] == ABRE_LISTA_BYTE {
+            return i
+        }
+        i -= 1
+    }
+    return 0
+}
+
+pub proc path_text(j: Json, path: str, at: ?^int = none) -> str ! JsonError {
+    let node = try get_path(j, path = path, at = at)
+    switch r in text(node) {
+    case str:
+        return r
+    case JsonError:
+        marca_posicao(at, inicio_ultimo_segmento(path))
+        return r
+    }
+    return JsonError.wrong_type
+}
+
+pub proc path_int(j: Json, path: str, at: ?^int = none) -> i64 ! JsonError {
+    let node = try get_path(j, path = path, at = at)
+    switch r in integer(node) {
+    case i64:
+        return r
+    case JsonError:
+        marca_posicao(at, inicio_ultimo_segmento(path))
+        return r
+    }
+    return JsonError.wrong_type
+}
+
+pub proc path_number(j: Json, path: str, at: ?^int = none) -> f64 ! JsonError {
+    let node = try get_path(j, path = path, at = at)
+    switch r in number(node) {
+    case f64:
+        return r
+    case JsonError:
+        marca_posicao(at, inicio_ultimo_segmento(path))
+        return r
+    }
+    return JsonError.wrong_type
+}
+
+pub proc path_bool(j: Json, path: str, at: ?^int = none) -> bool ! JsonError {
+    let node = try get_path(j, path = path, at = at)
+    switch r in boolean(node) {
+    case bool:
+        return r
+    case JsonError:
+        marca_posicao(at, inicio_ultimo_segmento(path))
+        return r
+    }
+    return JsonError.wrong_type
+}
+
+// ---------------------------------------------------------------- criar e escrever
+
+// Cria um no solto na Arena `ar` (ainda sem chave); quem chama o liga numa lista.
+proc no_novo(ar: mem.Arena, tipo: JsonKind) -> ^No {
+    let n = new(No, alloc = ar)
+    n.tipo = tipo
+    return n
+}
+
+// Objeto novo e vazio, na Arena `alloc`.
+pub proc new_object(alloc: mem.Arena) -> Json ! JsonError {
+    return Json{no = no_novo(alloc, JsonKind.object), ar = alloc, dono = true}
+}
+
+// Lista nova e vazia, na Arena `alloc`.
+pub proc new_list(alloc: mem.Arena) -> Json ! JsonError {
+    return Json{no = no_novo(alloc, JsonKind.list), ar = alloc, dono = true}
+}
+
+// Cria o no do campo `name` com tipo `tipo` e o liga ao objeto. Erro: wrong_type (object nao e objeto).
+proc anexa_campo(object: Json, name: str, tipo: JsonKind) -> ^No ! JsonError {
+    if object.no.tipo != JsonKind.object {
+        return JsonError.wrong_type
+    }
+    let n = no_novo(object.ar, tipo)
+    n.chave = format(f"{name}", alloc = object.ar)
+    anexa(object.no, n)
+    return n
+}
+
+// Cria o no do elemento novo de uma lista e o liga ao fim. Erro: wrong_type (list nao e lista).
+proc anexa_item(list: Json, tipo: JsonKind) -> ^No ! JsonError {
+    if list.no.tipo != JsonKind.list {
+        return JsonError.wrong_type
+    }
+    let n = no_novo(list.ar, tipo)
+    anexa(list.no, n)
+    return n
+}
+
+// Poe `name: value` no objeto. Se o nome ja existe, o campo novo fica depois do antigo (como o vendor); use remove_field antes para trocar.
+pub proc set_number(object: Json, name: str, value: f64) -> ! JsonError {
+    let n = try anexa_campo(object, name, JsonKind.number)
+    n.numero = value
+    n.texto = format(f"{value}", alloc = object.ar)
+}
+
+// Inteiro exato: o texto guarda os digitos de i64 (o dump nao passa por f64).
+pub proc set_int(object: Json, name: str, value: i64) -> ! JsonError {
+    let n = try anexa_campo(object, name, JsonKind.number)
+    n.numero = value as f64
+    n.inteiro = true
+    n.texto = format(f"{value}", alloc = object.ar)
+}
+
+pub proc set_text(object: Json, name: str, value: str) -> ! JsonError {
+    let n = try anexa_campo(object, name, JsonKind.text)
+    n.texto = format(f"{value}", alloc = object.ar)
+}
+
+pub proc set_bool(object: Json, name: str, value: bool) -> ! JsonError {
+    let n = try anexa_campo(object, name, JsonKind.boolean)
+    n.verdade = value
+}
+
+pub proc set_null(object: Json, name: str) -> ! JsonError {
+    _ = try anexa_campo(object, name, JsonKind.null)
+}
+
+// Cria um objeto/lista filho dentro do objeto e devolve a VISTA dele para preencher. Pertence ao pai.
+pub proc set_object(object: Json, name: str) -> Json ! JsonError {
+    let n = try anexa_campo(object, name, JsonKind.object)
+    return Json{no = n, ar = object.ar, dono = false}
+}
+
+pub proc set_list(object: Json, name: str) -> Json ! JsonError {
+    let n = try anexa_campo(object, name, JsonKind.list)
+    return Json{no = n, ar = object.ar, dono = false}
+}
+
+// Acrescenta um valor ao fim da lista.
+pub proc push_number(list: Json, value: f64) -> ! JsonError {
+    let n = try anexa_item(list, JsonKind.number)
+    n.numero = value
+    n.texto = format(f"{value}", alloc = list.ar)
+}
+
+pub proc push_int(list: Json, value: i64) -> ! JsonError {
+    let n = try anexa_item(list, JsonKind.number)
+    n.numero = value as f64
+    n.inteiro = true
+    n.texto = format(f"{value}", alloc = list.ar)
+}
+
+pub proc push_text(list: Json, value: str) -> ! JsonError {
+    let n = try anexa_item(list, JsonKind.text)
+    n.texto = format(f"{value}", alloc = list.ar)
+}
+
+pub proc push_bool(list: Json, value: bool) -> ! JsonError {
+    let n = try anexa_item(list, JsonKind.boolean)
+    n.verdade = value
+}
+
+pub proc push_null(list: Json) -> ! JsonError {
+    _ = try anexa_item(list, JsonKind.null)
+}
+
+pub proc push_object(list: Json) -> Json ! JsonError {
+    let n = try anexa_item(list, JsonKind.object)
+    return Json{no = n, ar = list.ar, dono = false}
+}
+
+pub proc push_list(list: Json) -> Json ! JsonError {
+    let n = try anexa_item(list, JsonKind.list)
+    return Json{no = n, ar = list.ar, dono = false}
+}
+
+// Indice do primeiro campo com esse nome, ou -1.
+proc indice_do_campo(obj: ^No, nome: str) -> int {
+    var atual = obj.primeiro
+    var i = 0
+    while true {
+        switch a in atual {
+        case ^No:
+            if a.chave == nome {
+                return i
+            }
+            atual = a.proximo
+            i += 1
+        case none:
+            return -1
+        }
+    }
+    return -1
+}
+
+// Tira da lista do no o filho na posicao index (a memoria segue na Arena).
+proc remove_na_posicao(obj: ^No, index: int) {
+    var anterior: ?^No = none
+    var atual = obj.primeiro
+    var i = 0
+    while true {
+        switch a in atual {
+        case ^No:
+            if i == index {
+                switch ant in anterior {
+                case ^No:
+                    ant.proximo = a.proximo
+                case none:
+                    obj.primeiro = a.proximo
+                }
+                switch pr in a.proximo {
+                case ^No:
+                case none:
+                    obj.ultimo = anterior
+                }
+                obj.quantidade -= 1
+                return
+            }
+            anterior = atual
+            atual = a.proximo
+            i += 1
+        case none:
+            return
+        }
+    }
+}
+
+// Apaga o campo `name` do objeto (o 1o com esse nome). Erros: wrong_type (nao e objeto), missing (nao tem o campo).
+pub proc remove_field(object: Json, name: str) -> ! JsonError {
+    if object.no.tipo != JsonKind.object {
+        return JsonError.wrong_type
+    }
+    let i = indice_do_campo(object.no, name)
+    if i < 0 {
+        return JsonError.missing
+    }
+    remove_na_posicao(object.no, i)
+}
+
+// Apaga o elemento `index` da lista. Erros: wrong_type (nao e lista), missing (indice fora).
+pub proc remove_item(list: Json, index: i32) -> ! JsonError {
+    if list.no.tipo != JsonKind.list {
+        return JsonError.wrong_type
+    }
+    if index < 0 or index as int >= list.no.quantidade {
+        return JsonError.missing
+    }
+    remove_na_posicao(list.no, index as int)
+}
+
+// ---------------------------------------------------------------- gerar texto
+
+struct Escritor {
+    ar: mem.Arena
+    identado: bool = false
+}
+
+// Texto JSON do valor, na Arena `alloc`. pretty = true indenta com 2 espacos. Erro: out_of_memory (reservado).
+pub proc dump(j: Json, pretty: bool, alloc: mem.Arena) -> str ! JsonError {
+    var e = Escritor{ar = alloc, identado = pretty}
+    var saida = make([dynamic]str, alloc = heap)
+    defer delete(saida)
+    escreve_no(&e, j.no, 0, &saida)
+    return tx.concat(saida[..], alloc = alloc)
+}
+
+// Le o arquivo inteiro e faz parse. Erros: file (nao abriu/leu) e os de parse. O buffer do arquivo e liberado aqui.
+pub proc parse_file(path: str, where: ?^JsonPos = none, alloc: mem.Arena) -> Json ! JsonError {
+    switch d in file.read_all(path, alloc = heap) {
+    case [dynamic]u8:
+        let s = from_bytes(d[..], alloc = heap)
+        delete(d)
+        defer delete(s)
+        return parse(s, where = where, alloc = alloc)
+    case file.FileError:
+        return JsonError.file
+    }
+    return JsonError.file
+}
+
+// Grava o dump de `j` em `path` (cria ou substitui). Erro: file.
+pub proc write_file(j: Json, path: str, pretty: bool = false) -> ! JsonError {
+    let tmp = mem.arena_create()
+    defer mem.arena_destroy(tmp)
+    let s = try dump(j, pretty = pretty, alloc = tmp)
+    let e = file.write_all(path, data = as_bytes(s))
+    if e != none {
+        return JsonError.file
+    }
+}
+
+// Texto como string JSON (com aspas e escapes), na Arena `alloc`.
+pub proc quote(text: str, alloc: mem.Arena) -> str {
+    var e = Escritor{ar = alloc, identado = false}
+    var saida = make([dynamic]str, alloc = heap)
+    defer delete(saida)
+    escreve_texto(&e, text, &saida)
+    return tx.concat(saida[..], alloc = alloc)
+}
+
+// Escreve o no em pedacos de texto (em `saida`), no nivel de indentacao dado.
+proc escreve_no(e: ^Escritor, no: ^No, nivel: int, saida: ^[dynamic]str) {
+    if no.tipo == JsonKind.object {
+        escreve_objeto(e, no, nivel, saida)
+    } else if no.tipo == JsonKind.list {
+        escreve_lista(e, no, nivel, saida)
+    } else if no.tipo == JsonKind.text {
+        escreve_texto(e, no.texto, saida)
+    } else if no.tipo == JsonKind.number {
+        append(saida, item = no.texto)
+    } else if no.tipo == JsonKind.boolean {
+        if no.verdade {
+            append(saida, item = "true")
+        } else {
+            append(saida, item = "false")
+        }
+    } else {
+        append(saida, item = "null")
+    }
+}
+
+// Quebra de linha e indentacao (so em modo identado).
+proc quebra_linha(e: ^Escritor, nivel: int, saida: ^[dynamic]str) {
+    if e.identado {
+        append(saida, item = "\n")
+        append(saida, item = tx.repeat(" ", nivel * 2, alloc = e.ar))
+    }
+}
+
+proc escreve_lista(e: ^Escritor, no: ^No, nivel: int, saida: ^[dynamic]str) {
+    append(saida, item = "[")
+    var atual = no.primeiro
+    var primeiro = true
+    while atual != none {
+        switch f in atual {
+        case ^No:
+            if not primeiro {
+                append(saida, item = ",")
+            }
+            primeiro = false
+            quebra_linha(e, nivel + 1, saida)
+            escreve_no(e, f, nivel + 1, saida)
+            atual = f.proximo
+        case none:
+        }
+    }
+    if no.quantidade > 0 {
+        quebra_linha(e, nivel, saida)
+    }
+    append(saida, item = "]")
+}
+
+proc escreve_objeto(e: ^Escritor, no: ^No, nivel: int, saida: ^[dynamic]str) {
+    append(saida, item = "{")
+    var atual = no.primeiro
+    var primeiro = true
+    while atual != none {
+        switch f in atual {
+        case ^No:
+            if not primeiro {
+                append(saida, item = ",")
+            }
+            primeiro = false
+            quebra_linha(e, nivel + 1, saida)
+            escreve_texto(e, f.chave, saida)
+            append(saida, item = ":")
+            if e.identado {
+                append(saida, item = " ")
+            }
+            escreve_no(e, f, nivel + 1, saida)
+            atual = f.proximo
+        case none:
+        }
+    }
+    if no.quantidade > 0 {
+        quebra_linha(e, nivel, saida)
+    }
+    append(saida, item = "}")
+}
+
+// String com aspas e escapes (aspas, barra invertida e controles abaixo de 0x20). Os pedacos vao para saida.
+proc escreve_texto(e: ^Escritor, s: str, saida: ^[dynamic]str) {
+    append(saida, item = "\"")
+    var inicio = 0
+    var i = 0
+    while i < len(s) {
+        let c = s[i]
+        if c == ASPAS_BYTE or c == BARRA_INVERSA_BYTE or c < CONTROLE_LIMITE_BYTE {
+            append(saida, item = s[inicio..<i])
+            append(saida, item = escape_de(e, c))
+            i += 1
+            inicio = i
+        } else {
+            i += 1
+        }
+    }
+    append(saida, item = s[inicio..<len(s)])
+    append(saida, item = "\"")
+}
+
+// Escape JSON de um byte que nao pode aparecer cru dentro da string.
+proc escape_de(e: ^Escritor, c: u8) -> str {
+    if c == ASPAS_BYTE {
+        return "\\\""
+    }
+    if c == BARRA_INVERSA_BYTE {
+        return "\\\\"
+    }
+    if c == 8 {
+        return "\\b"
+    }
+    if c == 12 {
+        return "\\f"
+    }
+    if c == QUEBRA_BYTE {
+        return "\\n"
+    }
+    if c == RETORNO_BYTE {
+        return "\\r"
+    }
+    if c == TAB_BYTE {
+        return "\\t"
+    }
+    return format(f"\\u00{c as u64:02x}", alloc = e.ar)
+}

@@ -1,0 +1,592 @@
+// ir/lower_expr.fj - porte de compiler/ir/lower_expr.c
+// sha256 de ir/lower_expr.c: fb6ca49147f21beb528296abc3c0cb5a6876e9be81f6ba887dbe464bbedb7072
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "common"
+import "frontend"
+import "semantic"
+
+struct Escape {
+    escrito: u8
+    real: u8
+}
+
+const ESCAPES: [5]Escape = {Escape{escrito = 110, real = 10}, Escape{escrito = 116, real = 9}, Escape{escrito = 114, real = 13}, Escape{escrito = 92, real = 92}, Escape{escrito = 34, real = 34}}
+// C2F:? tabela LOWERINGS (const LowerExpr[23]): folha nao escalar {'txt': '[ EX_CHAMADA_IND ] = LwChamadaI
+
+// C: ir/lower_expr.c:42
+proc valor_constante(c: ^LowerCtx, e: ?^frontend.Expr) -> Valor {
+    var v: Valor = Valor{}
+    if lw_dobrar(c, e, &v) {
+        return v
+    }
+    if not ((c.sem as ^semantic.Semantica).diag as ^common.Diag).tem {
+        let msg_1 = format(f"lowering: expressao constante nao dobrou (offset {(e as ^frontend.Expr).pos_op})", alloc = heap)
+        defer delete(msg_1)
+        common.falha_interna(msg_1)
+    }
+    return lw_valor_nenhum()
+}
+
+// C: ir/lower_expr.c:51
+proc instr_com_temp_3(c: ^LowerCtx, op: i32, e: ^frontend.Expr, tipo: u32) -> ^IrInstr {
+    let i: ^IrInstr = lw_nova_instr(c, op, e.pos_op)
+    i.destino = lw_novo_temp(c)
+    i.tipo = tipo
+    return i
+}
+
+// C: ir/lower_expr.c:59
+proc resultado_temp_2(i: ^IrInstr) -> Valor {
+    return lw_valor_temp(i.destino, i.tipo)
+}
+
+// C: ir/lower_expr.c:64
+proc atribuir_local_2(c: ^LowerCtx, local: i32, v: Valor, pos: u32) {
+    let i: ^IrInstr = lw_nova_instr(c, IR_ATRIBUICAO, pos)
+    i.destino = local
+    i.tipo = v.tipo
+    i.a = v
+}
+
+// C: ir/lower_expr.c:75 (valor constante: so confere e relata E0420; sem instrucao)
+proc conferir_faixa_constante(c: ^LowerCtx, campo: ^frontend.Campo, v: i64, pos: u32) {
+    let sem: ^semantic.Semantica = c.sem as ^semantic.Semantica
+    let diag: ^common.Diag = sem.diag as ^common.Diag
+    let sem_sinal: bool = semantic.tipo_eh_sem_sinal(campo.tipo.tipo)
+    let cabe64: bool = (not sem_sinal) or (v >= 0)
+    var fim_ok: bool = v <= campo.faixa_max
+    var op: str = "..="
+    if campo.faixa_excl {
+        fim_ok = v < campo.faixa_max
+        op = "..<"
+    }
+    let dentro: bool = cabe64 and (v >= campo.faixa_min) and fim_ok
+    if dentro or diag.tem {
+        return
+    }
+    let nomes: []common.Interner = (c.sem as ^semantic.Semantica).nomes or_else {}
+    let nome: str = common.interner_texto(&nomes[0], campo.nome)
+    if sem_sinal {
+        let msg_u = format(f"valor {(v as u64)} fora da faixa {campo.faixa_min}{op}{campo.faixa_max} do campo '{nome}'", alloc = heap)
+        defer delete(msg_u)
+        _ = common.diag_relatar(diag, common.E0420, pos, msg_u)
+        return
+    }
+    let msg = format(f"valor {v} fora da faixa {campo.faixa_min}{op}{campo.faixa_max} do campo '{nome}'", alloc = heap)
+    defer delete(msg)
+    _ = common.diag_relatar(diag, common.E0420, pos, msg)
+}
+
+// C: ir/lower_expr.c:93
+proc lw_verifica_faixa(c: ^LowerCtx, estrutura: ?^frontend.Decl, indice_campo: i32, v: Valor, pos: u32) {
+    let campo: ^frontend.Campo = &((estrutura as ^frontend.Decl).campos or_else {})[indice_campo]
+    if (not campo.tem_faixa) or (not semantic.tipo_eh_inteiro(campo.tipo.tipo)) {
+        return
+    }
+    if v.tipo_no == (V_INT as u8) {
+        conferir_faixa_constante(c, campo, v.inteiro, pos)
+        return
+    }
+    let i: ^IrInstr = lw_nova_instr(c, IR_VERIFICA_FAIXA, pos)
+    i.a = v
+    i.nome = campo.nome
+    i.faixa_min = campo.faixa_min
+    i.faixa_max = campo.faixa_max
+    i.faixa_excl = campo.faixa_excl
+}
+
+// C: ir/lower_expr.c:111
+proc escape_decodificado(escrito: u8) -> i32 {
+    for k in (0 as u64)..<(len(ESCAPES) as u64) { // C2F: sizeof ESCAPES C2F: sizeof ESCAPES [ 0 ]
+        if common.c2f_char_i32(ESCAPES[k].escrito) == common.c2f_char_i32(escrito) {
+            return common.c2f_char_i32(ESCAPES[k].real)
+        }
+    }
+    return -1
+}
+
+// C: ir/lower_expr.c:119 (#load (carregar) devolve o nome cru; senao desescapa \n \t \r \\ \" e interna)
+proc lw_texto_decodificado(c: ^LowerCtx, e: ?^frontend.Expr) -> i32 {
+    let ex: ^frontend.Expr = e as ^frontend.Expr
+    let nomes: []common.Interner = (c.sem as ^semantic.Semantica).nomes or_else {}
+    if ex.nome < 0 {
+        let msg_nome = format(f"lowering: texto sem nome internado (offset {ex.pos_op})", alloc = heap)
+        defer delete(msg_nome)
+        common.falha_interna(msg_nome)
+    }
+    if ex.carregar {
+        return ex.nome
+    }
+    let cru: []u8 = as_bytes(common.interner_texto(&nomes[0], ex.nome))
+    let tam: u32 = common.interner_tam(&nomes[0], ex.nome)
+    var saida = make([dynamic]u8, alloc = heap, cap = (tam as int) + 1)
+    defer delete(saida)
+    var i: u32 = 0
+    while i < tam {
+        var real: i32 = -1
+        if (cru[i as int] == 92) and ((i + 1) < tam) {
+            real = escape_decodificado(cru[(i + 1) as int])
+        }
+        if real >= 0 {
+            i += 1
+            append(&saida, item = real as u8)
+        } else {
+            append(&saida, item = cru[i as int])
+        }
+        i += 1
+    }
+    let texto = from_bytes(saida[..], alloc = heap)
+    defer delete(texto)
+    return common.internar(&nomes[0], texto, len(saida) as u32)
+}
+
+// C: ir/lower_expr.c:135
+proc lower_texto(c: ^LowerCtx, e: ^frontend.Expr) -> Valor {
+    let arg_1: u32 = e.tipo
+    let arg_2: i32 = lw_texto_decodificado(c, e)
+    return lw_valor_texto(arg_2, arg_1)
+}
+
+// C2F-1A: LwAlocar tipado da tabela de trampolins (zerada, na arena)
+proc lower_fatia_trampolim(a: ^common.Arena, n: int) -> []IrTrampolim {
+    var l = make([dynamic]IrTrampolim, alloc = common.arena_mem(a), cap = n)
+    for i in 0..<n {
+        append(&l, item = IrTrampolim{})
+    }
+    return l[..]
+}
+
+// C: ir/lower_expr.c:143 (um trampolim por proc, na ordem da 1a aparicao)
+proc registrar_trampolim(c: ^LowerCtx, d: ^frontend.Decl, tipo: u32) {
+    let prog: ^IrPrograma = c.prog as ^IrPrograma
+    let sem: ^semantic.Semantica = c.sem as ^semantic.Semantica
+    if prog.trampolins == none {
+        prog.trampolins = lower_fatia_trampolim(c.arena as ^common.Arena, sem.qtd_proc as int)
+    }
+    let tramp: []IrTrampolim = prog.trampolins or_else {}
+    var k: u32 = 0
+    while k < prog.ntrampolins {
+        if tramp[k as int].nome == d.chave {
+            return
+        }
+        k += 1
+    }
+    let antes: u32 = prog.ntrampolins
+    prog.ntrampolins += 1
+    tramp[antes as int] = IrTrampolim{nome = d.chave, tipo = tipo, linha = common.fonte_localizar_no_arquivo(sem.fonte, d.pos).linha, arquivo = common.fonte_trecho_do_offset(sem.fonte, d.pos)}
+}
+
+// C: ir/lower_expr.c:156
+proc lw_valor_proc(c: ^LowerCtx, e: ^frontend.Expr) -> Valor {
+    let d: ?^frontend.Decl = (c.procs or_else {})[e.ref_id]
+    registrar_trampolim(c, d as ^frontend.Decl, e.tipo)
+    return Valor{tipo_no = V_PROC as u8, tipo = e.tipo, id = (d as ^frontend.Decl).chave}
+}
+
+// C: ir/lower_expr.c:165
+proc lower_nome(c: ^LowerCtx, e: ^frontend.Expr) -> Valor {
+    if (e.ref == (frontend.REF_LOCAL as u8)) or (e.ref == (frontend.REF_PARAM as u8)) {
+        return lw_valor_local(e.ref_id, e.tipo)
+    }
+    if e.ref != (frontend.REF_CONST as u8) {
+        if e.ref == (frontend.REF_PROC as u8) {
+            return lw_valor_proc(c, e)
+        }
+        let msg_1 = format(f"lowering: nome sem ligacao da semantica (offset {e.pos_op})", alloc = heap)
+        defer delete(msg_1)
+        common.falha_interna(msg_1)
+    }
+    if (c.const_escalar or_else {})[e.ref_id] {
+        return valor_constante(c, e)
+    }
+    return lw_expr(c, ((c.consts or_else {})[e.ref_id] as ^frontend.Decl).init)
+}
+
+// C: ir/lower_expr.c:177
+proc lower_campo(c: ^LowerCtx, e: ^frontend.Expr) -> Valor {
+    if e.ref == (frontend.REF_MEMBRO as u8) {
+        return valor_constante(c, e)
+    }
+    if e.ref == (frontend.REF_COMPONENTE as u8) {
+        return lw_swizzle(c, e)
+    }
+    if (common.c2f_b2i32((c.sem as ^semantic.Semantica).tipos.tem_soa) != 0) and (common.c2f_b2i32(lw_campo_de_soa(c, e)) != 0) {
+        return lw_campo_soa(c, e)
+    }
+    if e.ref != (frontend.REF_CAMPO as u8) {
+        let msg_1 = format(f"lowering: campo sem ligacao da semantica (offset {e.pos_op})", alloc = heap)
+        defer delete(msg_1)
+        common.falha_interna(msg_1)
+    }
+    let via_deref: bool = ((e.a as ^frontend.Expr).tipo_no == (frontend.EX_UNARIO as u8)) and ((e.a as ^frontend.Expr).op == (frontend.OP_DEREF as u8))
+    var tern_1: ?^frontend.Expr = e.a
+    if common.c2f_b2i32(via_deref) != 0 {
+        tern_1 = (e.a as ^frontend.Expr).a
+    }
+    let base: Valor = lw_expr(c, tern_1)
+    let i: ^IrInstr = instr_com_temp_3(c, IR_CAMPO, e, e.tipo)
+    i.nome = e.nome
+    i.a = base
+    return resultado_temp_2(i)
+}
+
+// C: ir/lower_expr.c:193
+proc lower_unario(c: ^LowerCtx, e: ^frontend.Expr) -> Valor {
+    if (e.op == (frontend.OP_ENDERECO as u8)) and (((e.a as ^frontend.Expr).tipo_no == (frontend.EX_CAMPO as u8)) or ((e.a as ^frontend.Expr).tipo_no == (frontend.EX_INDICE as u8))) {
+        return lw_endereco(c, e.a)
+    }
+    if ((common.c2f_b2i32((c.sem as ^semantic.Semantica).tipos.tem_matriz) != 0) and (e.op == (frontend.OP_NEGAR as u8))) and (common.c2f_s2u_32(semantic.tipo_classe_de(&(c.sem as ^semantic.Semantica).tipos, e.tipo)) == (semantic.TC_MATRIZ as u32)) {
+        return lw_matriz_unaria(c, e, 6)
+    }
+    if ((common.c2f_b2i32((c.sem as ^semantic.Semantica).tipo_quat != 0) != 0) and (e.op == (frontend.OP_NEGAR as u8))) and (e.tipo == (c.sem as ^semantic.Semantica).tipo_quat) {
+        return lw_negar_quat(c, e)
+    }
+    var vetor: Valor = Valor{}
+    if (e.op == (frontend.OP_NEGAR as u8)) and (common.c2f_b2i32(lw_unario_vetor(c, e, &vetor)) != 0) {
+        return vetor
+    }
+    let a: Valor = lw_expr(c, e.a)
+    if (e.op == (frontend.OP_ENDERECO as u8)) and (a.tipo_no != (V_LOCAL as u8)) {
+        let msg_1 = format(f"lowering: '&' sobre algo que nao e variavel (offset {e.pos_op})", alloc = heap)
+        defer delete(msg_1)
+        common.falha_interna(msg_1)
+    }
+    let i: ^IrInstr = instr_com_temp_3(c, IR_UNARIO, e, e.tipo)
+    i.op_aux = e.op
+    i.a = a
+    return resultado_temp_2(i)
+}
+
+// C: ir/lower_expr.c:211
+proc lower_none(c: ^LowerCtx, e: ^frontend.Expr) -> Valor {
+    return lw_valor_nulo(e.tipo)
+}
+
+// C: ir/lower_expr.c:218
+proc lower_logico(c: ^LowerCtx, e: ^frontend.Expr) -> Valor {
+    let a: Valor = lw_expr(c, e.a)
+    let local: i32 = lw_novo_local(c)
+    let def: ^IrInstr = lw_nova_instr(c, IR_LOCAL, e.pos_op)
+    def.destino = local
+    def.tipo = semantic.TIPO_BOOL as u32
+    def.mutavel = true
+    def.a = a
+    var teste: Valor = a
+    if e.op == (frontend.OP_OU as u8) {
+        let nega: ^IrInstr = instr_com_temp_3(c, IR_UNARIO, e, semantic.TIPO_BOOL as u32)
+        nega.op_aux = frontend.OP_NAO as u8
+        nega.a = a
+        teste = resultado_temp_2(nega)
+    }
+    let se: ^IrInstr = lw_nova_instr(c, IR_SE, e.pos_op)
+    se.a = teste
+    let anterior: ^IrBloco = lw_trocar_bloco(c, &se.corpo)
+    let arg_1: u32 = e.pos_op
+    let arg_2: Valor = lw_expr(c, e.b)
+    let arg_3: i32 = local
+    let arg_4: ^LowerCtx = c
+    atribuir_local_2(arg_4, arg_3, arg_2, arg_1)
+    _ = lw_trocar_bloco(c, anterior)
+    return lw_valor_local(local, semantic.TIPO_BOOL as u32)
+}
+
+// C: ir/lower_expr.c:242
+proc lower_binario(c: ^LowerCtx, e: ^frontend.Expr) -> Valor {
+    if (e.op == (frontend.OP_E as u8)) or (e.op == (frontend.OP_OU as u8)) {
+        return lower_logico(c, e)
+    }
+    if (common.c2f_b2i32((c.sem as ^semantic.Semantica).tipo_quat != 0) != 0) and (((e.a as ^frontend.Expr).tipo == (c.sem as ^semantic.Semantica).tipo_quat) or ((e.b as ^frontend.Expr).tipo == (c.sem as ^semantic.Semantica).tipo_quat)) {
+        return lw_binario_quat(c, e)
+    }
+    if common.c2f_ou_i32(common.c2f_b2i32((c.sem as ^semantic.Semantica).tipos.tem_matriz), common.c2f_b2i32((c.sem as ^semantic.Semantica).tipos.tem_bit_set)) != 0 {
+        var especial: Valor = Valor{}
+        if lw_binario_v19(c, e, &especial) {
+            return especial
+        }
+    }
+    var vetor: Valor = Valor{}
+    if lw_binario_vetor(c, e, &vetor) {
+        return vetor
+    }
+    let a: Valor = lw_expr(c, e.a)
+    let b: Valor = lw_expr(c, e.b)
+    let i: ^IrInstr = instr_com_temp_3(c, IR_BINARIO, e, e.tipo)
+    i.op_aux = e.op
+    i.a = a
+    i.b = b
+    return resultado_temp_2(i)
+}
+
+// C: ir/lower_expr.c:261
+proc lower_conversao(c: ^LowerCtx, e: ^frontend.Expr) -> Valor {
+    let a: Valor = lw_expr(c, e.a)
+    let i: ^IrInstr = instr_com_temp_3(c, IR_CONVERSAO, e, e.tipo)
+    i.a = a
+    if (common.c2f_b2i32(semantic.tipo_eh_real(&(c.sem as ^semantic.Semantica).tipos, (e.a as ^frontend.Expr).tipo)) != 0) and (not semantic.tipo_eh_real(&(c.sem as ^semantic.Semantica).tipos, e.tipo)) {
+        let ptr_1: ^IrPrograma = c.prog as ^IrPrograma
+        ptr_1.usa_real_curto = true
+    }
+    return resultado_temp_2(i)
+}
+
+// C: ir/lower_expr.c:276 (struct ausente no literal: a struct de dentro com os padroes dela)
+proc lw_padrao_da_struct(c: ^LowerCtx, tipo: u32, pos: u32) -> Valor {
+    let sem: ^semantic.Semantica = c.sem as ^semantic.Semantica
+    let decls: []?^frontend.Decl = c.structs or_else {}
+    let indice: i32 = (sem.globais or_else {})[semantic.tipo_de(&sem.tipos, tipo).a].indice
+    let estrutura: ^frontend.Decl = decls[indice as int] as ^frontend.Decl
+    let fatia = lw_args(c, estrutura.ncampos)
+    let slots: []Valor = fatia or_else {}
+    for k in 0..<estrutura.ncampos {
+        slots[k as int] = valor_do_campo_ausente(c, estrutura, k, pos)
+    }
+    let i: ^IrInstr = lw_nova_instr(c, IR_STRUCT, pos)
+    i.destino = lw_novo_temp(c)
+    i.tipo = tipo
+    i.args = fatia
+    i.nargs = estrutura.ncampos
+    return lw_valor_temp(i.destino, tipo)
+}
+
+// C: ir/lower_expr.c:289 (zero tipado; classe fora da lista = FalhaInterna)
+proc lw_zero_do_tipo(c: ^LowerCtx, tipo: u32, pos: u32) -> Valor {
+    let sem: ^semantic.Semantica = c.sem as ^semantic.Semantica
+    let classe: i32 = semantic.tipo_classe_de(&sem.tipos, tipo)
+    if classe == semantic.TC_BOOL {
+        return lw_valor_bool(false)
+    }
+    if (classe == semantic.TC_REAL) or (classe == semantic.TC_F64) {
+        return lw_valor_real(0.0, tipo)
+    }
+    if (classe == semantic.TC_I32) or (classe == semantic.TC_INT) or (classe == semantic.TC_I8) or (classe == semantic.TC_I16) or (classe == semantic.TC_U8) or (classe == semantic.TC_U16) or (classe == semantic.TC_U32) or (classe == semantic.TC_UINT) or (classe == semantic.TC_ENUM) or (classe == semantic.TC_BIT_SET) {
+        return lw_valor_int(0, tipo)
+    }
+    if (classe == semantic.TC_TEXTO) or (classe == semantic.TC_CSTR) {
+        let nomes: []common.Interner = sem.nomes or_else {}
+        let vazio: i32 = common.internar(&nomes[0], "", 0)
+        var tipo_texto: u32 = semantic.TIPO_TEXTO as u32
+        if classe == semantic.TC_CSTR {
+            tipo_texto = semantic.TIPO_CSTR as u32
+        }
+        return lw_valor_texto(vazio, tipo_texto)
+    }
+    if (classe == semantic.TC_ANULAVEL) or (classe == semantic.TC_OPCIONAL) or (classe == semantic.TC_RAWPTR) {
+        return lw_valor_nulo(tipo)
+    }
+    if (classe == semantic.TC_ARRAY) or (classe == semantic.TC_FATIA) or (classe == semantic.TC_DINAMICO) or (classe == semantic.TC_MAPA) or (classe == semantic.TC_MATRIZ) or (classe == semantic.TC_SOA) {
+        return lw_zero_composto(c, tipo, pos)
+    }
+    if classe == semantic.TC_STRUCT {
+        return lw_padrao_da_struct(c, tipo, pos)
+    }
+    let msg = format(f"lowering: campo sem padrao de tipo {tipo} nao tem zero (offset {pos})", alloc = heap)
+    defer delete(msg)
+    common.falha_interna(msg)
+    return Valor{}
+}
+
+// C: ir/lower_expr.c:322
+proc valor_do_campo_ausente(c: ^LowerCtx, estrutura: ^frontend.Decl, k: u32, pos: u32) -> Valor {
+    let campo: ^frontend.Campo = &(estrutura.campos or_else {})[k]
+    if campo.padrao == none {
+        return lw_zero_do_tipo(c, campo.tipo.tipo, pos)
+    }
+    let v: Valor = lw_expr(c, campo.padrao)
+    lw_verifica_faixa(c, estrutura, transmute(k, to = i32), v, pos)
+    return v
+}
+
+// C: ir/lower_expr.c:332 (args na ordem do fonte, gravados no slot do campo; ausentes pelo padrao ou zero)
+proc lower_literal_struct(c: ^LowerCtx, e: ^frontend.Expr) -> Valor {
+    if (e.ref as i32) != frontend.REF_STRUCT {
+        let msg_ref = format(f"lowering: literal de struct sem ligacao (offset {e.pos_op})", alloc = heap)
+        defer delete(msg_ref)
+        common.falha_interna(msg_ref)
+    }
+    let decls: []?^frontend.Decl = c.structs or_else {}
+    let estrutura: ^frontend.Decl = decls[e.ref_id as int] as ^frontend.Decl
+    let fatia = lw_args(c, estrutura.ncampos)
+    let slots: []Valor = fatia or_else {}
+    let args: []frontend.Arg = e.args or_else {}
+    for i in 0..<e.nargs {
+        let g: ^frontend.Arg = &args[i as int]
+        let indice: i32 = g.indice
+        slots[indice as int] = lw_expr(c, g.valor)
+        lw_verifica_faixa(c, estrutura, indice, slots[indice as int], (g.valor as ^frontend.Expr).pos_op)
+    }
+    for k in 0..<estrutura.ncampos {
+        if slots[k as int].tipo_no == (V_NENHUM as u8) {
+            slots[k as int] = valor_do_campo_ausente(c, estrutura, k, e.pos_op)
+        }
+    }
+    let i: ^IrInstr = instr_com_temp_3(c, IR_STRUCT, e, e.tipo)
+    i.args = fatia
+    i.nargs = estrutura.ncampos
+    return resultado_temp_2(i)
+}
+
+// C: ir/lower_expr.c:352
+proc lw_tipo_solto(c: ^LowerCtx, e: ^frontend.Expr) -> Valor {
+    let msg_1 = format(f"lowering: tipo escrito fora de new/make (offset {e.pos_op})", alloc = heap)
+    defer delete(msg_1)
+    common.falha_interna(msg_1)
+    return Valor{}
+}
+
+// C: ir/lower_expr.c:361
+proc lw_embrulha(c: ^LowerCtx, e: ^frontend.Expr) -> Valor {
+    let v: Valor = lw_expr(c, e.a)
+    let i: ^IrInstr = instr_com_temp_3(c, IR_EMBRULHA, e, e.tipo)
+    i.a = v
+    if common.c2f_s2u_32(semantic.tipo_classe_de(&(c.sem as ^semantic.Semantica).tipos, e.tipo)) == (semantic.TC_UNIAO as u32) {
+        i.b = lw_valor_int(e.op as i64, semantic.TIPO_U32 as u32)
+    }
+    return resultado_temp_2(i)
+}
+
+// C: ir/lower_expr.c:371
+proc lw_opc_teste(c: ^LowerCtx, e: ^frontend.Expr) -> Valor {
+    let v: Valor = lw_expr(c, e.a)
+    let i: ^IrInstr = instr_com_temp_3(c, IR_OPC_TEM, e, semantic.TIPO_BOOL as u32)
+    i.op_aux = e.op
+    i.a = v
+    return resultado_temp_2(i)
+}
+
+// C: ir/lower_expr.c:381
+proc lw_tupla(c: ^LowerCtx, e: ^frontend.Expr) -> Valor {
+    let fatia = lw_args(c, e.nargs)
+    let valores: []Valor = fatia or_else {}
+    let args: []frontend.Arg = e.args or_else {}
+    for k in 0..<e.nargs {
+        valores[k as int] = lw_expr(c, args[k as int].valor)
+    }
+    let i: ^IrInstr = instr_com_temp_3(c, IR_TUPLA, e, e.tipo)
+    i.args = fatia
+    i.nargs = e.nargs
+    return resultado_temp_2(i)
+}
+
+// C: ir/lower_expr.c:392
+proc lw_f_texto_solto(c: ^LowerCtx, e: ^frontend.Expr) -> Valor {
+    let msg_1 = format(f"lowering: f\"...\" fora de print/format (offset {e.pos_op})", alloc = heap)
+    defer delete(msg_1)
+    common.falha_interna(msg_1)
+    return Valor{}
+}
+
+// C: ir/lower_expr.c:409 (flexivel dobra em constante; senao a tabela LOWERINGS por tipo_no; tipo sem entrada = FalhaInterna)
+proc lw_expr(c: ^LowerCtx, e: ?^frontend.Expr) -> Valor {
+    let ex: ^frontend.Expr = e as ^frontend.Expr
+    if ex.flexivel {
+        return valor_constante(c, e)
+    }
+    let t: u8 = ex.tipo_no
+    if t == (frontend.EX_CHAMADA_IND as u8) {
+        return lw_chamada_ind(c, e)
+    }
+    if t == (frontend.EX_EMBRULHA as u8) {
+        return lw_embrulha(c, ex)
+    }
+    if t == (frontend.EX_OPC_TESTE as u8) {
+        return lw_opc_teste(c, ex)
+    }
+    if t == (frontend.EX_TUPLA as u8) {
+        return lw_tupla(c, ex)
+    }
+    if t == (frontend.EX_FTEXTO as u8) {
+        return lw_f_texto_solto(c, ex)
+    }
+    if t == (frontend.EX_TIPO as u8) {
+        return lw_tipo_solto(c, ex)
+    }
+    if (t == (frontend.EX_INT as u8)) or (t == (frontend.EX_REAL as u8)) or (t == (frontend.EX_BOOL as u8)) {
+        return valor_constante(c, e)
+    }
+    if t == (frontend.EX_TEXTO as u8) {
+        return lower_texto(c, ex)
+    }
+    if t == (frontend.EX_NOME as u8) {
+        return lower_nome(c, ex)
+    }
+    if t == (frontend.EX_CAMPO as u8) {
+        return lower_campo(c, ex)
+    }
+    if t == (frontend.EX_CHAMADA as u8) {
+        return lw_chamada(c, e)
+    }
+    if t == (frontend.EX_LITERAL_STRUCT as u8) {
+        return lower_literal_struct(c, ex)
+    }
+    if t == (frontend.EX_UNARIO as u8) {
+        return lower_unario(c, ex)
+    }
+    if t == (frontend.EX_BINARIO as u8) {
+        return lower_binario(c, ex)
+    }
+    if t == (frontend.EX_CONVERSAO as u8) {
+        return lower_conversao(c, ex)
+    }
+    if t == (frontend.EX_TRY as u8) {
+        return lw_try(c, e)
+    }
+    if t == (frontend.EX_OR_ELSE as u8) {
+        return lw_or_else(c, ex)
+    }
+    if t == (frontend.EX_NONE as u8) {
+        return lower_none(c, ex)
+    }
+    if t == (frontend.EX_INDICE as u8) {
+        return lw_indice(c, ex)
+    }
+    if t == (frontend.EX_FATIA as u8) {
+        return lw_fatia(c, ex)
+    }
+    if t == (frontend.EX_LITERAL_ARRAY as u8) {
+        return lw_literal_array(c, ex)
+    }
+    let msg = format(f"lowering: expressao sem lowering (tipo {t}, offset {ex.pos_op})", alloc = heap)
+    defer delete(msg)
+    common.falha_interna(msg)
+    return Valor{}
+}
+
+// Testes dirigidos (valores do C: ConferirFaixaConstante e LwTextoDecodificado em lower_expr.c).
+test "lower_expr: faixa constante e texto decodificado" {
+    var arenas = make([dynamic]common.Arena, alloc = heap, cap = 1)
+    append(&arenas, item = common.Arena{})
+    let ar: ^common.Arena = &(arenas[..])[0]
+    var lista = make([dynamic]common.Interner, alloc = heap, cap = 1)
+    append(&lista, item = common.Interner{})
+    common.interner_iniciar(&lista[0], ar)
+    let nome_campo: i32 = common.internar(&lista[0], "x", 1)
+    var diag = common.Diag{}
+    var sem = semantic.Semantica{}
+    sem.nomes = lista[..]
+    sem.diag = &diag
+    var c = LowerCtx{}
+    c.sem = &sem
+    c.arena = ar
+    var campo = frontend.Campo{nome = nome_campo, tem_faixa = true, faixa_min = 0, faixa_max = 10}
+    campo.tipo = frontend.TipoRef{tipo = semantic.TIPO_I32 as u32}
+    conferir_faixa_constante(&c, &campo, 5, 1)
+    expect(not diag.tem)
+    conferir_faixa_constante(&c, &campo, 11, 1)
+    expect(diag.tem)
+    expect((diag.causa or_else "") == "valor 11 fora da faixa 0..=10 do campo 'x'")
+
+    let raw: i32 = common.internar(&lista[0], "a\\nb", 4)
+    var e = frontend.Expr{nome = raw, pos_op = 0}
+    let decodificado: i32 = lw_texto_decodificado(&c, &e)
+    expect(common.interner_texto(&lista[0], decodificado) == "a\nb")
+    let cheio: i32 = common.internar(&lista[0], "a\\\"b\\\\c\\td\\re\\nf\\qg", 19)
+    var e2 = frontend.Expr{nome = cheio, pos_op = 0}
+    let decodificado2: i32 = lw_texto_decodificado(&c, &e2)
+    expect(common.interner_texto(&lista[0], decodificado2) == "a\"b\\c\td\re\nf\\qg")
+    common.interner_liberar(&lista[0])
+    delete(lista)
+    common.arena_liberar(ar)
+    delete(arenas)
+}

@@ -1,0 +1,806 @@
+// frontend/parser_decl.fj - porte de compiler/frontend/parser_decl.c
+// sha256 de frontend/parser_decl.c: ba6ff4427d4003c825dbae9ed102584a9efc9ae44ed199a5c68e5aeceec433fa
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.2.0
+// Changelog: 0.2.0 - G3 P-front B: corpo real. Pilhas tipadas (copiar_lista_campo/_param/_membro, parser.fj); preencher_valores_implicitos com wrapping_add (o C da a volta em valor -1).
+
+import "common"
+
+// C2F-80: DECLARACOES (const AnalisaDeclaracao[82], indexada pelo tipo do token) -> tag_da_declaracao + chamar_analisa_declaracao.
+
+pub const ANALISA_DECLARACAO_ANALISAR_UNIT: u16 = 1
+pub const ANALISA_DECLARACAO_ANALISAR_CONST: u16 = 2
+pub const ANALISA_DECLARACAO_ANALISAR_STRUCT: u16 = 3
+pub const ANALISA_DECLARACAO_ANALISAR_ENUM: u16 = 4
+pub const ANALISA_DECLARACAO_ANALISAR_UNIAO: u16 = 5
+pub const ANALISA_DECLARACAO_ANALISAR_PROC: u16 = 6
+pub const ANALISA_DECLARACAO_ANALISAR_TEST: u16 = 7
+pub const ANALISA_DECLARACAO_ANALISAR_FOREIGN: u16 = 8
+pub const ANALISA_DECLARACAO_ANALISAR_IMPORT: u16 = 9
+pub const ANALISA_DECLARACAO_ANALISAR_STATIC_ASSERT: u16 = 10
+pub proc chamar_analisa_declaracao(tag: u16, p: ^Parser) -> bool {
+    if tag == 1 {
+        return analisar_unit(p)
+    }
+    if tag == 2 {
+        return analisar_const(p)
+    }
+    if tag == 3 {
+        return analisar_struct(p)
+    }
+    if tag == 4 {
+        return analisar_enum(p)
+    }
+    if tag == 5 {
+        return analisar_uniao(p)
+    }
+    if tag == 6 {
+        return analisar_proc(p)
+    }
+    if tag == 7 {
+        return analisar_test(p)
+    }
+    if tag == 8 {
+        return analisar_foreign(p)
+    }
+    if tag == 9 {
+        return analisar_import(p)
+    }
+    if tag == 10 {
+        return analisar_static_assert(p)
+    }
+    panic("tag de declaracao fora da tabela: frontend.chamar_analisa_declaracao")
+    return false
+}
+
+// C: frontend/parser_decl.c:27
+proc nova_decl(p: ^Parser, tipo: i32, pos: u32) -> ^Decl {
+    let d: ^Decl = new(Decl, alloc = common.arena_mem(p.arena as ^common.Arena))
+    d.tipo_no = tipo as u8
+    d.pos = pos
+    d.nome = -1
+    d.simbolo = -1
+    if p.programa.ultima == none {
+        p.programa.primeira = d
+    } else {
+        let ptr_1: ^Decl = p.programa.ultima as ^Decl
+        ptr_1.prox = d
+    }
+    p.programa.ultima = d
+    return d
+}
+
+// C: frontend/parser_decl.c:39
+proc pular_quebras(p: ^Parser) {
+    while common.c2f_s2u_32(tipo_atual(p)) == (TK_NL as u32) {
+        p.cur += 1
+    }
+}
+
+// C: frontend/parser_decl.c:44
+proc analisar_unit(p: ^Parser) -> bool {
+    let d: ^Decl = nova_decl(p, D_UNIDADE_BASE, token_atual(p).off)
+    p.cur += 1
+    if not ler_nome_2(p, &d.nome, &d.pos, "nome da unidade") {
+        return false
+    }
+    if common.c2f_s2u_32(tipo_atual(p)) == (TK_COLON as u32) {
+        p.cur += 1
+        if (common.c2f_s2u_32(tipo_atual(p)) != (TK_IDENT as u32)) or (token_atual(p).sym != SYM_F32) {
+            return erro_sintaxe(p, "'f32'")
+        }
+        p.cur += 1
+        return esperar_fim_de_linha(p)
+    }
+    if not esperar(p, TK_ASSIGN, "':' ou '='") {
+        return false
+    }
+    d.tipo_no = D_UNIDADE_DERIV as u8
+    if not ler_nome_2(p, &d.nome_a, &d.pos_a, "nome de unidade") {
+        return false
+    }
+    if (common.c2f_s2u_32(tipo_atual(p)) != (TK_STAR as u32)) and (common.c2f_s2u_32(tipo_atual(p)) != (TK_SLASH as u32)) {
+        return erro_sintaxe(p, "'*' ou '/'")
+    }
+    var tern_1: i32 = OP_DIV
+    if common.c2f_s2u_32(tipo_atual(p)) == (TK_STAR as u32) {
+        tern_1 = OP_MUL
+    }
+    d.op = tern_1 as u8
+    p.cur += 1
+    return (common.c2f_b2i32(ler_nome_2(p, &d.nome_b, &d.pos_b, "nome de unidade")) != 0) and (common.c2f_b2i32(esperar_fim_de_linha(p)) != 0)
+}
+
+// C: frontend/parser_decl.c:64
+proc analisar_const(p: ^Parser) -> bool {
+    let d: ^Decl = nova_decl(p, D_CONST, token_atual(p).off)
+    p.cur += 1
+    if not ler_nome_2(p, &d.nome, &d.pos, "nome da constante") {
+        return false
+    }
+    if (not esperar(p, TK_COLON, "':'")) or (not analisar_tipo_ref(p, &d.tipo)) {
+        return false
+    }
+    if not esperar(p, TK_ASSIGN, "'='") {
+        return false
+    }
+    d.init = analisar_expr(p)
+    return (d.init != none) and (common.c2f_b2i32(esperar_fim_de_linha(p)) != 0)
+}
+
+// C: frontend/parser_decl.c:77
+// Limite da faixa: inteiro com '-' opcional (digitos lidos do fonte). *pos = offset do '-' ou do numero. A magnitude passa de
+// 64 bits com sinal (9223372036854775807; 9223372036854775808 se negativo) = E0420 aqui mesmo, o unico vindo do parser.
+proc analisar_limite(p: ^Parser, valor: ^i64, pos: ^u32) -> bool {
+    let negativo = tipo_atual(p) == TK_MINUS
+    pos^ = token_atual(p).off
+    if negativo {
+        p.cur += 1
+    }
+    if tipo_atual(p) != TK_INT {
+        return erro_sintaxe(p, "inteiro")
+    }
+    var v: u64 = 0
+    let texto = (p.fonte as ^common.Fonte).texto
+    let coube = lexer_ler_inteiro_u64(texto[(token_atual(p).off as int)..<len(texto)], &v) // v1.10: aceita 0x... e 0b...
+    var teto: u64 = 9223372036854775807 // (uint64_t)INT64_MAX
+    if negativo {
+        teto = 9223372036854775808 // + 1u
+    }
+    if not coube or v > teto {
+        return common.diag_relatar(p.diag as ^common.Diag, common.E0420, pos^, "limite de faixa fora de 64 bits com sinal (maximo 9223372036854775807)")
+    }
+    if negativo {
+        valor^ = transmute(wrapping_sub(0 as u64, v), to = i64) // (int64_t)(0u - v)
+    } else {
+        valor^ = transmute(v, to = i64)
+    }
+    p.cur += 1
+    return true
+}
+
+// C: frontend/parser_decl.c:93
+proc analisar_faixa_do_campo(p: ^Parser, f: ^Campo) -> bool {
+    f.tem_faixa = true
+    p.cur += 1
+    if not analisar_limite(p, &f.faixa_min, &f.pos_min) {
+        return false
+    }
+    if (common.c2f_s2u_32(tipo_atual(p)) != (TK_DOTDOTEQ as u32)) and (common.c2f_s2u_32(tipo_atual(p)) != (TK_DOTDOTLT as u32)) {
+        return erro_sintaxe(p, "'..=' ou '..<'")
+    }
+    f.faixa_excl = common.c2f_s2u_32(tipo_atual(p)) == (TK_DOTDOTLT as u32)
+    p.cur += 1
+    return analisar_limite(p, &f.faixa_max, &f.pos_max)
+}
+
+// C: frontend/parser_decl.c:104
+proc analisar_campo(p: ^Parser, f: ^Campo) -> bool {
+    if not ler_nome_2(p, &f.nome, &f.pos, "nome do campo") {
+        return false
+    }
+    if (not esperar(p, TK_COLON, "':'")) or (not analisar_tipo_ref(p, &f.tipo)) {
+        return false
+    }
+    if (common.c2f_s2u_32(tipo_atual(p)) == (KW_IN as u32)) and (not analisar_faixa_do_campo(p, f)) {
+        return false
+    }
+    if common.c2f_s2u_32(tipo_atual(p)) == (TK_ASSIGN as u32) {
+        p.cur += 1
+        f.padrao = analisar_expr(p)
+        if f.padrao == none {
+            return false
+        }
+    }
+    return esperar_fim_de_linha(p)
+}
+
+// C: frontend/parser_decl.c:117
+proc analisar_struct(p: ^Parser) -> bool {
+    let d: ^Decl = nova_decl(p, D_STRUCT, token_atual(p).off)
+    let base = len(p.pilha_campos) as u64
+    p.cur += 1
+    if (not ler_nome_2(p, &d.nome, &d.pos, "nome da struct")) or (not esperar_abre_bloco(p)) {
+        return false
+    }
+    while tipo_atual(p) != TK_RBRACE {
+        var f = Campo{}
+        if tipo_atual(p) != TK_IDENT {
+            return erro_sintaxe(p, "campo ou '}'")
+        }
+        if not analisar_campo(p, &f) {
+            return false
+        }
+        append(&p.pilha_campos, item = f)
+    }
+    d.ncampos = (len(p.pilha_campos) as u64 - base) as u32
+    d.campos = copiar_lista_campo(p, base)
+    d.pos_fim = token_atual(p).off
+    p.cur += 1
+    return esperar_fim_de_linha(p)
+}
+
+// C: frontend/parser_decl.c:137
+// Membros separados por virgula e/ou quebra de linha, tudo numa linha ou uma por linha; virgula final aceita.
+proc analisar_membros(p: ^Parser, d: ^Decl) -> bool {
+    let base = len(p.pilha_membros) as u64
+    pular_quebras(p)
+    while tipo_atual(p) != TK_RBRACE {
+        var m = Membro{}
+        if not ler_nome_2(p, &m.nome, &m.pos, "nome do membro ou '}'") {
+            return false
+        }
+        if tipo_atual(p) == TK_ASSIGN {
+            p.cur += 1
+            if not analisar_limite(p, &m.valor, &m.pos_valor) {
+                return false
+            }
+            m.tem_valor = true
+            d.op = 1
+        }
+        append(&p.pilha_membros, item = m)
+        if tipo_atual(p) == TK_COMMA {
+            p.cur += 1
+        } else if tipo_atual(p) != TK_NL and tipo_atual(p) != TK_RBRACE {
+            return erro_sintaxe(p, "',', fim de linha ou '}'")
+        }
+        pular_quebras(p)
+    }
+    d.nmembros = (len(p.pilha_membros) as u64 - base) as u32
+    d.membros = copiar_lista_membro(p, base)
+    return true
+}
+
+// C: frontend/parser_decl.c:161
+proc preencher_valores_implicitos(d: ^Decl) {
+    var prox: i64 = 0
+    var k: u32 = 0
+    while k < d.nmembros {
+        let m: ^Membro = &(d.membros or_else {})[k]
+        if not m.tem_valor {
+            m.valor = prox
+            m.pos_valor = m.pos
+        }
+        prox = transmute(wrapping_add(common.c2f_s2u_64(m.valor), 1 as u64), to = i64) // (int64_t)((uint64_t)valor + 1u): da a volta (valor -1 -> 0)
+        k += 1
+    }
+}
+
+// C: frontend/parser_decl.c:174
+proc analisar_enum(p: ^Parser) -> bool {
+    let d: ^Decl = nova_decl(p, D_ENUM, token_atual(p).off)
+    p.cur += 1
+    if (not ler_nome_2(p, &d.nome, &d.pos, "nome do enum")) or (not esperar(p, TK_LBRACE, "'{'")) {
+        return false
+    }
+    if not analisar_membros(p, d) {
+        return false
+    }
+    if d.op == 1 {
+        preencher_valores_implicitos(d)
+    }
+    d.pos_fim = token_atual(p).off
+    p.cur += 1
+    return esperar_fim_de_linha(p)
+}
+
+// C: frontend/parser_decl.c:187
+// Variantes de union: tipos separados por virgula e/ou quebra de linha; virgula final aceita. Dois tipos seguidos = E0101 no 2o.
+proc analisar_variantes(p: ^Parser, d: ^Decl) -> bool {
+    let base = len(p.pilha_campos) as u64
+    pular_quebras(p)
+    while tipo_atual(p) != TK_RBRACE {
+        var v = Campo{}
+        v.nome = -1
+        v.pos = token_atual(p).off
+        if not analisar_tipo_ref(p, &v.tipo) {
+            return false
+        }
+        append(&p.pilha_campos, item = v)
+        if tipo_atual(p) == TK_COMMA {
+            p.cur += 1
+        } else if tipo_atual(p) != TK_NL and tipo_atual(p) != TK_RBRACE {
+            return erro_sintaxe(p, "',', fim de linha ou '}'")
+        }
+        pular_quebras(p)
+    }
+    d.ncampos = (len(p.pilha_campos) as u64 - base) as u32
+    d.campos = copiar_lista_campo(p, base)
+    return true
+}
+
+// C: frontend/parser_decl.c:207
+proc analisar_uniao(p: ^Parser) -> bool {
+    let d: ^Decl = nova_decl(p, D_UNIAO, token_atual(p).off)
+    p.cur += 1
+    if (not ler_nome_2(p, &d.nome, &d.pos, "nome da union")) or (not esperar(p, TK_LBRACE, "'{'")) {
+        return false
+    }
+    if not analisar_variantes(p, d) {
+        return false
+    }
+    d.pos_fim = token_atual(p).off
+    p.cur += 1
+    return esperar_fim_de_linha(p)
+}
+
+// C: frontend/parser_decl.c:218
+proc analisar_param(p: ^Parser, par: ^Param) -> bool {
+    if not ler_nome_2(p, &par.nome, &par.pos, "nome do parametro") {
+        return false
+    }
+    if (not esperar(p, TK_COLON, "':'")) or (not analisar_tipo_ref(p, &par.tipo)) {
+        return false
+    }
+    if common.c2f_s2u_32(tipo_atual(p)) == (TK_ASSIGN as u32) {
+        p.cur += 1
+        par.padrao = analisar_expr(p)
+        if par.padrao == none {
+            return false
+        }
+    }
+    return true
+}
+
+// C: frontend/parser_decl.c:230
+proc analisar_params(p: ^Parser, d: ^Decl) -> bool {
+    let base = len(p.pilha_params) as u64
+    while tipo_atual(p) != TK_RPAREN {
+        var par = Param{}
+        if d.externo and tipo_atual(p) == TK_DOTDOT {
+            return common.diag_relatar(p.diag as ^common.Diag, common.E0904, token_atual(p).off, "proc foreign variadico ('...') nao atravessa a fronteira C: no Windows x64 o C le os reais variadicos em outro registrador; declare uma funcao C de parametros fixos (forja ligar recusa com G0008)")
+        }
+        if not analisar_param(p, &par) {
+            return false
+        }
+        append(&p.pilha_params, item = par)
+        if tipo_atual(p) != TK_COMMA {
+            break
+        }
+        p.cur += 1
+    }
+    d.nparams = (len(p.pilha_params) as u64 - base) as u32
+    d.params = copiar_lista_param(p, base)
+    return esperar(p, TK_RPAREN, "')'")
+}
+
+// C: frontend/parser_decl.c:250
+// '(' nome: T, nome: T ')' [! E] (v1.7): elementos em Decl.retornos; a quantidade (2 a 8) e conferida na semantica (E0314).
+proc analisar_retorno_multiplo(p: ^Parser, d: ^Decl) -> bool {
+    let r = &d.retorno
+    let base = len(p.pilha_params) as u64
+    r.forma = TR_TUPLA as u8
+    r.alvo = none
+    r.nome = -1
+    r.erro = -1
+    r.pos = token_atual(p).off
+    p.cur += 1
+    while true {
+        var el = Param{}
+        if not ler_nome_2(p, &el.nome, &el.pos, "nome do elemento do retorno") {
+            return false
+        }
+        if (not esperar(p, TK_COLON, "':'")) or (not analisar_tipo_ref(p, &el.tipo)) {
+            return false
+        }
+        append(&p.pilha_params, item = el)
+        if tipo_atual(p) != TK_COMMA {
+            break
+        }
+        p.cur += 1
+    }
+    d.nretornos = (len(p.pilha_params) as u64 - base) as u32
+    d.retornos = copiar_lista_param(p, base)
+    if not esperar(p, TK_RPAREN, "')'") {
+        return false
+    }
+    if tipo_atual(p) != TK_BANG {
+        return true
+    }
+    r.pos_tamanho = token_atual(p).off
+    p.cur += 1
+    var pos_erro: u32 = 0
+    return ler_nome_2(p, &r.erro, &pos_erro, "nome do tipo de erro")
+}
+
+// C: frontend/parser_decl.c:278
+proc ler_erro_do_retorno(p: ^Parser, r: ^TipoRef) -> bool {
+    var pos_erro: u32 = 0
+    if p.napelidos != 0 {
+        r.modulo_erro = ler_apelido(p, &pos_erro)
+    }
+    return ler_nome_2(p, &r.erro, &pos_erro, "nome do tipo de erro")
+}
+
+// C: frontend/parser_decl.c:286
+// Depois de '->': "T", "T ! E", "! E" (so erro: retorno.nome = -1) ou "(nome: T, ...) [! E]".
+proc analisar_retorno(p: ^Parser, d: ^Decl) -> bool {
+    let r = &d.retorno
+    d.tem_retorno = true
+    if tipo_atual(p) == TK_LPAREN {
+        return analisar_retorno_multiplo(p, d)
+    }
+    if tipo_atual(p) == TK_BANG {
+        r.forma = TR_NOME as u8
+        r.alvo = none
+        r.nome = -1
+        r.erro = -1
+        r.pos = token_atual(p).off
+    } else {
+        if not analisar_tipo_ref(p, r) {
+            return false
+        }
+        if tipo_atual(p) != TK_BANG {
+            return true
+        }
+    }
+    p.cur += 1
+    return ler_erro_do_retorno(p, r)
+}
+
+// C: frontend/parser_decl.c:304
+proc analisar_proc(p: ^Parser) -> bool {
+    let d: ^Decl = nova_decl(p, D_PROC, token_atual(p).off)
+    p.cur += 1
+    if not ler_nome_2(p, &d.nome, &d.pos, "nome do proc") {
+        return false
+    }
+    if (not esperar(p, TK_LPAREN, "'('")) or (not analisar_params(p, d)) {
+        return false
+    }
+    if common.c2f_s2u_32(tipo_atual(p)) == (TK_ARROW as u32) {
+        if parser_idioma_main(p, d) {
+            return false
+        }
+        p.cur += 1
+        if not analisar_retorno(p, d) {
+            return false
+        }
+    }
+    return (common.c2f_b2i32(analisar_corpo_com_chaves(p, &d.corpo, &d.pos_fim)) != 0) and (common.c2f_b2i32(esperar_fim_de_linha(p)) != 0)
+}
+
+// C: frontend/parser_decl.c:318
+proc analisar_test(p: ^Parser) -> bool {
+    let d: ^Decl = nova_decl(p, D_TEST, token_atual(p).off)
+    p.cur += 1
+    if common.c2f_s2u_32(tipo_atual(p)) != (TK_TEXTO as u32) {
+        return erro_sintaxe(p, "titulo do teste entre aspas")
+    }
+    d.nome = token_atual(p).sym
+    d.pos_titulo = token_atual(p).off
+    p.cur += 1
+    return (common.c2f_b2i32(analisar_corpo_com_chaves(p, &d.corpo, &d.pos_fim)) != 0) and (common.c2f_b2i32(esperar_fim_de_linha(p)) != 0)
+}
+
+// C: frontend/parser_decl.c:330
+// 'link "biblioteca"' dentro de foreign: nome = texto cru da string, pos = offset da string.
+proc analisar_link(p: ^Parser) -> bool {
+    let d: ^Decl = nova_decl(p, D_LINK, token_atual(p).off)
+    p.cur += 1
+    if tipo_atual(p) != TK_TEXTO {
+        return erro_sintaxe(p, "nome da biblioteca entre aspas")
+    }
+    d.nome = token_atual(p).sym
+    d.pos_fim = token_atual(p).off
+    d.pos = d.pos_fim
+    p.cur += 1
+    return esperar_fim_de_linha(p)
+}
+
+// C: frontend/parser_decl.c:342
+proc ler_alias_do_simbolo(p: ^Parser, d: ^Decl) -> bool {
+    if common.c2f_s2u_32(tipo_atual(p)) != (TK_ASSIGN as u32) {
+        return true
+    }
+    p.cur += 1
+    if common.c2f_s2u_32(tipo_atual(p)) != (TK_TEXTO as u32) {
+        return erro_sintaxe(p, "o simbolo C entre aspas: proc c_remove = \"remove\"(caminho: cstr) -> i32")
+    }
+    d.simbolo = token_atual(p).sym
+    d.pos_simbolo = token_atual(p).off
+    p.cur += 1
+    return true
+}
+
+// C: frontend/parser_decl.c:354
+// 'opaque', 'header' e as palavras da clausula de posse so sao reconhecidos pelo texto (o resto do bloco nao paga a comparacao).
+proc eh_palavra_de_foreign(p: ^Parser, palavra: str, tam: u32) -> bool {
+    let t = token_atual(p)
+    if (t.tipo as i32) != TK_IDENT {
+        return false
+    }
+    let nomes = p.nomes as ^common.Interner
+    if common.interner_tam(nomes, t.sym) != tam {
+        return false
+    }
+    let n = tam as int
+    return common.c2f_memcmp(as_bytes(common.interner_texto(nomes, t.sym))[0..<n], as_bytes(palavra)[0..<n]) == 0
+}
+
+// C: frontend/parser_decl.c:361
+proc eh_clausula_de_posse(p: ^Parser) -> bool {
+    return (((common.c2f_b2i32(eh_palavra_de_foreign(p, "creates", 7)) != 0) or (common.c2f_b2i32(eh_palavra_de_foreign(p, "destroys", 8)) != 0)) or (common.c2f_b2i32(eh_palavra_de_foreign(p, "takes", 5)) != 0)) or (common.c2f_b2i32(eh_palavra_de_foreign(p, "ends", 4)) != 0)
+}
+
+// C: frontend/parser_decl.c:368
+// M6c P85: 'creates' | 'creates p' | 'destroys p' | 'takes p' depois da assinatura (D-M6c-3). Valida so o que a sintaxe ve (nome existe,
+// palavra conhecida, uma clausula so); o tipo do handle e conferido na semantica (sem_posse_c.c).
+proc ler_clausula_de_posse(p: ^Parser, d: ^Decl) -> bool {
+    let diag = p.diag as ^common.Diag
+    if tipo_atual(p) != TK_IDENT {
+        return true
+    }
+    let pos_palavra = token_atual(p).off
+    if eh_palavra_de_foreign(p, "creates", 7) {
+        d.posse_c = POSSE_C_CRIA_RETORNO as u8
+    } else if eh_palavra_de_foreign(p, "destroys", 8) {
+        d.posse_c = POSSE_C_DESTROI as u8
+    } else if eh_palavra_de_foreign(p, "takes", 5) {
+        d.posse_c = POSSE_C_ENTREGA as u8
+    } else if eh_palavra_de_foreign(p, "ends", 4) {
+        d.posse_c = POSSE_C_ENCERRA as u8
+    } else {
+        return common.diag_relatar(diag, common.E0912, pos_palavra, "depois da assinatura do proc foreign so cabe creates, creates p, destroys p, takes p ou ends")
+    }
+    d.posse_param = -1
+    d.pos_posse = pos_palavra
+    p.cur += 1
+    if (d.posse_c as i32) == POSSE_C_ENCERRA { // M6d P92b: 'ends' nao leva parametro; 'ends destroys f' e 2 clausulas (P93h), 'ends f' e o parametro
+        if tipo_atual(p) != TK_IDENT {
+            return true
+        }
+        if eh_clausula_de_posse(p) {
+            return common.diag_relatar(diag, common.E0912, token_atual(p).off, "no maximo uma clausula de posse por proc foreign")
+        }
+        return common.diag_relatar(diag, common.E0912, token_atual(p).off, "ends nao leva parametro: o proc encerra a lib inteira")
+    }
+    if tipo_atual(p) == TK_IDENT {
+        d.pos_posse = token_atual(p).off
+        var i: u32 = 0
+        while i < d.nparams and d.posse_param < 0 {
+            if (d.params or_else {})[i].nome == token_atual(p).sym {
+                d.posse_param = i as i16
+            }
+            i += 1
+        }
+        if d.posse_param < 0 {
+            return common.diag_relatar(diag, common.E0912, d.pos_posse, "a clausula cita um parametro que o proc nao tem")
+        }
+        if (d.posse_c as i32) == POSSE_C_CRIA_RETORNO {
+            d.posse_c = POSSE_C_CRIA_SAIDA as u8
+        }
+        p.cur += 1
+    } else if (d.posse_c as i32) != POSSE_C_CRIA_RETORNO {
+        return common.diag_relatar(diag, common.E0912, pos_palavra, "destroys e takes pedem o nome do parametro: destroys f")
+    } else if not d.tem_retorno {
+        return common.diag_relatar(diag, common.E0912, pos_palavra, "creates sem nome pede um retorno de handle; para parametro de saida escreva creates p")
+    }
+    if tipo_atual(p) == TK_IDENT {
+        return common.diag_relatar(diag, common.E0912, token_atual(p).off, "no maximo uma clausula de posse por proc foreign")
+    }
+    return true
+}
+
+// C: frontend/parser_decl.c:403
+// 'proc nome[ = "simbolo"](params) [-> T] [creates|destroys p|takes p]' dentro de foreign: sem corpo (esta na biblioteca C).
+proc analisar_proc_externo(p: ^Parser) -> bool {
+    let d: ^Decl = nova_decl(p, D_PROC, token_atual(p).off)
+    d.externo = true
+    p.cur += 1
+    if (not ler_nome_2(p, &d.nome, &d.pos, "nome do proc")) or (not ler_alias_do_simbolo(p, d)) {
+        return false
+    }
+    if (not esperar(p, TK_LPAREN, "'('")) or (not analisar_params(p, d)) {
+        return false
+    }
+    if tipo_atual(p) == TK_ARROW {
+        p.cur += 1
+        if not analisar_retorno(p, d) {
+            return false
+        }
+    }
+    if not ler_clausula_de_posse(p, d) {
+        return false
+    }
+    if tipo_atual(p) == TK_LBRACE {
+        return common.diag_relatar(p.diag as ^common.Diag, common.E0101, token_atual(p).off, "proc de foreign nao tem corpo: o corpo esta na biblioteca C")
+    }
+    d.pos_fim = token_atual(p).off
+    return esperar_fim_de_linha(p)
+}
+
+// C: frontend/parser_decl.c:423
+// 'opaque Nome' dentro de foreign (v1.8b): struct sem campos, so vale atras de ponteiro (conferido na semantica).
+proc analisar_opaco(p: ^Parser) -> bool {
+    let d: ^Decl = nova_decl(p, D_STRUCT, token_atual(p).off)
+    d.externo = true
+    p.cur += 1
+    if not ler_nome_2(p, &d.nome, &d.pos, "nome do tipo opaco") {
+        return false
+    }
+    if tipo_atual(p) == TK_LBRACE {
+        return common.diag_relatar(p.diag as ^common.Diag, common.E0101, token_atual(p).off, "tipo opaco nao tem campos: o layout fica na biblioteca C; declare 'opaque Nome' e use ^Nome")
+    }
+    d.pos_fim = token_atual(p).off
+    return esperar_fim_de_linha(p)
+}
+
+// C: frontend/parser_decl.c:437
+proc analisar_item_de_foreign(p: ^Parser) -> bool {
+    if tipo_atual(p) == TK_IDENT and token_atual(p).sym == SYM_LINK {
+        return analisar_link(p)
+    }
+    if tipo_atual(p) == KW_PROC {
+        return analisar_proc_externo(p)
+    }
+    if eh_palavra_de_foreign(p, "opaque", 6) {
+        return analisar_opaco(p)
+    }
+    if eh_palavra_de_foreign(p, "header", 6) {
+        return common.diag_relatar(p.diag as ^common.Diag, common.E0101, token_atual(p).off, "header nao entra no .fj: gere o modulo com 'forja ligar <header.h> --link <lib>' e importe-o (ou declare os procs a mao)")
+    }
+    return erro_sintaxe(p, "'link \"biblioteca\"', 'opaque Nome', 'proc' ou '}'")
+}
+
+// C: frontend/parser_decl.c:450
+// foreign { link "lib" / proc nome(...) -> T }: um item por linha; a AST fica plana (cada item vira uma Decl de topo).
+proc analisar_foreign(p: ^Parser) -> bool {
+    p.cur += 1
+    if tipo_atual(p) == TK_TEXTO {
+        return common.diag_relatar(p.diag as ^common.Diag, common.E0101, token_atual(p).off, "foreign nao leva nome: cada biblioteca e uma linha 'link \"nome\"' dentro do bloco")
+    }
+    if not esperar_abre_bloco(p) {
+        return false
+    }
+    var itens: u32 = 0
+    while tipo_atual(p) != TK_RBRACE {
+        if not analisar_item_de_foreign(p) {
+            return false
+        }
+        itens += 1
+    }
+    if itens == 0 {
+        return common.diag_relatar(p.diag as ^common.Diag, common.E0101, token_atual(p).off, "bloco foreign vazio: declare 'link \"biblioteca\"' ou 'proc nome(...)'")
+    }
+    p.cur += 1
+    return esperar_fim_de_linha(p)
+}
+
+// C: frontend/parser_decl.c:472
+// 'import "caminho" [as apelido]' (v1.8): so no topo do arquivo. A forma do caminho e o apelido unico saem de ModulosRegistrar (E1001).
+proc analisar_import(p: ^Parser) -> bool {
+    let diag = p.diag as ^common.Diag
+    let pos_import = token_atual(p).off
+    if p.modulos == none {
+        return common.diag_relatar(diag, common.E0101, pos_import, "construcao ainda nao suportada: 'import'")
+    }
+    if p.viu_declaracao {
+        return common.diag_relatar(diag, common.E0101, pos_import, "import so vale no topo do arquivo, antes de qualquer declaracao")
+    }
+    p.cur += 1
+    if tipo_atual(p) != TK_TEXTO {
+        if parser_idioma_import(p) {
+            return false
+        }
+        return common.diag_relatar(diag, common.E0101, token_atual(p).off, "import pede o caminho entre aspas: import \"std:mem\"")
+    }
+    let d: ^Decl = nova_decl(p, D_IMPORT, pos_import)
+    var r = RegistroImport{texto = token_atual(p).sym, apelido = -1, arquivo = p.arquivo_atual, pos_texto = token_atual(p).off}
+    d.nome = r.texto
+    r.pos_apelido = r.pos_texto
+    d.pos_b = r.pos_apelido
+    d.pos_a = d.pos_b
+    p.cur += 1
+    if tipo_atual(p) == KW_AS {
+        p.cur += 1
+        if tipo_atual(p) != TK_IDENT {
+            return common.diag_relatar(diag, common.E0101, token_atual(p).off, "depois de 'as' vem o apelido")
+        }
+        r.apelido = token_atual(p).sym
+        r.pos_apelido = token_atual(p).off
+        d.pos_b = r.pos_apelido
+        p.cur += 1
+    }
+    var indice: u8 = 0
+    if (not esperar_fim_de_linha(p)) or (not modulos_registrar(p.modulos, &r, diag, &indice)) {
+        return false
+    }
+    d.indice = indice as i32
+    if r.apelido >= 0 {
+        d.nome_a = r.apelido
+    } else {
+        d.nome_a = (p.modulos as ^Modulos).itens[indice].apelido
+    }
+    p.napelidos += 1
+    return true
+}
+
+// C: frontend/parser_decl.c:505
+proc analisar_static_assert(p: ^Parser) -> bool {
+    let d: ^Decl = nova_decl(p, D_ASSERT, token_atual(p).off)
+    d.init = analisar_expr(p)
+    if d.init == none {
+        return false
+    }
+    d.pos_fim = token_atual(p).off
+    return esperar_fim_de_linha(p)
+}
+
+// C: frontend/parser_decl.c:521
+// C2F-80: DECLARACOES[TK_QTD] (tabela de ponteiros de funcao indexada pelo tipo do token) -> a tag do alvo; 0 = NULL.
+proc tag_da_declaracao(tipo: i32) -> u16 {
+    if tipo == KW_IMPORT {
+        return ANALISA_DECLARACAO_ANALISAR_IMPORT
+    }
+    if tipo == KW_UNIT {
+        return ANALISA_DECLARACAO_ANALISAR_UNIT
+    }
+    if tipo == KW_CONST {
+        return ANALISA_DECLARACAO_ANALISAR_CONST
+    }
+    if tipo == KW_STRUCT {
+        return ANALISA_DECLARACAO_ANALISAR_STRUCT
+    }
+    if tipo == KW_ENUM {
+        return ANALISA_DECLARACAO_ANALISAR_ENUM
+    }
+    if tipo == KW_UNION {
+        return ANALISA_DECLARACAO_ANALISAR_UNIAO
+    }
+    if tipo == KW_PROC {
+        return ANALISA_DECLARACAO_ANALISAR_PROC
+    }
+    if tipo == KW_TEST {
+        return ANALISA_DECLARACAO_ANALISAR_TEST
+    }
+    if tipo == KW_FOREIGN {
+        return ANALISA_DECLARACAO_ANALISAR_FOREIGN
+    }
+    return 0
+}
+
+// C: frontend/parser_decl.c:521
+// [pub] [export] antes da declaracao: o parser so grava os dois marcadores em TODAS as decls criadas (foreign cria varias);
+// quem os confere e a semantica (E0903, E0906).
+proc analisar_declaracao(p: ^Parser) -> bool {
+    let publico = tipo_atual(p) == KW_PUB
+    if publico {
+        p.cur += 1
+    }
+    let exportado = tipo_atual(p) == KW_EXPORT
+    if exportado {
+        p.cur += 1
+    }
+    var tag = tag_da_declaracao(tipo_atual(p))
+    if tag == 0 and tipo_atual(p) == TK_IDENT and token_atual(p).sym == SYM_STATIC_ASSERT {
+        tag = ANALISA_DECLARACAO_ANALISAR_STATIC_ASSERT
+    }
+    if tag == 0 and tipo_atual(p) == KW_VAR {
+        return common.diag_relatar(p.diag as ^common.Diag, common.E0101, token_atual(p).off, "'var' global nao existe: o estado vai em uma struct local passada por ponteiro (^T); valor fixo e const")
+    }
+    if tag == 0 {
+        return erro_sintaxe(p, "declaracao (unit, const, struct, enum, proc, test ou foreign)")
+    }
+    if tipo_atual(p) != KW_IMPORT {
+        p.viu_declaracao = true
+    } else if publico or exportado {
+        return common.diag_relatar(p.diag as ^common.Diag, common.E0101, token_atual(p).off, "import nao leva pub nem export")
+    }
+    let antes = p.programa.ultima
+    if not chamar_analisa_declaracao(tag, p) {
+        return false
+    }
+    var cur = p.programa.primeira
+    if antes != none {
+        cur = (antes as ^Decl).prox
+    }
+    while cur != none {
+        let d = cur as ^Decl
+        d.publico = publico
+        d.exportado = exportado
+        d.modulo = p.modulo_atual
+        cur = d.prox
+    }
+    return true
+}

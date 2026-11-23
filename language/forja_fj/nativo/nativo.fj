@@ -1,0 +1,1124 @@
+// nativo/nativo.fj - porte de compiler/nativo/nativo.c, compiler/nativo/nativo.h
+// sha256 de nativo/nativo.c: d5a59a3baac2a4054dc8b54d581aa9a566636c6dd282afd7ba06a698f455b788
+// sha256 de nativo/nativo.h: 7a81b7543cf4bbe76abdf35cbf2738286f8c6884675d22f5d23182130be541c3
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.3.0
+// Changelog: 0.3.0 - I2: alvos iOS (IMAGEM_MACHO): ligam como ELF PIE dinamico e escrever_imagem chama obj.ligar_macho (plataforma 7 simulador / 2 aparelho).
+//            0.2.0 - A4.2/A4.3: alvo android = ELF dinamico: pedido de ligacao com DT_NEEDED (links do programa), runpath, pie e exports; sem busca de bibliotecas em disco.
+//            0.1.1 - A2.2(a): BirEntrada.runtime_forja = wasm OU a64 (arq 1), passado ao alcance da BIR.
+
+import "common"
+import "ir"
+import "nativo/bir"
+import "nativo/dbg"
+import "nativo/fmt" as pefmt
+import "nativo/obj"
+import "nativo/optimizer"
+import "nativo/wasm"
+import "nativo/x64"
+import "semantic"
+import "std:os"
+
+pub struct NativoCarga {
+    caminho: ?str
+    hash: u64
+}
+
+pub struct NativoPacote {
+    caminho: ?str
+    hash: u64
+}
+
+pub struct NativoTempos {
+    lex_ns: u64
+    parse_ns: u64
+    check_ns: u64
+    ir_ns: u64
+    bir_ns: u64
+    isel_ns: u64
+    regs_ns: u64
+    codificar_ns: u64
+    ligar_ns: u64
+    escrever_ns: u64
+    outros_ns: u64
+    total_ns: u64
+    linhas: u64
+    inicio_ns: u64
+}
+
+struct NativoTempoCampo {
+    nome: ?str
+    deslocamento: u64
+}
+
+pub struct NativoPedido {
+    ir: ?^ir.IrPrograma
+    tipos: ?^semantic.Tipos
+    nomes: ?^common.Interner
+    fonte: ?^common.Fonte
+    modo: u8
+    saida: ?str
+    debug_code: ?str
+    alvo: ?str
+    versao: ?str
+    tempos: ?^NativoTempos
+    comando: ?str
+    teste: bool
+    traco: bool
+    dll: bool
+    pasta_libs: ?str
+    pastas_extra: ?[]str
+    npastas_extra: u32
+    lib_pasta: ?str
+    entradas: ?str
+    cargas: ?^[dynamic]NativoCarga
+    pacotes: ?^[dynamic]NativoPacote
+    pie: bool
+    runpath: ?str
+    sem_otim: ?str
+    checagem: bool
+    simbolos: bool
+    guarda_memoria: bool
+    perfil: bool
+    rastreio: bool
+    sd: ?^common.SaidaDiag
+}
+
+struct Montagem {
+    pedido: ?^NativoPedido
+    alvo: ?^x64.Alvo
+    tempos: ?^NativoTempos
+    codigo: obj.Objeto
+    runtime: obj.Objeto
+    ryu: obj.Objeto
+    terceiros: obj.Objeto
+    legado: obj.Objeto
+    curto: obj.Objeto
+    math: obj.Objeto
+    es: obj.Objeto
+    thread: obj.Objeto
+    sync: obj.Objeto
+    atomic: obj.Objeto
+    varena: obj.Objeto
+    net: obj.Objeto
+    entrada: obj.Objeto
+    semente: obj.Objeto
+    perfil: obj.Objeto
+    tem_semente: bool
+    usa_ryu: bool
+    usa_math: bool
+    usa_es: bool
+    usa_thread: bool
+    usa_sync: bool
+    usa_atomic: bool
+    usa_varena: bool
+    usa_net: bool
+    usa_curto: bool
+    usa_legado: bool
+    usa_terceiros: bool
+    imagem: pefmt.Imagem
+    exe: [dynamic]u8
+    erro: common.Diag
+    itens: u32
+    bir_txt: [dynamic]u8
+    locais_txt: [dynamic]u8
+    otim_txt: [dynamic]u8
+    passes_txt: [dynamic]u8
+    lista: x64.AlvoListagem
+    dbg: dbg.DbgPrograma
+    dbg_vivo: bool
+    pdb_caminho: ?str
+    pdb_guid: [16]u8
+    bir: bir.BirPrograma
+    libs: obj.BibliotecasResolvidas
+    falha_lib: BibliotecaFalha
+    bir_viva: bool
+    bir_funcoes: u32
+    etapa: ?str
+    links_din: [dynamic]str // A4.2: nomes do `link "x"` para o DT_NEEDED do alvo android (so criado em pedido_de_ligacao)
+    links_din_vivo: bool
+}
+
+pub const SAIDA_OK: i32 = 0
+pub const SAIDA_DIAGNOSTICO: i32 = 1
+pub const SAIDA_USO: i32 = 2
+pub const SAIDA_INTERNO: i32 = 3
+const NATIVO_TEMPOS_QTD: i32 = 13
+const NATIVO_TEMPOS_ETAPAS: i32 = 10
+const NATIVO_ASSINATURA: str = "Forja Native "
+const PROVEDOR_RUNTIME: i32 = 0
+const PROVEDOR_LEGADO: i32 = 1
+const PROVEDOR_QTD: i32 = 2
+const NATIVO_ALVO_PADRAO: str = "x86_64-windows"
+const NATIVO_EACCES: i32 = 13
+const NATIVO_TAM_CAUSA_X0302: u64 = 1249
+const NATIVO_TAM_CAMINHO_DEBUG: u64 = 1099
+const NATIVO_TAM_CAMINHO_PDB: u64 = 1100
+const NATIVO_TAM_MODULO_PDB: u64 = 300
+pub const NATIVO_X0003_SO: str = "biblioteca .so: M5c"
+// C2F-A1 extern NATIVO_TEMPOS_CAMPOS (const NativoTempoCampo[13]) = dado .incbin: #load pendente (construir.bat)
+
+// C: nativo/nativo.c:149
+proc relatar_erro(m: ^Montagem) -> i32 {
+    var etapa_origem: ?str = m.etapa
+    if m.erro.codigo == common.X0902 {
+        etapa_origem = ETAPA_CODIFICAR
+    }
+    var bir_origem: ?^bir.BirPrograma = none
+    if m.bir_viva {
+        bir_origem = &m.bir
+    }
+    var campos_origem: ?str = none
+    if len(m.falha_lib.campos) > 0 {
+        campos_origem = from_bytes(m.falha_lib.campos[..], alloc = frame)
+    }
+    var origem = ErroOrigem{etapa = etapa_origem, bir = bir_origem, bir_funcoes = m.bir_funcoes, campos = campos_origem}
+    return nativo_relatar_erro(m.pedido as ^NativoPedido, &m.erro, &origem)
+}
+
+// C: nativo/nativo.c:157
+proc recusar_com_x0003(p: ^NativoPedido, causa: ?str) -> i32 {
+    common.diag_imprimir_json_sem_fonte(common.X0003, causa, common.c2f_saida_stderr(), sd_do_pedido(p))
+    return SAIDA_USO
+}
+
+// C: nativo/nativo.c:164
+proc injetou(m: ^Montagem, etapa: str) -> bool {
+    m.etapa = etapa
+    return nativo_injetar_falha(m.pedido as ^NativoPedido, etapa, &m.erro)
+}
+
+// C: nativo/nativo.c:171
+proc runtime_usa_ryu(runtime: ^obj.Objeto, ryu: ^obj.Objeto) -> bool {
+    var k: u64 = 0
+    while k < (len(ryu.simbolos) as u64) {
+        let def: ^obj.ObjSimbolo = &ryu.simbolos[k]
+        var tern_1: i64 = -1
+        if (common.c2f_b2i32(def.global) != 0) and (def.secao >= 0) {
+            tern_1 = obj.obj_achar_simbolo(runtime, def.nome)
+        }
+        let i: i64 = tern_1
+        if (i >= 0) and (runtime.simbolos[common.c2f_s2u_64(i)].secao == obj.OBJ_SECAO_INDEFINIDA) {
+            return true
+        }
+        k += 1
+    }
+    return false
+}
+
+// C: nativo/nativo.c:183
+// Ponte: o alvo ELF e o formato do Alvo; comparacao com o mesmo idioma do ler_legado
+proc montagem_e_elf(m: ^Montagem) -> bool {
+    return common.c2f_s2u_32((m.alvo as ^x64.Alvo).formato) == (pefmt.IMAGEM_ELF as u32)
+}
+
+// C: nativo/nativo.c:183
+// rt_objeto_de so devolve ponteiro para dado embutido (sem copia): o ramo nao escolhido e trocado sem custo
+proc ler_ryu(m: ^Montagem) -> bool {
+    var n: u64 = 0
+    var bytes: ^u8 = rt_nativo_win_ryu(&n)
+    if montagem_e_elf(m) {
+        bytes = rt_nativo_linux_comum(&n)
+    }
+    if not obj.coff_ler(bytes, n, &m.ryu, &m.erro) {
+        return false
+    }
+    m.usa_ryu = runtime_usa_ryu(&m.runtime, &m.ryu)
+    return true
+}
+
+// C: nativo/nativo.c:195
+proc ler_legado(m: ^Montagem) -> bool {
+    var n: u64 = 0
+    let bytes: ^u8 = rt_nativo_win_legado(&n)
+    if common.c2f_s2u_32((m.alvo as ^x64.Alvo).formato) == (pefmt.IMAGEM_ELF as u32) {
+        return true
+    }
+    return obj.coff_ler(bytes, n, &m.legado, &m.erro)
+}
+
+// C: nativo/nativo.c:206
+proc ler_curto(m: ^Montagem) -> bool {
+    var n: u64 = 0
+    var bytes: ^u8 = rt_nativo_win_curto(&n)
+    if montagem_e_elf(m) {
+        bytes = rt_nativo_linux_curto(&n)
+    }
+    return obj.coff_ler(bytes, n, &m.curto, &m.erro)
+}
+
+// C: nativo/nativo.c:215
+proc ler_math(m: ^Montagem) -> bool {
+    var n: u64 = 0
+    let bytes: ^u8 = rt_nativo_math(&n)
+    return obj.coff_ler(bytes, n, &m.math, &m.erro)
+}
+
+// C: nativo/nativo.c:224
+proc ler_es(m: ^Montagem) -> bool {
+    var n: u64 = 0
+    var bytes: ^u8 = rt_nativo_win_es(&n)
+    if montagem_e_elf(m) {
+        bytes = rt_nativo_linux_es(&n)
+    }
+    return obj.coff_ler(bytes, n, &m.es, &m.erro)
+}
+
+// C: nativo/nativo.c:234
+proc ler_entrada_libc(m: ^Montagem) -> bool {
+    var n: u64 = 0
+    let bytes: ^u8 = rt_nativo_linux_entrada_libc(&n)
+    var pasta: [SEMENTE_TAM_PASTA]u8 = {}
+    if not obj.coff_ler(bytes, n, &m.entrada, &m.erro) {
+        return false
+    }
+    let pasta_achada: bool = semente_musl_pasta(pasta[..], SEMENTE_TAM_PASTA as u64)
+    let pasta_txt: str = from_bytes(pasta[0..<common.c2f_strlen_b(pasta[..])], alloc = frame)
+    if (not pasta_achada) or (not semente_musl_completa(pasta_txt)) {
+        let causa: str = format(f"foreign no alvo x86_64-linux pede a semente musl (crt1.o e libc.a) em '{pasta_txt}', e ela nao esta la", alloc = heap)
+        _ = common.diag_relatar(&m.erro, common.X0003, 0, causa)
+        _ = common.diag_sugerir(&m.erro.sug, common.DIAG_CERTA, "restaure language\\third\\musl\\x86_64 (LEIAME.txt e construir_musl.sh no WSL alpine-build) ou compile sem foreign")
+        return false
+    }
+    if not semente_musl_crt1(pasta_txt, (m.pedido as ^NativoPedido).pie, &m.semente) {
+        let causa_crt1: str = format(f"crt1.o da semente musl em '{pasta_txt}' nao le como ELF x86-64", alloc = heap)
+        _ = common.diag_relatar(&m.erro, common.X0003, 0, causa_crt1)
+        return false
+    }
+    m.tem_semente = true
+    return true
+}
+
+// C: nativo/nativo.c:256
+proc ler_entrada(m: ^Montagem) -> bool {
+    if not montagem_e_elf(m) {
+        return true
+    }
+    let pedido: ^NativoPedido = m.pedido as ^NativoPedido
+    if nativo_usa_runtime_crt(pedido, &m.bir) or nativo_usa_threads_no_elf(&m.bir) {
+        return ler_entrada_libc(m)
+    }
+    var n: u64 = 0
+    var bytes: ^u8 = rt_nativo_linux_entrada(&n)
+    if pedido.pie {
+        bytes = rt_nativo_linux_entrada_pie(&n)
+    }
+    return obj.coff_ler(bytes, n, &m.entrada, &m.erro)
+}
+
+// C: nativo/nativo.c:270
+proc ler_thread(m: ^Montagem) -> bool {
+    var n: u64 = 0
+    var bytes: ^u8 = rt_nativo_win_thread(&n)
+    if montagem_e_elf(m) {
+        bytes = rt_nativo_linux_thread(&n)
+    }
+    return obj.coff_ler(bytes, n, &m.thread, &m.erro)
+}
+
+// C: nativo/nativo.c:279
+proc ler_sync(m: ^Montagem) -> bool {
+    var n: u64 = 0
+    var bytes: ^u8 = rt_nativo_win_sync(&n)
+    if montagem_e_elf(m) {
+        bytes = rt_nativo_linux_sync(&n)
+    }
+    return obj.coff_ler(bytes, n, &m.sync, &m.erro)
+}
+
+// C: nativo/nativo.c:288
+proc ler_atomic(m: ^Montagem) -> bool {
+    var n: u64 = 0
+    var bytes: ^u8 = rt_nativo_win_atomic(&n)
+    if montagem_e_elf(m) {
+        bytes = rt_nativo_linux_atomic(&n)
+    }
+    return obj.coff_ler(bytes, n, &m.atomic, &m.erro)
+}
+
+// C: nativo/nativo.c:297
+proc ler_varena(m: ^Montagem) -> bool {
+    var n: u64 = 0
+    var bytes: ^u8 = rt_nativo_win_varena(&n)
+    if montagem_e_elf(m) {
+        bytes = rt_nativo_linux_varena(&n)
+    }
+    return obj.coff_ler(bytes, n, &m.varena, &m.erro)
+}
+
+// C: nativo/nativo.c:306
+proc ler_net(m: ^Montagem) -> bool {
+    var n: u64 = 0
+    var bytes: ^u8 = rt_nativo_win_net(&n)
+    if montagem_e_elf(m) {
+        bytes = rt_nativo_linux_net(&n)
+    }
+    return obj.coff_ler(bytes, n, &m.net, &m.erro)
+}
+
+// C: nativo/nativo.c:316
+proc usa_rastreio(m: ^Montagem) -> bool {
+    return (m.pedido as ^NativoPedido).modo == (bir.BM_DEV as u8)
+}
+
+// C: nativo/nativo.c:322
+proc runtime_do_alvo(m: ^Montagem, n: ^u64) -> ^u8 {
+    let pedido: ^NativoPedido = m.pedido as ^NativoPedido
+    if montagem_e_elf(m) {
+        return rt_nativo_linux(pedido.modo, n)
+    }
+    if nativo_usa_runtime_crt(pedido, &m.bir) {
+        return rt_nativo_win_crt(pedido.modo, n)
+    }
+    return rt_nativo_win(pedido.modo, n)
+}
+
+// C: nativo/nativo.c:332
+proc conferir_layout(m: ^Montagem) -> bool {
+    var n: u64 = 0
+    let bytes: ^u8 = runtime_do_alvo(m, &n)
+    m.etapa = ETAPA_LIGAR
+    if ((((((((((((not obj.coff_ler(bytes, n, &m.runtime, &m.erro)) or (not ler_ryu(m))) or (not ler_legado(m))) or (not ler_curto(m))) or (not ler_math(m))) or (not ler_es(m))) or (not ler_thread(m))) or (not ler_sync(m))) or (not ler_atomic(m))) or (not ler_varena(m))) or (not ler_net(m))) or (not ler_entrada(m))) or (not nativo_perfil_ler(m.pedido as ^NativoPedido, common.c2f_s2u_32((m.alvo as ^x64.Alvo).formato) == (pefmt.IMAGEM_ELF as u32), &m.perfil, &m.erro)) {
+        return false
+    }
+    m.etapa = ETAPA_LAYOUT
+    return nativo_layout_conferir(m.pedido as ^NativoPedido, &m.runtime, &m.erro)
+}
+
+// C: nativo/nativo.c:345
+proc conferir_depois_da_bir(m: ^Montagem) -> bool {
+    return ((not injetou(m, ETAPA_BIR)) and (common.c2f_b2i32(conferir_layout(m)) != 0)) and (not injetou(m, ETAPA_LAYOUT))
+}
+
+// C: nativo/nativo.c:351
+proc construir_bir(m: ^Montagem) -> bool {
+    let pedido: ^NativoPedido = m.pedido as ^NativoPedido
+    let alvo: ^x64.Alvo = m.alvo as ^x64.Alvo
+    var entrada = bir.BirEntrada{ir = pedido.ir, tipos = pedido.tipos, nomes = pedido.nomes, fonte = pedido.fonte, modo = pedido.modo, teste = pedido.teste, traco = pedido.traco, dll = pedido.dll, wasm = alvo.formato == pefmt.IMAGEM_WASM, runtime_forja = (alvo.formato == pefmt.IMAGEM_WASM) or (alvo.arq == 1), poda = true, sysv = montagem_e_elf(m) and (alvo.arq != 1), nomes_mem = alvo.mem, guarda = pedido.guarda_memoria, checagem = pedido.checagem, simbolos_dbg = pedido.simbolos, perfil = pedido.perfil}
+    let t0: u64 = common.relogio_ns()
+    m.etapa = ETAPA_BIR
+    var ok: bool = bir.bir_construir(&entrada, &m.bir, &m.erro)
+    m.bir_viva = true
+    m.bir_funcoes = m.bir.nfuncoes
+    if (not ok) and (m.bir.nfuncoes != 0) {
+        m.bir_funcoes = m.bir.nfuncoes - 1
+    }
+    ok = ok and bir.bir_validar(&m.bir, &m.erro)
+    let eh_wasm: bool = alvo.formato == pefmt.IMAGEM_WASM
+    // A1.2: o aarch64-linux nao tem isel ainda; como o wasm, sem os passes do x64 e sem runtime em C
+    let eh_a64: bool = alvo.arq == 1
+    // passes do backend x64 (alocador, isel...) nao valem no wasm nem no aarch64
+    let sem_otim_usuario: str = pedido.sem_otim or_else ""
+    let sem_otim_wasm: str = format(f"{sem_otim_usuario},slp,alocador,isel,divconst", alloc = heap)
+    defer delete(sem_otim_wasm)
+    var sem_otim_pedido: str = sem_otim_usuario
+    if eh_wasm or eh_a64 {
+        sem_otim_pedido = sem_otim_wasm[0..<len(sem_otim_wasm)]
+        if sem_otim_usuario == "" {
+            sem_otim_pedido = "slp,alocador,isel,divconst"
+        }
+    }
+    if ok {
+        var relatos = optimizer.OtimRelatos{}
+        if (m.itens & DEBUG_OTIM) != 0 {
+            relatos.contadores = &m.otim_txt
+        }
+        if (m.itens & DEBUG_PASSES) != 0 {
+            relatos.passes = &m.passes_txt
+        }
+        ok = optimizer.otim_executar(&m.bir, sem_otim_pedido, &relatos, &m.erro)
+    }
+    let tempos_m: ^NativoTempos = m.tempos as ^NativoTempos
+    tempos_m.bir_ns = common.relogio_ns() - t0
+    return ok and (eh_wasm or eh_a64 or conferir_depois_da_bir(m))
+}
+
+// C: nativo/nativo.c:369
+proc assinar_rdata(o: ^obj.Objeto, versao: str) {
+    var rdata: u32 = 4294967295
+    var s: ?^obj.ObjSecao = none
+    var k: u32 = 0
+    while ((k as u64) < (len(o.secoes) as u64)) and (rdata == 4294967295) {
+        if (o.secoes[k as u64].nome or_else "") == ".rdata" {
+            rdata = k
+        }
+        k += 1
+    }
+    if rdata == 4294967295 {
+        rdata = obj.obj_secao_abrir(o, ".rdata", obj.OS_RDATA, 1)
+    }
+    s = &o.secoes[rdata as u64]
+    append(&(s as ^obj.ObjSecao).bytes, item = NATIVO_ASSINATURA)
+    append(&(s as ^obj.ObjSecao).bytes, item = versao)
+    append(&(s as ^obj.ObjSecao).bytes, item = 0)
+}
+
+// C: nativo/nativo.c:386
+proc usa_dwarf(m: ^Montagem) -> bool {
+    return (m.pedido as ^NativoPedido).simbolos
+}
+
+// C: nativo/nativo.c:392
+proc pede_coleta_dbg(m: ^Montagem) -> bool {
+    return ((common.c2f_b2i32(usa_rastreio(m)) != 0) or ((m.itens & DEBUG_LINHAS) != 0)) or (common.c2f_b2i32(usa_dwarf(m)) != 0)
+}
+
+// C: nativo/nativo.c:398
+proc gerar_codigo(m: ^Montagem) -> bool {
+    let pedido: ^NativoPedido = m.pedido as ^NativoPedido
+    let alvo: ^x64.Alvo = m.alvo as ^x64.Alvo
+    var fatias = x64.AlvoTempos{}
+    var colheita = x64.AlvoColheita{tempos = &fatias, rastreio = usa_rastreio(m), guarda = pedido.guarda_memoria, dinamico = alvo.dinamico, macho = alvo.formato == pefmt.IMAGEM_MACHO}
+    if (m.itens & (DEBUG_ASM | DEBUG_QUADROS)) != 0 {
+        colheita.lista = &m.lista
+    }
+    if injetou(m, ETAPA_ISEL) or injetou(m, ETAPA_CODIFICAR) {
+        return false
+    }
+    if pede_coleta_dbg(m) {
+        dbg.dbg_iniciar(&m.dbg)
+        m.dbg_vivo = true
+        colheita.dbg = &m.dbg
+    }
+    var ok: bool = x64.chamar_alvo_gerar(alvo.gerar, &m.bir, &m.codigo, &m.erro, &colheita)
+    ok = ok and nativo_interface_dll(&m.codigo, pedido)
+    ok = ok and nativo_perfil_tabela(&m.codigo, &m.bir, pedido)
+    if ok and usa_dwarf(m) {
+        var sem = dbg.DwarfSemantica{fonte = pedido.fonte, tipos = pedido.tipos, ir = pedido.ir, nomes = pedido.nomes, com_frame = montagem_e_elf(m)}
+        dbg.dwarf_escrever(&m.codigo, &m.dbg, &sem)
+    }
+    let tempos_m: ^NativoTempos = m.tempos as ^NativoTempos
+    tempos_m.isel_ns = fatias.isel_ns
+    tempos_m.regs_ns = fatias.regs_ns
+    tempos_m.codificar_ns = fatias.codificar_ns
+    if ok {
+        assinar_rdata(&m.codigo, pedido.versao or_else "")
+    }
+    return ok
+}
+
+// C: nativo/nativo.c:428
+proc versao_do_linker(m: ^Montagem) -> bool {
+    let versao: str = (m.pedido as ^NativoPedido).versao or_else ""
+    var fim_maior: int = 0
+    var fim_menor: int = 0
+    let maior: u64 = common.c2f_strtoull(versao, 10, &fim_maior)
+    var menor: u64 = 0
+    var lido: bool = (fim_maior > 0) and (fim_maior < len(versao)) and (versao[fim_maior..<(fim_maior + 1)] == ".")
+    if lido {
+        menor = common.c2f_strtoull(versao[(fim_maior + 1)..<len(versao)], 10, &fim_menor)
+        lido = fim_menor > 0
+    }
+    if (not lido) or (maior > 255) or (menor > 255) {
+        return common.diag_relatar(&m.erro, common.X0905, 0, format(f"versao do forja '{versao}' fora de maior.menor.patch (0..255) para o cabecalho do PE", alloc = heap))
+    }
+    m.imagem.linker_maior = maior as u8
+    m.imagem.linker_menor = menor as u8
+    return true
+}
+
+// C: nativo/nativo.c:441
+proc resolver_bibliotecas(m: ^Montagem) -> bool {
+    if (m.alvo as ^x64.Alvo).dinamico {
+        return true // A4.2: o carregador do Android acha as libs (DT_NEEDED); o ligador nao le lib em disco
+    }
+    let pedido: ^NativoPedido = m.pedido as ^NativoPedido
+    var provedores: [PROVEDOR_QTD]obj.BibliotecasProvedor = {obj.BibliotecasProvedor{objeto = &m.runtime, traz_imports = false}, obj.BibliotecasProvedor{objeto = &m.legado, traz_imports = true}}
+    var entrada = NativoBibliotecasEntrada{pedido = pedido, bir = &m.bir, provedores = provedores[..], qtd_provedores = PROVEDOR_QTD as u32, libmem = (pedido.modo == (bir.BM_DEV as u8)) and (not pedido.dll)}
+    if not nativo_bibliotecas(&entrada, &m.libs, &m.falha_lib) {
+        m.erro = m.falha_lib.diag
+        return false
+    }
+    let mascara_legado: u32 = (1 as u32) << (PROVEDOR_LEGADO as u32)
+    m.usa_legado = (m.libs.provedores_usados & mascara_legado) != 0
+    return true
+}
+
+// C: nativo/nativo.c:455
+proc nome_do_arquivo(caminho: str) -> str {
+    var inicio: int = 0
+    for k in (0 as int)..<len(caminho) {
+        let letra: str = caminho[k..<(k + 1)]
+        if (letra == "/") or (letra == "\\") {
+            inicio = k + 1
+        }
+    }
+    return caminho[inicio..<len(caminho)]
+}
+
+// C: nativo/nativo.c:466
+proc avisar_diretivas(relato: ^obj.TerceirosRelato) {
+    if relato.ignoradas > 0 {
+        let txt_1 = relato.primeira_ignorada or_else "(null)"
+        let msg_1 = format(f"aviso: {relato.ignoradas} diretiva(s) do .drectve de bibliotecas estaticas ignorada(s); a primeira: '{txt_1}'\n", alloc = heap)
+        defer delete(msg_1)
+        common.c2f_saida_formatar(common.c2f_saida_stderr(), msg_1)
+    }
+}
+
+// C: nativo/nativo.c:473
+proc montar_terceiros(m: ^Montagem) -> bool {
+    if not m.libs.tem_estaticas {
+        return true
+    }
+    var outros: [4]?^obj.Objeto = {&m.codigo, &m.runtime, none, none}
+    var qtd_outros: u32 = 2
+    if m.usa_ryu {
+        outros[qtd_outros] = &m.ryu
+        qtd_outros += 1
+    }
+    if m.usa_legado {
+        outros[qtd_outros] = &m.legado
+        qtd_outros += 1
+    }
+    let pedido: ^NativoPedido = m.pedido as ^NativoPedido
+    var ped = obj.TerceirosPedido{membros = &m.libs.selecao.membros, celulas = m.libs.celulas[..], qtd_celulas = len(m.libs.celulas) as u32, tabelas = m.libs.tabelas[..], qtd_tabelas = m.libs.qtd_tabelas, outros = outros[0..<(qtd_outros as u64)], qtd_outros = qtd_outros, formato = (m.alvo as ^x64.Alvo).formato}
+    if (pedido.modo == (bir.BM_DEV as u8)) and (not pedido.dll) {
+        ped.libmem = &m.libs.libmem
+    }
+    var relato = obj.TerceirosRelato{}
+    if not obj.terceiros_montar(&ped, &m.terceiros, &relato, &m.erro) {
+        return false
+    }
+    m.usa_terceiros = true
+    m.usa_legado = m.usa_legado or relato.tem_ctors
+    avisar_diretivas(&relato)
+    return true
+}
+
+// C: nativo/nativo.c:496
+// e_machine do ELF: 0 = padrao x86-64 (62 no elf_escrever); 183 = EM_AARCH64 (constante la e privada)
+proc maquina_do_alvo(alvo: ^x64.Alvo) -> u32 {
+    if alvo.arq == 1 {
+        return 183
+    }
+    return 0
+}
+
+// A4.2: nomes do `link "x"` do programa, sem repetir e sem as libs de sistema do Windows, para os DT_NEEDED libx.so do alvo android
+proc coletar_necessarias(m: ^Montagem) {
+    let pedido: ^NativoPedido = m.pedido as ^NativoPedido
+    let ir_c: ^ir.IrPrograma = pedido.ir as ^ir.IrPrograma
+    let ids: []i32 = ir_c.bibliotecas or_else {}
+    m.links_din = make([dynamic]str, alloc = heap)
+    m.links_din_vivo = true
+    for k in (0 as u32)..<ir_c.nbibliotecas {
+        let nome: str = nb_texto(pedido, ids[k])
+        var repetido: bool = nb_eh_lib_so_windows(nome)
+        for j in (0 as u64)..<(len(m.links_din) as u64) {
+            if m.links_din[j] == nome {
+                repetido = true
+            }
+        }
+        if not repetido {
+            append(&m.links_din, item = nome)
+        }
+    }
+}
+
+proc pedido_de_ligacao(m: ^Montagem) -> obj.LigarPedido {
+    let pedido: ^NativoPedido = m.pedido as ^NativoPedido
+    let alvo: ^x64.Alvo = m.alvo as ^x64.Alvo
+    // I2: o Mach-O passa pelo ligador ELF PIE dinamico (RVA == offset, GOT/rebase/bind na Imagem); ligar_macho grava o arquivo
+    var formato_ligador: i32 = alvo.formato
+    if formato_ligador == pefmt.IMAGEM_MACHO {
+        formato_ligador = pefmt.IMAGEM_ELF
+    }
+    var ped = obj.LigarPedido{programa = &m.codigo, runtime = &m.runtime, tabelas = m.libs.tabelas[..], qtd_tabelas = m.libs.qtd_tabelas, dll = pedido.dll, nome_dll = nome_do_arquivo(pedido.saida or_else ""), exports = m.bir.exportados, qtd_exports = m.bir.nexportados, formato = formato_ligador, pie = pedido.pie, maquina = maquina_do_alvo(alvo), pagina = alvo.pagina, entrada_no_programa = alvo.arq == 1}
+    if alvo.dinamico {
+        coletar_necessarias(m)
+        ped.pie = true
+        ped.dinamico = true
+        ped.necessarias = m.links_din[..]
+        ped.qtd_necessarias = len(m.links_din) as u32
+        ped.runpath = pedido.runpath
+    }
+    if m.usa_ryu {
+        ped.ryu = &m.ryu
+    }
+    if m.usa_terceiros {
+        ped.terceiros = &m.terceiros
+    }
+    if m.usa_legado {
+        ped.legado = &m.legado
+    }
+    if m.usa_curto {
+        ped.curto = &m.curto
+    }
+    if m.usa_math {
+        ped.math = &m.math
+    }
+    if m.usa_es {
+        ped.es = &m.es
+    }
+    if m.usa_thread {
+        ped.thread = &m.thread
+    }
+    if m.usa_sync {
+        ped.sync = &m.sync
+    }
+    if m.usa_atomic {
+        ped.atomic = &m.atomic
+    }
+    if m.usa_varena {
+        ped.varena = &m.varena
+    }
+    if m.usa_net {
+        ped.net = &m.net
+    }
+    if montagem_e_elf(m) {
+        ped.entrada = &m.entrada
+    }
+    if m.tem_semente {
+        ped.semente = &m.semente
+    }
+    if pedido.perfil {
+        ped.perfil = &m.perfil
+    }
+    return ped
+}
+
+// C: nativo/nativo.c:505
+proc usar_ryu_do_programa(m: ^Montagem) {
+    m.usa_ryu = (common.c2f_b2i32(m.usa_ryu) != 0) or (common.c2f_b2i32(runtime_usa_ryu(&m.codigo, &m.ryu)) != 0)
+    m.usa_curto = (common.c2f_b2i32(runtime_usa_ryu(&m.codigo, &m.curto)) != 0) or (common.c2f_b2i32(runtime_usa_ryu(&m.runtime, &m.curto)) != 0)
+    m.usa_math = runtime_usa_ryu(&m.codigo, &m.math)
+    m.usa_es = runtime_usa_ryu(&m.codigo, &m.es)
+    m.usa_thread = runtime_usa_ryu(&m.codigo, &m.thread)
+    m.usa_sync = runtime_usa_ryu(&m.codigo, &m.sync)
+    m.usa_atomic = runtime_usa_ryu(&m.codigo, &m.atomic)
+    m.usa_varena = runtime_usa_ryu(&m.codigo, &m.varena)
+    m.usa_net = runtime_usa_ryu(&m.codigo, &m.net)
+}
+
+// C: nativo/nativo.c:519
+proc acabar_imagem_do_pe(m: ^Montagem) -> bool {
+    return (common.c2f_s2u_32((m.alvo as ^x64.Alvo).formato) != (pefmt.IMAGEM_PE as u32)) or ((common.c2f_b2i32(versao_do_linker(m)) != 0) and (common.c2f_b2i32(pefmt.pe_acrescentar_recursos(&m.imagem, ((m.pedido as ^NativoPedido).versao or_else ""), &m.erro)) != 0))
+}
+
+// C: nativo/nativo.c:525
+proc ligar_imagem(m: ^Montagem) -> bool {
+    let t0: u64 = common.relogio_ns()
+    var ok: bool = false
+    if injetou(m, ETAPA_LIGAR) {
+        return false
+    }
+    usar_ryu_do_programa(m)
+    if (not resolver_bibliotecas(m)) or (not montar_terceiros(m)) {
+        return false
+    }
+    var pedido: obj.LigarPedido = pedido_de_ligacao(m)
+    ok = (common.c2f_b2i32(obj.ligar_com_tabelas(&pedido, &m.imagem, &m.erro)) != 0) and (common.c2f_b2i32(acabar_imagem_do_pe(m)) != 0)
+    let ptr_1: ^NativoTempos = m.tempos as ^NativoTempos
+    ptr_1.ligar_ns = common.relogio_ns() - t0
+    return ok
+}
+
+// C: nativo/nativo.c:542
+proc relatar_falha_de_gravacao(p: ^NativoPedido, caminho: ?str, err: i32) -> i32 {
+    let caminho_txt: str = caminho or_else ""
+    var sufixo: str = ""
+    if err == NATIVO_EACCES {
+        sufixo = " (em uso)"
+    }
+    let texto: str = format(f"nao consegui gravar '{caminho_txt}'{sufixo}", alloc = heap)
+    defer delete(texto)
+    let causa: str = common.c2f_cortar(texto, NATIVO_TAM_CAUSA_X0302 as int)
+    defer delete(causa)
+    common.diag_imprimir_json_sem_fonte(common.X0302, causa, common.c2f_saida_stderr(), sd_do_pedido(p))
+    return SAIDA_USO
+}
+
+// C: nativo/nativo.c:552
+proc usa_pdb(m: ^Montagem) -> bool {
+    return (common.c2f_b2i32(usa_dwarf(m)) != 0) and (common.c2f_s2u_32((m.alvo as ^x64.Alvo).formato) == (pefmt.IMAGEM_PE as u32))
+}
+
+// C: nativo/nativo.c:557
+proc preparar_code_view(m: ^Montagem) {
+    let saida: str = (m.pedido as ^NativoPedido).saida or_else ""
+    // _fullpath(absoluto, saida, 1092): so vale se o absoluto cabe com o NUL; senao, a saida crua cortada (snprintf)
+    var absoluto: str = common.c2f_cortar(saida, NATIVO_TAM_CAMINHO_PDB as int - 9)
+    switch caminho_abs in os.abs_path(saida, alloc = heap) {
+    case str:
+        if len(caminho_abs) < (NATIVO_TAM_CAMINHO_PDB as int - 8) {
+            delete(absoluto)
+            absoluto = caminho_abs
+        } else {
+            delete(caminho_abs)
+        }
+    case os.OsError:
+        // _fullpath falhou: fica a saida crua cortada (o mesmo fallback do snprintf)
+    }
+    var ponto: int = -1
+    var barra: int = -1
+    for k in (0 as int)..<len(absoluto) {
+        let letra: str = absoluto[k..<(k + 1)]
+        if letra == "." {
+            ponto = k
+        }
+        if letra == "\\" {
+            barra = k
+        }
+    }
+    var base_pdb: str = absoluto
+    if (ponto >= 0) and (ponto > barra) {
+        base_pdb = absoluto[0..<ponto]
+    }
+    m.pdb_caminho = format(f"{base_pdb}.pdb", alloc = frame)
+    m.imagem.pdb_caminho = m.pdb_caminho
+    m.imagem.cv_guid = &m.pdb_guid[0]
+    delete(absoluto)
+}
+
+// C: nativo/nativo.c:575
+proc escrever_imagem(m: ^Montagem) -> bool {
+    let alvo: ^x64.Alvo = m.alvo as ^x64.Alvo
+    if alvo.formato == pefmt.IMAGEM_MACHO {
+        // plataforma do LC_BUILD_VERSION: 7 = simulador, 2 = aparelho; o identificador da assinatura e o nome do arquivo de saida
+        var plataforma: u32 = 2
+        if (alvo.nome or_else "") == "aarch64-apple-ios-sim" {
+            plataforma = 7
+        }
+        return obj.ligar_macho(&m.imagem, nome_do_arquivo((m.pedido as ^NativoPedido).saida or_else ""), plataforma, &m.exe, &m.erro)
+    }
+    if common.c2f_s2u_32((m.alvo as ^x64.Alvo).formato) == (pefmt.IMAGEM_ELF as u32) {
+        return pefmt.elf_escrever(&m.imagem, &m.exe, &m.erro)
+    }
+    if usa_pdb(m) {
+        preparar_code_view(m)
+    }
+    return pefmt.pe_escrever(&m.imagem, &m.exe, &m.erro)
+}
+
+// C: nativo/nativo.c:585
+proc gravar_pdb(m: ^Montagem) -> i32 {
+    let pedido: ^NativoPedido = m.pedido as ^NativoPedido
+    let caminho_pdb: str = m.pdb_caminho or_else ""
+    var inicio_base: int = 0
+    for k in (0 as int)..<len(caminho_pdb) {
+        if caminho_pdb[k..<(k + 1)] == "\\" {
+            inicio_base = k + 1
+        }
+    }
+    let base: str = caminho_pdb[inicio_base..<len(caminho_pdb)]
+    // modulo = "%.*s.obj": tira os 4 ultimos bytes (".pdb") do nome base; sem eles, o nome inteiro
+    var sem_extensao: str = base
+    if len(base) >= 4 {
+        sem_extensao = base[0..<(len(base) - 4)]
+    }
+    let modulo_bruto: str = format(f"{sem_extensao}.obj", alloc = heap)
+    defer delete(modulo_bruto)
+    let modulo_txt: str = common.c2f_cortar(modulo_bruto, NATIVO_TAM_MODULO_PDB as int - 1)
+    defer delete(modulo_txt)
+    var p = dbg.PdbParametros{guid = m.pdb_guid, idade = pefmt.PE_CV_IDADE, dbg = &m.dbg, tipos = pedido.tipos, ir = pedido.ir, nomes = pedido.nomes, fonte = pedido.fonte, exe = &m.exe, modulo = modulo_txt, codigo_tam = m.imagem.runtime_texto_rva - m.imagem.secoes[0].rva}
+    var pdb = make([dynamic]u8, alloc = heap)
+    defer delete(pdb)
+    if not dbg.pdb_escrever(&p, &pdb) {
+        common.falha_interna(format(f"pdb: o PDB de '{caminho_pdb}' nao coube no MSF", alloc = frame))
+    }
+    let dados_pdb: str = from_bytes(pdb[..], alloc = heap)
+    defer delete(dados_pdb)
+    var err: i32 = 0
+    var codigo: i32 = SAIDA_OK
+    if not common.arquivo_gravar_atomico_sem_descarga(caminho_pdb, dados_pdb, len(pdb) as u64, &err) {
+        codigo = relatar_falha_de_gravacao(m.pedido as ^NativoPedido, m.pdb_caminho, err)
+    }
+    return codigo
+}
+
+// C: nativo/nativo.c:607
+proc escrever_exe(m: ^Montagem) -> i32 {
+    let t0: u64 = common.relogio_ns()
+    var err: i32 = 0
+    var codigo: i32 = SAIDA_OK
+    let alvo: ^x64.Alvo = m.alvo as ^x64.Alvo
+    if alvo.sem_escritor != none {
+        return recusar_com_x0003(m.pedido as ^NativoPedido, alvo.sem_escritor)
+    }
+    let ok: bool = (not injetou(m, ETAPA_ESCREVER)) and escrever_imagem(m)
+    if not ok {
+        return relatar_erro(m)
+    }
+    let pedido: ^NativoPedido = m.pedido as ^NativoPedido
+    let dados_exe: str = from_bytes(m.exe[..], alloc = heap)
+    defer delete(dados_exe)
+    if not common.arquivo_gravar_atomico(pedido.saida, dados_exe, len(m.exe) as u64, &err) {
+        codigo = relatar_falha_de_gravacao(pedido, pedido.saida, err)
+    }
+    let tempos_m: ^NativoTempos = m.tempos as ^NativoTempos
+    tempos_m.escrever_ns = common.relogio_ns() - t0
+    return codigo
+}
+
+// C: nativo/nativo.c:626
+proc fechar_tempos(m: ^Montagem) {
+    nativo_tempos_fechar(m.tempos as ^NativoTempos)
+    let ptr_1: ^NativoTempos = m.tempos as ^NativoTempos
+    ptr_1.linhas = common.fonte_contar_linhas((m.pedido as ^NativoPedido).fonte as ^common.Fonte)
+}
+
+// C: nativo/nativo.c:633
+proc gravar_depuracao(m: ^Montagem) -> i32 {
+    let pedido: ^NativoPedido = m.pedido as ^NativoPedido
+    let json: bool = (m.itens & DEBUG_JSON) != 0
+    var modo_txt: str = "dev"
+    if pedido.modo == (bir.BM_RELEASE as u8) {
+        modo_txt = "release"
+    }
+    var entrada = DebugEntrada{mascara = m.itens, versao = pedido.versao, modo = modo_txt, alvo = (m.alvo as ^x64.Alvo).nome, fonte = pedido.fonte, bir = &m.bir_txt, otim = &m.otim_txt, passes = &m.passes_txt, locais = &m.locais_txt, lista = &m.lista, codigo = &m.codigo, runtime = &m.runtime, imagem = &m.imagem, tempos = m.tempos, tam_exe = len(m.exe) as u64, procs_total = m.bir.procs_total, procs_gerados = m.bir.procs_gerados, pedido = m.pedido, programa = &m.bir}
+    if m.dbg_vivo {
+        entrada.dbg = &m.dbg
+    }
+    var texto = make([dynamic]u8, alloc = heap)
+    defer delete(texto)
+    var err: i32 = 0
+    var codigo: i32 = SAIDA_OK
+    if (m.itens & DEBUG_TEMPOS) != 0 {
+        fechar_tempos(m)
+    }
+    var extensao: str = "txt"
+    if json {
+        extensao = "jsonl"
+    }
+    let saida_txt: str = pedido.saida or_else ""
+    let caminho_bruto: str = format(f"{saida_txt}.debug.{extensao}", alloc = heap)
+    defer delete(caminho_bruto)
+    let caminho: str = common.c2f_cortar(caminho_bruto, NATIVO_TAM_CAMINHO_DEBUG as int)
+    defer delete(caminho)
+    if json {
+        debug_montar_json(&entrada, &texto)
+    } else {
+        debug_montar(&entrada, &texto)
+    }
+    let dados_texto: str = from_bytes(texto[..], alloc = heap)
+    defer delete(dados_texto)
+    if not common.arquivo_gravar_atomico(caminho, dados_texto, len(texto) as u64, &err) {
+        codigo = relatar_falha_de_gravacao(m.pedido as ^NativoPedido, caminho, err)
+    }
+    return codigo
+}
+
+// C: nativo/nativo.c:659
+proc gravar_entradas(m: ^Montagem) -> i32 {
+    var err: i32 = 0
+    if nativo_entradas_gravar(m.pedido as ^NativoPedido, &m.libs, &err) {
+        return SAIDA_OK
+    }
+    return relatar_falha_de_gravacao(m.pedido as ^NativoPedido, (m.pedido as ^NativoPedido).entradas, err)
+}
+
+// C: nativo/nativo.c:669
+proc gravar_complementos(m: ^Montagem) -> i32 {
+    var codigo: i32 = SAIDA_OK
+    if usa_pdb(m) {
+        codigo = gravar_pdb(m)
+    }
+    if (codigo == SAIDA_OK) and (m.itens != 0) {
+        codigo = gravar_depuracao(m)
+    }
+    if (codigo == SAIDA_OK) and ((m.pedido as ^NativoPedido).entradas != none) {
+        codigo = gravar_entradas(m)
+    }
+    return codigo
+}
+
+// C: nativo/nativo.c:683
+proc montar_codigo(m: ^Montagem) -> i32 {
+    if (not construir_bir(m)) or (not gerar_codigo(m)) {
+        return relatar_erro(m)
+    }
+    if (m.itens & DEBUG_BIR) != 0 {
+        bir.bir_imprimir(&m.bir, &m.bir_txt)
+    }
+    if (m.itens & DEBUG_LOCAIS) != 0 {
+        bir.bir_imprimir_locais(&m.bir, &m.locais_txt)
+    }
+    return SAIDA_OK
+}
+
+// Grava o modulo .wasm gerado em `-o` (mesmo caminho atomico do exe)
+proc escrever_modulo_wasm(m: ^Montagem) -> i32 {
+    var err: i32 = 0
+    var codigo: i32 = SAIDA_OK
+    let pedido: ^NativoPedido = m.pedido as ^NativoPedido
+    let dados: str = from_bytes(m.exe[..], alloc = heap)
+    defer delete(dados)
+    if not common.arquivo_gravar_atomico(pedido.saida, dados, len(m.exe) as u64, &err) {
+        codigo = relatar_falha_de_gravacao(pedido, pedido.saida, err)
+    }
+    return codigo
+}
+
+// Alvo wasm32-wasip1: BIR (sem passes do x64) -> modulo .wasm; nao usa ligador nem runtime COFF
+proc montar_wasm(m: ^Montagem) -> i32 {
+    if not construir_bir(m) {
+        return relatar_erro(m)
+    }
+    if (m.itens & DEBUG_BIR) != 0 {
+        bir.bir_imprimir(&m.bir, &m.bir_txt)
+    }
+    if not wasm.wasm_gerar(&m.bir, &m.exe, &m.erro) {
+        if m.itens != 0 {
+            _ = gravar_depuracao(m) // a BIR que o gerador recusou ajuda a entender a recusa
+        }
+        return relatar_erro(m)
+    }
+    var codigo: i32 = escrever_modulo_wasm(m)
+    if (codigo == SAIDA_OK) and (m.itens != 0) {
+        codigo = gravar_depuracao(m)
+    }
+    return codigo
+}
+
+// C: nativo/nativo.c:694
+proc montar(m: ^Montagem) -> i32 {
+    if (m.alvo as ^x64.Alvo).formato == pefmt.IMAGEM_WASM {
+        return montar_wasm(m)
+    }
+    var codigo: i32 = montar_codigo(m)
+    if (codigo == SAIDA_OK) and (not ligar_imagem(m)) {
+        codigo = relatar_erro(m)
+    }
+    if codigo == SAIDA_OK {
+        codigo = escrever_exe(m)
+    }
+    if codigo == SAIDA_OK {
+        codigo = gravar_complementos(m)
+    }
+    return codigo
+}
+
+// C: nativo/nativo.c:707
+proc liberar_montagem(m: ^Montagem) {
+    if m.bir_viva {
+        bir.bir_liberar(&m.bir)
+    }
+    obj.obj_liberar(&m.codigo)
+    obj.obj_liberar(&m.runtime)
+    obj.obj_liberar(&m.ryu)
+    obj.obj_liberar(&m.terceiros)
+    obj.obj_liberar(&m.legado)
+    obj.obj_liberar(&m.curto)
+    obj.obj_liberar(&m.math)
+    obj.obj_liberar(&m.es)
+    obj.obj_liberar(&m.thread)
+    obj.obj_liberar(&m.sync)
+    obj.obj_liberar(&m.atomic)
+    obj.obj_liberar(&m.varena)
+    obj.obj_liberar(&m.net)
+    obj.obj_liberar(&m.entrada)
+    obj.obj_liberar(&m.semente)
+    obj.obj_liberar(&m.perfil)
+    pefmt.imagem_liberar(&m.imagem)
+    obj.bibliotecas_liberar(&m.libs)
+    biblioteca_falha_liberar(&m.falha_lib)
+    delete(m.exe)
+    if m.links_din_vivo {
+        delete(m.links_din)
+    }
+    delete(m.bir_txt)
+    delete(m.locais_txt)
+    delete(m.otim_txt)
+    delete(m.passes_txt)
+    alvo_listagem_liberar(&m.lista)
+    if m.dbg_vivo {
+        dbg.dbg_liberar(&m.dbg)
+    }
+}
+
+// C: nativo/nativo.c:738
+proc iniciar_tempos(t: ?^NativoTempos) {
+    var novo: NativoTempos = NativoTempos{lex_ns = (t as ^NativoTempos).lex_ns, parse_ns = (t as ^NativoTempos).parse_ns, check_ns = (t as ^NativoTempos).check_ns, ir_ns = (t as ^NativoTempos).ir_ns, inicio_ns = (t as ^NativoTempos).inicio_ns}
+    if novo.inicio_ns == 0 {
+        novo.inicio_ns = common.relogio_ns()
+    }
+    let p_1 = t as ^NativoTempos
+    p_1^ = novo
+}
+
+// C: nativo/nativo.c:748
+proc recusa_do_alvo(pedido: ^NativoPedido, alvo: ?^x64.Alvo) -> ?str {
+    if (common.c2f_b2i32(pedido.dll) != 0) and (not (alvo as ^x64.Alvo).dll) {
+        return NATIVO_X0003_SO
+    }
+    if pedido.dll and (alvo as ^x64.Alvo).dinamico and ((alvo as ^x64.Alvo).formato == pefmt.IMAGEM_ELF) and (not nome_de_so_android(nome_do_arquivo(pedido.saida or_else ""))) {
+        return "o --modo dll do aarch64-linux-android pede -o libNOME.so (o nome do arquivo vira o DT_SONAME)"
+    }
+    return none
+}
+
+// A4.2: libNOME.so (o Android procura a lib pelo SONAME)
+proc nome_de_so_android(nome: str) -> bool {
+    return (len(nome) > 6) and (nome[0..<3] == "lib") and (nome[(len(nome) - 3)..<len(nome)] == ".so")
+}
+
+// C: nativo/nativo.c:756
+proc escolher_alvo(pedido: ^NativoPedido, recusa: ^?str) -> ?^x64.Alvo {
+    let alvo: ?^x64.Alvo = alvo_por_nome(pedido.alvo or_else NATIVO_ALVO_PADRAO)
+    if alvo == none {
+        recusa^ = "alvo desconhecido no backend nativo"
+    } else {
+        recusa^ = recusa_do_alvo(pedido, alvo)
+    }
+    return alvo
+}
+
+// C: nativo/nativo.c:764
+pub proc nativo_construir_exe(pedido: ^NativoPedido) -> i32 {
+    var itens: u32 = 0
+    var causa_debug: [300]u8 = {}
+    if (pedido.debug_code != none) and (not debug_itens(pedido.debug_code, &itens, causa_debug[..], 300)) {
+        return recusar_com_x0003(pedido, from_bytes(causa_debug[0..<common.c2f_strlen_b(causa_debug[..])], alloc = frame))
+    }
+    var recusa: ?str = none
+    let alvo: ?^x64.Alvo = escolher_alvo(pedido, &recusa)
+    if recusa != none {
+        return recusar_com_x0003(pedido, recusa)
+    }
+    if ((alvo as ^x64.Alvo).formato == pefmt.IMAGEM_WASM) or ((alvo as ^x64.Alvo).arq == 1) {
+        let so_x64: u32 = DEBUG_ASM | DEBUG_QUADROS | DEBUG_RELOC | DEBUG_FORMATO | DEBUG_LINHAS | DEBUG_INTERFACE | DEBUG_PERFIL
+        if (itens & so_x64) != 0 {
+            if itens != (DEBUG_JSON | DEBUG_TODOS_ITENS) {
+                return recusar_com_x0003(pedido, "--debug-code asm|quadros|reloc|formato|linhas|interface|perfil so existem nos alvos x86_64; no wasm32-wasip1 e aarch64-linux valem bir,tempos,json,locais,otim,passes")
+            }
+            itens = itens & (~so_x64) // json sozinho = todos os itens que o alvo tem
+        }
+    }
+    var descarte = NativoTempos{}
+    var tempos_ativos: ?^NativoTempos = &descarte
+    if pedido.tempos != none {
+        tempos_ativos = pedido.tempos
+    }
+    iniciar_tempos(tempos_ativos)
+    var m = Montagem{pedido = pedido, alvo = alvo, tempos = tempos_ativos, itens = itens, exe = make([dynamic]u8, alloc = heap), bir_txt = make([dynamic]u8, alloc = heap), locais_txt = make([dynamic]u8, alloc = heap), otim_txt = make([dynamic]u8, alloc = heap), passes_txt = make([dynamic]u8, alloc = heap)}
+    obj.obj_iniciar(&m.codigo)
+    obj.obj_iniciar(&m.runtime)
+    obj.obj_iniciar(&m.ryu)
+    obj.obj_iniciar(&m.terceiros)
+    obj.obj_iniciar(&m.legado)
+    obj.obj_iniciar(&m.curto)
+    obj.obj_iniciar(&m.math)
+    obj.obj_iniciar(&m.es)
+    obj.obj_iniciar(&m.thread)
+    obj.obj_iniciar(&m.sync)
+    obj.obj_iniciar(&m.atomic)
+    obj.obj_iniciar(&m.varena)
+    obj.obj_iniciar(&m.net)
+    obj.obj_iniciar(&m.entrada)
+    obj.obj_iniciar(&m.semente)
+    obj.obj_iniciar(&m.perfil)
+    pefmt.imagem_iniciar(&m.imagem)
+    alvo_listagem_iniciar(&m.lista)
+    let codigo: i32 = montar(&m)
+    liberar_montagem(&m)
+    return codigo
+}
+
+test "nativo_nome_do_arquivo_depois_do_ultimo_separador" {
+    expect(nome_do_arquivo("C:\\pasta\\sub\\prog.exe") == "prog.exe")
+    expect(nome_do_arquivo("pasta/lib.dll") == "lib.dll")
+    expect(nome_do_arquivo("C:\\pasta/mista\\x.exe") == "x.exe")
+    expect(nome_do_arquivo("sem_pasta.exe") == "sem_pasta.exe")
+    expect(nome_do_arquivo("termina\\") == "")
+}

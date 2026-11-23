@@ -1,0 +1,986 @@
+// nativo/x64/x64_isel_otim.fj - porte de compiler/nativo/x64/x64_isel_otim.c, compiler/nativo/x64/x64_isel_otim.h
+// sha256 de nativo/x64/x64_isel_otim.c: 52bf78e93d180be93b2b8f782dc02976d25e711b67bd4e345a91bdbda63f52d6
+// sha256 de nativo/x64/x64_isel_otim.h: ffd75a52afe5a8bde9423e47ff2e1f71748750dd87ae5972a116d39adbf0355a
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "common"
+import "nativo/bir"
+
+// a e b sao COPIAS dos operandos (nao ponteiros): ponteiro para parametro nao pode sair do proc (E0706).
+// Os operandos nao mudam durante a selecao, entao a copia le o mesmo valor que o C le pelo ponteiro.
+struct ContaOtim {
+    alvo: i32
+    a: bir.BirOperando
+    b: bir.BirOperando
+}
+
+const IMED_COLIDE_MIN: i32 = 516
+const IMED_COLIDE_MAX: i32 = 519
+const DESLOCA_CL: [2][2]u16 = {{71, 72}, {73, 74}}
+const DESLOCA_IMM: [2][2]u16 = {{77, 78}, {79, 80}}
+
+// C: nativo/x64/x64_isel_otim.c:17
+proc isel_otim_reg_destino(c: ^X64Ctx, vreg: u32) -> i32 {
+    var classe: u8 = 0
+    if (((c.f as ^bir.BirFuncao).reg_vreg == none) or (vreg >= (c.f as ^bir.BirFuncao).nvregs)) or (((c.f as ^bir.BirFuncao).reg_vreg or_else {})[vreg] == (bir.BIR_SEM_REG as u8)) {
+        return -1
+    }
+    classe = ((c.f as ^bir.BirFuncao).classe_vreg or_else {})[vreg]
+    var tern_1: i32 = -1
+    if ((classe as i32) >= bir.BC_I8) and ((classe as i32) <= bir.BC_I64) {
+        tern_1 = ((c.f as ^bir.BirFuncao).reg_vreg or_else {})[vreg] as i32
+    }
+    return tern_1
+}
+
+// C: nativo/x64/x64_isel_otim.c:27
+proc isel_otim_reg_int(c: ^X64Ctx, o: ?^bir.BirOperando) -> i32 {
+    var tern_1: i32 = -1
+    if (o as ^bir.BirOperando).tipo == (bir.BO_VREG as u8) {
+        tern_1 = isel_otim_reg_destino(c, (o as ^bir.BirOperando).id)
+    }
+    return tern_1
+}
+
+// C: nativo/x64/x64_isel_otim.c:32
+proc isel_otim_reg_xmm_destino(c: ^X64Ctx, vreg: u32) -> i32 {
+    var classe: u8 = 0
+    if (((c.f as ^bir.BirFuncao).reg_vreg == none) or (vreg >= (c.f as ^bir.BirFuncao).nvregs)) or (((c.f as ^bir.BirFuncao).reg_vreg or_else {})[vreg] == (bir.BIR_SEM_REG as u8)) {
+        return -1
+    }
+    classe = ((c.f as ^bir.BirFuncao).classe_vreg or_else {})[vreg]
+    var tern_1: i32 = -1
+    if common.c2f_b2i32(bir.bir_classe_eh_xmm(classe as i32)) != 0 {
+        tern_1 = ((c.f as ^bir.BirFuncao).reg_vreg or_else {})[vreg] as i32
+    }
+    return tern_1
+}
+
+// C: nativo/x64/x64_isel_otim.c:42
+proc isel_otim_reg_xmm(c: ^X64Ctx, o: ^bir.BirOperando) -> i32 {
+    var tern_1: i32 = -1
+    if o.tipo == (bir.BO_VREG as u8) {
+        tern_1 = isel_otim_reg_xmm_destino(c, o.id)
+    }
+    return tern_1
+}
+
+// C: nativo/x64/x64_isel_otim.c:47
+proc isel_otim_temp_unico(c: ^X64Ctx, vreg: u32) -> bool {
+    // C: usos == NULL sem BirFuncao.isel_otim; aqui o slice vazio faz o papel do NULL
+    if len(c.usos) == 0 {
+        return false
+    }
+    return (vreg < (c.f as ^bir.BirFuncao).nvregs) and (c.usos[vreg] == 1) and (c.defs[vreg] == 1)
+}
+
+// C: nativo/x64/x64_isel_otim.c:52
+proc isel_otim_fonte(c: ^X64Ctx, o: ^bir.BirOperando, rascunho: i32, ok: ^bool) -> i32 {
+    let r: i32 = isel_otim_reg_int(c, o)
+    if r >= 0 {
+        ok^ = true
+        return r
+    }
+    ok^ = isel_carregar(c, rascunho, o, bir.BE_NENHUMA as u8)
+    return rascunho
+}
+
+// C: nativo/x64/x64_isel_otim.c:64
+proc isel_otim_carregar_em(c: ^X64Ctx, reg: i32, o: ^bir.BirOperando, ext: u8) -> bool {
+    if (ext != (bir.BE_SINAL as u8)) and (isel_otim_reg_int(c, o) == reg) {
+        return true
+    }
+    return isel_carregar(c, reg, o, ext)
+}
+
+// C: nativo/x64/x64_isel_otim.c:71
+proc isel_otim_encodavel(mem_c: ^MOperando) -> bool {
+    var troca: i32 = 0
+    if ((mem_c.escala == 0) or (mem_c.desloc != 0)) or ((common.c2f_s2u_32(mem_c.base) & 7) != 5) {
+        return true
+    }
+    if (mem_c.escala != 1) or ((common.c2f_s2u_32(mem_c.indice) & 7) == 5) {
+        return false
+    }
+    troca = mem_c.base
+    mem_c.base = mem_c.indice
+    mem_c.indice = troca
+    return true
+}
+
+// C: nativo/x64/x64_isel_otim.c:85
+proc isel_otim_imediato(o: ^bir.BirOperando, valor: ^i64) -> bool {
+    if (o.tipo != (bir.BO_IMED as u8)) or ((o.classe != (bir.BC_I32 as u8)) and (o.classe != (bir.BC_I64 as u8))) {
+        return false
+    }
+    var tern_1: i64 = o.imed
+    if o.classe == (bir.BC_I32 as u8) {
+        tern_1 = common.c2f_trunc_i32(common.c2f_s2u_64(o.imed)) as i64
+    }
+    valor^ = tern_1
+    return (valor^ >= (((-2147483647) - 1) as i64)) and (valor^ <= 2147483647)
+}
+
+// C: nativo/x64/x64_isel_otim.c:93
+proc isel_otim_potencia_de2(o: ^bir.BirOperando, k: ^u8) -> bool {
+    if (o.tipo != (bir.BO_IMED as u8)) or ((o.classe != (bir.BC_I32 as u8)) and (o.classe != (bir.BC_I64 as u8))) {
+        return false
+    }
+    // C: (uint32_t)imed para I32 e (uint64_t)imed para I64; a mascara vem antes do cast (R0002 em dev)
+    var v: u64 = 0
+    if o.classe == (bir.BC_I32 as u8) {
+        v = common.c2f_trunc_u32(common.c2f_s2u_64(o.imed)) as u64
+    } else {
+        v = common.c2f_s2u_64(o.imed)
+    }
+    if (v == 0) or ((v & (v - 1)) != 0) {
+        return false
+    }
+    k^ = trailing_zeros(v) as u8
+    return true
+}
+
+// C: nativo/x64/x64_isel_otim.c:106
+// C2F-13: usos fundido em nvregs (len)
+proc contar_operando(o: ^bir.BirOperando, usos: []u8) {
+    if ((o.tipo == (bir.BO_VREG as u8)) and (o.id < (len(usos) as u32))) and ((usos[o.id] as i32) < 255) {
+        usos[o.id] += 1
+    }
+}
+
+// C: nativo/x64/x64_isel_otim.c:112
+// C2F-INDECIDIVEL: usos, defs
+proc isel_otim_contar_usos(f: ^bir.BirFuncao, usos: []u8, defs: []u8) {
+    var v: u32 = 0
+    while v < f.nvregs {
+        usos[v] = 0
+        var tern_1: u32 = 0
+        if v < f.nparams {
+            tern_1 = 1
+        }
+        defs[v] = tern_1 as u8
+        v += 1
+    }
+    var b: u32 = 0
+    while b < f.nblocos {
+        var k: u32 = 0
+        while k < f.blocos[b].n {
+            let i: ^bir.BirInstr = &f.blocos[b].instrs[k]
+            if ((i.dst != bir.BIR_SEM_VREG) and (i.dst < f.nvregs)) and ((defs[i.dst] as i32) < 255) {
+                defs[i.dst] += 1
+            }
+            contar_operando(&i.a, usos[0..<f.nvregs])
+            contar_operando(&i.b, usos[0..<f.nvregs])
+            for n in (0 as u32)..<i.nargs {
+                contar_operando(&(i.args or_else {})[n], usos[0..<f.nvregs])
+            }
+            k += 1
+        }
+        b += 1
+    }
+}
+
+// C: nativo/x64/x64_isel_otim.c:132
+proc classe_de_conta(classe: u8) -> bool {
+    return (classe == (bir.BC_I32 as u8)) or (classe == (bir.BC_I64 as u8))
+}
+
+// C: nativo/x64/x64_isel_otim.c:137
+proc eh_vreg(o: ^bir.BirOperando) -> bool {
+    return o.tipo == (bir.BO_VREG as u8)
+}
+
+// C: nativo/x64/x64_isel_otim.c:142
+proc mesmo_vreg(x: ^bir.BirOperando, y: ^bir.BirOperando) -> bool {
+    return ((common.c2f_b2i32(eh_vreg(x)) != 0) and (common.c2f_b2i32(eh_vreg(y)) != 0)) and (x.id == y.id)
+}
+
+// C: nativo/x64/x64_isel_otim.c:147
+proc comutativa(op: u8) -> bool {
+    return ((((op == (bir.BIR_ADD as u8)) or (op == (bir.BIR_MUL as u8))) or (op == (bir.BIR_AND as u8))) or (op == (bir.BIR_OR as u8))) or (op == (bir.BIR_XOR as u8))
+}
+
+// C: nativo/x64/x64_isel_otim.c:153
+proc fechar(c: ^X64Ctx, dst: u32, alvo: i32, r: i32) -> i32 {
+    if (r <= 0) or (common.c2f_s2u_32(alvo) != (X64_RAX as u32)) {
+        return r
+    }
+    var tern_1: i32 = -1
+    if common.c2f_b2i32(isel_guardar(c, dst, X64_RAX)) != 0 {
+        tern_1 = 1
+    }
+    return tern_1
+}
+
+// C: nativo/x64/x64_isel_otim.c:165
+proc preparar_conta(c: ^X64Ctx, i: ^bir.BirInstr) -> ContaOtim {
+    var k: ContaOtim = ContaOtim{alvo = X64_RAX, a = i.a, b = i.b}
+    let destino: i32 = isel_otim_reg_destino(c, i.dst)
+    if comutativa(i.op) and (i.a.tipo == (bir.BO_IMED as u8)) and (i.b.tipo != (bir.BO_IMED as u8)) {
+        k.a = i.b
+        k.b = i.a
+    }
+    if destino < 0 {
+        return k
+    }
+    k.alvo = destino
+    // C: b mora no registrador do dst; so a comutativa com a sem imediato troca de lugar, senao calcula em rax
+    if (isel_otim_reg_int(c, &k.b) != destino) or mesmo_vreg(&k.a, &k.b) {
+        return k
+    }
+    if (not comutativa(i.op)) or (k.a.tipo == (bir.BO_IMED as u8)) {
+        k.alvo = X64_RAX
+        return k
+    }
+    let no_alvo: bir.BirOperando = k.b
+    k.b = k.a
+    k.a = no_alvo
+    return k
+}
+
+// C: nativo/x64/x64_isel_otim.c:193
+proc tentar_lea(c: ^X64Ctx, i: ^bir.BirInstr, k: ^ContaOtim) -> i32 {
+    let ra: i32 = isel_otim_reg_int(c, &k.a)
+    let rb: i32 = isel_otim_reg_int(c, &k.b)
+    var imm: i64 = 0
+    var mem_c: MOperando = MOperando{}
+    if ((((i.op != (bir.BIR_ADD as u8)) and (i.op != (bir.BIR_SUB as u8))) or (i.classe != (bir.BC_I64 as u8))) or (ra < 0)) or (ra == k.alvo) {
+        return 0
+    }
+    if (common.c2f_b2i32(isel_otim_imediato(&k.b, &imm)) != 0) and (not ((i.op == (bir.BIR_SUB as u8)) and (imm == (((-2147483647) - 1) as i64)))) {
+        var tern_1: i64 = imm
+        if i.op == (bir.BIR_SUB as u8) {
+            tern_1 = -imm
+        }
+        mem_c = m_mem(ra, tern_1 as i32, 64)
+    } else if ((i.op == (bir.BIR_ADD as u8)) and (rb >= 0)) and (rb != k.alvo) {
+        mem_c = m_mem(ra, 0, 64)
+        mem_c.indice = rb
+        mem_c.escala = 1
+    } else {
+        return 0
+    }
+    if not isel_otim_encodavel(&mem_c) {
+        return 0
+    }
+    var tern_2: i32 = -1
+    if common.c2f_b2i32(x64_emitir(c, mi2(FX_LEA64_RM as u16, m_reg(k.alvo, 64), mem_c))) != 0 {
+        tern_2 = 1
+    }
+    return tern_2
+}
+
+// C: nativo/x64/x64_isel_otim.c:215
+proc mul_por_potencia_de2(c: ^X64Ctx, i: ^bir.BirInstr, k: ^ContaOtim, pot: u8) -> i32 {
+    let larg: u8 = isel_indice_largura(i.classe)
+    var bits: u8 = 32
+    var forma: u16 = FX_SHL32_RI as u16
+    if larg == 1 {
+        bits = 64
+        forma = FX_SHL64_RI as u16
+    }
+    if not isel_otim_carregar_em(c, k.alvo, &k.a, bir.BE_NENHUMA as u8) {
+        return -1
+    }
+    if pot == 0 {
+        return 1
+    }
+    if x64_emitir(c, mi2(forma, m_reg(k.alvo, bits), m_imed(pot as i64))) {
+        return 1
+    }
+    return -1
+}
+
+// C: nativo/x64/x64_isel_otim.c:225
+proc mul_por_lea(c: ^X64Ctx, k: ^ContaOtim, v: i64) -> i32 {
+    let ra: i32 = isel_otim_reg_int(c, &k.a)
+    var mem_c: MOperando = MOperando{}
+    if (ra < 0) or (((v != 3) and (v != 5)) and (v != 9)) {
+        return 0
+    }
+    mem_c = m_mem(ra, 0, 64)
+    mem_c.indice = ra
+    mem_c.escala = (v - 1) as u8
+    if not isel_otim_encodavel(&mem_c) {
+        return 0
+    }
+    var tern_1: i32 = -1
+    if common.c2f_b2i32(x64_emitir(c, mi2(FX_LEA64_RM as u16, m_reg(k.alvo, 64), mem_c))) != 0 {
+        tern_1 = 1
+    }
+    return tern_1
+}
+
+// C: nativo/x64/x64_isel_otim.c:241
+proc mul_por_imediato(c: ^X64Ctx, i: ^bir.BirInstr, k: ^ContaOtim, v: i64) -> i32 {
+    let larg: u8 = isel_indice_largura(i.classe)
+    var bits: u8 = 32
+    var forma: u16 = FX_IMUL32_RRI as u16
+    if larg == 1 {
+        bits = 64
+        forma = FX_IMUL64_RRI as u16
+    }
+    // imul com imediato de 0x204..0x207 colide com AH..BH no fadec (x64_codificar.c)
+    if (v >= (IMED_COLIDE_MIN as i64)) and (v <= (IMED_COLIDE_MAX as i64)) {
+        return 0
+    }
+    var ok: bool = false
+    let fonte: i32 = isel_otim_fonte(c, &k.a, k.alvo, &ok)
+    if not ok {
+        return -1
+    }
+    if x64_emitir(c, mi3(forma, m_reg(k.alvo, bits), m_reg(fonte, bits), m_imed(v))) {
+        return 1
+    }
+    return -1
+}
+
+// C: nativo/x64/x64_isel_otim.c:257
+proc mul_por_constante(c: ^X64Ctx, i: ^bir.BirInstr, k: ^ContaOtim, v: i64) -> i32 {
+    var pot: u8 = 0
+    var r: i32 = 0
+    if v == 0 {
+        if x64_emitir(c, mi2(FX_XOR32_RR as u16, m_reg(k.alvo, 32), m_reg(k.alvo, 32))) {
+            return 1
+        }
+        return -1
+    }
+    if (v > 0) and isel_otim_potencia_de2(&k.b, &pot) {
+        return mul_por_potencia_de2(c, i, k, pot)
+    }
+    if i.classe == (bir.BC_I64 as u8) {
+        r = mul_por_lea(c, k, v)
+    }
+    if r != 0 {
+        return r
+    }
+    return mul_por_imediato(c, i, k, v)
+}
+
+// C: nativo/x64/x64_isel_otim.c:270
+proc tentar_mul_imediato(c: ^X64Ctx, i: ^bir.BirInstr, k: ^ContaOtim) -> i32 {
+    var v: i64 = 0
+    if (i.op != (bir.BIR_MUL as u8)) or (not isel_otim_imediato(&k.b, &v)) {
+        return 0
+    }
+    return mul_por_constante(c, i, k, v)
+}
+
+// C: nativo/x64/x64_isel_otim.c:280
+// C: nativo/x64/x64_isel.c:34 (FORMAS_ARIT, extern em x64_interno.h). Copia das 7 entradas listadas no C; as outras ficam zero, como la.
+proc formas_de_operacao(op: u8) -> FormasAritmeticas {
+    if op == (bir.BIR_ADD as u8) {
+        return FormasAritmeticas{rr = {FX_ADD32_RR as u16, FX_ADD64_RR as u16}, ri = {FX_ADD32_RI as u16, FX_ADD64_RI as u16}}
+    }
+    if op == (bir.BIR_SUB as u8) {
+        return FormasAritmeticas{rr = {FX_SUB32_RR as u16, FX_SUB64_RR as u16}, ri = {FX_SUB32_RI as u16, FX_SUB64_RI as u16}}
+    }
+    if op == (bir.BIR_AND as u8) {
+        return FormasAritmeticas{rr = {FX_AND32_RR as u16, FX_AND64_RR as u16}, ri = {FX_AND32_RI as u16, FX_AND64_RI as u16}}
+    }
+    if op == (bir.BIR_OR as u8) {
+        return FormasAritmeticas{rr = {FX_OR32_RR as u16, FX_OR64_RR as u16}, ri = {FX_OR32_RI as u16, FX_OR64_RI as u16}}
+    }
+    if op == (bir.BIR_XOR as u8) {
+        return FormasAritmeticas{rr = {FX_XOR32_RR as u16, FX_XOR64_RR as u16}, ri = {FX_XOR32_RI as u16, FX_XOR64_RI as u16}}
+    }
+    if op == (bir.BIR_CMP as u8) {
+        return FormasAritmeticas{rr = {FX_CMP32_RR as u16, FX_CMP64_RR as u16}, ri = {FX_CMP32_RI as u16, FX_CMP64_RI as u16}}
+    }
+    if op == (bir.BIR_MUL as u8) {
+        // imul nao tem forma com imediato: FX_QTD marca "sem forma ri" (como no C)
+        return FormasAritmeticas{rr = {FX_IMUL32_RR as u16, FX_IMUL64_RR as u16}, ri = {FX_QTD as u16, FX_QTD as u16}}
+    }
+    return FormasAritmeticas{}
+}
+
+// C: nativo/x64/x64_isel_otim.c:280
+proc conta_geral(c: ^X64Ctx, i: ^bir.BirInstr, k: ^ContaOtim) -> i32 {
+    let formas: FormasAritmeticas = formas_de_operacao(i.op)
+    let larg: u8 = isel_indice_largura(i.classe)
+    var bits: u8 = 32
+    if larg == 1 {
+        bits = 64
+    }
+    var imm: i64 = 0
+    var ok: bool = false
+    if not isel_otim_carregar_em(c, k.alvo, &k.a, bir.BE_NENHUMA as u8) {
+        return -1
+    }
+    if (formas.ri[larg] != (FX_QTD as u16)) and isel_otim_imediato(&k.b, &imm) {
+        if x64_emitir(c, mi2(formas.ri[larg], m_reg(k.alvo, bits), m_imed(imm))) {
+            return 1
+        }
+        return -1
+    }
+    let fonte: i32 = isel_otim_fonte(c, &k.b, X64_RCX, &ok)
+    if not ok {
+        return -1
+    }
+    if x64_emitir(c, mi2(formas.rr[larg], m_reg(k.alvo, bits), m_reg(fonte, bits))) {
+        return 1
+    }
+    return -1
+}
+
+// C: nativo/x64/x64_isel_otim.c:299
+proc isel_otim_aritmetica(c: ^X64Ctx, i: ^bir.BirInstr) -> i32 {
+    var k: ContaOtim = ContaOtim{}
+    var r: i32 = 0
+    if ((not classe_de_conta(i.classe)) or ((i.a.classe as i32) != (i.classe as i32))) or ((i.b.classe as i32) != (i.classe as i32)) {
+        return 0
+    }
+    k = preparar_conta(c, i)
+    r = tentar_lea(c, i, &k)
+    if r == 0 {
+        r = tentar_mul_imediato(c, i, &k)
+    }
+    if r == 0 {
+        r = conta_geral(c, i, &k)
+    }
+    return fechar(c, i.dst, k.alvo, r)
+}
+
+// C: nativo/x64/x64_isel_otim.c:317
+proc condicao_do_ov_2(i: ^bir.BirInstr, base: u8) -> i32 {
+    var tern_1: i32 = X64_CC_B
+    if (i.aux == (bir.BIR_SINAL as u8)) or (base == (bir.BIR_MUL as u8)) {
+        tern_1 = X64_CC_O
+    }
+    return tern_1
+}
+
+// C: nativo/x64/x64_isel_otim.c:323
+proc mul_com_sinal(c: ^X64Ctx, i: ^bir.BirInstr, alvo: i32, k: ^ContaOtim) -> i32 {
+    let larg: u8 = isel_indice_largura(i.classe)
+    var bits: u8 = 32
+    if larg == 1 {
+        bits = 64
+    }
+    var v: i64 = 0
+    var ok: bool = false
+    var fonte: i32 = 0
+    if (isel_otim_imediato(&k.b, &v)) and (not ((v >= (IMED_COLIDE_MIN as i64)) and (v <= (IMED_COLIDE_MAX as i64)))) {
+        fonte = isel_otim_fonte(c, &k.a, alvo, &ok)
+        if not ok {
+            return -1
+        }
+        var forma_ri: u16 = FX_IMUL32_RRI as u16
+        if larg == 1 {
+            forma_ri = FX_IMUL64_RRI as u16
+        }
+        if x64_emitir(c, mi3(forma_ri, m_reg(alvo, bits), m_reg(fonte, bits), m_imed(v))) {
+            return 1
+        }
+        return -1
+    }
+    if not isel_otim_carregar_em(c, alvo, &k.a, bir.BE_NENHUMA as u8) {
+        return -1
+    }
+    fonte = isel_otim_fonte(c, &k.b, X64_RCX, &ok)
+    if not ok {
+        return -1
+    }
+    var forma_rr: u16 = FX_IMUL32_RR as u16
+    if larg == 1 {
+        forma_rr = FX_IMUL64_RR as u16
+    }
+    if x64_emitir(c, mi2(forma_rr, m_reg(alvo, bits), m_reg(fonte, bits))) {
+        return 1
+    }
+    return -1
+}
+
+// C: nativo/x64/x64_isel_otim.c:345
+proc conta_do_ov(c: ^X64Ctx, i: ^bir.BirInstr, base: u8, k: ^ContaOtim) -> i32 {
+    if base == (bir.BIR_MUL as u8) {
+        return mul_com_sinal(c, i, k.alvo, k)
+    }
+    var lit_1 = bir.BirInstr{op = base, classe = i.classe}
+    return conta_geral(c, &lit_1, k)
+}
+
+// C: nativo/x64/x64_isel_otim.c:353
+proc isel_otim_overflow(c: ^X64Ctx, i: ^bir.BirInstr) -> i32 {
+    var base: u8 = bir.BIR_MUL as u8
+    if i.op == (bir.BIR_ADD_OV as u8) {
+        base = bir.BIR_ADD as u8
+    } else if i.op == (bir.BIR_SUB_OV as u8) {
+        base = bir.BIR_SUB as u8
+    }
+    let destino: i32 = isel_otim_reg_destino(c, i.dst)
+    var k: ContaOtim = ContaOtim{alvo = X64_RAX, a = i.a, b = i.b}
+    var r: i32 = 0
+    if (not classe_de_conta(i.classe)) or ((i.a.classe as i32) != (i.classe as i32)) or (destino < 0) {
+        return 0
+    }
+    if (base == (bir.BIR_MUL as u8)) and (i.aux == (bir.BIR_SEM_SINAL as u8)) {
+        return 0
+    }
+    if (destino == isel_otim_reg_int(c, &i.a)) or (destino == isel_otim_reg_int(c, &i.b)) {
+        return 0
+    }
+    if (base != (bir.BIR_SUB as u8)) and (i.a.tipo == (bir.BO_IMED as u8)) and (i.b.tipo != (bir.BO_IMED as u8)) {
+        k.a = i.b
+        k.b = i.a
+    }
+    k.alvo = destino
+    r = conta_do_ov(c, i, base, &k)
+    if r <= 0 {
+        return r
+    }
+    if x64_emitir(c, mi_cc(FX_JCC_REL32 as u16, condicao_do_ov_2(i, base), m_bloco(i.alvo[0]))) {
+        return 1
+    }
+    return -1
+}
+
+// C: nativo/x64/x64_isel_otim.c:380
+proc mover_imediato(c: ^X64Ctx, i: ^bir.BirInstr, d: i32, classe: u8) -> i32 {
+    // C: (uint64_t)(uint32_t)imed para I32 e (uint64_t)imed no resto (cast por c2f, sem R0002)
+    var v: u64 = 0
+    if classe == (bir.BC_I32 as u8) {
+        v = common.c2f_trunc_u32(common.c2f_s2u_64(i.a.imed)) as u64
+    } else {
+        v = common.c2f_s2u_64(i.a.imed)
+    }
+    if (i.a.classe != classe) or ((i.op != (bir.BIR_CONST as u8)) and (i.op != (bir.BIR_COPIA as u8)) and (i.op != (bir.BIR_TRUNC as u8))) {
+        return 0
+    }
+    if v == 0 {
+        if x64_emitir(c, mi2(FX_XOR32_RR as u16, m_reg(d, 32), m_reg(d, 32))) {
+            return 1
+        }
+        return -1
+    }
+    if v <= 4294967295 {
+        if x64_emitir(c, mi2(FX_MOV32_RI as u16, m_reg(d, 32), m_imed(common.c2f_trunc_i32(common.c2f_s2u_64(i.a.imed)) as i64))) {
+            return 1
+        }
+        return -1
+    }
+    if x64_emitir(c, mi2(FX_MOV64_RI as u16, m_reg(d, 64), m_imed(i.a.imed))) {
+        return 1
+    }
+    return -1
+}
+
+// C: nativo/x64/x64_isel_otim.c:394
+proc truncar_para32(c: ^X64Ctx, i: ^bir.BirInstr, d: i32) -> i32 {
+    var baixo: bir.BirOperando = i.a
+    let ra: i32 = isel_otim_reg_int(c, &i.a)
+    if ra >= 0 {
+        if x64_emitir(c, mi2(FX_MOV32_RR as u16, m_reg(d, 32), m_reg(ra, 32))) {
+            return 1
+        }
+        return -1
+    }
+    baixo.classe = bir.BC_I32 as u8
+    if isel_carregar(c, d, &baixo, bir.BE_NENHUMA as u8) {
+        return 1
+    }
+    return -1
+}
+
+// C: nativo/x64/x64_isel_otim.c:405
+proc estender_com_sinal(c: ^X64Ctx, i: ^bir.BirInstr, d: i32) -> i32 {
+    let ra: i32 = isel_otim_reg_int(c, &i.a)
+    if (i.a.classe == (bir.BC_I32 as u8)) and (ra >= 0) {
+        if x64_emitir(c, mi2(FX_MOVSXD64_RR32 as u16, m_reg(d, 64), m_reg(ra, 32))) {
+            return 1
+        }
+        return -1
+    }
+    if isel_otim_carregar_em(c, d, &i.a, bir.BE_SINAL as u8) {
+        return 1
+    }
+    return -1
+}
+
+// C: nativo/x64/x64_isel_otim.c:414
+proc mover_vreg(c: ^X64Ctx, i: ^bir.BirInstr, d: i32, classe: u8) -> i32 {
+    let origem: u8 = i.a.classe
+    if i.op == (bir.BIR_EXT_S as u8) {
+        var tern_1: i32 = 0
+        if ((classe == (bir.BC_I64 as u8)) and ((origem as i32) >= bir.BC_I8)) and ((origem as i32) <= bir.BC_I32) {
+            tern_1 = estender_com_sinal(c, i, d)
+        }
+        return tern_1
+    }
+    if i.op == (bir.BIR_EXT_Z as u8) {
+        if ((origem as i32) < bir.BC_I8) or ((origem as i32) >= (classe as i32)) {
+            return 0
+        }
+        var tern_2: i32 = -1
+        if common.c2f_b2i32(isel_otim_carregar_em(c, d, &i.a, bir.BE_ZERO as u8)) != 0 {
+            tern_2 = 1
+        }
+        return tern_2
+    }
+    if ((i.op == (bir.BIR_TRUNC as u8)) and (origem == (bir.BC_I64 as u8))) and (classe == (bir.BC_I32 as u8)) {
+        return truncar_para32(c, i, d)
+    }
+    if (origem as i32) != (classe as i32) {
+        return 0
+    }
+    var tern_3: i32 = -1
+    if common.c2f_b2i32(isel_otim_carregar_em(c, d, &i.a, bir.BE_NENHUMA as u8)) != 0 {
+        tern_3 = 1
+    }
+    return tern_3
+}
+
+// C: nativo/x64/x64_isel_otim.c:432
+proc isel_otim_mover(c: ^X64Ctx, i: ^bir.BirInstr) -> i32 {
+    let destino: i32 = isel_otim_reg_destino(c, i.dst)
+    let classe: u8 = ((c.f as ^bir.BirFuncao).classe_vreg or_else {})[i.dst]
+    if (destino < 0) or (not classe_de_conta(classe)) {
+        return 0
+    }
+    if i.a.tipo == (bir.BO_IMED as u8) {
+        return mover_imediato(c, i, destino, classe)
+    }
+    var tern_1: i32 = 0
+    if i.a.tipo == (bir.BO_VREG as u8) {
+        tern_1 = mover_vreg(c, i, destino, classe)
+    }
+    return tern_1
+}
+
+// C: nativo/x64/x64_isel_otim.c:446
+proc isel_otim_unaria(c: ^X64Ctx, i: ^bir.BirInstr) -> i32 {
+    let larg: u8 = isel_indice_largura(i.classe)
+    let destino: i32 = isel_otim_reg_destino(c, i.dst)
+    var alvo: i32 = X64_RAX
+    if destino >= 0 {
+        alvo = destino
+    }
+    if (not classe_de_conta(i.classe)) or ((i.a.classe as i32) != (i.classe as i32)) {
+        return 0
+    }
+    if not isel_otim_carregar_em(c, alvo, &i.a, bir.BE_NENHUMA as u8) {
+        return -1
+    }
+    var bits: u8 = 32
+    if larg == 1 {
+        bits = 64
+    }
+    var forma: u16 = FX_NOT32_R as u16
+    if i.op == (bir.BIR_NEG as u8) {
+        forma = FX_NEG32_R as u16
+        if larg == 1 {
+            forma = FX_NEG64_R as u16
+        }
+    } else if larg == 1 {
+        forma = FX_NOT64_R as u16
+    }
+    if not x64_emitir(c, mi1(forma, m_reg(alvo, bits))) {
+        return -1
+    }
+    return fechar(c, i.dst, alvo, 1)
+}
+
+// C: nativo/x64/x64_isel_otim.c:469
+proc deslocar(c: ^X64Ctx, i: ^bir.BirInstr, alvo: i32) -> i32 {
+    var sentido: u8 = 0
+    if i.op == (bir.BIR_SHR as u8) {
+        sentido = 1
+    }
+    let larg: u8 = isel_indice_largura(i.classe)
+    var bits: u8 = 32
+    if larg == 1 {
+        bits = 64
+    }
+    let reg: MOperando = m_reg(alvo, bits)
+    if i.b.tipo == (bir.BO_IMED as u8) {
+        if not isel_otim_carregar_em(c, alvo, &i.a, bir.BE_NENHUMA as u8) {
+            return -1
+        }
+        if x64_emitir(c, mi2(DESLOCA_IMM[sentido][larg], reg, m_imed(i.b.imed))) {
+            return 1
+        }
+        return -1
+    }
+    if (not isel_otim_carregar_em(c, X64_RCX, &i.b, bir.BE_NENHUMA as u8)) or (not isel_otim_carregar_em(c, alvo, &i.a, bir.BE_NENHUMA as u8)) {
+        return -1
+    }
+    if x64_emitir(c, mi2(DESLOCA_CL[sentido][larg], reg, m_reg(X64_RCX, 8))) {
+        return 1
+    }
+    return -1
+}
+
+// C: nativo/x64/x64_isel_otim.c:486
+proc dividir_por_potencia(c: ^X64Ctx, i: ^bir.BirInstr, alvo: i32, k: u8) -> i32 {
+    let larg: u8 = isel_indice_largura(i.classe)
+    var bits: u8 = 32
+    if larg == 1 {
+        bits = 64
+    }
+    // C: (int64_t)((1ull << k) - 1u); k <= 63, entao a mascara nunca passa de INT64_MAX
+    let mascara: i64 = (((1 as u64) << (k as u64)) - 1) as i64
+    if (i.op == (bir.BIR_REM as u8)) and (mascara == 0) {
+        if x64_emitir(c, mi2(FX_XOR32_RR as u16, m_reg(alvo, 32), m_reg(alvo, 32))) {
+            return 1
+        }
+        return -1
+    }
+    if (i.op == (bir.BIR_REM as u8)) and (mascara > 2147483647) {
+        return 0
+    }
+    if not isel_otim_carregar_em(c, alvo, &i.a, bir.BE_NENHUMA as u8) {
+        return -1
+    }
+    if i.op == (bir.BIR_REM as u8) {
+        let formas_and: FormasAritmeticas = formas_de_operacao(bir.BIR_AND as u8)
+        if x64_emitir(c, mi2(formas_and.ri[larg], m_reg(alvo, bits), m_imed(mascara))) {
+            return 1
+        }
+        return -1
+    }
+    if k == 0 {
+        return 1
+    }
+    var forma_shr: u16 = FX_SHR32_RI as u16
+    if larg == 1 {
+        forma_shr = FX_SHR64_RI as u16
+    }
+    if x64_emitir(c, mi2(forma_shr, m_reg(alvo, bits), m_imed(k as i64))) {
+        return 1
+    }
+    return -1
+}
+
+// C: nativo/x64/x64_isel_otim.c:503
+proc isel_otim_desloca_divide(c: ^X64Ctx, i: ^bir.BirInstr) -> i32 {
+    let destino: i32 = isel_otim_reg_destino(c, i.dst)
+    var tern_1: u32 = X64_RAX as u32
+    if destino >= 0 {
+        tern_1 = common.c2f_s2u_32(destino)
+    }
+    let alvo: i32 = transmute(tern_1, to = i32)
+    var k: u8 = 0
+    var r: i32 = 0
+    if (not classe_de_conta(i.classe)) or ((i.a.classe as i32) != (i.classe as i32)) {
+        return 0
+    }
+    if (i.op == (bir.BIR_SHL as u8)) or (i.op == (bir.BIR_SHR as u8)) {
+        r = deslocar(c, i, alvo)
+    } else if (i.aux == (bir.BIR_SEM_SINAL as u8)) and (common.c2f_b2i32(isel_otim_potencia_de2(&i.b, &k)) != 0) {
+        r = dividir_por_potencia(c, i, alvo, k)
+    } else {
+        return 0
+    }
+    return fechar(c, i.dst, alvo, r)
+}
+
+// C: nativo/x64/x64_isel_otim.c:522
+pub proc x64_isel_marcar(programa: ^bir.BirPrograma, funcao: ^bir.BirFuncao) {
+    funcao.isel_otim = true
+}
+
+// C: nativo/x64/x64_isel_otim.c:531
+proc dividir_inteiro(c: ^X64Ctx, i: ^bir.BirInstr) -> i32 {
+    var tern_1: i32 = 0
+    if (common.c2f_b2i32((c.f as ^bir.BirFuncao).div_const) != 0) and (i.b.tipo == (bir.BO_IMED as u8)) {
+        tern_1 = isel_otim_div_const(c, i)
+    }
+    let r: i32 = tern_1
+    var tern_2: i32 = 0
+    if r != 0 {
+        tern_2 = r
+    } else {
+        tern_2 = isel_otim_desloca_divide(c, i)
+    }
+    return tern_2
+}
+
+// C: nativo/x64/x64_isel_otim.c:539
+proc despachar_uma(c: ^X64Ctx, i: ^bir.BirInstr) -> i32 {
+    let real: bool = bir.bir_classe_eh_real(i.classe as i32)
+    let sw_1 = i.op as i32
+    if sw_1 == bir.BIR_ADD or sw_1 == bir.BIR_SUB or sw_1 == bir.BIR_MUL or sw_1 == bir.BIR_AND or sw_1 == bir.BIR_OR or sw_1 == bir.BIR_XOR {
+        var tern_1: i32 = 0
+        if common.c2f_b2i32(real) != 0 {
+            tern_1 = isel_otim_real(c, i)
+        } else {
+            tern_1 = isel_otim_aritmetica(c, i)
+        }
+        return tern_1
+    } else if sw_1 == bir.BIR_DIV {
+        var tern_2: i32 = 0
+        if common.c2f_b2i32(real) != 0 {
+            tern_2 = isel_otim_real(c, i)
+        } else {
+            tern_2 = dividir_inteiro(c, i)
+        }
+        return tern_2
+    } else if sw_1 == bir.BIR_ADD_OV or sw_1 == bir.BIR_SUB_OV or sw_1 == bir.BIR_MUL_OV {
+        return isel_otim_overflow(c, i)
+    } else if sw_1 == bir.BIR_CONST or sw_1 == bir.BIR_COPIA or sw_1 == bir.BIR_TRUNC or sw_1 == bir.BIR_EXT_S or sw_1 == bir.BIR_EXT_Z {
+        var tern_3: i32 = 0
+        if common.c2f_b2i32(real) != 0 {
+            tern_3 = isel_otim_real(c, i)
+        } else {
+            tern_3 = isel_otim_mover(c, i)
+        }
+        return tern_3
+    } else if sw_1 == bir.BIR_NEG {
+        var tern_4: i32 = 0
+        if common.c2f_b2i32(real) != 0 {
+            tern_4 = isel_otim_real(c, i)
+        } else {
+            tern_4 = isel_otim_unaria(c, i)
+        }
+        return tern_4
+    } else if sw_1 == bir.BIR_NOT {
+        return isel_otim_unaria(c, i)
+    } else if sw_1 == bir.BIR_REM {
+        return dividir_inteiro(c, i)
+    } else if sw_1 == bir.BIR_SHL or sw_1 == bir.BIR_SHR {
+        return isel_otim_desloca_divide(c, i)
+    } else if sw_1 == bir.BIR_RAIZ or sw_1 == bir.BIR_I_PARA_F or sw_1 == bir.BIR_F_PARA_F {
+        return isel_otim_real(c, i)
+    } else if sw_1 == bir.BIR_CARREGA {
+        return isel_otim_carrega_simples(c, i)
+    } else {
+        return 0
+    }
+    return 0
+}
+
+// C: nativo/x64/x64_isel_otim.c:560
+proc tentar_destino_fundido(c: ^X64Ctx, bloco: ^bir.BirBloco, k: u32) -> i32 {
+    let i: ^bir.BirInstr = &bloco.instrs[k]
+    var tern_1: ?^bir.BirInstr = none
+    if (k + 1) < bloco.n {
+        tern_1 = &bloco.instrs[k + 1]
+    }
+    let copia: ?^bir.BirInstr = tern_1
+    var com_destino_final: bir.BirInstr = bir.BirInstr{}
+    var r: i32 = 0
+    if (((((copia == none) or ((copia as ^bir.BirInstr).op != (bir.BIR_COPIA as u8))) or ((copia as ^bir.BirInstr).a.tipo != (bir.BO_VREG as u8))) or (i.dst == bir.BIR_SEM_VREG)) or ((copia as ^bir.BirInstr).a.id != i.dst)) or ((copia as ^bir.BirInstr).dst == i.dst) {
+        return 0
+    }
+    if (not isel_otim_temp_unico(c, i.dst)) or ((((c.f as ^bir.BirFuncao).classe_vreg or_else {})[(copia as ^bir.BirInstr).dst] as i32) != (((c.f as ^bir.BirFuncao).classe_vreg or_else {})[i.dst] as i32)) {
+        return 0
+    }
+    com_destino_final = i^
+    com_destino_final.dst = (copia as ^bir.BirInstr).dst
+    r = despachar_uma(c, &com_destino_final)
+    var tern_2: i32 = r
+    if r > 0 {
+        tern_2 = 2
+    }
+    return tern_2
+}
+
+// C: nativo/x64/x64_isel_otim.c:577
+proc despachar_valor(c: ^X64Ctx, bloco: ^bir.BirBloco, k: u32) -> i32 {
+    let i: ^bir.BirInstr = &bloco.instrs[k]
+    var r: i32 = 0
+    if ((i.op == (bir.BIR_ADD as u8)) or (i.op == (bir.BIR_MUL as u8))) and (i.classe == (bir.BC_I64 as u8)) {
+        r = isel_otim_memoria(c, bloco, k)
+        if r != 0 {
+            return r
+        }
+    }
+    r = tentar_destino_fundido(c, bloco, k)
+    var tern_1: i32 = 0
+    if r != 0 {
+        tern_1 = r
+    } else {
+        tern_1 = despachar_uma(c, i)
+    }
+    return tern_1
+}
+
+// C: nativo/x64/x64_isel_otim.c:591
+proc despachar_fluxo_e_memoria(c: ^X64Ctx, bloco: ^bir.BirBloco, k: u32) -> i32 {
+    let i: ^bir.BirInstr = &bloco.instrs[k]
+    let sw_1 = i.op as i32
+    if sw_1 == bir.BIR_CMP {
+        if (k + 1) < bloco.n {
+            let fundido: i32 = isel_otim_compara_desvia(c, bloco, k)
+            if fundido != 0 {
+                return fundido
+            }
+        }
+        return isel_otim_compara(c, i)
+    } else if sw_1 == bir.BIR_DESVIA {
+        return isel_otim_desvia(c, i)
+    } else if sw_1 == bir.BIR_GRAVA {
+        return isel_otim_memoria(c, bloco, k)
+    } else if sw_1 == bir.BIR_END_SIMBOLO {
+        return isel_otim_end_simbolo(c, i)
+    } else if sw_1 == bir.BIR_END_SLOT {
+        return isel_otim_end_slot(c, i)
+    } else {
+        return 0
+    }
+    return 0
+}
+
+// C: nativo/x64/x64_isel_otim.c:613
+proc usa_vetor(i: ^bir.BirInstr) -> bool {
+    return ((i.classe == (bir.BC_V128 as u8)) or (i.a.classe == (bir.BC_V128 as u8))) or (i.b.classe == (bir.BC_V128 as u8))
+}
+
+// C: nativo/x64/x64_isel_otim.c:620
+proc despachar_vetor(c: ^X64Ctx, bloco: ^bir.BirBloco, k: u32) -> i32 {
+    let i: ^bir.BirInstr = &bloco.instrs[k]
+    if i.op == (bir.BIR_CARREGA as u8) {
+        return isel_otim_carrega_simples(c, i)
+    }
+    var tern_1: i32 = 0
+    if i.op == (bir.BIR_GRAVA as u8) {
+        tern_1 = isel_otim_memoria(c, bloco, k)
+    }
+    return tern_1
+}
+
+// C: nativo/x64/x64_isel_otim.c:629
+proc isel_otim_tentar(c: ^X64Ctx, bloco: ^bir.BirBloco, k: u32) -> i32 {
+    let i: ^bir.BirInstr = &bloco.instrs[k]
+    // C: c->instr = i (convencao do main: slice de 1 + indice dentro do bloco)
+    c.instr = slice_from(i, len = 1)
+    c.instr_idx = k as int
+    if isel_plantio(c, i) != 0 {
+        return 0
+    }
+    if usa_vetor(i) {
+        return despachar_vetor(c, bloco, k)
+    }
+    let r: i32 = despachar_valor(c, bloco, k)
+    if r != 0 {
+        return r
+    }
+    return despachar_fluxo_e_memoria(c, bloco, k)
+}
+
+test "x64_isel_otim: formas_de_operacao ADD, MUL e tipo sem forma batem com o C" {
+    let add: FormasAritmeticas = formas_de_operacao(bir.BIR_ADD as u8)
+    expect(add.rr[0] == (FX_ADD32_RR as u16))
+    expect(add.ri[1] == (FX_ADD64_RI as u16))
+    let mul: FormasAritmeticas = formas_de_operacao(bir.BIR_MUL as u8)
+    expect(mul.rr[1] == (FX_IMUL64_RR as u16))
+    expect(mul.ri[0] == (FX_QTD as u16))
+    let fora: FormasAritmeticas = formas_de_operacao(bir.BIR_NOT as u8)
+    expect(fora.rr[0] == 0)
+}
+
+test "x64_isel_otim: potencia de 2 de I64 e I32 (I32 pelos 32 bits baixos)" {
+    var o: bir.BirOperando = bir.BirOperando{tipo = bir.BO_IMED as u8, classe = bir.BC_I64 as u8, imed = 8}
+    var k: u8 = 0
+    expect(isel_otim_potencia_de2(&o, &k))
+    expect(k == 3)
+    o.imed = 6
+    expect(isel_otim_potencia_de2(&o, &k) == false)
+    o.imed = 0
+    expect(isel_otim_potencia_de2(&o, &k) == false)
+    o.classe = bir.BC_I32 as u8
+    o.imed = -2147483648
+    expect(isel_otim_potencia_de2(&o, &k))
+    expect(k == 31)
+}

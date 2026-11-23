@@ -1,0 +1,433 @@
+// std:url - URL conforme a RFC 3986: codificar e decodificar por percentual (encode, decode) e no formulario (encode_form, decode_form: '+' = espaco), query string (query_parse, query_build), separar em partes (parse) e remontar (to_string). Forja pura (sem foreign), igual nos 2 backends e nos 2 sistemas.
+// Versao: 0.1.0. Changelog: 0.1.0 - R1 do marco rede: encode, encode_form, decode, decode_form, query_parse, query_build, parse e to_string; tipos Url, QueryPair e UrlError.
+// Posse: encode, encode_form, decode, decode_form, query_build e to_string devolvem texto DONO do alocador que o chamador passou (delete so se for heap). query_parse devolve lista DONA desse alocador, com key e value DONOS tambem (delete de cada um, depois da lista). parse nao aloca: os campos de Url sao vistas do texto de entrada, que tem de viver enquanto a Url for usada.
+// Erros: decode, decode_form e query_parse com % sem dois digitos hex = UrlError.invalid_escape (conferido antes de alocar, entao nada fica alocado); parse com scheme, porta, colchete ou espaco/controle invalidos = UrlError.invalid_url.
+// Limites (decisoes, nao erros): host de IPv6 guarda os colchetes; to_string nao escreve '?' com query vazia, '#' com fragmento vazio nem ':' com senha vazia; parse nao decodifica % (quem decodifica e o chamador); bytes >= 0x80 passam (UTF-8 cru).
+
+pub enum UrlError { invalid_escape, invalid_url }
+
+// Par chave=valor de uma query, ja decodificado. key e value sao DONOS do alocador de query_parse.
+pub struct QueryPair {
+    key: str = ""
+    value: str = ""
+}
+
+// Partes de uma URL. As vistas apontam para o texto de parse. port = -1 quando nao ha porta; has_authority diz se veio "//" (file:///x tem autoridade vazia).
+pub struct Url {
+    scheme: str = ""
+    has_authority: bool = false
+    user: str = ""
+    password: str = ""
+    host: str = ""
+    port: int = -1
+    path: str = ""
+    query: str = ""
+    fragment: str = ""
+}
+
+const PERCENTUAL: u8 = 37
+const CERQUILHA: u8 = 35
+const E_COMERCIAL: u8 = 38
+const INTERROGACAO: u8 = 63
+const ESPACO: u8 = 32
+const APAGAR: u8 = 127
+const MAIS: u8 = 43
+const HIFEN: u8 = 45
+const PONTO: u8 = 46
+const BARRA: u8 = 47
+const DIGITO_ZERO: u8 = 48
+const DIGITO_NOVE: u8 = 57
+const DOIS_PONTOS: u8 = 58
+const IGUAL: u8 = 61
+const ARROBA: u8 = 64
+const LETRA_A_MAIUSCULA: u8 = 65
+const LETRA_F_MAIUSCULA: u8 = 70
+const LETRA_Z_MAIUSCULA: u8 = 90
+const COLCHETE_ABRE: u8 = 91
+const COLCHETE_FECHA: u8 = 93
+const SUBLINHADO: u8 = 95
+const LETRA_A_MINUSCULA: u8 = 97
+const LETRA_F_MINUSCULA: u8 = 102
+const LETRA_Z_MINUSCULA: u8 = 122
+const TIL: u8 = 126
+const HEX_MAIUSCULAS: str = "0123456789ABCDEF"
+const DECIMAL: int = 10
+const PORTA_MAXIMA: int = 65535
+const SEM_PORTA: int = -1
+
+// true se c e letra ASCII (ALFA da RFC 3986).
+proc e_letra(c: u8) -> bool {
+    return (c >= LETRA_A_MAIUSCULA and c <= LETRA_Z_MAIUSCULA) or (c >= LETRA_A_MINUSCULA and c <= LETRA_Z_MINUSCULA)
+}
+
+// true se c e digito decimal ASCII.
+proc e_digito(c: u8) -> bool {
+    return c >= DIGITO_ZERO and c <= DIGITO_NOVE
+}
+
+// true se c passa sem codificar: ALFA, digito, '-', '.', '_' e '~' (RFC 3986 secao 2.3).
+proc e_nao_reservado(c: u8) -> bool {
+    return e_letra(c) or e_digito(c) or c == HIFEN or c == PONTO or c == SUBLINHADO or c == TIL
+}
+
+// Valor 0..15 do digito hexadecimal c (maiuscula ou minuscula), ou -1 se c nao e hex.
+proc valor_hex(c: u8) -> int {
+    if e_digito(c) {
+        return (c - DIGITO_ZERO) as int
+    }
+    if c >= LETRA_A_MINUSCULA and c <= LETRA_F_MINUSCULA {
+        return (c - LETRA_A_MINUSCULA) as int + 10
+    }
+    if c >= LETRA_A_MAIUSCULA and c <= LETRA_F_MAIUSCULA {
+        return (c - LETRA_A_MAIUSCULA) as int + 10
+    }
+    return -1
+}
+
+// Escreve o byte c como %XX, com hexadecimal em maiusculas (RFC 3986 secao 2.1).
+proc acrescentar_percentual(buf: ^[dynamic]u8, c: u8) {
+    append(buf, item = PERCENTUAL)
+    append(buf, item = HEX_MAIUSCULAS[(c >> 4) as int])
+    append(buf, item = HEX_MAIUSCULAS[(c & 15) as int])
+}
+
+// Escreve s codificado no buf: o nao reservado passa; com form, espaco vira '+'; o resto vira %XX.
+proc acrescentar_codificado(buf: ^[dynamic]u8, s: str, form: bool) {
+    for i in 0..<len(s) {
+        let c = s[i]
+        if e_nao_reservado(c) {
+            append(buf, item = c)
+        } else if form and c == ESPACO {
+            append(buf, item = MAIS)
+        } else {
+            acrescentar_percentual(buf, c)
+        }
+    }
+}
+
+// s codificado num so buffer do alocador do chamador.
+proc codificar(s: str, form: bool, alloc: Allocator) -> str {
+    var saida = make([dynamic]u8, alloc = alloc, cap = len(s))
+    defer delete(saida)
+    acrescentar_codificado(&saida, s, form)
+    return to_str(&saida)
+}
+
+// Codifica para URL (RFC 3986): so ALFA, digito, - . _ ~ passam; o resto vira %XX (espaco = %20).
+pub proc encode(s: str, alloc: Allocator) -> str {
+    return codificar(s, false, alloc)
+}
+
+// Codifica para formulario (query de HTML): como encode, mas espaco vira '+'.
+pub proc encode_form(s: str, alloc: Allocator) -> str {
+    return codificar(s, true, alloc)
+}
+
+// Byte do %XX que comeca em s[i], ou -1 se nao ha dois digitos hex depois do %.
+proc byte_percentual(s: str, i: int) -> int {
+    if i + 2 >= len(s) {
+        return -1
+    }
+    let alto = valor_hex(s[i + 1])
+    let baixo = valor_hex(s[i + 2])
+    if alto < 0 or baixo < 0 {
+        return -1
+    }
+    return alto * 16 + baixo
+}
+
+// true se todo % de s tem dois digitos hex depois. Roda antes de alocar: erro nunca deixa lixo.
+proc escapes_validos(s: str) -> bool {
+    var i = 0
+    while i < len(s) {
+        if s[i] == PERCENTUAL {
+            if byte_percentual(s, i) < 0 {
+                return false
+            }
+            i += 3
+        } else {
+            i += 1
+        }
+    }
+    return true
+}
+
+// Decodifica s, ja conferido por escapes_validos: %XX vira o byte; com form, '+' vira espaco.
+proc decodificar_valido(s: str, form: bool, alloc: Allocator) -> str {
+    var saida = make([dynamic]u8, alloc = alloc, cap = len(s))
+    defer delete(saida)
+    var i = 0
+    while i < len(s) {
+        if s[i] == PERCENTUAL {
+            append(&saida, item = byte_percentual(s, i) as u8)
+            i += 3
+        } else if form and s[i] == MAIS {
+            append(&saida, item = ESPACO)
+            i += 1
+        } else {
+            append(&saida, item = s[i])
+            i += 1
+        }
+    }
+    return to_str(&saida)
+}
+
+// Decodifica o percentual (%XX). '+' fica como esta. % sem dois digitos hex = UrlError.invalid_escape.
+pub proc decode(s: str, alloc: Allocator) -> str ! UrlError {
+    if not escapes_validos(s) {
+        return UrlError.invalid_escape
+    }
+    return decodificar_valido(s, false, alloc)
+}
+
+// Decodifica o formulario: como decode, e '+' vira espaco.
+pub proc decode_form(s: str, alloc: Allocator) -> str ! UrlError {
+    if not escapes_validos(s) {
+        return UrlError.invalid_escape
+    }
+    return decodificar_valido(s, true, alloc)
+}
+
+// Posicao do primeiro byte sep em s a partir de inicio, ou len(s) se nao ha.
+proc posicao_de(s: str, sep: u8, inicio: int) -> int {
+    var i = inicio
+    while i < len(s) {
+        if s[i] == sep {
+            return i
+        }
+        i += 1
+    }
+    return len(s)
+}
+
+// Antes e depois do primeiro sep de s. Sem sep: antes = s, depois = "" e achou = false.
+proc cortar(s: str, sep: u8) -> (antes: str, depois: str, achou: bool) {
+    let i = posicao_de(s, sep, 0)
+    if i == len(s) {
+        return s, "", false
+    }
+    return s[0..<i], s[i + 1..<len(s)], true
+}
+
+// Como cortar, mas pelo ultimo sep de s.
+proc cortar_ultimo(s: str, sep: u8) -> (antes: str, depois: str, achou: bool) {
+    var i = len(s)
+    while i > 0 {
+        i -= 1
+        if s[i] == sep {
+            return s[0..<i], s[i + 1..<len(s)], true
+        }
+    }
+    return s, "", false
+}
+
+// Um par da query (segmento sem '&'): antes do primeiro '=' e a chave; sem '=', o valor e vazio.
+proc par_da_query(seg: str, alloc: Allocator) -> QueryPair {
+    let antes, depois, _ = cortar(seg, IGUAL)
+    return QueryPair{key = decodificar_valido(antes, true, alloc), value = decodificar_valido(depois, true, alloc)}
+}
+
+// Pares da query: separados por '&' (segmento vazio some), cada chave e valor decodificados como formulario. Escape invalido = UrlError.invalid_escape, conferido antes de alocar.
+pub proc query_parse(q: str, alloc: Allocator) -> [dynamic]QueryPair ! UrlError {
+    if not escapes_validos(q) {
+        return UrlError.invalid_escape
+    }
+    var pares = make([dynamic]QueryPair, alloc = alloc)
+    var inicio = 0
+    while inicio < len(q) {
+        let fim = posicao_de(q, E_COMERCIAL, inicio)
+        if fim > inicio {
+            append(&pares, item = par_da_query(q[inicio..<fim], alloc))
+        }
+        inicio = fim + 1
+    }
+    return pares
+}
+
+// Query a partir dos pares: chave=valor separados por '&', cada parte em formulario (espaco vira '+').
+pub proc query_build(pares: []QueryPair, alloc: Allocator) -> str {
+    var saida = make([dynamic]u8, alloc = alloc)
+    defer delete(saida)
+    for i in 0..<len(pares) {
+        if i > 0 {
+            append(&saida, item = E_COMERCIAL)
+        }
+        acrescentar_codificado(&saida, pares[i].key, true)
+        append(&saida, item = IGUAL)
+        acrescentar_codificado(&saida, pares[i].value, true)
+    }
+    return to_str(&saida)
+}
+
+// true se u so tem bytes que a RFC 3986 aceita: sem espaco nem controle (<= 0x20 e 0x7F). Bytes >= 0x80 passam (UTF-8 cru).
+proc caracteres_validos(u: str) -> bool {
+    for i in 0..<len(u) {
+        if u[i] <= ESPACO or u[i] == APAGAR {
+            return false
+        }
+    }
+    return true
+}
+
+// scheme = ALFA *( ALFA / DIGITO / "+" / "-" / "." ) (RFC 3986 secao 3.1).
+proc scheme_valido(s: str) -> bool {
+    if len(s) == 0 or not e_letra(s[0]) {
+        return false
+    }
+    for i in 1..<len(s) {
+        let c = s[i]
+        if not (e_letra(c) or e_digito(c) or c == MAIS or c == HIFEN or c == PONTO) {
+            return false
+        }
+    }
+    return true
+}
+
+// Porta em decimal: vazia = SEM_PORTA; so digitos e no maximo 65535. Outra coisa = UrlError.invalid_url.
+proc ler_porta(s: str) -> int ! UrlError {
+    if len(s) == 0 {
+        return SEM_PORTA
+    }
+    var porta = 0
+    for i in 0..<len(s) {
+        if not e_digito(s[i]) {
+            return UrlError.invalid_url
+        }
+        porta = porta * DECIMAL + (s[i] - DIGITO_ZERO) as int
+        if porta > PORTA_MAXIMA {
+            return UrlError.invalid_url
+        }
+    }
+    return porta
+}
+
+// hospedeiro:porta. IPv6 vai entre '[' e ']' (o host guarda os colchetes); fora dos colchetes a porta vem depois do ':'. valido = false se o colchete nao fecha ou sobra texto depois de ']'.
+proc separar_host(hp: str) -> (host: str, porta: str, valido: bool) {
+    if len(hp) > 0 and hp[0] == COLCHETE_ABRE {
+        let fecha = posicao_de(hp, COLCHETE_FECHA, 0)
+        if fecha == len(hp) {
+            return "", "", false
+        }
+        let resto = hp[fecha + 1..<len(hp)]
+        if len(resto) == 0 {
+            return hp, "", true
+        }
+        if resto[0] == DOIS_PONTOS {
+            return hp[0..<fecha + 1], resto[1..<len(resto)], true
+        }
+        return "", "", false
+    }
+    let host, porta, _ = cortar(hp, DOIS_PONTOS)
+    return host, porta, true
+}
+
+// Autoridade (o que vem depois de "//"): userinfo@host:porta. O '@' vale o ultimo; usuario e senha separam no primeiro ':'.
+proc preencher_autoridade(autoridade: str) -> Url ! UrlError {
+    var u = Url{has_authority = true}
+    let antes, depois, tem_arroba = cortar_ultimo(autoridade, ARROBA)
+    var hospedeiro_porta = autoridade
+    if tem_arroba {
+        hospedeiro_porta = depois
+        let usuario, senha, _ = cortar(antes, DOIS_PONTOS)
+        u.user = usuario
+        u.password = senha
+    }
+    let host, porta_texto, valido = separar_host(hospedeiro_porta)
+    if not valido {
+        return UrlError.invalid_url
+    }
+    let porta = try ler_porta(porta_texto)
+    u.host = host
+    u.port = porta
+    return u
+}
+
+// Depois de "//" (resto tem pelo menos 2 bytes): (autoridade, caminho). A autoridade vai ate a primeira '/'.
+proc cortar_autoridade(resto: str) -> (autoridade: str, caminho: str) {
+    let sem_barras = resto[2..<len(resto)]
+    let fim = posicao_de(sem_barras, BARRA, 0)
+    return sem_barras[0..<fim], sem_barras[fim..<len(sem_barras)]
+}
+
+// Separa a URL nas partes da RFC 3986 secao 3: fragmento depois de '#', query depois de '?', scheme antes de ':' (so se o ':' vem antes de qualquer '/'), autoridade depois de "//". Nao decodifica nem resolve referencia relativa.
+pub proc parse(texto: str) -> Url ! UrlError {
+    if not caracteres_validos(texto) {
+        return UrlError.invalid_url
+    }
+    let sem_fragmento, fragmento, _ = cortar(texto, CERQUILHA)
+    let sem_query, query, _ = cortar(sem_fragmento, INTERROGACAO)
+    let antes_dp, depois_dp, tem_dp = cortar(sem_query, DOIS_PONTOS)
+    let tem_scheme = tem_dp and posicao_de(antes_dp, BARRA, 0) == len(antes_dp)
+    var scheme = ""
+    var resto = sem_query
+    if tem_scheme {
+        if not scheme_valido(antes_dp) {
+            return UrlError.invalid_url
+        }
+        scheme = antes_dp
+        resto = depois_dp
+    }
+    var resultado = Url{}
+    var caminho = resto
+    if len(resto) >= 2 and resto[0] == BARRA and resto[1] == BARRA {
+        let autoridade, caminho_autoridade = cortar_autoridade(resto)
+        let preenchida = try preencher_autoridade(autoridade)
+        resultado = preenchida
+        caminho = caminho_autoridade
+    }
+    resultado.scheme = scheme
+    resultado.path = caminho
+    resultado.query = query
+    resultado.fragment = fragmento
+    return resultado
+}
+
+// Escreve n >= 0 em decimal no buf (usado para a porta, 0..65535).
+proc acrescentar_inteiro(buf: ^[dynamic]u8, n: int) {
+    if n >= DECIMAL {
+        acrescentar_inteiro(buf, n / DECIMAL)
+    }
+    append(buf, item = ((n % DECIMAL) as u8) + DIGITO_ZERO)
+}
+
+// "//" + userinfo (usuario, :senha se houver, e '@', so se ha usuario ou senha) + host + ":porta" (so se ha porta).
+proc acrescentar_autoridade(buf: ^[dynamic]u8, u: Url) {
+    append(buf, item = BARRA)
+    append(buf, item = BARRA)
+    if len(u.user) > 0 or len(u.password) > 0 {
+        append(buf, item = u.user)
+        if len(u.password) > 0 {
+            append(buf, item = DOIS_PONTOS)
+            append(buf, item = u.password)
+        }
+        append(buf, item = ARROBA)
+    }
+    append(buf, item = u.host)
+    if u.port != SEM_PORTA {
+        append(buf, item = DOIS_PONTOS)
+        acrescentar_inteiro(buf, u.port)
+    }
+}
+
+// Remonta a URL: scheme:, //autoridade (so se has_authority), path, ?query e #fragment (vazios nao voltam com o '?' ou o '#').
+pub proc to_string(u: Url, alloc: Allocator) -> str {
+    var saida = make([dynamic]u8, alloc = alloc, cap = len(u.path) + len(u.host) + 16)
+    defer delete(saida)
+    if len(u.scheme) > 0 {
+        append(&saida, item = u.scheme)
+        append(&saida, item = DOIS_PONTOS)
+    }
+    if u.has_authority {
+        acrescentar_autoridade(&saida, u)
+    }
+    append(&saida, item = u.path)
+    if len(u.query) > 0 {
+        append(&saida, item = INTERROGACAO)
+        append(&saida, item = u.query)
+    }
+    if len(u.fragment) > 0 {
+        append(&saida, item = CERQUILHA)
+        append(&saida, item = u.fragment)
+    }
+    return to_str(&saida)
+}

@@ -1,0 +1,379 @@
+// semantic/sem_layout.fj - porte de compiler/semantic/sem_layout.c
+// sha256 de semantic/sem_layout.c: bb83d6ccf66e743917ad63259abb16eb72e226ec00354a5ca5c6900198838efa
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "common"
+import "frontend"
+
+// C2F-A0: SEM_LAYOUT (so TC_VAZIO e TC_TUPLA tem texto) virou if em motivo_sem_layout; CONSTANTES (ponteiro de funcao por tipo_no) virou a escolha da tag em
+// eh_constante_de_layout + chamar_constante_no (C2F-80)
+
+pub const CONSTANTE_NO_CONSTANTE_LITERAL: u16 = 1
+pub const CONSTANTE_NO_CONSTANTE_CONST: u16 = 2
+pub const CONSTANTE_NO_CONSTANTE_MEMBRO: u16 = 3
+pub const CONSTANTE_NO_CONSTANTE_LAYOUT: u16 = 4
+pub const CONSTANTE_NO_CONSTANTE_UNARIO: u16 = 5
+pub const CONSTANTE_NO_CONSTANTE_BINARIO: u16 = 6
+pub const CONSTANTE_NO_CONSTANTE_CONVERSAO: u16 = 7
+pub proc chamar_constante_no(tag: u16, e: ^frontend.Expr) -> bool {
+    if tag == 1 {
+        return constante_literal(e)
+    }
+    if tag == 2 {
+        return constante_const(e)
+    }
+    if tag == 3 {
+        return constante_membro(e)
+    }
+    if tag == 4 {
+        return constante_layout(e)
+    }
+    if tag == 5 {
+        return constante_unario(e)
+    }
+    if tag == 6 {
+        return constante_binario(e)
+    }
+    if tag == 7 {
+        return constante_conversao(e)
+    }
+    return false // tag 0 = NULL na tabela CONSTANTES (o C: confere != NULL && confere(e))
+}
+
+// C: semantic/sem_layout.c:20
+// Por que o tipo nao tem layout; none = tem.
+proc motivo_sem_layout(s: ^Semantica, t: u32) -> ?str {
+    let classe: i32 = tipo_classe_de(&s.tipos, t)
+    if classe == TC_VAZIO {
+        return "um tipo sem valor nao tem tamanho"
+    }
+    if classe == TC_TUPLA {
+        return "retorno multiplo nao e um tipo com tamanho"
+    }
+    if (classe == TC_STRUCT) and sem_tipo_eh_opaco(s, t) {
+        return "tipo opaco: so a biblioteca C conhece o tamanho"
+    }
+    if (classe == TC_RESULTADO) and (tipo_classe_de(&s.tipos, tipo_de(&s.tipos, t).a) == TC_VAZIO) {
+        return "'! E' sem tipo de valor nao tem tamanho"
+    }
+    return none
+}
+
+// C: semantic/sem_layout.c:32
+proc resolver_tipo_do_layout(s: ^Semantica, ref: ?^frontend.TipoRef) -> bool {
+    if s.tem_opaco {
+        s.sob_ponteiro = (ref as ^frontend.TipoRef).forma == (frontend.TR_NOME as u8)
+    }
+    let ok: bool = sem_resolver_tipo_ref(s, ref)
+    s.sob_ponteiro = false
+    return ok
+}
+
+// C: semantic/sem_layout.c:41
+// size_of(T) / align_of(T): 1 argumento, um tipo.
+proc chamar_tamanho_ou_alinhamento(s: ^Semantica, e: ^frontend.Expr) -> bool {
+    if e.nargs == 0 {
+        let msg_1 = format(f"{sem_nome_texto(s, e.nome)} recebe um tipo: {sem_nome_texto(s, e.nome)}(Vertice)", alloc = heap)
+        defer delete(msg_1)
+        return sem_erro(s, common.E0503, e.pos_op, msg_1)
+    }
+    if e.nargs > 1 {
+        let msg_2 = format(f"{sem_nome_texto(s, e.nome)} recebe so o tipo", alloc = heap)
+        defer delete(msg_2)
+        return sem_erro(s, common.E0504, ((e.args or_else {})[1].valor as ^frontend.Expr).pos, msg_2)
+    }
+    let no: ^frontend.Expr = (e.args or_else {})[0].valor as ^frontend.Expr
+    if not resolver_tipo_do_layout(s, no.alvo) {
+        return false
+    }
+    no.tipo = (no.alvo as ^frontend.TipoRef).tipo
+    let motivo: ?str = motivo_sem_layout(s, no.tipo)
+    if motivo != none {
+        let texto = sem_descrever_str(s, no.tipo)
+        defer delete(texto)
+        let motivo_texto: str = motivo or_else ""
+        let msg_3 = format(f"{sem_nome_texto(s, e.nome)}({texto}): {motivo_texto}", alloc = heap)
+        defer delete(msg_3)
+        return sem_erro(s, common.E0328, no.pos, msg_3)
+    }
+    let args = e.args or_else {}
+    args[0].indice = 0
+    e.tipo = TIPO_INT as u32
+    s.usa_layout = true
+    return true
+}
+
+// C: semantic/sem_layout.c:61
+proc struct_do_offset(s: ^Semantica, base: ?^frontend.Expr) -> ?^Simbolo {
+    let y: ^Simbolo = sem_achar_simbolo(s, (base as ^frontend.Expr).nome, (base as ^frontend.Expr).modulo)
+    var tern_1: u32 = (base as ^frontend.Expr).pos
+    if (base as ^frontend.Expr).modulo != 0 {
+        tern_1 = (base as ^frontend.Expr).pos_op
+    }
+    var uso: NomeUsado = NomeUsado{nome = (base as ^frontend.Expr).nome, pos = tern_1, modulo = (base as ^frontend.Expr).modulo}
+    if not sem_visivel(s, y, &uso) {
+        return none
+    }
+    if y.categoria != (SIM_STRUCT as u8) {
+        let msg_1 = format(f"offset_of(Struct.campo): '{sem_nome_texto(s, (base as ^frontend.Expr).nome)}' nao e uma struct", alloc = heap)
+        defer delete(msg_1)
+        _ = sem_erro(s, common.E0328, (base as ^frontend.Expr).pos, msg_1)
+        return none
+    }
+    if (not sem_simbolo_veneno(y)) and (common.c2f_b2i32((y.decl as ^frontend.Decl).externo) != 0) {
+        let msg_2 = format(f"offset_of({sem_nome_texto(s, (base as ^frontend.Expr).nome)}.campo): tipo opaco: so a biblioteca C conhece o layout", alloc = heap)
+        defer delete(msg_2)
+        _ = sem_erro(s, common.E0328, (base as ^frontend.Expr).pos, msg_2)
+        return none
+    }
+    return y
+}
+
+// C: semantic/sem_layout.c:78
+proc campo_do_offset(s: ^Semantica, y: ?^Simbolo, campo: ?^frontend.Expr, indice: ^i32) -> bool {
+    indice^ = sem_achar_campo((y as ^Simbolo).decl, (campo as ^frontend.Expr).nome)
+    if indice^ >= 0 {
+        return true
+    }
+    var sp: SemParecido = SemParecido{}
+    sem_parecido_iniciar(s, common.E0201, (campo as ^frontend.Expr).pos_op, (campo as ^frontend.Expr).nome, &sp)
+    sem_parecidos_de_campos(s, (y as ^Simbolo).decl, &sp)
+    let msg_1 = format(f"a struct '{sem_nome_texto(s, ((y as ^Simbolo).decl as ^frontend.Decl).nome)}' nao tem o campo '{sem_nome_texto(s, (campo as ^frontend.Expr).nome)}'", alloc = heap)
+    defer delete(msg_1)
+    return sem_erro_parecido(s, &sp, msg_1)
+}
+
+// C: semantic/sem_layout.c:89
+proc chamar_offset_of(s: ^Semantica, e: ^frontend.Expr) -> bool {
+    if e.nargs == 0 {
+        let msg_1 = format(f"offset_of recebe Struct.campo: offset_of(Vertice.uv)", alloc = heap)
+        defer delete(msg_1)
+        return sem_erro(s, common.E0503, e.pos_op, msg_1)
+    }
+    if e.nargs > 1 {
+        let msg_2 = format(f"offset_of recebe so Struct.campo", alloc = heap)
+        defer delete(msg_2)
+        return sem_erro(s, common.E0504, ((e.args or_else {})[1].valor as ^frontend.Expr).pos, msg_2)
+    }
+    let campo: ?^frontend.Expr = (e.args or_else {})[0].valor
+    if ((campo as ^frontend.Expr).tipo_no != (frontend.EX_CAMPO as u8)) or (((campo as ^frontend.Expr).a as ^frontend.Expr).tipo_no != (frontend.EX_NOME as u8)) {
+        let msg_3 = format(f"offset_of recebe Struct.campo, com um campo direto da struct (aninhado: some os offsets na mao)", alloc = heap)
+        defer delete(msg_3)
+        return sem_erro(s, common.E0328, (campo as ^frontend.Expr).pos, msg_3)
+    }
+    let y: ?^Simbolo = struct_do_offset(s, (campo as ^frontend.Expr).a)
+    if y == none {
+        return false
+    }
+    if sem_simbolo_veneno(y) {
+        e.tipo = sem_uso_de_veneno(s)
+        return true
+    }
+    var indice: i32 = 0
+    if not campo_do_offset(s, y, campo, &indice) {
+        return false
+    }
+    let ptr_1: ^frontend.Expr = campo as ^frontend.Expr
+    let ptr_2: ^frontend.Expr = ptr_1.a as ^frontend.Expr
+    ptr_2.ref = frontend.REF_STRUCT as u8
+    let ptr_3: ^frontend.Expr = campo as ^frontend.Expr
+    let ptr_4: ^frontend.Expr = ptr_3.a as ^frontend.Expr
+    ptr_4.ref_id = (y as ^Simbolo).indice
+    let ptr_5: ^frontend.Expr = campo as ^frontend.Expr
+    let ptr_6: ^frontend.Expr = ptr_5.a as ^frontend.Expr
+    ptr_6.tipo = (y as ^Simbolo).tipo
+    let ptr_7: ^frontend.Expr = campo as ^frontend.Expr
+    ptr_7.ref = frontend.REF_CAMPO as u8
+    let ptr_8: ^frontend.Expr = campo as ^frontend.Expr
+    ptr_8.ref_id = indice
+    let ptr_9: ^frontend.Expr = campo as ^frontend.Expr
+    ptr_9.tipo = TIPO_INT as u32
+    let p_1 = e.args or_else {}
+    p_1[0].indice = 0
+    e.tipo = TIPO_INT as u32
+    s.usa_layout = true
+    return true
+}
+
+// C: semantic/sem_layout.c:117
+proc sem_chamar_layout(s: ^Semantica, e: ^frontend.Expr, embutido: i32) -> bool {
+    if embutido == frontend.EMB_OFFSET_OF {
+        return chamar_offset_of(s, e)
+    }
+    return chamar_tamanho_ou_alinhamento(s, e)
+}
+
+// C: semantic/sem_layout.c:125
+proc constante_literal(e: ^frontend.Expr) -> bool {
+    return true
+}
+
+// C: semantic/sem_layout.c:131
+proc constante_const(e: ^frontend.Expr) -> bool {
+    return e.ref == (frontend.REF_CONST as u8)
+}
+
+// C: semantic/sem_layout.c:136
+proc constante_membro(e: ^frontend.Expr) -> bool {
+    return e.ref == (frontend.REF_MEMBRO as u8)
+}
+
+// C: semantic/sem_layout.c:141
+proc constante_layout(e: ^frontend.Expr) -> bool {
+    return ((e.ref == (frontend.REF_EMBUTIDO as u8)) and (e.ref_id >= frontend.EMB_SIZE_OF)) and (e.ref_id <= frontend.EMB_OFFSET_OF)
+}
+
+// C: semantic/sem_layout.c:148
+proc constante_unario(e: ^frontend.Expr) -> bool {
+    return (((e.op == (frontend.OP_NEGAR as u8)) or (e.op == (frontend.OP_NAO as u8))) or (e.op == (frontend.OP_BIT_NAO as u8))) and (common.c2f_b2i32(eh_constante_de_layout(e.a)) != 0)
+}
+
+// C: semantic/sem_layout.c:153
+proc constante_binario(e: ^frontend.Expr) -> bool {
+    return (common.c2f_b2i32(eh_constante_de_layout(e.a)) != 0) and (common.c2f_b2i32(eh_constante_de_layout(e.b)) != 0)
+}
+
+// C: semantic/sem_layout.c:158
+proc constante_conversao(e: ^frontend.Expr) -> bool {
+    return eh_constante_de_layout(e.a)
+}
+
+// C: semantic/sem_layout.c:170
+// Literal, const, membro de enum, size_of/align_of/offset_of e contas entre eles.
+proc eh_constante_de_layout(e: ?^frontend.Expr) -> bool {
+    let ex: ^frontend.Expr = e as ^frontend.Expr
+    let no: i32 = ex.tipo_no as i32
+    var tag: u16 = 0
+    if (no == frontend.EX_INT) or (no == frontend.EX_REAL) or (no == frontend.EX_BOOL) {
+        tag = CONSTANTE_NO_CONSTANTE_LITERAL
+    } else if no == frontend.EX_NOME {
+        tag = CONSTANTE_NO_CONSTANTE_CONST
+    } else if no == frontend.EX_CAMPO {
+        tag = CONSTANTE_NO_CONSTANTE_MEMBRO
+    } else if no == frontend.EX_CHAMADA {
+        tag = CONSTANTE_NO_CONSTANTE_LAYOUT
+    } else if no == frontend.EX_UNARIO {
+        tag = CONSTANTE_NO_CONSTANTE_UNARIO
+    } else if no == frontend.EX_BINARIO {
+        tag = CONSTANTE_NO_CONSTANTE_BINARIO
+    } else if no == frontend.EX_CONVERSAO {
+        tag = CONSTANTE_NO_CONSTANTE_CONVERSAO
+    }
+    return chamar_constante_no(tag, ex)
+}
+
+// C: semantic/sem_layout.c:177
+proc sem_conferir_static_assert(s: ^Semantica, e: ^frontend.Expr) -> bool {
+    let cond: ?^frontend.Expr = (e.args or_else {})[0].valor
+    s.usa_layout = true
+    if eh_constante_de_layout(cond) {
+        return true
+    }
+    let msg_1 = format(f"a condicao do static_assert nao e constante: use literal, const, size_of, align_of, offset_of e contas entre eles", alloc = heap)
+    defer delete(msg_1)
+    return sem_erro(s, common.E0329, (cond as ^frontend.Expr).pos, msg_1)
+}
+
+// C: semantic/sem_layout.c:186
+proc sem_decl_assert(s: ^Semantica, d: ^frontend.Decl) -> bool {
+    let chamada: ?^frontend.Expr = d.init
+    if ((chamada as ^frontend.Expr).tipo_no != (frontend.EX_CHAMADA as u8)) or ((chamada as ^frontend.Expr).nome != frontend.SYM_STATIC_ASSERT) {
+        let msg_1 = format(f"no topo do arquivo static_assert e a chamada sozinha: static_assert(cond, msg = \"...\")", alloc = heap)
+        defer delete(msg_1)
+        return sem_erro(s, common.E0329, (chamada as ^frontend.Expr).pos, msg_1)
+    }
+    return sem_expr(s, chamada, TIPO_VAZIO as u32)
+}
+
+// C: semantic/sem_layout.c:196
+proc sem_usa_layout_no_texto(e: ?^frontend.Expr) -> bool {
+    if e == none {
+        return false
+    }
+    if ((e as ^frontend.Expr).tipo_no == (frontend.EX_CHAMADA as u8)) and ((((e as ^frontend.Expr).nome == frontend.SYM_SIZE_OF) or ((e as ^frontend.Expr).nome == frontend.SYM_ALIGN_OF)) or ((e as ^frontend.Expr).nome == frontend.SYM_OFFSET_OF)) {
+        return true
+    }
+    if (common.c2f_b2i32(sem_usa_layout_no_texto((e as ^frontend.Expr).a)) != 0) or (common.c2f_b2i32(sem_usa_layout_no_texto((e as ^frontend.Expr).b)) != 0) {
+        return true
+    }
+    var i: u32 = 0
+    while i < (e as ^frontend.Expr).nargs {
+        if sem_usa_layout_no_texto(((e as ^frontend.Expr).args or_else {})[i].valor) {
+            return true
+        }
+        i += 1
+    }
+    return false
+}
+
+// Constantes de layout (ConstanteLiteral/Const/Membro/Layout/Unario/Binario/Conversao e a escolha por tipo_no de EhConstanteDeLayout)
+test "sem_layout: eh_constante_de_layout" {
+    var arena: common.Arena = common.Arena{}
+    var ex = make([dynamic]frontend.Expr, alloc = common.arena_mem(&arena), cap = 16)
+    for i in 0..<16 {
+        append(&ex, item = frontend.Expr{})
+    }
+    let lit: ^frontend.Expr = &ex[0]
+    lit.tipo_no = frontend.EX_INT as u8
+    let local: ^frontend.Expr = &ex[1]
+    local.tipo_no = frontend.EX_NOME as u8
+    local.ref = frontend.REF_LOCAL as u8
+    let constante: ^frontend.Expr = &ex[2]
+    constante.tipo_no = frontend.EX_NOME as u8
+    constante.ref = frontend.REF_CONST as u8
+    let membro: ^frontend.Expr = &ex[3]
+    membro.tipo_no = frontend.EX_CAMPO as u8
+    membro.ref = frontend.REF_MEMBRO as u8
+    let campo: ^frontend.Expr = &ex[4]
+    campo.tipo_no = frontend.EX_CAMPO as u8
+    campo.ref = frontend.REF_CAMPO as u8
+    let tamanho: ^frontend.Expr = &ex[5]
+    tamanho.tipo_no = frontend.EX_CHAMADA as u8
+    tamanho.ref = frontend.REF_EMBUTIDO as u8
+    tamanho.ref_id = frontend.EMB_SIZE_OF
+    let deslocamento: ^frontend.Expr = &ex[6]
+    deslocamento.tipo_no = frontend.EX_CHAMADA as u8
+    deslocamento.ref = frontend.REF_EMBUTIDO as u8
+    deslocamento.ref_id = frontend.EMB_OFFSET_OF
+    let outra_chamada: ^frontend.Expr = &ex[7]
+    outra_chamada.tipo_no = frontend.EX_CHAMADA as u8
+    outra_chamada.ref = frontend.REF_EMBUTIDO as u8
+    outra_chamada.ref_id = frontend.EMB_OFFSET_OF + 1
+    let texto: ^frontend.Expr = &ex[8]
+    texto.tipo_no = frontend.EX_TEXTO as u8
+    expect(eh_constante_de_layout(lit) and eh_constante_de_layout(constante) and not eh_constante_de_layout(local))
+    expect(eh_constante_de_layout(membro) and not eh_constante_de_layout(campo))
+    expect(eh_constante_de_layout(tamanho) and eh_constante_de_layout(deslocamento) and not eh_constante_de_layout(outra_chamada) and not eh_constante_de_layout(texto))
+    let neg: ^frontend.Expr = &ex[9]
+    neg.tipo_no = frontend.EX_UNARIO as u8
+    neg.op = frontend.OP_NEGAR as u8
+    neg.a = tamanho
+    let nao_unario: ^frontend.Expr = &ex[10]
+    nao_unario.tipo_no = frontend.EX_UNARIO as u8
+    nao_unario.op = frontend.OP_SOMA as u8
+    nao_unario.a = lit
+    let neg_local: ^frontend.Expr = &ex[11]
+    neg_local.tipo_no = frontend.EX_UNARIO as u8
+    neg_local.op = frontend.OP_BIT_NAO as u8
+    neg_local.a = local
+    expect(eh_constante_de_layout(neg) and not eh_constante_de_layout(nao_unario) and not eh_constante_de_layout(neg_local))
+    let conta: ^frontend.Expr = &ex[12]
+    conta.tipo_no = frontend.EX_BINARIO as u8
+    conta.a = tamanho
+    conta.b = constante
+    let conta_ruim: ^frontend.Expr = &ex[13]
+    conta_ruim.tipo_no = frontend.EX_BINARIO as u8
+    conta_ruim.a = lit
+    conta_ruim.b = local
+    let conversao: ^frontend.Expr = &ex[14]
+    conversao.tipo_no = frontend.EX_CONVERSAO as u8
+    conversao.a = conta
+    let conversao_ruim: ^frontend.Expr = &ex[15]
+    conversao_ruim.tipo_no = frontend.EX_CONVERSAO as u8
+    conversao_ruim.a = conta_ruim
+    expect(eh_constante_de_layout(conta) and not eh_constante_de_layout(conta_ruim))
+    expect(eh_constante_de_layout(conversao) and not eh_constante_de_layout(conversao_ruim))
+    expect(not chamar_constante_no(0, lit) and chamar_constante_no(CONSTANTE_NO_CONSTANTE_LITERAL, lit) and not chamar_constante_no(99, lit))
+    common.arena_liberar(&arena)
+}

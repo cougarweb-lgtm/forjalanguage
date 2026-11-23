@@ -1,0 +1,690 @@
+// nativo/bir/bir_construir_aloca.fj - porte de compiler/nativo/bir/bir_construir_aloca.c
+// sha256 de nativo/bir/bir_construir_aloca.c: f9f3f50bde91c4668941ca3a8395f438c69f8353712c93a1fb795eaa489a80b7
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "common"
+import "ir"
+import "semantic"
+
+struct PedidoLista {
+    alocador: BirOperando
+    cap: BirOperando
+    tam_elem: u32
+}
+
+const LISTA_OFFSET_PTR: u32 = 0
+const LIBERA_AUX_QTD: u32 = 6
+const MARCO_LIBERA_RESTANTE: str = "M2"
+const FATIA_MEMBRO_LEN: u32 = 1
+const MSG_RESIZE_NEGATIVO: str = "resize com len negativo"
+// C2F:? tabela LIBERAS (const LiberaFn[6]): folha nao escalar {'ref': 'LiberaBloco'}
+
+// C: nativo/bir/bir_construir_aloca.c:28
+// C2F-INDECIDIVEL: args (BirOperando* -> ?[]BirOperando; nargs vem da len, sem NULL com n > 0)
+proc bir_chamar_runtime(c: ^BirCtx, chamada: ^BirChamadaRt, args: ?[]BirOperando) -> u32 {
+    var dst: u32 = BIR_SEM_VREG
+    if chamada.retorno != (BC_NADA as u8) {
+        dst = bir_novo_vreg(c, chamada.retorno)
+    }
+    let chama: ^BirInstr = bir_emitir(c, BIR_CHAMA, chamada.retorno)
+    chama.simbolo = bir_simbolo_runtime(c, chamada.funcao)
+    chama.dst = dst
+    chama.args = args
+    chama.nargs = chamada.nargs
+    return dst
+}
+
+// C: nativo/bir/bir_construir_aloca.c:41
+// C2F-INDECIDIVEL: saida (BirOperando[2] por ponteiro &args[k]) -> slice + indice k; a versao por valor nao escrevia no chamador
+proc arquivo_e_linha_2(c: ^BirCtx, i: ^ir.IrInstr, saida: []BirOperando, k: u32) {
+    var linha: u32 = 0
+    saida[k] = bir_vreg_do_arquivo(c, i.pos, &linha)
+    saida[k + 1] = op_imed(linha as i64, BC_I32 as u8)
+}
+
+// C: nativo/bir/bir_construir_aloca.c:50
+proc bir_alocador_de(c: ^BirCtx, i: ^ir.IrInstr, v: ^ir.Valor, saida: ^BirOperando) -> bool {
+    if v.tipo_no == (ir.V_INT as u8) {
+        saida^ = op_imed((v.inteiro as u32) as i64, BC_I32 as u8)
+        return true
+    }
+    if not bir_operando_de(c, i, v, saida) {
+        return false
+    }
+    return (saida.classe == (BC_I32 as u8)) or (common.c2f_b2i32(bir_falha_inconsistente(c, "alocador que nao e u32")) != 0)
+}
+
+// C: nativo/bir/bir_construir_aloca.c:64
+proc bir_regra_aloca(c: ^BirCtx, i: ^ir.IrInstr) -> bool {
+    let apontado: u32 = semantic.tipo_de((c.e as ^BirEntrada).tipos as ^semantic.Tipos, i.tipo).a
+    var args: []BirOperando = arena_fatia_bir_operando(&(c.p as ^BirPrograma).arena, 4)
+    var forma: BirSlot = BirSlot{}
+    var dst: u32 = 0
+    if (not bir_alocador_de(c, i, &i.a, &args[0])) or (not bir_forma(c, apontado, &forma)) or (not bir_definir_destino(c, BC_I64 as u8, &dst)) {
+        return false
+    }
+    args[1] = op_imed(forma.tam as i64, BC_I64 as u8)
+    arquivo_e_linha_2(c, i, args, 2)
+    var chamada: BirChamadaRt = BirChamadaRt{funcao = "forja_mem_alocar", retorno = BC_I64 as u8, nargs = 4}
+    bir_mover(c, dst, op_vreg(bir_chamar_runtime(c, &chamada, args), BC_I64 as u8))
+    if (i.op_aux as u32) == ir.IR_ALOCA_ZERADO {
+        bir_zera_bloco(c, dst, forma.tam)
+    }
+    return true
+}
+
+// C: nativo/bir/bir_construir_aloca.c:87
+proc chamar_lista_criar(c: ^BirCtx, i: ^ir.IrInstr, lista: ^BirListaRef, pedido: ^PedidoLista) -> u32 {
+    var args: []BirOperando = arena_fatia_bir_operando(&(c.p as ^BirPrograma).arena, 6)
+    args[0] = pedido.alocador
+    args[1] = pedido.cap
+    args[2] = op_imed(pedido.tam_elem as i64, BC_I64 as u8)
+    args[3] = op_vreg(bir_endereco_mais(c, lista.endereco, bir_offset_da_lista(c, lista, LISTA_MEMBRO_EPOCA)), BC_I64 as u8)
+    arquivo_e_linha_2(c, i, args, 4)
+    var chamada: BirChamadaRt = BirChamadaRt{funcao = "forja_lista_criar", retorno = BC_I64 as u8, nargs = 6}
+    return bir_chamar_runtime(c, &chamada, args)
+}
+
+// C: nativo/bir/bir_construir_aloca.c:100
+proc bir_regra_lista_cria(c: ^BirCtx, i: ^ir.IrInstr) -> bool {
+    var slot: BirPedidoSlot = BirPedidoSlot{temporario = true, id = i.destino}
+    var lista: BirListaRef = BirListaRef{tipo = i.tipo}
+    var pedido: PedidoLista = PedidoLista{}
+    var elemento: BirSlot = BirSlot{}
+    var ptr: u32 = 0
+    if (not bir_alocador_de(c, i, &i.a, &pedido.alocador)) or (not bir_inteiro64(c, i, &i.b, &pedido.cap)) {
+        return false
+    }
+    if ((not bir_forma(c, i.tipo, &slot.forma)) or (not bir_forma(c, semantic.tipo_de((c.e as ^BirEntrada).tipos as ^semantic.Tipos, i.tipo).a, &elemento))) or (not bir_definir_slot(c, &slot, &lista.endereco)) {
+        return false
+    }
+    pedido.tam_elem = elemento.tam
+    ptr = chamar_lista_criar(c, i, &lista, &pedido)
+    let arg_1: BirOperando = op_vreg(ptr, BC_I64 as u8)
+    let arg_2: i32 = transmute(bir_offset_da_lista(c, &lista, LISTA_OFFSET_PTR), to = i32)
+    let arg_3: u32 = lista.endereco
+    let arg_4: ^BirCtx = c
+    bir_emitir_grava(arg_4, arg_3, arg_2, arg_1)
+    let arg_5: BirOperando = op_imed(0, BC_I64 as u8)
+    let arg_6: i32 = transmute(bir_offset_da_lista(c, &lista, LISTA_MEMBRO_LEN), to = i32)
+    let arg_7: u32 = lista.endereco
+    let arg_8: ^BirCtx = c
+    bir_emitir_grava(arg_8, arg_7, arg_6, arg_5)
+    let arg_9: BirOperando = pedido.cap
+    let arg_10: i32 = transmute(bir_offset_da_lista(c, &lista, LISTA_MEMBRO_CAP), to = i32)
+    let arg_11: u32 = lista.endereco
+    let arg_12: ^BirCtx = c
+    bir_emitir_grava(arg_12, arg_11, arg_10, arg_9)
+    let arg_13: BirOperando = pedido.alocador
+    let arg_14: i32 = transmute(bir_offset_da_lista(c, &lista, LISTA_MEMBRO_ALOCADOR), to = i32)
+    let arg_15: u32 = lista.endereco
+    let arg_16: ^BirCtx = c
+    bir_emitir_grava(arg_16, arg_15, arg_14, arg_13)
+    return true
+}
+
+// C: nativo/bir/bir_construir_aloca.c:124
+proc carregar_membro(c: ^BirCtx, lista: ^BirListaRef, membro: u32, classe: u8) -> u32 {
+    let dst: u32 = bir_novo_vreg(c, classe)
+    let arg_1: i32 = transmute(bir_offset_da_lista(c, lista, membro), to = i32)
+    let arg_2: u32 = lista.endereco
+    let arg_3: u32 = dst
+    let arg_4: ^BirCtx = c
+    bir_emitir_carrega(arg_4, arg_3, arg_2, arg_1)
+    return dst
+}
+
+// C: nativo/bir/bir_construir_aloca.c:134
+// LIMITE: parametros 5 (contexto, instrucao, lista, tamanho do elemento e alvo; agrupar criaria tipo de uso unico)
+proc crescer_lista_alvo(c: ^BirCtx, i: ^ir.IrInstr, lista: ^BirListaRef, tam_elem: u32, alvo: BirOperando) {
+    var args: []BirOperando = arena_fatia_bir_operando(&(c.p as ^BirPrograma).arena, 5)
+    args[0] = op_vreg(bir_endereco_mais(c, lista.endereco, bir_offset_da_lista(c, lista, LISTA_OFFSET_PTR)), BC_I64 as u8)
+    args[1] = op_imed(tam_elem as i64, BC_I64 as u8)
+    args[2] = alvo
+    arquivo_e_linha_2(c, i, args, 3)
+    var chamada: BirChamadaRt = BirChamadaRt{funcao = "forja_lista_crescer_alvo", retorno = BC_I64 as u8, nargs = 5}
+    let novo: u32 = bir_chamar_runtime(c, &chamada, args)
+    bir_emitir_grava(c, lista.endereco, transmute(bir_offset_da_lista(c, lista, LISTA_OFFSET_PTR), to = i32), op_vreg(novo, BC_I64 as u8))
+}
+
+// C: nativo/bir/bir_construir_aloca.c:149
+// LIMITE: parametros 5 (contexto, instrucao, lista, tamanho do elemento e alvo; agrupar criaria tipo de uso unico)
+proc crescer_lista(c: ^BirCtx, i: ^ir.IrInstr, lista: ^BirListaRef, tam_elem: u32, alvo: BirOperando) {
+    if (c.p as ^BirPrograma).guarda {
+        crescer_lista_alvo(c, i, lista, tam_elem, alvo)
+        return
+    }
+    var args: []BirOperando = arena_fatia_bir_operando(&(c.p as ^BirPrograma).arena, 8)
+    args[0] = op_vreg(carregar_membro(c, lista, LISTA_OFFSET_PTR, BC_I64 as u8), BC_I64 as u8)
+    args[1] = op_vreg(carregar_membro(c, lista, LISTA_MEMBRO_LEN, BC_I64 as u8), BC_I64 as u8)
+    args[2] = op_vreg(bir_endereco_mais(c, lista.endereco, bir_offset_da_lista(c, lista, LISTA_MEMBRO_CAP)), BC_I64 as u8)
+    args[3] = op_imed(tam_elem as i64, BC_I64 as u8)
+    args[4] = op_vreg(carregar_membro(c, lista, LISTA_MEMBRO_ALOCADOR, BC_I32 as u8), BC_I32 as u8)
+    args[5] = op_vreg(bir_endereco_mais(c, lista.endereco, bir_offset_da_lista(c, lista, LISTA_MEMBRO_EPOCA)), BC_I64 as u8)
+    arquivo_e_linha_2(c, i, args, 6)
+    var chamada: BirChamadaRt = BirChamadaRt{funcao = "forja_lista_crescer", retorno = BC_I64 as u8, nargs = 8}
+    let novo: u32 = bir_chamar_runtime(c, &chamada, args)
+    bir_emitir_grava(c, lista.endereco, transmute(bir_offset_da_lista(c, lista, LISTA_OFFSET_PTR), to = i32), op_vreg(novo, BC_I64 as u8))
+}
+
+// C: nativo/bir/bir_construir_aloca.c:171
+proc gravar_item(c: ^BirCtx, i: ^ir.IrInstr, lista: ^BirListaRef, tam_elem: u32) -> bool {
+    let ptr: u32 = carregar_membro(c, lista, LISTA_OFFSET_PTR, BC_I64 as u8)
+    let len_c: u32 = carregar_membro(c, lista, LISTA_MEMBRO_LEN, BC_I64 as u8)
+    let deslocamento: u32 = bir_conta_nova(c, BC_I64 as u8, BirPedido{op = BIR_MUL as u8, a = op_vreg(len_c, BC_I64 as u8), b = op_imed(tam_elem as i64, BC_I64 as u8)})
+    let alvo: u32 = bir_conta_nova(c, BC_I64 as u8, BirPedido{op = BIR_ADD as u8, a = op_vreg(ptr, BC_I64 as u8), b = op_vreg(deslocamento, BC_I64 as u8)})
+    var novo_len: u32 = 0
+    var lit_1 = BirAlvoMem{base = alvo, offset = 0, tipo = i.tipo}
+    let arg_1: ^ir.Valor = &i.b
+    let arg_2: ^BirAlvoMem = &lit_1
+    let arg_3: ^ir.IrInstr = i
+    let arg_4: ^BirCtx = c
+    if not bir_gravar_em(arg_4, arg_3, arg_2, arg_1) {
+        return false
+    }
+    novo_len = bir_conta_nova(c, BC_I64 as u8, BirPedido{op = BIR_ADD as u8, a = op_vreg(len_c, BC_I64 as u8), b = op_imed(1, BC_I64 as u8)})
+    let arg_5: BirOperando = op_vreg(novo_len, BC_I64 as u8)
+    let arg_6: i32 = transmute(bir_offset_da_lista(c, lista, LISTA_MEMBRO_LEN), to = i32)
+    let arg_7: u32 = lista.endereco
+    let arg_8: ^BirCtx = c
+    bir_emitir_grava(arg_8, arg_7, arg_6, arg_5)
+    return true
+}
+
+// C: nativo/bir/bir_construir_aloca.c:187
+proc bir_regra_anexa(c: ^BirCtx, i: ^ir.IrInstr) -> bool {
+    var lista: BirListaRef = BirListaRef{}
+    var elemento: BirSlot = BirSlot{}
+    var cheia: u32 = 0
+    var cresce: u32 = 0
+    var segue: u32 = 0
+    if common.c2f_s2u_32(semantic.tipo_classe_de((c.e as ^BirEntrada).tipos as ^semantic.Tipos, i.a.tipo)) != (semantic.TC_PONTEIRO as u32) {
+        return bir_falha_tipo(c, i, "-", i.a.tipo)
+    }
+    if (not bir_lista_de(c, i, &i.a, &lista)) or (not bir_forma(c, i.tipo, &elemento)) {
+        return false
+    }
+    if (c.p as ^BirPrograma).modo == (BM_DEV as u8) {
+        bir_chamar_lista_viva(c, i, carregar_membro(c, &lista, LISTA_MEMBRO_EPOCA, BC_I32 as u8))
+    }
+    if (c.p as ^BirPrograma).guarda {
+        let len_c: u32 = carregar_membro(c, &lista, LISTA_MEMBRO_LEN, BC_I64 as u8)
+        let mais_um: u32 = bir_conta_nova(c, BC_I64 as u8, BirPedido{op = BIR_ADD as u8, a = op_vreg(len_c, BC_I64 as u8), b = op_imed(1, BC_I64 as u8)})
+        let arg_1: BirOperando = op_vreg(mais_um, BC_I64 as u8)
+        let arg_2: u32 = elemento.tam
+        let arg_3: ^BirListaRef = &lista
+        let arg_4: ^ir.IrInstr = i
+        let arg_5: ^BirCtx = c
+        crescer_lista(arg_5, arg_4, arg_3, arg_2, arg_1)
+        return gravar_item(c, i, &lista, elemento.tam)
+    }
+    let arg_6: BirOperando = op_vreg(carregar_membro(c, &lista, LISTA_MEMBRO_CAP, BC_I64 as u8), BC_I64 as u8)
+    let arg_7: BirOperando = op_vreg(carregar_membro(c, &lista, LISTA_MEMBRO_LEN, BC_I64 as u8), BC_I64 as u8)
+    let arg_8: ^BirCtx = c
+    cheia = bir_comparar(arg_8, BCOND_EQ as u8, arg_7, arg_6)
+    cresce = bir_novo_bloco(c, false)
+    segue = bir_novo_bloco(c, false)
+    bir_desvia(c, op_vreg(cheia, BC_I8 as u8), cresce, segue)
+    c.cur = cresce
+    let arg_9: BirOperando = op_imed(0, BC_I64 as u8)
+    let arg_10: u32 = elemento.tam
+    let arg_11: ^BirListaRef = &lista
+    let arg_12: ^ir.IrInstr = i
+    let arg_13: ^BirCtx = c
+    crescer_lista(arg_13, arg_12, arg_11, arg_10, arg_9)
+    bir_salta(c, segue)
+    c.cur = segue
+    return gravar_item(c, i, &lista, elemento.tam)
+}
+
+// C: nativo/bir/bir_construir_aloca.c:221
+proc libera_bloco(c: ^BirCtx, i: ^ir.IrInstr) -> bool {
+    var args: []BirOperando = arena_fatia_bir_operando(&(c.p as ^BirPrograma).arena, 3)
+    if not bir_operando_de(c, i, &i.a, &args[0]) {
+        return false
+    }
+    arquivo_e_linha_2(c, i, args, 1)
+    var chamada: BirChamadaRt = BirChamadaRt{funcao = "forja_mem_liberar", retorno = BC_NADA as u8, nargs = 3}
+    _ = bir_chamar_runtime(c, &chamada, args)
+    return true
+}
+
+// C: nativo/bir/bir_construir_aloca.c:233
+proc libera_lista(c: ^BirCtx, i: ^ir.IrInstr) -> bool {
+    var args: []BirOperando = arena_fatia_bir_operando(&(c.p as ^BirPrograma).arena, 4)
+    var lista: BirListaRef = BirListaRef{}
+    var forma: BirSlot = BirSlot{}
+    if (not bir_lista_de(c, i, &i.a, &lista)) or (not bir_forma(c, lista.tipo, &forma)) {
+        return false
+    }
+    let alocador: u32 = carregar_membro(c, &lista, LISTA_MEMBRO_ALOCADOR, BC_I32 as u8)
+    args[0] = op_vreg(carregar_membro(c, &lista, LISTA_OFFSET_PTR, BC_I64 as u8), BC_I64 as u8)
+    args[1] = op_vreg(alocador, BC_I32 as u8)
+    arquivo_e_linha_2(c, i, args, 2)
+    var chamada: BirChamadaRt = BirChamadaRt{funcao = "forja_lista_liberar", retorno = BC_NADA as u8, nargs = 4}
+    _ = bir_chamar_runtime(c, &chamada, args)
+    bir_zera_bloco(c, lista.endereco, forma.tam)
+    bir_emitir_grava(c, lista.endereco, transmute(bir_offset_da_lista(c, &lista, LISTA_MEMBRO_ALOCADOR), to = i32), op_vreg(alocador, BC_I32 as u8))
+    return true
+}
+
+// C: nativo/bir/bir_construir_aloca.c:253
+// op_aux 2: forja_mem_liberar(a.ptr, arquivo, linha); a e o str de um format (o ptr esta no membro 0).
+proc libera_texto(c: ^BirCtx, i: ^ir.IrInstr) -> bool {
+    var args: []BirOperando = arena_fatia_bir_operando(&(c.p as ^BirPrograma).arena, 3)
+    let ptr: u32 = bir_novo_vreg(c, BC_I64 as u8)
+    var endereco: u32 = 0
+    if not bir_endereco_de(c, i, &i.a, &endereco) {
+        return false
+    }
+    bir_emitir_carrega(c, ptr, endereco, transmute(ir.layout_offset_campo(bir_layouts(c), i.a.tipo, 0), to = i32))
+    args[0] = op_vreg(ptr, BC_I64 as u8)
+    arquivo_e_linha_2(c, i, args, 1)
+    var chamada: BirChamadaRt = BirChamadaRt{funcao = "forja_mem_liberar", retorno = BC_NADA as u8, nargs = 3}
+    _ = bir_chamar_runtime(c, &chamada, args)
+    return true
+}
+
+// C: nativo/bir/bir_construir_aloca.c:268
+// op_aux 3: forja_pool_devolver(handle do Pool = b, bloco = a, arquivo, linha).
+proc libera_pool(c: ^BirCtx, i: ^ir.IrInstr) -> bool {
+    var args: []BirOperando = arena_fatia_bir_operando(&(c.p as ^BirPrograma).arena, 4)
+    if (not bir_alocador_de(c, i, &i.b, &args[0])) or (not bir_operando_de(c, i, &i.a, &args[1])) {
+        return false
+    }
+    arquivo_e_linha_2(c, i, args, 2)
+    var chamada: BirChamadaRt = BirChamadaRt{funcao = "forja_pool_devolver", retorno = BC_NADA as u8, nargs = 4}
+    _ = bir_chamar_runtime(c, &chamada, args)
+    return true
+}
+
+// C: nativo/bir/bir_construir_aloca.c:284
+// C2F-80: LIBERAS (ponteiro de funcao) virou cadeia por op_aux; 4 e 5 vivem em bir_construir_soa_mapa.fj
+proc bir_regra_libera(c: ^BirCtx, i: ^ir.IrInstr) -> bool {
+    if (i.op_aux as u32) >= LIBERA_AUX_QTD {
+        return bir_falha_x0001(c, i.pos, {bir_nome_do_op(i.op), "-", "-"}, MARCO_LIBERA_RESTANTE)
+    }
+    if i.op_aux == 0 {
+        return libera_bloco(c, i)
+    }
+    if i.op_aux == 1 {
+        return libera_lista(c, i)
+    }
+    if i.op_aux == 2 {
+        return libera_texto(c, i)
+    }
+    if i.op_aux == 3 {
+        return libera_pool(c, i)
+    }
+    if i.op_aux == 4 {
+        return bir_libera_mapa(c, i)
+    }
+    return bir_libera_soa(c, i)
+}
+
+// C: nativo/bir/bir_construir_aloca.c:293
+proc bir_regra_frame_reset(c: ^BirCtx, i: ^ir.IrInstr) -> bool {
+    var lit_1 = BirChamadaRt{funcao = "forja_frame_reset", retorno = BC_NADA as u8, nargs = 0}
+    _ = bir_chamar_runtime(c, &lit_1, none)
+    return true
+}
+
+// C: nativo/bir/bir_construir_aloca.c:305
+proc conta_i64(c: ^BirCtx, op: u8, a: BirOperando, b: BirOperando) -> u32 {
+    return bir_conta_nova(c, BC_I64 as u8, BirPedido{op = op, a = a, b = b})
+}
+
+// C: nativo/bir/bir_construir_aloca.c:312
+proc crescer_ate(c: ^BirCtx, i: ^ir.IrInstr, lista: ^BirListaRef, tam_elem: u32, alvo: BirOperando) {
+    let cabeca: u32 = bir_novo_bloco(c, false)
+    let corpo: u32 = bir_novo_bloco(c, false)
+    let fim: u32 = bir_novo_bloco(c, false)
+    var menor: u32 = 0
+    bir_salta(c, cabeca)
+    c.cur = cabeca
+    menor = bir_comparar(c, BCOND_LT_S as u8, op_vreg(carregar_membro(c, lista, LISTA_MEMBRO_CAP, BC_I64 as u8), BC_I64 as u8), alvo)
+    bir_desvia(c, op_vreg(menor, BC_I8 as u8), corpo, fim)
+    c.cur = corpo
+    crescer_lista(c, i, lista, tam_elem, alvo)
+    bir_salta(c, cabeca)
+    c.cur = fim
+}
+
+// C: nativo/bir/bir_construir_aloca.c:328
+proc conferir_len_nao_negativo(c: ^BirCtx, i: ^ir.IrInstr, novo: BirOperando) {
+    let negativo: u32 = bir_comparar(c, BCOND_LT_S as u8, novo, op_imed(0, BC_I64 as u8))
+    let frio: u32 = bir_novo_bloco(c, true)
+    let segue: u32 = bir_novo_bloco(c, false)
+    bir_desvia(c, op_vreg(negativo, BC_I8 as u8), frio, segue)
+    c.cur = frio
+    var args: []BirOperando = arena_fatia_bir_operando(&(c.p as ^BirPrograma).arena, 4)
+    args[0] = op_vreg(bir_vreg_do_texto(c, MSG_RESIZE_NEGATIVO, len(MSG_RESIZE_NEGATIVO) as u32), BC_I64 as u8)
+    args[1] = novo
+    arquivo_e_linha_2(c, i, args, 2)
+    bir_armadilha(c, bir_simbolo_runtime(c, "forja_falha_alocacao"), args)
+    c.cur = segue
+}
+
+// C: nativo/bir/bir_construir_aloca.c:345
+// Se novo > len: memset(ptr + len * tam, 0, (novo - len) * tam). ptr e lido depois do crescimento.
+proc zerar_elementos_novos(c: ^BirCtx, lista: ^BirListaRef, tam_elem: u32, novo: BirOperando) {
+    let len: u32 = carregar_membro(c, lista, LISTA_MEMBRO_LEN, BC_I64 as u8)
+    let cresce: u32 = bir_comparar(c, BCOND_GT_S as u8, novo, op_vreg(len, BC_I64 as u8))
+    let zera: u32 = bir_novo_bloco(c, false)
+    let segue: u32 = bir_novo_bloco(c, false)
+    bir_desvia(c, op_vreg(cresce, BC_I8 as u8), zera, segue)
+    c.cur = zera
+    let ptr: u32 = carregar_membro(c, lista, LISTA_OFFSET_PTR, BC_I64 as u8)
+    let destino: u32 = conta_i64(c, BIR_ADD as u8, op_vreg(ptr, BC_I64 as u8), op_vreg(conta_i64(c, BIR_MUL as u8, op_vreg(len, BC_I64 as u8), op_imed(tam_elem as i64, BC_I64 as u8)), BC_I64 as u8))
+    let quantos: u32 = conta_i64(c, BIR_MUL as u8, op_vreg(conta_i64(c, BIR_SUB as u8, novo, op_vreg(len, BC_I64 as u8)), BC_I64 as u8), op_imed(tam_elem as i64, BC_I64 as u8))
+    bir_zera_dinamico(c, destino, op_vreg(quantos, BC_I64 as u8))
+    bir_salta(c, segue)
+    c.cur = segue
+}
+
+// C: nativo/bir/bir_construir_aloca.c:363
+proc redimensiona_cap(c: ^BirCtx, i: ^ir.IrInstr) -> bool {
+    var lista: BirListaRef = BirListaRef{}
+    var dst: u32 = 0
+    if (not bir_lista_de(c, i, &i.a, &lista)) or (not bir_definir_destino(c, BC_I64 as u8, &dst)) {
+        return false
+    }
+    let arg_1: i32 = transmute(bir_offset_da_lista(c, &lista, LISTA_MEMBRO_CAP), to = i32)
+    let arg_2: u32 = lista.endereco
+    let arg_3: u32 = dst
+    let arg_4: ^BirCtx = c
+    bir_emitir_carrega(arg_4, arg_3, arg_2, arg_1)
+    return true
+}
+
+// C: nativo/bir/bir_construir_aloca.c:375
+proc redimensiona_reserva(c: ^BirCtx, i: ^ir.IrInstr) -> bool {
+    var lista: BirListaRef = BirListaRef{}
+    var elemento: BirSlot = BirSlot{}
+    var novo: BirOperando = BirOperando{}
+    if (((not bir_lista_de(c, i, &i.a, &lista)) or (not bir_forma(c, i.tipo, &elemento))) or (not bir_inteiro64(c, i, &i.b, &novo))) or (not bir_operando_vreg(c, novo, &novo)) {
+        return false
+    }
+    if (c.p as ^BirPrograma).modo == (BM_DEV as u8) {
+        bir_chamar_lista_viva(c, i, carregar_membro(c, &lista, LISTA_MEMBRO_EPOCA, BC_I32 as u8))
+    }
+    crescer_ate(c, i, &lista, elemento.tam, novo)
+    return true
+}
+
+// C: nativo/bir/bir_construir_aloca.c:390
+proc redimensiona_resize(c: ^BirCtx, i: ^ir.IrInstr) -> bool {
+    var lista: BirListaRef = BirListaRef{}
+    var elemento: BirSlot = BirSlot{}
+    var novo: BirOperando = BirOperando{}
+    if (((not bir_lista_de(c, i, &i.a, &lista)) or (not bir_forma(c, i.tipo, &elemento))) or (not bir_inteiro64(c, i, &i.b, &novo))) or (not bir_operando_vreg(c, novo, &novo)) {
+        return false
+    }
+    if (c.p as ^BirPrograma).modo == (BM_DEV as u8) {
+        bir_chamar_lista_viva(c, i, carregar_membro(c, &lista, LISTA_MEMBRO_EPOCA, BC_I32 as u8))
+    }
+    conferir_len_nao_negativo(c, i, novo)
+    crescer_ate(c, i, &lista, elemento.tam, novo)
+    zerar_elementos_novos(c, &lista, elemento.tam, novo)
+    let arg_1: BirOperando = novo
+    let arg_2: i32 = transmute(bir_offset_da_lista(c, &lista, LISTA_MEMBRO_LEN), to = i32)
+    let arg_3: u32 = lista.endereco
+    let arg_4: ^BirCtx = c
+    bir_emitir_grava(arg_4, arg_3, arg_2, arg_1)
+    return true
+}
+
+// C: nativo/bir/bir_construir_aloca.c:409
+proc redimensiona_para_str(c: ^BirCtx, i: ^ir.IrInstr) -> bool {
+    var lista: BirListaRef = BirListaRef{}
+    var pedido: BirPedidoSlot = BirPedidoSlot{temporario = true, id = i.destino}
+    var str: u32 = 0
+    var len_c: u32 = 0
+    var ptr: u32 = 0
+    var fim: u32 = 0
+    if (not bir_lista_de(c, i, &i.a, &lista)) or (not bir_forma(c, semantic.TIPO_STR as u32, &pedido.forma)) {
+        return false
+    }
+    if (c.p as ^BirPrograma).modo == (BM_DEV as u8) {
+        bir_chamar_lista_viva(c, i, carregar_membro(c, &lista, LISTA_MEMBRO_EPOCA, BC_I32 as u8))
+    }
+    len_c = carregar_membro(c, &lista, LISTA_MEMBRO_LEN, BC_I64 as u8)
+    let arg_1: BirOperando = op_imed(1, BC_I64 as u8)
+    let arg_2: BirOperando = op_vreg(len_c, BC_I64 as u8)
+    let arg_3: ^BirCtx = c
+    crescer_ate(c, i, &lista, 1, op_vreg(conta_i64(arg_3, BIR_ADD as u8, arg_2, arg_1), BC_I64 as u8))
+    ptr = carregar_membro(c, &lista, LISTA_OFFSET_PTR, BC_I64 as u8)
+    let arg_4: BirOperando = op_vreg(len_c, BC_I64 as u8)
+    let arg_5: BirOperando = op_vreg(ptr, BC_I64 as u8)
+    let arg_6: ^BirCtx = c
+    fim = conta_i64(arg_6, BIR_ADD as u8, arg_5, arg_4)
+    bir_emitir_grava(c, fim, 0, op_imed(0, BC_I8 as u8))
+    if not bir_definir_slot(c, &pedido, &str) {
+        return false
+    }
+    let arg_7: BirOperando = op_vreg(ptr, BC_I64 as u8)
+    let arg_8: i32 = transmute(ir.layout_offset_campo(bir_layouts(c), semantic.TIPO_STR as u32, 0), to = i32)
+    let arg_9: u32 = str
+    let arg_10: ^BirCtx = c
+    bir_emitir_grava(arg_10, arg_9, arg_8, arg_7)
+    let arg_11: BirOperando = op_vreg(len_c, BC_I64 as u8)
+    let arg_12: i32 = transmute(ir.layout_offset_campo(bir_layouts(c), semantic.TIPO_STR as u32, FATIA_MEMBRO_LEN), to = i32)
+    let arg_13: u32 = str
+    let arg_14: ^BirCtx = c
+    bir_emitir_grava(arg_14, arg_13, arg_12, arg_11)
+    let arg_15: BirOperando = op_imed(0, BC_I64 as u8)
+    let arg_16: i32 = transmute(bir_offset_da_lista(c, &lista, LISTA_OFFSET_PTR), to = i32)
+    let arg_17: u32 = lista.endereco
+    let arg_18: ^BirCtx = c
+    bir_emitir_grava(arg_18, arg_17, arg_16, arg_15)
+    let arg_19: BirOperando = op_imed(0, BC_I64 as u8)
+    let arg_20: i32 = transmute(bir_offset_da_lista(c, &lista, LISTA_MEMBRO_LEN), to = i32)
+    let arg_21: u32 = lista.endereco
+    let arg_22: ^BirCtx = c
+    bir_emitir_grava(arg_22, arg_21, arg_20, arg_19)
+    let arg_23: BirOperando = op_imed(0, BC_I64 as u8)
+    let arg_24: i32 = transmute(bir_offset_da_lista(c, &lista, LISTA_MEMBRO_CAP), to = i32)
+    let arg_25: u32 = lista.endereco
+    let arg_26: ^BirCtx = c
+    bir_emitir_grava(arg_26, arg_25, arg_24, arg_23)
+    return true
+}
+
+// C: nativo/bir/bir_construir_aloca.c:435
+proc bir_regra_redimensiona(c: ^BirCtx, i: ^ir.IrInstr) -> bool {
+    if i.op_aux == (ir.REDIM_CAP as u8) {
+        return redimensiona_cap(c, i)
+    }
+    if i.op_aux == (ir.REDIM_RESERVA as u8) {
+        return redimensiona_reserva(c, i)
+    }
+    if i.op_aux == (ir.REDIM_PARA_STR as u8) {
+        return redimensiona_para_str(c, i)
+    }
+    return redimensiona_resize(c, i)
+}
+
+// C: nativo/bir/bir_construir_aloca.c:447
+proc bir_regra_anexa_fatia(c: ^BirCtx, i: ^ir.IrInstr) -> bool {
+    var lista: BirListaRef = BirListaRef{}
+    var elemento: BirSlot = BirSlot{}
+    let origem: u32 = bir_novo_vreg(c, BC_I64 as u8)
+    let quantos: u32 = bir_novo_vreg(c, BC_I64 as u8)
+    var fatia: u32 = 0
+    if (not bir_lista_de(c, i, &i.a, &lista)) or (not bir_forma(c, i.tipo, &elemento)) or (not bir_endereco_de(c, i, &i.b, &fatia)) {
+        return false
+    }
+    bir_emitir_carrega(c, origem, fatia, transmute(ir.layout_offset_campo(bir_layouts(c), i.b.tipo, 0), to = i32))
+    bir_emitir_carrega(c, quantos, fatia, transmute(ir.layout_offset_campo(bir_layouts(c), i.b.tipo, FATIA_MEMBRO_LEN), to = i32))
+    if (c.p as ^BirPrograma).modo == (BM_DEV as u8) {
+        bir_chamar_lista_viva(c, i, carregar_membro(c, &lista, LISTA_MEMBRO_EPOCA, BC_I32 as u8))
+    }
+    let len: u32 = carregar_membro(c, &lista, LISTA_MEMBRO_LEN, BC_I64 as u8)
+    let total: u32 = conta_i64(c, BIR_ADD as u8, op_vreg(len, BC_I64 as u8), op_vreg(quantos, BC_I64 as u8))
+    crescer_ate(c, i, &lista, elemento.tam, op_vreg(total, BC_I64 as u8))
+    let ptr: u32 = carregar_membro(c, &lista, LISTA_OFFSET_PTR, BC_I64 as u8)
+    let destino: u32 = conta_i64(c, BIR_ADD as u8, op_vreg(ptr, BC_I64 as u8), op_vreg(conta_i64(c, BIR_MUL as u8, op_vreg(len, BC_I64 as u8), op_imed(elemento.tam as i64, BC_I64 as u8)), BC_I64 as u8))
+    bir_copia_dinamica(c, destino, origem, op_vreg(conta_i64(c, BIR_MUL as u8, op_vreg(quantos, BC_I64 as u8), op_imed(elemento.tam as i64, BC_I64 as u8)), BC_I64 as u8))
+    bir_emitir_grava(c, lista.endereco, transmute(bir_offset_da_lista(c, &lista, LISTA_MEMBRO_LEN), to = i32), op_vreg(total, BC_I64 as u8))
+    return true
+}
+
+// C: nativo/bir/bir_construir_aloca.c:471
+// sort(fatia): forja_ordenar(ptr, len, ORDENA_*) do runtime (rt_ordenar.c).
+proc bir_regra_ordena(c: ^BirCtx, i: ^ir.IrInstr) -> bool {
+    var args: []BirOperando = arena_fatia_bir_operando(&(c.p as ^BirPrograma).arena, 3)
+    let ptr: u32 = bir_novo_vreg(c, BC_I64 as u8)
+    let quantos: u32 = bir_novo_vreg(c, BC_I64 as u8)
+    var fatia: u32 = 0
+    if not bir_endereco_de(c, i, &i.a, &fatia) {
+        return false
+    }
+    bir_emitir_carrega(c, ptr, fatia, transmute(ir.layout_offset_campo(bir_layouts(c), i.a.tipo, 0), to = i32))
+    bir_emitir_carrega(c, quantos, fatia, transmute(ir.layout_offset_campo(bir_layouts(c), i.a.tipo, FATIA_MEMBRO_LEN), to = i32))
+    args[0] = op_vreg(ptr, BC_I64 as u8)
+    args[1] = op_vreg(quantos, BC_I64 as u8)
+    args[2] = op_imed(i.op_aux as i64, BC_I32 as u8)
+    var chamada: BirChamadaRt = BirChamadaRt{funcao = "forja_ordenar", retorno = BC_NADA as u8, nargs = 3}
+    _ = bir_chamar_runtime(c, &chamada, args)
+    return true
+}
+
+// C: nativo/bir/bir_construir_aloca.c:488
+// sort_by_key (IR_ORDENA_CHAVE): forja_ordc_ordenar(ptr, len, tam, desloc, tipo_chave) do runtime; sem proc.
+proc bir_regra_ordena_chave(c: ^BirCtx, i: ^ir.IrInstr) -> bool {
+    var args: []BirOperando = arena_fatia_bir_operando(&(c.p as ^BirPrograma).arena, 5)
+    var elemento: BirSlot = BirSlot{}
+    let ptr: u32 = bir_novo_vreg(c, BC_I64 as u8)
+    let quantos: u32 = bir_novo_vreg(c, BC_I64 as u8)
+    var fatia: u32 = 0
+    if (not bir_forma(c, i.tipo, &elemento)) or (not bir_endereco_de(c, i, &i.a, &fatia)) {
+        return false
+    }
+    bir_emitir_carrega(c, ptr, fatia, transmute(ir.layout_offset_campo(bir_layouts(c), i.a.tipo, 0), to = i32))
+    bir_emitir_carrega(c, quantos, fatia, transmute(ir.layout_offset_campo(bir_layouts(c), i.a.tipo, FATIA_MEMBRO_LEN), to = i32))
+    args[0] = op_vreg(ptr, BC_I64 as u8)
+    args[1] = op_vreg(quantos, BC_I64 as u8)
+    args[2] = op_imed(elemento.tam as i64, BC_I64 as u8)
+    args[3] = op_imed(i.desloc_chave, BC_I64 as u8)
+    args[4] = op_imed(i.tipo_chave as i64, BC_I64 as u8)
+    var chamada: BirChamadaRt = BirChamadaRt{funcao = "forja_ordc_ordenar", retorno = BC_NADA as u8, nargs = 5}
+    _ = bir_chamar_runtime(c, &chamada, args)
+    return true
+}
+
+// C: nativo/bir/bir_construir_aloca.c:508
+// Chamada de runtime cujo retorno vai para o destino ja definido (dst): o BIR_CHAMA escreve nele direto.
+proc chamar_runtime_em(c: ^BirCtx, chamada: ^BirChamadaRt, args: ?[]BirOperando, dst: u32) {
+    let chama: ^BirInstr = bir_emitir(c, BIR_CHAMA, chamada.retorno)
+    chama.simbolo = bir_simbolo_runtime(c, chamada.funcao)
+    chama.dst = dst
+    chama.args = args
+    chama.nargs = chamada.nargs
+}
+
+// C: nativo/bir/bir_construir_aloca.c:519
+proc endereco_do_valor_busca(c: ^BirCtx, i: ^ir.IrInstr, endereco: ^u32) -> bool {
+    var forma: BirSlot = BirSlot{}
+    var valor: BirOperando = BirOperando{}
+    var slot: u32 = 0
+    if bir_eh_agregado((c.e as ^BirEntrada).tipos as ^semantic.Tipos, i.b.tipo) {
+        return bir_endereco_de(c, i, &i.b, endereco)
+    }
+    if (not bir_forma(c, i.b.tipo, &forma)) or (not bir_operando_de(c, i, &i.b, &valor)) {
+        return false
+    }
+    slot = bir_novo_slot(c, forma.tam, forma.alinhamento)
+    endereco^ = bir_novo_vreg(c, BC_I64 as u8)
+    _ = bir_emitir_end_slot(c, slot, endereco^)
+    bir_emitir_grava(c, endereco^, 0, valor)
+    return true
+}
+
+// C: nativo/bir/bir_construir_aloca.c:537
+proc bir_regra_busca_binaria(c: ^BirCtx, i: ^ir.IrInstr) -> bool {
+    var args: []BirOperando = arena_fatia_bir_operando(&(c.p as ^BirPrograma).arena, 5)
+    var elemento: BirSlot = BirSlot{}
+    var classe: u8 = BC_I64 as u8
+    if (i.op_aux as i32) == ir.BUSCA_ACHOU {
+        classe = BC_I8 as u8
+    }
+    let ptr: u32 = bir_novo_vreg(c, BC_I64 as u8)
+    let quantos: u32 = bir_novo_vreg(c, BC_I64 as u8)
+    var fatia: u32 = 0
+    var valor: u32 = 0
+    var dst: u32 = 0
+    if (not bir_forma(c, semantic.tipo_de((c.e as ^BirEntrada).tipos as ^semantic.Tipos, i.a.tipo).a, &elemento)) or (not bir_endereco_de(c, i, &i.a, &fatia)) or (not endereco_do_valor_busca(c, i, &valor)) or (not bir_definir_destino(c, classe, &dst)) {
+        return false
+    }
+    bir_emitir_carrega(c, ptr, fatia, transmute(ir.layout_offset_campo(bir_layouts(c), i.a.tipo, 0), to = i32))
+    bir_emitir_carrega(c, quantos, fatia, transmute(ir.layout_offset_campo(bir_layouts(c), i.a.tipo, FATIA_MEMBRO_LEN), to = i32))
+    args[0] = op_vreg(ptr, BC_I64 as u8)
+    args[1] = op_vreg(quantos, BC_I64 as u8)
+    args[2] = op_imed(elemento.tam as i64, BC_I64 as u8)
+    args[3] = op_vreg(valor, BC_I64 as u8)
+    args[4] = op_imed(i.tipo_chave as i64, BC_I64 as u8)
+    var nome: str = "forja_ordc_posicao"
+    if (i.op_aux as i32) == ir.BUSCA_ACHOU {
+        nome = "forja_ordc_achou"
+    }
+    var chamada: BirChamadaRt = BirChamadaRt{funcao = nome, retorno = classe, nargs = 5}
+    chamar_runtime_em(c, &chamada, args, dst)
+    return true
+}
+
+// C: nativo/bir/bir_construir_aloca.c:559
+// sort_by(s, less = p) (IR_ORDENA_GERAL, ESTAVEL): forja_ordenar_estavel(ptr, len, tam, p) do runtime.
+// O modo CHAVE (sort_by_key) vai para bir_regra_ordena_chave.
+proc bir_regra_ordena_geral(c: ^BirCtx, i: ^ir.IrInstr) -> bool {
+    if (i.op_aux as i32) == ir.ORDENA_GERAL_CHAVE {
+        return bir_regra_ordena_chave(c, i)
+    }
+    var args: []BirOperando = arena_fatia_bir_operando(&(c.p as ^BirPrograma).arena, 4)
+    var elemento: BirSlot = BirSlot{}
+    var comparador: BirOperando = BirOperando{}
+    let ptr: u32 = bir_novo_vreg(c, BC_I64 as u8)
+    let quantos: u32 = bir_novo_vreg(c, BC_I64 as u8)
+    var fatia: u32 = 0
+    if (not bir_forma(c, i.tipo, &elemento)) or (not bir_endereco_de(c, i, &i.a, &fatia)) or (not bir_comparador_do_runtime(c, i, &i.b, &comparador)) {
+        return false
+    }
+    bir_emitir_carrega(c, ptr, fatia, transmute(ir.layout_offset_campo(bir_layouts(c), i.a.tipo, 0), to = i32))
+    bir_emitir_carrega(c, quantos, fatia, transmute(ir.layout_offset_campo(bir_layouts(c), i.a.tipo, FATIA_MEMBRO_LEN), to = i32))
+    args[0] = op_vreg(ptr, BC_I64 as u8)
+    args[1] = op_vreg(quantos, BC_I64 as u8)
+    args[2] = op_imed(elemento.tam as i64, BC_I64 as u8)
+    args[3] = comparador
+    var chamada: BirChamadaRt = BirChamadaRt{funcao = "forja_ordenar_estavel", retorno = BC_NADA as u8, nargs = 4}
+    _ = bir_chamar_runtime(c, &chamada, args)
+    return true
+}
+
+// C: nativo/bir/bir_construir_aloca.c:582
+// heap_push / heap_pop (IR_HEAP, K17): forja_heap_subir ou forja_heap_retira_topo sobre ptr/len da lista.
+proc bir_regra_heap(c: ^BirCtx, i: ^ir.IrInstr) -> bool {
+    var args: []BirOperando = arena_fatia_bir_operando(&(c.p as ^BirPrograma).arena, 5)
+    var comparador: BirOperando = op_imed(0, BC_I64 as u8)
+    var lista: BirListaRef = BirListaRef{}
+    var elemento: BirSlot = BirSlot{}
+    let com_less: bool = ((i.op_aux as i32) == ir.HEAP_SUBIR_BY) or ((i.op_aux as i32) == ir.HEAP_RETIRA_TOPO_BY)
+    let retira: bool = ((i.op_aux as i32) == ir.HEAP_RETIRA_TOPO) or ((i.op_aux as i32) == ir.HEAP_RETIRA_TOPO_BY)
+    if (not bir_lista_de(c, i, &i.a, &lista)) or (not bir_forma(c, i.tipo, &elemento)) {
+        return false
+    }
+    if com_less and (not bir_comparador_do_runtime(c, i, &i.b, &comparador)) {
+        return false
+    }
+    args[0] = op_vreg(carregar_membro(c, &lista, LISTA_MEMBRO_PTR, BC_I64 as u8), BC_I64 as u8)
+    args[1] = op_vreg(carregar_membro(c, &lista, LISTA_MEMBRO_LEN, BC_I64 as u8), BC_I64 as u8)
+    args[2] = op_imed(elemento.tam as i64, BC_I64 as u8)
+    args[3] = comparador
+    args[4] = op_imed(i.tipo_chave as i64, BC_I64 as u8)
+    var nome: str = "forja_heap_subir"
+    if retira {
+        nome = "forja_heap_retira_topo"
+    }
+    var chamada: BirChamadaRt = BirChamadaRt{funcao = nome, retorno = BC_NADA as u8, nargs = 5}
+    _ = bir_chamar_runtime(c, &chamada, args)
+    return true
+}

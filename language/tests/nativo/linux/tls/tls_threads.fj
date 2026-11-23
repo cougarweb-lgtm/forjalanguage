@@ -1,0 +1,92 @@
+// tls_threads.fj - M5c-b P61: __thread da lib C (foreign "tls", vendor/linux/libtls.a) usado por 6 fios Forja (std:thread) e pela principal.
+// Cada fio ve o SEU valor: no inicio, o .tbss vale 0 e o .tdata vale o inicial (1000 e 2000); depois grava o id dele, dorme 2 ms e confere.
+// Saida (byte a byte): "T 0 ok" .. "T 5 ok" (na ordem dos fios, depois do join) e "main ok". Versao: 0.1.0 - M5c-b P61: primeira versao.
+import "std:thread"
+import "std:os"
+
+foreign {
+    link "tls"
+    proc tlst_ler(k: i32) -> i32
+    proc tlst_gravar(k: i32, v: i32)
+}
+
+const FIOS: int = 6
+const VARIAS: int = 5
+
+struct Carga {
+    id: i32
+    ok: i32 = 0
+}
+
+proc inicial_certo() -> i32 {
+    if tlst_ler(0) != 0 or tlst_ler(1) != 1000 or tlst_ler(2) != 0 or tlst_ler(3) != 2000 or tlst_ler(4) != 0 {
+        return 0
+    }
+    return 1
+}
+
+proc gravar_todas(id: i32) {
+    tlst_gravar(0, 100 + id)
+    tlst_gravar(1, 200 + id)
+    tlst_gravar(2, 300 + id)
+    tlst_gravar(3, 400 + id)
+    tlst_gravar(4, 500 + id)
+}
+
+proc conferir_todas(id: i32) -> i32 {
+    if tlst_ler(0) != 100 + id or tlst_ler(1) != 200 + id or tlst_ler(2) != 300 + id or tlst_ler(3) != 400 + id or tlst_ler(4) != 500 + id {
+        return 0
+    }
+    return 1
+}
+
+proc filha(p: rawptr) -> u32 {
+    let c = p as ^Carga
+    c.ok = 0
+    if inicial_certo() == 1 {
+        gravar_todas(c.id)
+        os.sleep_ms(2)
+        c.ok = conferir_todas(c.id)
+    }
+    return 0
+}
+
+proc main() {
+    var cargas = make([dynamic]^Carga, alloc = heap)
+    var fios = make([dynamic]thread.Thread, alloc = heap)
+    for k in 0..<FIOS {
+        let c = new(Carga, alloc = heap)
+        c.id = k as i32
+        append(&cargas, item = c)
+        switch t in thread.spawn(filha, c as rawptr) {
+        case thread.Thread:
+            append(&fios, item = t)
+        case thread.ThreadError:
+            print("falhou")
+        }
+    }
+    for k in 0..<len(fios) {
+        _ = thread.join(fios[k])
+    }
+    for k in 0..<FIOS {
+        if cargas[k].ok == 1 {
+            print(f"T {k:02} ok")
+        } else {
+            print(f"T {k:02} ERRO")
+        }
+        delete(cargas[k])
+    }
+    delete(cargas)
+    delete(fios)
+    if inicial_certo() == 1 {
+        gravar_todas(7)
+        os.sleep_ms(2)
+        if conferir_todas(7) == 1 {
+            print("main ok")
+        } else {
+            print("main ERRO")
+        }
+    } else {
+        print("main inicio ERRO")
+    }
+}

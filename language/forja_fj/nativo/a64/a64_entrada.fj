@@ -1,0 +1,68 @@
+// nativo/a64/a64_entrada.fj - `_start` do ELF estatico aarch64-linux (contrato_a64 §3.3, D6)
+// Versao: 0.4.0
+// Changelog: 0.4.0 - I3: iOS com runtime: `_start` = entrada_main(x0..x2 do dyld) ; forja_programa ; fim (exit da libSystem); sem runtime segue o `b forja_programa` da 0.3.0.
+//            0.3.0 - I2: alvo iOS (c.macho): `_start` = `b forja_programa` (o dyld chama como main).
+//            0.2.0 - A2.2(b): com o runtime a64 (entrada e fim no programa): `mov x0,sp ; bl entrada ; bl forja_programa ; bl fim ; brk #0`; sem ele, o corpo de 0.1.0.
+//            0.1.0 - A1.3(i), SEM runtime: `mov x29,#0 ; mov x30,#0 ; bl forja_programa ; mov x8,#94 (exit_group) ; svc #0 ; brk #0`.
+//                    forja_programa devolve o codigo de saida em w0 (BIR_construir_programa).
+
+import "nativo/bir"
+import "nativo/obj"
+
+const A64_NOME_PROGRAMA: str = "forja_programa"
+const A64_SYS_EXIT_GROUP: u64 = 94
+
+// indice (BIR) do simbolo da funcao sintetica forja_programa; BIR_SEM_SIMBOLO se o programa nao a tem
+proc a64_achar_programa(p: ^bir.BirPrograma) -> u32 {
+    for k in (0 as u32)..<p.nsimbolos {
+        if ((p.simbolos[k].tipo as i32) == bir.BS_FUNCAO) and ((p.simbolos[k].nome or_else "") == A64_NOME_PROGRAMA) {
+            return k
+        }
+    }
+    return bir.BIR_SEM_SIMBOLO
+}
+
+// _start com o runtime a64: entrada(sp) ; forja_programa ; fim(codigo) (fim sai pelo exit_group)
+proc a64_start_com_runtime(c: ^A64Ctx, raizes: ^A64Raizes, programa: u32) {
+    let funcoes: []bir.BirFuncao = c.p.funcoes or_else {}
+    // I3 (iOS): x0..x2 ja trazem argc/argv/envp do dyld e vao direto para entrada_main; no Linux x0 = sp
+    if not c.macho {
+        a64_op(c, A64F_ADD_IMM, true, A64Ops{rd = 0, rn = R_SP, imm = 0, imm2 = 0})
+    }
+    a64_bl_simbolo(c, funcoes[raizes.entrada].simbolo)
+    a64_bl_simbolo(c, programa)
+    a64_bl_simbolo(c, funcoes[raizes.fim].simbolo)
+    a64_op(c, A64F_BRK, false, A64Ops{imm = 0})
+}
+
+// I2 (iOS): o dyld chama o LC_MAIN como main(argc, argv, envp) e sai com o retorno; um `b forja_programa` (cauda, sem tocar em x30) devolve o codigo em w0 direto ao dyld
+proc a64_start_macho(c: ^A64Ctx, programa: u32) {
+    let sim = a64_simbolo(c, programa)
+    let off = a64_offset(c)
+    obj.obj_relocar(c.o, obj.ObjAlvoReloc{secao = c.texto, off = off}, obj.ObjCorrecao{tipo = obj.OR_A64_JUMP26, simbolo = sim, adendo = 0})
+    a64_op(c, A64F_B, false, A64Ops{imm = 0})
+}
+
+proc a64_gerar_entrada(c: ^A64Ctx, raizes: ^A64Raizes) -> bool {
+    let programa = a64_achar_programa(c.p)
+    if programa == bir.BIR_SEM_SIMBOLO {
+        return a64_recusa(c, "programa sem forja_programa")
+    }
+    a64_alinhar_texto(c, 16)
+    _ = obj.obj_simbolo_definir(c.o, "_start", c.texto as i32, a64_offset(c))
+    if c.macho and ((raizes.entrada == A64_ALC_SEM) or (raizes.fim == A64_ALC_SEM)) {
+        a64_start_macho(c, programa)
+        return true
+    }
+    a64_const(c, R_FP, 0, true)
+    a64_const(c, R_LR, 0, true)
+    if (raizes.entrada != A64_ALC_SEM) and (raizes.fim != A64_ALC_SEM) {
+        a64_start_com_runtime(c, raizes, programa)
+        return true
+    }
+    a64_bl_simbolo(c, programa)
+    a64_const(c, R_NUMERO_SYSCALL, A64_SYS_EXIT_GROUP, true)
+    a64_op(c, A64F_SVC, false, A64Ops{imm = 0})
+    a64_op(c, A64F_BRK, false, A64Ops{imm = 0})
+    return true
+}

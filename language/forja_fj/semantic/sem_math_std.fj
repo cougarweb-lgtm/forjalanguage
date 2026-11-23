@@ -1,0 +1,850 @@
+// semantic/sem_math_std.fj - porte de compiler/semantic/sem_math_std.c
+// sha256 de semantic/sem_math_std.c: 9c67af7fcd67d1be8b40c012af9f82f5c381508325b2b651f451e6870bbe6973
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.2.0 (G3 S5: corpo real)
+
+import "common"
+import "frontend"
+
+struct LibmBin {
+    base: ?str
+    p0: ?str
+    p1: ?str
+}
+
+const MATH_SUFIXO_F32: str = "_f32"
+const MATH_NOME_MAX: i32 = 96
+// C2F-A0: a tabela LIBM_BIN (const LibmBin[5]) fica const; o C devolve &LIBM_BIN[k], aqui libm_binaria_de devolve o INDICE (-1 = funcao de um argumento) e nomes_do_libm recebe o indice
+const LIBM_BIN: [5]LibmBin = {LibmBin{base = "pow", p0 = "x", p1 = "y"}, LibmBin{base = "atan2", p0 = "y", p1 = "x"}, LibmBin{base = "hypot", p0 = "x", p1 = "y"}, LibmBin{base = "fmod", p0 = "x", p1 = "y"}, LibmBin{base = "copysign", p0 = "x", p1 = "y"}}
+
+// C: semantic/sem_math_std.c:21
+proc eh_modulo_math(s: ^Semantica, d: ?^frontend.Decl) -> bool {
+    let dd: ^frontend.Decl = d as ^frontend.Decl
+    if (dd.modulo == 0) or (s.modulos == none) {
+        return false
+    }
+    let m: frontend.Modulo = modulos_da_sem(s).itens[dd.modulo as int]
+    return (m.origem == (frontend.MOD_STD as u8)) and (common.interner_texto(nomes_da_sem(s), m.caminho) == "std:math")
+}
+
+// C: semantic/sem_math_std.c:32
+proc gemea_f32(s: ^Semantica, d: ?^frontend.Decl) -> ?^Simbolo {
+    let dd: ^frontend.Decl = d as ^frontend.Decl
+    let nomes: ^common.Interner = nomes_da_sem(s)
+    let tam: u32 = common.interner_tam(nomes, dd.nome)
+    let sufixo: u32 = len(MATH_SUFIXO_F32) as u32
+    if (tam + sufixo) >= (MATH_NOME_MAX as u32) {
+        return none
+    }
+    let base: str = common.interner_texto(nomes, dd.nome)
+    let nome = format(f"{base}{MATH_SUFIXO_F32}", alloc = heap)
+    defer delete(nome)
+    let id: i32 = common.interner_achar(nomes, nome, tam + sufixo)
+    if id < 0 {
+        return none
+    }
+    let y: ^Simbolo = sem_achar_simbolo_em(s, id, dd.modulo, s.modulo_atual)
+    if (y.decl != none) and ((y.decl as ^frontend.Decl).modulo == dd.modulo) and ((y.decl as ^frontend.Decl).tipo_no == (frontend.D_PROC as u8)) {
+        return y
+    }
+    return none
+}
+
+// C: semantic/sem_math_std.c:49
+proc argumento_eh_real_literal(s: ^Semantica, v: ?^frontend.Expr) -> bool {
+    return (common.c2f_b2i32((v as ^frontend.Expr).flexivel) != 0) and (common.c2f_b2i32(tipo_eh_real(&s.tipos, (v as ^frontend.Expr).tipo)) != 0)
+}
+
+// C: semantic/sem_math_std.c:55
+proc tipar_argumentos_math(s: ^Semantica, e: ^frontend.Expr, base: ^u32) -> bool {
+    var achou: bool = false
+    base^ = TIPO_F64 as u32
+    let args = e.args or_else {}
+    for i in (0 as u32)..<e.nargs {
+        let v: ^frontend.Expr = args[i].valor as ^frontend.Expr
+        if not sem_checar(s, v, TIPO_VAZIO as u32) {
+            return false
+        }
+        if argumento_eh_real_literal(s, v) {
+            continue
+        }
+        if v.flexivel {
+            let a = sem_descrever_str(s, v.tipo)
+            defer delete(a)
+            let quem = sem_nome_texto(s, e.nome)
+            let msg_1 = format(f"{quem} pede f32 ou f64, nao {a} (literal de inteiro ou texto nao entra)", alloc = heap)
+            defer delete(msg_1)
+            return sem_erro(s, common.E0334, v.pos, msg_1)
+        }
+        if not achou {
+            base^ = v.tipo
+            achou = true
+        } else if v.tipo != base^ {
+            let a = sem_descrever_str(s, base^)
+            defer delete(a)
+            let b = sem_descrever_str(s, v.tipo)
+            defer delete(b)
+            let quem = sem_nome_texto(s, e.nome)
+            let msg_2 = format(f"{quem} pede o mesmo tipo nos argumentos: {a} e {b}", alloc = heap)
+            defer delete(msg_2)
+            return sem_erro(s, common.E0334, v.pos, msg_2)
+        }
+    }
+    if (base^ == (TIPO_F32 as u32)) or (base^ == (TIPO_F64 as u32)) {
+        return true
+    }
+    let a = sem_descrever_str(s, base^)
+    defer delete(a)
+    let quem = sem_nome_texto(s, e.nome)
+    let msg_3 = format(f"{quem} pede f32 ou f64 sem unidade, nao {a}", alloc = heap)
+    defer delete(msg_3)
+    return sem_erro(s, common.E0334, e.pos_op, msg_3)
+}
+
+// C: semantic/sem_math_std.c:83
+proc sem_math_chamada(s: ^Semantica, e: ^frontend.Expr, y: ^?^Simbolo) -> bool {
+    let d: ?^frontend.Decl = (y^ as ^Simbolo).decl
+    var base: u32 = 0
+    var gemea: ?^Simbolo = none
+    if ((d == none) or ((d as ^frontend.Decl).tipo_no != (frontend.D_PROC as u8))) or (not eh_modulo_math(s, d)) {
+        return true
+    }
+    if not tipar_argumentos_math(s, e, &base) {
+        return false
+    }
+    if base != (TIPO_F32 as u32) {
+        return true
+    }
+    gemea = gemea_f32(s, d)
+    if gemea != none {
+        y^ = gemea
+    }
+    return true
+}
+
+// C: semantic/sem_math_std.c:103
+// Devolve o indice em LIBM_BIN (-1 = nenhum: funcao de um argumento). strncmp(csym, base, n) == 0 e csym[n] fim ou 'f' + fim.
+proc libm_binaria_de(csym: str) -> i32 {
+    for k in 0..<5 {
+        let base: str = LIBM_BIN[k].base or_else ""
+        let n: int = len(base)
+        let proximo: u8 = common.c2f_nul_em(csym, n)
+        if common.c2f_prefixo_igual(csym, base, n) and ((proximo == 0) or ((proximo == 102) and (common.c2f_nul_em(csym, n + 1) == 0))) {
+            return k as i32
+        }
+    }
+    return -1
+}
+
+// C: semantic/sem_math_std.c:113
+proc nomes_do_libm(s: ^Semantica, d: ?^frontend.Decl, bin: i32) -> bool {
+    let params = (d as ^frontend.Decl).params or_else {}
+    var p0: str = "x"
+    if bin >= 0 {
+        p0 = LIBM_BIN[bin as int].p0 or_else ""
+    }
+    if sem_nome_texto(s, params[0].nome) != p0 {
+        return false
+    }
+    return (bin < 0) or (sem_nome_texto(s, params[1].nome) == (LIBM_BIN[bin as int].p1 or_else ""))
+}
+
+// C: semantic/sem_math_std.c:122
+proc tipos_do_libm(d: ?^frontend.Decl, tipo: u32) -> bool {
+    if (not (d as ^frontend.Decl).tem_retorno) or ((d as ^frontend.Decl).retorno.tipo != tipo) {
+        return false
+    }
+    for i in (0 as u32)..<(d as ^frontend.Decl).nparams {
+        if ((d as ^frontend.Decl).params or_else {})[i].tipo.tipo != tipo {
+            return false
+        }
+    }
+    return true
+}
+
+// C: semantic/sem_math_std.c:132
+proc linha_do_decl(s: ^Semantica, d: ?^frontend.Decl, ini: ^u32, tam: ^u32) -> bool {
+    let t: []u8 = (s.fonte as ^common.Fonte).texto
+    let fim: u32 = ((s.fonte as ^common.Fonte).tam) as u32
+    var a: u32 = (d as ^frontend.Decl).pos
+    var b: u32 = (d as ^frontend.Decl).pos
+    while (a > 0) and (t[a - 1] != 10) {
+        a -= 1
+    }
+    while (b < fim) and (t[b] != 10) {
+        b += 1
+    }
+    let ini_linha: u32 = a
+    for k in a..<b {
+        if (t[k] == 123) or (t[k] == 125) {
+            return false
+        }
+    }
+    while (a < b) and ((t[a] == 32) or (t[a] == 9)) {
+        a += 1
+    }
+    // strncmp(t + a, "proc ", 5): o texto tem sentinela NUL depois do fim, que nunca bate
+    let proc_espaco: str = "proc "
+    for j in 0..<5 {
+        if ((a + (j as u32)) >= (len(t) as u32)) or (t[a + (j as u32)] != proc_espaco[j]) {
+            return false
+        }
+    }
+    if b < fim {
+        b += 1
+    }
+    ini^ = ini_linha
+    tam^ = b - ini_linha
+    return true
+}
+
+// C: semantic/sem_math_std.c:152
+// O C devolve a entrada da tabela de renomeados ou NULL; renomeado_buscar entrega copia de heap, entao o que nao e devolvido e liberado aqui
+// (quem recebe o ponteiro e o dono). *motivo e um literal ou nenhum.
+proc libm_migravel(s: ^Semantica, d: ?^frontend.Decl, motivo: ^?str) -> ?^common.Renomeado {
+    let dd: ^frontend.Decl = d as ^frontend.Decl
+    var simbolo: i32 = dd.nome
+    if dd.simbolo >= 0 {
+        simbolo = dd.simbolo
+    }
+    let csym: str = sem_nome_texto(s, simbolo)
+    let r: ?^common.Renomeado = common.renomeado_buscar(common.REN_LIBM, csym)
+    let bin: i32 = libm_binaria_de(csym)
+    var tipo: u32 = TIPO_F64 as u32
+    if csym[len(csym) - 1] == 102 {
+        tipo = TIPO_F32 as u32
+    }
+    var ini: u32 = 0
+    var tam: u32 = 0
+    motivo^ = none
+    if r == none {
+        return none
+    }
+    var esperados: u32 = 1
+    if bin >= 0 {
+        esperados = 2
+    }
+    if dd.nparams != esperados {
+        motivo^ = "a aridade difere de std:math"
+    } else if not nomes_do_libm(s, d, bin) {
+        motivo^ = "os nomes dos parametros diferem de std:math"
+    } else if not tipos_do_libm(d, tipo) {
+        motivo^ = "o tipo nao bate: f32 com sufixo f, f64 sem"
+    } else if not linha_do_decl(s, d, &ini, &tam) {
+        motivo^ = "a linha do foreign tem chave ou mais de um item"
+    }
+    if motivo^ == none {
+        return r
+    }
+    delete(r as ^common.Renomeado)
+    return none
+}
+
+// C: semantic/sem_math_std.c:170
+proc importa_std_math(s: ^Semantica) -> bool {
+    let f: ^common.Fonte = s.fonte as ^common.Fonte
+    let t: []u8 = f.texto
+    let alvo: str = "import \"std:math\""
+    let n: u64 = len(alvo) as u64
+    var fim: u64 = f.tam
+    if f.ntrechos > 0 {
+        fim = ((f.trechos or_else {})[0].fim) as u64
+    }
+    var k: u64 = 0
+    while (k + n) <= fim {
+        var igual: bool = true
+        for j in 0..<len(alvo) {
+            if t[k + (j as u64)] != alvo[j] {
+                igual = false
+                break
+            }
+        }
+        if igual {
+            return true
+        }
+        k += 1
+    }
+    return false
+}
+
+// C: semantic/sem_math_std.c:182
+proc notar_import_libm(s: ^Semantica) {
+    let t: ^common.RenTrocas = (s.diag as ^common.Diag).trocas as ^common.RenTrocas
+    if importa_std_math(s) {
+        return
+    }
+    for k in 0..<len(t.itens) {
+        if (t.itens[k].classe == common.REN_LIBM_LINHA) and (t.itens[k].tam == 0) {
+            return
+        }
+    }
+    var troca = common.RenTroca{off = 0, tam = 0, classe = common.REN_LIBM_LINHA, antigo = "", novo = "import \"std:math\" as math\n"}
+    common.renomeado_notar(s.diag as ^common.Diag, &troca)
+}
+
+// C: semantic/sem_math_std.c:195
+proc sem_libm_notar_decl(s: ^Semantica, d: ^frontend.Decl) {
+    var motivo: ?str = none
+    var ini: u32 = 0
+    var tam: u32 = 0
+    if (s.diag as ^common.Diag).trocas == none {
+        return
+    }
+    let r: ?^common.Renomeado = libm_migravel(s, d, &motivo)
+    if r == none {
+        if motivo != none {
+            var aviso = common.RenTroca{off = d.pos, tam = 0, classe = common.REN_LIBM_AVISO, antigo = sem_nome_texto(s, d.nome), novo = motivo}
+            common.renomeado_notar(s.diag as ^common.Diag, &aviso)
+        }
+        return
+    }
+    delete(r as ^common.Renomeado)
+    if not linha_do_decl(s, d, &ini, &tam) {
+        return
+    }
+    var linha = common.RenTroca{off = ini, tam = tam, classe = common.REN_LIBM_LINHA, antigo = "", novo = ""}
+    common.renomeado_notar(s.diag as ^common.Diag, &linha)
+}
+
+// C: semantic/sem_math_std.c:210
+proc sem_libm_notar_chamada(s: ^Semantica, e: ^frontend.Expr, d: ?^frontend.Decl) {
+    var motivo: ?str = none
+    if ((s.diag as ^common.Diag).trocas == none) or (not (d as ^frontend.Decl).externo) {
+        return
+    }
+    let r: ?^common.Renomeado = libm_migravel(s, d, &motivo)
+    if r == none {
+        return
+    }
+    defer delete(r as ^common.Renomeado)
+    let nome: str = sem_nome_texto(s, (d as ^frontend.Decl).nome)
+    let novo: str = (r as ^common.Renomeado).novo or_else ""
+    var troca = common.RenTroca{off = e.pos_op, tam = len(nome) as u32, classe = common.REN_LIBM, antigo = nome, novo = novo}
+    common.renomeado_notar(s.diag as ^common.Diag, &troca)
+    if common.c2f_prefixo_igual(novo, "math.", 5) {
+        notar_import_libm(s)
+    }
+}
+
+// ---------------------------------------------------------------- G3 S5: cena e testes dirigidos do lote (so existem em `forja test`)
+
+// Semantica real (semantica_iniciar) com 1 modulo, 1 arena, 1 interner (com os nomes iniciais do lexer, como o driver) e programa vazio; os nomes de `pre` entram ANTES do iniciar (ids dentro de globais).
+struct S5Cena {
+    arenas: [dynamic]common.Arena
+    ins: [dynamic]common.Interner
+    diag: common.Diag
+    prog: frontend.Programa
+    fonte: common.Fonte
+    sv: Semantica
+}
+
+proc s5_cena_montar(c: ^S5Cena, pre: []str) {
+    c.arenas = make([dynamic]common.Arena, alloc = heap)
+    append(&c.arenas, item = common.Arena{})
+    c.ins = make([dynamic]common.Interner, alloc = heap)
+    append(&c.ins, item = common.Interner{})
+    common.interner_iniciar(&c.ins[0], &c.arenas[0])
+    frontend.lexer_nomes_iniciais(&c.ins[0])
+    for k in 0..<len(pre) {
+        _ = common.internar(&c.ins[0], pre[k], len(pre[k]) as u32)
+    }
+    c.sv.arena = &c.arenas[0]
+    c.sv.nomes = c.ins[0..<1]
+    c.sv.diag = &c.diag
+    c.sv.programa = &c.prog
+    c.sv.fonte = &c.fonte
+    c.sv.qtd_modulos = 1
+    semantica_iniciar(&c.sv)
+}
+
+proc s5_cena_liberar(c: ^S5Cena) {
+    semantica_liberar(&c.sv)
+    common.fonte_liberar(&c.fonte)
+    common.interner_liberar(&c.ins[0])
+    common.arena_liberar(&c.arenas[0])
+    delete(c.ins)
+    delete(c.arenas)
+}
+
+// O texto do arquivo com os 4 zeros de sentinela que fonte_de_texto poe (o C le a Fonte assim).
+proc s5_cena_texto(c: ^S5Cena, texto: str) {
+    common.fonte_liberar(&c.fonte)
+    c.fonte.dono_texto = make([dynamic]u8, alloc = heap)
+    append(&c.fonte.dono_texto, items = as_bytes(texto))
+    resize(&c.fonte.dono_texto, len(texto) + 4)
+    c.fonte.texto = c.fonte.dono_texto[..]
+    c.fonte.tam = len(texto) as u64
+}
+
+proc s5_nome(c: ^S5Cena, texto: str) -> i32 {
+    return common.internar(&c.ins[0], texto, len(texto) as u32)
+}
+
+// Folha ja tipada (EX_EMBRULHA = ex_ja_tipado: sem_checar so devolve true) com o tipo e a flexibilidade pedidos.
+proc s5_folha(tipo: u32, flexivel: bool) -> frontend.Expr {
+    return frontend.Expr{tipo_no = frontend.EX_EMBRULHA as u8, tipo = tipo, flexivel = flexivel}
+}
+
+// Literal inteiro que sem_inteiro_constante le sem Fonte (ref = REF_COMPONENTE: o valor mora em ref_id; op = 1 digito).
+proc s5_inteiro(valor: i32, pos: u32) -> frontend.Expr {
+    return frontend.Expr{tipo_no = frontend.EX_INT as u8, op = 1, ref = frontend.REF_COMPONENTE as u8, ref_id = valor, tipo = TIPO_INT as u32, pos = pos}
+}
+
+// Liga e.args as folhas (posicional: Arg.indice = k); `folhas` nao pode crescer depois (os ponteiros ficam dentro dela).
+proc s5_ligar_args(e: ^frontend.Expr, folhas: ^[dynamic]frontend.Expr, args: ^[dynamic]frontend.Arg) {
+    for k in 0..<len(folhas^) {
+        append(args, item = frontend.Arg{nome = -1, valor = &folhas[k], indice = k as i32})
+    }
+    e.args = args[..]
+    e.nargs = len(args^) as u32
+}
+
+// Decl de foreign de libm: params de `tipo` com os nomes dados, retorno do mesmo tipo.
+proc s5_decl_libm(d: ^frontend.Decl, ps: ^[dynamic]frontend.Param, nome: i32, simbolo: i32, tipo: u32, nomes_param: []i32, pos: u32) {
+    d.nome = nome
+    d.simbolo = simbolo
+    d.externo = true
+    d.tem_retorno = true
+    d.retorno.tipo = tipo
+    d.pos = pos
+    for k in 0..<len(nomes_param) {
+        var p = frontend.Param{nome = nomes_param[k]}
+        p.tipo.tipo = tipo
+        append(ps, item = p)
+    }
+    d.params = ps[..]
+    d.nparams = len(ps^) as u32
+}
+
+test "sem_math_std: libm_binaria_de e as tabelas de libm" {
+    expect(libm_binaria_de("pow") == 0 and libm_binaria_de("powf") == 0)
+    expect(libm_binaria_de("atan2") == 1 and libm_binaria_de("atan2f") == 1)
+    expect(libm_binaria_de("hypot") == 2 and libm_binaria_de("hypotf") == 2)
+    expect(libm_binaria_de("fmod") == 3 and libm_binaria_de("fmodf") == 3)
+    expect(libm_binaria_de("copysign") == 4 and libm_binaria_de("copysignf") == 4)
+    expect(libm_binaria_de("sin") == -1 and libm_binaria_de("sqrtf") == -1 and libm_binaria_de("") == -1)
+    expect(libm_binaria_de("powx") == -1 and libm_binaria_de("powff") == -1 and libm_binaria_de("po") == -1 and libm_binaria_de("pow_f") == -1)
+    var c = S5Cena{}
+    s5_cena_montar(&c, {})
+    let x: i32 = c.sv.nome_x
+    let y: i32 = c.sv.nome_y
+    var um_x: [1]i32 = {x}
+    var xy: [2]i32 = {x, y}
+    var yx: [2]i32 = {y, x}
+    var ps = make([dynamic]frontend.Param, alloc = heap)
+    var d = frontend.Decl{}
+    s5_decl_libm(&d, &ps, x, -1, TIPO_F64 as u32, um_x[..], 0)
+    expect(nomes_do_libm(&c.sv, &d, -1) and tipos_do_libm(&d, TIPO_F64 as u32) and not tipos_do_libm(&d, TIPO_F32 as u32))
+    ps[0].nome = y
+    expect(not nomes_do_libm(&c.sv, &d, -1))
+    delete(ps)
+    ps = make([dynamic]frontend.Param, alloc = heap)
+    s5_decl_libm(&d, &ps, x, -1, TIPO_F32 as u32, xy[..], 0)
+    expect(nomes_do_libm(&c.sv, &d, 0) and nomes_do_libm(&c.sv, &d, 2) and nomes_do_libm(&c.sv, &d, 3) and nomes_do_libm(&c.sv, &d, 4))
+    expect(not nomes_do_libm(&c.sv, &d, 1))
+    expect(tipos_do_libm(&d, TIPO_F32 as u32))
+    ps[1].tipo.tipo = TIPO_F64 as u32
+    expect(not tipos_do_libm(&d, TIPO_F32 as u32))
+    delete(ps)
+    ps = make([dynamic]frontend.Param, alloc = heap)
+    s5_decl_libm(&d, &ps, x, -1, TIPO_F64 as u32, yx[..], 0)
+    expect(nomes_do_libm(&c.sv, &d, 1) and not nomes_do_libm(&c.sv, &d, 0))
+    d.tem_retorno = false
+    expect(not tipos_do_libm(&d, TIPO_F64 as u32))
+    d.tem_retorno = true
+    d.retorno.tipo = TIPO_F32 as u32
+    expect(not tipos_do_libm(&d, TIPO_F64 as u32))
+    delete(ps)
+    s5_cena_liberar(&c)
+}
+
+test "sem_math_std: linha_do_decl, importa_std_math, eh_modulo_math e gemea_f32" {
+    let l0 = "import \"std:math\"\n"
+    let l1 = "proc sin(x: f64) -> f64\n"
+    let l2 = "  proc a() { }\n"
+    let l3 = "foo proc b()\n"
+    let l4 = "\tproc cos(x: f64) -> f64"
+    let texto = format(f"{l0}{l1}{l2}{l3}{l4}", alloc = heap)
+    defer delete(texto)
+    var pre: [3]str = {"sin", "sin_f32", "cos"}
+    var c = S5Cena{}
+    s5_cena_montar(&c, pre[..])
+    s5_cena_texto(&c, texto)
+    var ini: u32 = 99
+    var tam: u32 = 99
+    let ini1: u32 = len(l0) as u32
+    var d = frontend.Decl{}
+    d.pos = ini1 + 5
+    expect(linha_do_decl(&c.sv, &d, &ini, &tam) and ini == ini1 and tam == (len(l1) as u32))
+    d.pos = ini1
+    expect(linha_do_decl(&c.sv, &d, &ini, &tam) and ini == ini1 and tam == (len(l1) as u32))
+    d.pos = ini1 + (len(l1) as u32) + 3
+    ini = 99
+    expect(not linha_do_decl(&c.sv, &d, &ini, &tam) and ini == 99)
+    d.pos = ini1 + (len(l1) as u32) + (len(l2) as u32) + 2
+    expect(not linha_do_decl(&c.sv, &d, &ini, &tam))
+    let ini4: u32 = (len(l0) + len(l1) + len(l2) + len(l3)) as u32
+    d.pos = ini4 + 3
+    expect(linha_do_decl(&c.sv, &d, &ini, &tam) and ini == ini4 and tam == (len(l4) as u32))
+    expect(importa_std_math(&c.sv))
+    var trs = make([dynamic]common.FonteTrecho, alloc = heap)
+    append(&trs, item = common.FonteTrecho{inicio = 0, fim = 10})
+    c.fonte.trechos = trs[..]
+    c.fonte.ntrechos = 1
+    expect(not importa_std_math(&c.sv))
+    trs[0].fim = (len(l0) as u32) - 1
+    expect(importa_std_math(&c.sv))
+    trs[0].fim = (len(l0) as u32) - 2
+    expect(not importa_std_math(&c.sv))
+    c.fonte.trechos = none
+    c.fonte.ntrechos = 0
+    delete(trs)
+    s5_cena_texto(&c, "import \"std:mathx\"\nimport \"std:rand\"\n")
+    expect(not importa_std_math(&c.sv))
+    s5_cena_texto(&c, "import \"std:rand\"\nimport \"std:math\" as m\n")
+    expect(importa_std_math(&c.sv))
+    s5_cena_texto(&c, "import \"std:rand\"\nimport \"std:mat\"\n")
+    expect(not importa_std_math(&c.sv))
+    // eh_modulo_math: o caminho do modulo e std:math e a origem e MOD_STD
+    var mods = make([dynamic]frontend.Modulos, alloc = heap)
+    append(&mods, item = frontend.Modulos{})
+    let id_math: i32 = s5_nome(&c, "std:math")
+    let id_rand: i32 = s5_nome(&c, "std:rand")
+    mods[0].itens[1] = frontend.Modulo{caminho = id_math, origem = frontend.MOD_STD as u8}
+    mods[0].itens[2] = frontend.Modulo{caminho = id_rand, origem = frontend.MOD_STD as u8}
+    mods[0].itens[3] = frontend.Modulo{caminho = id_math, origem = frontend.MOD_ARQUIVO as u8}
+    expect(not eh_modulo_math(&c.sv, &d))
+    c.sv.modulos = mods[..]
+    d.modulo = 0
+    expect(not eh_modulo_math(&c.sv, &d))
+    d.modulo = 1
+    expect(eh_modulo_math(&c.sv, &d))
+    d.modulo = 2
+    expect(not eh_modulo_math(&c.sv, &d))
+    d.modulo = 3
+    expect(not eh_modulo_math(&c.sv, &d))
+    c.sv.modulos = none
+    delete(mods)
+    // linha_do_decl: so '{' recusa, so '}' recusa, a linha limpa passa (cada chave sozinha na sua linha)
+    s5_cena_texto(&c, "proc d() {\nproc e() }\nproc f()\n")
+    d.pos = 0
+    expect(not linha_do_decl(&c.sv, &d, &ini, &tam))
+    d.pos = 11
+    expect(not linha_do_decl(&c.sv, &d, &ini, &tam))
+    d.pos = 22
+    expect(linha_do_decl(&c.sv, &d, &ini, &tam) and ini == 22 and tam == 9)
+    // gemea_f32: <nome>_f32 interno e o simbolo de proc do mesmo modulo
+    let id_sin: i32 = s5_nome(&c, "sin")
+    let id_gemea: i32 = s5_nome(&c, "sin_f32")
+    let proc_f32: ^frontend.Decl = s4_novo_decl(&c.sv) // na arena: o endereco vai para globais (heap)
+    proc_f32.tipo_no = frontend.D_PROC as u8
+    var dsin = frontend.Decl{nome = id_sin, modulo = 0}
+    expect(gemea_f32(&c.sv, &dsin) == none)
+    let globais = c.sv.globais or_else {}
+    globais[id_gemea] = Simbolo{categoria = SIM_PROC as u8, decl = proc_f32}
+    let achada: ?^Simbolo = gemea_f32(&c.sv, &dsin)
+    expect(achada != none and (achada as ^Simbolo).decl != none)
+    proc_f32.tipo_no = frontend.D_STRUCT as u8
+    expect(gemea_f32(&c.sv, &dsin) == none)
+    proc_f32.tipo_no = frontend.D_PROC as u8
+    proc_f32.modulo = 7
+    expect(gemea_f32(&c.sv, &dsin) == none)
+    let id_cos: i32 = s5_nome(&c, "cos")
+    var dcos = frontend.Decl{nome = id_cos, modulo = 0}
+    expect(gemea_f32(&c.sv, &dcos) == none)
+    var longo_buf: [93]u8 = {}
+    for k in 0..<93 {
+        longo_buf[k] = 97
+    }
+    let longo = from_bytes(longo_buf[..], alloc = heap)
+    defer delete(longo)
+    let id_longo: i32 = s5_nome(&c, longo)
+    var dlongo = frontend.Decl{nome = id_longo, modulo = 0}
+    expect(gemea_f32(&c.sv, &dlongo) == none)
+    s5_cena_liberar(&c)
+}
+
+test "sem_math_std: libm_migravel, motivos e trocas do forja migrar" {
+    let la = "proc sin(x: f64) -> f64\n"
+    let lb = "proc sinf(x: f32) -> f32\n"
+    let lc = "proc pow(x: f64, y: f64) -> f64 { }\n"
+    let texto = format(f"{la}{lb}{lc}", alloc = heap)
+    defer delete(texto)
+    var c = S5Cena{}
+    s5_cena_montar(&c, {})
+    s5_cena_texto(&c, texto)
+    let id_x: i32 = c.sv.nome_x
+    let id_y: i32 = c.sv.nome_y
+    let id_sin: i32 = s5_nome(&c, "sin")
+    let id_sinf: i32 = s5_nome(&c, "sinf")
+    let id_pow: i32 = s5_nome(&c, "pow")
+    let id_sqrt: i32 = s5_nome(&c, "sqrt")
+    let id_foo: i32 = s5_nome(&c, "foo")
+    var um_x: [1]i32 = {id_x}
+    var um_y: [1]i32 = {id_y}
+    var xy: [2]i32 = {id_x, id_y}
+    var motivo: ?str = none
+    var ps = make([dynamic]frontend.Param, alloc = heap)
+    var d = frontend.Decl{}
+    // sin f64 com x: migra para math.sin
+    s5_decl_libm(&d, &ps, id_sin, -1, TIPO_F64 as u32, um_x[..], 0)
+    var r: ?^common.Renomeado = libm_migravel(&c.sv, &d, &motivo)
+    expect(r != none and motivo == none and ((r as ^common.Renomeado).novo or_else "") == "math.sin")
+    delete(r as ^common.Renomeado)
+    // o simbolo C vem de d.simbolo quando >= 0: nome foo, simbolo sinf, f32
+    delete(ps)
+    ps = make([dynamic]frontend.Param, alloc = heap)
+    s5_decl_libm(&d, &ps, id_foo, id_sinf, TIPO_F32 as u32, um_x[..], ((len(la)) as u32))
+    r = libm_migravel(&c.sv, &d, &motivo)
+    expect(r != none and motivo == none and ((r as ^common.Renomeado).novo or_else "") == "math.sin")
+    delete(r as ^common.Renomeado)
+    // sqrt vira o embutido
+    delete(ps)
+    ps = make([dynamic]frontend.Param, alloc = heap)
+    s5_decl_libm(&d, &ps, id_sqrt, -1, TIPO_F64 as u32, um_x[..], 0)
+    r = libm_migravel(&c.sv, &d, &motivo)
+    expect(r != none and motivo == none and ((r as ^common.Renomeado).novo or_else "") == "sqrt")
+    delete(r as ^common.Renomeado)
+    // nao e libm: nenhum motivo
+    delete(ps)
+    ps = make([dynamic]frontend.Param, alloc = heap)
+    s5_decl_libm(&d, &ps, id_foo, -1, TIPO_F64 as u32, um_x[..], 0)
+    r = libm_migravel(&c.sv, &d, &motivo)
+    expect(r == none and motivo == none)
+    // aridade: sin com 2 parametros e pow com 1
+    delete(ps)
+    ps = make([dynamic]frontend.Param, alloc = heap)
+    s5_decl_libm(&d, &ps, id_sin, -1, TIPO_F64 as u32, xy[..], 0)
+    r = libm_migravel(&c.sv, &d, &motivo)
+    expect(r == none and (motivo or_else "") == "a aridade difere de std:math")
+    delete(ps)
+    ps = make([dynamic]frontend.Param, alloc = heap)
+    s5_decl_libm(&d, &ps, id_pow, -1, TIPO_F64 as u32, um_x[..], 0)
+    r = libm_migravel(&c.sv, &d, &motivo)
+    expect(r == none and (motivo or_else "") == "a aridade difere de std:math")
+    // nomes dos parametros
+    delete(ps)
+    ps = make([dynamic]frontend.Param, alloc = heap)
+    s5_decl_libm(&d, &ps, id_sin, -1, TIPO_F64 as u32, um_y[..], 0)
+    r = libm_migravel(&c.sv, &d, &motivo)
+    expect(r == none and (motivo or_else "") == "os nomes dos parametros diferem de std:math")
+    // tipo: sin com f32 e sinf com f64
+    delete(ps)
+    ps = make([dynamic]frontend.Param, alloc = heap)
+    s5_decl_libm(&d, &ps, id_sin, -1, TIPO_F32 as u32, um_x[..], 0)
+    r = libm_migravel(&c.sv, &d, &motivo)
+    expect(r == none and (motivo or_else "") == "o tipo nao bate: f32 com sufixo f, f64 sem")
+    delete(ps)
+    ps = make([dynamic]frontend.Param, alloc = heap)
+    s5_decl_libm(&d, &ps, id_sinf, -1, TIPO_F64 as u32, um_x[..], 0)
+    r = libm_migravel(&c.sv, &d, &motivo)
+    expect(r == none and (motivo or_else "") == "o tipo nao bate: f32 com sufixo f, f64 sem")
+    // linha com chave (pow na 3a linha)
+    delete(ps)
+    ps = make([dynamic]frontend.Param, alloc = heap)
+    s5_decl_libm(&d, &ps, id_pow, -1, TIPO_F64 as u32, xy[..], ((len(la) + len(lb)) as u32))
+    r = libm_migravel(&c.sv, &d, &motivo)
+    expect(r == none and (motivo or_else "") == "a linha do foreign tem chave ou mais de um item")
+    // ---- trocas
+    var reg = common.RenTrocas{}
+    common.ren_trocas_iniciar(&reg)
+    delete(ps)
+    ps = make([dynamic]frontend.Param, alloc = heap)
+    s5_decl_libm(&d, &ps, id_sin, -1, TIPO_F64 as u32, um_x[..], 0)
+    sem_libm_notar_decl(&c.sv, &d)
+    expect(len(reg.itens) == 0) // sem Diag.trocas (check/build) nada e notado
+    c.diag.trocas = &reg
+    sem_libm_notar_decl(&c.sv, &d)
+    expect(len(reg.itens) == 1)
+    expect(reg.itens[0].classe == common.REN_LIBM_LINHA and reg.itens[0].off == 0 and reg.itens[0].tam == (len(la) as u32) and (reg.itens[0].novo or_else "x") == "")
+    clear(&reg.itens)
+    // aviso: motivo vira REN_LIBM_AVISO no pos do decl, com o nome do decl
+    delete(ps)
+    ps = make([dynamic]frontend.Param, alloc = heap)
+    s5_decl_libm(&d, &ps, id_sin, -1, TIPO_F32 as u32, um_x[..], ((len(la)) as u32))
+    sem_libm_notar_decl(&c.sv, &d)
+    expect(len(reg.itens) == 1 and reg.itens[0].classe == common.REN_LIBM_AVISO and reg.itens[0].off == (len(la) as u32) and reg.itens[0].tam == 0)
+    expect((reg.itens[0].antigo or_else "") == "sin" and (reg.itens[0].novo or_else "") == "o tipo nao bate: f32 com sufixo f, f64 sem")
+    clear(&reg.itens)
+    // nao e libm: nada
+    delete(ps)
+    ps = make([dynamic]frontend.Param, alloc = heap)
+    s5_decl_libm(&d, &ps, id_foo, -1, TIPO_F64 as u32, um_x[..], 0)
+    sem_libm_notar_decl(&c.sv, &d)
+    expect(len(reg.itens) == 0)
+    // chamada: math.sin troca o nome e poe o import uma vez
+    delete(ps)
+    ps = make([dynamic]frontend.Param, alloc = heap)
+    s5_decl_libm(&d, &ps, id_sin, -1, TIPO_F64 as u32, um_x[..], 0)
+    var e = frontend.Expr{pos_op = 77}
+    sem_libm_notar_chamada(&c.sv, &e, &d)
+    expect(len(reg.itens) == 2)
+    expect(reg.itens[0].classe == common.REN_LIBM and reg.itens[0].off == 77 and reg.itens[0].tam == 3)
+    expect((reg.itens[0].antigo or_else "") == "sin" and (reg.itens[0].novo or_else "") == "math.sin")
+    expect(reg.itens[1].classe == common.REN_LIBM_LINHA and reg.itens[1].off == 0 and reg.itens[1].tam == 0)
+    expect((reg.itens[1].novo or_else "") == "import \"std:math\" as math\n")
+    e.pos_op = 90
+    sem_libm_notar_chamada(&c.sv, &e, &d)
+    expect(len(reg.itens) == 3 and reg.itens[2].classe == common.REN_LIBM and reg.itens[2].off == 90)
+    clear(&reg.itens)
+    // sqrt: sem math., sem import
+    delete(ps)
+    ps = make([dynamic]frontend.Param, alloc = heap)
+    s5_decl_libm(&d, &ps, id_sqrt, -1, TIPO_F64 as u32, um_x[..], 0)
+    sem_libm_notar_chamada(&c.sv, &e, &d)
+    expect(len(reg.itens) == 1 and (reg.itens[0].novo or_else "") == "sqrt" and reg.itens[0].tam == 4)
+    clear(&reg.itens)
+    // foreign que nao migra ou decl que nao e externo: nada
+    d.externo = false
+    sem_libm_notar_chamada(&c.sv, &e, &d)
+    expect(len(reg.itens) == 0)
+    d.externo = true
+    d.tem_retorno = false
+    sem_libm_notar_chamada(&c.sv, &e, &d)
+    expect(len(reg.itens) == 0)
+    // import ja no arquivo: notar_import_libm nao acrescenta
+    d.tem_retorno = true
+    delete(ps)
+    ps = make([dynamic]frontend.Param, alloc = heap)
+    s5_decl_libm(&d, &ps, id_sin, -1, TIPO_F64 as u32, um_x[..], 0)
+    s5_cena_texto(&c, "import \"std:math\" as math\nproc sin(x: f64) -> f64\n")
+    d.pos = 27 // a linha do proc (a do import tem 26 bytes + LF)
+    sem_libm_notar_chamada(&c.sv, &e, &d)
+    expect(len(reg.itens) == 1 and reg.itens[0].classe == common.REN_LIBM)
+    c.diag.trocas = none
+    common.ren_trocas_liberar(&reg)
+    delete(ps)
+    s5_cena_liberar(&c)
+}
+
+// Chamada de teste: Expr EX_CHAMADA com um argumento posicional por tipo (folhas ja tipadas, nao flexiveis); os ponteiros ficam dentro de folhas.
+struct S5Chamada {
+    folhas: [dynamic]frontend.Expr
+    args: [dynamic]frontend.Arg
+    e: frontend.Expr
+}
+
+proc s5_chamada_montar(ch: ^S5Chamada, nome: i32, tipos: []u32) {
+    ch.folhas = make([dynamic]frontend.Expr, alloc = heap)
+    ch.args = make([dynamic]frontend.Arg, alloc = heap)
+    for k in 0..<len(tipos) {
+        append(&ch.folhas, item = s5_folha(tipos[k], false))
+        ch.folhas[k].pos = 100 + (k as u32)
+    }
+    ch.e = frontend.Expr{tipo_no = frontend.EX_CHAMADA as u8, nome = nome, pos = 50, pos_op = 9}
+    s5_ligar_args(&ch.e, &ch.folhas, &ch.args)
+}
+
+proc s5_chamada_liberar(ch: ^S5Chamada) {
+    delete(ch.folhas)
+    delete(ch.args)
+}
+
+// Chama tipar_argumentos_math com folhas (tipo, flexivel) e devolve o resultado; base sai em `base`.
+proc s5_tipar_math(c: ^S5Cena, nome: i32, tipos: []u32, flex: []bool, base: ^u32) -> bool {
+    var folhas = make([dynamic]frontend.Expr, alloc = heap)
+    var args = make([dynamic]frontend.Arg, alloc = heap)
+    for k in 0..<len(tipos) {
+        append(&folhas, item = s5_folha(tipos[k], flex[k]))
+        folhas[k].pos = 100 + (k as u32)
+    }
+    var e = frontend.Expr{nome = nome, pos_op = 9}
+    s5_ligar_args(&e, &folhas, &args)
+    let ok: bool = tipar_argumentos_math(&c.sv, &e, base)
+    delete(folhas)
+    delete(args)
+    return ok
+}
+
+test "sem_math_std: tipar_argumentos_math e sem_math_chamada (E0334 e a gemea f32)" {
+    var pre: [2]str = {"pow", "pow_f32"}
+    var c = S5Cena{}
+    s5_cena_montar(&c, pre[..])
+    let id_pow: i32 = s5_nome(&c, "pow")
+    let f32t: u32 = TIPO_F32 as u32
+    let f64t: u32 = TIPO_F64 as u32
+    let intt: u32 = TIPO_INT as u32
+    var base: u32 = 0
+    // f32 e literal real: o tipo que manda e o do nao-literal
+    var t1: [2]u32 = {f32t, f32t}
+    var x1: [2]bool = {false, true}
+    expect(s5_tipar_math(&c, id_pow, t1[..], x1[..], &base) and base == f32t)
+    // so literais reais: f64 (D2)
+    var x2: [2]bool = {true, true}
+    expect(s5_tipar_math(&c, id_pow, t1[..], x2[..], &base) and base == f64t)
+    // f64 com f64
+    var t3: [2]u32 = {f64t, f64t}
+    expect(s5_tipar_math(&c, id_pow, t3[..], x1[..], &base) and base == f64t)
+    // literal de inteiro (flexivel, nao real): E0334 no argumento
+    var t4: [2]u32 = {f32t, intt}
+    expect(not s5_tipar_math(&c, id_pow, t4[..], x2[..], &base))
+    expect(c.diag.codigo == common.E0334 and c.diag.off == 101 and (c.diag.causa or_else "") == "pow pede f32 ou f64, nao int (literal de inteiro ou texto nao entra)")
+    var t4a: [2]u32 = {intt, f32t}
+    expect(not s5_tipar_math(&c, id_pow, t4a[..], x2[..], &base))
+    expect(c.diag.off == 100)
+    var t4b: [2]u32 = {f32t, intt}
+    var x4b: [2]bool = {false, true}
+    expect(not s5_tipar_math(&c, id_pow, t4b[..], x4b[..], &base))
+    expect(c.diag.off == 101 and (c.diag.causa or_else "") == "pow pede f32 ou f64, nao int (literal de inteiro ou texto nao entra)")
+    // f32 e f64 misturados
+    var t5: [2]u32 = {f32t, f64t}
+    var x5: [2]bool = {false, false}
+    expect(not s5_tipar_math(&c, id_pow, t5[..], x5[..], &base))
+    expect(c.diag.off == 101 and (c.diag.causa or_else "") == "pow pede o mesmo tipo nos argumentos: f32 e f64")
+    // nao-literal inteiro: o tipo que manda nao e real
+    var t6: [2]u32 = {intt, intt}
+    expect(not s5_tipar_math(&c, id_pow, t6[..], x5[..], &base))
+    expect(c.diag.off == 9 and (c.diag.causa or_else "") == "pow pede f32 ou f64 sem unidade, nao int")
+    // sem_math_chamada: so mexe em proc de std:math
+    var mods = make([dynamic]frontend.Modulos, alloc = heap)
+    append(&mods, item = frontend.Modulos{})
+    let id_math: i32 = s5_nome(&c, "std:math")
+    mods[0].itens[1] = frontend.Modulo{caminho = id_math, origem = frontend.MOD_STD as u8}
+    c.sv.modulos = mods[..]
+    let gemea: ^frontend.Decl = s4_novo_decl(&c.sv)
+    gemea.tipo_no = frontend.D_PROC as u8
+    gemea.modulo = 1
+    let original: ^frontend.Decl = s4_novo_decl(&c.sv)
+    original.tipo_no = frontend.D_PROC as u8
+    original.modulo = 1
+    original.nome = id_pow
+    let globais = c.sv.globais or_else {}
+    let id_gemea: i32 = s5_nome(&c, "pow_f32")
+    globais[id_gemea] = Simbolo{categoria = SIM_PROC as u8, decl = gemea}
+    var y_original = Simbolo{categoria = SIM_PROC as u8, decl = original}
+    var y: ?^Simbolo = &y_original
+    var folhas = make([dynamic]frontend.Expr, alloc = heap)
+    var args = make([dynamic]frontend.Arg, alloc = heap)
+    append(&folhas, item = s5_folha(f32t, false))
+    append(&folhas, item = s5_folha(f32t, true))
+    var e = frontend.Expr{nome = id_pow, pos_op = 9}
+    s5_ligar_args(&e, &folhas, &args)
+    expect(sem_math_chamada(&c.sv, &e, &y))
+    expect(y != none and (y as ^Simbolo).decl == (gemea as ?^frontend.Decl)) // f32: troca pela gemea pow_f32
+    y = &y_original
+    folhas[0].tipo = f64t
+    folhas[1].tipo = f64t
+    expect(sem_math_chamada(&c.sv, &e, &y))
+    expect(y == (&y_original as ?^Simbolo)) // f64: segue o original
+    original.modulo = 0
+    folhas[0].tipo = f32t
+    expect(sem_math_chamada(&c.sv, &e, &y)) // modulo 0: nao e std:math, nem tipa
+    expect(y == (&y_original as ?^Simbolo))
+    original.modulo = 1
+    original.tipo_no = frontend.D_STRUCT as u8
+    expect(sem_math_chamada(&c.sv, &e, &y))
+    y_original.decl = none
+    expect(sem_math_chamada(&c.sv, &e, &y))
+    original.tipo_no = frontend.D_PROC as u8
+    y_original.decl = original
+    folhas[0].tipo = f32t
+    folhas[1].tipo = f64t
+    folhas[1].flexivel = false
+    expect(not sem_math_chamada(&c.sv, &e, &y)) // erro de tipo sai do gancho
+    expect(c.diag.codigo == common.E0334)
+    delete(folhas)
+    delete(args)
+    c.sv.modulos = none
+    delete(mods)
+    s5_cena_liberar(&c)
+}

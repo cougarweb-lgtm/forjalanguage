@@ -1,0 +1,142 @@
+// nativo/obj/terceiros_ctors.fj - porte de compiler/nativo/obj/terceiros_ctors.c, compiler/nativo/obj/terceiros_ctors.h
+// sha256 de nativo/obj/terceiros_ctors.c: 0b8ba4c06fea204a2abf324ceecd49b5f7526c0836bf96ea11327518d2eb3b52
+// sha256 de nativo/obj/terceiros_ctors.h: 77ff9e72dfd5440671360b78bcada6f93df1098cdcb9ba1746d75de5ab36cec4
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "common"
+
+struct TcEntrada {
+    grupo: i32
+    secao: u32
+    off: u32
+    correcao: ObjCorrecao
+    ordem: u32
+}
+
+const TC_PREFIXO_XC: str = ".CRT$XC"
+const TERCEIROS_SIMBOLO_CTORS_INI: str = "forja_ctors_ini"
+const TC_NOME_CTORS: str = ".ctors"
+const TERCEIROS_SIMBOLO_CTORS_FIM: str = "forja_ctors_fim"
+const TC_SECAO_TABELA: str = ".rdata$ctors"
+const TC_TAM_PONTEIRO: u32 = 8
+const TC_NAO_E_CTOR: i32 = -1
+const TC_GRUPO_XC: i32 = 0
+const TC_GRUPO_CTORS: i32 = 1
+const ZEROS_3: [8]u8 = {0, 0, 0, 0, 0, 0, 0, 0}
+
+// C: nativo/obj/terceiros_ctors.c:28
+proc tc_grupo_da_secao(nome: str) -> i32 {
+    if common.c2f_prefixo_igual(nome, TC_PREFIXO_XC, len(TC_PREFIXO_XC)) {
+        return TC_GRUPO_XC
+    }
+    // o byte depois de ".ctors" tem que ser o NUL do fim ou um '.' (46); c2f_nul_em devolve 0 fora do texto
+    let apos: u8 = common.c2f_nul_em(nome, len(TC_NOME_CTORS))
+    if common.c2f_prefixo_igual(nome, TC_NOME_CTORS, len(TC_NOME_CTORS)) and ((apos == 0) or (apos == 46)) {
+        return TC_GRUPO_CTORS
+    }
+    return TC_NAO_E_CTOR
+}
+
+// C: nativo/obj/terceiros_ctors.c:39
+proc tc_coletar(o: ^Objeto, entradas: ^[dynamic]TcEntrada) {
+    var r: u64 = 0
+    while r < (len(o.relocs) as u64) {
+        let rel: ^ObjReloc = &o.relocs[r]
+        let grupo: i32 = tc_grupo_da_secao((o.secoes[rel.alvo.secao as u64].nome or_else ""))
+        if (grupo != TC_NAO_E_CTOR) and (common.c2f_s2u_32(rel.correcao.tipo) == (OR_ADDR64 as u32)) {
+            append(entradas, item = TcEntrada{})
+            entradas[len(entradas^) - 1] = TcEntrada{grupo = grupo, secao = rel.alvo.secao, off = rel.alvo.off, correcao = rel.correcao, ordem = (len(entradas^) - 1) as u32}
+        }
+        r += 1
+    }
+}
+
+// C: nativo/obj/terceiros_ctors.c:50
+proc tc_menor(a: u32, b: u32) -> i32 {
+    return common.c2f_b2i32(a > b) - common.c2f_b2i32(a < b)
+}
+
+// C: nativo/obj/terceiros_ctors.c:56
+// C2F-B0: less do sort_by. Ordem total: empate de (grupo, secao, off) desempata pela posicao de chegada (campo ordem); o C pode empatar (dois ADDR64 no mesmo off) e o msvcrt nao garante a ordem.
+proc tc_comparar(a: ^TcEntrada, b: ^TcEntrada) -> bool {
+    if a.grupo != b.grupo {
+        return a.grupo < b.grupo
+    }
+    var c: i32 = tc_menor(a.secao, b.secao)
+    if c == 0 {
+        c = tc_menor(a.off, b.off)
+    }
+    if a.grupo == TC_GRUPO_CTORS {
+        c = -c
+    }
+    if c != 0 {
+        return c < 0
+    }
+    return a.ordem < b.ordem
+}
+
+// C: nativo/obj/terceiros_ctors.c:70
+proc tc_criar_tabela(o: ^Objeto, entradas: ^[dynamic]TcEntrada) {
+    let secao: u32 = obj_secao_abrir(o, TC_SECAO_TABELA, OS_RDATA, TC_TAM_PONTEIRO)
+    var zeros: [8]u8 = ZEROS_3
+    for k in (0 as u64)..<(len(entradas^) as u64) {
+        append(&o.secoes[secao as u64].bytes, items = zeros[0..<len(zeros)])
+        obj_relocar(o, ObjAlvoReloc{secao = secao, off = ((k * (TC_TAM_PONTEIRO as u64)) as u32)}, entradas[k].correcao)
+    }
+    _ = obj_simbolo_definir(o, TERCEIROS_SIMBOLO_CTORS_INI, transmute(secao, to = i32), 0)
+    _ = obj_simbolo_definir(o, TERCEIROS_SIMBOLO_CTORS_FIM, transmute(secao, to = i32), ((len(entradas^) as u64) * (TC_TAM_PONTEIRO as u64)) as u32)
+}
+
+// C: nativo/obj/terceiros_ctors.c:86
+proc terceiros_construtores(o: ^Objeto) -> bool {
+    var entradas: [dynamic]TcEntrada = make([dynamic]TcEntrada, alloc = heap)
+    tc_coletar(o, &entradas)
+    let criou: bool = len(entradas) > 0
+    if criou {
+        sort_by(entradas[..], less = tc_comparar)
+        tc_criar_tabela(o, &entradas)
+    }
+    delete(entradas)
+    return criou
+}
+
+test "terceiros_tc_grupo_da_secao" {
+    expect(tc_grupo_da_secao(".CRT$XCA") == TC_GRUPO_XC)
+    expect(tc_grupo_da_secao(".CRT$XCU") == TC_GRUPO_XC)
+    expect(tc_grupo_da_secao(".ctors") == TC_GRUPO_CTORS)
+    expect(tc_grupo_da_secao(".ctors.65535") == TC_GRUPO_CTORS)
+    expect(tc_grupo_da_secao(".ctorsX") == TC_NAO_E_CTOR)
+    expect(tc_grupo_da_secao(".text") == TC_NAO_E_CTOR)
+    expect(tc_grupo_da_secao("") == TC_NAO_E_CTOR)
+}
+
+test "terceiros_tc_comparar_ordem" {
+    var xc_1: TcEntrada = TcEntrada{grupo = TC_GRUPO_XC, secao = 1, off = 0, ordem = 0}
+    var xc_2: TcEntrada = TcEntrada{grupo = TC_GRUPO_XC, secao = 1, off = 8, ordem = 1}
+    var ct_1: TcEntrada = TcEntrada{grupo = TC_GRUPO_CTORS, secao = 1, off = 0, ordem = 2}
+    var ct_2: TcEntrada = TcEntrada{grupo = TC_GRUPO_CTORS, secao = 1, off = 8, ordem = 3}
+    var empate_1: TcEntrada = TcEntrada{grupo = TC_GRUPO_XC, secao = 2, off = 4, ordem = 4}
+    var empate_2: TcEntrada = TcEntrada{grupo = TC_GRUPO_XC, secao = 2, off = 4, ordem = 5}
+    expect(tc_comparar(&xc_1, &xc_2))
+    expect(not tc_comparar(&xc_2, &xc_1))
+    expect(tc_comparar(&ct_2, &ct_1))
+    expect(not tc_comparar(&ct_1, &ct_2))
+    expect(tc_comparar(&xc_2, &ct_1))
+    expect(tc_comparar(&empate_1, &empate_2))
+}
+
+test "terceiros_construtores_monta_tabela" {
+    var o: Objeto = Objeto{}
+    obj_iniciar(&o)
+    let secao_xc: u32 = obj_secao_abrir(&o, ".CRT$XCU", OS_DATA, 8)
+    let alvo: u32 = obj_simbolo_referir(&o, "fn_init")
+    obj_relocar(&o, ObjAlvoReloc{secao = secao_xc, off = 0}, ObjCorrecao{tipo = OR_ADDR64, simbolo = alvo, adendo = 0})
+    expect(terceiros_construtores(&o))
+    expect(len(o.secoes) == 2)
+    expect((o.secoes[1].nome or_else "") == ".rdata$ctors")
+    expect(len(o.secoes[1].bytes) == 8)
+    expect(obj_achar_simbolo(&o, "forja_ctors_fim") >= 0)
+    expect(len(o.relocs) == 2)
+    obj_liberar(&o)
+}

@@ -1,0 +1,505 @@
+// nativo/obj/estatica.fj - porte de compiler/nativo/obj/estatica.c, compiler/nativo/obj/estatica.h
+// sha256 de nativo/obj/estatica.c: 4cf7960e74800c9376481d913624f585c7db00b11974fc874b810df3965dd309
+// sha256 de nativo/obj/estatica.h: 244f838592fababa2b83bb1f87ddba0d184e9cd7629c0a6e83df22b2af731a9f
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "common"
+
+struct EstaticaArquivo {
+    nome: ?str
+    bytes: ?^u8
+    n: u64
+    link: ?str
+}
+
+struct EstaticaPedido {
+    arquivos: ?[]EstaticaArquivo
+    qtd_arquivos: u32
+    raizes: ?[]str
+    qtd_raizes: u32
+}
+
+struct EstaticaMembro {
+    arquivo: u32
+    nome: ?str
+    dados: ?^u8
+    tam: u64
+}
+
+pub struct EstaticaSelecao {
+    memoria: common.Arena
+    membros: [dynamic]EstaticaMembro
+    pendentes: [dynamic]str
+}
+
+struct EstMembro {
+    off: u64
+    nome: ?str
+    dados: ?^u8
+    tam: u64
+    puxado: bool
+}
+
+struct Definicao {
+    simbolo: i32
+    arquivo: u32
+    membro: u32
+    prox: i32
+}
+
+struct Estatica {
+    pedido: ?^EstaticaPedido
+    sel: ?^EstaticaSelecao
+    erro: ?^common.Diag
+    nomes: common.Interner
+    arquivos: [dynamic][dynamic]EstMembro // C2F: um Vec de EstMembro por arquivo do pedido (vazio no repetido)
+    defs: [dynamic]Definicao
+    cabeca: [dynamic]i32
+    cauda: [dynamic]i32
+    visto: [dynamic]u8
+    fila: [dynamic]i32
+    fila_pos: u64
+}
+
+const EST_SEM_DEF: i32 = -1
+
+// C: nativo/obj/estatica.c:56
+proc est_relatar_arquivo(e: ^Estatica, arq: ^EstaticaArquivo, lido: ^common.Diag) -> bool {
+    let txt_1 = arq.nome or_else "(null)"
+    let txt_2 = lido.causa or_else "(null)"
+    let msg_1 = format(f"biblioteca estatica '{txt_1}': {txt_2}", alloc = heap)
+    defer delete(msg_1)
+    return common.diag_relatar(e.erro as ^common.Diag, common.X0105, 0, msg_1)
+}
+
+// C: nativo/obj/estatica.c:61
+proc est_relatar_membro(e: ^Estatica, arq: ^EstaticaArquivo, m: ^EstMembro, lido: ^common.Diag) -> bool {
+    let txt_1 = arq.nome or_else "(null)"
+    let txt_2 = m.nome or_else "(null)"
+    let txt_3 = lido.causa or_else "(null)"
+    let msg_1 = format(f"biblioteca estatica '{txt_1}', membro '{txt_2}': {txt_3}", alloc = heap)
+    defer delete(msg_1)
+    return common.diag_relatar(e.erro as ^common.Diag, common.X0105, 0, msg_1)
+}
+
+// C: nativo/obj/estatica.c:66
+proc est_membro_de(e: ^Estatica, arquivo: u32, membro: u32) -> ^EstMembro {
+    return &e.arquivos[arquivo as u64][membro as u64]
+}
+
+// C: nativo/obj/estatica.c:71
+proc est_relatar_duplicado(e: ^Estatica, id: i32, a: ^Definicao, b: ^Definicao) -> bool {
+    let arqs: []EstaticaArquivo = (e.pedido as ^EstaticaPedido).arquivos or_else {}
+    let txt_1 = common.interner_texto(&e.nomes, id)
+    let txt_2 = arqs[a.arquivo as u64].nome or_else "(null)"
+    let txt_3 = est_membro_de(e, a.arquivo, a.membro).nome or_else "(null)"
+    let txt_4 = arqs[b.arquivo as u64].nome or_else "(null)"
+    let txt_5 = est_membro_de(e, b.arquivo, b.membro).nome or_else "(null)"
+    let msg_1 = format(f"o simbolo '{txt_1}' e definido em duas bibliotecas estaticas: '{txt_2}' (membro '{txt_3}') e '{txt_4}' (membro '{txt_5}')", alloc = heap)
+    defer delete(msg_1)
+    return common.diag_relatar(e.erro as ^common.Diag, common.X0106, 0, msg_1)
+}
+
+// C: nativo/obj/estatica.c:81
+// V4: ArSimbolo.nome e ArMembro.nome sao vistas (?[]u8) nos bytes do arquivo, que o formato .a termina em NUL;
+// o texto e lido ate o NUL como o %s do C (o consumidor limita a nome_tam). Vazio/none = "".
+proc est_texto_do_nome(nome: ?[]u8) -> str {
+    let b: []u8 = nome or_else {}
+    if len(b) == 0 {
+        return ""
+    }
+    return (&b[0]) as rawptr as cstr as str
+}
+
+proc est_simbolo(e: ^Estatica, nome: str, tam: u64) -> i32 {
+    let id: i32 = common.internar(&e.nomes, nome, tam as u32)
+    while (len(e.cabeca) as u64) <= common.c2f_s2u_64(id as i64) {
+        append(&e.cabeca, item = 0)
+        e.cabeca[len(e.cabeca) - 1] = EST_SEM_DEF
+        append(&e.cauda, item = 0)
+        e.cauda[len(e.cauda) - 1] = EST_SEM_DEF
+        append(&e.visto, item = 0)
+    }
+    return id
+}
+
+// C: nativo/obj/estatica.c:92
+proc est_anexar_def(e: ^Estatica, simbolo: i32, arquivo: u32, membro: u32) {
+    let idx: i32 = (len(e.defs) as u64) as i32
+    append(&e.defs, item = Definicao{})
+    e.defs[len(e.defs) - 1] = Definicao{simbolo = simbolo, arquivo = arquivo, membro = membro, prox = EST_SEM_DEF}
+    let cauda: ^i32 = &e.cauda[common.c2f_s2u_64(simbolo as i64)]
+    if cauda^ == EST_SEM_DEF {
+        e.cabeca[common.c2f_s2u_64(simbolo as i64)] = idx
+    } else {
+        e.defs[common.c2f_s2u_64(cauda^ as i64)].prox = idx
+    }
+    cauda^ = idx
+}
+
+// C: nativo/obj/estatica.c:106
+proc est_ler_membros(e: ^Estatica, arq: ^EstaticaArquivo, membros: ^[dynamic]EstMembro) -> bool {
+    var it: ArIterador = ArIterador{}
+    var m: ArMembro = ArMembro{}
+    var lido: common.Diag = common.Diag{tem = false}
+    if not ar_iniciar(&it, arq.bytes as ^u8, arq.n, &lido) {
+        return est_relatar_arquivo(e, arq, &lido)
+    }
+    while ar_proximo(&it, &m, &lido) {
+        if m.tipo != AR_OBJETO {
+            continue
+        }
+        let nome_txt: str = est_texto_do_nome(m.nome)
+        let nome_copia: str = from_bytes(as_bytes(nome_txt)[0..<m.nome_tam], alloc = common.arena_mem(&(e.sel as ^EstaticaSelecao).memoria))
+        // C2F-B4: EstMembro.dados e ponteiro (como no C); membro vazio aponta para o inicio do arquivo, que o C tambem deixa nao nulo
+        var dados: ?^u8 = arq.bytes
+        let fatia: []u8 = m.dados or_else {}
+        if len(fatia) > 0 {
+            dados = &fatia[0]
+        }
+        append(membros, item = EstMembro{off = m.off, nome = nome_copia, dados = dados, tam = m.tam, puxado = false})
+    }
+    if lido.tem {
+        return est_relatar_arquivo(e, arq, &lido)
+    }
+    return true
+}
+
+// C: nativo/obj/estatica.c:124
+proc est_achar_membro(membros: ^[dynamic]EstMembro, off: u64) -> i64 {
+    var lo: u64 = 0
+    var hi: u64 = len(membros^) as u64
+    while lo < hi {
+        let meio: u64 = lo + ((hi - lo) / 2)
+        let atual: u64 = membros[meio].off
+        if atual == off {
+            return transmute(meio, to = i64)
+        }
+        if atual < off {
+            lo = meio + 1
+        } else {
+            hi = meio
+        }
+    }
+    return -1
+}
+
+// C: nativo/obj/estatica.c:140
+proc est_anexar_indice(e: ^Estatica, k: u32, simbolos: ^[dynamic]ArSimbolo) -> bool {
+    let arq: ^EstaticaArquivo = &((e.pedido as ^EstaticaPedido).arquivos or_else {})[k as u64]
+    let membros: ^[dynamic]EstMembro = &e.arquivos[k as u64]
+    var i: u64 = 0
+    while i < (len(simbolos^) as u64) {
+        let s: ^ArSimbolo = &simbolos[i]
+        let membro: i64 = est_achar_membro(membros, s.membro_off as u64)
+        if membro < 0 {
+            let txt_1 = arq.nome or_else "(null)"
+            let txt_2 = est_texto_do_nome(s.nome)
+            let off: u32 = s.membro_off
+            let msg_1 = format(f"biblioteca estatica '{txt_1}': o indice manda o simbolo '{txt_2}' para o offset {off}, que nao e um membro", alloc = heap)
+            defer delete(msg_1)
+            return common.diag_relatar(e.erro as ^common.Diag, common.X0105, 0, msg_1)
+        }
+        est_anexar_def(e, est_simbolo(e, est_texto_do_nome(s.nome), s.nome_tam), k, membro as u32)
+        i += 1
+    }
+    return true
+}
+
+// C: nativo/obj/estatica.c:155
+proc est_indexar(e: ^Estatica, k: u32) -> bool {
+    let arq: ^EstaticaArquivo = &((e.pedido as ^EstaticaPedido).arquivos or_else {})[k as u64]
+    var simbolos: [dynamic]ArSimbolo = make([dynamic]ArSimbolo, alloc = heap) // C2F-B4: o C deixa o VecIniciar para ArLerIndice; a lista Forja precisa nascer aqui (R0007 com valor zero)
+    var lido: common.Diag = common.Diag{tem = false}
+    var ok: bool = ar_ler_indice(slice_from(arq.bytes as ^u8, len = arq.n as int), &simbolos, &lido)
+    if not ok {
+        ok = est_relatar_arquivo(e, arq, &lido)
+    }
+    ok = ok and est_anexar_indice(e, k, &simbolos)
+    delete(simbolos)
+    return ok
+}
+
+// C: nativo/obj/estatica.c:167
+proc est_repetido(pedido: ^EstaticaPedido, k: u32) -> bool {
+    let arqs: []EstaticaArquivo = pedido.arquivos or_else {}
+    var j: u32 = 0
+    while j < k {
+        if arqs[j as u64].bytes == arqs[k as u64].bytes {
+            return true
+        }
+        j += 1
+    }
+    return false
+}
+
+// C: nativo/obj/estatica.c:176
+proc est_carregar(e: ^Estatica) -> bool {
+    let pedido: ^EstaticaPedido = e.pedido as ^EstaticaPedido
+    for k in (0 as u32)..<pedido.qtd_arquivos {
+        append(&e.arquivos, item = make([dynamic]EstMembro, alloc = heap))
+        let membros: ^[dynamic]EstMembro = &e.arquivos[len(e.arquivos) - 1]
+        if est_repetido(pedido, k) {
+            continue
+        }
+        if (not est_ler_membros(e, &(pedido.arquivos or_else {})[k as u64], membros)) or (not est_indexar(e, k)) {
+            return false
+        }
+    }
+    return true
+}
+
+// C: nativo/obj/estatica.c:191
+proc est_enfileirar(e: ^Estatica, nome: str) {
+    let id: i32 = est_simbolo(e, nome, len(nome) as u64)
+    let visto: ^u8 = &e.visto[common.c2f_s2u_64(id as i64)]
+    if visto^ != 0 {
+        return
+    }
+    visto^ = 1
+    append(&e.fila, item = 0)
+    e.fila[len(e.fila) - 1] = id
+}
+
+// C: nativo/obj/estatica.c:202
+proc est_listar_membro(dados: ^u8, tam: u64, destino: ^CoffDestinoNomes, lido: ^common.Diag) -> bool {
+    var erro: ElfLErro = ElfLErro{codigo = 0}
+    if not ar_eh_elf(dados, tam) {
+        return coff_listar_indefinidos(dados, tam, destino, lido)
+    }
+    var elfdest: ElfLDestinoNomes = ElfLDestinoNomes{arena = destino.arena, lista = destino.lista}
+    if common.c2f_s2u_32(elf_listar_indefinidos(dados, tam, &elfdest, &erro)) == (ELFL_OK as u32) {
+        return true
+    }
+    let txt_1 = erro.mensagem or_else "(null)"
+    let msg_1 = format(f"{txt_1}", alloc = heap)
+    defer delete(msg_1)
+    _ = common.diag_relatar(lido, common.X0105, 0, msg_1)
+    return false
+}
+
+// C: nativo/obj/estatica.c:215
+proc est_enfileirar_indefinidos(e: ^Estatica, k: u32, m: ^EstMembro) -> bool {
+    var indef: [dynamic]str = make([dynamic]str, alloc = heap)
+    var lido: common.Diag = common.Diag{tem = false}
+    let sel: ^EstaticaSelecao = e.sel as ^EstaticaSelecao
+    var destino: CoffDestinoNomes = CoffDestinoNomes{arena = &sel.memoria, lista = &indef}
+    if not est_listar_membro(m.dados as ^u8, m.tam, &destino, &lido) {
+        delete(indef)
+        return est_relatar_membro(e, &((e.pedido as ^EstaticaPedido).arquivos or_else {})[k as u64], m, &lido)
+    }
+    var i: u64 = 0
+    while i < (len(indef) as u64) {
+        est_enfileirar(e, indef[i])
+        i += 1
+    }
+    delete(indef)
+    return true
+}
+
+// C: nativo/obj/estatica.c:231
+proc est_puxar(e: ^Estatica, d: ^Definicao) -> bool {
+    let m: ^EstMembro = est_membro_de(e, d.arquivo, d.membro)
+    if m.puxado {
+        return true
+    }
+    m.puxado = true
+    let ptr_1: ^EstaticaSelecao = e.sel as ^EstaticaSelecao
+    append(&ptr_1.membros, item = EstaticaMembro{})
+    ptr_1.membros[len(ptr_1.membros) - 1] = EstaticaMembro{arquivo = d.arquivo, nome = m.nome, dados = m.dados, tam = m.tam}
+    return est_enfileirar_indefinidos(e, d.arquivo, m)
+}
+
+// C: nativo/obj/estatica.c:242
+proc est_conferir_unica(e: ^Estatica, id: i32, primeira: ^Definicao) -> bool {
+    var i: i32 = primeira.prox
+    while i != EST_SEM_DEF {
+        let outra: ^Definicao = &e.defs[common.c2f_s2u_64(i as i64)]
+        if outra.arquivo != primeira.arquivo {
+            return est_relatar_duplicado(e, id, primeira, outra)
+        }
+        i = e.defs[common.c2f_s2u_64(i as i64)].prox
+    }
+    return true
+}
+
+// C: nativo/obj/estatica.c:252
+proc est_resolver(e: ^Estatica, id: i32) -> bool {
+    let cabeca: i32 = e.cabeca[common.c2f_s2u_64(id as i64)]
+    if cabeca == EST_SEM_DEF {
+        let nome: str = common.interner_texto(&e.nomes, id)
+        if alcance_indice_simbolo_do_ligador(nome) < 0 {
+            let ptr_1: ^EstaticaSelecao = e.sel as ^EstaticaSelecao
+            append(&ptr_1.pendentes, item = "")
+            ptr_1.pendentes[len(ptr_1.pendentes) - 1] = nome
+        }
+        return true
+    }
+    var primeira: Definicao = e.defs[common.c2f_s2u_64(cabeca as i64)]
+    return (common.c2f_b2i32(est_conferir_unica(e, id, &primeira)) != 0) and (common.c2f_b2i32(est_puxar(e, &primeira)) != 0)
+}
+
+// C: nativo/obj/estatica.c:265
+proc est_selecionar_raizes(e: ^Estatica) -> bool {
+    for i in (0 as u32)..<(e.pedido as ^EstaticaPedido).qtd_raizes {
+        est_enfileirar(e, ((e.pedido as ^EstaticaPedido).raizes or_else {})[i])
+    }
+    while e.fila_pos < (len(e.fila) as u64) {
+        let antes_1: u64 = e.fila_pos
+        e.fila_pos += 1
+        let id: i32 = e.fila[antes_1]
+        if not est_resolver(e, id) {
+            return false
+        }
+    }
+    return true
+}
+
+// C: nativo/obj/estatica.c:279
+proc est_iniciar(e: ^Estatica, pedido: ^EstaticaPedido, sel: ^EstaticaSelecao, erro: ^common.Diag) {
+    e^ = Estatica{pedido = pedido, sel = sel, erro = erro}
+    sel^ = EstaticaSelecao{}
+    sel.membros = make([dynamic]EstaticaMembro, alloc = heap)
+    sel.pendentes = make([dynamic]str, alloc = heap)
+    common.interner_iniciar(&e.nomes, &sel.memoria)
+    e.arquivos = make([dynamic][dynamic]EstMembro, alloc = heap)
+    e.defs = make([dynamic]Definicao, alloc = heap)
+    e.cabeca = make([dynamic]i32, alloc = heap)
+    e.cauda = make([dynamic]i32, alloc = heap)
+    e.visto = make([dynamic]u8, alloc = heap)
+    e.fila = make([dynamic]i32, alloc = heap)
+}
+
+// C: nativo/obj/estatica.c:294
+proc est_liberar(e: ^Estatica) {
+    var k: u64 = 0
+    while k < (len(e.arquivos) as u64) {
+        delete(e.arquivos[k])
+        k += 1
+    }
+    delete(e.arquivos)
+    delete(e.defs)
+    delete(e.cabeca)
+    delete(e.cauda)
+    delete(e.visto)
+    delete(e.fila)
+    common.interner_liberar(&e.nomes)
+}
+
+// C: nativo/obj/estatica.c:307
+proc estatica_selecionar(pedido: ^EstaticaPedido, sel: ^EstaticaSelecao, erro: ^common.Diag) -> bool {
+    var e: Estatica = Estatica{}
+    est_iniciar(&e, pedido, sel, erro)
+    let ok: bool = (common.c2f_b2i32(est_carregar(&e)) != 0) and (common.c2f_b2i32(est_selecionar_raizes(&e)) != 0)
+    est_liberar(&e)
+    return ok
+}
+
+// C: nativo/obj/estatica.c:316
+proc estatica_liberar(sel: ^EstaticaSelecao) {
+    delete(sel.membros)
+    delete(sel.pendentes)
+    common.arena_liberar(&sel.memoria)
+}
+
+test "estatica: sem arquivos, as raizes viram pendentes (menos as do ligador) e sem repeticao" {
+    var raizes: [4]str = {"a", "b", "a", "__init_array_start"}
+    var pedido: EstaticaPedido = EstaticaPedido{qtd_arquivos = 0, raizes = raizes[..], qtd_raizes = 4}
+    var sel: EstaticaSelecao = EstaticaSelecao{}
+    var erro: common.Diag = common.Diag{tem = false}
+    expect(estatica_selecionar(&pedido, &sel, &erro))
+    expect(not erro.tem)
+    expect(len(sel.membros) == 0)
+    expect(len(sel.pendentes) == 2)
+    expect(sel.pendentes[0] == "a")
+    expect(sel.pendentes[1] == "b")
+    estatica_liberar(&sel)
+}
+
+test "estatica: est_repetido (mesmo ponteiro de bytes) e est_achar_membro (busca binaria)" {
+    var b1: [4]u8 = {1, 2, 3, 4}
+    var b2: [4]u8 = {5, 6, 7, 8}
+    var arqs: [3]EstaticaArquivo = {}
+    arqs[0] = EstaticaArquivo{nome = "a", bytes = &b1[0], n = 4}
+    arqs[1] = EstaticaArquivo{nome = "b", bytes = &b2[0], n = 4}
+    arqs[2] = EstaticaArquivo{nome = "c", bytes = &b1[0], n = 4}
+    var pedido: EstaticaPedido = EstaticaPedido{arquivos = arqs[..], qtd_arquivos = 3}
+    expect(not est_repetido(&pedido, 0))
+    expect(not est_repetido(&pedido, 1))
+    expect(est_repetido(&pedido, 2))
+    var membros: [dynamic]EstMembro = make([dynamic]EstMembro, alloc = heap)
+    defer delete(membros)
+    append(&membros, item = EstMembro{off = 8})
+    append(&membros, item = EstMembro{off = 100})
+    append(&membros, item = EstMembro{off = 300})
+    expect(est_achar_membro(&membros, 8) == 0)
+    expect(est_achar_membro(&membros, 100) == 1)
+    expect(est_achar_membro(&membros, 300) == 2)
+    expect(est_achar_membro(&membros, 0) == -1)
+    expect(est_achar_membro(&membros, 9) == -1)
+    expect(est_achar_membro(&membros, 301) == -1)
+    var vazio: [dynamic]EstMembro = make([dynamic]EstMembro, alloc = heap)
+    defer delete(vazio)
+    expect(est_achar_membro(&vazio, 8) == -1)
+}
+
+test "estatica: indice, definicoes duplicadas e membro ja puxado" {
+    var arqs: [2]EstaticaArquivo = {}
+    arqs[0] = EstaticaArquivo{nome = "a.lib"}
+    arqs[1] = EstaticaArquivo{nome = "b.lib"}
+    var pedido: EstaticaPedido = EstaticaPedido{arquivos = arqs[..], qtd_arquivos = 2}
+    var sel: EstaticaSelecao = EstaticaSelecao{}
+    var erro: common.Diag = common.Diag{tem = false}
+    var e: Estatica = Estatica{}
+    est_iniciar(&e, &pedido, &sel, &erro)
+    defer est_liberar(&e)
+    defer estatica_liberar(&sel)
+    append(&e.arquivos, item = make([dynamic]EstMembro, alloc = heap))
+    append(&e.arquivos, item = make([dynamic]EstMembro, alloc = heap))
+    append(&e.arquivos[0], item = EstMembro{off = 8, nome = "m0"})
+    append(&e.arquivos[0], item = EstMembro{off = 100, nome = "m0b"})
+    append(&e.arquivos[1], item = EstMembro{off = 8, nome = "m1"})
+    expect(est_membro_de(&e, 0, 1).off == 100)
+    expect((est_membro_de(&e, 1, 0).nome or_else "") == "m1")
+    // est_anexar_indice: f e h no arquivo 0 (membros 0 e 1), nada mais
+    var simbolos: [dynamic]ArSimbolo = make([dynamic]ArSimbolo, alloc = heap)
+    defer delete(simbolos)
+    // ArSimbolo.nome e vista nos bytes do arquivo, com NUL final como no .a
+    var nome_f: [2]u8 = {102, 0}
+    var nome_h: [2]u8 = {104, 0}
+    var nome_g: [2]u8 = {103, 0}
+    append(&simbolos, item = ArSimbolo{nome = nome_f[..], nome_tam = 1, membro_off = 8})
+    append(&simbolos, item = ArSimbolo{nome = nome_h[..], nome_tam = 1, membro_off = 100})
+    expect(est_anexar_indice(&e, 0, &simbolos))
+    expect(len(e.defs) == 2)
+    expect(e.defs[0].arquivo == 0)
+    expect(e.defs[0].membro == 0)
+    expect(e.defs[1].membro == 1)
+    expect(e.defs[0].prox == EST_SEM_DEF)
+    expect(e.cabeca[0] == 0)
+    expect(e.cabeca[1] == 1)
+    // offset que nao e membro: erro X0105 com o texto do C
+    var ruim: [dynamic]ArSimbolo = make([dynamic]ArSimbolo, alloc = heap)
+    defer delete(ruim)
+    append(&ruim, item = ArSimbolo{nome = nome_g[..], nome_tam = 1, membro_off = 99})
+    expect(not est_anexar_indice(&e, 0, &ruim))
+    expect(len(e.defs) == 2)
+    expect(erro.codigo == common.X0105)
+    expect((erro.causa or_else "") == "biblioteca estatica 'a.lib': o indice manda o simbolo 'g' para o offset 99, que nao e um membro")
+    // o mesmo simbolo "f" tambem no arquivo 1: definido em duas bibliotecas
+    est_anexar_def(&e, 0, 1, 0)
+    expect(e.defs[0].prox == 2)
+    expect(e.cauda[0] == 2)
+    expect(not est_conferir_unica(&e, 0, &e.defs[0]))
+    expect(erro.codigo == common.X0106)
+    expect((erro.causa or_else "") == "o simbolo 'f' e definido em duas bibliotecas estaticas: 'a.lib' (membro 'm0') e 'b.lib' (membro 'm1')")
+    expect(not est_resolver(&e, 0))
+    // dois no mesmo arquivo: vale o primeiro, sem erro; o membro ja puxado nao entra de novo
+    est_anexar_def(&e, 1, 0, 1)
+    expect(est_conferir_unica(&e, 1, &e.defs[1]))
+    let ja: ^EstMembro = est_membro_de(&e, 0, 1)
+    ja.puxado = true
+    expect(est_puxar(&e, &e.defs[1]))
+    expect(len(sel.membros) == 0)
+}

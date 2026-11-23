@@ -1,0 +1,333 @@
+// driver/editar_mover.fj - porte de compiler/driver/editar_mover.c
+// sha256 de driver/editar_mover.c: b5f5fd4cf7066e98e6c215d1cce30c83921a5b4556804f71f360532582ffd5cc
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "common"
+import "frontend"
+import "semantic"
+
+struct Retalho {
+    ini: u32
+    fim: u32
+    novo: ?str
+    ordem: u32
+}
+
+struct Movimento {
+    p: ?^Plano
+    d: ?^frontend.Decl
+    origem: u8
+    destino: u8
+    origem_arq: u32
+    destino_arq: u32
+    faixa: FaixaDecl
+    ini_decl: u32
+    fim_decl: u32
+    imp: ?^Imports
+    retalhos: [dynamic]Retalho
+    nretalhos: u32
+    cap: u32
+    precisa_pub: bool
+}
+
+// C: driver/editar_mover.c:34
+proc adicionar_retalho(m: ^Movimento, ini: u32, fim: u32, novo: ?str) {
+    append(&m.retalhos, item = Retalho{ini = ini, fim = fim, novo = novo, ordem = m.nretalhos})
+    m.nretalhos += 1
+}
+
+// C: driver/editar_mover.c:46
+// "apelido." na arena do plano. 159 bytes no maximo: o texto[160] do C.
+proc com_ponto(p: ^Plano, apelido: ?str) -> str {
+    let nome: str = apelido or_else ""
+    let com: str = format(f"{nome}.", alloc = common.arena_mem(p.arena as ^common.Arena))
+    return com[0..<min(len(com), 159)]
+}
+
+// C: driver/editar_mover.c:56
+proc decl_movivel(p: ^Plano, d: ?^frontend.Decl) -> bool {
+    if not consulta_eh_simbolo(d) {
+        let msg_1 = format(f"so se move proc, struct, enum, union, const e unit", alloc = heap)
+        defer delete(msg_1)
+        return plano_erro(p, msg_1)
+    }
+    if (d as ^frontend.Decl).externo {
+        let msg_2 = format(f"a declaracao e de um bloco 'foreign': o bloco inteiro nao se move com mover_decl", alloc = heap)
+        defer delete(msg_2)
+        return plano_erro(p, msg_2)
+    }
+    if consulta_entrada_de(p.q as ^Consulta, d) != none {
+        let msg_3 = format(f"a declaracao e ponto de entrada (main ou pub export): fica no arquivo raiz", alloc = heap)
+        defer delete(msg_3)
+        return plano_erro(p, msg_3)
+    }
+    return editar_modulo_editavel(p, (d as ^frontend.Decl).modulo)
+}
+
+// C: driver/editar_mover.c:66
+proc modulo_sem_pacote(p: ^Plano, modulo: u8, papel: str, arquivo: ^u32) -> bool {
+    let q: ?^Consulta = p.q
+    let n: u32 = frontend.modulos_trechos_do_pacote(&((q as ^Consulta).c as ^Compilacao).modulos, ((q as ^Consulta).c as ^Compilacao).fonte.ntrechos, modulo, arquivo)
+    if n < 2 {
+        return true
+    }
+    let msg_1 = format(f"mover_decl nao move de nem para um pacote (pasta com {n} arquivos): o modulo \"{common.interner_texto(&((q as ^Consulta).c as ^Compilacao).nomes, ((q as ^Consulta).c as ^Compilacao).modulos.itens[modulo].caminho)[0..<transmute(common.interner_tam(&((q as ^Consulta).c as ^Compilacao).nomes, ((q as ^Consulta).c as ^Compilacao).modulos.itens[modulo].caminho), to = i32)]}\" e o {papel}; mova a mao ou com inserir_decl e remover_decl", alloc = heap)
+    defer delete(msg_1)
+    return plano_erro(p, msg_1)
+}
+
+// C: driver/editar_mover.c:76
+proc iniciar_movimento(m: ^Movimento, para: str) -> bool {
+    let p: ?^Plano = m.p
+    let destino: i32 = editar_achar_modulo(p as ^Plano, para)
+    if (destino < 0) or (not editar_modulo_editavel(p as ^Plano, destino as u8)) {
+        return false
+    }
+    if (not modulo_sem_pacote(p as ^Plano, (m.d as ^frontend.Decl).modulo, "de origem", &m.origem_arq)) or (not modulo_sem_pacote(p as ^Plano, destino as u8, "de destino", &m.destino_arq)) {
+        return false
+    }
+    if destino == ((m.d as ^frontend.Decl).modulo as i32) {
+        let msg_1 = format(f"a declaracao ja esta no modulo '{para}'", alloc = heap)
+        defer delete(msg_1)
+        return plano_erro(p as ^Plano, msg_1)
+    }
+    m.origem = (m.d as ^frontend.Decl).modulo
+    m.destino = destino as u8
+    m.ini_decl = consulta_inicio_decl((p as ^Plano).q as ^Consulta, m.d)
+    m.fim_decl = frontend.ast_fim_decl(&((p as ^Plano).q as ^Consulta).fim, m.d)
+    return editar_faixa_da_decl(p as ^Plano, m.d, &m.faixa)
+}
+
+// C: driver/editar_mover.c:94
+proc tornar_publico(m: ^Movimento, alvo: ?^frontend.Decl) -> bool {
+    var ini: u32 = 0
+    if (alvo as ^frontend.Decl).publico {
+        return true
+    }
+    if (alvo as ^frontend.Decl).externo {
+        let msg_1 = format(f"a declaracao usa um proc de bloco 'foreign' que nao e pub: torne o bloco pub e tente de novo", alloc = heap)
+        defer delete(msg_1)
+        return plano_erro(m.p as ^Plano, msg_1)
+    }
+    ini = consulta_inicio_decl((m.p as ^Plano).q as ^Consulta, alvo)
+    return editar_trocar_no_arquivo(m.p as ^Plano, ini, ini, "pub ")
+}
+
+// C: driver/editar_mover.c:107
+proc qualificar_irmao(m: ^Movimento, u: ^semantic.IndUso, token: u32) -> bool {
+    let apelido: ?str = imports_apelido(m.imp, m.destino_arq, m.origem, -1)
+    let off: u32 = editar_token((m.p as ^Plano).q as ^Consulta, token).off
+    if apelido == none {
+        return false
+    }
+    imports_contar(m.imp, m.destino_arq, m.origem, 1)
+    adicionar_retalho(m, off, off, com_ponto(m.p as ^Plano, apelido))
+    return tornar_publico(m, u.alvo)
+}
+
+// C: driver/editar_mover.c:119
+proc trocar_apelido_interno(m: ^Movimento, nome: u32, k: u8) -> bool {
+    let q: ^Consulta = (m.p as ^Plano).q as ^Consulta
+    let apelido: ^frontend.Token = editar_token(q, nome - 2)
+    let tam: int = common.interner_tam(&(q.c as ^Compilacao).nomes, apelido.sym) as int
+    let novo: ?str = imports_apelido(m.imp, m.destino_arq, k, apelido.sym)
+    if novo == none {
+        return false
+    }
+    imports_contar(m.imp, m.destino_arq, k, 1)
+    let novo_txt: str = novo or_else ""
+    let antigo: str = common.interner_texto(&(q.c as ^Compilacao).nomes, apelido.sym)[0..<tam]
+    if (len(novo_txt) != tam) or (common.c2f_memcmp(as_bytes(novo_txt), as_bytes(antigo)) != 0) {
+        adicionar_retalho(m, apelido.off, apelido.off + (tam as u32), novo)
+    }
+    return true
+}
+
+// C: driver/editar_mover.c:132
+proc uso_interno(m: ^Movimento, u: ^semantic.IndUso, token: u32) -> bool {
+    let q: ?^Consulta = (m.p as ^Plano).q
+    let k: u8 = (u.alvo as ^frontend.Decl).modulo
+    var nome: u32 = 0
+    if (k as i32) == (m.origem as i32) {
+        return qualificar_irmao(m, u, token)
+    }
+    if not editar_uso_qualificado(q as ^Consulta, u, &nome) {
+        return true
+    }
+    if (k as i32) == (m.destino as i32) {
+        let arg_1: str = ""
+        let arg_2: u32 = editar_token(q as ^Consulta, nome).off
+        let arg_3: u32 = editar_token(q as ^Consulta, nome - 2).off
+        let arg_4: ^Movimento = m
+        adicionar_retalho(arg_4, arg_3, arg_2, arg_1)
+        return true
+    }
+    return trocar_apelido_interno(m, nome, k)
+}
+
+// C: driver/editar_mover.c:150
+proc qualificar_na_origem(m: ^Movimento, token: u32) -> bool {
+    let apelido: ?str = imports_apelido(m.imp, m.origem_arq, m.destino, -1)
+    let off: u32 = editar_token((m.p as ^Plano).q as ^Consulta, token).off
+    if apelido == none {
+        return false
+    }
+    imports_contar(m.imp, m.origem_arq, m.destino, 1)
+    m.precisa_pub = true
+    let arg_1: str = com_ponto(m.p as ^Plano, apelido)
+    let arg_2: u32 = off
+    let arg_3: u32 = off
+    let arg_4: ^Plano = m.p as ^Plano
+    return editar_trocar_no_arquivo(arg_4, arg_3, arg_2, arg_1)
+}
+
+// C: driver/editar_mover.c:162
+proc trocar_apelido_externo(m: ^Movimento, x: u32, nome: u32) -> bool {
+    let q: ?^Consulta = (m.p as ^Plano).q
+    let apelido: ^frontend.Token = editar_token(q as ^Consulta, nome - 2)
+    let fim_apelido: u32 = apelido.off + common.interner_tam(&((q as ^Consulta).c as ^Compilacao).nomes, apelido.sym)
+    var novo: ?str = none
+    imports_contar(m.imp, x, m.origem, -1)
+    if (frontend.modulos_pacote_do_arquivo(&((q as ^Consulta).c as ^Compilacao).modulos, x) as i32) == (m.destino as i32) {
+        let arg_1: str = ""
+        let arg_2: u32 = editar_token(q as ^Consulta, nome).off
+        let arg_3: u32 = apelido.off
+        let arg_4: ^Plano = m.p as ^Plano
+        return editar_trocar_no_arquivo(arg_4, arg_3, arg_2, arg_1)
+    }
+    novo = imports_apelido(m.imp, x, m.destino, -1)
+    if novo == none {
+        return false
+    }
+    imports_contar(m.imp, x, m.destino, 1)
+    m.precisa_pub = true
+    return editar_trocar_no_arquivo(m.p as ^Plano, apelido.off, fim_apelido, novo)
+}
+
+// C: driver/editar_mover.c:178
+proc uso_externo(m: ^Movimento, u: ^semantic.IndUso, token: u32) -> bool {
+    let x: u8 = editar_modulo_do_offset((m.p as ^Plano).q as ^Consulta, u.pos_nome)
+    var nome: u32 = 0
+    if (x as i32) == (m.origem as i32) {
+        return qualificar_na_origem(m, token)
+    }
+    if not editar_modulo_editavel(m.p as ^Plano, x) {
+        return false
+    }
+    if not editar_uso_qualificado((m.p as ^Plano).q as ^Consulta, u, &nome) {
+        return true
+    }
+    return trocar_apelido_externo(m, editar_arquivo_do_offset((m.p as ^Plano).q as ^Consulta, u.pos_nome), nome)
+}
+
+// C: driver/editar_mover.c:190
+// Cada uso do indice: o de dentro da declaracao (que aponta para outra) e o de fora (que aponta para ela).
+proc tratar_usos(m: ^Movimento) -> bool {
+    let q: ^Consulta = (m.p as ^Plano).q as ^Consulta
+    var k: int = 0
+    while k < len(q.indice.usos) {
+        let u: ^semantic.IndUso = &q.indice.usos[k]
+        k += 1
+        let dentro: bool = (u.pos_nome >= m.ini_decl) and (u.pos_nome < m.fim_decl)
+        var token: u32 = TOKEN_AUSENTE as u32
+        if editar_uso_eh_de_decl(u) {
+            token = editar_token_do_nome(q, u)
+        }
+        if token == (TOKEN_AUSENTE as u32) {
+            continue
+        }
+        if (u.alvo == m.d) and (not dentro) and (not uso_externo(m, u, token)) {
+            return false
+        }
+        if (u.alvo != m.d) and dentro and (not uso_interno(m, u, token)) {
+            return false
+        }
+    }
+    return true
+}
+
+// C: driver/editar_mover.c:208
+// Ordem total (ini, fim, ordem): o sort_by entrega o que o qsort + desempate do C entregavam.
+proc comparar_retalhos(a: ^Retalho, b: ^Retalho) -> bool {
+    if a.ini != b.ini {
+        return a.ini < b.ini
+    }
+    if a.fim != b.fim {
+        return a.fim < b.fim
+    }
+    return a.ordem < b.ordem
+}
+
+// C: driver/editar_mover.c:218
+// Anexa o fonte em [ini, fim) sem os CR (o destino poe o fim de linha dele).
+proc anexar_sem_cr(saida: ^[dynamic]u8, texto: []u8, ini: u32, fim: u32) {
+    var k: u32 = ini
+    while k < fim {
+        if texto[k] != 13 {
+            append(saida, item = texto[k])
+        }
+        k += 1
+    }
+}
+
+// C: driver/editar_mover.c:225
+// Texto novo do movimento: o fonte com os retalhos trocados, na ordem de posicao.
+proc montar_texto(m: ^Movimento, saida: ^[dynamic]u8) {
+    let fonte: []u8 = (((m.p as ^Plano).q as ^Consulta).c as ^Compilacao).fonte.texto
+    var pos: u32 = m.faixa.ini_texto
+    sort_by(m.retalhos[..], less = comparar_retalhos)
+    var k: u32 = 0
+    while k < m.nretalhos {
+        anexar_sem_cr(saida, fonte, pos, m.retalhos[k as u64].ini)
+        append(saida, item = (m.retalhos[k as u64].novo or_else ""))
+        pos = m.retalhos[k as u64].fim
+        k += 1
+    }
+    anexar_sem_cr(saida, fonte, pos, m.faixa.fim_texto)
+}
+
+// C: driver/editar_mover.c:240
+// Tira a declaracao da origem, poe o texto novo no fim do destino e ajusta os imports.
+proc gravar_movimento(m: ^Movimento) -> bool {
+    var texto: [dynamic]u8 = make([dynamic]u8, alloc = heap)
+    defer delete(texto)
+    if m.precisa_pub and (not (m.d as ^frontend.Decl).publico) {
+        adicionar_retalho(m, m.ini_decl, m.ini_decl, "pub ")
+    }
+    montar_texto(m, &texto)
+    let novo: str = from_bytes(texto[..], alloc = heap)
+    defer delete(novo)
+    return editar_trocar_no_arquivo(m.p as ^Plano, m.faixa.ini_remocao, m.faixa.fim_remocao, "") and editar_inserir_texto(m.p as ^Plano, m.destino_arq, LUGAR_NO_FIM, none, novo) and imports_aplicar(m.imp)
+}
+
+// C: driver/editar_mover.c:253
+proc editar_mover_decl(p: ^Plano, id: str, para: str) -> bool {
+    var m: Movimento = Movimento{}
+    m.p = p
+    m.d = consulta_achar_decl(p.q as ^Consulta, id)
+    m.retalhos = make([dynamic]Retalho, alloc = heap)
+    defer delete(m.retalhos)
+    if m.d == none {
+        let msg_1 = format(f"'{id}' nao e declaracao do projeto (use o nome ou o id de 'forja consultar simbolos')", alloc = heap)
+        defer delete(msg_1)
+        return plano_erro(p, msg_1)
+    }
+    if (not decl_movivel(p, m.d)) or (not iniciar_movimento(&m, para)) {
+        return false
+    }
+    m.imp = imports_iniciar(p)
+    imports_descontar_decl(m.imp, m.d)
+    let ok: bool = tratar_usos(&m) and gravar_movimento(&m)
+    imports_liberar(m.imp)
+    return ok
+}
+
+test "comparar_retalhos: ordem por ini, depois fim, depois a ordem de insercao" {
+    var a: Retalho = Retalho{ini = 1, fim = 5, novo = none, ordem = 0}
+    var b: Retalho = Retalho{ini = 2, fim = 3, novo = none, ordem = 1}
+    var c: Retalho = Retalho{ini = 2, fim = 3, novo = none, ordem = 2}
+    expect(comparar_retalhos(&a, &b))
+    expect(comparar_retalhos(&b, &c))
+    expect(not comparar_retalhos(&c, &b))
+}

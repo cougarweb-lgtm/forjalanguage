@@ -1,0 +1,436 @@
+// std:text, pedaco utf8 (parte do modulo std:text: veja text.fj)
+// Versao: 0.3.0. Changelog: 0.3.0 - G06: utf16be_encode, utf16be_decode (com Utf16Error) e to_valid_lossy (cada maior subparte invalida vira UM U+FFFD, como Rust String::from_utf8_lossy). 0.2.0 - B01e1: from_rune, montar_preenchido, pad_left, pad_right, center e str_reverse ganham `alloc: Allocator` (ultimo parametro, sem padrao; fill continua com padrao e vem antes); 0.1.0 - IA1-S2c: decode, encode, rune_count, valid_utf8, next_rune, from_rune (T13); pad_left, pad_right e center (T12); str_reverse (T14, o nome reverse e reservado).
+// Runa = i32 (ponto de codigo Unicode, sem tipo novo). Politica dos invalidos (igual ao Go): byte que nao abre sequencia, continuacao solta, sequencia truncada, overlong, surrogate (U+D800..U+DFFF) e valor acima de U+10FFFF viram a runa U+FFFD com tamanho 1 (so aquele byte e consumido); o laco continua no byte seguinte. Um U+FFFD valido no texto tem tamanho 3, e e assim que se distingue de um byte invalido.
+// Posse: decode, rune_count, valid_utf8 e next_rune nao alocam. encode acrescenta ao builder do chamador. from_rune, pad_left, pad_right, center e str_reverse devolvem texto DONO do alocador que o chamador passou (alloc, ultimo parametro): delete(texto) so se o alloc foi heap, sempre, mesmo quando nada mudou.
+const RUNA_SUBSTITUTA: i32 = 0xFFFD
+const RUNA_MAXIMA: i32 = 0x10FFFF
+const SURROGATE_INICIO: i32 = 0xD800
+const SURROGATE_FIM: i32 = 0xDFFF
+const ESPACO_RUNA: i32 = 32
+const MINIMO_2_BYTES: i32 = 0x80
+const MINIMO_3_BYTES: i32 = 0x800
+const MINIMO_4_BYTES: i32 = 0x10000
+const PRIMEIRO_2_BYTES: u8 = 0xC2
+const ULTIMO_2_BYTES: u8 = 0xDF
+const PRIMEIRO_3_BYTES: u8 = 0xE0
+const ULTIMO_3_BYTES: u8 = 0xEF
+const PRIMEIRO_4_BYTES: u8 = 0xF0
+const ULTIMO_4_BYTES: u8 = 0xF4
+const BYTE_ASCII_MAXIMO: u8 = 0x7F
+const BYTE_CHEIO: u32 = 0xFF
+const MARCA_CONTINUACAO: u32 = 0x80
+const MASCARA_CONTINUACAO: u32 = 0x3F
+const MASCARA_MARCA: u32 = 0xC0
+const MARCA_2_BYTES: u32 = 0xC0
+const MARCA_3_BYTES: u32 = 0xE0
+const MARCA_4_BYTES: u32 = 0xF0
+const BITS_POR_CONTINUACAO: u32 = 6
+const BOM_ALTO: u8 = 0xFE
+const BOM_BAIXO: u8 = 0xFF
+const BITS_POR_BYTE: u32 = 8
+const MASCARA_10_BITS: u32 = 0x3FF
+const UTF16_ALTO_INICIO: u32 = 0xD800
+const UTF16_ALTO_FIM: u32 = 0xDBFF
+const UTF16_BAIXO_INICIO: u32 = 0xDC00
+const UTF16_BAIXO_FIM: u32 = 0xDFFF
+const UTF16_PAR_MINIMO: u32 = 0x10000
+const UTF16_BITS_DO_PAR: u32 = 10
+const LEAD_E0: u8 = 0xE0
+const LEAD_ED: u8 = 0xED
+const LEAD_F0: u8 = 0xF0
+const LEAD_F4: u8 = 0xF4
+const CONTINUACAO_MINIMA: u8 = 0x80
+const CONTINUACAO_MAXIMA: u8 = 0xBF
+const SEGUNDO_MINIMO_E0: u8 = 0xA0
+const SEGUNDO_MAXIMO_ED: u8 = 0x9F
+const SEGUNDO_MINIMO_F0: u8 = 0x90
+const SEGUNDO_MAXIMO_F4: u8 = 0x8F
+
+// true se r e uma runa Unicode valida: de 0 a U+10FFFF, fora da faixa de surrogates.
+proc runa_valida(r: i32) -> bool {
+    if r < 0 or r > RUNA_MAXIMA {
+        return false
+    }
+    return r < SURROGATE_INICIO or r > SURROGATE_FIM
+}
+
+// r se for valida; U+FFFD se nao for.
+proc runa_ou_substituta(r: i32) -> i32 {
+    if runa_valida(r) {
+        return r
+    }
+    return RUNA_SUBSTITUTA
+}
+
+// Quantos bytes a sequencia aberta pelo byte b tem (2 a 4); 0 se b nao abre sequencia (continuacao solta 80..BF, C0 e C1 sempre overlong, F5..FF acima do Unicode). O ASCII (1 byte) e tratado antes.
+proc tamanho_anunciado(b: u8) -> int {
+    if b >= PRIMEIRO_2_BYTES and b <= ULTIMO_2_BYTES {
+        return 2
+    }
+    if b >= PRIMEIRO_3_BYTES and b <= ULTIMO_3_BYTES {
+        return 3
+    }
+    if b >= PRIMEIRO_4_BYTES and b <= ULTIMO_4_BYTES {
+        return 4
+    }
+    return 0
+}
+
+// Menor runa que precisa de tam bytes: valor menor que isso na sequencia de tam bytes e overlong.
+proc minimo_da_sequencia(tam: int) -> i32 {
+    if tam == 2 {
+        return MINIMO_2_BYTES
+    }
+    if tam == 3 {
+        return MINIMO_3_BYTES
+    }
+    return MINIMO_4_BYTES
+}
+
+// Runa da sequencia de tam bytes que comeca em s[at] (o chamador ja conferiu que ela cabe em s); none se uma continuacao nao e 10xxxxxx, se e overlong, surrogate ou acima de U+10FFFF.
+proc ler_sequencia(s: str, at: int, tam: int) -> ?i32 {
+    var valor = (s[at] as u32) & (BYTE_CHEIO >> ((tam + 1) as u32))
+    for k in 1..<tam {
+        let b = s[at + k] as u32
+        if (b & MASCARA_MARCA) != MARCA_CONTINUACAO {
+            return none
+        }
+        valor = (valor << BITS_POR_CONTINUACAO) | (b & MASCARA_CONTINUACAO)
+    }
+    let runa = valor as i32
+    if runa < minimo_da_sequencia(tam) or not runa_valida(runa) {
+        return none
+    }
+    return runa
+}
+
+// Decodifica a runa que comeca no byte at de s: devolve (runa, tamanho em bytes). Byte invalido, sequencia truncada, overlong, surrogate ou acima de U+10FFFF da (U+FFFD, 1); at fora de 0..<len(s) da (U+FFFD, 0). at no meio de uma runa le a continuacao como byte solto: (U+FFFD, 1).
+pub proc decode(s: str, at: int) -> (rune: i32, size: int) {
+    if at < 0 or at >= len(s) {
+        return RUNA_SUBSTITUTA, 0
+    }
+    let primeiro = s[at]
+    if primeiro <= BYTE_ASCII_MAXIMO {
+        return primeiro as i32, 1
+    }
+    let tam = tamanho_anunciado(primeiro)
+    if tam == 0 or at + tam > len(s) {
+        return RUNA_SUBSTITUTA, 1
+    }
+    let lida = ler_sequencia(s, at, tam = tam)
+    if lida == none {
+        return RUNA_SUBSTITUTA, 1
+    }
+    return lida or_else RUNA_SUBSTITUTA, tam
+}
+
+// Byte de continuacao (10xxxxxx) com os 6 bits de v a partir do bit deslocamento.
+proc byte_continuacao(v: u32, deslocamento: u32) -> u8 {
+    return (MARCA_CONTINUACAO | ((v >> deslocamento) & MASCARA_CONTINUACAO)) as u8
+}
+
+// Quantos bytes encode gasta com r (1 a 4; r invalida gasta os 3 de U+FFFD).
+proc tamanho_codificado(r: i32) -> int {
+    let runa = runa_ou_substituta(r)
+    if runa < MINIMO_2_BYTES {
+        return 1
+    }
+    if runa < MINIMO_3_BYTES {
+        return 2
+    }
+    if runa < MINIMO_4_BYTES {
+        return 3
+    }
+    return 4
+}
+
+// Acrescenta ao builder buf os 1 a 4 bytes UTF-8 de r. r invalida (negativa, surrogate ou acima de U+10FFFF) acrescenta U+FFFD (3 bytes). buf deve ser [dynamic]u8 do chamador.
+pub proc encode(r: i32, buf: ^[dynamic]u8) {
+    let v = runa_ou_substituta(r) as u32
+    let tam = tamanho_codificado(r)
+    if tam == 1 {
+        append(buf, item = v as u8)
+    } else if tam == 2 {
+        append(buf, item = (MARCA_2_BYTES | (v >> BITS_POR_CONTINUACAO)) as u8)
+        append(buf, item = byte_continuacao(v, deslocamento = 0))
+    } else if tam == 3 {
+        append(buf, item = (MARCA_3_BYTES | (v >> (2 * BITS_POR_CONTINUACAO))) as u8)
+        append(buf, item = byte_continuacao(v, deslocamento = BITS_POR_CONTINUACAO))
+        append(buf, item = byte_continuacao(v, deslocamento = 0))
+    } else {
+        append(buf, item = (MARCA_4_BYTES | (v >> (3 * BITS_POR_CONTINUACAO))) as u8)
+        append(buf, item = byte_continuacao(v, deslocamento = 2 * BITS_POR_CONTINUACAO))
+        append(buf, item = byte_continuacao(v, deslocamento = BITS_POR_CONTINUACAO))
+        append(buf, item = byte_continuacao(v, deslocamento = 0))
+    }
+}
+
+// Quantas runas s tem: cada byte invalido conta como 1 runa (U+FFFD). "ac\xC3\xA7\xC3\xA3o" tem 5 runas. Nao aloca.
+pub proc rune_count(s: str) -> int {
+    var total = 0
+    var i = 0
+    while i < len(s) {
+        let _, tamanho = decode(s, at = i)
+        i += tamanho
+        total += 1
+    }
+    return total
+}
+
+// true se todo s e UTF-8 valido (texto vazio e valido). Nao aloca.
+pub proc valid_utf8(s: str) -> bool {
+    var i = 0
+    while i < len(s) {
+        let runa, tamanho = decode(s, at = i)
+        if runa == RUNA_SUBSTITUTA and tamanho == 1 {
+            return false
+        }
+        i += tamanho
+    }
+    return true
+}
+
+// Cursor de runas: devolve a proxima runa de rest e avanca rest para depois dela; none quando rest esta vazio. Byte invalido devolve U+FFFD e avanca 1. Nao aloca.
+pub proc next_rune(rest: ^str) -> ?i32 {
+    let texto = rest^
+    if len(texto) == 0 {
+        return none
+    }
+    let runa, tamanho = decode(texto, at = 0)
+    rest^ = texto[tamanho..<len(texto)]
+    return runa
+}
+
+// Texto DONO do alocador que o chamador passou (1 alocacao) com so a runa r em UTF-8 (r invalida da U+FFFD): delete(texto) so se o alloc foi heap.
+pub proc from_rune(r: i32, alloc: Allocator) -> str {
+    var saida = make([dynamic]u8, alloc = alloc, cap = tamanho_codificado(r))
+    defer delete(saida)
+    encode(r, &saida)
+    return to_str(&saida)
+}
+
+// ---- Preenchimento (T12). Largura em RUNAS (rune_count), nao em bytes; fill e uma runa repetida (qualquer runa valida, multibyte inclusive; invalida vira U+FFFD).
+
+// Quantas runas faltam para s chegar a width; 0 se ja tem width ou mais (ou width <= 0).
+proc faltam_runas(s: str, width: int) -> int {
+    let atual = rune_count(s)
+    if width <= atual {
+        return 0
+    }
+    return width - atual
+}
+
+// Acrescenta a runa fill vezes vezes a buf.
+proc repetir_runa(buf: ^[dynamic]u8, fill: i32, vezes: int) {
+    for _vez in 0..<vezes {
+        encode(fill, buf)
+    }
+}
+
+// s com esquerda copias de fill antes e direita depois, numa so alocacao. Se o tamanho nao cabe em int, panic com a mensagem.
+proc montar_preenchido(s: str, esquerda: int, direita: int, fill: i32, alloc: Allocator) -> str {
+    let bytes_fill = tamanho_codificado(fill)
+    if esquerda + direita > (MAIOR_INT - len(s)) / bytes_fill {
+        panic("pad: tamanho do resultado estoura int")
+    }
+    var saida = make([dynamic]u8, alloc = alloc, cap = len(s) + (esquerda + direita) * bytes_fill)
+    defer delete(saida)
+    repetir_runa(&saida, fill, vezes = esquerda)
+    append(&saida, item = s)
+    repetir_runa(&saida, fill, vezes = direita)
+    return to_str(&saida)
+}
+
+// Completa s a esquerda com fill ate width runas: pad_left("7", 3, 48) da "007". s com width runas ou mais, ou width <= 0, da copia de s. Texto DONO do alocador que o chamador passou: delete(texto) so se o alloc foi heap.
+pub proc pad_left(s: str, width: int, fill: i32 = ESPACO_RUNA, alloc: Allocator) -> str {
+    return montar_preenchido(s, esquerda = faltam_runas(s, width), direita = 0, fill = fill, alloc = alloc)
+}
+
+// Completa s a direita com fill ate width runas: pad_right("ab", 4) da "ab  ". Mesmas regras de pad_left. Texto DONO do alocador que o chamador passou: delete(texto) so se o alloc foi heap.
+pub proc pad_right(s: str, width: int, fill: i32 = ESPACO_RUNA, alloc: Allocator) -> str {
+    return montar_preenchido(s, esquerda = 0, direita = faltam_runas(s, width), fill = fill, alloc = alloc)
+}
+
+// Centraliza s em width runas com fill; sobra impar vai para a DIREITA: center("a", 4) da " a  ". Mesmas regras de pad_left. Texto DONO do alocador que o chamador passou: delete(texto) so se o alloc foi heap.
+pub proc center(s: str, width: int, fill: i32 = ESPACO_RUNA, alloc: Allocator) -> str {
+    let faltam = faltam_runas(s, width)
+    return montar_preenchido(s, esquerda = faltam / 2, direita = faltam - faltam / 2, fill = fill, alloc = alloc)
+}
+
+// ---- Inverter (T14). O nome leva o prefixo str_ porque reverse e embutido de lista (nome reservado, E0202).
+
+// s com a ordem das runas invertida (nao a dos bytes): "ab\xC3\xA7" (a b c-cedilha) da c-cedilha, b, a, com os bytes de cada runa na ordem certa. Cada byte invalido e uma unidade de 1 byte e fica como esta (os bytes originais sao preservados, nao viram U+FFFD). Texto DONO do alocador que o chamador passou (1 alocacao do tamanho exato): delete(texto) so se o alloc foi heap.
+pub proc str_reverse(s: str, alloc: Allocator) -> str {
+    let n = len(s)
+    var saida = make([dynamic]u8, alloc = alloc, len = n)
+    defer delete(saida)
+    var i = 0
+    var fim = n
+    while i < n {
+        let _, tamanho = decode(s, at = i)
+        fim -= tamanho
+        for k in 0..<tamanho {
+            saida[fim + k] = s[i + k]
+        }
+        i += tamanho
+    }
+    return to_str(&saida)
+}
+
+// ---- UTF-16BE (G06). Texto UTF-8 <-> bytes UTF-16 big-endian. utf16be_decode consome o BOM FE FF do inicio; utf16be_encode grava o BOM so com com_bom = true.
+
+pub enum Utf16Error { comprimento_impar, substituto_solto }
+
+// Acrescenta a unidade de 16 bits u em big-endian (2 bytes).
+proc escreve_unidade_be(buf: ^[dynamic]u8, u: u32) {
+    append(buf, item = (u >> BITS_POR_BYTE) as u8)
+    append(buf, item = (u & BYTE_CHEIO) as u8)
+}
+
+// Acrescenta a runa r (valida) em UTF-16BE: uma unidade na BMP, ou par substituto acima de U+FFFF.
+proc escreve_runa_utf16(buf: ^[dynamic]u8, r: i32) {
+    let v = r as u32
+    if v < UTF16_PAR_MINIMO {
+        escreve_unidade_be(buf, v)
+    } else {
+        let codigo = v - UTF16_PAR_MINIMO
+        escreve_unidade_be(buf, UTF16_ALTO_INICIO + (codigo >> UTF16_BITS_DO_PAR))
+        escreve_unidade_be(buf, UTF16_BAIXO_INICIO + (codigo & MASCARA_10_BITS))
+    }
+}
+
+// Texto UTF-8 em UTF-16BE. com_bom = true grava FE FF no inicio. Byte invalido do texto vira U+FFFD. Lista DONA do alocador que o chamador passou: delete so se o alloc foi heap.
+pub proc utf16be_encode(s: str, com_bom: bool = false, alloc: Allocator) -> [dynamic]u8 {
+    var saida = make([dynamic]u8, alloc = alloc)
+    if com_bom {
+        append(&saida, item = BOM_ALTO)
+        append(&saida, item = BOM_BAIXO)
+    }
+    var i = 0
+    while i < len(s) {
+        let runa, tamanho = decode(s, at = i)
+        escreve_runa_utf16(&saida, runa)
+        i += tamanho
+    }
+    return saida
+}
+
+// Quantos bytes do BOM FE FF pular no inicio de b: 2 se ele esta la, 0 se nao.
+proc pula_bom_utf16(b: []u8) -> int {
+    if len(b) >= 2 and b[0] == BOM_ALTO and b[1] == BOM_BAIXO {
+        return 2
+    }
+    return 0
+}
+
+// Unidade de 16 bits big-endian que comeca em b[at].
+proc unidade_be_em(b: []u8, at: int) -> u32 {
+    return ((b[at] as u32) << BITS_POR_BYTE) | (b[at + 1] as u32)
+}
+
+// Runa UTF-16BE que comeca em b[at]: a unidade direta, ou o par substituto somado. Substituto sem par (solto, ou par cortado no fim) = Utf16Error.substituto_solto.
+proc runa_utf16_em(b: []u8, at: int) -> u32 ! Utf16Error {
+    let unidade = unidade_be_em(b, at)
+    if unidade >= UTF16_BAIXO_INICIO and unidade <= UTF16_BAIXO_FIM {
+        return Utf16Error.substituto_solto
+    }
+    if unidade < UTF16_ALTO_INICIO or unidade > UTF16_ALTO_FIM {
+        return unidade
+    }
+    if at + 4 > len(b) {
+        return Utf16Error.substituto_solto
+    }
+    let baixa = unidade_be_em(b, at + 2)
+    if baixa < UTF16_BAIXO_INICIO or baixa > UTF16_BAIXO_FIM {
+        return Utf16Error.substituto_solto
+    }
+    return UTF16_PAR_MINIMO + ((unidade - UTF16_ALTO_INICIO) << UTF16_BITS_DO_PAR) + (baixa - UTF16_BAIXO_INICIO)
+}
+
+// UTF-16BE -> UTF-8. Comprimento impar = comprimento_impar; substituto solto ou par cortado = substituto_solto. BOM FE FF no inicio e consumido. Texto DONO do alocador que o chamador passou: delete so se o alloc foi heap.
+pub proc utf16be_decode(b: []u8, alloc: Allocator) -> str ! Utf16Error {
+    if len(b) % 2 != 0 {
+        return Utf16Error.comprimento_impar
+    }
+    var saida = make([dynamic]u8, alloc = alloc, cap = len(b))
+    defer delete(saida)
+    var i = pula_bom_utf16(b)
+    while i < len(b) {
+        let runa = try runa_utf16_em(b, i)
+        encode(runa as i32, &saida)
+        if runa >= UTF16_PAR_MINIMO {
+            i += 4
+        } else {
+            i += 2
+        }
+    }
+    return to_str(&saida)
+}
+
+// true se o byte c, na posicao k (1 ou mais) da sequencia que abre com lead, e valido (RFC 3629, tabela 3-7): o 2o byte de E0, ED, F0 e F4 tem faixa propria.
+proc faixa_valida(lead: u8, k: int, c: u8) -> bool {
+    var minimo = CONTINUACAO_MINIMA
+    var maximo = CONTINUACAO_MAXIMA
+    if k == 1 {
+        if lead == LEAD_E0 {
+            minimo = SEGUNDO_MINIMO_E0
+        }
+        if lead == LEAD_ED {
+            maximo = SEGUNDO_MAXIMO_ED
+        }
+        if lead == LEAD_F0 {
+            minimo = SEGUNDO_MINIMO_F0
+        }
+        if lead == LEAD_F4 {
+            maximo = SEGUNDO_MAXIMO_F4
+        }
+    }
+    return c >= minimo and c <= maximo
+}
+
+// Bytes da sequencia completa e valida que abre em b[at] (1 para ASCII); 0 se nao ha uma: byte que nao abre, truncada no fim, ou continuacao fora da faixa.
+proc sequencia_valida_em(b: []u8, at: int) -> int {
+    if b[at] <= BYTE_ASCII_MAXIMO {
+        return 1
+    }
+    let tam = tamanho_anunciado(b[at])
+    if tam == 0 or at + tam > len(b) {
+        return 0
+    }
+    for k in 1..<tam {
+        if not faixa_valida(b[at], k, b[at + k]) {
+            return 0
+        }
+    }
+    return tam
+}
+
+// Maior subparte invalida que abre em b[at]: o lead mais as continuacoes validas que vem antes do primeiro byte ruim (1 se o lead nao abre sequencia). Vira UM U+FFFD.
+proc subparte_invalida_em(b: []u8, at: int) -> int {
+    let tam = tamanho_anunciado(b[at])
+    var k = 1
+    while k < tam and at + k < len(b) and faixa_valida(b[at], k, b[at + k]) {
+        k += 1
+    }
+    return k
+}
+
+// UTF-8 valido a partir de bytes quaisquer, no estilo Rust String::from_utf8_lossy: cada maior subparte invalida vira UM U+FFFD (EF BF BD) e o laco segue no byte seguinte. Texto DONO do alocador que o chamador passou: delete so se o alloc foi heap.
+pub proc to_valid_lossy(b: []u8, alloc: Allocator) -> str {
+    var saida = make([dynamic]u8, alloc = alloc, cap = len(b))
+    defer delete(saida)
+    var i = 0
+    while i < len(b) {
+        let valida = sequencia_valida_em(b, at = i)
+        if valida > 0 {
+            for k in 0..<valida {
+                append(&saida, item = b[i + k])
+            }
+            i += valida
+        } else {
+            encode(RUNA_SUBSTITUTA, &saida)
+            i += subparte_invalida_em(b, at = i)
+        }
+    }
+    return to_str(&saida)
+}

@@ -1,0 +1,290 @@
+// nativo/dbg/pdb_modulo.fj - porte de compiler/nativo/dbg/pdb_modulo.c
+// sha256 de nativo/dbg/pdb_modulo.c: ebcf53019b2697eb77ae61d054aa751052ae5b6629f0c713210b8a1775453931
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "common"
+
+struct PdbLinhas {
+    b: ?^[dynamic]u8
+    p: ?^PdbParametros
+    a: ?^PdbArquivos
+    segmento: u32
+    inicio: u32
+    tam: u32
+    tem_ultima: bool
+    bloco_aberto: bool
+    ultimo_off: u32
+    ultima_linha: u32
+    ultimo_arq: u32
+    bloco: u64
+    bloco_n: u32
+}
+
+const CV_ASSINATURA_C13: u32 = 4
+const CV_S_END: u32 = 6
+const CV_S_FRAMEPROC: u32 = 4114
+const CV_S_GPROC32: u32 = 4368
+const CV_C13_LINHAS: u32 = 242
+const CV_C13_ARQUIVOS: u32 = 244
+const CV_TAM_CABECALHO: u32 = 4
+const CV_TAM_GPROC_FIXO: u32 = 35
+const CV_TAM_FRAMEPROC_CORPO: u32 = 26
+const CV_TAM_FRAMEPROC: u32 = 32
+const CV_TAM_SUBSTREAM: u32 = 8
+const CV_TAM_LINHAS_CABECALHO: u32 = 12
+const CV_TAM_BLOCO: u32 = 12
+const CV_TAM_LINHA: u32 = 8
+const CV_TAM_ARQUIVO: u32 = 8
+const CV_LINHA_STATEMENT: u32 = 2147483648
+const CV_LINHA_MAX: u32 = 16777215
+const CV_S_REGREL32: u32 = 4369
+const CV_REG_RBP: u32 = 334
+const CV_TAM_REGREL_FIXO: u32 = 10
+const ZEROS: [4]u8 = {0, 0, 0, 0}
+// C2F:? tabela PREENCHIMENTO (const char[3]): inteiro -13 fora de u8
+
+// C: nativo/dbg/pdb_modulo.c:49
+proc pdb_patch_u32(b: ^[dynamic]u8, pos: u64, v: u32) {
+    let d: []u8 = b^[..]
+    for k in (0 as u32)..<4 {
+        d[pos + (k as u64)] = common.c2f_trunc_u8(((v >> (8 * k)) & 0xFF) as u64)
+    }
+}
+
+// C: nativo/dbg/pdb_modulo.c:57
+proc pdb_zeros(b: ^[dynamic]u8, n: u32) {
+    var zeros4: [4]u8 = {0, 0, 0, 0}
+    append(b, items = zeros4[0 ..< (n as u64)])
+}
+
+// C: nativo/dbg/pdb_modulo.c:64
+proc pdb_registro_s_end(b: ^[dynamic]u8) {
+    pdb_u16(b, 2)
+    pdb_u16(b, CV_S_END)
+}
+
+// C: nativo/dbg/pdb_modulo.c:71
+proc pdb_registro_frame_proc(b: ^[dynamic]u8, p: ^DbgProc) {
+    pdb_u16(b, CV_TAM_FRAMEPROC - 2)
+    pdb_u16(b, CV_S_FRAMEPROC)
+    pdb_u32(b, p.rbp_quadro)
+    pdb_zeros(b, 4)
+    pdb_zeros(b, 4)
+    pdb_zeros(b, 4)
+    pdb_zeros(b, 4)
+    pdb_zeros(b, 2)
+    pdb_zeros(b, 4)
+    pdb_zeros(b, (CV_TAM_FRAMEPROC - CV_TAM_CABECALHO) - CV_TAM_FRAMEPROC_CORPO)
+}
+
+// C: nativo/dbg/pdb_modulo.c:86
+proc pdb_preenchimento(b: ^[dynamic]u8, n: u32) {
+    var pre: [3]u8 = {243, 242, 241}
+    append(b, items = pre[(3 - (n as u64)) ..< 3])
+}
+
+// C: nativo/dbg/pdb_modulo.c:94
+proc pdb_registro_regrel(b: ^[dynamic]u8, v: ^DbgVar, tipo: u32) {
+    let nome_txt: str = v.nome or_else ""
+    let nome: u64 = (len(nome_txt) as u64) + 1
+    let bruto: u64 = (4 + 10 + nome + 3)
+    let total: u64 = (bruto >> 2) << 2
+    pdb_u16(b, (total - 2) as u32)
+    pdb_u16(b, CV_S_REGREL32)
+    pdb_u32(b, common.c2f_trunc_u32(common.c2f_s2u_64(v.loc.rbp_off as i64)))
+    pdb_u32(b, tipo)
+    pdb_u16(b, CV_REG_RBP)
+    append(b, items = as_bytes(nome_txt))
+    append(b, item = 0 as u8)
+    pdb_preenchimento(b, (total - 4 - 10 - nome) as u32)
+}
+
+// C: nativo/dbg/pdb_modulo.c:110
+proc pdb_variaveis_proc(b: ^[dynamic]u8, p: ^PdbParametros, proc_c: ^DbgProc) {
+    var k: u32 = 0
+    while k < proc_c.nvars {
+        let v: ^DbgVar = &(p.dbg as ^DbgPrograma).vars[(proc_c.var_ini + k) as u64]
+        var tipo: u32 = 0
+        if v.loc.indireto {
+            k += 1
+            continue
+        }
+        tipo = pdb_tipo_indice(p.tpi as ^PdbTipos, v.tipo)
+        if tipo != 0 {
+            pdb_registro_regrel(b, v, tipo)
+        }
+        k += 1
+    }
+}
+
+// C: nativo/dbg/pdb_modulo.c:125
+proc pdb_registro_gproc(b: ^[dynamic]u8, p: ^DbgProc, segmento: u32) -> u64 {
+    let nome_txt: str = p.nome or_else ""
+    let nome: u64 = (len(nome_txt) as u64) + 1
+    let bruto: u64 = (4 + 35 + nome + 3)
+    let total: u64 = (bruto >> 2) << 2
+    let tam_codigo: u32 = p.fim - p.inicio
+    pdb_u16(b, (total - 2) as u32)
+    pdb_u16(b, CV_S_GPROC32)
+    pdb_u32(b, 0)
+    let campo_fim: u64 = len(b^) as u64
+    pdb_u32(b, 0)
+    pdb_u32(b, 0)
+    pdb_u32(b, tam_codigo)
+    pdb_u32(b, 0)
+    pdb_u32(b, tam_codigo)
+    pdb_u32(b, 0)
+    pdb_u32(b, p.inicio)
+    pdb_u16(b, segmento)
+    pdb_zeros(b, 1)
+    append(b, items = as_bytes(nome_txt))
+    append(b, item = 0 as u8)
+    pdb_zeros(b, (total - 4 - 35 - nome) as u32)
+    return campo_fim
+}
+
+// C: nativo/dbg/pdb_modulo.c:151
+proc pdb_substream_abrir(b: ^[dynamic]u8, tipo: u32) -> u64 {
+    pdb_u32(b, tipo)
+    pdb_u32(b, 0)
+    return (len(b^) as u64) - 4
+}
+
+// C: nativo/dbg/pdb_modulo.c:158
+proc pdb_substream_fechar(b: ^[dynamic]u8, campo: u64) {
+    pdb_patch_u32(b, campo, (((len(b^) as u64) - campo) - 4) as u32)
+}
+
+// C: nativo/dbg/pdb_modulo.c:164
+proc pdb_substream_arquivos(b: ^[dynamic]u8, a: ^PdbArquivos) {
+    let campo: u64 = pdb_substream_abrir(b, CV_C13_ARQUIVOS)
+    var k: u64 = 0
+    while k < (len(a.lista) as u64) {
+        pdb_u32(b, a.lista[k].nome_off)
+        pdb_u32(b, 0)
+        k += 1
+    }
+    pdb_substream_fechar(b, campo)
+}
+
+// C: nativo/dbg/pdb_modulo.c:176
+proc pdb_bloco_fechar(c: ^PdbLinhas) {
+    if not c.bloco_aberto {
+        return
+    }
+    pdb_patch_u32(c.b as ^[dynamic]u8, c.bloco + 4, c.bloco_n)
+    pdb_patch_u32(c.b as ^[dynamic]u8, c.bloco + 8, CV_TAM_BLOCO + (CV_TAM_LINHA * c.bloco_n))
+    c.bloco_aberto = false
+}
+
+// C: nativo/dbg/pdb_modulo.c:185
+proc pdb_bloco_abrir(c: ^PdbLinhas, arquivo: u32) {
+    pdb_bloco_fechar(c)
+    let b: ^[dynamic]u8 = c.b as ^[dynamic]u8
+    c.bloco = len(b^) as u64
+    pdb_u32(b, CV_TAM_ARQUIVO * arquivo)
+    pdb_u32(b, 0)
+    pdb_u32(b, 0)
+    c.bloco_n = 0
+    c.bloco_aberto = true
+}
+
+// C: nativo/dbg/pdb_modulo.c:197
+proc pdb_linha_vista(c: ^PdbLinhas, k: u32) {
+    let l: ^DbgLinha = &((c.p as ^PdbParametros).dbg as ^DbgPrograma).linhas[k as u64]
+    let pos: ^PdbPosLinha = &(c.a as ^PdbArquivos).linhas[k as u64]
+    var rel: u32 = 0
+    if (l.off < c.inicio) or ((l.off - c.inicio) >= c.tam) {
+        let msg_1 = format(f"pdb: linha no offset {l.off} fora do proc ({c.inicio}..{c.inicio + c.tam})", alloc = heap)
+        defer delete(msg_1)
+        common.falha_interna(msg_1)
+    }
+    if pos.linha > CV_LINHA_MAX {
+        let msg_2 = format(f"pdb: linha {pos.linha} passa de 24 bits", alloc = heap)
+        defer delete(msg_2)
+        common.falha_interna(msg_2)
+    }
+    var tern_1: u32 = 0
+    if common.c2f_b2i32(c.tem_ultima) != 0 {
+        tern_1 = l.off - c.inicio
+    }
+    rel = tern_1
+    if (common.c2f_b2i32(c.tem_ultima) != 0) and ((rel <= c.ultimo_off) or ((pos.linha == c.ultima_linha) and (pos.arquivo == c.ultimo_arq))) {
+        return
+    }
+    if (not c.bloco_aberto) or (pos.arquivo != c.ultimo_arq) {
+        pdb_bloco_abrir(c, pos.arquivo)
+    }
+    pdb_u32(c.b as ^[dynamic]u8, rel)
+    pdb_u32(c.b as ^[dynamic]u8, pos.linha | CV_LINHA_STATEMENT)
+    c.bloco_n += 1
+    c.tem_ultima = true
+    c.ultimo_off = rel
+    c.ultima_linha = pos.linha
+    c.ultimo_arq = pos.arquivo
+}
+
+// C: nativo/dbg/pdb_modulo.c:222
+proc pdb_proc_linhas(c: ^PdbLinhas, proc_c: ^DbgProc) {
+    var campo: u64 = 0
+    if proc_c.nlinhas == 0 {
+        return
+    }
+    campo = pdb_substream_abrir(c.b as ^[dynamic]u8, CV_C13_LINHAS)
+    pdb_u32(c.b as ^[dynamic]u8, proc_c.inicio)
+    pdb_u16(c.b as ^[dynamic]u8, c.segmento)
+    pdb_u16(c.b as ^[dynamic]u8, 0)
+    pdb_u32(c.b as ^[dynamic]u8, proc_c.fim - proc_c.inicio)
+    c.inicio = proc_c.inicio
+    c.tam = proc_c.fim - proc_c.inicio
+    c.tem_ultima = false
+    c.bloco_aberto = false
+    for k in (0 as u32)..<proc_c.nlinhas {
+        pdb_linha_vista(c, proc_c.linha_ini + k)
+    }
+    pdb_bloco_fechar(c)
+    pdb_substream_fechar(c.b as ^[dynamic]u8, campo)
+}
+
+// C: nativo/dbg/pdb_modulo.c:244
+proc pdb_c13(b: ^[dynamic]u8, p: ^PdbParametros, a: ^PdbArquivos, segmento: u32) {
+    var c: PdbLinhas = PdbLinhas{b = b, p = p, a = a, segmento = segmento}
+    if (len(a.lista) as u64) > 0 {
+        pdb_substream_arquivos(b, a)
+    }
+    for k in (0 as u64)..<(len((p.dbg as ^DbgPrograma).procs) as u64) {
+        pdb_proc_linhas(&c, &(p.dbg as ^DbgPrograma).procs[k])
+    }
+}
+
+// C: nativo/dbg/pdb_modulo.c:254
+proc pdb_fluxo_modulo(b: ^[dynamic]u8, p: ^PdbParametros, a: ^PdbArquivos, segmento: u32) -> PdbTamanhosModulo {
+    var t: PdbTamanhosModulo = PdbTamanhosModulo{}
+    var inicio_c13: u64 = 0
+    t.arquivos = a
+    pdb_u32(b, CV_ASSINATURA_C13)
+    var k: u64 = 0
+    while k < (len((p.dbg as ^DbgPrograma).procs) as u64) {
+        let proc_c: ^DbgProc = &(p.dbg as ^DbgPrograma).procs[k]
+        var campo_fim: u64 = 0
+        if (proc_c.fim < proc_c.inicio) or (proc_c.fim > p.codigo_tam) {
+            let txt_1 = proc_c.nome or_else "(null)"
+            let msg_1 = format(f"pdb: o proc '{txt_1}' ({proc_c.inicio}..{proc_c.fim}) passa do .text do programa ({p.codigo_tam} bytes)", alloc = heap)
+            defer delete(msg_1)
+            common.falha_interna(msg_1)
+        }
+        campo_fim = pdb_registro_gproc(b, proc_c, segmento)
+        pdb_registro_frame_proc(b, proc_c)
+        pdb_variaveis_proc(b, p, proc_c)
+        pdb_patch_u32(b, campo_fim, (len(b^) as u64) as u32)
+        pdb_registro_s_end(b)
+        k += 1
+    }
+    t.simbolos = (len(b^) as u64) as u32
+    inicio_c13 = len(b^) as u64
+    pdb_c13(b, p, a, segmento)
+    t.c13 = ((len(b^) as u64) - inicio_c13) as u32
+    pdb_u32(b, 0)
+    return t
+}

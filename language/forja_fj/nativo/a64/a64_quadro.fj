@@ -1,0 +1,263 @@
+// nativo/a64/a64_quadro.fj - quadro de pilha, prologo, epilogo e ordem dos blocos da funcao A64 (contrato_a64 §3.2)
+// Versao: 0.4.0
+// Changelog: 0.4.0 - A2.2(e): guarda de R0016 no prologo (a64_guarda_pilha) quando c.pilha existe (dev com runtime a64); sem bloco frio (b.hs sobre o caminho de falha).
+//            0.3.0 - A1.3(iii): convencao NGRN/NSRN (A64Alocacao, a64_alocar_arg): reais em v0-v7, inteiros em x0-x7, excedente na pilha em ordem.
+//            0.2.0 - A1.3(ii): slots extras depois dos vregs: x8 do retorno maior (a64_slot_sret) e um por parametro agregado de
+//                    registrador (a64_slot_param); agregado por valor e retorno agregado deixam de ser recusados (a64_isel_agregado.fj).
+//            0.1.0 - A1.3(i): so-slots. Quadro de baixo (sp) para cima: [area de saida OUT][x29,x30][slots agregados][slots dos vregs (8 B cada)][padding 16].
+//                    x29 = sp + OUT; todo RETORNA repete o epilogo. Parametros inteiros entram por x0-x7 e pilha; agregado por valor, real e V128 = X0001.
+
+import "nativo/bir"
+
+const A64_REGS_DE_ARGUMENTO: u32 = 8
+const A64_REGISTRO_QUADRO: u32 = 16 // x29 e x30
+const A64_MAX_STP: u32 = 504 // imm7 escalado por 8, sinalizado positivo
+const A64_MAX_IMM12: u32 = 4095
+const A64_MAX_QUADRO: u32 = 16777215 // dois SUB imm12 (sh 0 e sh 12)
+const A64_OFF_LIMITE_PILHA: i64 = 1048 // slot ESTADO_LIMITE_PILHA do rt_a64 (estado_base + 1048)
+
+proc a64_alinhar(v: u32, a: u32) -> u32 {
+    return (v + a - 1) / a * a
+}
+
+proc a64_classe_inteira(classe: u8) -> bool {
+    let k = classe as i32
+    return (k >= bir.BC_I8) and (k <= bir.BC_I64)
+}
+
+// reais (F32/F64) vao em v0-v7 (s/d) pela convencao Forja-A64 (contrato §3.1)
+proc a64_classe_real(classe: u8) -> bool {
+    let k = classe as i32
+    return (k == bir.BC_F32) or (k == bir.BC_F64)
+}
+
+// classe que a A64 carrega/guarda sem vetor: inteira ou real
+proc a64_classe_escalar(classe: u8) -> bool {
+    return a64_classe_inteira(classe) or a64_classe_real(classe)
+}
+
+// contadores NGRN (x0-x7), NSRN (v0-v7) e da pilha, na ordem dos argumentos
+struct A64Alocacao {
+    ngrn: u32
+    nsrn: u32
+    npilha: u32
+}
+
+// onde um argumento mora: registrador (x ou v, conforme real) ou o slot k da area de pilha
+struct A64Posicao {
+    real: bool
+    pilha: bool
+    reg: u32
+    pilha_k: u32
+}
+
+// proximo argumento: registrador livre da sua classe, senao a pilha (8 B, em ordem)
+proc a64_alocar_arg(st: ^A64Alocacao, real: bool) -> A64Posicao {
+    if real {
+        if st.nsrn < A64_REGS_DE_ARGUMENTO {
+            st.nsrn += 1
+            return A64Posicao{real = true, reg = st.nsrn - 1}
+        }
+    } else if st.ngrn < A64_REGS_DE_ARGUMENTO {
+        st.ngrn += 1
+        return A64Posicao{reg = st.ngrn - 1}
+    }
+    st.npilha += 1
+    return A64Posicao{pilha = true, pilha_k = st.npilha - 1}
+}
+
+// quantos argumentos da chamada vao na pilha (mesma regra de a64_alocar_arg)
+proc a64_pilha_da_chamada(ins: ^bir.BirInstr) -> u32 {
+    var st = A64Alocacao{}
+    let args: []bir.BirOperando = ins.args or_else {}
+    for k in (0 as u32)..<ins.nargs {
+        _ = a64_alocar_arg(&st, a64_classe_real(args[k].classe))
+    }
+    return st.npilha
+}
+
+// maior numero de argumentos de pilha entre as chamadas da funcao
+proc a64_maior_pilha_de_args(f: ^bir.BirFuncao) -> u32 {
+    var maior: u32 = 0
+    for b in (0 as u32)..<f.nblocos {
+        let bloco: ^bir.BirBloco = &f.blocos[b]
+        for k in (0 as u32)..<bloco.n {
+            let ins: ^bir.BirInstr = &bloco.instrs[k]
+            let op = ins.op as i32
+            if (op == bir.BIR_CHAMA) or (op == bir.BIR_CHAMA_IND) {
+                maior = max(maior, a64_pilha_da_chamada(ins))
+            }
+        }
+    }
+    return maior
+}
+
+// preenche saida, slot_off, vreg_off e quadro; recusa quadro que nao cabe nos imediatos do prologo
+proc a64_calcular_quadro(c: ^A64Ctx) -> bool {
+    let f = c.f
+    c.saida = a64_alinhar(a64_maior_pilha_de_args(f) * 8, 16)
+    var cur: u32 = A64_REGISTRO_QUADRO
+    for k in (0 as u32)..<f.nslots {
+        let ali = f.slots[k].alinhamento
+        cur = a64_alinhar(cur, ali)
+        c.slot_off[k] = cur
+        cur += f.slots[k].tam
+    }
+    c.vreg_off = a64_alinhar(cur, 8)
+    c.quadro = a64_alinhar(c.saida + c.vreg_off + 8 * (f.nvregs + f.nparams + 1), 16)
+    if c.saida > A64_MAX_IMM12 {
+        return a64_recusa(c, "chamada com argumentos de pilha demais")
+    }
+    if c.quadro > A64_MAX_QUADRO {
+        return a64_recusa(c, "quadro de pilha acima de 16 MiB")
+    }
+    return true
+}
+
+// slot (a partir de x29) que guarda x8 quando a funcao devolve agregado maior que um registrador
+proc a64_slot_sret(c: ^A64Ctx) -> u32 {
+    return c.vreg_off + 8 * c.f.nvregs
+}
+
+// slot (a partir de x29) do parametro k quando ele e agregado de registrador (vira o endereco do proprio slot)
+proc a64_slot_param(c: ^A64Ctx, k: u32) -> u32 {
+    return c.vreg_off + 8 * (c.f.nvregs + 1 + k)
+}
+
+// blocos na ordem de emissao: os quentes na ordem da BIR, depois os frios
+proc a64_ordenar_blocos(f: ^bir.BirFuncao, ordem: []u32) {
+    var n: int = 0
+    for b in (0 as u32)..<f.nblocos {
+        if not f.blocos[b].frio {
+            ordem[n] = b
+            n += 1
+        }
+    }
+    for b in (0 as u32)..<f.nblocos {
+        if f.blocos[b].frio {
+            ordem[n] = b
+            n += 1
+        }
+    }
+}
+
+// bloco que sera emitido logo depois do atual (BIR_SEM_BLOCO se for o ultimo)
+proc a64_proximo_bloco(c: ^A64Ctx) -> u32 {
+    if (c.pos_ordem + 1) < c.f.nblocos {
+        return c.ordem[c.pos_ordem + 1]
+    }
+    return bir.BIR_SEM_BLOCO
+}
+
+// sp = sp -/+ n (n ate 16 MiB): um ou dois ADD/SUB imm12
+proc a64_ajustar_sp(c: ^A64Ctx, subtrair: bool, n: u32) {
+    var forma: u32 = A64F_ADD_IMM
+    if subtrair {
+        forma = A64F_SUB_IMM
+    }
+    if (n >> 12) != 0 {
+        a64_op(c, forma, true, A64Ops{rd = R_SP, rn = R_SP, imm = n >> 12, imm2 = 1})
+    }
+    if (n & 4095) != 0 {
+        a64_op(c, forma, true, A64Ops{rd = R_SP, rn = R_SP, imm = n & 4095})
+    }
+}
+
+// stp/ldp x29,x30,[sp,#saida]: imm7 escalado ate 504; acima disso o endereco vai em x16
+proc a64_par_do_quadro(c: ^A64Ctx, carregar: bool) {
+    var forma: u32 = A64F_STP_X
+    if carregar {
+        forma = A64F_LDP_X
+    }
+    var base: u32 = R_SP
+    var imm: u32 = c.saida / 8
+    if c.saida > A64_MAX_STP {
+        a64_op(c, A64F_ADD_IMM, true, A64Ops{rd = R_TA, rn = R_SP, imm = c.saida})
+        base = R_TA
+        imm = 0
+    }
+    a64_op(c, forma, true, A64Ops{rd = R_FP, rn = base, rm = R_LR, imm = imm})
+}
+
+// parametros -> slots: x0-x7 direto; os demais vem da pilha do chamador, em [x29 + (quadro - saida) + 8*(k-8)].
+// Agregado de registrador (1/2/4/8 B) ganha slot proprio e o vreg passa a ser o endereco dele; o maior ja e ponteiro
+proc a64_guardar_parametros(c: ^A64Ctx) -> bool {
+    let f = c.f
+    let classes: []u8 = f.classe_vreg or_else {}
+    var st = A64Alocacao{}
+    for k in (0 as u32)..<f.nparams {
+        let pos = a64_alocar_arg(&st, a64_classe_real(classes[k]))
+        a64_guardar_parametro(c, k, pos)
+    }
+    return true
+}
+
+// um parametro: real em registrador vai direto ao slot; inteiro/agregado vem de x_n ou da pilha (via x9)
+proc a64_guardar_parametro(c: ^A64Ctx, k: u32, pos: A64Posicao) {
+    if pos.real and (not pos.pilha) {
+        a64_gravar_real(c, pos.reg, k)
+        return
+    }
+    var origem: u32 = pos.reg
+    if pos.pilha {
+        let desloc = (c.quadro - c.saida + 8 * pos.pilha_k) as i64
+        a64_acesso(c, A64F_LDR_X, R_T0, R_FP, desloc)
+        origem = R_T0
+    }
+    if a64_param_em_registrador(c, k) {
+        a64_acesso(c, A64F_STR_X, origem, R_FP, a64_slot_param(c, k) as i64)
+        a64_somar(c, R_T0, R_FP, a64_slot_param(c, k))
+        a64_gravar_vreg(c, R_T0, k)
+    } else {
+        a64_gravar_vreg(c, origem, k)
+    }
+}
+
+// a assinatura da funcao cabe no A64: classes escalares (agregado por valor e ponteiro sao inteiros de 64 bits)
+proc a64_assinatura_suportada(c: ^A64Ctx) -> bool {
+    let f = c.f
+    let classes: []u8 = f.classe_vreg or_else {}
+    for k in (0 as u32)..<f.nparams {
+        if not a64_classe_escalar(classes[k]) {
+            return a64_recusa(c, "parametro vetorial")
+        }
+    }
+    if ((f.retorno as i32) != bir.BC_NADA) and (not a64_classe_escalar(f.retorno)) {
+        return a64_recusa(c, "retorno vetorial")
+    }
+    return true
+}
+
+// R0016 (contrato §3.7): sp abaixo do limite de ESTADO_LIMITE_PILHA zera o limite (para falha_pilha nao reentrar) e chama falha_pilha.
+// Sem bloco frio: `b.hs .+16` pula as 3 instrucoes do caminho de falha (str, bl, brk); x9 = sp, x10 = limite, x16 = estado
+proc a64_guarda_pilha(c: ^A64Ctx) {
+    a64_op(c, A64F_ADD_IMM, true, A64Ops{rd = R_T0, rn = R_SP, imm = 0})
+    a64_estado_em(c, R_TA)
+    a64_acesso(c, A64F_LDR_X, R_T1, R_TA, A64_OFF_LIMITE_PILHA)
+    a64_op(c, A64F_SUBS_REG, true, A64Ops{rd = R_XZR, rn = R_T0, rm = R_T1})
+    a64_op(c, A64F_B_COND, false, A64Ops{imm = 4, imm2 = A64_COND_HS})
+    a64_acesso(c, A64F_STR_X, R_XZR, R_TA, A64_OFF_LIMITE_PILHA)
+    a64_bl_simbolo(c, c.pilha)
+    a64_op(c, A64F_BRK, false, A64Ops{imm = 0})
+}
+
+// sp/quadro, x29, guarda de R0016 (so dev com runtime), guarda de x8 (retorno maior) e parametros; o epilogo repete em cada RETORNA
+proc a64_prologo(c: ^A64Ctx) -> bool {
+    a64_ajustar_sp(c, true, c.quadro)
+    if c.pilha != A64_ALC_SEM {
+        a64_guarda_pilha(c)
+    }
+    a64_par_do_quadro(c, false)
+    a64_op(c, A64F_ADD_IMM, true, A64Ops{rd = R_FP, rn = R_SP, imm = c.saida})
+    if (c.f.retorno_tam != 0) and (not a64_tam_registrador(c.f.retorno_tam)) {
+        a64_acesso(c, A64F_STR_X, A64_REG_SRET, R_FP, a64_slot_sret(c) as i64)
+    }
+    return a64_guardar_parametros(c)
+}
+
+// ldp x29,x30 ; sp += quadro ; ret
+proc a64_epilogo(c: ^A64Ctx) {
+    a64_par_do_quadro(c, true)
+    a64_ajustar_sp(c, false, c.quadro)
+    a64_op(c, A64F_RET, false, A64Ops{rn = R_LR})
+}

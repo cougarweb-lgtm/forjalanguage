@@ -1,0 +1,190 @@
+// semantic/sem_fluxo.fj - porte de compiler/semantic/sem_fluxo.c
+// sha256 de semantic/sem_fluxo.c: 47c601766b5faea1c65b41010a27389c747b5cc3ae3bf570b6bd0277faf4f84d
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "common"
+import "frontend"
+
+// C: semantic/sem_fluxo.c:21
+proc return_move_ou_copia(s: ^Semantica, e: ?^frontend.Expr) -> bool {
+    if ((e as ^frontend.Expr).tipo_no == (frontend.EX_NOME as u8)) and ((e as ^frontend.Expr).ref == (frontend.REF_LOCAL as u8)) {
+        return sem_conferir_posse(s, e, PONTO_SAIDA)
+    }
+    return (common.c2f_b2i32(sem_conferir_movimento(s, e)) != 0) and (common.c2f_b2i32(sem_conferir_posse(s, e, PONTO_SAIDA)) != 0)
+}
+
+// C: semantic/sem_fluxo.c:28
+proc return_de_resultado(s: ^Semantica, st: ^frontend.Stmt, retorno: u32) -> bool {
+    let resultado: TipoInfo = tipo_de(&s.tipos, retorno)^
+    if st.expr == none {
+        if resultado.a == (TIPO_VAZIO as u32) {
+            return true
+        }
+        let msg_1 = format(f"return sem valor em proc com retorno", alloc = heap)
+        defer delete(msg_1)
+        return sem_erro(s, common.E0301, st.pos, msg_1)
+    }
+    if not sem_expr(s, st.expr, resultado.a) {
+        return false
+    }
+    let t: u32 = (st.expr as ^frontend.Expr).tipo
+    if (t != (TIPO_VAZIO as u32)) and ((t == resultado.a) or (t == resultado.b) or (t == retorno)) {
+        return return_move_ou_copia(s, st.expr)
+    }
+    let texto_retorno = texto_do_tipo(s, retorno, 96)
+    defer delete(texto_retorno)
+    let texto_recebido = texto_do_tipo(s, t, 96)
+    defer delete(texto_recebido)
+    let msg_2 = format(f"return de {texto_recebido} em proc que devolve {texto_retorno}: devolva o valor ou um membro do enum de erro", alloc = heap)
+    defer delete(msg_2)
+    return sem_erro(s, common.E0703, (st.expr as ^frontend.Expr).pos, msg_2)
+}
+
+// C: semantic/sem_fluxo.c:47
+proc return_de_tupla_literal(s: ^Semantica, valor: ?^frontend.Expr, retorno: u32) -> bool {
+    let qtd: u32 = tipo_tupla_qtd(&s.tipos, retorno)
+    if (valor as ^frontend.Expr).nargs != qtd {
+        let msg_1 = format(f"return com {(valor as ^frontend.Expr).nargs} valores; o proc devolve {qtd}", alloc = heap)
+        defer delete(msg_1)
+        return sem_erro(s, common.E0314, (valor as ^frontend.Expr).pos, msg_1)
+    }
+    for k in (0 as u32)..<qtd {
+        let v: ?^frontend.Expr = ((valor as ^frontend.Expr).args or_else {})[k].valor
+        if not sem_expr_com(s, v, tipo_tupla_elemento(&s.tipos, retorno, k)) {
+            return false
+        }
+        if not return_move_ou_copia(s, v) {
+            return false
+        }
+    }
+    let ptr_1: ^frontend.Expr = valor as ^frontend.Expr
+    ptr_1.tipo = retorno
+    return true
+}
+
+// C: semantic/sem_fluxo.c:61
+proc return_de_tupla(s: ^Semantica, st: ^frontend.Stmt, retorno: u32) -> bool {
+    let valor: ?^frontend.Expr = st.expr
+    if valor == none {
+        let msg_1 = format(f"return sem valor em proc com retorno", alloc = heap)
+        defer delete(msg_1)
+        return sem_erro(s, common.E0301, st.pos, msg_1)
+    }
+    if (valor as ^frontend.Expr).tipo_no == (frontend.EX_TUPLA as u8) {
+        return return_de_tupla_literal(s, valor, retorno)
+    }
+    if not sem_expr(s, valor, TIPO_VAZIO as u32) {
+        return false
+    }
+    if (valor as ^frontend.Expr).tipo == retorno {
+        return true
+    }
+    let msg_2 = format(f"return com 1 valor; o proc devolve {tipo_tupla_qtd(&s.tipos, retorno)} (return a, b)", alloc = heap)
+    defer delete(msg_2)
+    return sem_erro(s, common.E0314, (valor as ^frontend.Expr).pos, msg_2)
+}
+
+// C: semantic/sem_fluxo.c:72
+proc return_de_cstr_exportado(s: ^Semantica, valor: ?^frontend.Expr, retorno: u32) -> bool {
+    var v: ?^frontend.Expr = valor
+    if (valor as ^frontend.Expr).tipo_no == (frontend.EX_EMBRULHA as u8) {
+        v = (valor as ^frontend.Expr).a
+    }
+    if ((v as ^frontend.Expr).tipo_no == (frontend.EX_NONE as u8)) and (retorno != (TIPO_CSTR as u32)) {
+        return true
+    }
+    if ((v as ^frontend.Expr).tipo_no == (frontend.EX_CHAMADA as u8)) and ((v as ^frontend.Expr).ref == (frontend.REF_EMBUTIDO as u8)) and ((v as ^frontend.Expr).ref_id == frontend.EMB_FORMAT_C) and ((v as ^frontend.Expr).nargs > 1) and ((((v as ^frontend.Expr).args or_else {})[1].valor as ^frontend.Expr).tipo_no == (frontend.EX_NOME as u8)) and ((((v as ^frontend.Expr).args or_else {})[1].valor as ^frontend.Expr).nome == s.nome_heap) {
+        return true
+    }
+    let msg_1 = format(f"o proc exportado '{sem_nome_texto(s, (s.proc_c as ^frontend.Decl).nome)}' devolve cstr: o return precisa ser format_c(..., alloc = heap) direto (o C libera com forja_liberar)", alloc = heap)
+    defer delete(msg_1)
+    return sem_erro(s, common.E0901, (valor as ^frontend.Expr).pos, msg_1)
+}
+
+// C: semantic/sem_fluxo.c:85
+proc retorno_eh_cstr_exportado(s: ^Semantica, retorno: u32) -> bool {
+    if not (s.proc_c as ^frontend.Decl).exportado {
+        return false
+    }
+    return (retorno == (TIPO_CSTR as u32)) or ((tipo_classe_de(&s.tipos, retorno) == TC_OPCIONAL) and tipo_opcional_nicho(&s.tipos, retorno))
+}
+
+// C: semantic/sem_fluxo.c:92
+proc return_conferido(s: ^Semantica, st: ^frontend.Stmt) -> bool {
+    let retorno: u32 = (s.proc_c as ^frontend.Decl).retorno.tipo
+    let tupla: bool = tipo_classe_de(&s.tipos, retorno) == TC_TUPLA
+    if tupla {
+        return return_de_tupla(s, st, retorno)
+    }
+    if (st.expr != none) and ((st.expr as ^frontend.Expr).tipo_no == (frontend.EX_TUPLA as u8)) {
+        let msg_1 = format(f"'return a, b' pede retorno multiplo: -> (a: A, b: B)", alloc = heap)
+        defer delete(msg_1)
+        return sem_erro(s, common.E0314, (st.expr as ^frontend.Expr).pos, msg_1)
+    }
+    if retorno == (TIPO_VAZIO as u32) {
+        if st.expr == none {
+            return true
+        }
+        let msg_2 = format(f"o proc nao declara retorno", alloc = heap)
+        defer delete(msg_2)
+        return sem_erro(s, common.E0301, (st.expr as ^frontend.Expr).pos, msg_2)
+    }
+    if tipo_classe_de(&s.tipos, retorno) == TC_RESULTADO {
+        return return_de_resultado(s, st, retorno)
+    }
+    if st.expr == none {
+        let msg_3 = format(f"return sem valor em proc com retorno", alloc = heap)
+        defer delete(msg_3)
+        return sem_erro(s, common.E0301, st.pos, msg_3)
+    }
+    if not sem_expr(s, st.expr, retorno) {
+        return false
+    }
+    s.ctx_tipo = ContextoDoTipo{onde = CTX_RETORNO as u8, valor = st.expr, nome = -1, dono = (s.proc_c as ^frontend.Decl).nome}
+    if not sem_coagir(s, st.expr, retorno, (st.expr as ^frontend.Expr).pos) {
+        return false
+    }
+    if retorno_eh_cstr_exportado(s, retorno) and (not return_de_cstr_exportado(s, st.expr, retorno)) {
+        return false
+    }
+    return return_move_ou_copia(s, st.expr)
+}
+
+// C: semantic/sem_fluxo.c:110
+proc sem_return(s: ^Semantica, st: ^frontend.Stmt) -> bool {
+    return (common.c2f_b2i32(return_conferido(s, st)) != 0) and (common.c2f_b2i32(sem_conferir_saida(s, 0, st)) != 0)
+}
+
+// C: semantic/sem_fluxo.c:115
+proc sem_laco_controle(s: ^Semantica, st: ^frontend.Stmt) -> bool {
+    if s.prof_laco > 0 {
+        return sem_conferir_saida(s, s.marca_laco, st)
+    }
+    var tern_1: str = "continue"
+    if st.tipo_no == (frontend.ST_BREAK as u8) {
+        tern_1 = "break"
+    }
+    let msg_1 = format(f"{tern_1} fora de while ou for", alloc = heap)
+    defer delete(msg_1)
+    return sem_erro(s, common.E0701, st.pos, msg_1)
+}
+
+// C: semantic/sem_fluxo.c:121
+proc sem_defer(s: ^Semantica, st: ^frontend.Stmt) -> bool {
+    let salvo: bool = s.em_defer
+    s.em_defer = true
+    let ok: bool = sem_comando(s, st.corpo)
+    s.em_defer = salvo
+    return ok
+}
+
+// C: semantic/sem_fluxo.c:130
+proc sem_expect(s: ^Semantica, st: ^frontend.Stmt) -> bool {
+    if not s.em_teste {
+        let msg_1 = format(f"expect so pode aparecer dentro de um bloco test", alloc = heap)
+        defer delete(msg_1)
+        return sem_erro(s, common.E0801, st.pos, msg_1)
+    }
+    return sem_condicao(s, st.expr)
+}

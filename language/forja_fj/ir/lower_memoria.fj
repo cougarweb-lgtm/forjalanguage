@@ -1,0 +1,404 @@
+// ir/lower_memoria.fj - porte de compiler/ir/lower_memoria.c
+// sha256 de ir/lower_memoria.c: cb7eef165f6df6268f67888a997e168871894dba7a4144cd882f85eb0978c08f
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "common"
+import "frontend"
+import "semantic"
+
+const ALOCADOR_HEAP: i32 = 1
+const ALOCADOR_FRAME_2: i32 = 2
+const NEW_ZERO_NO_DESTINO_MIN: u32 = 1024
+
+// C: ir/lower_memoria.c:27
+proc argumento_de_2(e: ^frontend.Expr, indice: i32) -> ?^frontend.Expr {
+    for k in (0 as u32)..<e.nargs {
+        if (e.args or_else {})[k].indice == indice {
+            return (e.args or_else {})[k].valor
+        }
+    }
+    return none
+}
+
+// C: ir/lower_memoria.c:37
+proc lw_alocador(c: ^LowerCtx, e: ^frontend.Expr) -> Valor {
+    let sw_1 = e.alocacao as i32
+    if sw_1 == frontend.ALOC_HEAP or sw_1 == frontend.ALOC_ESCOPO {
+        return lw_valor_int(ALOCADOR_HEAP as i64, semantic.TIPO_U32 as u32)
+    } else if sw_1 == frontend.ALOC_FRAME {
+        return lw_valor_int(ALOCADOR_FRAME_2 as i64, semantic.TIPO_U32 as u32)
+    } else if sw_1 == frontend.ALOC_ARENA or sw_1 == frontend.ALOC_PARAM or sw_1 == frontend.ALOC_POOL {
+        return lw_expr(c, argumento_de_2(e, 1))
+    } else {
+        let msg_1 = format(f"lowering: alocacao {e.alocacao as u32} sem 'em' (offset {e.pos_op})", alloc = heap)
+        defer delete(msg_1)
+        common.falha_interna(msg_1)
+    }
+    return Valor{}
+}
+
+// C: ir/lower_memoria.c:55
+proc new_zera_no_destino(c: ^LowerCtx, apontado: u32) -> bool {
+    let tipo: ^semantic.TipoInfo = semantic.tipo_de(&(c.sem as ^semantic.Semantica).tipos, apontado)
+    return (tipo.classe == (semantic.TC_ARRAY as u8)) and (tipo.b >= NEW_ZERO_NO_DESTINO_MIN)
+}
+
+// C: ir/lower_memoria.c:63
+proc lw_new(c: ^LowerCtx, e: ^frontend.Expr) -> Valor {
+    let apontado: u32 = semantic.tipo_de(&(c.sem as ^semantic.Semantica).tipos, e.tipo).a
+    let zera_no_destino: bool = (e.b == none) and (common.c2f_b2i32(new_zera_no_destino(c, apontado)) != 0)
+    var inicial: Valor = Valor{tipo_no = 0}
+    if e.b != none {
+        inicial = lw_expr(c, e.b)
+    } else if not zera_no_destino {
+        inicial = lw_zero_do_tipo(c, apontado, e.pos_op)
+    }
+    let alocador: Valor = lw_alocador(c, e)
+    let aloca: ^IrInstr = lw_nova_instr(c, IR_ALOCA, e.pos_op)
+    aloca.destino = lw_novo_temp(c)
+    aloca.tipo = e.tipo
+    aloca.a = alocador
+    let ponteiro: Valor = lw_valor_temp(aloca.destino, aloca.tipo)
+    if zera_no_destino {
+        aloca.op_aux = IR_ALOCA_ZERADO as u8
+        return ponteiro
+    }
+    let grava: ^IrInstr = lw_nova_instr(c, IR_GRAVA_PONTEIRO, e.pos_op)
+    grava.a = ponteiro
+    grava.b = inicial
+    grava.nome = -1
+    grava.tipo = apontado
+    return ponteiro
+}
+
+// C: ir/lower_memoria.c:91
+proc lw_make_v19(c: ^LowerCtx, e: ^frontend.Expr, classe: i32) -> Valor {
+    if (common.c2f_s2u_32(classe) != (semantic.TC_SOA as u32)) and (common.c2f_s2u_32(classe) != (semantic.TC_MAPA as u32)) {
+        let msg_1 = format(f"lowering: make de tipo {e.tipo} (offset {e.pos_op})", alloc = heap)
+        defer delete(msg_1)
+        common.falha_interna(msg_1)
+    }
+    let cap: ?^frontend.Expr = argumento_de_2(e, 2)
+    var tern_1: Valor = Valor{}
+    if cap != none {
+        tern_1 = lw_expr(c, cap)
+    } else {
+        tern_1 = lw_valor_int(0, semantic.TIPO_INT as u32)
+    }
+    let capacidade: Valor = tern_1
+    let alocador: Valor = lw_alocador(c, e)
+    var tern_2: i32 = IR_SOA_CRIA
+    if common.c2f_s2u_32(classe) == (semantic.TC_MAPA as u32) {
+        tern_2 = IR_MAPA_CRIA
+    }
+    let i: ^IrInstr = lw_nova_instr(c, tern_2, e.pos_op)
+    i.destino = lw_novo_temp(c)
+    i.tipo = e.tipo
+    i.a = alocador
+    i.b = capacidade
+    return lw_valor_temp(i.destino, i.tipo)
+}
+
+// C: ir/lower_memoria.c:106
+proc lw_redimensiona(c: ^LowerCtx, e: ^frontend.Expr, lista: Valor, tamanho: Valor) {
+    var tern_1: u32 = lista.tipo
+    if common.c2f_s2u_32(semantic.tipo_classe_de(&(c.sem as ^semantic.Semantica).tipos, lista.tipo)) == (semantic.TC_PONTEIRO as u32) {
+        tern_1 = semantic.tipo_de(&(c.sem as ^semantic.Semantica).tipos, lista.tipo).a
+    }
+    let dinamica: u32 = tern_1
+    let i: ^IrInstr = lw_nova_instr(c, IR_REDIMENSIONA, e.pos_op)
+    i.tipo = semantic.tipo_de(&(c.sem as ^semantic.Semantica).tipos, dinamica).a
+    i.a = lista
+    i.b = tamanho
+}
+
+// C: ir/lower_memoria.c:116
+proc lw_make(c: ^LowerCtx, e: ^frontend.Expr) -> Valor {
+    let classe: i32 = semantic.tipo_classe_de(&(c.sem as ^semantic.Semantica).tipos, e.tipo)
+    if common.c2f_b2i32(common.c2f_s2u_32(classe) != (semantic.TC_DINAMICO as u32)) != 0 {
+        return lw_make_v19(c, e, classe)
+    }
+    let cap: ?^frontend.Expr = argumento_de_2(e, frontend.MAKE_PARAM_CAP)
+    let len_c: ?^frontend.Expr = argumento_de_2(e, frontend.MAKE_PARAM_LEN)
+    var tern_1: Valor = Valor{}
+    if cap != none {
+        tern_1 = lw_expr(c, cap)
+    } else {
+        tern_1 = lw_valor_int(0, semantic.TIPO_INT as u32)
+    }
+    var capacidade: Valor = tern_1
+    var tern_2: Valor = Valor{}
+    if len_c != none {
+        tern_2 = lw_expr(c, len_c)
+    } else {
+        tern_2 = lw_valor_int(0, semantic.TIPO_INT as u32)
+    }
+    let tamanho: Valor = tern_2
+    if (cap == none) and (len_c != none) {
+        capacidade = tamanho
+    }
+    let alocador: Valor = lw_alocador(c, e)
+    let i: ^IrInstr = lw_nova_instr(c, IR_LISTA_CRIA, e.pos_op)
+    i.destino = lw_novo_temp(c)
+    i.tipo = e.tipo
+    i.a = alocador
+    i.b = capacidade
+    let lista: Valor = lw_valor_temp(i.destino, i.tipo)
+    if len_c != none {
+        lw_redimensiona(c, e, lista, tamanho)
+    }
+    return lista
+}
+
+// C: ir/lower_memoria.c:135
+proc lw_append(c: ^LowerCtx, e: ^frontend.Expr) -> Valor {
+    let alvo: ?^frontend.Expr = argumento_de_2(e, 0)
+    let dinamica: u32 = semantic.tipo_de(&(c.sem as ^semantic.Semantica).tipos, (alvo as ^frontend.Expr).tipo).a
+    if common.c2f_b2i32(semantic.tipo_eh_lista_fixa(&(c.sem as ^semantic.Semantica).tipos, dinamica)) != 0 {
+        return lw_append_lista_fixa(c, e, alvo, argumento_de_2(e, 1))
+    }
+    if common.c2f_b2i32(common.c2f_s2u_32(semantic.tipo_classe_de(&(c.sem as ^semantic.Semantica).tipos, dinamica)) == (semantic.TC_SOA as u32)) != 0 {
+        let soa: Valor = lw_expr(c, alvo)
+        let item: Valor = lw_expr(c, argumento_de_2(e, 1))
+        let anexa: ^IrInstr = lw_nova_instr(c, IR_SOA_ANEXA, e.pos_op)
+        let arg_1: u32 = semantic.tipo_de(&(c.sem as ^semantic.Semantica).tipos, dinamica).a
+        let arg_2: ^semantic.Tipos = &(c.sem as ^semantic.Semantica).tipos
+        anexa.tipo = semantic.tipo_de(arg_2, arg_1).a
+        anexa.a = soa
+        anexa.b = item
+        return lw_valor_nenhum()
+    }
+    let fatia: ?^frontend.Expr = argumento_de_2(e, frontend.APPEND_PARAM_ITEMS)
+    let lista: Valor = lw_expr(c, alvo)
+    var tern_1: ?^frontend.Expr = none
+    if fatia != none {
+        tern_1 = fatia
+    } else {
+        tern_1 = argumento_de_2(e, frontend.APPEND_PARAM_ITEM)
+    }
+    let item: Valor = lw_expr(c, tern_1)
+    var tern_2: i32 = IR_ANEXA
+    if fatia != none {
+        tern_2 = IR_ANEXA_FATIA
+    }
+    let i: ^IrInstr = lw_nova_instr(c, tern_2, e.pos_op)
+    i.tipo = semantic.tipo_de(&(c.sem as ^semantic.Semantica).tipos, dinamica).a
+    i.a = lista
+    i.b = item
+    return lw_valor_nenhum()
+}
+
+// C: ir/lower_memoria.c:160
+proc lw_resize(c: ^LowerCtx, e: ^frontend.Expr) -> Valor {
+    let lista: Valor = lw_expr(c, argumento_de_2(e, 0))
+    let tamanho: Valor = lw_expr(c, argumento_de_2(e, 1))
+    lw_redimensiona(c, e, lista, tamanho)
+    return lw_valor_nenhum()
+}
+
+// C: ir/lower_memoria.c:169
+proc tipo_de_ordenacao(c: ^LowerCtx, elemento: u32) -> u8 {
+    let sw_1 = common.c2f_s2u_32(semantic.tipo_classe_de(&(c.sem as ^semantic.Semantica).tipos, elemento))
+    if sw_1 == (semantic.TC_I8 as u32) {
+        return ORDENA_I8 as u8
+    } else if sw_1 == (semantic.TC_I16 as u32) {
+        return ORDENA_I16 as u8
+    } else if sw_1 == (semantic.TC_I32 as u32) {
+        return ORDENA_I32 as u8
+    } else if sw_1 == (semantic.TC_INT as u32) {
+        return ORDENA_I64 as u8
+    } else if sw_1 == (semantic.TC_U8 as u32) {
+        return ORDENA_U8 as u8
+    } else if sw_1 == (semantic.TC_U16 as u32) {
+        return ORDENA_U16 as u8
+    } else if sw_1 == (semantic.TC_U32 as u32) {
+        return ORDENA_U32 as u8
+    } else if sw_1 == (semantic.TC_UINT as u32) {
+        return ORDENA_U64 as u8
+    } else if sw_1 == (semantic.TC_REAL as u32) {
+        return ORDENA_F32 as u8
+    } else if sw_1 == (semantic.TC_F64 as u32) {
+        return ORDENA_F64 as u8
+    } else if sw_1 == (semantic.TC_TEXTO as u32) {
+        return ORDENA_STR as u8
+    } else {
+        let msg_1 = format(f"lowering: sort de elemento do tipo {elemento}", alloc = heap)
+        defer delete(msg_1)
+        common.falha_interna(msg_1)
+    }
+    return 0
+}
+
+// C: ir/lower_memoria.c:188
+proc lw_sort(c: ^LowerCtx, e: ^frontend.Expr) -> Valor {
+    let fatia: Valor = lw_expr(c, argumento_de_2(e, 0))
+    let i: ^IrInstr = lw_nova_instr(c, IR_ORDENA, e.pos_op)
+    i.tipo = fatia.tipo
+    i.a = fatia
+    i.op_aux = tipo_de_ordenacao(c, semantic.tipo_de(&(c.sem as ^semantic.Semantica).tipos, fatia.tipo).a)
+    let ptr_1: ^IrPrograma = c.prog as ^IrPrograma
+    ptr_1.usa_ordenar = true
+    return lw_valor_nenhum()
+}
+
+// C: ir/lower_memoria.c:200
+proc lw_sort_by(c: ^LowerCtx, e: ^frontend.Expr) -> Valor {
+    let fatia: Valor = lw_expr(c, argumento_de_2(e, 0))
+    let comparador: Valor = lw_expr(c, argumento_de_2(e, 1))
+    let i: ^IrInstr = lw_nova_instr(c, IR_ORDENA_GERAL, e.pos_op)
+    i.tipo = semantic.tipo_de(&(c.sem as ^semantic.Semantica).tipos, fatia.tipo).a
+    i.a = fatia
+    i.b = comparador
+    i.op_aux = ORDENA_GERAL_ESTAVEL as u8
+    let ptr_1: ^IrPrograma = c.prog as ^IrPrograma
+    ptr_1.usa_ordenar_estavel = true
+    return lw_valor_nenhum()
+}
+
+// C: ir/lower_memoria.c:214
+proc lw_sort_by_key(c: ^LowerCtx, e: ^frontend.Expr) -> Valor {
+    let chave: ?^frontend.Expr = argumento_de_2(e, 1)
+    let fatia: Valor = lw_expr(c, argumento_de_2(e, 0))
+    let i: ^IrInstr = lw_nova_instr(c, IR_ORDENA_GERAL, e.pos_op)
+    i.tipo = semantic.tipo_de(&(c.sem as ^semantic.Semantica).tipos, fatia.tipo).a
+    i.a = fatia
+    i.op_aux = ORDENA_GERAL_CHAVE as u8
+    i.desloc_chave = layout_offset_campo(&c.layouts, ((chave as ^frontend.Expr).a as ^frontend.Expr).tipo, common.c2f_s2u_32((chave as ^frontend.Expr).ref_id)) as i64
+    i.tipo_chave = tipo_de_ordenacao(c, (chave as ^frontend.Expr).tipo)
+    let ptr_1: ^IrPrograma = c.prog as ^IrPrograma
+    ptr_1.usa_ordenar_chave = true
+    return lw_valor_nenhum()
+}
+
+// C: ir/lower_memoria.c:229
+// C2F-INDECIDIVEL: par
+proc lw_busca_modo(c: ^LowerCtx, e: ^frontend.Expr, modo: u8, par: []Valor) -> Valor {
+    let i: ^IrInstr = lw_nova_instr(c, IR_BUSCA_BINARIA, e.pos_op)
+    let elemento: u32 = semantic.tipo_de(&(c.sem as ^semantic.Semantica).tipos, par[0].tipo).a
+    i.destino = lw_novo_temp(c)
+    var tern_1: i32 = semantic.TIPO_INT
+    if modo == (BUSCA_ACHOU as u8) {
+        tern_1 = semantic.TIPO_BOOL
+    }
+    i.tipo = common.c2f_s2u_32(tern_1)
+    i.a = par[0]
+    i.b = par[1]
+    i.op_aux = modo
+    i.tipo_chave = tipo_de_ordenacao(c, elemento)
+    return lw_valor_temp(i.destino, i.tipo)
+}
+
+// C: ir/lower_memoria.c:243
+proc lw_binary_search(c: ^LowerCtx, e: ^frontend.Expr) -> Valor {
+    var par: [2]Valor = {}
+    par[0] = lw_expr(c, argumento_de_2(e, 0))
+    let valor: Valor = lw_expr(c, argumento_de_2(e, 1))
+    let elemento: u32 = semantic.tipo_de(&(c.sem as ^semantic.Semantica).tipos, par[0].tipo).a
+    let local: i32 = lw_novo_local(c)
+    let guarda: ^IrInstr = lw_nova_instr(c, IR_LOCAL, e.pos_op)
+    guarda.destino = local
+    guarda.tipo = elemento
+    guarda.a = valor
+    par[1] = lw_valor_local(local, elemento)
+    let prog_busca: ^IrPrograma = c.prog as ^IrPrograma
+    prog_busca.usa_ordenar_chave = true
+    let posicao: Valor = lw_busca_modo(c, e, BUSCA_POSICAO as u8, par[..])
+    let achou: Valor = lw_busca_modo(c, e, BUSCA_ACHOU as u8, par[..])
+    let tupla: ^IrInstr = lw_nova_instr(c, IR_TUPLA, e.pos_op)
+    tupla.destino = lw_novo_temp(c)
+    tupla.tipo = e.tipo
+    tupla.args = lw_args(c, 2)
+    let args_tupla: []Valor = tupla.args or_else {}
+    args_tupla[0] = posicao
+    args_tupla[1] = achou
+    tupla.nargs = 2
+    return lw_valor_temp(tupla.destino, e.tipo)
+}
+
+// C: ir/lower_memoria.c:269 (lista 1, map 4, soa dinamica 5)
+proc op_da_colecao(classe: i32) -> u8 {
+    if classe == semantic.TC_MAPA {
+        return 4
+    }
+    if classe == semantic.TC_SOA {
+        return 5
+    }
+    return 1
+}
+
+// C: ir/lower_memoria.c:276
+proc lw_zera_nome_do_delete(c: ^LowerCtx, alvo: ?^frontend.Expr, classe: i32, pos: u32) {
+    if ((alvo as ^frontend.Expr).tipo_no != (frontend.EX_NOME as u8)) or (((alvo as ^frontend.Expr).ref != (frontend.REF_LOCAL as u8)) and ((alvo as ^frontend.Expr).ref != (frontend.REF_PARAM as u8))) {
+        return
+    }
+    if ((common.c2f_s2u_32(classe) != (semantic.TC_PONTEIRO as u32)) and (common.c2f_s2u_32(classe) != (semantic.TC_ANULAVEL as u32))) and ((alvo as ^frontend.Expr).tipo != (semantic.TIPO_CSTR as u32)) {
+        return
+    }
+    let i: ^IrInstr = lw_nova_instr(c, IR_ATRIBUICAO, pos)
+    i.destino = (alvo as ^frontend.Expr).ref_id
+    i.tipo = (alvo as ^frontend.Expr).tipo
+    i.a = lw_valor_nulo((alvo as ^frontend.Expr).tipo)
+    i.nome = -1
+}
+
+// C: ir/lower_memoria.c:288
+proc lw_delete(c: ^LowerCtx, e: ^frontend.Expr) -> Valor {
+    let alvo: ?^frontend.Expr = argumento_de_2(e, 0)
+    if e.alocacao == (frontend.ALOC_POOL as u8) {
+        let bloco: Valor = lw_expr(c, alvo)
+        let handle: Valor = lw_expr(c, argumento_de_2(e, 1))
+        let devolve: ^IrInstr = lw_nova_instr(c, IR_LIBERA, e.pos_op)
+        devolve.op_aux = 3
+        devolve.a = bloco
+        devolve.b = handle
+        return lw_valor_nenhum()
+    }
+    let classe: i32 = semantic.tipo_classe_de(&(c.sem as ^semantic.Semantica).tipos, (alvo as ^frontend.Expr).tipo)
+    let lista: bool = (classe == semantic.TC_DINAMICO) or (classe == semantic.TC_MAPA) or (classe == semantic.TC_SOA)
+    var endereco: Valor = Valor{}
+    if lista {
+        endereco = lw_endereco(c, alvo)
+    } else {
+        endereco = lw_expr(c, alvo)
+    }
+    let i: ^IrInstr = lw_nova_instr(c, IR_LIBERA, e.pos_op)
+    if lista {
+        i.op_aux = op_da_colecao(classe)
+    } else if (alvo as ^frontend.Expr).tipo == (semantic.TIPO_TEXTO as u32) {
+        i.op_aux = 2
+    } else {
+        i.op_aux = 0
+    }
+    i.a = endereco
+    lw_zera_nome_do_delete(c, alvo, classe, e.pos_op)
+    return lw_valor_nenhum()
+}
+
+// C: ir/lower_memoria.c:310
+proc lw_memoria(c: ^LowerCtx, e: ^frontend.Expr) -> Valor {
+    let sw_1 = e.ref_id
+    if sw_1 == frontend.EMB_NEW {
+        return lw_new(c, e)
+    } else if sw_1 == frontend.EMB_MAKE {
+        return lw_make(c, e)
+    } else if sw_1 == frontend.EMB_APPEND {
+        return lw_append(c, e)
+    } else if sw_1 == frontend.EMB_DELETE {
+        return lw_delete(c, e)
+    } else if sw_1 == frontend.EMB_FRAME_RESET {
+        _ = lw_nova_instr(c, IR_FRAME_RESET, e.pos_op)
+        return lw_valor_nenhum()
+    } else {
+        let msg_1 = format(f"lowering: embutido de memoria desconhecido (offset {e.pos_op})", alloc = heap)
+        defer delete(msg_1)
+        common.falha_interna(msg_1)
+    }
+    return Valor{}
+}
+
+// Valores do C (OpDaColecao: lista 1, map 4, soa dinamica 5).
+test "lower_memoria: op_da_colecao segue OpDaColecao do C" {
+    expect(op_da_colecao(semantic.TC_DINAMICO) == 1 and op_da_colecao(semantic.TC_MAPA) == 4)
+    expect(op_da_colecao(semantic.TC_SOA) == 5 and op_da_colecao(semantic.TC_ARRAY) == 1)
+}

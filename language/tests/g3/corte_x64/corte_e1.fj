@@ -1,0 +1,219 @@
+import "std:os"
+import "nativo/optimizer"
+    // Corte X64 (V3, plano do Opus FORJA-D0785): corpo de nativo_construir_exe para o espelho (--corte). IR -> BIR validada -> otim_executar (so o --sem-otim do pedido) -> x64_gerar
+    // (colheita com listagem, sem tempos) -> dump do Objeto e da listagem no stdout -> 2a geracao sem listagem: repeticao igual|difere. rc 0. Igual ao corte_e0.c.
+    var sd: common.SaidaDiag = common.SaidaDiag{}
+    let nome: str = pedido.alvo or_else NATIVO_ALVO_PADRAO
+    let sysv: bool = nome == "x86_64-linux"
+    if (not sysv) and (nome != "x86_64-windows") {
+        common.diag_imprimir_json_sem_fonte(common.X0003, "alvo desconhecido no backend nativo", common.c2f_saida_stderr(), &sd)
+        return SAIDA_USO
+    }
+    if pedido.dll and sysv {
+        common.diag_imprimir_json_sem_fonte(common.X0003, NATIVO_X0003_SO, common.c2f_saida_stderr(), &sd)
+        return SAIDA_USO
+    }
+    var nomes_alvo: bir.BirNomesMem = bir.BirNomesMem{copia = "memcpy", zera = "memset"}
+    if sysv {
+        nomes_alvo = bir.BirNomesMem{copia = "forja_memcpy", zera = "forja_memset"}
+    }
+    var entrada: bir.BirEntrada = bir.BirEntrada{ir = pedido.ir, tipos = pedido.tipos, nomes = pedido.nomes, fonte = pedido.fonte, modo = pedido.modo, teste = pedido.teste, traco = pedido.traco, dll = pedido.dll, poda = true, sysv = sysv, guarda = pedido.guarda_memoria, checagem = pedido.checagem, simbolos_dbg = pedido.simbolos, perfil = pedido.perfil, nomes_mem = nomes_alvo}
+    var programa: bir.BirPrograma = bir.BirPrograma{}
+    var erro: common.Diag = common.Diag{tem = false}
+    var contadores = make([dynamic]u8, alloc = heap)
+    defer delete(contadores)
+    var passes = make([dynamic]u8, alloc = heap)
+    defer delete(passes)
+    var saida = make([dynamic]u8, alloc = heap)
+    defer delete(saida)
+    var relatos: optimizer.OtimRelatos = optimizer.OtimRelatos{contadores = &contadores, passes = &passes}
+    let sem: str = pedido.sem_otim or_else ""
+    var lista: x64.AlvoListagem = x64.AlvoListagem{}
+    alvo_listagem_iniciar(&lista)
+    var objeto1: obj.Objeto = obj.Objeto{}
+    obj.obj_iniciar(&objeto1)
+    var objeto2: obj.Objeto = obj.Objeto{}
+    obj.obj_iniciar(&objeto2)
+    var colheita: x64.AlvoColheita = x64.AlvoColheita{lista = &lista, tempos = none, rastreio = false, dbg = none, guarda = pedido.guarda_memoria}
+    let saida_diag = common.c2f_saida_stdout()
+    var codigo: i32 = 0
+    if not bir.bir_construir(&entrada, &programa, &erro) {
+        common.diag_imprimir_json(&erro, (pedido.fonte as ^common.Fonte), saida_diag, &sd)
+        codigo = 3
+        if erro.codigo == common.X0001 {
+            codigo = 1
+        }
+    } else if not bir.bir_validar(&programa, &erro) {
+        common.diag_imprimir_json(&erro, (pedido.fonte as ^common.Fonte), saida_diag, &sd)
+        codigo = 3
+    } else if not optimizer.otim_executar(&programa, sem, &relatos, &erro) {
+        common.diag_imprimir_json(&erro, (pedido.fonte as ^common.Fonte), saida_diag, &sd)
+        codigo = 3
+    } else if not x64.x64_gerar(&programa, &objeto1, &erro, &colheita) {
+        common.diag_imprimir_json(&erro, (pedido.fonte as ^common.Fonte), saida_diag, &sd)
+        codigo = 3
+    } else {
+        var texto: int = -1
+        var s: int = 0
+        while (s < len(objeto1.secoes)) and (texto < 0) {
+            if objeto1.secoes[s].tipo == obj.OS_TEXTO {
+                texto = s
+            }
+            s += 1
+        }
+        format(f"alvo {nome}\n", into = &saida)
+        var i: int = 0
+        while i < len(lista.funcoes) {
+            let f: ^x64.ListaFuncao = &lista.funcoes[i]
+            format(f"funcao {i} nome=", into = &saida)
+            var k: int = f.nome as int
+            while lista.textos[k] != 0 {
+                append(&saida, item = lista.textos[k])
+                k += 1
+            }
+            format(f" inicio={f.inicio} fim={f.fim} pos={f.pos} quadro={f.quadro} slots={f.slots} maxargs={f.maxargs} push={f.push} fpreg={f.fpreg} alocacao={f.alocacao} sondagem={f.sondagem} unwind=", into = &saida)
+            var q: int = 0
+            while q < (f.tam_unwind as int) {
+                let ub: u8 = (f.unwind or_else {})[q]
+                format(f"{ub:02x}", into = &saida)
+                q += 1
+            }
+            append(&saida, item = "\n")
+            var qs: int = 0
+            while qs < (f.nslots_agregado as int) {
+                format(f"slot {i} {qs} tam={f.slots_agregado[qs].tam} alin={f.slots_agregado[qs].alinhamento} off={f.slots_agregado[qs].offset}\n", into = &saida)
+                qs += 1
+            }
+            i += 1
+        }
+        i = 0
+        while i < len(lista.instrs) {
+            let li: ^x64.ListaInstr = &lista.instrs[i]
+            format(f"instr f={li.funcao} off={li.off} tam={li.tam} origem={li.origem} bloco={li.bloco} indice={li.indice} pos={li.pos} texto=", into = &saida)
+            var k: int = li.texto as int
+            while lista.textos[k] != 0 {
+                append(&saida, item = lista.textos[k])
+                k += 1
+            }
+            append(&saida, item = " simbolo=")
+            if li.simbolo != 0 {
+                var ks: int = (li.simbolo - 1) as int
+                while lista.textos[ks] != 0 {
+                    append(&saida, item = lista.textos[ks])
+                    ks += 1
+                }
+            } else {
+                append(&saida, item = "-")
+            }
+            append(&saida, item = " bytes=")
+            if (texto >= 0) and (((li.off as int) + (li.tam as int)) <= len(objeto1.secoes[texto].bytes)) {
+                var q: int = 0
+                while q < (li.tam as int) {
+                    let bb: u8 = objeto1.secoes[texto].bytes[(li.off as int) + q]
+                    format(f"{bb:02x}", into = &saida)
+                    q += 1
+                }
+            }
+            append(&saida, item = "\n")
+            i += 1
+        }
+        i = 0
+        while i < len(objeto1.secoes) {
+            let sec: ^obj.ObjSecao = &objeto1.secoes[i]
+            var fnv: u64 = 14695981039346656037
+            var q: int = 0
+            while q < len(sec.bytes) {
+                fnv = wrapping_mul(fnv ~ (sec.bytes[q] as u64), 1099511628211)
+                q += 1
+            }
+            let nome_sec: str = sec.nome or_else "(null)"
+            let tam_sec: int = len(sec.bytes)
+            format(f"secao {i} nome={nome_sec} tipo={sec.tipo} alin={sec.alinhamento} tam={tam_sec} bss={sec.tam_bss} fnv={fnv:016x}\n", into = &saida)
+            if (sec.tipo == obj.OS_TEXTO) or (sec.tipo == obj.OS_PDATA) or (sec.tipo == obj.OS_XDATA) {
+                format(f"hex {i} ", into = &saida)
+                var qh: int = 0
+                while qh < len(sec.bytes) {
+                    let hb: u8 = sec.bytes[qh]
+                    format(f"{hb:02x}", into = &saida)
+                    qh += 1
+                }
+                append(&saida, item = "\n")
+            }
+            i += 1
+        }
+        i = 0
+        while i < len(objeto1.relocs) {
+            let rl: ^obj.ObjReloc = &objeto1.relocs[i]
+            let nome_sim: str = objeto1.simbolos[rl.correcao.simbolo as int].nome or_else "(null)"
+            format(f"reloc secao={rl.alvo.secao} off={rl.alvo.off} tipo={rl.correcao.tipo} simbolo={nome_sim} adendo={rl.correcao.adendo}\n", into = &saida)
+            i += 1
+        }
+        i = 0
+        while i < len(objeto1.simbolos) {
+            let sim: ^obj.ObjSimbolo = &objeto1.simbolos[i]
+            let nome_s: str = sim.nome or_else "(null)"
+            var gl: int = 0
+            if sim.global {
+                gl = 1
+            }
+            var fr: int = 0
+            if sim.fraco {
+                fr = 1
+            }
+            format(f"simbolo {i} nome={nome_s} secao={sim.secao} off={sim.off} global={gl} fraco={fr}\n", into = &saida)
+            i += 1
+        }
+        var igual: bool = true
+        var colheita2: x64.AlvoColheita = x64.AlvoColheita{lista = none, tempos = none, rastreio = false, dbg = none, guarda = pedido.guarda_memoria}
+        var erro2: common.Diag = common.Diag{tem = false}
+        if (not x64.x64_gerar(&programa, &objeto2, &erro2, &colheita2)) or (len(objeto2.secoes) != len(objeto1.secoes)) or (len(objeto2.relocs) != len(objeto1.relocs)) or (len(objeto2.simbolos) != len(objeto1.simbolos)) {
+            igual = false
+        }
+        var s2: int = 0
+        while igual and (s2 < len(objeto1.secoes)) {
+            let a: ^obj.ObjSecao = &objeto1.secoes[s2]
+            let b: ^obj.ObjSecao = &objeto2.secoes[s2]
+            if (len(a.bytes) != len(b.bytes)) or (a.tam_bss != b.tam_bss) or (a.tipo != b.tipo) {
+                igual = false
+            } else {
+                var qb: int = 0
+                while igual and (qb < len(a.bytes)) {
+                    if a.bytes[qb] != b.bytes[qb] {
+                        igual = false
+                    }
+                    qb += 1
+                }
+            }
+            s2 += 1
+        }
+        var r2: int = 0
+        while igual and (r2 < len(objeto1.relocs)) {
+            let a: ^obj.ObjReloc = &objeto1.relocs[r2]
+            let b: ^obj.ObjReloc = &objeto2.relocs[r2]
+            if (a.alvo.secao != b.alvo.secao) or (a.alvo.off != b.alvo.off) or (a.correcao.tipo != b.correcao.tipo) or (a.correcao.simbolo != b.correcao.simbolo) or (a.correcao.adendo != b.correcao.adendo) {
+                igual = false
+            }
+            r2 += 1
+        }
+        var y2: int = 0
+        while igual and (y2 < len(objeto1.simbolos)) {
+            let a: ^obj.ObjSimbolo = &objeto1.simbolos[y2]
+            let b: ^obj.ObjSimbolo = &objeto2.simbolos[y2]
+            if ((a.nome or_else "") != (b.nome or_else "")) or (a.secao != b.secao) or (a.off != b.off) or (a.global != b.global) or (a.fraco != b.fraco) {
+                igual = false
+            }
+            y2 += 1
+        }
+        if igual {
+            append(&saida, item = "repeticao igual\n")
+        } else {
+            append(&saida, item = "repeticao difere\n")
+        }
+        os.write_stdout(saida[..])
+    }
+    obj.obj_liberar(&objeto1)
+    obj.obj_liberar(&objeto2)
+    alvo_listagem_liberar(&lista)
+    bir.bir_liberar(&programa)
+    os.exit(codigo as int)
+    return codigo

@@ -1,0 +1,553 @@
+// servidor.fj - servidor de prova do M5 P55: lockstep a 60 Hz em 127.0.0.1 (D-R11, D-R12).
+// Thread de rede recebe as entradas dos bots e guarda por bot (Mutex + Cond). A thread de tick (a principal) espera as entradas do tick t, aplica nas fatias disjuntas pelo Pool, soma em ordem fixa, emite hash a cada 60 ticks e manda o ack a cada bot.
+// Versao: 0.1.0. Changelog: 0.1.0 - M5 P55: lockstep de 20000 entidades em 24 fatias, xxh64 do estado, VirtualArena de scratch por tick, ritmo 60 Hz e medida de tremor.
+// Uso: forja run servidor.fj -- <workers> <bots> <ticks> [arquivo-da-porta]
+// Verificacao: python tests\nativo\m5c\servidor\rodar_servidor.py <forja.exe> --workers 1,6 --segundos 60
+import "std:async" as asy
+import "std:file"
+import "std:hash"
+import "std:mem" as mem
+import "std:net" as net
+import "std:os"
+import "std:sync"
+import "std:text"
+import "std:thread"
+
+const ENTIDADES: int = 20000
+const FATIAS: int = 24
+const BOTS_MAX: int = 64
+const MODULO: int = 1000003
+const TICKS_POR_HASH: int = 60
+const PERIODO_NS: int = 16666667
+const NS_POR_MS: int = 1000000
+const NS_POR_MINUTO: int = 60000000000
+const PATIENCIA_NS: int = 10000000000
+const ESPERA_CHEGADA_MS: u32 = 50
+const RECEBE_TIMEOUT_MS: i32 = 50
+const VA_RESERVA: int = 1048576
+const BYTES_ESTADO: int = 160008
+const PACOTE_TAM: int = 10
+const ACK_TAM: int = 6
+const TIPO_ENTRADA: u8 = 0
+const TIPO_FIM: u8 = 1
+const TIPO_ACK: u8 = 2
+const BUCKET_US: int = 100
+const BUCKETS: int = 1001
+
+// Estado compartilhado pelas threads: fila por bot (entrada do tick, valor e porta) e o socket. Mutex e Cond no heap (nao copiaveis).
+struct Servidor {
+    m: sync.Mutex
+    chegou: sync.Cond
+    sock: net.UdpSocket
+    rede: thread.Thread
+    bots: int = 0
+    parar: bool = false
+    ultimo_tick: [BOTS_MAX]int
+    valores: [BOTS_MAX]int
+    portas: [BOTS_MAX]int
+    recebidas: int = 0
+}
+
+// Uma fatia disjunta [inicio, fim) do mundo: o worker escreve so ali e devolve a soma. entradas = as entradas do tick (so leitura).
+struct Fatia {
+    mundo: ^[ENTIDADES]int
+    entradas: ^[BOTS_MAX]int
+    inicio: int = 0
+    fim: int = 0
+    tick: int = 0
+    bots: int = 0
+    soma: int = 0
+}
+
+// Estado da thread de tick: mundo, entradas e portas (heap, por tick), fatias, grupo do Pool, arena de scratch e medidas de ritmo.
+struct Sim {
+    s: ^Servidor
+    grupo: asy.Group
+    mundo: ^[ENTIDADES]int
+    entradas: ^[BOTS_MAX]int
+    portas: ^[BOTS_MAX]int
+    fatias: [dynamic]Fatia
+    va: mem.VirtualArena
+    acumulado: int = 0
+    hash_final: u64 = 0
+    inicio_ns: int = 0
+    anterior_ns: int = 0
+    proximo_pico_ns: int = 0
+    minutos: int = 0
+    max_us: int = 0
+    hist: [BUCKETS]int
+}
+
+// Trabalho de uma fatia no worker: atualiza so os indices [inicio, fim) e guarda a soma. A entidade e do bot (e % bots).
+proc avancar_fatia(q: rawptr) -> u32 {
+    let f = q as ^Fatia
+    var soma = 0
+    for e in f.inicio..<f.fim {
+        let entrada = f.entradas^[e % f.bots]
+        let novo = (f.mundo^[e] * 31 + entrada * (e + 1) + f.tick) % MODULO
+        f.mundo^[e] = novo
+        soma += novo
+    }
+    f.soma = soma
+    return 0
+}
+
+// Escreve v em 4 bytes big-endian a partir de pos.
+proc escrever_be32(dest: []u8, pos: int, valor: int) {
+    var v = valor
+    for k in 0..<4 {
+        dest[pos + 3 - k] = (v % 256) as u8
+        v = v / 256
+    }
+}
+
+// Le 4 bytes big-endian a partir de pos.
+proc ler_be32(origem: []u8, pos: int) -> int {
+    var v = 0
+    for k in 0..<4 {
+        v = v * 256 + (origem[pos + k] as int)
+    }
+    return v
+}
+
+// Escreve v em 8 bytes little-endian a partir de pos (v >= 0).
+proc escrever_le64(dest: []u8, pos: int, valor: int) {
+    var v = valor
+    for k in 0..<8 {
+        dest[pos + k] = (v % 256) as u8
+        v = v / 256
+    }
+}
+
+// Pede a parada (fim de um bot, erro de socket ou fim da simulacao) e acorda quem espera.
+proc pedir_parada(s: ^Servidor) {
+    sync.lock(&s.m)
+    s.parar = true
+    sync.broadcast(&s.chegou)
+    sync.unlock(&s.m)
+}
+
+// Verdadeiro quando a parada foi pedida.
+proc parou(s: ^Servidor) -> bool {
+    sync.lock(&s.m)
+    let r = s.parar
+    sync.unlock(&s.m)
+    return r
+}
+
+// Guarda uma entrada (tipo 0: bot, tick, valor, porta) ou marca a parada (tipo 1). Repetida do mesmo tick nao conta de novo.
+proc guardar_pacote(s: ^Servidor, dados: []u8, n: int) {
+    if n < PACOTE_TAM {
+        return
+    }
+    if dados[0] == TIPO_FIM {
+        pedir_parada(s)
+        return
+    }
+    if dados[0] != TIPO_ENTRADA {
+        return
+    }
+    let bot = dados[1] as int
+    let tick = ler_be32(dados, 2)
+    sync.lock(&s.m)
+    if bot < s.bots and s.ultimo_tick[bot] != tick {
+        s.valores[bot] = (dados[6] as int) * 256 + (dados[7] as int)
+        s.portas[bot] = (dados[8] as int) * 256 + (dados[9] as int)
+        s.ultimo_tick[bot] = tick
+        s.recebidas += 1
+        sync.broadcast(&s.chegou)
+    }
+    sync.unlock(&s.m)
+}
+
+// Recebe um datagrama com timeout curto; erro que nao seja timeout para a rede (o laco de ticks acusa).
+proc receber_um(s: ^Servidor, buf: []u8) {
+    switch r in net.udp_recv_from(&s.sock, buf, RECEBE_TIMEOUT_MS, heap) {
+    case net.UdpRecebido:
+        defer delete(r.de)
+        guardar_pacote(s, buf, r.quantos)
+    case net.NetError:
+        if r != net.NetError.timeout {
+            pedir_parada(s)
+        }
+    }
+}
+
+// Thread de rede: recebe ate a parada.
+proc laco_rede(q: rawptr) -> u32 {
+    let s = q as ^Servidor
+    var buf: [PACOTE_TAM]u8 = {}
+    while not parou(s) {
+        receber_um(s, buf[..])
+    }
+    return 0
+}
+
+// Verdadeiro quando cada bot ja mandou a entrada do tick t. Chamar com o Mutex travado.
+proc chegaram_todas(s: ^Servidor, t: int) -> bool {
+    for b in 0..<s.bots {
+        if s.ultimo_tick[b] != t {
+            return false
+        }
+    }
+    return true
+}
+
+// Copia as entradas e as portas do tick para o heap da simulacao. Chamar com o Mutex travado.
+proc copiar_entradas(sim: ^Sim) {
+    for b in 0..<sim.s.bots {
+        sim.entradas^[b] = sim.s.valores[b]
+        sim.portas^[b] = sim.s.portas[b]
+    }
+}
+
+// Lockstep: espera as entradas de TODOS os bots do tick t (nunca avanca sem todas). Travou alem de PATIENCIA_NS = falha.
+proc esperar_entradas(sim: ^Sim, t: int) -> bool {
+    let s = sim.s
+    let inicio = os.time_ns()
+    sync.lock(&s.m)
+    while not chegaram_todas(s, t) {
+        if s.parar {
+            sync.unlock(&s.m)
+            print("FALHA fim antecipado")
+            return false
+        }
+        if os.time_ns() - inicio > PATIENCIA_NS {
+            sync.unlock(&s.m)
+            print(f"FALHA travou tick={t}")
+            return false
+        }
+        _ = sync.wait_ms(&s.chegou, &s.m, ESPERA_CHEGADA_MS)
+    }
+    copiar_entradas(sim)
+    sync.unlock(&s.m)
+    return true
+}
+
+// Manda a cada bot o ack "tick t concluido" para a porta que ele informou na entrada.
+proc enviar_ack(sock: ^net.UdpSocket, porta: int, b: int, t: int) -> bool {
+    var ack: [ACK_TAM]u8 = {}
+    ack[0] = TIPO_ACK
+    ack[1] = b as u8
+    escrever_be32(ack[..], 2, t)
+    let destino = format(f"127.0.0.1:{porta}", alloc = heap)
+    defer delete(destino)
+    switch r in net.udp_send_to(sock, destino, ack[..]) {
+    case int:
+        return r == ACK_TAM
+    case net.NetError:
+        print(f"FALHA envio ack bot={b} tick={t}")
+        return false
+    }
+    return false
+}
+
+// Manda os acks do tick t a todos os bots, na ordem de indice.
+proc enviar_acks(sim: ^Sim, t: int) -> bool {
+    for b in 0..<sim.s.bots {
+        if not enviar_ack(&sim.s.sock, sim.portas^[b], b, t) {
+            return false
+        }
+    }
+    return true
+}
+
+// Monta os bytes do estado no scratch da arena (8 bytes LE por entidade, depois o acumulado) e imprime o xxh64.
+proc emitir_hash(sim: ^Sim, t: int) -> bool {
+    switch ptr in mem.va_alloc(&sim.va, BYTES_ESTADO, 1) {
+    case rawptr:
+        let bytes = slice_from(ptr as ^u8, len = BYTES_ESTADO)
+        for e in 0..<ENTIDADES {
+            escrever_le64(bytes, e * 8, sim.mundo^[e])
+        }
+        escrever_le64(bytes, ENTIDADES * 8, sim.acumulado)
+        let h = hash.xxh64(bytes, seed = 0)
+        sim.hash_final = h
+        print(f"hash tick={t} {h:016x}")
+        return true
+    case mem.VarenaError:
+        print("FALHA scratch do hash")
+        return false
+    }
+    return false
+}
+
+// Soma das fatias em ordem fixa (0..FATIAS-1); o acumulado so depende do estado, nunca de quem terminou antes.
+proc combinar_fatias(sim: ^Sim) {
+    var soma = 0
+    for k in 0..<FATIAS {
+        soma += sim.fatias[k].soma
+    }
+    sim.acumulado = (sim.acumulado * 31 + soma) % MODULO
+}
+
+// Um tick: espera as entradas, aplica nas fatias pelo Pool, soma em ordem fixa, emite hash (se for o caso) e manda os acks.
+proc processar_tick(sim: ^Sim, t: int, total: int) -> bool {
+    mem.va_reset(&sim.va)
+    if not esperar_entradas(sim, t) {
+        return false
+    }
+    for k in 0..<FATIAS {
+        sim.fatias[k].tick = t
+        asy.group_spawn(sim.grupo, avancar_fatia, &sim.fatias[k] as rawptr)
+    }
+    asy.group_wait(sim.grupo)
+    combinar_fatias(sim)
+    if t % TICKS_POR_HASH == 0 or t == total {
+        if not emitir_hash(sim, t) {
+            return false
+        }
+    }
+    return enviar_acks(sim, t)
+}
+
+// Dorme ate o instante do tick t (inicio + (t-1) * PERIODO_NS); se ja passou, nao dorme (recupera o atraso).
+proc esperar_ritmo(sim: ^Sim, t: int) {
+    let falta = sim.inicio_ns + (t - 1) * PERIODO_NS - os.time_ns()
+    if falta >= NS_POR_MS {
+        os.sleep_ms(falta / NS_POR_MS)
+    }
+}
+
+// Tremor: desvio do intervalo entre inicios de tick consecutivos em relacao a PERIODO_NS (max exato em us; histograma de 0,1 ms).
+proc medir_tremor(sim: ^Sim, intervalo_ns: int) {
+    let desvio_us = abs(intervalo_ns - PERIODO_NS) / 1000
+    if desvio_us > sim.max_us {
+        sim.max_us = desvio_us
+    }
+    var faixa = desvio_us / BUCKET_US
+    if faixa >= BUCKETS {
+        faixa = BUCKETS - 1
+    }
+    sim.hist[faixa] += 1
+}
+
+// Marca o inicio do tick t (apos o ritmo) e mede o intervalo para o anterior. Tick 1 nao conta (espera o 1o bot) e o tick 2 so marca.
+proc registrar_inicio(sim: ^Sim, t: int) {
+    let agora = os.time_ns()
+    if t > 2 {
+        medir_tremor(sim, agora - sim.anterior_ns)
+    }
+    if t >= 2 {
+        sim.anterior_ns = agora
+    }
+}
+
+// Depois do tick 1 (que pode ter esperado o start dos bots) o relogio do ritmo recomeca: o tick 2 cai em "agora".
+proc ancorar_ritmo(sim: ^Sim) {
+    sim.inicio_ns = os.time_ns() - PERIODO_NS
+}
+
+// Imprime o pico de memoria a cada minuto de relogio (RAM plana = o pico para de crescer).
+proc checar_pico(sim: ^Sim, agora: int) {
+    if agora < sim.proximo_pico_ns {
+        return
+    }
+    sim.proximo_pico_ns += NS_POR_MINUTO
+    sim.minutos += 1
+    switch p in os.peak_memory() {
+    case u64:
+        print(f"peak_memory={p} minuto={sim.minutos}")
+    case os.OsError:
+        print("FALHA peak_memory")
+    }
+}
+
+// Laco de ticks (thread de tick = a principal): ritmo, tremor, pico por minuto e um tick do lockstep.
+proc laco_ticks(sim: ^Sim, total: int) -> bool {
+    sim.inicio_ns = os.time_ns()
+    sim.anterior_ns = sim.inicio_ns
+    sim.proximo_pico_ns = sim.inicio_ns + NS_POR_MINUTO
+    for t in 1..=total {
+        esperar_ritmo(sim, t)
+        registrar_inicio(sim, t)
+        checar_pico(sim, os.time_ns())
+        if not processar_tick(sim, t, total) {
+            return false
+        }
+        if t == 1 {
+            ancorar_ritmo(sim)
+        }
+    }
+    return true
+}
+
+// p99 do tremor em microssegundos (limite inferior do bucket de 0,1 ms); 0 sem medidas.
+proc p99_us(sim: ^Sim) -> int {
+    var total = 0
+    for b in 0..<BUCKETS {
+        total += sim.hist[b]
+    }
+    let limite = (total * 99 + 99) / 100
+    var acumulado = 0
+    for b in 0..<BUCKETS {
+        acumulado += sim.hist[b]
+        if total > 0 and acumulado >= limite {
+            return b * BUCKET_US
+        }
+    }
+    return 0
+}
+
+// Linha final: hash, ticks, perdidos (entradas esperadas - recebidas) e tremor em ms.
+proc imprimir_fim(sim: ^Sim, total: int) {
+    sync.lock(&sim.s.m)
+    let recebidas = sim.s.recebidas
+    sync.unlock(&sim.s.m)
+    let perdidos = sim.s.bots * total - recebidas
+    let max_ms = sim.max_us / 1000
+    let max_frac = sim.max_us % 1000
+    let p99 = p99_us(sim)
+    let p99_ms = p99 / 1000
+    let p99_frac = p99 % 1000
+    print(f"FIM hash={sim.hash_final:016x} ticks={total} perdidos={perdidos} jitter_max_ms={max_ms}.{max_frac:03} jitter_p99_ms={p99_ms}.{p99_frac:03}")
+}
+
+// Monta as FATIAS fatias disjuntas e cobrindo [0, ENTIDADES): a divisao e inteira e nao sobrepoe.
+proc montar_fatias(sim: ^Sim, bots: int) {
+    for k in 0..<FATIAS {
+        append(&sim.fatias, item = Fatia{mundo = sim.mundo, entradas = sim.entradas, inicio = k * ENTIDADES / FATIAS, fim = (k + 1) * ENTIDADES / FATIAS, bots = bots})
+    }
+}
+
+// Reserva a VirtualArena de scratch (RAM so commitada sob demanda); false = o sistema recusou.
+proc reservar_arena(sim: ^Sim) -> bool {
+    switch r in mem.va_reserve(VA_RESERVA) {
+    case mem.VirtualArena:
+        sim.va = r
+        return true
+    case mem.VarenaError:
+        print("FALHA arena")
+        return false
+    }
+    return false
+}
+
+// Libera a simulacao: a arena antes (reserva do sistema), depois o heap.
+proc liberar_sim(sim: ^Sim) {
+    mem.va_release(&sim.va)
+    delete(sim.fatias)
+    delete(sim.mundo)
+    delete(sim.entradas)
+    delete(sim.portas)
+}
+
+// Sobe a thread de rede; o laco de rede so recebe e guarda.
+proc subir_rede(s: ^Servidor) -> bool {
+    switch t in thread.spawn(laco_rede, arg = s as rawptr) {
+    case thread.Thread:
+        s.rede = t
+        return true
+    case thread.ThreadError:
+        print("FALHA thread de rede")
+        return false
+    }
+    return false
+}
+
+// Roda a simulacao inteira com a rede no ar; sempre para a rede e libera o que alocou.
+proc rodar_simulacao(s: ^Servidor, p: ^asy.Pool, total: int) -> bool {
+    if not subir_rede(s) {
+        return false
+    }
+    var sim = Sim{s = s, grupo = asy.group_new(p), mundo = new([ENTIDADES]int, alloc = heap), entradas = new([BOTS_MAX]int, alloc = heap), portas = new([BOTS_MAX]int, alloc = heap), fatias = make([dynamic]Fatia, alloc = heap, cap = FATIAS)}
+    montar_fatias(&sim, s.bots)
+    var ok = reservar_arena(&sim)
+    if ok {
+        ok = laco_ticks(&sim, total)
+    }
+    if ok {
+        imprimir_fim(&sim, total)
+    }
+    liberar_sim(&sim)
+    pedir_parada(s)
+    _ = thread.join(s.rede)
+    return ok
+}
+
+// Pool de workers, simulacao e fechamento do Pool (0 threads vivas depois).
+proc rodar_com_pool(s: ^Servidor, workers: int, total: int) -> bool {
+    switch p in asy.pool_new(workers) {
+    case ^asy.Pool:
+        let ok = rodar_simulacao(s, p, total)
+        asy.pool_close(p)
+        delete(p)
+        return ok
+    case asy.AsyncError:
+        print("FALHA pool")
+        return false
+    }
+    return false
+}
+
+// Abre o socket UDP em 127.0.0.1 com porta efemera (nunca 0.0.0.0).
+proc abrir_socket(s: ^Servidor) -> bool {
+    switch r in net.udp_bind("127.0.0.1:0") {
+    case net.UdpSocket:
+        s.sock = r
+        return true
+    case net.NetError:
+        print("FALHA socket")
+        return false
+    }
+    return false
+}
+
+// Imprime a porta e, se houver arquivo, grava "127.0.0.1:porta" nele (o orquestrador le).
+proc anunciar_porta(s: ^Servidor, arquivo: str) -> bool {
+    switch e in net.udp_local_addr(&s.sock, heap) {
+    case str:
+        defer delete(e)
+        print(f"PORTA {e}")
+        if arquivo == "" {
+            return true
+        }
+        if file.write_all(arquivo, as_bytes(e)) != none {
+            print("FALHA gravar porta")
+            return false
+        }
+        return true
+    case net.NetError:
+        print("FALHA endereco local")
+        return false
+    }
+    return false
+}
+
+// Monta o servidor (socket, porta anunciada, Pool, rede e ticks) e fecha o socket no fim.
+proc rodar(workers: int, bots: int, total: int, arquivo: str) -> bool {
+    let s = new(Servidor, alloc = heap)
+    defer delete(s)
+    s.bots = bots
+    if not abrir_socket(s) {
+        return false
+    }
+    var ok = anunciar_porta(s, arquivo)
+    if ok {
+        ok = rodar_com_pool(s, workers, total)
+    }
+    _ = net.udp_close(&s.sock)
+    return ok
+}
+
+proc main() {
+    let args = os.args()
+    if len(args) < 4 {
+        print("uso: servidor <workers> <bots> <ticks> [arquivo-da-porta]")
+        os.exit(2)
+    }
+    let workers = text.parse_int(args[1]) or_else 0
+    let bots = text.parse_int(args[2]) or_else 0
+    let total = text.parse_int(args[3]) or_else 0
+    var arquivo = ""
+    if len(args) > 4 {
+        arquivo = args[4]
+    }
+    if workers < 1 or bots < 1 or bots > BOTS_MAX or total < 1 {
+        print("FALHA argumentos")
+        os.exit(2)
+    }
+    if not rodar(workers, bots, total, arquivo) {
+        os.exit(1)
+    }
+}

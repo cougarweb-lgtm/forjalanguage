@@ -1,0 +1,339 @@
+// std:url - testes do modulo (R1 do marco rede). Anexados ao texto de std:url SO em forja test std:url (o build normal nao os ve).
+// Versao: 0.1.0. Changelog: 0.1.0 - R1: exemplos da RFC 3986 (secoes 3 e 5.4.1), codificacao e decodificacao, UTF-8 multibyte, formulario, query_parse/query_build, to_string e 2000 textos aleatorios de ida e volta.
+// Sem import e sem proc main: o pedaco fica dentro do modulo, entao chama as procs dele SEM prefixo (encode, decode, parse...).
+// Os helpers *_igual e *_falha devolvem bool: o erro vira falso em vez de quebrar o teste. Strings liberadas aqui (alloc = heap) ficam sem vazamento (R0009).
+
+proc encode_igual(s: str, esperado: str) -> bool {
+    let codigo = encode(s, alloc = heap)
+    let ok = codigo == esperado
+    delete(codigo)
+    return ok
+}
+
+proc encode_form_igual(s: str, esperado: str) -> bool {
+    let codigo = encode_form(s, alloc = heap)
+    let ok = codigo == esperado
+    delete(codigo)
+    return ok
+}
+
+proc decode_igual(s: str, esperado: str) -> bool {
+    var ok = false
+    switch r in decode(s, alloc = heap) {
+    case str:
+        ok = r == esperado
+        delete(r)
+    case UrlError:
+        ok = false
+    }
+    return ok
+}
+
+proc decode_form_igual(s: str, esperado: str) -> bool {
+    var ok = false
+    switch r in decode_form(s, alloc = heap) {
+    case str:
+        ok = r == esperado
+        delete(r)
+    case UrlError:
+        ok = false
+    }
+    return ok
+}
+
+proc decode_falha(s: str) -> bool {
+    var falhou = false
+    switch r in decode(s, alloc = heap) {
+    case str:
+        delete(r)
+    case UrlError:
+        falhou = true
+    }
+    return falhou
+}
+
+// Ida (encode) e volta (decode) de original: tem de devolver o mesmo texto.
+proc ida_e_volta_ok(original: str) -> bool {
+    let codificado = encode(original, alloc = heap)
+    var ok = false
+    switch r in decode(codificado, alloc = heap) {
+    case str:
+        ok = r == original
+        delete(r)
+    case UrlError:
+        ok = false
+    }
+    delete(codificado)
+    return ok
+}
+
+// Campo a campo: scheme, autoridade, usuario, senha, host, porta, caminho, query e fragmento.
+proc mesma_url(a: Url, b: Url) -> bool {
+    if a.scheme != b.scheme or a.has_authority != b.has_authority {
+        return false
+    }
+    if a.user != b.user or a.password != b.password or a.host != b.host {
+        return false
+    }
+    return a.port == b.port and a.path == b.path and a.query == b.query and a.fragment == b.fragment
+}
+
+proc parse_igual(s: str, esperado: Url) -> bool {
+    var ok = false
+    switch r in parse(s) {
+    case Url:
+        ok = mesma_url(r, esperado)
+    case UrlError:
+        ok = false
+    }
+    return ok
+}
+
+proc parse_falha(s: str) -> bool {
+    var falhou = false
+    switch r in parse(s) {
+    case Url:
+        falhou = false
+    case UrlError:
+        falhou = true
+    }
+    return falhou
+}
+
+// parse e depois to_string: a URL volta igual ao texto dado.
+proc para_texto_igual(s: str, esperado: str) -> bool {
+    var ok = false
+    switch r in parse(s) {
+    case Url:
+        let texto = to_string(r, alloc = heap)
+        ok = texto == esperado
+        delete(texto)
+    case UrlError:
+        ok = false
+    }
+    return ok
+}
+
+// Pares no formato "chave=valor|chave=valor", na ordem.
+proc query_texto(pares: []QueryPair, alloc: Allocator) -> str {
+    var saida = make([dynamic]u8, alloc = alloc)
+    defer delete(saida)
+    for i in 0..<len(pares) {
+        if i > 0 {
+            append(&saida, item = "|")
+        }
+        append(&saida, item = pares[i].key)
+        append(&saida, item = "=")
+        append(&saida, item = pares[i].value)
+    }
+    return to_str(&saida)
+}
+
+proc query_igual(q: str, esperado: str) -> bool {
+    var ok = false
+    switch r in query_parse(q, alloc = heap) {
+    case [dynamic]QueryPair:
+        let texto = query_texto(r[..], heap)
+        ok = texto == esperado
+        delete(texto)
+        for i in 0..<len(r) {
+            delete(r[i].key)
+            delete(r[i].value)
+        }
+        delete(r)
+    case UrlError:
+        ok = false
+    }
+    return ok
+}
+
+proc query_falha(q: str) -> bool {
+    var falhou = false
+    switch r in query_parse(q, alloc = heap) {
+    case [dynamic]QueryPair:
+        for i in 0..<len(r) {
+            delete(r[i].key)
+            delete(r[i].value)
+        }
+        delete(r)
+    case UrlError:
+        falhou = true
+    }
+    return falhou
+}
+
+proc build_igual(pares: []QueryPair, esperado: str) -> bool {
+    let texto = query_build(pares, alloc = heap)
+    let ok = texto == esperado
+    delete(texto)
+    return ok
+}
+
+// Gerador xorshift64 deterministico: a mesma semente da sempre a mesma sequencia (o teste nao depende do relogio).
+proc proximo_aleatorio(estado: ^u64) -> u64 {
+    var x = estado^
+    x = x ~ (x << 13)
+    x = x ~ (x >> 7)
+    x = x ~ (x << 17)
+    estado^ = x
+    return x
+}
+
+// Texto de 0 a 39 bytes aleatorios (valores 0..255 inteiros, bytes invalidos em UTF-8 incluidos), no heap; quem chama libera.
+proc texto_aleatorio(estado: ^u64) -> str {
+    var buf = make([dynamic]u8, alloc = heap)
+    defer delete(buf)
+    let tam = (proximo_aleatorio(estado) % 40) as int
+    for _i in 0..<tam {
+        append(&buf, item = (proximo_aleatorio(estado) & 0xFF) as u8)
+    }
+    return to_str(&buf)
+}
+
+test "encode deixa passar o nao reservado" {
+    expect(encode_igual("AZaz09-._~", "AZaz09-._~"))
+    expect(encode_igual("", ""))
+}
+
+test "encode codifica o reservado em maiusculas" {
+    expect(encode_igual("a b/c?d=e&f", "a%20b%2Fc%3Fd%3De%26f"))
+    expect(encode_igual("100%", "100%25"))
+}
+
+test "encode de UTF-8 multibyte" {
+    expect(encode_igual("é", "%C3%A9"))
+    expect(encode_igual("日", "%E6%97%A5"))
+}
+
+test "encode_form troca espaco por + e codifica o +" {
+    expect(encode_form_igual("a b+c", "a+b%2Bc"))
+    expect(encode_form_igual("a b", "a+b"))
+}
+
+test "decode traz o byte de cada %XX" {
+    expect(decode_igual("%41%42%2f", "AB/"))
+    expect(decode_igual("x%2Fy%20z", "x/y z"))
+}
+
+test "decode aceita hexadecimal minusculo e UTF-8" {
+    expect(decode_igual("%c3%a9", "é"))
+    expect(decode_igual("%F0%9F%98%80", "😀"))
+}
+
+test "decode mantem o +" {
+    expect(decode_igual("a+b", "a+b"))
+    expect(decode_igual("", ""))
+}
+
+test "decode_form troca + por espaco" {
+    expect(decode_form_igual("a+b%20c", "a b c"))
+    expect(decode_form_igual("%2B+", "+ "))
+}
+
+test "decode com % sem dois digitos hex e UrlError" {
+    expect(decode_falha("%zz"))
+    expect(decode_falha("%4"))
+    expect(decode_falha("abc%"))
+    expect(decode_falha("%4g"))
+}
+
+test "ida e volta de UTF-8 e reservados" {
+    expect(ida_e_volta_ok("é日😀 a/b?c&d=e%f"))
+    expect(ida_e_volta_ok("+ + %20 ~"))
+}
+
+test "2000 textos aleatorios: encode e decode de volta" {
+    var estado: u64 = 0x2545F4914F6CDD1D
+    var todos_ok = true
+    for _caso in 0..<2000 {
+        let original = texto_aleatorio(&estado)
+        if not ida_e_volta_ok(original) {
+            todos_ok = false
+        }
+        delete(original)
+    }
+    expect(todos_ok)
+}
+
+test "RFC 3986 5.4.1: g:h e URL absoluta" {
+    expect(parse_igual("g:h", Url{scheme = "g", path = "h"}))
+    expect(parse_igual("http://a/b/c/d;p?q", Url{scheme = "http", has_authority = true, host = "a", path = "/b/c/d;p", query = "q"}))
+}
+
+test "RFC 3986 5.4.1: referencias relativas sem scheme" {
+    expect(parse_igual("./g", Url{path = "./g"}))
+    expect(parse_igual("g?y", Url{path = "g", query = "y"}))
+    expect(parse_igual("#s", Url{fragment = "s"}))
+    expect(parse_igual("//g", Url{has_authority = true, host = "g"}))
+}
+
+test "autoridade completa: userinfo, host, porta, caminho, query e fragmento" {
+    expect(parse_igual("http://user:pw@host.exemplo:8080/a/b?x=1#f", Url{scheme = "http", has_authority = true, user = "user", password = "pw", host = "host.exemplo", port = 8080, path = "/a/b", query = "x=1", fragment = "f"}))
+}
+
+test "IPv6 entre colchetes, com e sem porta" {
+    expect(parse_igual("http://[::1]:8443/x", Url{scheme = "http", has_authority = true, host = "[::1]", port = 8443, path = "/x"}))
+    expect(parse_igual("http://[::1]/", Url{scheme = "http", has_authority = true, host = "[::1]", path = "/"}))
+}
+
+test "porta ausente e porta vazia valem -1" {
+    expect(parse_igual("http://h/", Url{scheme = "http", has_authority = true, host = "h", path = "/"}))
+    expect(parse_igual("http://h:/", Url{scheme = "http", has_authority = true, host = "h", path = "/"}))
+}
+
+test "file:/// tem autoridade vazia e mailto nao tem //" {
+    expect(parse_igual("file:///tmp/x", Url{scheme = "file", has_authority = true, path = "/tmp/x"}))
+    expect(parse_igual("mailto:ana@exemplo.com", Url{scheme = "mailto", path = "ana@exemplo.com"}))
+}
+
+test "userinfo: o ultimo @ separa o host" {
+    expect(parse_igual("http://a@b@c/", Url{scheme = "http", has_authority = true, user = "a@b", host = "c", path = "/"}))
+}
+
+test "UTF-8 cru no caminho passa" {
+    expect(parse_igual("http://ex/á", Url{scheme = "http", has_authority = true, host = "ex", path = "/á"}))
+}
+
+test "parse recusa espaco, porta ruim, scheme ruim e colchete aberto" {
+    expect(parse_falha("ht tp://x"))
+    expect(parse_falha("http://h:80a/"))
+    expect(parse_falha("http://h:99999/"))
+    expect(parse_falha("1abc:x"))
+    expect(parse_falha(":x"))
+    expect(parse_falha("http://[::1/"))
+    expect(parse_falha("http://[::1]x"))
+}
+
+test "to_string devolve a URL que o parse leu" {
+    expect(para_texto_igual("http://user:pw@host:8080/a/b?x=1#f", "http://user:pw@host:8080/a/b?x=1#f"))
+    expect(para_texto_igual("file:///tmp/x", "file:///tmp/x"))
+    expect(para_texto_igual("mailto:ana@exemplo.com", "mailto:ana@exemplo.com"))
+    expect(para_texto_igual("/a/b?c", "/a/b?c"))
+    expect(para_texto_igual("//g", "//g"))
+    expect(para_texto_igual("http://[::1]:8443/x", "http://[::1]:8443/x"))
+}
+
+test "query_parse decodifica e pula pares vazios" {
+    expect(query_igual("a=1&&b=x+y&c=%C3%A9&vazio=&solto", "a=1|b=x y|c=é|vazio=|solto="))
+    expect(query_igual("", ""))
+    expect(query_igual("&&", ""))
+}
+
+test "query_parse com escape invalido e UrlError" {
+    expect(query_falha("a=%zz"))
+    expect(query_falha("%4&b=1"))
+}
+
+test "query_build monta chave=valor em formulario" {
+    var pares: [2]QueryPair = {QueryPair{key = "nome", value = "Ana Silva"}, QueryPair{key = "x", value = "a&b"}}
+    expect(build_igual(pares[..], "nome=Ana+Silva&x=a%26b"))
+}
+
+test "caminho absoluto, query e fragmento sem autoridade" {
+    expect(parse_igual("/a/b?c#d", Url{path = "/a/b", query = "c", fragment = "d"}))
+    expect(parse_igual("", Url{}))
+}
+
+test "query_parse: so '=' e chave que vem de escape" {
+    expect(query_igual("=x&%41=", "=x|A="))
+}

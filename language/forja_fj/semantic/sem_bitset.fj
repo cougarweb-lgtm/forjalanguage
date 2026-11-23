@@ -1,0 +1,345 @@
+// semantic/sem_bitset.fj - porte de compiler/semantic/sem_bitset.c
+// sha256 de semantic/sem_bitset.c: 13b3a6a438d44ef2f02c1b81db3b4978a384bbc3477895f02a8203b0d862a90b
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "common"
+import "frontend"
+
+const BIT_SET_MEMBROS_MAX: i32 = 64
+
+// C: semantic/sem_bitset.c:13
+proc resolver_bit_set(s: ^Semantica, t: ?^frontend.TipoRef, base: ^u32) -> bool {
+    // TipoRef.alvo (TipoRef * no C) chega como fatia de 1 elemento: o objeto e o [0]
+    let alvo_ref: ^frontend.TipoRef = &((t as ^frontend.TipoRef).alvo or_else {})[0]
+    if not sem_resolver_tipo_ref(s, alvo_ref) {
+        return false
+    }
+    let alvo: u32 = alvo_ref.tipo
+    if tipo_classe_de(&s.tipos, alvo) != TC_ENUM {
+        let tipo = sem_descrever_str(s, alvo)
+        defer delete(tipo)
+        let msg_1 = format(f"bit_set[E] pede um enum (recebeu {tipo})", alloc = heap)
+        defer delete(msg_1)
+        return sem_erro(s, common.E0319, alvo_ref.pos, msg_1)
+    }
+    let d: ^frontend.Decl = (s.globais or_else {})[tipo_de(&s.tipos, alvo).a].decl as ^frontend.Decl
+    if d.op == 1 {
+        let msg_2 = format(f"bit_set de enum com valor explicito nao existe: o bit de cada membro e a posicao dele (tire os '= valor')", alloc = heap)
+        defer delete(msg_2)
+        return sem_erro(s, common.E0319, alvo_ref.pos, msg_2)
+    }
+    if d.nmembros > (BIT_SET_MEMBROS_MAX as u32) {
+        let nmembros: u32 = d.nmembros
+        let msg_3 = format(f"bit_set de enum com {nmembros} membros: o maximo e 64", alloc = heap)
+        defer delete(msg_3)
+        return sem_erro(s, common.E0319, alvo_ref.pos, msg_3)
+    }
+    base^ = tipo_bit_set(&s.tipos, alvo, d.nmembros)
+    return true
+}
+
+// C: semantic/sem_bitset.c:35
+proc sem_literal_bit_set(s: ^Semantica, e: ^frontend.Expr, ctx: u32) -> bool {
+    let enumerado: u32 = tipo_de(&s.tipos, ctx).a
+    var i: u32 = 0
+    while i < e.nargs {
+        let v: ?^frontend.Expr = (e.args or_else {})[i].valor
+        if (not sem_checar(s, v, enumerado)) or (not sem_coagir(s, v, enumerado, (v as ^frontend.Expr).pos)) {
+            return false
+        }
+        i += 1
+    }
+    e.tipo = ctx
+    return true
+}
+
+// C: semantic/sem_bitset.c:47
+proc sem_conta_bit_set(s: ^Semantica, e: ^frontend.Expr) -> bool {
+    let ta: u32 = (e.a as ^frontend.Expr).tipo
+    let tb: u32 = (e.b as ^frontend.Expr).tipo
+    if (tipo_classe_de(&s.tipos, ta) != TC_BIT_SET) or (tipo_classe_de(&s.tipos, tb) != TC_BIT_SET) {
+        let msg_1 = format(f"bit_set so opera com bit_set do mesmo enum", alloc = heap)
+        defer delete(msg_1)
+        return sem_erro(s, common.E0319, e.pos_op, msg_1)
+    }
+    if ta != tb {
+        let texto_a = sem_descrever_str(s, ta)
+        defer delete(texto_a)
+        let texto_b = sem_descrever_str(s, tb)
+        defer delete(texto_b)
+        let msg_2 = format(f"operandos de bit_set de enums diferentes ({texto_a} e {texto_b})", alloc = heap)
+        defer delete(msg_2)
+        return sem_erro(s, common.E0319, e.pos_op, msg_2)
+    }
+    if (e.op != (frontend.OP_BIT_OU as u8)) and (e.op != (frontend.OP_BIT_E as u8)) and (e.op != (frontend.OP_SUB as u8)) {
+        let msg_3 = format(f"bit_set tem | (uniao), & (intersecao) e - (diferenca)", alloc = heap)
+        defer delete(msg_3)
+        return sem_erro(s, common.E0319, e.pos_op, msg_3)
+    }
+    e.tipo = ta
+    return true
+}
+
+// C: semantic/sem_bitset.c:67
+proc sem_comparacao_bit_set(s: ^Semantica, e: ^frontend.Expr) -> bool {
+    if (e.a as ^frontend.Expr).tipo != (e.b as ^frontend.Expr).tipo {
+        let msg_1 = format(f"bit_set so se compara com bit_set do mesmo enum", alloc = heap)
+        defer delete(msg_1)
+        return sem_erro(s, common.E0319, e.pos_op, msg_1)
+    }
+    if (e.op == (frontend.OP_IGUAL as u8)) or (e.op == (frontend.OP_DIFERENTE as u8)) {
+        e.tipo = TIPO_BOOL as u32
+        return true
+    }
+    let msg_2 = format(f"bit_set nao tem ordem: compare com == ou !=", alloc = heap)
+    defer delete(msg_2)
+    return sem_erro(s, common.E0319, e.pos_op, msg_2)
+}
+
+// C: semantic/sem_bitset.c:78
+proc conferir_alteracao(s: ^Semantica, e: ^frontend.Expr, nome: str, colecao: ?^frontend.Expr) -> bool {
+    let c: ^frontend.Expr = colecao as ^frontend.Expr
+    if tipo_classe_de(&s.tipos, c.tipo) != TC_PONTEIRO {
+        let msg_1 = format(f"{nome} recebe o endereco do bit_set: {nome}(&s, key = Cor.x)", alloc = heap)
+        defer delete(msg_1)
+        return sem_erro(s, common.E0319, c.pos, msg_1)
+    }
+    if (c.tipo_no == (frontend.EX_UNARIO as u8)) and (c.op == (frontend.OP_ENDERECO as u8)) {
+        // char motivo[64]: o nome e insert ou remove, o texto cabe
+        let motivo = format(f"{nome} altera o bit_set: declare com var", alloc = heap)
+        defer delete(motivo)
+        if not sem_lvalor_mutavel_de(s, c.a, motivo) {
+            return false
+        }
+    }
+    let args = e.args or_else {}
+    for i in (0 as u32)..<e.nargs {
+        if args[i].indice == 2 {
+            let msg_2 = format(f"bit_set guarda so a chave: insert(&s, key = Cor.x)", alloc = heap)
+            defer delete(msg_2)
+            return sem_erro(s, common.E0319, (args[i].valor as ^frontend.Expr).pos, msg_2)
+        }
+    }
+    return true
+}
+
+// C: semantic/sem_bitset.c:97
+proc sem_chamar_bit_set(s: ^Semantica, e: ^frontend.Expr, embutido: i32, colecao: ?^frontend.Expr) -> bool {
+    let nome: str = sem_nome_texto(s, e.nome)
+    let por_ponteiro: bool = common.c2f_s2u_32(tipo_classe_de(&s.tipos, (colecao as ^frontend.Expr).tipo)) == (TC_PONTEIRO as u32)
+    if (embutido == frontend.EMB_GET) or (embutido == frontend.EMB_GET_PTR) {
+        let msg_1 = format(f"bit_set nao tem get: use has(s, key = Cor.x)", alloc = heap)
+        defer delete(msg_1)
+        return sem_erro(s, common.E0319, (colecao as ^frontend.Expr).pos, msg_1)
+    }
+    if (embutido == frontend.EMB_HAS) and (common.c2f_b2i32(por_ponteiro) != 0) {
+        let msg_2 = format(f"has recebe o bit_set: has(s, key = Cor.x)", alloc = heap)
+        defer delete(msg_2)
+        return sem_erro(s, common.E0319, (colecao as ^frontend.Expr).pos, msg_2)
+    }
+    if (embutido != frontend.EMB_HAS) and (not conferir_alteracao(s, e, nome, colecao)) {
+        return false
+    }
+    var tern_1: u32 = (colecao as ^frontend.Expr).tipo
+    if common.c2f_b2i32(por_ponteiro) != 0 {
+        tern_1 = tipo_de(&s.tipos, (colecao as ^frontend.Expr).tipo).a
+    }
+    let bit_set: u32 = tern_1
+    let enumerado: u32 = tipo_de(&s.tipos, bit_set).a
+    var i: u32 = 0
+    while i < e.nargs {
+        let chave: ?^frontend.Expr = (e.args or_else {})[i].valor
+        if (e.args or_else {})[i].indice != 1 {
+            i += 1
+            continue
+        }
+        if (not sem_checar(s, chave, enumerado)) or (not sem_coagir(s, chave, enumerado, (chave as ^frontend.Expr).pos)) {
+            return false
+        }
+        i += 1
+    }
+    var tern_2: i32 = TIPO_VAZIO
+    if embutido == frontend.EMB_HAS {
+        tern_2 = TIPO_BOOL
+    }
+    e.tipo = common.c2f_s2u_32(tern_2)
+    return true
+}
+
+// C: semantic/sem_bitset.c:118
+proc sem_for_bit_set(s: ^Semantica, st: ^frontend.Stmt) -> bool {
+    let pos: u32 = sem_pos_depois_da_palavra(s, st.pos)
+    if st.item_ref {
+        let msg_1 = format(f"for &item nao existe em bit_set: o membro e um valor", alloc = heap)
+        defer delete(msg_1)
+        return sem_erro(s, common.E0319, pos, msg_1)
+    }
+    if st.nome_indice >= 0 {
+        let msg_2 = format(f"for de bit_set nao tem indice: for item in s", alloc = heap)
+        defer delete(msg_2)
+        return sem_erro(s, common.E0319, pos, msg_2)
+    }
+    if common.c2f_s2u_32(tipo_classe_de(&s.tipos, (st.expr as ^frontend.Expr).tipo)) == (TC_PONTEIRO as u32) {
+        let msg_3 = format(f"for percorre o bit_set: for item in s (sem ^)", alloc = heap)
+        defer delete(msg_3)
+        return sem_erro(s, common.E0319, (st.expr as ^frontend.Expr).pos, msg_3)
+    }
+    let altura: u32 = escopo_altura(&s.escopo)
+    st.tipo_local = tipo_de(&s.tipos, (st.expr as ^frontend.Expr).tipo).a
+    var item: NovoLocal = NovoLocal{nome = st.nome, pos = pos, tipo = st.tipo_local, natureza = LOC_FOR as u8, origem = 0}
+    let ok: bool = (common.c2f_b2i32(sem_declarar_local(s, &item, &st.local_id)) != 0) and (common.c2f_b2i32(corpo_de_laco(s, st.corpo)) != 0)
+    escopo_recuar(&s.escopo, altura)
+    return ok
+}
+
+// G3 S5: testes dirigidos (so existem em `forja test`)
+// O enum "Cor" do teste: simbolo SIM_ENUM com Decl de `nmembros` membros (op = 1 quando algum membro tem valor explicito).
+proc s5_enum_cor(c: ^S5Cena, d: ^frontend.Decl, nmembros: u32, explicito: bool) -> u32 {
+    let id: i32 = s5_nome(c, "Cor")
+    d.tipo_no = frontend.D_ENUM as u8
+    d.nome = id
+    d.nmembros = nmembros
+    if explicito {
+        d.op = 1
+    }
+    let tipo: u32 = tipo_enum(&c.sv.tipos, id)
+    let y: ^Simbolo = &(c.sv.globais or_else {})[id]
+    y.categoria = SIM_ENUM as u8
+    y.tipo = tipo
+    y.decl = d
+    return tipo
+}
+
+test "sem_bitset: resolver_bit_set (enum, valor explicito, mais de 64 membros, nao enum)" {
+    var pre: [1]str = {"Cor"}
+    var c = S5Cena{}
+    s5_cena_montar(&c, pre[..])
+    let d: ^frontend.Decl = s4_novo_decl(&c.sv)
+    let cor: u32 = s5_enum_cor(&c, d,3, false)
+    var alvo: [1]frontend.TipoRef = {frontend.TipoRef{nome = s5_nome(&c, "Cor"), erro = -1, pos = 12}}
+    var t = frontend.TipoRef{forma = frontend.TR_BIT_SET as u8, alvo = alvo[..], erro = -1}
+    var base: u32 = 0
+    expect(resolver_bit_set(&c.sv, &t, &base) and base == tipo_bit_set(&c.sv.tipos, cor, 3))
+    d.nmembros = 64
+    expect(resolver_bit_set(&c.sv, &t, &base) and base == tipo_bit_set(&c.sv.tipos, cor, 64))
+    d.nmembros = 65
+    expect(not resolver_bit_set(&c.sv, &t, &base))
+    expect(c.diag.codigo == common.E0319 and c.diag.off == 12 and (c.diag.causa or_else "") == "bit_set de enum com 65 membros: o maximo e 64")
+    d.nmembros = 3
+    d.op = 1
+    expect(not resolver_bit_set(&c.sv, &t, &base))
+    expect(c.diag.codigo == common.E0319 and c.diag.off == 12 and (c.diag.causa or_else "") == "bit_set de enum com valor explicito nao existe: o bit de cada membro e a posicao dele (tire os '= valor')")
+    alvo[0].nome = s5_nome(&c, "int")
+    expect(not resolver_bit_set(&c.sv, &t, &base))
+    expect(c.diag.codigo == common.E0319 and (c.diag.causa or_else "") == "bit_set[E] pede um enum (recebeu int)")
+    s5_cena_liberar(&c)
+}
+
+test "sem_bitset: conta, comparacao e literal do bit_set" {
+    var pre: [1]str = {"Cor"}
+    var c = S5Cena{}
+    s5_cena_montar(&c, pre[..])
+    let d: ^frontend.Decl = s4_novo_decl(&c.sv)
+    let cor: u32 = s5_enum_cor(&c, d,3, false)
+    let bs: u32 = tipo_bit_set(&c.sv.tipos, cor, 3)
+    var fa = s5_folha(bs, false)
+    var fb = s5_folha(bs, false)
+    var e = frontend.Expr{tipo_no = frontend.EX_BINARIO as u8, op = frontend.OP_BIT_OU as u8, a = &fa, b = &fb, pos = 4, pos_op = 6}
+    expect(sem_conta_bit_set(&c.sv, &e) and e.tipo == bs)
+    e.op = frontend.OP_BIT_E as u8
+    e.tipo = 0
+    expect(sem_conta_bit_set(&c.sv, &e) and e.tipo == bs)
+    e.op = frontend.OP_SUB as u8
+    e.tipo = 0
+    expect(sem_conta_bit_set(&c.sv, &e) and e.tipo == bs)
+    e.op = frontend.OP_SOMA as u8
+    expect(not sem_conta_bit_set(&c.sv, &e))
+    expect(c.diag.codigo == common.E0319 and c.diag.off == 6 and (c.diag.causa or_else "") == "bit_set tem | (uniao), & (intersecao) e - (diferenca)")
+    fb = s5_folha(TIPO_I32 as u32, false)
+    expect(not sem_conta_bit_set(&c.sv, &e))
+    expect((c.diag.causa or_else "") == "bit_set so opera com bit_set do mesmo enum")
+    fb = s5_folha(tipo_bit_set(&c.sv.tipos, cor, 4), false)
+    e.op = frontend.OP_BIT_OU as u8
+    expect(not sem_conta_bit_set(&c.sv, &e))
+    let texto_a = sem_descrever_str(&c.sv, bs)
+    defer delete(texto_a)
+    let texto_b = sem_descrever_str(&c.sv, tipo_bit_set(&c.sv.tipos, cor, 4))
+    defer delete(texto_b)
+    let esperado = format(f"operandos de bit_set de enums diferentes ({texto_a} e {texto_b})", alloc = heap)
+    defer delete(esperado)
+    expect(texto_a == "bit_set[Cor]" and (c.diag.causa or_else "") == esperado)
+    // comparacao
+    fb = s5_folha(bs, false)
+    e.op = frontend.OP_IGUAL as u8
+    expect(sem_comparacao_bit_set(&c.sv, &e) and e.tipo == (TIPO_BOOL as u32))
+    e.op = frontend.OP_DIFERENTE as u8
+    e.tipo = 0
+    expect(sem_comparacao_bit_set(&c.sv, &e) and e.tipo == (TIPO_BOOL as u32))
+    e.op = frontend.OP_MENOR as u8
+    expect(not sem_comparacao_bit_set(&c.sv, &e))
+    expect(c.diag.codigo == common.E0319 and (c.diag.causa or_else "") == "bit_set nao tem ordem: compare com == ou !=")
+    fb = s5_folha(TIPO_I32 as u32, false)
+    expect(not sem_comparacao_bit_set(&c.sv, &e))
+    expect((c.diag.causa or_else "") == "bit_set so se compara com bit_set do mesmo enum")
+    // literal: elementos do enum
+    var folhas = make([dynamic]frontend.Expr, alloc = heap)
+    var args = make([dynamic]frontend.Arg, alloc = heap)
+    append(&folhas, item = s5_folha(cor, false))
+    append(&folhas, item = s5_folha(cor, false))
+    var lit = frontend.Expr{tipo_no = frontend.EX_LITERAL_ARRAY as u8, pos = 9}
+    s5_ligar_args(&lit, &folhas, &args)
+    expect(sem_literal_bit_set(&c.sv, &lit, bs) and lit.tipo == bs)
+    delete(folhas)
+    delete(args)
+    s5_cena_liberar(&c)
+}
+
+test "sem_bitset: conferir_alteracao e sem_chamar_bit_set (has, insert, remove, get)" {
+    var pre: [5]str = {"Cor", "has", "insert", "remove", "get"}
+    var c = S5Cena{}
+    s5_cena_montar(&c, pre[..])
+    let d: ^frontend.Decl = s4_novo_decl(&c.sv)
+    let cor: u32 = s5_enum_cor(&c, d,3, false)
+    let bs: u32 = tipo_bit_set(&c.sv.tipos, cor, 3)
+    let pbs: u32 = tipo_ponteiro(&c.sv.tipos, bs)
+    // conferir_alteracao direto: colecao nao ponteiro, ponteiro com value (indice 2), ponteiro limpo
+    var col = s5_folha(bs, false)
+    col.pos = 33
+    var dois: [2]u32 = {bs, cor}
+    var ch = S5Chamada{}
+    s5_chamada_montar(&ch, s5_nome(&c, "insert"), dois[..])
+    expect(not conferir_alteracao(&c.sv, &ch.e, "insert", &col))
+    expect(c.diag.codigo == common.E0319 and c.diag.off == 33 and (c.diag.causa or_else "") == "insert recebe o endereco do bit_set: insert(&s, key = Cor.x)")
+    col = s5_folha(pbs, false)
+    ch.args[0].indice = 0
+    ch.args[1].indice = 1
+    expect(conferir_alteracao(&c.sv, &ch.e, "insert", &col))
+    ch.args[1].indice = 2
+    expect(not conferir_alteracao(&c.sv, &ch.e, "insert", &col))
+    expect(c.diag.codigo == common.E0319 and c.diag.off == 101 and (c.diag.causa or_else "") == "bit_set guarda so a chave: insert(&s, key = Cor.x)")
+    ch.args[1].indice = 1
+    // sem_chamar_v19 -> sem_chamar_bit_set
+    ch.e.nome = s5_nome(&c, "has")
+    ch.folhas[0].tipo = bs
+    expect(sem_chamar_v19(&c.sv, &ch.e, frontend.EMB_HAS) and ch.e.tipo == (TIPO_BOOL as u32))
+    ch.folhas[0].tipo = pbs
+    expect(not sem_chamar_v19(&c.sv, &ch.e, frontend.EMB_HAS))
+    expect(c.diag.codigo == common.E0319 and c.diag.off == 100 and (c.diag.causa or_else "") == "has recebe o bit_set: has(s, key = Cor.x)")
+    ch.e.nome = s5_nome(&c, "get")
+    ch.folhas[0].tipo = bs
+    expect(not sem_chamar_v19(&c.sv, &ch.e, frontend.EMB_GET))
+    expect(c.diag.codigo == common.E0319 and (c.diag.causa or_else "") == "bit_set nao tem get: use has(s, key = Cor.x)")
+    expect(not sem_chamar_v19(&c.sv, &ch.e, frontend.EMB_GET_PTR))
+    expect((c.diag.causa or_else "") == "bit_set nao tem get: use has(s, key = Cor.x)")
+    ch.e.nome = s5_nome(&c, "insert")
+    expect(not sem_chamar_v19(&c.sv, &ch.e, frontend.EMB_INSERT))
+    expect((c.diag.causa or_else "") == "insert recebe o endereco do bit_set: insert(&s, key = Cor.x)")
+    ch.folhas[0].tipo = pbs
+    expect(sem_chamar_v19(&c.sv, &ch.e, frontend.EMB_INSERT) and ch.e.tipo == (TIPO_VAZIO as u32))
+    ch.e.nome = s5_nome(&c, "remove")
+    ch.e.tipo = 0
+    expect(sem_chamar_v19(&c.sv, &ch.e, frontend.EMB_REMOVE) and ch.e.tipo == (TIPO_VAZIO as u32))
+    s5_chamada_liberar(&ch)
+    s5_cena_liberar(&c)
+}

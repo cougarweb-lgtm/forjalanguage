@@ -1,0 +1,293 @@
+// nativo/bir/bir_alcance.fj - porte de compiler/nativo/bir/bir_alcance.c, compiler/nativo/bir/bir_alcance.h
+// sha256 de nativo/bir/bir_alcance.c: 7381160bf8226199aa127c3fd17233f7fc53502ef389b4833f7167513a8c4c2e
+// sha256 de nativo/bir/bir_alcance.h: a8b6c5382f2644d74de925a2e695c09bad364cb409012963d745538f86c60345
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.2.4
+// Changelog: 0.2.4 - A2.2(e): comentario de eh_runtime_wasm corrigido (no a64 os wasm_* tambem sao raiz desde 0.2.3; o texto dizia "poda normal").
+//            0.2.3 - A2.2(d): no a64 os wasm_* tambem sao raiz (o forja_X do runtime reusado nasce como BS_RUNTIME e nao puxa o proc pelo BIR; sem isso o heap cai em X0001); a poda tardia do a64_alcance tira o que nao e chamado.
+//            0.2.2 - A2.2(a): raiz do runtime so do proprio alvo (wasm_* no wasm; a64_ no a64); nome_de_modulo_wasm vira nome_de_modulo_com_prefixo.
+//            0.2.1 - A2.2(a): runtime_forja (wasm OU a64) em eh_runtime_wasm; prefixo a64_ (std:a64_rt).
+//            0.2.0 - B4b: as tabelas do alcance sao [dynamic] no heap (calloc do C) e bir_alcance_liberar faz delete; a arena do programa nao chega
+//                    a bir_alcance_calcular(entrada, ...), que bir_construir.fj chama sem BirCtx. alocar_tabela sai (sem tipo generico: repetir_*).
+//            0.1.0 - esqueleto gerado.
+
+import "common"
+import "ir"
+
+struct BirAlcance {
+    ir: ?^ir.IrPrograma
+    teste: bool
+    dll: bool
+    wasm: bool
+    runtime_forja: bool
+    omite_somem: bool
+    nomes: ?^common.Interner
+    nnomes: u32
+    funcao: [dynamic]u8
+    trampolim: [dynamic]u8
+    funcao_do_nome: [dynamic]i32
+    trampolim_do_nome: [dynamic]i32
+    fila: [dynamic]u32
+    total: u32
+    gerados: u32
+}
+
+// C: nativo/bir/bir_alcance.c:16 (AlocarTabela = calloc(n ou 1, tam)): as tabelas se enchem com zeros (ou -1 nos nomes).
+proc repetir_u8(t: ^[dynamic]u8, n: u32, valor: u8) {
+    for k in (0 as u32)..<n {
+        append(t, item = valor)
+    }
+}
+
+proc repetir_u32(t: ^[dynamic]u32, n: u32, valor: u32) {
+    for k in (0 as u32)..<n {
+        append(t, item = valor)
+    }
+}
+
+proc repetir_i32(t: ^[dynamic]i32, n: u32, valor: i32) {
+    for k in (0 as u32)..<n {
+        append(t, item = valor)
+    }
+}
+
+// Corrigido (R-S10): o porte gerado indexava por len(tabela); o C indexa por nome (tabela[nome]).
+// C: nativo/bir/bir_alcance.c:25
+proc indice_do_nome(a: ^BirAlcance, tabela: []i32, nome: i32) -> i32 {
+    var tern_1: i32 = -1
+    if (nome >= 0) and (common.c2f_s2u_32(nome) < a.nnomes) {
+        tern_1 = tabela[nome]
+    }
+    return tern_1
+}
+
+// C: nativo/bir/bir_alcance.c:31
+proc marcar_funcao(a: ^BirAlcance, indice: i32) {
+    if indice < 0 {
+        return
+    }
+    if a.funcao[indice] != 0 {
+        return
+    }
+    a.funcao[indice] = 1
+    let antes_1: u32 = a.gerados
+    a.gerados += 1
+    a.fila[antes_1] = common.c2f_s2u_32(indice)
+}
+
+// C: nativo/bir/bir_alcance.c:40
+proc marcar_endereco(a: ^BirAlcance, nome: i32) {
+    let trampolim: i32 = indice_do_nome(a, a.trampolim_do_nome[..], nome)
+    if trampolim >= 0 {
+        a.trampolim[trampolim] = 1
+    }
+    marcar_funcao(a, indice_do_nome(a, a.funcao_do_nome[..], nome))
+}
+
+// C: nativo/bir/bir_alcance.c:49
+proc varrer_valor(a: ^BirAlcance, v: ^ir.Valor) {
+    if v.tipo_no == (ir.V_PROC as u8) {
+        marcar_endereco(a, v.id)
+    }
+}
+
+// C: nativo/bir/bir_alcance.c:56
+proc bir_nome_somem(chave: str) -> bool {
+    return (((chave == "3mem_snapshot") or (chave == "3mem_report_since")) or (chave == "3mem_track_handle")) or (chave == "3mem_untrack_handle")
+}
+
+// C: VarrerInstr, condicao de omissao: em release a chamada de std:mem que some nao marca o proc.
+proc chamada_somem_omitida(a: ^BirAlcance, ins: ^ir.IrInstr) -> bool {
+    if not a.omite_somem {
+        return false
+    }
+    if ins.nome < 0 {
+        return false
+    }
+    if common.c2f_s2u_32(ins.nome) >= a.nnomes {
+        return false
+    }
+    return bir_nome_somem(common.interner_texto(a.nomes as ^common.Interner, ins.nome))
+}
+
+// C: nativo/bir/bir_alcance.c:62
+proc varrer_instr(a: ^BirAlcance, i: ?^ir.IrInstr) {
+    let ins: ^ir.IrInstr = i as ^ir.IrInstr
+    if ins.op == (ir.IR_CHAMADA as u8) {
+        if not chamada_somem_omitida(a, ins) {
+            marcar_funcao(a, indice_do_nome(a, a.funcao_do_nome[..], ins.nome))
+        }
+    }
+    varrer_valor(a, &ins.a)
+    varrer_valor(a, &ins.b)
+    var k: u32 = 0
+    while k < ins.nargs {
+        varrer_valor(a, &(ins.args or_else {})[k])
+        k += 1
+    }
+    varrer_bloco(a, &ins.cond)
+    varrer_bloco(a, &ins.corpo)
+    varrer_bloco(a, &ins.senao)
+    var c: u32 = 0
+    while c < ins.ncasos {
+        varrer_bloco(a, &(ins.casos or_else {})[c].corpo)
+        c += 1
+    }
+}
+
+// C: nativo/bir/bir_alcance.c:77
+proc varrer_bloco(a: ^BirAlcance, bloco: ^ir.IrBloco) {
+    var i: ?^ir.IrInstr = bloco.primeira
+    while i != none {
+        varrer_instr(a, i)
+        i = (i as ^ir.IrInstr).prox
+    }
+}
+
+// C: nativo/bir/bir_alcance.c:83
+proc eh_raiz(a: ^BirAlcance, f: ^ir.IrFuncao) -> bool {
+    return ((common.c2f_b2i32(f.e_main) != 0) or ((common.c2f_b2i32(a.teste) != 0) and (common.c2f_b2i32(f.e_teste) != 0))) or ((common.c2f_b2i32(a.dll) != 0) and (common.c2f_b2i32(f.exportado) != 0)) or eh_runtime_wasm(a, f)
+}
+
+// Runtime em Forja (o driver injeta so nos alvos certos): os procs sao chamados por simbolo forja_X que nasce na BIR, depois deste alcance,
+// entao todo proc do modulo e raiz. A raiz e so do PROPRIO alvo: no wasm, os modulos wasm_*; no a64, os a64_* e os wasm_* reusados (rt_wasm,
+// desde A2.2(d)): sem essa raiz o forja_X nasceria como BS_RUNTIME sem proc no alcance e cairia em X0001. A poda tardia (a64_alcance.fj) tira o que nao e chamado.
+proc eh_runtime_wasm(a: ^BirAlcance, f: ^ir.IrFuncao) -> bool {
+    if not a.runtime_forja {
+        return false
+    }
+    let nome: str = common.interner_texto(a.nomes as ^common.Interner, f.nome)
+    // o BIR poe "fj_" na frente (bir_base.fj:324); os modulos wasm_* (wasm_rt, wasm_real 0.30.0, wasm_math/trig/atan/exp/pow 0.31.0)
+    // tem as mesmas regras (a poda tardia do wasm_alcance.fj tira o que nao e chamado): nome mangled = <tamanho>wasm_<modulo>_<proc>
+    if a.wasm {
+        return nome_de_modulo_com_prefixo(nome, "wasm_")
+    }
+    return nome_de_modulo_com_prefixo(nome, "a64_") or nome_de_modulo_com_prefixo(nome, "wasm_")
+}
+
+// O nome mangled de proc de pacote e "<digitos do tamanho do modulo><prefixo>..."; devolve se o nome cai nesse modulo
+proc nome_de_modulo_com_prefixo(nome: str, prefixo: str) -> bool {
+    var k: int = 0
+    while (k < len(nome)) and (nome[k] >= 48) and (nome[k] <= 57) {
+        k += 1
+    }
+    if k == 0 {
+        return false
+    }
+    return (len(nome) >= (k + len(prefixo))) and (nome[k..<(k + len(prefixo))] == prefixo)
+}
+
+// C: nativo/bir/bir_alcance.c:89
+proc indexar_funcoes(a: ^BirAlcance) {
+    var k: u32 = 0
+    while k < (a.ir as ^ir.IrPrograma).nfuncoes {
+        let f: ^ir.IrFuncao = &((a.ir as ^ir.IrPrograma).funcoes or_else {})[k]
+        if (common.c2f_b2i32(f.e_teste) != 0) and (not a.teste) {
+            k += 1
+            continue
+        }
+        a.total += 1
+        a.funcao_do_nome[f.nome] = transmute(k, to = i32)
+        if eh_raiz(a, f) {
+            marcar_funcao(a, transmute(k, to = i32))
+        }
+        k += 1
+    }
+}
+
+// C: nativo/bir/bir_alcance.c:103 (Alocar): tabelas do tamanho do programa; nomes e trampolins preenchidos como o C.
+proc alocar(a: ^BirAlcance) {
+    let prog: ^ir.IrPrograma = a.ir as ^ir.IrPrograma
+    a.funcao = make([dynamic]u8, alloc = heap, cap = (prog.nfuncoes as int) + 1)
+    repetir_u8(&a.funcao, prog.nfuncoes, 0)
+    a.trampolim = make([dynamic]u8, alloc = heap, cap = (prog.ntrampolins as int) + 1)
+    repetir_u8(&a.trampolim, prog.ntrampolins, 0)
+    a.fila = make([dynamic]u32, alloc = heap, cap = (prog.nfuncoes as int) + 1)
+    repetir_u32(&a.fila, prog.nfuncoes, 0)
+    a.funcao_do_nome = make([dynamic]i32, alloc = heap, cap = (a.nnomes as int) + 1)
+    repetir_i32(&a.funcao_do_nome, a.nnomes, -1)
+    a.trampolim_do_nome = make([dynamic]i32, alloc = heap, cap = (a.nnomes as int) + 1)
+    repetir_i32(&a.trampolim_do_nome, a.nnomes, -1)
+    let tramp = prog.trampolins or_else {}
+    for k in (0 as u32)..<prog.ntrampolins {
+        a.trampolim_do_nome[tramp[k].nome] = transmute(k, to = i32)
+    }
+}
+
+// C: nativo/bir/bir_alcance.c:116
+proc bir_alcance_calcular(entrada: ^BirEntrada, alcance: ^BirAlcance) {
+    alcance^ = BirAlcance{}
+    alcance.ir = entrada.ir
+    alcance.teste = entrada.teste
+    alcance.dll = entrada.dll
+    alcance.wasm = entrada.wasm
+    alcance.runtime_forja = entrada.runtime_forja
+    alcance.omite_somem = entrada.modo == (BM_RELEASE as u8)
+    alcance.nomes = entrada.nomes
+    alcance.nnomes = (len((entrada.nomes as ^common.Interner).nomes) as u64) as u32
+    alocar(alcance)
+    indexar_funcoes(alcance)
+    var k: u32 = 0
+    while k < alcance.gerados {
+        let prog: ^ir.IrPrograma = alcance.ir as ^ir.IrPrograma
+        let f: ^ir.IrFuncao = &(prog.funcoes or_else {})[alcance.fila[k]]
+        varrer_bloco(alcance, &f.corpo)
+        k += 1
+    }
+}
+
+// C: nativo/bir/bir_alcance.c:125
+proc bir_alcance_funcao(alcance: ?^BirAlcance, k: u32) -> bool {
+    return (alcance as ^BirAlcance).funcao[k] != 0
+}
+
+// C: nativo/bir/bir_alcance.c:130
+proc bir_alcance_trampolim(alcance: ?^BirAlcance, k: u32) -> bool {
+    return (alcance as ^BirAlcance).trampolim[k] != 0
+}
+
+// C: nativo/bir/bir_alcance.c:135 (free das tabelas; o struct volta a zero pelos escalares).
+proc bir_alcance_liberar(alcance: ^BirAlcance) {
+    delete(alcance.funcao)
+    delete(alcance.trampolim)
+    delete(alcance.fila)
+    delete(alcance.funcao_do_nome)
+    delete(alcance.trampolim_do_nome)
+    alcance^ = BirAlcance{}
+}
+
+// ---------------------------------------------------------------- testes (tabelas e marcacao, sem IR montada)
+
+test "bir_alcance_nome_somem" {
+    expect(bir_nome_somem("3mem_snapshot"))
+    expect(bir_nome_somem("3mem_report_since"))
+    expect(bir_nome_somem("3mem_track_handle"))
+    expect(bir_nome_somem("3mem_untrack_handle"))
+    expect(not bir_nome_somem("3mem_alocar"))
+    expect(not bir_nome_somem(""))
+}
+
+test "bir_alcance_indice_do_nome" {
+    var a = BirAlcance{}
+    a.nnomes = 3
+    var t: [3]i32 = {7, 8, 9}
+    expect(indice_do_nome(&a, t[..], 1) == 8)
+    expect(indice_do_nome(&a, t[..], 3) == -1)
+    expect(indice_do_nome(&a, t[..], -1) == -1)
+}
+
+test "bir_alcance_marcar_e_liberar" {
+    var a = BirAlcance{}
+    a.funcao = make([dynamic]u8, alloc = heap, cap = 4)
+    repetir_u8(&a.funcao, 3, 0)
+    a.fila = make([dynamic]u32, alloc = heap, cap = 4)
+    repetir_u32(&a.fila, 3, 0)
+    marcar_funcao(&a, 2)
+    marcar_funcao(&a, 2)
+    expect(a.gerados == 1)
+    expect(a.fila[0] == 2)
+    expect(bir_alcance_funcao(&a, 2))
+    expect(not bir_alcance_funcao(&a, 0))
+    bir_alcance_liberar(&a)
+    expect(a.gerados == 0 and a.nnomes == 0 and a.ir == none)
+}

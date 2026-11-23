@@ -1,0 +1,244 @@
+// nativo/nativo_layout.fj - porte de compiler/nativo/nativo_layout.c, compiler/nativo/nativo_layout.h
+// sha256 de nativo/nativo_layout.c: 73092ad39ad68eb51f10c3f743f146c547c208ad0b97727b3aa45a9a157874b7
+// sha256 de nativo/nativo_layout.h: 68ff1b391ae5b05fca3d760cf298b74276539cedcd0ae1e486b08979055450dd
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+// Changelog: 0.1.0 - G3 V4-W7b: corpo real dos 7 stubs; ler_rt_layout e ler_rt_layout_conferido gravam por ponteiro (^[23]u32), como o C; as tabelas NOMES_* viram locais.
+
+import "common"
+import "ir"
+import "nativo/obj"
+import "semantic"
+
+struct CampoRt {
+    tipo: ?str
+    nome: ?str
+    backend: u32
+    runtime: u32
+}
+
+const RT_LAYOUT_VERSAO: u32 = 3
+const RT_LAYOUT_CAMPOS: u32 = 23
+const RT_LAYOUT_SIMBOLO: str = "forja_rt_layout"
+const RT_LAYOUT_LISTA: u32 = 4
+const STR_CAMPO_LEN: u32 = 1
+const LISTA_MEMBROS: u32 = 4
+// C2F-82 macro RT_LAYOUT_BYTES = ( RT_LAYOUT_CAMPOS * sizeof ( uint32_t ) )  (expandida no uso)
+const RT_LAYOUT_MAPA: u32 = 10
+const MAPA_MEMBROS: u32 = 4
+const RT_LAYOUT_SOA: u32 = 15
+const SOA_COLUNAS_MAX: u32 = 8
+const SOA_MEMBRO_LEN: u32 = 1
+const SOA_BYTES_POR_COLUNA: u32 = 8
+// Offsets do map (LAYOUT_MAPA_OFF_* de ir/layout.h): chaves, valores, len, epoca.
+const OFFSETS: [4]u32 = {0, 8, 24, 48}
+
+// C: nativo/nativo_layout.c:28
+// Le as 23 palavras de forja_rt_layout (little endian); false = simbolo ausente, indefinido ou fora da secao.
+proc ler_rt_layout(runtime: ^obj.Objeto, saida: ^[23]u32) -> bool {
+    var k: int = 0
+    while k < len(runtime.simbolos) {
+        let s: ^obj.ObjSimbolo = &runtime.simbolos[k]
+        if (s.nome or_else "") == RT_LAYOUT_SIMBOLO {
+            if s.secao == obj.OBJ_SECAO_INDEFINIDA {
+                return false
+            }
+            if (s.secao < 0) or ((s.secao as int) >= len(runtime.secoes)) {
+                return false
+            }
+            let secao: ^obj.ObjSecao = &runtime.secoes[s.secao as int]
+            let inicio: int = s.off as int
+            if inicio + ((RT_LAYOUT_CAMPOS * 4) as int) > len(secao.bytes) {
+                return false
+            }
+            var campo: u32 = 0
+            while campo < RT_LAYOUT_CAMPOS {
+                saida[campo] = common.c2f_ler_u32_le(secao.bytes[..], inicio + ((campo * 4) as int))
+                campo += 1
+            }
+            return true
+        }
+        k += 1
+    }
+    return false
+}
+
+// C: nativo/nativo_layout.c:50
+// Um campo do layout de um tipo do runtime: o tipo ('str' ou '[dynamic]T'), prefixo da causa (vazio = o tamanho), o que o backend calculou e o que o runtime declarou.
+proc campo_igual(erro: ^common.Diag, campo: ^CampoRt) -> bool {
+    if campo.backend == campo.runtime {
+        return true
+    }
+    let txt_1 = campo.tipo or_else "(null)"
+    let txt_2 = campo.nome or_else "(null)"
+    let msg_1 = format(f"layout de '{txt_1}': {txt_2}backend {campo.backend} B, runtime {campo.runtime} B", alloc = heap)
+    defer delete(msg_1)
+    return common.diag_relatar(erro, common.X0906, 0, msg_1)
+}
+
+// C: nativo/nativo_layout.c:57
+proc str_confere(rt: [23]u32, layouts: ^ir.Layouts, erro: ^common.Diag) -> bool {
+    let tipo_str: u32 = semantic.TIPO_STR as u32
+    var tamanho: CampoRt = CampoRt{tipo = "str", nome = "", backend = ir.layout_tamanho(layouts, tipo_str), runtime = rt[1]}
+    var alinhamento: CampoRt = CampoRt{tipo = "str", nome = "alinhamento ", backend = ir.layout_alinhamento(layouts, tipo_str), runtime = rt[2]}
+    var campo_len: CampoRt = CampoRt{tipo = "str", nome = "offset de len ", backend = ir.layout_offset_campo(layouts, tipo_str, STR_CAMPO_LEN), runtime = rt[3]}
+    if not campo_igual(erro, &tamanho) {
+        return false
+    }
+    if not campo_igual(erro, &alinhamento) {
+        return false
+    }
+    return campo_igual(erro, &campo_len)
+}
+
+// C: nativo/nativo_layout.c:73
+// O primeiro tipo da classe dada na tabela de tipos (0 = o programa nao tem).
+proc primeiro_da_classe(layouts: ^ir.Layouts, tipos: ^semantic.Tipos, classe: i32) -> u32 {
+    var id: u32 = 1
+    while id < layouts.qtd {
+        if common.c2f_s2u_32(semantic.tipo_classe_de(tipos, id)) == common.c2f_s2u_32(classe) {
+            return id
+        }
+        id += 1
+    }
+    return 0
+}
+
+// C: nativo/nativo_layout.c:82
+proc lista_confere(rt: [23]u32, layouts: ^ir.Layouts, lista: u32, erro: ^common.Diag) -> bool {
+    var tamanho: CampoRt = CampoRt{tipo = "[dynamic]T", nome = "", backend = ir.layout_tamanho(layouts, lista), runtime = rt[RT_LAYOUT_LISTA]}
+    var alinhamento: CampoRt = CampoRt{tipo = "[dynamic]T", nome = "alinhamento ", backend = ir.layout_alinhamento(layouts, lista), runtime = rt[RT_LAYOUT_LISTA + 1]}
+    if not campo_igual(erro, &tamanho) {
+        return false
+    }
+    if not campo_igual(erro, &alinhamento) {
+        return false
+    }
+    let nomes: [4]str = {"offset de len ", "offset de cap ", "offset de alocador ", "offset de epoca "}
+    var k: u32 = 0
+    while k < LISTA_MEMBROS {
+        var campo: CampoRt = CampoRt{tipo = "[dynamic]T", nome = nomes[k], backend = ir.layout_offset_campo(layouts, lista, k + 1), runtime = rt[RT_LAYOUT_LISTA + 2 + k]}
+        if not campo_igual(erro, &campo) {
+            return false
+        }
+        k += 1
+    }
+    return true
+}
+
+// C: nativo/nativo_layout.c:107
+// O map (opaco no layout\): tamanho do layout\ e os offsets que o codigo gerado usa (layout.h) contra o runtime.
+proc mapa_confere(rt: [23]u32, layouts: ^ir.Layouts, mapa: u32, erro: ^common.Diag) -> bool {
+    var tamanho: CampoRt = CampoRt{tipo = "map", nome = "", backend = ir.layout_tamanho(layouts, mapa), runtime = rt[RT_LAYOUT_MAPA]}
+    if not campo_igual(erro, &tamanho) {
+        return false
+    }
+    let nomes: [4]str = {"offset de chaves ", "offset de valores ", "offset de len ", "offset de epoca "}
+    var k: u32 = 0
+    while k < MAPA_MEMBROS {
+        var campo: CampoRt = CampoRt{tipo = "map", nome = nomes[k], backend = OFFSETS[k], runtime = rt[RT_LAYOUT_MAPA + 1 + k]}
+        if not campo_igual(erro, &campo) {
+            return false
+        }
+        k += 1
+    }
+    return true
+}
+
+// C: nativo/nativo_layout.c:124
+proc eh_soa_dinamica(layouts: ^ir.Layouts, tipos: ^semantic.Tipos, id: u32) -> bool {
+    return ((common.c2f_s2u_32(semantic.tipo_classe_de(tipos, id)) == (semantic.TC_SOA as u32)) and (common.c2f_s2u_32(semantic.tipo_classe_de(tipos, semantic.tipo_de(tipos, id).a)) == (semantic.TC_DINAMICO as u32))) and (ir.layout_tamanho(layouts, id) != 0)
+}
+
+// C: nativo/nativo_layout.c:130
+// O cabecalho (8 * ncol + 24 B) da soa dinamica de 1 a 8 colunas contra a palavra do runtime; mais de 8 colunas nao tem palavra e fica sem conferencia.
+proc soa_confere(rt: [23]u32, layouts: ^ir.Layouts, soa: u32, erro: ^common.Diag) -> bool {
+    let colunas: u32 = ir.layout_offset_campo(layouts, soa, SOA_MEMBRO_LEN) / SOA_BYTES_POR_COLUNA
+    if (colunas < 1) or (colunas > SOA_COLUNAS_MAX) {
+        return true
+    }
+    let nomes: [8]str = {"cabecalho de 1 coluna ", "cabecalho de 2 colunas ", "cabecalho de 3 colunas ", "cabecalho de 4 colunas ", "cabecalho de 5 colunas ", "cabecalho de 6 colunas ", "cabecalho de 7 colunas ", "cabecalho de 8 colunas "}
+    var campo: CampoRt = CampoRt{tipo = "soa[dynamic]S", nome = nomes[colunas - 1], backend = ir.layout_tamanho(layouts, soa), runtime = rt[RT_LAYOUT_SOA + colunas - 1]}
+    return campo_igual(erro, &campo)
+}
+
+// C: nativo/nativo_layout.c:144
+// Toda soa[dynamic]S do programa.
+proc soas_conferem(rt: [23]u32, layouts: ^ir.Layouts, tipos: ^semantic.Tipos, erro: ^common.Diag) -> bool {
+    var id: u32 = 1
+    while id < layouts.qtd {
+        if (common.c2f_b2i32(eh_soa_dinamica(layouts, tipos, id)) != 0) and (not soa_confere(rt, layouts, id, erro)) {
+            return false
+        }
+        id += 1
+    }
+    return true
+}
+
+// C: nativo/nativo_layout.c:154
+// Le o forja_rt_layout do runtime e confere a versao dele (X0906 se faltar ou for de outra versao).
+proc ler_rt_layout_conferido(runtime: ^obj.Objeto, rt: ^[23]u32, erro: ^common.Diag) -> bool {
+    if not ler_rt_layout(runtime, rt) {
+        let msg_1 = format(f"o runtime nao tem o simbolo {RT_LAYOUT_SIMBOLO} (rt_win.o de outra versao do backend)", alloc = heap)
+        defer delete(msg_1)
+        return common.diag_relatar(erro, common.X0906, 0, msg_1)
+    }
+    let versao_rt: u32 = rt[0]
+    if versao_rt != RT_LAYOUT_VERSAO {
+        let msg_2 = format(f"{RT_LAYOUT_SIMBOLO} do runtime e da versao {versao_rt}; o backend conhece a {RT_LAYOUT_VERSAO}", alloc = heap)
+        defer delete(msg_2)
+        return common.diag_relatar(erro, common.X0906, 0, msg_2)
+    }
+    return true
+}
+
+// C: nativo/nativo_layout.c:164
+// [dynamic]T e map so sao conferidos se o programa tem algum.
+proc lista_e_mapa_conferem(rt: [23]u32, layouts: ^ir.Layouts, tipos: ^semantic.Tipos, erro: ^common.Diag) -> bool {
+    let lista: u32 = primeiro_da_classe(layouts, tipos, semantic.TC_DINAMICO)
+    var mapa: u32 = 0
+    if (lista != 0) and (not lista_confere(rt, layouts, lista, erro)) {
+        return false
+    }
+    mapa = primeiro_da_classe(layouts, tipos, semantic.TC_MAPA)
+    return (mapa == 0) or (common.c2f_b2i32(mapa_confere(rt, layouts, mapa, erro)) != 0)
+}
+
+// C: nativo/nativo_layout.c:175
+proc nativo_rt_layout_conferir(runtime: ^obj.Objeto, layouts: ^ir.Layouts, tipos: ^semantic.Tipos, erro: ^common.Diag) -> bool {
+    var rt: [23]u32 = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
+    if not ler_rt_layout_conferido(runtime, &rt, erro) {
+        return false
+    }
+    if not str_confere(rt, layouts, erro) {
+        return false
+    }
+    if not lista_e_mapa_conferem(rt, layouts, tipos, erro) {
+        return false
+    }
+    return soas_conferem(rt, layouts, tipos, erro)
+}
+
+// C: nativo/nativo_layout.c:186
+// LayoutCalcular + LayoutConferir + forja_rt_layout, com a arena do layout liberada no fim.
+proc nativo_layout_conferir(pedido: ^NativoPedido, runtime: ^obj.Objeto, erro: ^common.Diag) -> bool {
+    var arena: common.Arena = common.Arena{}
+    var layouts: ir.Layouts = ir.Layouts{}
+    let tipos: ^semantic.Tipos = pedido.tipos as ^semantic.Tipos
+    ir.layout_calcular(tipos, pedido.ir as ^ir.IrPrograma, &arena, &layouts)
+    let ok: bool = ir.layout_conferir(&layouts, tipos, erro) and nativo_rt_layout_conferir(runtime, &layouts, tipos, erro)
+    common.arena_liberar(&arena)
+    return ok
+}
+
+test "nativo_layout: campo_igual aceita tamanhos iguais sem relatar" {
+    var erro: common.Diag = common.Diag{}
+    var campo: CampoRt = CampoRt{tipo = "str", nome = "", backend = 16, runtime = 16}
+    expect(campo_igual(&erro, &campo))
+}
+
+test "nativo_layout: ler_rt_layout sem o simbolo devolve false" {
+    var objeto: obj.Objeto = obj.Objeto{}
+    var rt: [23]u32 = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
+    expect(not ler_rt_layout(&objeto, &rt))
+}

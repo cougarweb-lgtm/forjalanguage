@@ -1,0 +1,403 @@
+// ir/lower_depurar.fj - porte de compiler/ir/lower_depurar.c
+// sha256 de ir/lower_depurar.c: 7db5109c4a25d5188d31821dc904d3c5ff89e352814d0474b4f1c41a021d540c
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "common"
+import "frontend"
+import "semantic"
+
+struct Depura {
+    c: ?^LowerCtx
+    pares: ?^[dynamic]Valor
+    texto: [dynamic]u8
+    pos: u32
+}
+
+struct ProcEnum {
+    c: ?^LowerCtx
+    tipo: u32 // TipoId
+    decl: ?^frontend.Decl
+    pos: u32
+}
+
+const MAX_ELEMENTOS_DEPURAR: i32 = 16
+const ALOCADOR_FRAME: i32 = 2
+
+// C: ir/lower_depurar.c:14 (o Semantica guarda o Interner num slice de 1 elemento)
+proc depurar_nomes(c: ^LowerCtx) -> ^common.Interner {
+    let nomes: []common.Interner = (c.sem as ^semantic.Semantica).nomes or_else {}
+    return &nomes[0]
+}
+
+// C: ir/lower_depurar.c:19
+proc empurrar_par(d: ^Depura, valor: Valor) {
+    let pares: ^[dynamic]Valor = d.pares as ^[dynamic]Valor
+    append(pares, item = lw_valor_int(0, semantic.TIPO_U32 as u32))
+    append(pares, item = valor)
+}
+
+// C: ir/lower_depurar.c:25
+proc fechar_texto(d: ^Depura) {
+    if len(d.texto) == 0 {
+        return
+    }
+    let valor_texto: Valor = texto_internado(d.c as ^LowerCtx, &d.texto)
+    empurrar_par(d, valor_texto)
+    clear(&d.texto)
+}
+
+// C: ir/lower_depurar.c:32
+proc texto(d: ^Depura, literal: str) {
+    append(&d.texto, item = literal)
+}
+
+// C: ir/lower_depurar.c:37
+proc texto_nome(d: ^Depura, nome: i32) {
+    anexar_nome(&d.texto, depurar_nomes(d.c as ^LowerCtx), nome)
+}
+
+// C: ir/lower_depurar.c:42
+proc parte(d: ^Depura, valor: Valor) {
+    fechar_texto(d)
+    empurrar_par(d, valor)
+}
+
+// C: ir/lower_depurar.c:55
+proc nome_do_proc_de_enum(c: ^LowerCtx, enumerado: u32) -> i32 {
+    let nome_txt = format(f"0depurar_{enumerado}", alloc = heap)
+    defer delete(nome_txt)
+    return common.internar(depurar_nomes(c), nome_txt, len(nome_txt) as u32)
+}
+
+// C: ir/lower_depurar.c:62
+proc decl_do_tipo(c: ^LowerCtx, t: u32) -> ?^frontend.Decl {
+    return ((c.sem as ^semantic.Semantica).globais or_else {})[semantic.tipo_de(&(c.sem as ^semantic.Semantica).tipos, t).a].decl
+}
+
+// C: ir/lower_depurar.c:67
+proc anexar_nome(texto: ^[dynamic]u8, nomes: ^common.Interner, nome: i32) {
+    append(texto, item = common.interner_texto(nomes, nome)[0..<common.interner_tam(nomes, nome) as u64])
+}
+
+// C: ir/lower_depurar.c:72
+proc texto_internado(c: ^LowerCtx, texto: ^[dynamic]u8) -> Valor {
+    let bytes: str = from_bytes(texto[..], alloc = frame)
+    return lw_valor_texto(common.internar(depurar_nomes(c), bytes, len(bytes) as u32), semantic.TIPO_STR as u32)
+}
+
+// C: ir/lower_depurar.c:78 (case Cor.verde: return "Cor.verde")
+proc caso_do_membro(p: ^ProcEnum, k: u32, caso: ^IrCaso) {
+    let c: ^LowerCtx = p.c as ^LowerCtx
+    let decl: ^frontend.Decl = p.decl as ^frontend.Decl
+    caso.membro = k as i32
+    caso.ligacao = -1
+    caso.tipo = p.tipo
+    var nome_caso: [dynamic]u8 = make([dynamic]u8, alloc = heap)
+    defer delete(nome_caso)
+    anexar_nome(&nome_caso, depurar_nomes(c), decl.nome)
+    append(&nome_caso, item = ".")
+    anexar_nome(&nome_caso, depurar_nomes(c), (decl.membros or_else {})[k].nome)
+    let anterior: ^IrBloco = lw_trocar_bloco(c, &caso.corpo)
+    let retorna: ^IrInstr = lw_nova_instr(c, IR_RETORNA, p.pos)
+    retorna.a = texto_internado(c, &nome_caso)
+    _ = lw_trocar_bloco(c, anterior)
+}
+
+// C: ir/lower_depurar.c:94 ("Cor(" + numero + ")" no frame: o valor sem nome)
+proc formata_sem_nome(p: ^ProcEnum, numero: i32) -> ^IrInstr {
+    let c: ^LowerCtx = p.c as ^LowerCtx
+    let decl: ^frontend.Decl = p.decl as ^frontend.Decl
+    var abre: [dynamic]u8 = make([dynamic]u8, alloc = heap)
+    defer delete(abre)
+    anexar_nome(&abre, depurar_nomes(c), decl.nome)
+    append(&abre, item = "(")
+    let formata: ^IrInstr = lw_nova_instr(c, IR_FORMATA, p.pos)
+    formata.op_aux = 1
+    formata.tipo = semantic.TIPO_STR as u32
+    formata.destino = lw_novo_temp(c)
+    formata.a = lw_valor_int(ALOCADOR_FRAME as i64, semantic.TIPO_U32 as u32)
+    formata.nargs = 6
+    formata.args = lw_args(c, 6)
+    let args_formata: []Valor = formata.args or_else {}
+    args_formata[0] = lw_valor_int(0, semantic.TIPO_U32 as u32)
+    args_formata[2] = lw_valor_int(0, semantic.TIPO_U32 as u32)
+    args_formata[4] = lw_valor_int(0, semantic.TIPO_U32 as u32)
+    args_formata[1] = texto_internado(c, &abre)
+    args_formata[3] = lw_valor_temp(numero, semantic.TIPO_I32 as u32)
+    args_formata[5] = lw_valor_texto(common.internar(depurar_nomes(c), ")", 1), semantic.TIPO_STR as u32)
+    return formata
+}
+
+// C: ir/lower_depurar.c:116 (default: return "Cor(7)")
+proc caso_sem_nome(p: ^ProcEnum, caso: ^IrCaso) {
+    let c: ?^LowerCtx = p.c
+    caso.padrao = true
+    caso.ligacao = -1
+    caso.tipo = p.tipo
+    let anterior: ^IrBloco = lw_trocar_bloco(c as ^LowerCtx, &caso.corpo)
+    let numero: ^IrInstr = lw_nova_instr(c as ^LowerCtx, IR_TRANSMUTA, p.pos)
+    numero.destino = lw_novo_temp(c as ^LowerCtx)
+    numero.tipo = semantic.TIPO_I32 as u32
+    numero.a = lw_valor_local(0, p.tipo)
+    let formata: ^IrInstr = formata_sem_nome(p, numero.destino)
+    let p_1 = lw_nova_instr(c as ^LowerCtx, IR_RETORNA, p.pos)
+    p_1.a = lw_valor_temp(formata.destino, semantic.TIPO_STR as u32)
+    _ = lw_trocar_bloco(c as ^LowerCtx, anterior)
+}
+
+// C: ir/lower_depurar.c:132
+proc corpo_do_proc_de_enum(c: ^LowerCtx, enumerado: u32, pos: u32) {
+    var p: ProcEnum = ProcEnum{c = c, tipo = enumerado, decl = decl_do_tipo(c, enumerado), pos = pos}
+    let decl: ^frontend.Decl = p.decl as ^frontend.Decl
+    let chave: ^IrInstr = lw_nova_instr(c, IR_CHAVEIA, pos)
+    chave.a = lw_valor_local(0, enumerado)
+    chave.tipo = enumerado
+    chave.ncasos = decl.nmembros + 1
+    chave.casos = fluxo_fatia_caso(c.arena as ^common.Arena, chave.ncasos as int)
+    let casos: []IrCaso = chave.casos or_else {}
+    var k: u32 = 0
+    while k < decl.nmembros {
+        caso_do_membro(&p, k, &casos[k])
+        k += 1
+    }
+    caso_sem_nome(&p, &casos[decl.nmembros])
+}
+
+// C: ir/lower_depurar.c:145 (guarda o estado da funcao em construcao e o devolve no fim)
+proc criar_proc_de_enum(c: ^LowerCtx, enumerado: u32, nome: i32, pos: u32) {
+    let anterior_funcao: ?^IrFuncao = c.funcao
+    let anterior_bloco: ?^IrBloco = c.atual
+    let anterior_temps: u32 = c.ntemps
+    let anterior_locais: u32 = c.prox_local
+    let prog: ^IrPrograma = c.prog as ^IrPrograma
+    let f: ^IrFuncao = &(prog.funcoes or_else {})[prog.nfuncoes]
+    prog.nfuncoes += 1
+    f.nome = nome
+    f.retorno = semantic.TIPO_STR as u32
+    f.nparams = 1
+    f.params = lower_fatia_param(c.arena as ^common.Arena, 1)
+    let params: []IrParam = f.params or_else {}
+    params[0] = IrParam{nome = common.internar(depurar_nomes(c), "0valor", 6), tipo = enumerado}
+    c.funcao = f
+    c.atual = &f.corpo
+    c.ntemps = 0
+    c.prox_local = 1
+    corpo_do_proc_de_enum(c, enumerado, pos)
+    f.ntemps = c.ntemps
+    f.nlocais = c.prox_local
+    c.funcao = anterior_funcao
+    c.atual = anterior_bloco
+    c.ntemps = anterior_temps
+    c.prox_local = anterior_locais
+}
+
+// C: ir/lower_depurar.c:169
+proc proc_de_enum(c: ^LowerCtx, enumerado: u32, pos: u32) -> i32 {
+    let nome: i32 = nome_do_proc_de_enum(c, enumerado)
+    for k in (0 as u32)..<(c.prog as ^IrPrograma).nfuncoes {
+        if ((c.prog as ^IrPrograma).funcoes or_else {})[k].nome == nome {
+            return nome
+        }
+    }
+    criar_proc_de_enum(c, enumerado, nome, pos)
+    return nome
+}
+
+// C: ir/lower_depurar.c:179
+proc mostrar_enum(d: ^Depura, v: Valor) {
+    let c: ^LowerCtx = d.c as ^LowerCtx
+    let i: ^IrInstr = lw_nova_instr(c, IR_CHAMADA, d.pos)
+    i.nome = proc_de_enum(c, v.tipo, d.pos)
+    i.destino = lw_novo_temp(c)
+    i.tipo = semantic.TIPO_STR as u32
+    i.args = lw_args(c, 1)
+    let args_chamada: []Valor = i.args or_else {}
+    args_chamada[0] = v
+    i.nargs = 1
+    parte(d, lw_valor_temp(i.destino, semantic.TIPO_STR as u32))
+}
+
+// C: ir/lower_depurar.c:193
+proc ler_campo(d: ^Depura, v: Valor, campo: ^frontend.Campo) -> Valor {
+    let i: ^IrInstr = lw_nova_instr(d.c as ^LowerCtx, IR_CAMPO, d.pos)
+    i.destino = lw_novo_temp(d.c as ^LowerCtx)
+    i.tipo = campo.tipo.tipo
+    i.a = v
+    i.nome = campo.nome
+    return lw_valor_temp(i.destino, i.tipo)
+}
+
+// C: ir/lower_depurar.c:204
+proc mostrar_struct(d: ^Depura, v: Valor) {
+    let estrutura: ?^frontend.Decl = decl_do_tipo(d.c as ^LowerCtx, v.tipo)
+    texto_nome(d, (estrutura as ^frontend.Decl).nome)
+    texto(d, "{")
+    var k: u32 = 0
+    while k < (estrutura as ^frontend.Decl).ncampos {
+        let campo: ^frontend.Campo = &((estrutura as ^frontend.Decl).campos or_else {})[k]
+        if k > 0 {
+            texto(d, ", ")
+        }
+        texto_nome(d, campo.nome)
+        texto(d, " = ")
+        mostrar(d, ler_campo(d, v, campo))
+        k += 1
+    }
+    texto(d, "}")
+}
+
+// C: ir/lower_depurar.c:219
+proc ler_elemento(d: ^Depura, v: Valor, elemento: u32, indice: u32) -> Valor {
+    let i: ^IrInstr = lw_nova_instr(d.c as ^LowerCtx, IR_ELEMENTO, d.pos)
+    i.destino = lw_novo_temp(d.c as ^LowerCtx)
+    i.tipo = elemento
+    i.a = v
+    i.b = lw_valor_int(indice as i64, semantic.TIPO_INT as u32)
+    i.op_aux = 1
+    return lw_valor_temp(i.destino, i.tipo)
+}
+
+// C: ir/lower_depurar.c:231
+proc mostrar_array(d: ^Depura, v: Valor) {
+    let tipo: ^semantic.TipoInfo = semantic.tipo_de(&((d.c as ^LowerCtx).sem as ^semantic.Semantica).tipos, v.tipo)
+    let mostrados: u32 = min(tipo.b, MAX_ELEMENTOS_DEPURAR as u32)
+    texto(d, "{")
+    for k in (0 as u32)..<mostrados {
+        if k > 0 {
+            texto(d, ", ")
+        }
+        mostrar(d, ler_elemento(d, v, tipo.a, k))
+    }
+    if tipo.b > mostrados {
+        texto(d, ", ... (+")
+        format(f"{(tipo.b - mostrados) as u64}", into = &d.texto)
+        texto(d, ")")
+    }
+    texto(d, "}")
+}
+
+// C: ir/lower_depurar.c:248
+proc mostrar_str(d: ^Depura, v: Valor) {
+    texto(d, "\"")
+    parte(d, v)
+    texto(d, "\"")
+}
+
+// C: ir/lower_depurar.c:256 (Ryu P2: real em {x:?} sai com Display curto, FMT_CURTO no formato do par)
+proc mostrar_real(d: ^Depura, v: Valor) {
+    fechar_texto(d)
+    let pares: ^[dynamic]Valor = d.pares as ^[dynamic]Valor
+    append(pares, item = lw_valor_int(frontend.FMT_CURTO as i64, semantic.TIPO_U32 as u32))
+    append(pares, item = v)
+    let prog: ^IrPrograma = (d.c as ^LowerCtx).prog as ^IrPrograma
+    prog.usa_real_curto = true
+}
+
+// C: ir/lower_depurar.c:264
+proc mostrar(d: ^Depura, v: Valor) {
+    let sw_1 = common.c2f_s2u_32(semantic.tipo_classe_de(&((d.c as ^LowerCtx).sem as ^semantic.Semantica).tipos, v.tipo))
+    if sw_1 == (semantic.TC_STRUCT as u32) {
+        mostrar_struct(d, v)
+    } else if sw_1 == (semantic.TC_ARRAY as u32) {
+        mostrar_array(d, v)
+    } else if sw_1 == (semantic.TC_ENUM as u32) {
+        mostrar_enum(d, v)
+    } else if sw_1 == (semantic.TC_TEXTO as u32) {
+        mostrar_str(d, v)
+    } else if sw_1 == (semantic.TC_REAL as u32) or sw_1 == (semantic.TC_F64 as u32) {
+        mostrar_real(d, v)
+    } else {
+        parte(d, v)
+    }
+}
+
+// C: ir/lower_depurar.c:276
+proc lw_depurar(c: ^LowerCtx, pares: ^[dynamic]Valor, v: Valor, pos: u32) {
+    var d: Depura = Depura{c = c, pares = pares, pos = pos}
+    d.texto = make([dynamic]u8, alloc = heap)
+    mostrar(&d, v)
+    fechar_texto(&d)
+    delete(d.texto)
+}
+
+// Valores do C: nome "0depurar_<id>" e texto de parte (literais vizinhos viram uma parte; formato 0 antes do texto).
+test "lower_depurar: nome do proc de enum e fechamento de texto" {
+    var a: common.Arena = common.Arena{}
+    defer common.arena_liberar(&a)
+    var nomes_arr: [1]common.Interner = {}
+    common.interner_iniciar(&nomes_arr[0], &a)
+    defer common.interner_liberar(&nomes_arr[0])
+    var sem: semantic.Semantica = semantic.Semantica{}
+    sem.nomes = nomes_arr[..]
+    var c: LowerCtx = LowerCtx{}
+    c.sem = &sem
+    c.arena = &a
+    let nome_proc: i32 = nome_do_proc_de_enum(&c, 7)
+    expect(common.interner_texto(&nomes_arr[0], nome_proc) == "0depurar_7")
+    let id_ponto: i32 = common.internar(&nomes_arr[0], "Ponto", 5)
+    var pares = make([dynamic]Valor, alloc = heap)
+    defer delete(pares)
+    var d: Depura = Depura{c = &c, pares = &pares}
+    d.texto = make([dynamic]u8, alloc = heap)
+    defer delete(d.texto)
+    texto(&d, "Cor")
+    texto_nome(&d, id_ponto)
+    texto(&d, "{")
+    fechar_texto(&d)
+    expect(len(pares) == 2)
+    expect(pares[0].tipo_no == V_INT as u8 and pares[0].inteiro == 0 and pares[0].tipo == semantic.TIPO_U32 as u32)
+    expect(pares[1].tipo_no == V_TEXTO as u8 and common.interner_texto(&nomes_arr[0], pares[1].id) == "CorPonto{")
+    expect(len(d.texto) == 0)
+}
+
+test "lower_depurar: real vai com FMT_CURTO e marca usa_real_curto" {
+    var a: common.Arena = common.Arena{}
+    defer common.arena_liberar(&a)
+    var prog: IrPrograma = IrPrograma{}
+    var c: LowerCtx = LowerCtx{}
+    c.prog = &prog
+    c.arena = &a
+    var pares = make([dynamic]Valor, alloc = heap)
+    defer delete(pares)
+    var d: Depura = Depura{c = &c, pares = &pares}
+    d.texto = make([dynamic]u8, alloc = heap)
+    defer delete(d.texto)
+    mostrar_real(&d, Valor{tipo_no = V_TEXTO as u8})
+    expect(len(pares) == 2 and pares[0].inteiro == frontend.FMT_CURTO as i64)
+    expect(pares[1].tipo_no == V_TEXTO as u8 and prog.usa_real_curto)
+}
+
+test "lower_depurar: caso do membro e 'Cor(3)' sem nome seguem o C" {
+    var a: common.Arena = common.Arena{}
+    defer common.arena_liberar(&a)
+    var nomes_arr: [1]common.Interner = {}
+    common.interner_iniciar(&nomes_arr[0], &a)
+    defer common.interner_liberar(&nomes_arr[0])
+    var sem: semantic.Semantica = semantic.Semantica{}
+    sem.nomes = nomes_arr[..]
+    var bloco: IrBloco = IrBloco{}
+    var c: LowerCtx = LowerCtx{}
+    c.sem = &sem
+    c.arena = &a
+    c.atual = &bloco
+    let id_cor: i32 = common.internar(&nomes_arr[0], "Cor", 3)
+    let id_verde: i32 = common.internar(&nomes_arr[0], "verde", 5)
+    var membros_l = make([dynamic]frontend.Membro, alloc = common.arena_mem(&a), cap = 1)
+    append(&membros_l, item = frontend.Membro{nome = id_verde})
+    var decl: frontend.Decl = frontend.Decl{nome = id_cor}
+    decl.membros = membros_l[..]
+    decl.nmembros = 1
+    var p: ProcEnum = ProcEnum{c = &c, tipo = 9, decl = &decl, pos = 0}
+    let casos: []IrCaso = fluxo_fatia_caso(&a, 1)
+    caso_do_membro(&p, 0, &casos[0])
+    expect(casos[0].membro == 0 and casos[0].ligacao == -1 and casos[0].tipo == 9)
+    let retorno_membro: ^IrInstr = casos[0].corpo.primeira as ^IrInstr
+    expect(common.interner_texto(&nomes_arr[0], retorno_membro.a.id) == "Cor.verde")
+    let formata: ^IrInstr = formata_sem_nome(&p, 3)
+    expect(formata.op == IR_FORMATA as u8 and formata.nargs == 6 and formata.op_aux == 1)
+    let args_f: []Valor = formata.args or_else {}
+    expect(common.interner_texto(&nomes_arr[0], args_f[1].id) == "Cor(")
+    expect(args_f[3].id == 3 and common.interner_texto(&nomes_arr[0], args_f[5].id) == ")")
+    expect(formata.a.inteiro == ALOCADOR_FRAME as i64 and args_f[0].inteiro == 0)
+}

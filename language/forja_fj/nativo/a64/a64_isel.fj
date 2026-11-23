@@ -1,0 +1,247 @@
+// nativo/a64/a64_isel.fj - selecao de instrucoes A64 (so-slots): despacho por op da BIR e as ops inteiras escalares (contrato_a64 §4)
+// Versao: 0.5.0
+// Changelog: 0.5.0 - A2.2(c): a64_estender_operando (extensao do operando da BIR, bir_estendido64: i8/i16/i32 viram 64 bits com sinal ou zero, inclusive i32 que a64_estender deixa como esta).
+//            0.4.0 - A1.3(iii): ops reais (CONST/ADD..DIV/NEG/RAIZ/CMP/SELECIONA/I_PARA_F/F_PARA_F) para a64_isel_real.fj (a64_eh_op_real); gate de classe aceita F32/F64.
+//            0.3.0 - A1.3(iv): despacho de ADD_OV..NEG_OV, SELECIONA e ARMADILHA para a64_isel_estouro.fj (a64_selecionar_estouro).
+//            0.2.0 - A1.3(ii): despacho de END_SIMBOLO/COPIA_MEM/ZERA_MEM/CHAMA_IND para a64_isel_agregado.fj (a64_selecionar_agregado).
+//            0.1.0 - A1.3(i): CONST COPIA ADD SUB MUL AND OR XOR NEG NOT CMP EXT_S EXT_Z TRUNC DIV REM SHL SHR + despacho de fluxo/memoria/chamada.
+//                    Cada op carrega os operandos em x9/x10 (a64_operando), calcula em x9 e grava o destino no slot. Bits acima da classe sao
+//                    indefinidos: CMP/DIV/SHR (e EXT) estendem antes. Ops *_OV, ARMADILHA, SELECIONA, reais, vetor, COPIA_MEM... = X0001 (A1.3 ii-iv).
+
+import "nativo/bir"
+
+const A64_NOMES_OP: [39]str = {"const", "copia", "add", "sub", "mul", "and", "or", "xor", "neg", "cmp", "ext_s", "ext_z", "trunc", "add_ov", "sub_ov", "mul_ov", "neg_ov", "end_simbolo", "chama", "salta", "desvia", "retorna", "armadilha", "div", "rem", "shl", "shr", "not", "i_para_f", "f_para_f", "raiz", "chama_ind", "seleciona", "splat", "end_slot", "carrega", "grava", "copia_mem", "zera_mem"}
+// ADD SUB MUL AND OR XOR: forma do encoder (ADD_REG SUB_REG MADD AND_REG ORR_REG EOR_REG) e o Ra do MADD (xzr = MUL)
+const A64_FORMA_BINARIA: [6]u32 = {4, 6, 28, 9, 10, 11}
+const A64_RA_BINARIA: [6]u32 = {0, 0, 31, 0, 0, 0}
+// aux de CMP (BCOND_EQ..BCOND_GE_U) -> codigo de condicao A64: eq ne lt le gt ge lo ls hi hs
+const A64_COND_DA_BIR: [10]u32 = {0, 1, 11, 13, 12, 10, 3, 9, 8, 2}
+
+proc a64_nome_do_op(op: u8) -> str {
+    if (op as u64) < (len(A64_NOMES_OP) as u64) {
+        return A64_NOMES_OP[op]
+    }
+    return "op desconhecida"
+}
+
+proc a64_x(classe: u8) -> bool {
+    return (classe as i32) == bir.BC_I64
+}
+
+// bits da classe inteira estreita (8/16/32); 0 para as demais
+proc a64_bits_estreitos(classe: u8) -> u32 {
+    let k = classe as i32
+    if k == bir.BC_I8 {
+        return 8
+    }
+    if k == bir.BC_I16 {
+        return 16
+    }
+    if k == bir.BC_I32 {
+        return 32
+    }
+    return 0
+}
+
+// estende i8/i16 em w{reg} (sinal ou zero) antes de uma op que depende dos bits altos; i32/i64 nao mudam
+proc a64_estender(c: ^A64Ctx, reg: u32, classe: u8, com_sinal: bool) {
+    let bits = a64_bits_estreitos(classe)
+    if (bits == 0) or (bits == 32) {
+        return
+    }
+    var forma: u32 = A64F_UBFM
+    if com_sinal {
+        forma = A64F_SBFM
+    }
+    a64_op(c, forma, false, A64Ops{rd = reg, rn = reg, imm = 0, imm2 = bits - 1})
+}
+
+// extensao do operando de chamada (bir_estendido64): i8/i16/i32 viram 64 bits com sinal ou zero (o a64 guarda o estreito
+// em w, cujo bit alto nao e a extensao); i64 e real nao mudam
+proc a64_estender_operando(c: ^A64Ctx, reg: u32, classe: u8, com_sinal: bool) {
+    let bits = a64_bits_estreitos(classe)
+    if bits == 0 {
+        return
+    }
+    var forma: u32 = A64F_UBFM
+    if com_sinal {
+        forma = A64F_SBFM
+    }
+    a64_op(c, forma, true, A64Ops{rd = reg, rn = reg, imm = 0, imm2 = bits - 1})
+}
+
+// classes: inteiras (I8..I64), reais (F32/F64) ou ausentes; vetorial = X0001 (as ops reais tratam a propria classe em a64_isel_real.fj)
+proc a64_classes_escalares(c: ^A64Ctx, ins: ^bir.BirInstr) -> bool {
+    if (ins.classe != (bir.BC_NADA as u8)) and (not a64_classe_escalar(ins.classe)) {
+        return a64_recusa(c, "classe vetorial")
+    }
+    if ((ins.a.tipo as i32) != bir.BO_NADA) and ((ins.a.tipo as i32) != bir.BO_SIMBOLO) and (not a64_classe_escalar(ins.a.classe)) {
+        return a64_recusa(c, "operando vetorial")
+    }
+    if ((ins.b.tipo as i32) != bir.BO_NADA) and ((ins.b.tipo as i32) != bir.BO_SIMBOLO) and (not a64_classe_escalar(ins.b.classe)) {
+        return a64_recusa(c, "operando vetorial")
+    }
+    return true
+}
+
+// CONST e COPIA: operando a (imediato ou vreg) -> destino
+proc a64_isel_copia(c: ^A64Ctx, ins: ^bir.BirInstr) -> bool {
+    if not a64_operando(c, R_T0, &ins.a) {
+        return false
+    }
+    a64_resultado(c, ins, R_T0)
+    return true
+}
+
+// ADD SUB MUL AND OR XOR: rd = a OP b (w para i8/i16/i32, x para i64)
+proc a64_isel_binaria(c: ^A64Ctx, ins: ^bir.BirInstr) -> bool {
+    if (not a64_operando(c, R_T0, &ins.a)) or (not a64_operando(c, R_T1, &ins.b)) {
+        return false
+    }
+    let k = (ins.op as i32) - bir.BIR_ADD
+    a64_op(c, A64_FORMA_BINARIA[k], a64_x(ins.classe), A64Ops{rd = R_T0, rn = R_T0, rm = R_T1, imm = A64_RA_BINARIA[k]})
+    a64_resultado(c, ins, R_T0)
+    return true
+}
+
+// NEG = sub xzr,a ; NOT = orn xzr,a
+proc a64_isel_unaria(c: ^A64Ctx, ins: ^bir.BirInstr) -> bool {
+    if not a64_operando(c, R_T0, &ins.a) {
+        return false
+    }
+    if (ins.op as i32) == bir.BIR_NEG {
+        a64_op(c, A64F_SUB_REG, a64_x(ins.classe), A64Ops{rd = R_T0, rn = R_XZR, rm = R_T0})
+    } else {
+        a64_op(c, A64F_ORR_REG, a64_x(ins.classe), A64Ops{rd = R_T0, rn = R_XZR, rm = R_T0, imm2 = 1})
+    }
+    a64_resultado(c, ins, R_T0)
+    return true
+}
+
+// CMP inteiro: estende a e b (sinal nas condicoes com sinal), subs xzr ; cset
+proc a64_isel_cmp(c: ^A64Ctx, ins: ^bir.BirInstr) -> bool {
+    let cond = ins.aux as i32
+    if cond > bir.BCOND_GE_U {
+        return a64_recusa(c, "comparacao real")
+    }
+    if (not a64_operando(c, R_T0, &ins.a)) or (not a64_operando(c, R_T1, &ins.b)) {
+        return false
+    }
+    let com_sinal = (cond >= bir.BCOND_LT_S) and (cond <= bir.BCOND_GE_S)
+    a64_estender(c, R_T0, ins.a.classe, com_sinal)
+    a64_estender(c, R_T1, ins.a.classe, com_sinal)
+    a64_op(c, A64F_SUBS_REG, a64_x(ins.a.classe), A64Ops{rd = R_XZR, rn = R_T0, rm = R_T1})
+    a64_op(c, A64F_CSINC, false, A64Ops{rd = R_T0, rn = R_XZR, rm = R_XZR, imm = A64_COND_DA_BIR[cond] ~ 1})
+    a64_resultado(c, ins, R_T0)
+    return true
+}
+
+// EXT_S: sbfm (sxtb/sxth/sxtw); EXT_Z: uxtb/uxth, e de i32 para i64 `mov w,w` (escrever em w zera os 32 altos)
+proc a64_isel_extensao(c: ^A64Ctx, ins: ^bir.BirInstr) -> bool {
+    if not a64_operando(c, R_T0, &ins.a) {
+        return false
+    }
+    let bits = a64_bits_estreitos(ins.a.classe)
+    if (ins.op as i32) == bir.BIR_EXT_S {
+        a64_op(c, A64F_SBFM, a64_x(ins.classe), A64Ops{rd = R_T0, rn = R_T0, imm = 0, imm2 = bits - 1})
+    } else if bits == 32 {
+        a64_op(c, A64F_ORR_REG, false, A64Ops{rd = R_T0, rn = R_XZR, rm = R_T0})
+    } else {
+        a64_op(c, A64F_UBFM, false, A64Ops{rd = R_T0, rn = R_T0, imm = 0, imm2 = bits - 1})
+    }
+    a64_resultado(c, ins, R_T0)
+    return true
+}
+
+// TRUNC: bits altos livres; de i64 para i32 zera os 32 altos (mov w,w)
+proc a64_isel_trunc(c: ^A64Ctx, ins: ^bir.BirInstr) -> bool {
+    if not a64_operando(c, R_T0, &ins.a) {
+        return false
+    }
+    if a64_x(ins.a.classe) and ((ins.classe as i32) == bir.BC_I32) {
+        a64_op(c, A64F_ORR_REG, false, A64Ops{rd = R_T0, rn = R_XZR, rm = R_T0})
+    }
+    a64_resultado(c, ins, R_T0)
+    return true
+}
+
+// DIV e REM (sem checagem de zero: a BIR protege): sdiv/udiv ; REM = a - (a/b)*b por msub
+proc a64_isel_divisao(c: ^A64Ctx, ins: ^bir.BirInstr) -> bool {
+    if (not a64_operando(c, R_T0, &ins.a)) or (not a64_operando(c, R_T1, &ins.b)) {
+        return false
+    }
+    let com_sinal = (ins.aux as i32) == bir.BIR_SINAL
+    a64_estender(c, R_T0, ins.classe, com_sinal)
+    a64_estender(c, R_T1, ins.classe, com_sinal)
+    var forma: u32 = A64F_UDIV
+    if com_sinal {
+        forma = A64F_SDIV
+    }
+    let x = a64_x(ins.classe)
+    if (ins.op as i32) == bir.BIR_DIV {
+        a64_op(c, forma, x, A64Ops{rd = R_T0, rn = R_T0, rm = R_T1})
+    } else {
+        a64_op(c, forma, x, A64Ops{rd = R_T2, rn = R_T0, rm = R_T1})
+        a64_op(c, A64F_MSUB, x, A64Ops{rd = R_T0, rn = R_T2, rm = R_T1, imm = R_T0})
+    }
+    a64_resultado(c, ins, R_T0)
+    return true
+}
+
+// SHL e SHR (logico; contagem < largura garantida pela BIR): lslv/lsrv; SHR estende por zero antes
+proc a64_isel_deslocamento(c: ^A64Ctx, ins: ^bir.BirInstr) -> bool {
+    if (not a64_operando(c, R_T0, &ins.a)) or (not a64_operando(c, R_T1, &ins.b)) {
+        return false
+    }
+    var forma: u32 = A64F_LSLV
+    if (ins.op as i32) == bir.BIR_SHR {
+        a64_estender(c, R_T0, ins.classe, false)
+        forma = A64F_LSRV
+    }
+    a64_op(c, forma, a64_x(ins.classe), A64Ops{rd = R_T0, rn = R_T0, rm = R_T1})
+    a64_resultado(c, ins, R_T0)
+    return true
+}
+
+// despacho por op da BIR; o que nao tem emissao sai X0001 com o nome da op
+proc a64_selecionar(c: ^A64Ctx, ins: ^bir.BirInstr) -> bool {
+    c.pos = ins.pos
+    if a64_eh_op_real(ins) {
+        return a64_selecionar_real(c, ins)
+    }
+    if not a64_classes_escalares(c, ins) {
+        return false
+    }
+    let op = ins.op as i32
+    if (op == bir.BIR_CONST) or (op == bir.BIR_COPIA) {
+        return a64_isel_copia(c, ins)
+    }
+    if (op >= bir.BIR_ADD) and (op <= bir.BIR_XOR) {
+        return a64_isel_binaria(c, ins)
+    }
+    if (op == bir.BIR_NEG) or (op == bir.BIR_NOT) {
+        return a64_isel_unaria(c, ins)
+    }
+    if op == bir.BIR_CMP {
+        return a64_isel_cmp(c, ins)
+    }
+    if (op == bir.BIR_EXT_S) or (op == bir.BIR_EXT_Z) {
+        return a64_isel_extensao(c, ins)
+    }
+    if op == bir.BIR_TRUNC {
+        return a64_isel_trunc(c, ins)
+    }
+    if (op == bir.BIR_DIV) or (op == bir.BIR_REM) {
+        return a64_isel_divisao(c, ins)
+    }
+    if (op == bir.BIR_SHL) or (op == bir.BIR_SHR) {
+        return a64_isel_deslocamento(c, ins)
+    }
+    if ((op >= bir.BIR_ADD_OV) and (op <= bir.BIR_NEG_OV)) or (op == bir.BIR_SELECIONA) or (op == bir.BIR_ARMADILHA) {
+        return a64_selecionar_estouro(c, ins)
+    }
+    if (op == bir.BIR_END_SIMBOLO) or (op == bir.BIR_COPIA_MEM) or (op == bir.BIR_ZERA_MEM) or (op == bir.BIR_CHAMA_IND) {
+        return a64_selecionar_agregado(c, ins)
+    }
+    return a64_selecionar_fluxo(c, ins)
+}

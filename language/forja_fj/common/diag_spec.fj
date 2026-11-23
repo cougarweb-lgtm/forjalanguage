@@ -1,0 +1,95 @@
+// common/diag_spec.fj - porte de compiler/common/diag_spec.c, compiler/common/diag_spec.h
+// sha256 de common/diag_spec.c: 8c691a53b41370a658d75d10c35e214f5c44cf11600ce25f550f97f8bd0bbb1c
+// sha256 de common/diag_spec.h: ce7341cdce9e875c61c6539c486aa45c87c6dcab7882c8e6d8264f07c3d5edb1
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.2.0
+// Changelog: 0.2.0 - G3 P-common C2: corpo real. C2F-70: PrimeiraVezDoCodigo e CodigoJaVisto (globais) vivem em SaidaDiag (diag.fj), passado como sd.
+//            acrescentar recebe o texto como []u8 (o tam do C era sempre o tamanho do trecho passado).
+
+pub const DIAG_SPEC_MAX: i32 = 2048
+
+// Tamanho dos buffers de secao (SPEC_NOME_MAX) e de trecho (SPEC_TRECHO_MAX + 8) do C.
+const SPEC_BUFFER_SECAO: int = 32
+const SPEC_BUFFER_TRECHO: int = 328
+
+// C: common/diag_spec.c:17
+// C2F-70: sd.primeira_vez e sd.ja_visto no lugar das globais.
+proc diag_spec_iniciar_linha(sd: ^SaidaDiag, codigo: i32) {
+    sd.primeira_vez = not sd.ja_visto[codigo]
+    sd.ja_visto[codigo] = true
+}
+
+// C: common/diag_spec.c:24
+// Acrescenta texto ao fim do texto (terminado em NUL) de saida, sem passar de cap - 1 bytes.
+proc acrescentar(saida: []u8, cap: u64, texto: []u8) {
+    let usado = c2f_strlen_b(saida)
+    var tam = len(texto)
+    let cabe = (cap as int) - 1 - usado
+    if tam > cabe {
+        tam = cabe
+    }
+    copy(saida[usado..<(usado + tam)], texto[0..<tam])
+    saida[usado + tam] = 0
+}
+
+// C: common/diag_spec.c:34
+proc acrescentar_exemplo_certo(codigo: ?str, saida: []u8, cap: u64) {
+    var e: SpecExemplo = SpecExemplo{}
+    var linha: DocTexto = DocTexto{}
+    var separador: str = "\nexemplo certo:\n"
+    if (not spec_exemplo_do_codigo(codigo, &e)) or (e.certo.tam == 0) {
+        return
+    }
+    var resto: DocTexto = e.certo
+    while spec_proxima_linha(&resto, &linha) {
+        var pular: u64 = linha.tam
+        if linha.tam >= 2 {
+            pular = 2
+        }
+        acrescentar(saida, cap, as_bytes(separador))
+        acrescentar(saida, cap, linha.texto[(pular as int)..<(linha.tam as int)])
+        separador = "\n"
+    }
+}
+
+// C: common/diag_spec.c:51
+// LIMITE: 3 parametros - o buffer do chamador (saida, cap) e a assinatura do C.
+pub proc diag_spec_texto(codigo: ?str, saida: []u8, cap: u64) {
+    var nome_secao = ""
+    var trecho: [SPEC_BUFFER_TRECHO]u8 = {}
+    saida[0] = 0
+    // spec_secao_do_codigo (C3) devolve o nome da secao como fatia do texto embutido (vista, sem delete).
+    let achou_secao = spec_secao_do_codigo(codigo, &nome_secao)
+    if (not achou_secao) or (spec_trecho_do_codigo(codigo, nome_secao, trecho[..], SPEC_BUFFER_TRECHO as u64) == 0) {
+        acrescentar(saida, cap, as_bytes("forja spec"))
+        return
+    }
+    acrescentar(saida, cap, as_bytes(nome_secao))
+    acrescentar(saida, cap, as_bytes(": "))
+    acrescentar(saida, cap, trecho[0..<c2f_strlen_b(trecho[..])])
+    acrescentar_exemplo_certo(codigo, saida, cap)
+}
+
+// C: common/diag_spec.c:67
+// ", \"spec\": <texto>" sempre (forja explicar).
+proc diag_spec_imprimir_completo(codigo: i32, saida: ^Saida) {
+    var texto: [DIAG_SPEC_MAX]u8 = {}
+    diag_spec_texto(diag_codigo_texto(codigo), texto[..], DIAG_SPEC_MAX as u64)
+    c2f_saida_escrever_texto(saida, ", \"spec\": ")
+    let completo = diag_texto_do_buffer(texto[..])
+    defer delete(completo)
+    imprimir_texto_json(saida, completo)
+}
+
+// C: common/diag_spec.c:76
+// ", \"spec\": <texto>" na 1a vez do codigo na execucao (diag_spec_iniciar_linha); nas seguintes ", \"spec_ref\": \"forja explicar CODIGO\"".
+proc diag_spec_imprimir(codigo: i32, saida: ^Saida, sd: ^SaidaDiag) {
+    if sd.primeira_vez {
+        diag_spec_imprimir_completo(codigo, saida)
+        return
+    }
+    let referencia = format(f"forja explicar {diag_codigo_texto(codigo)}", alloc = heap)
+    defer delete(referencia)
+    c2f_saida_escrever_texto(saida, ", \"spec_ref\": ")
+    imprimir_texto_json(saida, referencia)
+}

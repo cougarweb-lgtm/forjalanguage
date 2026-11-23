@@ -1,0 +1,253 @@
+// ir/lower_fluxo.fj - porte de compiler/ir/lower_fluxo.c
+// sha256 de ir/lower_fluxo.c: 6b0cc23d4cfda952c83a8093a3ad68c837cc9bafa2c0ed0a39439d289bc68cd8
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "common"
+import "frontend"
+import "semantic"
+
+// C: ir/lower_fluxo.c:14
+proc lw_expandir_defers(c: ^LowerCtx, escopo_alvo: u32) {
+    if (escopo_alvo as u64) >= (len(c.escopos) as u64) {
+        return
+    }
+    let inicio: u32 = c.escopos[escopo_alvo as u64].inicio
+    var k: u64 = len(c.defers) as u64
+    while k > (inicio as u64) {
+        let adiado: ?^frontend.Stmt = c.defers[k - 1]
+        lw_stmt(c, (adiado as ^frontend.Stmt).corpo)
+        k -= 1
+    }
+}
+
+// C: ir/lower_fluxo.c:24
+proc lw_escopo_do_laco(c: ^LowerCtx) -> u32 {
+    var k: u64 = len(c.escopos) as u64
+    while k > 0 {
+        if c.escopos[k - 1].e_laco {
+            return (k - 1) as u32
+        }
+        k -= 1
+    }
+    let msg_1 = format(f"lowering: break/continue fora de laco (a semantica devia ter barrado)", alloc = heap)
+    defer delete(msg_1)
+    common.falha_interna(msg_1)
+    return 0
+}
+
+// C: ir/lower_fluxo.c:33
+proc bloco_em(c: ^LowerCtx, destino: ^IrBloco, lista: ?^frontend.Stmt, e_laco: bool) {
+    let anterior: ^IrBloco = lw_trocar_bloco(c, destino)
+    lw_bloco(c, lista, e_laco)
+    _ = lw_trocar_bloco(c, anterior)
+}
+
+// C: ir/lower_fluxo.c:40
+proc lw_stmt_defer(c: ^LowerCtx, s: ?^frontend.Stmt) {
+    if (s as ^frontend.Stmt).corpo == none {
+        lw_falha_stmt(c, s, "defer sem comando")
+    }
+    append(&c.defers, item = none)
+    c.defers[len(c.defers) - 1] = s
+}
+
+// C: ir/lower_fluxo.c:49
+proc lw_stmt_if(c: ^LowerCtx, s: ^frontend.Stmt) {
+    let condicao: Valor = lw_expr(c, s.expr)
+    let i: ^IrInstr = lw_nova_instr(c, IR_SE, s.pos)
+    i.a = condicao
+    bloco_em(c, &i.corpo, s.corpo, false)
+    bloco_em(c, &i.senao, s.senao, false)
+}
+
+// C: ir/lower_fluxo.c:59
+proc lw_stmt_while(c: ^LowerCtx, s: ^frontend.Stmt) {
+    let i: ^IrInstr = lw_nova_instr(c, IR_ENQUANTO, s.pos)
+    let anterior: ^IrBloco = lw_trocar_bloco(c, &i.cond)
+    i.a = lw_expr(c, s.expr)
+    _ = lw_trocar_bloco(c, anterior)
+    bloco_em(c, &i.corpo, s.corpo, true)
+}
+
+// C: ir/lower_fluxo.c:69
+proc prologo_do_item(c: ^LowerCtx, s: ^frontend.Stmt, base: Valor, contador: i32) {
+    var tern_1: i32 = IR_ELEMENTO
+    if common.c2f_b2i32(s.item_ref) != 0 {
+        tern_1 = IR_ENDERECO_ELEMENTO
+    }
+    let e: ^IrInstr = lw_nova_instr(c, tern_1, s.pos)
+    e.destino = lw_novo_temp(c)
+    e.tipo = s.tipo_local
+    e.a = base
+    e.b = lw_valor_local(contador, semantic.TIPO_INT as u32)
+    var tern_2: i32 = 1
+    if common.c2f_b2i32(lw_eh_lista(c, base.tipo)) != 0 {
+        tern_2 = 0
+    }
+    e.op_aux = tern_2 as u8
+    let l: ^IrInstr = lw_nova_instr(c, IR_LOCAL, s.pos)
+    l.destino = s.local_id
+    l.tipo = s.tipo_local
+    l.a = lw_valor_temp(e.destino, e.tipo)
+    l.mutavel = false
+}
+
+// C: ir/lower_fluxo.c:85
+proc lw_stmt_for_colecao(c: ^LowerCtx, s: ^frontend.Stmt) {
+    if (common.c2f_b2i32(semantic.tipos_tem_v19(&(c.sem as ^semantic.Semantica).tipos)) != 0) and (common.c2f_b2i32(lw_eh_v19(c, (s.expr as ^frontend.Expr).tipo)) != 0) {
+        lw_stmt_for_v19(c, s)
+        return
+    }
+    var n: Valor = Valor{}
+    let base: Valor = lw_base_da_colecao(c, s.expr, &n)
+    var tern_1: i32 = 0
+    if s.local_indice >= 0 {
+        tern_1 = s.local_indice
+    } else {
+        tern_1 = lw_novo_local(c)
+    }
+    let contador: i32 = tern_1
+    let i: ^IrInstr = lw_nova_instr(c, IR_PARA, s.pos)
+    i.destino = contador
+    i.tipo = semantic.TIPO_INT as u32
+    i.a = lw_valor_int(0, semantic.TIPO_INT as u32)
+    i.b = n
+    i.faixa_excl = true
+    let anterior: ^IrBloco = lw_trocar_bloco(c, &i.corpo)
+    prologo_do_item(c, s, base, contador)
+    lw_bloco(c, s.corpo, true)
+    _ = lw_trocar_bloco(c, anterior)
+}
+
+// C: ir/lower_fluxo.c:107
+proc lw_stmt_for(c: ^LowerCtx, s: ^frontend.Stmt) {
+    if s.expr2 == none {
+        lw_stmt_for_colecao(c, s)
+        return
+    }
+    if s.tipo_local == (frontend.TIPO_NAO_RESOLVIDO as u32) {
+        lw_falha_stmt(c, s, "for sem tipo do contador")
+    }
+    let inicio: Valor = lw_expr(c, s.expr)
+    let fim: Valor = lw_expr(c, s.expr2)
+    let i: ^IrInstr = lw_nova_instr(c, IR_PARA, s.pos)
+    i.destino = s.local_id
+    i.tipo = s.tipo_local
+    i.a = inicio
+    i.b = fim
+    i.faixa_excl = s.faixa_excl
+    bloco_em(c, &i.corpo, s.corpo, true)
+}
+
+// C: ir/lower_fluxo.c:128
+proc lw_stmt_break(c: ^LowerCtx, s: ^frontend.Stmt) {
+    lw_expandir_defers(c, lw_escopo_do_laco(c))
+    _ = lw_nova_instr(c, IR_PARE, s.pos)
+}
+
+// C: ir/lower_fluxo.c:134
+proc lw_stmt_continue(c: ^LowerCtx, s: ^frontend.Stmt) {
+    lw_expandir_defers(c, lw_escopo_do_laco(c))
+    _ = lw_nova_instr(c, IR_CONTINUA, s.pos)
+}
+
+// C: ir/lower_fluxo.c:144
+proc corpo_do_caso(c: ^LowerCtx, origem: ^frontend.Caso, destino: ^IrCaso, valor: Valor) {
+    let anterior: ^IrBloco = lw_trocar_bloco(c, &destino.corpo)
+    if (origem.local_id >= 0) and (destino.ligacao < 0) {
+        let i: ^IrInstr = lw_nova_instr(c, IR_LOCAL, origem.pos)
+        i.destino = origem.local_id
+        i.tipo = origem.tipo
+        i.a = valor
+    }
+    lw_bloco(c, origem.corpo, false)
+    _ = lw_trocar_bloco(c, anterior)
+}
+
+// C: ir/lower_fluxo.c:159
+proc ligar_caso(origem: ^frontend.Caso, destino: ^IrCaso, classe: i32) {
+    if common.c2f_s2u_32(classe) == (semantic.TC_RESULTADO as u32) {
+        destino.membro = transmute(origem.tipo, to = i32)
+        destino.ligacao = origem.local_id
+    } else if (common.c2f_s2u_32(classe) == (semantic.TC_OPCIONAL as u32)) or (common.c2f_s2u_32(classe) == (semantic.TC_ANULAVEL as u32)) {
+        destino.membro = origem.indice_membro
+        var tern_1: i32 = -1
+        if origem.indice_membro == 1 {
+            tern_1 = origem.local_id
+        }
+        destino.ligacao = tern_1
+    } else if common.c2f_s2u_32(classe) == (semantic.TC_UNIAO as u32) {
+        destino.membro = origem.indice_membro
+        destino.ligacao = origem.local_id
+    } else {
+        destino.membro = origem.indice_membro
+    }
+}
+
+// C: ir/lower_fluxo.c:175
+proc lw_caso(c: ^LowerCtx, origem: ^frontend.Caso, destino: ^IrCaso, valor: Valor) {
+    let classe: i32 = semantic.tipo_classe_de(&(c.sem as ^semantic.Semantica).tipos, valor.tipo)
+    destino.padrao = origem.padrao
+    destino.ligacao = -1
+    destino.tipo = origem.tipo
+    if not origem.padrao {
+        ligar_caso(origem, destino, classe)
+    }
+    corpo_do_caso(c, origem, destino, valor)
+}
+
+// C2F-1A: LwAlocar tipado dos casos do switch (zerados, na arena), como os arena_fatia_<tipo>.
+proc fluxo_fatia_caso(a: ^common.Arena, n: int) -> []IrCaso {
+    var l = make([dynamic]IrCaso, alloc = common.arena_mem(a), cap = n)
+    for i in 0..<n {
+        append(&l, item = IrCaso{})
+    }
+    return l[..]
+}
+
+// C: ir/lower_fluxo.c:185 (uma avaliacao do valor; os casos saem na ordem do fonte)
+proc lw_stmt_switch(c: ^LowerCtx, s: ^frontend.Stmt) {
+    let valor: Valor = lw_expr(c, s.expr)
+    let i: ^IrInstr = lw_nova_instr(c, IR_CHAVEIA, s.pos)
+    i.a = valor
+    i.tipo = (s.expr as ^frontend.Expr).tipo
+    i.ncasos = s.ncasos
+    i.casos = fluxo_fatia_caso(c.arena as ^common.Arena, s.ncasos as int)
+    let casos: []IrCaso = i.casos or_else {}
+    let origem: []frontend.Caso = s.casos or_else {}
+    for k in 0..<s.ncasos {
+        lw_caso(c, &origem[k as int], &casos[k as int], valor)
+    }
+}
+
+// Teste dirigido (valores do C: LigarCaso em lower_fluxo.c). O lowering do switch inteiro fica sem execucao aqui.
+test "lower_fluxo: ligacao do caso por classe" {
+    var o = frontend.Caso{tipo = 9, indice_membro = 1, local_id = 4}
+    var d = IrCaso{}
+    ligar_caso(&o, &d, semantic.TC_RESULTADO as i32)
+    expect(d.membro == 9 and d.ligacao == 4)
+    ligar_caso(&o, &d, semantic.TC_OPCIONAL as i32)
+    expect(d.membro == 1 and d.ligacao == 4)
+    o.indice_membro = 0
+    ligar_caso(&o, &d, semantic.TC_ANULAVEL as i32)
+    expect(d.membro == 0 and d.ligacao == -1)
+    ligar_caso(&o, &d, semantic.TC_UNIAO as i32)
+    expect(d.membro == 0 and d.ligacao == 4)
+    ligar_caso(&o, &d, semantic.TC_INT as i32)
+    expect(d.membro == 0)
+}
+
+test "lower_fluxo: escopo do laco mais interno" {
+    var a = common.Arena{}
+    var c = LowerCtx{}
+    c.escopos = make([dynamic]LwEscopo, alloc = common.arena_mem(&a), cap = 4)
+    append(&c.escopos, item = LwEscopo{inicio = 0, e_laco = true})
+    append(&c.escopos, item = LwEscopo{inicio = 2, e_laco = false})
+    append(&c.escopos, item = LwEscopo{inicio = 5, e_laco = true})
+    append(&c.escopos, item = LwEscopo{inicio = 7, e_laco = false})
+    expect(lw_escopo_do_laco(&c) == 2)
+    c.escopos[2].e_laco = false
+    expect(lw_escopo_do_laco(&c) == 0)
+    common.arena_liberar(&a)
+}

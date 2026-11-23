@@ -1,0 +1,341 @@
+// semantic/sem_switch.fj - porte de compiler/semantic/sem_switch.c
+// sha256 de semantic/sem_switch.c: 9e39ef98a93170b3ed37e9017ed32cc4ac9a4d096926c98997896f5d49955713
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "common"
+import "frontend"
+
+struct Cobertura {
+    enumeracao: ?^frontend.Decl
+    membros: ?[]u8
+    cobertos: u32
+    padrao: bool
+    valor: bool
+    erro: bool
+    opcional: bool
+    uniao: ?^frontend.Decl
+}
+
+// C: semantic/sem_switch.c:26
+proc repetido(s: ^Semantica, c: ^frontend.Caso, marca: ^bool) -> bool {
+    if marca^ {
+        let msg_1 = format(f"case repetido", alloc = heap)
+        defer delete(msg_1)
+        return sem_erro(s, common.E0608, c.pos, msg_1)
+    }
+    marca^ = true
+    return true
+}
+
+// C: semantic/sem_switch.c:34
+proc pos_do_tipo_do_caso(s: ^Semantica, c: ^frontend.Caso) -> u32 {
+    let pos: u32 = sem_pos_depois_da_palavra(s, c.pos)
+    var tern_1: u32 = pos
+    if c.modulo != 0 {
+        tern_1 = sem_pos_do_nome_qualificado(s, pos)
+    }
+    return tern_1
+}
+
+// C: semantic/sem_switch.c:40
+proc caso_de_enum(s: ^Semantica, c: ^frontend.Caso, cob: ^Cobertura) -> bool {
+    let en: ?^frontend.Decl = cob.enumeracao
+    if (c.tipo_nome != (en as ^frontend.Decl).nome) or (c.membro < 0) {
+        let msg_1 = format(f"case de enum precisa ser 'case {sem_nome_texto(s, (en as ^frontend.Decl).nome)}.membro:'", alloc = heap)
+        defer delete(msg_1)
+        return sem_erro(s, common.E0608, c.pos, msg_1)
+    }
+    var uso: NomeUsado = NomeUsado{nome = c.tipo_nome, pos = pos_do_tipo_do_caso(s, c), modulo = c.modulo}
+    let y: ^Simbolo = sem_achar_simbolo(s, c.tipo_nome, c.modulo)
+    if not sem_visivel(s, y, &uso) {
+        return false
+    }
+    if y.decl != en { // IA1-L8: homonimo de outro modulo (o nome puro bate, o enum nao)
+        let msg_2 = format(f"case de enum precisa ser 'case {sem_nome_texto(s, (en as ^frontend.Decl).nome)}.membro:'", alloc = heap)
+        defer delete(msg_2)
+        return sem_erro(s, common.E0608, c.pos, msg_2)
+    }
+    let idx: i32 = sem_achar_membro(s, en, c.membro, c.pos_membro)
+    if idx == SEM_MEMBRO_RECUSADO {
+        return false
+    }
+    if idx < 0 {
+        let msg_3 = format(f"o enum '{sem_nome_texto(s, (en as ^frontend.Decl).nome)}' nao tem o membro '{sem_nome_texto(s, c.membro)}'", alloc = heap)
+        defer delete(msg_3)
+        return sem_erro(s, common.E0608, c.pos, msg_3)
+    }
+    var membros: []u8 = cob.membros or_else {}
+    if membros[idx] != 0 {
+        let msg_4 = format(f"membro '{sem_nome_texto(s, c.membro)}' repetido", alloc = heap)
+        defer delete(msg_4)
+        return sem_erro(s, common.E0608, c.pos, msg_4)
+    }
+    membros[idx] = 1
+    cob.cobertos += 1
+    c.indice_membro = idx
+    return true
+}
+
+// C: semantic/sem_switch.c:66
+proc sem_tipo_do_caso(s: ^Semantica, c: ^frontend.Caso, t: ^u32) -> bool {
+    if c.tipo_escrito == none {
+        let arg_1: ^u32 = t
+        let arg_2: u8 = c.modulo
+        let arg_3: u32 = pos_do_tipo_do_caso(s, c)
+        let arg_4: i32 = c.tipo_nome
+        let arg_5: ^Semantica = s
+        if not sem_resolver_nome_tipo(arg_5, arg_4, arg_3, arg_2, arg_1) {
+            return false
+        }
+        return (not sem_eh_allocator(s, t^)) or (common.c2f_b2i32(sem_allocator_nome_fora_de_parametro(s, pos_do_tipo_do_caso(s, c))) != 0)
+    }
+    if not sem_resolver_tipo_ref(s, c.tipo_escrito) {
+        return false
+    }
+    t^ = (c.tipo_escrito as ^frontend.TipoRef).tipo
+    return true
+}
+
+// C: semantic/sem_switch.c:77
+proc caso_de_resultado(s: ^Semantica, c: ^frontend.Caso, alvo: u32, cob: ^Cobertura) -> bool {
+    var t: u32 = 0
+    if c.membro >= 0 {
+        let msg_1 = format(f"case de resultado e 'case Tipo:' ou 'case Erro:', sem membro", alloc = heap)
+        defer delete(msg_1)
+        return sem_erro(s, common.E0608, c.pos, msg_1)
+    }
+    if not sem_tipo_do_caso(s, c, &t) {
+        return false
+    }
+    let resultado: TipoInfo = tipo_de(&s.tipos, alvo)^
+    c.tipo = t
+    if t == resultado.a {
+        return repetido(s, c, &cob.valor)
+    }
+    if t == resultado.b {
+        return repetido(s, c, &cob.erro)
+    }
+    let texto = texto_do_tipo(s, alvo, 96)
+    defer delete(texto)
+    let texto_caso = texto_do_tipo(s, t, 96)
+    defer delete(texto_caso)
+    let msg_2 = format(f"o case '{texto_caso}' nao e o valor nem o erro do resultado {texto}", alloc = heap)
+    defer delete(msg_2)
+    return sem_erro(s, common.E0608, c.pos, msg_2)
+}
+
+// C: semantic/sem_switch.c:93
+// switch sobre ?T ou ?^T: 'case T:' (ou 'case ^T:') liga o valor, 'case none:' liga o valor inteiro.
+proc caso_de_opcional(s: ^Semantica, c: ^frontend.Caso, alvo: u32, cob: ^Cobertura) -> bool {
+    var t: u32 = 0
+    if c.membro >= 0 {
+        let msg_1 = format(f"case de ?T e 'case T:' ou 'case none:'", alloc = heap)
+        defer delete(msg_1)
+        return sem_erro(s, common.E0608, c.pos, msg_1)
+    }
+    if (c.tipo_escrito == none) and (c.tipo_nome == (frontend.KW_NONE - frontend.KW_CONST)) {
+        c.indice_membro = 0
+        c.tipo = alvo
+        return repetido(s, c, &cob.erro)
+    }
+    if not sem_tipo_do_caso(s, c, &t) {
+        return false
+    }
+    let k: TipoInfo = tipo_de(&s.tipos, alvo)^
+    var valor: u32 = k.a
+    if k.classe != (TC_OPCIONAL as u8) {
+        valor = tipo_ponteiro(&s.tipos, k.a)
+    }
+    if t != valor {
+        let texto = texto_do_tipo(s, t, 96)
+        defer delete(texto)
+        let texto_alvo = texto_do_tipo(s, alvo, 96)
+        defer delete(texto_alvo)
+        let msg_2 = format(f"o case '{texto}' nao e o valor de {texto_alvo} nem none", alloc = heap)
+        defer delete(msg_2)
+        return sem_erro(s, common.E0608, c.pos, msg_2)
+    }
+    c.indice_membro = 1
+    c.tipo = t
+    return repetido(s, c, &cob.valor)
+}
+
+// C: semantic/sem_switch.c:118
+// switch sobre union: 'case Variante:' liga o valor da variante; cada variante uma vez.
+proc caso_de_uniao(s: ^Semantica, c: ^frontend.Caso, alvo: u32, cob: ^Cobertura) -> bool {
+    var t: u32 = 0
+    if (c.membro >= 0) or ((c.tipo_escrito == none) and (c.tipo_nome == (frontend.KW_NONE - frontend.KW_CONST))) {
+        let msg_1 = format(f"case de union e 'case Variante:'", alloc = heap)
+        defer delete(msg_1)
+        return sem_erro(s, common.E0608, c.pos, msg_1)
+    }
+    if not sem_tipo_do_caso(s, c, &t) {
+        return false
+    }
+    let k: i32 = sem_variante_de(s, alvo, t)
+    let texto = texto_do_tipo(s, t, 96)
+    defer delete(texto)
+    let nome = texto_do_tipo(s, alvo, 96)
+    defer delete(nome)
+    if k < 0 {
+        let msg_2 = format(f"'{texto}' nao e variante da union '{nome}'", alloc = heap)
+        defer delete(msg_2)
+        return sem_erro(s, common.E0608, c.pos, msg_2)
+    }
+    var membros: []u8 = cob.membros or_else {}
+    if membros[k] != 0 {
+        let msg_3 = format(f"variante '{texto}' repetida", alloc = heap)
+        defer delete(msg_3)
+        return sem_erro(s, common.E0608, c.pos, msg_3)
+    }
+    membros[k] = 1
+    cob.cobertos += 1
+    c.indice_membro = k
+    c.tipo = t
+    return true
+}
+
+// C: semantic/sem_switch.c:139
+proc corpo_do_caso_2(s: ^Semantica, st: ^frontend.Stmt, c: ^frontend.Caso) -> bool {
+    let altura: u32 = escopo_altura(&s.escopo)
+    if st.nome >= 0 {
+        var novo: NovoLocal = NovoLocal{nome = st.nome, pos = sem_pos_depois_da_palavra(s, st.pos), tipo = c.tipo, natureza = LOC_LIGACAO as u8, origem = 0}
+        if not sem_declarar_local(s, &novo, &c.local_id) {
+            return false
+        }
+    }
+    let ok: bool = sem_bloco(s, c.corpo)
+    escopo_recuar(&s.escopo, altura)
+    return ok
+}
+
+// C: semantic/sem_switch.c:151
+proc sem_caso(s: ^Semantica, st: ^frontend.Stmt, c: ^frontend.Caso, alvo: u32, cob: ^Cobertura) -> bool {
+    var ok: bool = true
+    c.tipo = alvo
+    c.indice_membro = -1
+    c.local_id = -1
+    if c.padrao {
+        ok = repetido(s, c, &cob.padrao)
+    } else if cob.enumeracao != none {
+        ok = caso_de_enum(s, c, cob)
+    } else if cob.opcional {
+        ok = caso_de_opcional(s, c, alvo, cob)
+    } else if cob.uniao != none {
+        ok = caso_de_uniao(s, c, alvo, cob)
+    } else {
+        ok = caso_de_resultado(s, c, alvo, cob)
+    }
+    return (common.c2f_b2i32(ok) != 0) and (common.c2f_b2i32(corpo_do_caso_2(s, st, c)) != 0)
+}
+
+// C: semantic/sem_switch.c:165
+proc cobertura_do_enum(s: ^Semantica, st: ^frontend.Stmt, cob: ^Cobertura) -> bool {
+    let en: ?^frontend.Decl = cob.enumeracao
+    if cob.cobertos == (en as ^frontend.Decl).nmembros {
+        return true
+    }
+    let membros: []u8 = cob.membros or_else {}
+    for i in (0 as u32)..<(en as ^frontend.Decl).nmembros {
+        if membros[i] != 0 {
+            continue
+        }
+        let nome_membro: i32 = ((en as ^frontend.Decl).membros or_else {})[i].nome
+        let msg_1 = format(f"o switch nao cobre o membro '{sem_nome_texto(s, nome_membro)}' do enum '{sem_nome_texto(s, (en as ^frontend.Decl).nome)}' (faltam {(en as ^frontend.Decl).nmembros - cob.cobertos}): cubra todos ou use default", alloc = heap)
+        defer delete(msg_1)
+        return sem_erro(s, common.E0607, st.pos, msg_1)
+    }
+    return true
+}
+
+// C: semantic/sem_switch.c:177
+proc cobertura_da_uniao(s: ^Semantica, st: ^frontend.Stmt, cob: ^Cobertura) -> bool {
+    let un: ?^frontend.Decl = cob.uniao
+    if cob.cobertos == (un as ^frontend.Decl).ncampos {
+        return true
+    }
+    let membros: []u8 = cob.membros or_else {}
+    for i in (0 as u32)..<(un as ^frontend.Decl).ncampos {
+        if membros[i] != 0 {
+            continue
+        }
+        let texto = texto_do_tipo(s, (((un as ^frontend.Decl).campos or_else {})[i]).tipo.tipo, 96)
+        defer delete(texto)
+        let msg_1 = format(f"o switch nao cobre a variante '{texto}' da union '{sem_nome_texto(s, (un as ^frontend.Decl).nome)}' (faltam {(un as ^frontend.Decl).ncampos - cob.cobertos}): cubra todas ou use default", alloc = heap)
+        defer delete(msg_1)
+        return sem_erro(s, common.E0607, st.pos, msg_1)
+    }
+    return true
+}
+
+// C: semantic/sem_switch.c:191
+proc conferir_cobertura(s: ^Semantica, st: ^frontend.Stmt, cob: ^Cobertura) -> bool {
+    if cob.padrao {
+        return true
+    }
+    if cob.enumeracao != none {
+        return cobertura_do_enum(s, st, cob)
+    }
+    if cob.uniao != none {
+        return cobertura_da_uniao(s, st, cob)
+    }
+    if cob.valor and cob.erro {
+        return true
+    }
+    if cob.opcional {
+        let texto = texto_do_tipo(s, (st.expr as ^frontend.Expr).tipo, 96)
+        defer delete(texto)
+        let msg_1 = format(f"o switch sobre {texto} precisa de 'case T:' e 'case none:' (ou default)", alloc = heap)
+        defer delete(msg_1)
+        return sem_erro(s, common.E0607, st.pos, msg_1)
+    }
+    let msg_2 = format(f"o switch sobre resultado precisa cobrir o valor e o erro ('case Tipo:' e 'case Erro:'); em '! E' o lado do valor so se cobre com default", alloc = heap)
+    defer delete(msg_2)
+    return sem_erro(s, common.E0607, st.pos, msg_2)
+}
+
+// C: semantic/sem_switch.c:206
+proc iniciar_cobertura(s: ^Semantica, alvo: u32, cob: ^Cobertura) {
+    cob.enumeracao = (s.globais or_else {})[tipo_de(&s.tipos, alvo).a].decl
+    cob.membros = common.arena_fatia_u8(s.arena as ^common.Arena, ((cob.enumeracao as ^frontend.Decl).nmembros as int) + 1)
+}
+
+// C: semantic/sem_switch.c:212
+proc iniciar_cobertura_uniao(s: ^Semantica, alvo: u32, cob: ^Cobertura) {
+    cob.uniao = (s.globais or_else {})[tipo_de(&s.tipos, alvo).a].decl
+    cob.membros = common.arena_fatia_u8(s.arena as ^common.Arena, ((cob.uniao as ^frontend.Decl).ncampos as int) + 1)
+}
+
+// C: semantic/sem_switch.c:218
+proc sem_switch(s: ^Semantica, st: ^frontend.Stmt) -> bool {
+    var cob: Cobertura = Cobertura{}
+    if not sem_expr(s, st.expr, TIPO_VAZIO as u32) {
+        return false
+    }
+    let alvo: u32 = (st.expr as ^frontend.Expr).tipo
+    let classe: i32 = tipo_classe_de(&s.tipos, alvo)
+    cob.opcional = (classe == TC_OPCIONAL) or (classe == TC_ANULAVEL)
+    if (classe != TC_ENUM) and (classe != TC_RESULTADO) and (classe != TC_UNIAO) and (not cob.opcional) {
+        let texto = texto_do_tipo(s, alvo, 96)
+        defer delete(texto)
+        let msg_1 = format(f"switch aceita enum, resultado, ?T, ?^T ou union; recebeu {texto}", alloc = heap)
+        defer delete(msg_1)
+        return sem_erro(s, common.E0608, (st.expr as ^frontend.Expr).pos, msg_1)
+    }
+    if (classe == TC_RESULTADO) and (not sem_conferir_movimento(s, st.expr)) { // L-01: a ligacao recebe o dono; de um lvalor seria copia
+        return false
+    }
+    if classe == TC_ENUM {
+        iniciar_cobertura(s, alvo, &cob)
+    }
+    if classe == TC_UNIAO {
+        iniciar_cobertura_uniao(s, alvo, &cob)
+    }
+    for i in (0 as u32)..<st.ncasos {
+        if not sem_caso(s, st, &(st.casos or_else {})[i], alvo, &cob) {
+            return false
+        }
+    }
+    return conferir_cobertura(s, st, &cob)
+}

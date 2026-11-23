@@ -1,0 +1,96 @@
+// semantic/sem_posse_c.fj - porte de compiler/semantic/sem_posse_c.c
+// sha256 de semantic/sem_posse_c.c: 8d94566f74cde4e3d7693e4ab77a498363ebf5a71fb2af7c9df66dd1bba431c9
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "common"
+import "frontend"
+
+// C: semantic/sem_posse_c.c:10
+proc tipo_eh_handle_de_lib_c(s: ^Semantica, t: u32) -> bool {
+    if tipo_eh_inteiro(t) {
+        return true
+    }
+    let c: i32 = tipo_classe_de(&s.tipos, t)
+    return (((common.c2f_s2u_32(c) == (TC_PONTEIRO as u32)) or (common.c2f_s2u_32(c) == (TC_ANULAVEL as u32))) or (common.c2f_s2u_32(c) == (TC_RAWPTR as u32))) or (common.c2f_s2u_32(c) == (TC_STRUCT as u32))
+}
+
+// C: semantic/sem_posse_c.c:18
+proc sem_checar_posse_c(s: ^Semantica, d: ^frontend.Decl) -> bool {
+    let saida: bool = d.posse_c == (frontend.POSSE_C_CRIA_SAIDA as u8)
+    if d.posse_c == (frontend.POSSE_C_ENCERRA as u8) {
+        return true // M6d P92b: 'ends' nao tem handle (encerra a lib inteira)
+    }
+    var alvo: u32 = d.retorno.tipo
+    if d.posse_param >= 0 {
+        alvo = ((d.params or_else {})[d.posse_param]).tipo.tipo
+    }
+    if saida {
+        if tipo_classe_de(&s.tipos, alvo) != TC_PONTEIRO {
+            let texto: str = s4_descrever(s, alvo)
+            defer delete(texto)
+            let nome_param: str = sem_nome_texto(s, ((d.params or_else {})[d.posse_param]).nome)
+            let msg_1 = format(f"'creates {nome_param}' pede um parametro de saida ^H (o handle que a lib escreve em *p), mas o parametro e {texto}", alloc = heap)
+            defer delete(msg_1)
+            return sem_erro(s, common.E0912, d.pos_posse, msg_1)
+        }
+        alvo = tipo_de(&s.tipos, alvo).a
+    }
+    if tipo_eh_handle_de_lib_c(s, alvo) {
+        return true
+    }
+    let texto_2: str = s4_descrever(s, alvo)
+    defer delete(texto_2)
+    let msg_2 = format(f"{texto_2} nao e um handle de lib C: a clausula de posse vale para ^T, ?^T, rawptr, inteiro ou struct por valor", alloc = heap)
+    defer delete(msg_2)
+    return sem_erro(s, common.E0912, d.pos_posse, msg_2)
+}
+
+// ---------------------------------------------------------------- G3 S6: testes da clausula de posse (textos = saida real do forja.exe em tests\semantica\err_E0912_*)
+
+test "sem_posse_c: tipo_eh_handle_de_lib_c e sem_checar_posse_c (E0912: tipo nao handle, creates sem ^H; passa: ptr, inteiro, ends)" {
+    let c = s6_cen_novo("foreign {\n    proc abre_valor(saida: i32) -> i32 creates saida\n}\n")
+    defer s6_cen_liberar(c)
+    let s: ^Semantica = &c.s
+    let t_p: u32 = tipo_ponteiro(&s.tipos, TIPO_INT as u32)
+    expect(tipo_eh_handle_de_lib_c(s, TIPO_INT as u32) and tipo_eh_handle_de_lib_c(s, TIPO_U8 as u32))
+    expect(tipo_eh_handle_de_lib_c(s, t_p) and tipo_eh_handle_de_lib_c(s, tipo_anulavel(&s.tipos, TIPO_INT as u32)) and tipo_eh_handle_de_lib_c(s, TIPO_RAWPTR as u32))
+    expect(tipo_eh_handle_de_lib_c(s, tipo_struct(&s.tipos, s6_nome(c, "Arq"))))
+    expect(not tipo_eh_handle_de_lib_c(s, TIPO_BOOL as u32) and not tipo_eh_handle_de_lib_c(s, TIPO_F64 as u32) and not tipo_eh_handle_de_lib_c(s, TIPO_CSTR as u32))
+    expect(not tipo_eh_handle_de_lib_c(s, tipo_dinamico(&s.tipos, TIPO_INT as u32)))
+    let d = s4_novo_decl(s)
+    d.tipo_no = frontend.D_PROC as u8
+    var um: [1]i32 = {s6_nome(c, "saida")}
+    d.params = s6_params(s, um[..], TIPO_I32 as u32)
+    d.nparams = 1
+    d.retorno = frontend.TipoRef{tipo = TIPO_I32 as u32}
+    // creates saida com saida: i32 (err_E0912_creates_p_sem_ptr: coluna 48 = offset 57)
+    d.posse_c = frontend.POSSE_C_CRIA_SAIDA as u8
+    d.posse_param = 0
+    d.pos_posse = 57
+    expect(not sem_checar_posse_c(s, d))
+    expect(c.diag.tem and c.diag.codigo == common.E0912 and c.diag.off == 57)
+    expect((c.diag.causa or_else "") == "'creates saida' pede um parametro de saida ^H (o handle que a lib escreve em *p), mas o parametro e i32")
+    // creates saida com ^i32: o handle e o apontado (inteiro) -> ok
+    d.params = s6_params(s, um[..], tipo_ponteiro(&s.tipos, TIPO_I32 as u32))
+    expect(sem_checar_posse_c(s, d))
+    // creates saida com ^bool: o apontado nao e handle
+    d.params = s6_params(s, um[..], tipo_ponteiro(&s.tipos, TIPO_BOOL as u32))
+    expect(not sem_checar_posse_c(s, d))
+    expect((c.diag.causa or_else "") == "bool nao e um handle de lib C: a clausula de posse vale para ^T, ?^T, rawptr, inteiro ou struct por valor")
+    // destroys x com x: bool (err_E0912_tipo_nao_handle: coluna 46 = offset 55)
+    d.posse_c = frontend.POSSE_C_DESTROI as u8
+    d.params = s6_params(s, um[..], TIPO_BOOL as u32)
+    d.pos_posse = 55
+    expect(not sem_checar_posse_c(s, d))
+    expect(c.diag.off == 55 and (c.diag.causa or_else "") == "bool nao e um handle de lib C: a clausula de posse vale para ^T, ?^T, rawptr, inteiro ou struct por valor")
+    // 'creates' sem parametro (posse_param < 0): vale o retorno
+    d.posse_c = frontend.POSSE_C_CRIA_RETORNO as u8
+    d.posse_param = -1
+    expect(sem_checar_posse_c(s, d)) // retorno i32: inteiro
+    d.retorno = frontend.TipoRef{tipo = TIPO_BOOL as u32}
+    expect(not sem_checar_posse_c(s, d))
+    // 'ends' nao tem handle
+    d.posse_c = frontend.POSSE_C_ENCERRA as u8
+    expect(sem_checar_posse_c(s, d))
+}

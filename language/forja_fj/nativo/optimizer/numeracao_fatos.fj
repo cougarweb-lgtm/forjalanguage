@@ -1,0 +1,285 @@
+// nativo/optimizer/numeracao_fatos.fj - porte de compiler/nativo/optimizer/numeracao_fatos.c
+// sha256 de nativo/optimizer/numeracao_fatos.c: 4c973aff92675a027bc754a233e1156457d672d104b45783db4d23ee11c9b455
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.2.0
+// Changelog: 0.2.0 - O5: memoria de trabalho = fatias de c.temp (NumTemp); vetores e fatos crescem por append (sem realloc); tirada/Quadro fora da temp.
+
+import "common"
+import "nativo/bir"
+
+// C: nativo/optimizer/numeracao_fatos.c:13
+// C2F-VOID: p, retorno
+proc crescer(p: rawptr, novo: u64, tam: u64) -> rawptr {
+    common.falha_interna("numeracao: crescer nao existe na Forja; vetores crescem por append")
+    let nada: ?^u8 = none
+    return nada as rawptr
+}
+
+// C: nativo/optimizer/numeracao_fatos.c:22
+proc num_vetor_acrescentar(vetor: ^NumVetor, valor: u32) {
+    if cap(vetor.v) == 0 {
+        vetor.v = make([dynamic]u32, alloc = heap, cap = 64)
+    }
+    if (vetor.n as int) == len(vetor.v) {
+        append(&vetor.v, item = valor)
+    } else {
+        vetor.v[vetor.n] = valor
+    }
+    vetor.n += 1
+    vetor.cap = (cap(vetor.v) as u64) as u32
+}
+
+// C: nativo/optimizer/numeracao_fatos.c:31
+// Fatia de palavras_n palavras de c.temp a partir do uso atual; preenchimento 0 zera, 255 (0xFF no C) vira 0xFFFFFFFF.
+proc num_temp(c: ^NumCtx, palavras: u64, preenchimento: i32) -> []u32 {
+    if c.temp_usado + palavras > c.temp_cap {
+        let msg = format(f"numeracao: memoria de trabalho insuficiente ({c.temp_usado} + {palavras} > {c.temp_cap})", alloc = heap)
+        defer delete(msg)
+        common.falha_interna(msg)
+    }
+    let ini: u64 = c.temp_usado
+    var valor: u32 = 0
+    if preenchimento != 0 {
+        valor = 4294967295
+    }
+    c.temp_usado += palavras
+    var k: u64 = ini
+    while k < c.temp_usado {
+        c.temp[k as int] = valor
+        k += 1
+    }
+    return c.temp[(ini as int)..<(c.temp_usado as int)]
+}
+
+// C: nativo/optimizer/numeracao_fatos.c:43
+proc num_preparar(c: ^NumCtx, palavras: u64) {
+    if palavras > c.temp_cap {
+        delete(c.temp)
+        c.temp_cap = palavras + palavras / 2
+        c.temp = make([dynamic]u32, alloc = heap, cap = c.temp_cap as int)
+        var k: u64 = 0
+        while k < c.temp_cap {
+            append(&c.temp, item = 0)
+            k += 1
+        }
+    }
+    c.temp_usado = 0
+    c.nfatos = 0
+    c.cargas.n = 0
+    c.verlog.n = 0
+    c.mortos.n = 0
+    c.seq = 0
+    c.n = NumContagem{}
+}
+
+// C: nativo/optimizer/numeracao_fatos.c:57
+proc num_fatos_iniciar(c: ^NumCtx, ninstrs: u32) {
+    var baldes: u32 = 64
+    while (baldes < ninstrs) and (baldes < 4194304) {
+        baldes = baldes * 2
+    }
+    c.mascara = baldes - 1
+    c.balde = num_temp(c, baldes as u64, 255)
+    c.ver = num_temp(c, (c.nvregs as u64) + 1, 0)
+    c.cp = num_temp(c, (c.nvregs as u64) + 1, 255)
+}
+
+// C: nativo/optimizer/numeracao_fatos.c:70
+// Fim do programa: devolve tudo (a memoria de trabalho e os vetores vivem o programa inteiro).
+proc num_fatos_liberar(c: ^NumCtx) {
+    delete(c.fatos)
+    delete(c.temp)
+    delete(c.cargas.v)
+    delete(c.verlog.v)
+    delete(c.mortos.v)
+}
+
+// C: nativo/optimizer/numeracao_fatos.c:79
+proc num_marcar(c: ^NumCtx) -> NumMarca {
+    return NumMarca{nfatos = c.nfatos, ncargas = c.cargas.n, nverlog = c.verlog.n, nmortos = c.mortos.n}
+}
+
+// C: nativo/optimizer/numeracao_fatos.c:85
+proc desfazer_fato(c: ^NumCtx, k: u32) {
+    let f: ^NumFato = &c.fatos[k]
+    if f.copia != 0 {
+        let p_1 = c.cp or_else {}
+        p_1[f.dep[0]] = f.prox
+    } else {
+        let p_2 = c.balde or_else {}
+        p_2[f.hash & c.mascara] = f.prox
+    }
+}
+
+// C: nativo/optimizer/numeracao_fatos.c:96
+proc num_restaurar(c: ^NumCtx, marca: NumMarca, versoes: bool) {
+    while c.nfatos > marca.nfatos {
+        c.nfatos -= 1
+        desfazer_fato(c, c.nfatos)
+    }
+    c.cargas.n = marca.ncargas
+    if not versoes {
+        return
+    }
+    while c.verlog.n > marca.nverlog {
+        c.verlog.n -= 1
+        let vreg_mudado: u32 = c.verlog.v[c.verlog.n]
+        let p_3 = c.ver or_else {}
+        p_3[vreg_mudado] -= 1
+    }
+    while c.mortos.n > marca.nmortos {
+        c.mortos.n -= 1
+        let fato_morto: u32 = c.mortos.v[c.mortos.n]
+        c.fatos[fato_morto].morta = 0
+    }
+}
+
+// C: nativo/optimizer/numeracao_fatos.c:109
+proc num_definir(c: ^NumCtx, vreg: u32) {
+    let p_1 = c.ver or_else {}
+    p_1[vreg] += 1
+    num_vetor_acrescentar(&c.verlog, vreg)
+}
+
+// C: nativo/optimizer/numeracao_fatos.c:115
+proc num_fato_valido(c: ^NumCtx, fato: ^NumFato, ebb: u32) -> bool {
+    if ((fato.morta as i32) != 0) or ((not (fato.global != 0)) and (fato.ebb != ebb)) {
+        return false
+    }
+    for k in (0 as u32)..<3 {
+        if (fato.dep[k] != NUM_SEM) and ((c.ver or_else {})[fato.dep[k]] != fato.ver[k]) {
+            return false
+        }
+    }
+    return true
+}
+
+// C: nativo/optimizer/numeracao_fatos.c:126
+proc chaves_iguais(x: ^NumChave, y: ^NumChave) -> bool {
+    return ((((((((((x.op as i32) == (y.op as i32)) and ((x.aux as i32) == (y.aux as i32))) and ((x.classe as i32) == (y.classe as i32))) and ((x.ta as i32) == (y.ta as i32))) and ((x.tb as i32) == (y.tb as i32))) and ((x.ca as i32) == (y.ca as i32))) and ((x.cb as i32) == (y.cb as i32))) and (x.va == y.va)) and (x.vb == y.vb)) and (x.desloc == y.desloc)
+}
+
+// C: nativo/optimizer/numeracao_fatos.c:132
+proc misturar(h: u64, v: u64) -> u32 {
+    var h_v: u64 = h
+    h_v = h_v ~ wrapping_add(wrapping_add(wrapping_add(v, 11400714819323198485), h_v << 6), h_v >> 2)
+    return common.c2f_trunc_u32(h_v ~ (h_v >> 32))
+}
+
+// C: nativo/optimizer/numeracao_fatos.c:138
+proc hash_da(k: ^NumChave) -> u32 {
+    var h: u64 = ((((((k.op as u64) | ((k.aux as u64) << 8)) | ((k.classe as u64) << 16)) | ((k.ta as u64) << 24)) | ((k.tb as u64) << 32)) | ((k.ca as u64) << 40)) | ((k.cb as u64) << 48)
+    h = misturar(h, common.c2f_s2u_64(k.va)) as u64
+    h = misturar(h, common.c2f_s2u_64(k.vb)) as u64
+    return misturar(h, common.c2f_s2u_32(k.desloc) as u64)
+}
+
+// C: nativo/optimizer/numeracao_fatos.c:148
+proc num_buscar(c: ^NumCtx, chave: ^NumChave, ebb: u32) -> u32 {
+    var k: u32 = (c.balde or_else {})[hash_da(chave) & c.mascara]
+    var visitados: u32 = 0
+    while (k != NUM_SEM) and (visitados < NUM_CADEIA_MAX) {
+        let f: ^NumFato = &c.fatos[k]
+        if ((not (f.copia != 0)) and (common.c2f_b2i32(chaves_iguais(&f.chave, chave)) != 0)) and (common.c2f_b2i32(num_fato_valido(c, f, ebb)) != 0) {
+            return k
+        }
+        k = f.prox
+        visitados += 1
+    }
+    return NUM_SEM
+}
+
+// C: nativo/optimizer/numeracao_fatos.c:163
+proc num_inserir(c: ^NumCtx, fato: NumFato) {
+    var novo: NumFato = fato
+    if cap(c.fatos) == 0 {
+        c.fatos = make([dynamic]NumFato, alloc = heap, cap = 256)
+    }
+    novo.morta = 0
+    if novo.copia != 0 {
+        let p_1 = c.cp or_else {}
+        novo.prox = p_1[novo.dep[0]]
+        p_1[novo.dep[0]] = c.nfatos
+    } else {
+        novo.hash = hash_da(&novo.chave)
+        let p_2 = c.balde or_else {}
+        novo.prox = p_2[novo.hash & c.mascara]
+        p_2[novo.hash & c.mascara] = c.nfatos
+    }
+    if (novo.copia == 0) and (novo.chave.op == (bir.BIR_CARREGA as u8)) {
+        num_vetor_acrescentar(&c.cargas, c.nfatos)
+    }
+    if (c.nfatos as int) == len(c.fatos) {
+        append(&c.fatos, item = novo)
+    } else {
+        c.fatos[c.nfatos] = novo
+    }
+    c.nfatos += 1
+    c.capfatos = (cap(c.fatos) as u64) as u32
+}
+
+// C: nativo/optimizer/numeracao_fatos.c:183
+proc num_matar(c: ^NumCtx, fato: u32) {
+    if c.fatos[fato].morta != 0 {
+        return
+    }
+    c.fatos[fato].morta = 1
+    num_vetor_acrescentar(&c.mortos, fato)
+}
+
+// Valores de referencia: gcc sobre compiler/nativo/optimizer/numeracao_fatos.c (Misturar/HashDa).
+test "num_hash_misturar_e_hash_da_do_c" {
+    expect(misturar(0, 0) == 3783067052)
+    expect(misturar(1, 2) == 3783067119)
+    expect(misturar(18446744073709551615, 11400714819323198485) == 2197423259)
+    expect(misturar(12345, 9223372036854775808) == 1633804259)
+    var k1 = NumChave{op = 5, aux = 0, classe = 3, ta = 1, tb = 2, ca = 0, cb = 0, va = -1, vb = 7, desloc = -4}
+    expect(hash_da(&k1) == 3955146419)
+    var k2 = NumChave{op = 33, aux = 2, classe = 6, ta = 2, tb = 2, ca = 1, cb = 3, va = 123456789012, vb = 0, desloc = 16}
+    expect(hash_da(&k2) == 2688041610)
+}
+
+test "num_temp_fatia_zera_ou_enche" {
+    var c = NumCtx{}
+    num_preparar(&c, 16)
+    let a = num_temp(&c, 3, 0)
+    let b = num_temp(&c, 2, 255)
+    expect(len(a) == 3 and a[0] == 0 and a[2] == 0)
+    expect(len(b) == 2 and b[0] == 4294967295 and b[1] == 4294967295)
+    expect(c.temp_usado == 5)
+    num_fatos_liberar(&c)
+}
+
+test "num_vetor_cresce_e_restaura_topo" {
+    var c = NumCtx{}
+    num_preparar(&c, 16)
+    var i: u32 = 0
+    while i < 100 {
+        num_vetor_acrescentar(&c.cargas, i * 3)
+        i += 1
+    }
+    expect(c.cargas.n == 100 and c.cargas.v[99] == 297)
+    num_restaurar(&c, NumMarca{nfatos = 0, ncargas = 2, nverlog = 0, nmortos = 0}, false)
+    expect(c.cargas.n == 2)
+    num_vetor_acrescentar(&c.cargas, 77)
+    expect(c.cargas.n == 3 and c.cargas.v[2] == 77 and c.cargas.v[1] == 3)
+    num_fatos_liberar(&c)
+}
+
+test "num_tabela_acha_fato_e_invalida_por_versao" {
+    var c = NumCtx{nvregs = 4}
+    num_preparar(&c, 64)
+    num_fatos_iniciar(&c, 8)
+    var ch = NumChave{op = 2, classe = 4, ta = 1, va = 2, tb = 1, vb = 3}
+    var fato = NumFato{chave = ch, res = 3, ebb = 0, seq = 1, global = 1}
+    fato.dep[0] = 3
+    fato.dep[1] = 2
+    fato.dep[2] = NUM_SEM
+    num_inserir(&c, fato)
+    expect(num_buscar(&c, &ch, 0) == 0)
+    num_definir(&c, 2)
+    expect(num_buscar(&c, &ch, 0) == NUM_SEM)
+    num_restaurar(&c, NumMarca{nfatos = 0, ncargas = 0, nverlog = 0, nmortos = 0}, true)
+    expect(c.nfatos == 0)
+    num_fatos_liberar(&c)
+}

@@ -1,0 +1,371 @@
+// driver/limites.fj - porte de compiler/driver/limites.c, compiler/driver/limites.h
+// sha256 de driver/limites.c: bcfb80a236780a46798d8ed25a087008db047988e2df071293a591dbdb70dff1
+// sha256 de driver/limites.h: 41710b250e8122e784296db686b44ffdc86f2d480835cfc37519cec2075cf96c
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.2.0
+// Changelog: 0.2.0 - G3 P-driver DA: corpo real. C2F-70: MotivoArquivo (global char[856]) -> texto do alocador frame (devolvido a quem chamou, como o ponteiro do estatico);
+//            SaidaDiag unico por `sd` nas 4 procs que imprimem diagnostico; ler_digitos devolve o fim como indice (`fim: ^int`); ler_arquivo_inteiro devolve os bytes numa lista e o
+//            motivo por ^str (a Forja nao tem malloc com NUL final); resolver_escapes e separar_linhas viram texto novo por linha (a Forja nao tem str mutavel); o errno do fopen vem de
+//            errno_ao_abrir (file.open devolve FileError, nao errno). O exit do filho (DWORD) volta como i32 pelo transmute.
+
+import "std:file"
+import "common"
+import "nativo"
+
+struct Limites {
+    tempo_s: f64
+    mem_bytes: u64
+    saida_bytes: u64
+}
+
+const LIMITES_SAIDA_TEMPO: i32 = 102
+const LIMITES_SAIDA_MEMORIA: i32 = 103
+const LIMITES_SAIDA_SAIDA: i32 = 104
+const LIMITES_SAIDA_PILHA: i32 = 101 // R0016: estouro da pilha nativa (saida de falha de execucao)
+const STATUS_ESTOURO_PILHA: u32 = 3221225725 // 0xC00000FD: STATUS_STACK_OVERFLOW, o Windows mata o exe com ele
+const TEMPO_MIN_S: f64 = 0.001
+const TEMPO_MAX_S: f64 = 86400.0
+const MEM_MAX_MIB: u64 = 1048576
+const SAIDA_MAX_BYTES: u64 = 1099511627776
+const ARGS_FILE_MAX: u32 = 1048576
+const DIGITOS_MAX: i32 = 15
+const MOTIVO_ARQUIVO_MAX: int = 856
+const CAUSA_TEMPO_MAX: int = 400
+const CAUSA_SAIDA_MAX: int = 500
+
+// C: driver/limites.c:32
+// Digitos (1 a 15) no inicio do texto; fim = indice do primeiro byte depois deles. false = nao comeca por digito (ou tem mais de 15).
+proc ler_digitos(texto: str, valor: ^u64, fim: ^int) -> bool {
+    var p: int = 0
+    valor^ = 0
+    while (common.c2f_nul_em(texto, p) >= 48) and (common.c2f_nul_em(texto, p) <= 57) and (p < (DIGITOS_MAX as int)) { // '0' '9'
+        valor^ = (valor^ * 10) + ((texto[p] - 48) as u64)
+        p += 1
+    }
+    fim^ = p
+    let seguinte: u8 = common.c2f_nul_em(texto, p)
+    return (p > 0) and (not ((seguinte >= 48) and (seguinte <= 57)))
+}
+
+// C: driver/limites.c:43
+// Segundos: "5", "0.5" ou "12.25" (so digitos e um ponto).
+proc ler_tempo(texto: str, segundos: ^f64) -> bool {
+    var inteiro: u64 = 0
+    var fracao: u64 = 0
+    var fim: int = 0
+    if not ler_digitos(texto, &inteiro, &fim) {
+        return false
+    }
+    if common.c2f_nul_em(texto, fim) == 46 { // '.'
+        var fim_fracao: int = 0
+        if not ler_digitos(texto[(fim + 1)..<len(texto)], &fracao, &fim_fracao) {
+            return false
+        }
+        fim = fim + 1 + fim_fracao
+    }
+    if common.c2f_nul_em(texto, fim) != 0 {
+        return false
+    }
+    var fim_real: int = 0
+    segundos^ = common.c2f_strtod(texto, &fim_real)
+    return (segundos^ >= TEMPO_MIN_S) and (segundos^ <= TEMPO_MAX_S)
+}
+
+// C: driver/limites.c:55
+proc ler_memoria(texto: str, bytes: ^u64) -> bool {
+    var mib: u64 = 0
+    var fim: int = 0
+    if (not ler_digitos(texto, &mib, &fim)) or (common.c2f_nul_em(texto, fim) != 0) or (mib < 1) or (mib > MEM_MAX_MIB) {
+        return false
+    }
+    bytes^ = mib << 20
+    return true
+}
+
+// C: driver/limites.c:66
+// Bytes: "65536", "64KiB" ou "1MiB" (KiB e MiB em qualquer caixa).
+proc ler_saida(texto: str, bytes: ^u64) -> bool {
+    var n: u64 = 0
+    var fim: int = 0
+    if not ler_digitos(texto, &n, &fim) {
+        return false
+    }
+    let sufixo: str = texto[fim..<len(texto)]
+    if common.c2f_stricmp(sufixo, "KiB") == 0 {
+        n = n << 10
+    } else if common.c2f_stricmp(sufixo, "MiB") == 0 {
+        n = n << 20
+    } else if len(sufixo) != 0 {
+        return false
+    }
+    bytes^ = n
+    return (n >= 1) and (n <= SAIDA_MAX_BYTES)
+}
+
+// C: driver/limites.c:79
+proc limites_ler(o: ^Opcoes, limites: ^Limites) -> ?str {
+    limites^ = Limites{tempo_s = 0.0}
+    if (o.limite_tempo != none) and (not ler_tempo(o.limite_tempo or_else "", &limites.tempo_s)) {
+        return "--limite-tempo aceita segundos, de 0.001 a 86400 (ex.: 5 ou 0.5)"
+    }
+    if (o.limite_mem != none) and (not ler_memoria(o.limite_mem or_else "", &limites.mem_bytes)) {
+        return "--limite-mem aceita um numero inteiro de MiB, de 1 a 1048576"
+    }
+    if (o.limite_saida != none) and (not ler_saida(o.limite_saida or_else "", &limites.saida_bytes)) {
+        return "--limite-saida aceita bytes, KiB ou MiB (ex.: 65536, 64KiB, 1MiB), de 1 byte a 1 TiB"
+    }
+    return none
+}
+
+// errno que o fopen(caminho, "rb") do C da (UCRT) para a falha que o file.open devolveu: nao existe e caminho dentro de arquivo = ENOENT (2); sem permissao, pasta e arquivo
+// travado = EACCES (13); caminho vazio ou invalido = EINVAL (22).
+proc errno_ao_abrir(e: file.FileError, caminho: str) -> i32 {
+    if len(caminho) == 0 {
+        return 22
+    }
+    if (e == file.FileError.not_found) or (e == file.FileError.not_directory) {
+        return 2
+    }
+    if (e == file.FileError.no_permission) or (e == file.FileError.is_directory) or (e == file.FileError.locked) {
+        return 13
+    }
+    return 22
+}
+
+// Texto de mensagem no alocador frame (o C usava o buffer estatico MotivoArquivo[856]: vive ate o fim do processo), cortado em 855 bytes como o snprintf.
+proc motivo_do_arquivo(texto: str) -> str {
+    return cortar_em_frame(texto, MOTIVO_ARQUIVO_MAX - 1)
+}
+
+// C: driver/limites.c:93
+// O arquivo inteiro em dados (ate ARGS_FILE_MAX + 1 bytes: mais que o maximo e erro). false = nao leu: o motivo (texto de frame) vai em motivo.
+proc ler_arquivo_inteiro(caminho: str, dados: ^[dynamic]u8, motivo: ^str) -> bool {
+    switch r in file.open(caminho, file.OpenMode.read) {
+    case file.File:
+        var arq: file.File = r
+        resize(dados, (ARGS_FILE_MAX as int) + 1)
+        var lido: int = 0
+        while lido < len(dados^) {
+            let n: int = file.read(&arq, dados[lido..<len(dados^)]) or_else -1
+            if n <= 0 {
+                break
+            }
+            lido += n
+        }
+        file.close(&arq)
+        truncate(dados, lido)
+        if lido > (ARGS_FILE_MAX as int) {
+            let msg = format(f"--args-file: '{caminho}' passa de 1 MiB (ou faltou memoria)", alloc = heap)
+            defer delete(msg)
+            motivo^ = motivo_do_arquivo(msg)
+            return false
+        }
+        return true
+    case file.FileError:
+        var causa_buf = make([dynamic]u8, alloc = heap, len = (ERRO_TEXTO_MAX as int))
+        defer delete(causa_buf)
+        erro_crt_texto(errno_ao_abrir(r, caminho), causa_buf[..], ERRO_TEXTO_MAX as u64)
+        let causa = from_bytes(causa_buf[0..<common.c2f_strlen_b(causa_buf[..])], alloc = heap)
+        defer delete(causa)
+        let msg = format(f"--args-file: nao consegui abrir '{caminho}' ({causa})", alloc = heap)
+        defer delete(msg)
+        motivo^ = motivo_do_arquivo(msg)
+        return false
+    }
+    return false
+}
+
+// C: driver/limites.c:117
+// Escapes da linha: \n vira quebra de linha, \\ vira uma barra; outra barra fica como esta. O resultado e texto novo no alocador frame (argumento do programa, sem dono).
+proc resolver_escapes(linha: []u8) -> str {
+    var saida = make([dynamic]u8, alloc = heap)
+    defer delete(saida)
+    var p: int = 0
+    while p < len(linha) {
+        if (linha[p] == 92) and (common.c2f_nul_em_b(linha, p + 1) == 110) { // '\\' 'n'
+            append(&saida, item = 10) // '\n'
+            p += 2
+        } else if (linha[p] == 92) and (common.c2f_nul_em_b(linha, p + 1) == 92) { // '\\' '\\'
+            append(&saida, item = 92) // '\\'
+            p += 2
+        } else {
+            append(&saida, item = linha[p])
+            p += 1
+        }
+    }
+    return from_bytes(saida[..], alloc = frame)
+}
+
+// C: driver/limites.c:136
+// Quantas linhas o texto tem (a ultima conta sem fim de linha; texto vazio = 0).
+proc contar_linhas_2(texto: []u8, tam: u64) -> u64 {
+    var linhas: u64 = 0
+    for k in (0 as u64)..<tam {
+        linhas += common.c2f_b2i32(texto[k] == 10) as u64 // '\n'
+    }
+    return linhas + (common.c2f_b2i32((tam > 0) and (texto[tam - 1] != 10)) as u64) // '\n'
+}
+
+// C: driver/limites.c:145
+// Corta o texto em linhas, tira o CR do fim e resolve os escapes; cada linha entra em lista (texto novo). O C marcava o fim com NUL no proprio texto: aqui o fim e o indice.
+proc separar_linhas(texto: []u8, tam: u64, lista: ^[dynamic]str) {
+    var inicio: u64 = 0
+    var k: u64 = 0
+    while k <= tam {
+        let fim_de_linha: bool = (common.c2f_nul_em_b(texto, k as int) == 10) or ((k == tam) and (k > inicio)) // '\n'
+        if fim_de_linha {
+            var fim: u64 = k
+            if (k > inicio) and (texto[k - 1] == 13) { // '\r'
+                fim = k - 1
+            }
+            append(lista, item = resolver_escapes(texto[inicio..<fim]))
+            inicio = k + 1
+        }
+        k += 1
+    }
+}
+
+// C: driver/limites.c:161
+// --args-file: as linhas do arquivo vem antes dos argumentos depois do '--'. Devolve o motivo do erro (texto de frame) ou none.
+proc limites_preparar_argumentos(o: ^Opcoes) -> ?str {
+    if o.args_file == none {
+        return none
+    }
+    let arquivo: str = o.args_file or_else ""
+    var dados = make([dynamic]u8, alloc = heap)
+    defer delete(dados)
+    var motivo: str = ""
+    if not ler_arquivo_inteiro(arquivo, &dados, &motivo) {
+        return motivo
+    }
+    var tam: u64 = len(dados) as u64
+    for k in (0 as u64)..<tam {
+        if dados[k] == 0 {
+            let msg = format(f"--args-file: '{arquivo}' tem byte nulo (argumento nao leva NUL)", alloc = heap)
+            defer delete(msg)
+            return motivo_do_arquivo(msg)
+        }
+    }
+    var texto: []u8 = dados[0..<len(dados)]
+    if (tam >= 3) and (texto[0] == 0xEF) and (texto[1] == 0xBB) and (texto[2] == 0xBF) { // BOM UTF-8 do Bloco de Notas
+        texto = dados[3..<len(dados)]
+        tam -= 3
+    }
+    let linhas: u64 = contar_linhas_2(texto, tam)
+    // lista de frame: o Opcoes guarda so a fatia e nenhum dono a libera (o C usava malloc sem free)
+    var lista = make([dynamic]str, alloc = frame)
+    separar_linhas(texto, tam, &lista)
+    for k in (0 as i32)..<o.nargs_programa {
+        append(&lista, item = (o.args_programa or_else {})[k])
+    }
+    o.args_programa = lista[..]
+    o.nargs_programa += linhas as i32
+    return none
+}
+
+// C: driver/limites.c:191
+proc limite_de_tempo(o: ^Opcoes, sd: ^common.SaidaDiag) -> i32 {
+    let limite: str = o.limite_tempo or_else "(null)"
+    let completo = format(f"o programa passou do limite de tempo (--limite-tempo {limite} s) e foi encerrado com os processos filhos", alloc = heap)
+    defer delete(completo)
+    let causa = common.c2f_cortar(completo, CAUSA_TEMPO_MAX - 1)
+    defer delete(causa)
+    let erro = common.c2f_saida_stderr()
+    common.diag_imprimir_json_sem_fonte(common.R0013, causa, erro, sd)
+    _ = common.c2f_saida_fechar(erro)
+    return LIMITES_SAIDA_TEMPO
+}
+
+// C: driver/limites.c:200
+proc limite_de_memoria(o: ^Opcoes, r: ^FilhoResultado, sd: ^common.SaidaDiag) -> i32 {
+    let pico_mib: u64 = (r.pico_mem + 1048575) >> 20 // (pico + (1ull << 20) - 1) >> 20
+    let limite: str = o.limite_mem or_else "(null)"
+    let completo = format(f"o programa passou do limite de memoria (--limite-mem {limite} MiB; pico medido: {pico_mib} MiB) e foi encerrado com os processos filhos", alloc = heap)
+    defer delete(completo)
+    let causa = common.c2f_cortar(completo, CAUSA_TEMPO_MAX - 1)
+    defer delete(causa)
+    let erro = common.c2f_saida_stderr()
+    common.diag_imprimir_json_sem_fonte(common.R0014, causa, erro, sd)
+    _ = common.c2f_saida_fechar(erro)
+    return LIMITES_SAIDA_MEMORIA
+}
+
+// C: driver/limites.c:210
+proc limite_de_saida(o: ^Opcoes, l: ^Limites, r: ^FilhoResultado, sd: ^common.SaidaDiag) -> i32 {
+    let limite: str = o.limite_saida or_else "(null)"
+    let completo = format(f"o programa passou do limite de saida (--limite-saida {limite} = {l.saida_bytes} bytes de stdout + stderr): a saida foi cortada nele, {r.descartados} bytes foram descartados e o programa foi encerrado", alloc = heap)
+    defer delete(completo)
+    let causa = common.c2f_cortar(completo, CAUSA_SAIDA_MAX - 1)
+    defer delete(causa)
+    let erro = common.c2f_saida_stderr()
+    common.diag_imprimir_json_sem_fonte(common.R0015, causa, erro, sd)
+    _ = common.c2f_saida_fechar(erro)
+    return LIMITES_SAIDA_SAIDA
+}
+
+// R0016: o programa estourou a pilha nativa (8 MiB no exe gerado); mesmo JSON do wasm, saida 101
+proc limite_de_pilha(sd: ^common.SaidaDiag) -> i32 {
+    let erro = common.c2f_saida_stderr()
+    common.diag_imprimir_json_sem_fonte(common.R0016, "estouro de pilha: recursao funda demais", erro, sd)
+    _ = common.c2f_saida_fechar(erro)
+    return LIMITES_SAIDA_PILHA
+}
+
+// C: driver/limites.c:220
+// Roda o exe do usuario sob os limites; devolve o exit dele ou 102..104 se um limite estourou. Falha ao iniciar = exit 3 com a mensagem no stderr.
+proc limites_executar(o: ^Opcoes, arq_exe: str, sd: ^common.SaidaDiag) -> i32 {
+    var pedido: FilhoPedido = FilhoPedido{exe = arq_exe, enriquecer = not o.resumo}
+    if o.nargs_programa > 0 {
+        pedido.args = o.args_programa
+    }
+    return limites_rodar_pedido(o, &pedido, sd)
+}
+
+// 0.33.0: run/test no alvo wasm: o Node roda o executor embutido (prefixo = flags do node, o script e o .wasm); mesmos limites e mesmos exits do exe nativo
+// 0.34.0: os argumentos do programa (-- args e --args-file, ja juntos em o.args_programa) seguem o prefixo; o executor os entrega ao wasm por args_get
+proc limites_executar_node(o: ^Opcoes, prefixo: []str, sd: ^common.SaidaDiag) -> i32 {
+    var lista = make([dynamic]str, alloc = frame)
+    for k in 0..<len(prefixo) {
+        append(&lista, item = prefixo[k])
+    }
+    for k in (0 as i32)..<o.nargs_programa {
+        append(&lista, item = (o.args_programa or_else {})[k])
+    }
+    var pedido: FilhoPedido = FilhoPedido{exe = "node", args = lista[..], enriquecer = not o.resumo}
+    return limites_rodar_pedido(o, &pedido, sd)
+}
+
+proc limites_rodar_pedido(o: ^Opcoes, pedido: ^FilhoPedido, sd: ^common.SaidaDiag) -> i32 {
+    var l: Limites = Limites{}
+    var r: FilhoResultado = FilhoResultado{}
+    var erro: u32 = 0
+    let arq_exe: str = pedido.exe or_else ""
+    _ = limites_ler(o, &l) // ja conferido em opcoes_validar
+    pedido.limite_tempo_s = l.tempo_s
+    pedido.limite_mem = l.mem_bytes
+    pedido.limite_saida = l.saida_bytes
+    if not filho_executar(pedido, &r, &erro) {
+        var causa_buf = make([dynamic]u8, alloc = heap, len = (ERRO_TEXTO_MAX as int))
+        defer delete(causa_buf)
+        erro_win_texto(erro, causa_buf[..], ERRO_TEXTO_MAX as u64)
+        let causa = from_bytes(causa_buf[0..<common.c2f_strlen_b(causa_buf[..])], alloc = heap)
+        defer delete(causa)
+        let msg = format(f"forja: nao consegui iniciar {arq_exe} ({causa})\n", alloc = heap)
+        defer delete(msg)
+        driver_stderr_texto(msg)
+        return nativo.SAIDA_INTERNO
+    }
+    if r.fim == FILHO_ESTOUROU_TEMPO {
+        return limite_de_tempo(o, sd)
+    }
+    if r.fim == FILHO_ESTOUROU_MEMORIA {
+        return limite_de_memoria(o, &r, sd)
+    }
+    if r.fim == FILHO_ESTOUROU_SAIDA {
+        return limite_de_saida(o, &l, &r, sd)
+    }
+    if r.codigo == STATUS_ESTOURO_PILHA {
+        return limite_de_pilha(sd)
+    }
+    return transmute(r.codigo, to = i32) // (int)r.codigo
+}

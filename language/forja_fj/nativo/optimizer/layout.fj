@@ -1,0 +1,315 @@
+// nativo/optimizer/layout.fj - porte de compiler/nativo/optimizer/layout.c
+// sha256 de nativo/optimizer/layout.c: 4d87ccb813cabafe52c934dfb0d12bd16b64b57a4ddfb7da973308f33b26a018
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "common"
+import "nativo/bir"
+
+struct Layout {
+    f: ?^bir.BirFuncao
+    a: ?^bir.AnalisesBir
+    ordem: ?[]u32
+    nordem: u32
+    fila: ?[]u32
+    nfila: u32
+    pos: []u32 // C2F-INDECIDIVEL
+    colocado: []u8 // C2F-INDECIDIVEL
+    emlaco: []u8 // C2F-INDECIDIVEL
+    memoria: [dynamic]u32 // dono de ordem/pos/fila (visoes)
+    memoria_u8: [dynamic]u8 // dono de colocado/emlaco (visoes)
+}
+
+// C: nativo/optimizer/layout.c:27
+proc eh_frio_ou_armadilha(f: ^bir.BirFuncao, b: u32) -> bool {
+    let k: ^bir.BirBloco = &f.blocos[b]
+    return (common.c2f_b2i32(k.frio) != 0) or (k.instrs[k.n - 1].op == (bir.BIR_ARMADILHA as u8))
+}
+
+// C: nativo/optimizer/layout.c:34
+proc nota(l: ^Layout, b: u32) -> u32 {
+    var tern_1: u32 = 0
+    if common.c2f_b2i32(eh_frio_ou_armadilha(l.f as ^bir.BirFuncao, b)) != 0 {
+        tern_1 = 0
+    } else {
+        tern_1 = 1 + ((l.a as ^bir.AnalisesBir).prof_laco or_else {})[b]
+    }
+    return tern_1
+}
+
+// C: nativo/optimizer/layout.c:40
+proc melhor_que(l: ^Layout, a: u32, b: u32) -> bool {
+    let na: u32 = nota(l, a)
+    let nb: u32 = nota(l, b)
+    return (na > nb) or ((na == nb) and ((l.f as ^bir.BirFuncao).blocos[a].n < (l.f as ^bir.BirFuncao).blocos[b].n))
+}
+
+// C: nativo/optimizer/layout.c:47
+proc enfileirar(l: ^Layout, b: u32) {
+    if l.colocado[b] == 0 {
+        let fila: []u32 = l.fila or_else {}
+        fila[l.nfila] = b
+        l.nfila += 1
+    }
+}
+
+// C: nativo/optimizer/layout.c:54
+proc retirar_melhor(l: ^Layout) -> u32 {
+    var melhor: u32 = bir.BIR_SEM_BLOCO
+    var restam: u32 = 0
+    let fila: []u32 = l.fila or_else {}
+    var k: u32 = 0
+    while k < l.nfila {
+        let b: u32 = fila[k]
+        k += 1
+        if l.colocado[b] != 0 {
+            continue
+        }
+        fila[restam] = b
+        restam += 1
+        if (melhor == bir.BIR_SEM_BLOCO) or (nota(l, b) > nota(l, melhor)) {
+            melhor = b
+        }
+    }
+    l.nfila = restam
+    return melhor
+}
+
+// C: nativo/optimizer/layout.c:72
+proc colocar(l: ^Layout, b: u32) {
+    let f: ^bir.BirFuncao = l.f as ^bir.BirFuncao
+    let blk: ^bir.BirBloco = &f.blocos[b]
+    l.colocado[b] = 1
+    let ordem: []u32 = l.ordem or_else {}
+    ordem[l.nordem] = b
+    l.nordem += 1
+    var k: u32 = 0
+    while k < blk.n {
+        let op: u8 = blk.instrs[k].op
+        if (op == (bir.BIR_ADD_OV as u8)) or (op == (bir.BIR_SUB_OV as u8)) or (op == (bir.BIR_MUL_OV as u8)) or (op == (bir.BIR_NEG_OV as u8)) {
+            enfileirar(l, blk.instrs[k].alvo[0])
+        }
+        k += 1
+    }
+}
+
+// C: nativo/optimizer/layout.c:87
+// Renomeado de melhor para melhor_que: o parametro melhor do C esconderia a funcao.
+proc confrontar(l: ^Layout, melhor: u32, c: u32) -> u32 {
+    if (c == bir.BIR_SEM_BLOCO) or (l.colocado[c] != 0) {
+        return melhor
+    }
+    if (melhor == bir.BIR_SEM_BLOCO) or melhor_que(l, c, melhor) {
+        if melhor != bir.BIR_SEM_BLOCO {
+            enfileirar(l, melhor)
+        }
+        return c
+    }
+    enfileirar(l, c)
+    return melhor
+}
+
+// C: nativo/optimizer/layout.c:101
+proc escolher_proximo(l: ^Layout, b: u32) -> u32 {
+    let blk: ^bir.BirBloco = &(l.f as ^bir.BirFuncao).blocos[b]
+    let t: ^bir.BirInstr = &blk.instrs[blk.n - 1]
+    var melhor: u32 = bir.BIR_SEM_BLOCO
+    if (t.op == (bir.BIR_SALTA as u8)) or (t.op == (bir.BIR_DESVIA as u8)) {
+        melhor = confrontar(l, melhor, t.alvo[0])
+    }
+    if t.op == (bir.BIR_DESVIA as u8) {
+        melhor = confrontar(l, melhor, t.alvo[1])
+    }
+    if (melhor != bir.BIR_SEM_BLOCO) and (nota(l, melhor) == 0) {
+        enfileirar(l, melhor)
+        melhor = bir.BIR_SEM_BLOCO
+    }
+    return melhor
+}
+
+// C: nativo/optimizer/layout.c:119
+proc montar_ordem(l: ^Layout) {
+    var atual: u32 = 0
+    while atual != bir.BIR_SEM_BLOCO {
+        colocar(l, atual)
+        atual = escolher_proximo(l, atual)
+        if atual == bir.BIR_SEM_BLOCO {
+            atual = retirar_melhor(l)
+        }
+    }
+    let f: ^bir.BirFuncao = l.f as ^bir.BirFuncao
+    let ordem: []u32 = l.ordem or_else {}
+    var b: u32 = 0
+    while b < f.nblocos {
+        if l.colocado[b] == 0 {
+            ordem[l.nordem] = b
+            l.nordem += 1
+        }
+        b += 1
+    }
+}
+
+// C: nativo/optimizer/layout.c:135
+proc atualizar_posicoes(l: ^Layout, de: u32, ate: u32) {
+    let ordem: []u32 = l.ordem or_else {}
+    var k: u32 = de
+    while k < ate {
+        l.pos[ordem[k]] = k
+        k += 1
+    }
+}
+
+// C: nativo/optimizer/layout.c:142
+proc laco_contiguo(l: ^Layout, laco: ^bir.LacoBir) -> bool {
+    let inicio: u32 = l.pos[laco.cabecalho]
+    let corpo: []u32 = laco.corpo or_else {}
+    var k: u32 = 0
+    while k < laco.ncorpo {
+        let p: u32 = l.pos[corpo[k]]
+        if (p < inicio) or (p >= inicio + laco.ncorpo) {
+            return false
+        }
+        k += 1
+    }
+    return true
+}
+
+// C: nativo/optimizer/layout.c:156
+// Usa emlaco como rascunho e o deixa zerado (como o C).
+proc cabecalho_com_teste(l: ^Layout, laco: ^bir.LacoBir) -> bool {
+    let f: ^bir.BirFuncao = l.f as ^bir.BirFuncao
+    let h: ^bir.BirBloco = &f.blocos[laco.cabecalho]
+    let t: ^bir.BirInstr = &h.instrs[h.n - 1]
+    if t.op != (bir.BIR_DESVIA as u8) {
+        return false
+    }
+    let corpo: []u32 = laco.corpo or_else {}
+    var k: u32 = 0
+    while k < laco.ncorpo {
+        l.emlaco[corpo[k]] = 1
+        k += 1
+    }
+    let dentro0: bool = l.emlaco[t.alvo[0]] != 0
+    let dentro1: bool = l.emlaco[t.alvo[1]] != 0
+    k = 0
+    while k < laco.ncorpo {
+        l.emlaco[corpo[k]] = 0
+        k += 1
+    }
+    return dentro0 != dentro1
+}
+
+// C: nativo/optimizer/layout.c:174
+proc girar_laco(l: ^Layout, laco: ^bir.LacoBir) -> bool {
+    let cabecalho: u32 = laco.cabecalho
+    if (laco.ncorpo < 2) or (cabecalho == 0) or (l.pos[cabecalho] == bir.BIR_SEM_BLOCO) {
+        return false
+    }
+    let inicio: u32 = l.pos[cabecalho]
+    if (not laco_contiguo(l, laco)) or (not cabecalho_com_teste(l, laco)) {
+        return false
+    }
+    let ordem: []u32 = l.ordem or_else {}
+    var k: u32 = 0
+    while k + 1 < laco.ncorpo {
+        ordem[inicio + k] = ordem[inicio + k + 1]
+        k += 1
+    }
+    ordem[inicio + laco.ncorpo - 1] = cabecalho
+    atualizar_posicoes(l, inicio, inicio + laco.ncorpo)
+    return true
+}
+
+// C: nativo/optimizer/layout.c:190
+// A fila recebe um bloco por aresta (no maximo 2 por bloco, mais um por *_OV): o vetor tem espaco para todas. Donos: memoria e memoria_u8.
+proc alocar_layout(l: ^Layout, f: ^bir.BirFuncao, a: ^bir.AnalisesBir) {
+    let n: int = f.nblocos as int
+    var arestas: int = 2 * n + 1
+    var b: u32 = 0
+    while b < f.nblocos {
+        arestas += (f.blocos[b].n as int)
+        b += 1
+    }
+    let total: int = 2 * n + arestas
+    l.f = f
+    l.a = a
+    l.memoria = make([dynamic]u32, alloc = heap, cap = total + 1)
+    var i: int = 0
+    while i < total {
+        append(&l.memoria, item = 0)
+        i += 1
+    }
+    l.memoria_u8 = make([dynamic]u8, alloc = heap, cap = 2 * n + 2)
+    i = 0
+    while i < 2 * n + 1 {
+        append(&l.memoria_u8, item = 0)
+        i += 1
+    }
+    let w: []u32 = l.memoria[..]
+    l.ordem = w[0..<n]
+    l.pos = w[n..<(2 * n)]
+    l.fila = w[(2 * n)..<total]
+    let m: []u8 = l.memoria_u8[..]
+    l.colocado = m[0..<n]
+    l.emlaco = m[n..<(2 * n)]
+}
+
+// C: nativo/optimizer/layout.c:204
+proc ordem_mudou(l: ^Layout) -> bool {
+    for k in (0 as u32)..<l.nordem {
+        if (l.ordem or_else {})[k] != k {
+            return true
+        }
+    }
+    return false
+}
+
+// C: nativo/optimizer/layout.c:213
+proc otim_layout_aplicar(programa: ^bir.BirPrograma, funcao: ^bir.BirFuncao) {
+    if (not cfg_elegivel(programa, funcao)) or (funcao.nblocos < 3) {
+        return
+    }
+    var a = bir.AnalisesBir{}
+    bir.analises_calcular_lacos_apenas(funcao, &a)
+    var l = Layout{}
+    alocar_layout(&l, funcao, &a)
+    defer delete(l.memoria)
+    defer delete(l.memoria_u8)
+    montar_ordem(&l)
+    atualizar_posicoes(&l, 0, l.nordem)
+    var mudou: bool = false
+    let lacos: []bir.LacoBir = a.lacos or_else {}
+    var k: u32 = 0
+    while k < a.nlacos {
+        if girar_laco(&l, &lacos[k]) {
+            mudou = true
+        }
+        k += 1
+    }
+    if mudou or ordem_mudou(&l) {
+        cfg_aplicar_ordem(funcao, (l.ordem or_else {})[0..<(l.nordem as int)])
+    }
+    bir.analises_liberar(&a)
+}
+
+test "layout_nota_e_melhor_que" {
+    var f = bir.BirFuncao{}
+    f.blocos = make([dynamic]bir.BirBloco, alloc = heap, cap = 4)
+    cfgt_novo_bloco(&f, bir.BIR_SALTA, 1)
+    cfgt_novo_bloco(&f, bir.BIR_RETORNA, bir.BIR_SEM_BLOCO)
+    f.blocos[1].frio = true
+    var a = bir.AnalisesBir{}
+    var prof = make([dynamic]u32, alloc = heap, cap = 2)
+    append(&prof, item = 0)
+    append(&prof, item = 2)
+    a.prof_laco = prof[..]
+    var l = Layout{}
+    l.f = &f
+    l.a = &a
+    expect(nota(&l, 0) == 1)
+    expect(nota(&l, 1) == 0)
+    expect(melhor_que(&l, 0, 1))
+    expect(not melhor_que(&l, 1, 0))
+    delete(prof)
+    cfgt_libera(&f)
+}

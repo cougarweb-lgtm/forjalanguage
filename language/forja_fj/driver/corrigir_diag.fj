@@ -1,0 +1,320 @@
+// driver/corrigir_diag.fj - porte de compiler/driver/corrigir_diag.c, compiler/driver/corrigir_diag.h
+// sha256 de driver/corrigir_diag.c: 46730662c32ea637ce30196bae3353a84f4cfcac55976f5b022a8644cb295f73
+// sha256 de driver/corrigir_diag.h: eab03313689c462e06166f60ae689340568a87f4e6e2613f99329fa04f105b89
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "common"
+import "cache"
+import "std:file"
+import "std:os"
+
+struct DiagLido {
+    codigo: ?str
+    arquivo: ?str
+    confianca: ?str
+    sugestao: ?str
+    id: ?str
+    bruto: ?str
+    linha: u32
+    coluna: u32
+    edicoes: ?[]Edicao
+    nedicoes: u32
+    edicoes_no_alvo: bool
+}
+
+struct ResultadoCheck {
+    saida: i32
+    itens: ?[]DiagLido
+    n: u32
+}
+
+const CAMINHO_MAX_2: i32 = 600
+const ERRO_FILHO_MAX: i32 = 300
+const MAX_ERROS_DO_CHECK: i32 = 100
+
+pub proc arena_fatia_ptr_diag_lido(a: ^common.Arena, n: int) -> []?^DiagLido {
+    var l = make([dynamic]?^DiagLido, alloc = common.arena_mem(a), cap = n)
+    for i in 0..<n {
+        append(&l, item = none)
+    }
+    return l[..]
+}
+
+pub proc arena_fatia_diag_lido(a: ^common.Arena, n: int) -> []DiagLido {
+    var l = make([dynamic]DiagLido, alloc = common.arena_mem(a), cap = n)
+    for i in 0..<n {
+        append(&l, item = DiagLido{})
+    }
+    return l[..]
+}
+
+// C: driver/corrigir_diag.c:23
+// Um byte do caminho depois da normalizacao: contrabarra vira barra, A-Z vira a-z (tolower da locale C).
+proc caractere_de_caminho(c: u8) -> u8 {
+    if c == 92 { // '\\'
+        return 47 // '/'
+    }
+    if (c >= 65) and (c <= 90) { // 'A' 'Z'
+        return c + 32
+    }
+    return c
+}
+
+// C: driver/corrigir_diag.c:23
+// Mesmo arquivo? Os dois caminhos iguais depois de normalizados, do primeiro ao ultimo byte (o C para no NUL, o str nao tem NUL aqui).
+proc corrigir_mesmo_caminho(a: ?str, b: ?str) -> bool {
+    let sa: str = a or_else ""
+    let sb: str = b or_else ""
+    var k: int = 0
+    while (k < len(sa)) and (k < len(sb)) {
+        if caractere_de_caminho(sa[k]) != caractere_de_caminho(sb[k]) {
+            return false
+        }
+        k += 1
+    }
+    return len(sa) == len(sb)
+}
+
+// C: driver/corrigir_diag.c:33
+proc corrigir_tem_codigo(r: ^ResultadoCheck, codigo: ?str) -> bool {
+    for k in (0 as u32)..<r.n {
+        if ((r.itens or_else {})[k].codigo or_else "") == (codigo or_else "") {
+            return true
+        }
+    }
+    return false
+}
+
+// C: driver/corrigir_diag.c:42
+// Numero do membro como u32 (o (uint32_t) do C: trunca os bits altos).
+proc json_u32_de(objeto: ?^JsonValor, chave: str) -> u32 {
+    return common.c2f_trunc_u32(common.c2f_s2u_64(json_numero_de(objeto, chave, 0)))
+}
+
+// C: driver/corrigir_diag.c:42
+// Uma edicao do JSON; true = o arquivo dela e o alvo pedido (so estas o corrigir aplica).
+proc ler_edicao(j: ?^JsonValor, alvo: ?str, e: ^Edicao) -> bool {
+    let arquivo = json_texto_de(j, "arquivo")
+    let antigo = json_texto_de(j, "antigo")
+    let novo = json_texto_de(j, "novo")
+    e.linha = json_u32_de(j, "linha")
+    e.coluna = json_u32_de(j, "coluna")
+    e.coluna_fim = json_u32_de(j, "coluna_fim")
+    e.linha_fim = json_u32_de(j, "linha_fim")
+    e.antigo = antigo or_else ""
+    e.novo = novo or_else ""
+    return (arquivo != none) and corrigir_mesmo_caminho(arquivo, alvo)
+}
+
+// C: driver/corrigir_diag.c:55
+// Preenche um diagnostico a partir do objeto JSON; as edicoes vao para a arena de quem chamou.
+proc ler_diagnostico(arena: ^common.Arena, obj_c: ?^JsonValor, alvo: ?str, d: ^DiagLido) {
+    let lista = json_membro(obj_c, "correcao")
+    var n: u32 = 0
+    d.codigo = json_texto_de(obj_c, "codigo")
+    d.arquivo = json_texto_de(obj_c, "arquivo")
+    d.confianca = json_texto_de(obj_c, "confianca")
+    d.sugestao = json_texto_de(obj_c, "sugestao")
+    d.id = json_texto_de(obj_c, "id")
+    d.linha = json_u32_de(obj_c, "linha")
+    d.coluna = json_u32_de(obj_c, "coluna")
+    d.edicoes_no_alvo = true
+    if (lista == none) or ((lista as ^JsonValor).tipo != JSON_LISTA) {
+        return
+    }
+    var item = (lista as ^JsonValor).filho
+    while item != none {
+        n += 1
+        item = (item as ^JsonValor).prox
+    }
+    var tamanho: u32 = 1
+    if n > 0 {
+        tamanho = n
+    }
+    d.edicoes = arena_fatia_edicao(arena, tamanho as int)
+    var j = (lista as ^JsonValor).filho
+    while j != none {
+        let indice: u32 = d.nedicoes
+        d.nedicoes += 1
+        if not ler_edicao(j, alvo, &(d.edicoes or_else {})[indice]) {
+            d.edicoes_no_alvo = false
+        }
+        j = (j as ^JsonValor).prox
+    }
+}
+
+// C: driver/corrigir_diag.c:77
+// Posicao do '\n' a partir de ini (ou tam, se a linha vai ate o fim).
+proc fim_da_linha_json(corpo: str, ini: u64, tam: u64) -> u64 {
+    var p: u64 = ini
+    while p < tam {
+        if corpo[p] == 10 { // '\n'
+            return p
+        }
+        p += 1
+    }
+    return tam
+}
+
+// C: driver/corrigir_diag.c:77
+// Copia a linha JSON inteira para a arena (o 'bruto' do diagnostico).
+proc copiar_linha_na_arena(arena: ^common.Arena, linha: str) -> str {
+    return from_bytes(as_bytes(linha), alloc = common.arena_mem(arena))
+}
+
+// C: driver/corrigir_diag.c:77
+// Cada linha do texto e um diagnostico em JSON; o que nao for objeto com "codigo" e ignorado.
+// LIMITE: parametros 5 (texto+tam e um buffer; arena, alvo e resultado sao os tres donos da leitura; agrupar em struct so criaria um tipo de uso unico).
+proc ler_diagnosticos(arena: ^common.Arena, alvo: ?str, texto: ?str, tam: u64, r: ^ResultadoCheck) {
+    let corpo: str = texto or_else ""
+    var linhas: u64 = 0
+    var k: u64 = 0
+    while k < tam {
+        if corpo[k] == 10 {
+            linhas += 1
+        }
+        k += 1
+    }
+    r.itens = arena_fatia_diag_lido(arena, (linhas + 1) as int)
+    let itens = r.itens or_else {}
+    var ini: u64 = 0
+    while ini < tam {
+        let fim: u64 = fim_da_linha_json(corpo, ini, tam)
+        if fim > ini {
+            let obj = json_ler(arena, corpo[(ini as int)..<(fim as int)], fim - ini)
+            if (obj != none) and (json_texto_de(obj, "codigo") != none) {
+                ler_diagnostico(arena, obj, alvo, &itens[r.n])
+                itens[r.n].bruto = copiar_linha_na_arena(arena, corpo[(ini as int)..<(fim as int)])
+                r.n += 1
+            }
+        }
+        ini = fim + 1
+    }
+}
+
+// C: driver/corrigir_diag.c:101
+// Mensagem de erro quando o proprio caminho do forja.exe nao sai (ou sai longo demais para o buffer).
+proc corrigir_sem_exe(erro: []u8) -> bool {
+    _ = common.c2f_snprintf(erro, "nao descobri o caminho do proprio forja.exe")
+    return false
+}
+
+// C: driver/corrigir_diag.c:101
+// Dispara "<exe> check --max-erros 100 <alvo>" num processo filho com stdout e stderr nos arquivos dados, e espera.
+// LIMITE: parametros 6 (o processo pede exe, args e os dois arquivos; o exit e o erro saem por ponteiro/buffer como no C).
+proc disparar_processo_check(exe: str, alvo: ?str, arq_out: str, arq_err: str, saida: ^i32, erro: []u8) -> bool {
+    var args: [4]str = {"check", "--max-erros", "100", alvo or_else ""}
+    var pedido = ProcessoPedido{exe = exe, args = args[..], saida_out = arq_out, saida_err = arq_err}
+    var filho = Processo{id = 0, pid = 0, erro = 0}
+    if not processo_disparar(&pedido, &filho) {
+        let txt = format(f"nao consegui iniciar o check (erro do sistema {filho.erro})", alloc = heap)
+        defer delete(txt)
+        _ = common.c2f_snprintf(erro, txt)
+        return false
+    }
+    var fila: [1]Processo = {filho}
+    var qual: u32 = 0
+    if not processo_esperar_qualquer(fila[..], &qual) {
+        let txt = format(f"a espera pelo check falhou (erro do sistema {os.last_error()})", alloc = heap)
+        defer delete(txt)
+        _ = common.c2f_snprintf(erro, txt)
+        return false
+    }
+    saida^ = processo_concluir(&filho)
+    return true
+}
+
+// C: driver/corrigir_diag.c:101
+// Roda o check do proprio forja.exe e devolve o exit do filho em *saida. false = nao rodou (a frase fica em erro).
+// LIMITE: parametros 6 (alvo, os dois arquivos de saida, o exit e o par buffer+tamanho do erro; funcao de uso unico, struct nao ganha clareza).
+proc disparar_check(alvo: ?str, arq_out: str, arq_err: str, saida: ^i32, erro: []u8, tam_erro: u64) -> bool {
+    switch exe in os.exe_path(alloc = heap) {
+    case str:
+        defer delete(exe)
+        if (len(exe) == 0) or (len(exe) >= (CAMINHO_MAX_2 as int)) {
+            return corrigir_sem_exe(erro)
+        }
+        return disparar_processo_check(exe, alvo, arq_out, arq_err, saida, erro)
+    case os.OsError:
+        return corrigir_sem_exe(erro)
+    }
+    return false
+}
+
+// C: driver/corrigir_diag.c:127
+// A frase de erro quando o filho saiu com uso (2) ou erro interno (3): o 1o trecho do que ele escreveu no stderr.
+proc erro_do_filho(arq_err: str, saida: i32, erro: []u8, tam_erro: u64) {
+    let prefixo = format(f"o check terminou com exit {saida}", alloc = heap)
+    defer delete(prefixo)
+    var dados = make([dynamic]u8, alloc = heap)
+    defer delete(dados)
+    if ((len(prefixo) as u64) >= tam_erro) or (not cache.arquivo_ler_inteiro(arq_err, &dados)) or (len(dados) == 0) {
+        _ = common.c2f_snprintf(erro, prefixo)
+        return
+    }
+    let todos = dados[..]
+    var tam: int = len(todos)
+    while (tam > 0) and ((todos[tam - 1] == 10) or (todos[tam - 1] == 13)) { // '\n' '\r'
+        tam -= 1
+    }
+    let corte: int = min(tam, ERRO_FILHO_MAX as int)
+    var trecho: int = 0
+    while (trecho < corte) and (todos[trecho] != 0) {
+        trecho += 1
+    }
+    var msg = make([dynamic]u8, alloc = heap)
+    defer delete(msg)
+    append(&msg, items = as_bytes(prefixo))
+    append(&msg, items = as_bytes(": "))
+    append(&msg, items = todos[0..<trecho])
+    let texto_msg: str = from_bytes(msg[..], alloc = heap)
+    defer delete(texto_msg)
+    _ = common.c2f_snprintf(erro, texto_msg)
+}
+
+// C: driver/corrigir_diag.c:143
+// Caminho de um arquivo temporario (ProcArquivoTemporario) guardado na arena; none = a pasta temporaria e longa demais.
+proc caminho_temporario_check(arena: ^common.Arena, extensao: str) -> ?str {
+    let buf = common.arena_fatia_u8(arena, CAMINHO_MAX_2 as int)
+    if not proc_arquivo_temporario(buf, CAMINHO_MAX_2 as u64, extensao) {
+        return none
+    }
+    let usado: int = common.c2f_strlen_b(buf)
+    return from_bytes(buf[0..<usado], alloc = common.arena_mem(arena))
+}
+
+// C: driver/corrigir_diag.c:143
+// Roda o check e le os diagnosticos. false = o check nao rodou ou saiu com uso/erro interno (a frase fica em erro).
+// LIMITE: parametros 5 (o par buffer+tamanho do erro e a convencao do driver; o resto e arena, alvo e resultado).
+proc corrigir_rodar_check(arena: ^common.Arena, alvo: ?str, resultado: ^ResultadoCheck, erro: []u8, tam_erro: u64) -> bool {
+    resultado^ = ResultadoCheck{}
+    let arq_out = caminho_temporario_check(arena, ".corrigir.out")
+    let arq_err = caminho_temporario_check(arena, ".corrigir.err")
+    if (arq_out == none) or (arq_err == none) {
+        _ = common.c2f_snprintf(erro, "o caminho da pasta temporaria e longo demais")
+        return false
+    }
+    let caminho_out: str = arq_out or_else ""
+    let caminho_err: str = arq_err or_else ""
+    var ok = false
+    if disparar_check(alvo, caminho_out, caminho_err, &resultado.saida, erro, tam_erro) {
+        if resultado.saida > 1 {
+            erro_do_filho(caminho_err, resultado.saida, erro, tam_erro)
+        } else {
+            var dados = make([dynamic]u8, alloc = heap)
+            defer delete(dados)
+            if not cache.arquivo_ler_inteiro(caminho_out, &dados) {
+                _ = common.c2f_snprintf(erro, "nao consegui ler a saida do check")
+            } else {
+                let texto_saida: str = from_bytes(dados[..], alloc = heap)
+                defer delete(texto_saida)
+                ler_diagnosticos(arena, alvo, texto_saida, len(texto_saida) as u64, resultado)
+                ok = true
+            }
+        }
+    }
+    _ = file.remove_file(caminho_out)
+    _ = file.remove_file(caminho_err)
+    return ok
+}

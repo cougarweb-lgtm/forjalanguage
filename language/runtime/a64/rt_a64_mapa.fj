@@ -1,0 +1,656 @@
+// runtime/a64/rt_a64_mapa.fj - map[K]V e soa[N]S do alvo aarch64-linux em Forja (A3.3f): modulo std:a64_mapa
+// Versao: 0.1.0
+// Changelog: 0.1.0 - A3.3f: porte a mao de runtime/nativo/rt_mapa.c 0.1.4 e rt_soa.c 0.1.0 (mesmo hash FNV-1a + mistura, mesma sondagem
+//            linear, mesmo crescimento (cap 0..3 vira 8, depois dobra), mesmo Algoritmo R de Knuth e swap-remove: a ordem de iteracao
+//            sai igual ao x64). Cabecalho do map de 56 B nos offsets de LAYOUT_MAPA_OFF_* (ir/layout.fj). Blocos por std:a64_mem
+//            (heap, frame, Arena/Pool); R0007 por std:a64_rt. Chave por valor (k4/k8) vai em MapaChave.valor, sem escrever na memoria.
+// Verificacao: python -I tests\nativo\a64\verificar_a64.py --conjunto linux --candidato <exe> --timeout-seg 10 (map/SoA: filtro de mapa)
+
+import "std:wasm_rt" as wasm_rt
+import "std:a64_rt" as host
+import "std:a64_mem" as mem
+
+// modo dev do alvo: alias do mesmo simbolo do rt_a64.fj e do a64_mem (E0202 aceita N aliases com a mesma ABI)
+foreign {
+    proc modo_dev_mapa = "forja_rt_modo_dev"() -> bool
+}
+
+// cabecalho do map (56 B) = forja_mapa do C e LAYOUT_MAPA_OFF_* (chaves 0, valores 8, len 24, epoca 48); o resto e interno
+const MAPA_OFF_CHAVES: uint = 0
+const MAPA_OFF_VALORES: uint = 8
+const MAPA_OFF_SLOTS: uint = 16
+const MAPA_OFF_LEN: uint = 24
+const MAPA_OFF_CAP: uint = 32
+const MAPA_OFF_NSLOTS: uint = 40
+const MAPA_OFF_ALOCADOR: uint = 44
+const MAPA_OFF_EPOCA: uint = 48
+const MAPA_BYTES: uint = 56
+const MAPA_SLOTS_MIN: uint = 16
+const MAPA_CAP_MAX: uint = 1073741824
+const MAPA_CAP_INICIAL: uint = 8
+const MAPA_CAP_LIMIAR: uint = 4
+const MAPA_FNV_BASE: uint = 0xcbf29ce484222325
+const MAPA_FNV_PRIMO: uint = 0x100000001b3
+const MAPA_MIX_A: uint = 0xff51afd7ed558ccd
+const MAPA_MIX_B: uint = 0xc4ceb9fe1a85ec53
+const MAPA_DESLOC_MIX: uint = 33
+const MAPA_ALINHA: uint = 16
+const MAPA_SLOT_BYTES: uint = 4
+const MAPA_OFF_STR_LEN: uint = 8
+const BITS_BYTE: uint = 8
+const MASCARA_BYTE: uint = 255
+const ALOC_HEAP: u32 = 1
+const ALOC_FRAME: u32 = 2
+const SOA_CAP_MAX: uint = 2305843009213693951
+const SOA_TOTAL_MAX: uint = 4611686018427387903
+const SOA_LINHAS_INICIAL: uint = 8
+const SOA_LINHAS_LIMIAR: uint = 4
+const TAM_PONTEIRO: uint = 8
+
+// contexto da operacao: tamanhos, se a chave e texto (str por conteudo) e o ponto no fonte para R0007/R0008
+struct MapaCtx {
+    tam_chave: uint
+    tam_valor: uint
+    texto: bool
+    arquivo: cstr
+    linha: i32
+}
+
+// chave da operacao: por_valor = o valor ja vem no registrador (k4/k8); senao e o endereco dos bytes da chave
+struct MapaChave {
+    endereco: uint
+    valor: uint
+    por_valor: bool
+}
+
+// forma do bloco da soa: tamanhos das colunas (int64 em memoria), numero de colunas, linhas (cap) e o ponto no fonte
+struct SoaForma {
+    tams: uint
+    ncol: uint
+    linhas: uint
+    arquivo: cstr
+    linha: i32
+}
+
+proc mapa_arquivo_int(arquivo: cstr) -> int {
+    return transmute(arquivo as rawptr, to = int)
+}
+
+// R0007 (alocacao): a causa e o texto do fonte do map, o valor e o numero que estourou
+proc mapa_falha(causa: str, valor: int, arquivo: cstr, linha: i32) {
+    host.falha_r0007_texto(causa, valor, mapa_arquivo_int(arquivo), linha)
+}
+
+// campo u64 do cabecalho do map (ponteiros, len, cap)
+proc mapa_le_campo(m: uint, off: uint) -> uint {
+    return wasm_rt.memoria_ler_u64(m + off)
+}
+
+proc mapa_grava_campo(m: uint, off: uint, valor: uint) {
+    wasm_rt.memoria_escrever_u64(m + off, valor)
+}
+
+// inteiro little-endian de tam bytes (1, 2, 4 ou 8): o mesmo bit a bit do memcpy do C
+proc mapa_le_le(endereco: uint, tam: uint) -> uint {
+    var valor: uint = 0
+    var k: uint = 0
+    while k < tam {
+        valor = valor | (wasm_rt.memoria_ler_u8(endereco + k) << (k * BITS_BYTE))
+        k += 1
+    }
+    return valor
+}
+
+proc mapa_grava_le(endereco: uint, valor: uint, tam: uint) {
+    var k: uint = 0
+    while k < tam {
+        wasm_rt.memoria_escrever_u8(endereco + k, (valor >> (k * BITS_BYTE)) & MASCARA_BYTE)
+        k += 1
+    }
+}
+
+proc mapa_copia_bytes(destino: uint, origem: uint, n: uint) {
+    var k: uint = 0
+    while k < n {
+        wasm_rt.memoria_escrever_u8(destino + k, wasm_rt.memoria_ler_u8(origem + k))
+        k += 1
+    }
+}
+
+proc mapa_alinha(n: uint) -> uint {
+    return ((n + MAPA_ALINHA - 1) / MAPA_ALINHA) * MAPA_ALINHA
+}
+
+proc mapa_endereco_chave(m: uint, i: uint, tam: uint) -> uint {
+    return mapa_le_campo(m, MAPA_OFF_CHAVES) + i * tam
+}
+
+proc mapa_endereco_valor(m: uint, i: uint, tam: uint) -> uint {
+    return mapa_le_campo(m, MAPA_OFF_VALORES) + i * tam
+}
+
+proc mapa_slot_le(m: uint, s: uint) -> uint {
+    return mapa_le_le(mapa_le_campo(m, MAPA_OFF_SLOTS) + s * MAPA_SLOT_BYTES, 4)
+}
+
+proc mapa_slot_grava(m: uint, s: uint, valor: uint) {
+    mapa_grava_le(mapa_le_campo(m, MAPA_OFF_SLOTS) + s * MAPA_SLOT_BYTES, valor, 4)
+}
+
+// slot com indice denso + 1: 0 (vazio) vira -1, o indice da entrada senao
+proc mapa_indice_do_slot(m: uint, s: uint) -> int {
+    return (mapa_slot_le(m, s) as int) - 1
+}
+
+// mistura de 64 bits (murmur3 fmix64), o mesmo hash do rt_mapa.c para chave nao-texto
+proc mapa_mistura(k: uint) -> uint {
+    var x: uint = k
+    x = x ~ (x >> MAPA_DESLOC_MIX)
+    x = wrapping_mul(x, MAPA_MIX_A)
+    x = x ~ (x >> MAPA_DESLOC_MIX)
+    x = wrapping_mul(x, MAPA_MIX_B)
+    x = x ~ (x >> MAPA_DESLOC_MIX)
+    return x
+}
+
+// FNV-1a sobre os bytes do str (ptr em [0], len em [8]) e depois a mistura, como rt_mapa_hash
+proc mapa_hash_texto(endereco: uint) -> uint {
+    let ptr: uint = wasm_rt.memoria_ler_u64(endereco)
+    let len: uint = wasm_rt.memoria_ler_u64(endereco + MAPA_OFF_STR_LEN)
+    var h: uint = MAPA_FNV_BASE
+    var i: uint = 0
+    while i < len {
+        h = wrapping_mul(h ~ wasm_rt.memoria_ler_u8(ptr + i), MAPA_FNV_PRIMO)
+        i += 1
+    }
+    return mapa_mistura(h)
+}
+
+// valor da chave nao-texto: o registrador (por_valor) ou os tam bytes no endereco
+proc mapa_valor_chave(ch: MapaChave, tam: uint) -> uint {
+    if ch.por_valor {
+        return ch.valor
+    }
+    return mapa_le_le(ch.endereco, tam)
+}
+
+proc mapa_hash(ch: MapaChave, c: MapaCtx) -> uint {
+    if c.texto {
+        return mapa_hash_texto(ch.endereco)
+    }
+    return mapa_mistura(mapa_valor_chave(ch, c.tam_chave))
+}
+
+// igualdade de str: mesmo len e mesmos bytes (o len 0 nao le ponteiro)
+proc mapa_str_igual(a: uint, b: uint) -> bool {
+    let ptr_a: uint = wasm_rt.memoria_ler_u64(a)
+    let ptr_b: uint = wasm_rt.memoria_ler_u64(b)
+    let len_a: uint = wasm_rt.memoria_ler_u64(a + MAPA_OFF_STR_LEN)
+    let len_b: uint = wasm_rt.memoria_ler_u64(b + MAPA_OFF_STR_LEN)
+    if len_a != len_b {
+        return false
+    }
+    var i: uint = 0
+    while i < len_a {
+        if wasm_rt.memoria_ler_u8(ptr_a + i) != wasm_rt.memoria_ler_u8(ptr_b + i) {
+            return false
+        }
+        i += 1
+    }
+    return true
+}
+
+// a chave da consulta bate com a entrada que esta no endereco 'entrada' (sempre bytes da chave guardada)
+proc mapa_chave_igual(ch: MapaChave, c: MapaCtx, entrada: uint) -> bool {
+    if c.texto {
+        return mapa_str_igual(ch.endereco, entrada)
+    }
+    return mapa_valor_chave(ch, c.tam_chave) == mapa_le_le(entrada, c.tam_chave)
+}
+
+// hash da chave ja guardada na posicao i (usado no refazer, no swap-remove e na casa do Algoritmo R)
+proc mapa_hash_entrada(m: uint, i: uint, c: MapaCtx) -> uint {
+    let e = MapaChave{endereco = mapa_endereco_chave(m, i, c.tam_chave), valor = 0, por_valor = false}
+    return mapa_hash(e, c)
+}
+
+// slot da chave: o da entrada igual (indice denso + 1) ou o primeiro vazio da sondagem linear
+proc mapa_sondar(m: uint, ch: MapaChave, c: MapaCtx) -> uint {
+    let mascara: uint = mapa_le_le(m + MAPA_OFF_NSLOTS, 4) - 1
+    var s: uint = mapa_hash(ch, c) & mascara
+    var v: uint = mapa_slot_le(m, s)
+    while v != 0 {
+        if mapa_chave_igual(ch, c, mapa_endereco_chave(m, v - 1, c.tam_chave)) {
+            break
+        }
+        s = (s + 1) & mascara
+        v = mapa_slot_le(m, s)
+    }
+    return s
+}
+
+// sondagem de uma entrada ja guardada (i), sem montar chave de consulta
+proc mapa_sondar_entrada(m: uint, i: uint, c: MapaCtx) -> uint {
+    let e = MapaChave{endereco = mapa_endereco_chave(m, i, c.tam_chave), valor = 0, por_valor = false}
+    return mapa_sondar(m, e, c)
+}
+
+// casa (slot de origem) da entrada v: hash da chave dela e a mascara da tabela
+proc mapa_casa(m: uint, v: uint, c: MapaCtx) -> uint {
+    let mascara: uint = mapa_le_le(m + MAPA_OFF_NSLOTS, 4) - 1
+    return mapa_hash_entrada(m, v - 1, c) & mascara
+}
+
+// a casa k fica ciclicamente em (i, j]: a entrada em j nao pode ir para o buraco i
+proc mapa_casa_entre(i: uint, j: uint, k: uint) -> bool {
+    if i <= j {
+        return (i < k) and (k <= j)
+    }
+    return (i < k) or (k <= j)
+}
+
+// Algoritmo R de Knuth: fecha o buraco do slot s deslocando para tras as entradas que nao ficam antes da casa delas
+proc mapa_fechar_buraco(m: uint, s: uint, c: MapaCtx) {
+    let mascara: uint = mapa_le_le(m + MAPA_OFF_NSLOTS, 4) - 1
+    var i: uint = s
+    var j: uint = (s + 1) & mascara
+    var v: uint = mapa_slot_le(m, j)
+    while v != 0 {
+        let k: uint = mapa_casa(m, v, c)
+        if not mapa_casa_entre(i, j, k) {
+            mapa_slot_grava(m, i, v)
+            i = j
+        }
+        j = (j + 1) & mascara
+        v = mapa_slot_le(m, j)
+    }
+    mapa_slot_grava(m, i, 0)
+}
+
+// swap-remove: a ultima entrada densa ocupa o lugar da removida (x) e o slot dela aponta para x
+proc mapa_trocar_ultimo(m: uint, x: uint, c: MapaCtx) {
+    let ult: uint = mapa_le_campo(m, MAPA_OFF_LEN) - 1
+    if x == ult {
+        return
+    }
+    let slot_ult: uint = mapa_sondar_entrada(m, ult, c)
+    mapa_copia_bytes(mapa_endereco_chave(m, x, c.tam_chave), mapa_endereco_chave(m, ult, c.tam_chave), c.tam_chave)
+    mapa_copia_bytes(mapa_endereco_valor(m, x, c.tam_valor), mapa_endereco_valor(m, ult, c.tam_valor), c.tam_valor)
+    mapa_slot_grava(m, slot_ult, x + 1)
+}
+
+// grava a chave na posicao i: bytes copiados (str guarda o struct, nao o texto) ou o valor em little-endian
+proc mapa_grava_chave(m: uint, i: uint, ch: MapaChave, c: MapaCtx) {
+    let destino: uint = mapa_endereco_chave(m, i, c.tam_chave)
+    if ch.por_valor {
+        mapa_grava_le(destino, ch.valor, c.tam_chave)
+        return
+    }
+    mapa_copia_bytes(destino, ch.endereco, c.tam_chave)
+}
+
+// dev: lista do frame usada depois do frame_reset = R0008 (epoca 0 = sem frame; o check fica no a64_mem)
+proc mapa_viva(m: uint, c: MapaCtx) {
+    if modo_dev_mapa() {
+        mem.lista_viva(mapa_le_le(m + MAPA_OFF_EPOCA, 4) as u32, c.arquivo, c.linha)
+    }
+}
+
+// cap que nao cabe em int64 (ou passa do limite de 2^30 entradas) e R0007, como rt_mapa_conferir_cap
+proc mapa_conferir_cap(m: uint, nc: uint, c: MapaCtx) {
+    var maior: uint = c.tam_chave
+    if c.tam_valor > maior {
+        maior = c.tam_valor
+    }
+    if maior == 0 {
+        return
+    }
+    if (nc > (INT64_MAX_A64_MAPA / 4) / maior) or (nc > MAPA_CAP_MAX) {
+        mapa_falha("map passou do limite de memoria com cap", mapa_le_campo(m, MAPA_OFF_CAP) as int, c.arquivo, c.linha)
+    }
+}
+
+const INT64_MAX_A64_MAPA: uint = 9223372036854775807
+
+// bloco do map no alocador do cabecalho: heap e frame pelo a64_mem; Arena/Pool pelo mesmo caminho de lista (Pool recusa)
+// LIMITE: 3 parametros; o cabecalho do map ja diz o alocador
+proc mapa_bloco(m: uint, bytes: uint, c: MapaCtx) -> uint {
+    let alocador: u32 = mapa_le_le(m + MAPA_OFF_ALOCADOR, 4) as u32
+    if alocador == ALOC_HEAP {
+        return mem.mem_alocar(ALOC_HEAP, bytes as int, c.arquivo, c.linha)
+    }
+    if alocador == ALOC_FRAME {
+        let novo: uint = mem.mem_alocar(ALOC_FRAME, bytes as int, c.arquivo, c.linha)
+        mapa_grava_le(m + MAPA_OFF_EPOCA, mem.epoca_frame(), 4)
+        return novo
+    }
+    return mem.alocar_lista_em_handle(alocador as uint, bytes, c.arquivo, c.linha)
+}
+
+// copia len chaves e len valores do bloco antigo para o novo (a ordem densa e preservada)
+proc mapa_copia_antigo(m: uint, b: uint, off_valores: uint, c: MapaCtx) {
+    let len: uint = mapa_le_campo(m, MAPA_OFF_LEN)
+    if len == 0 {
+        return
+    }
+    mapa_copia_bytes(b, mapa_le_campo(m, MAPA_OFF_CHAVES), len * c.tam_chave)
+    mapa_copia_bytes(b + off_valores, mapa_le_campo(m, MAPA_OFF_VALORES), len * c.tam_valor)
+}
+
+// refaz a tabela de slots a partir das entradas densas (zera antes; a ordem de insercao decide a sondagem)
+proc mapa_refazer(m: uint, c: MapaCtx) {
+    let nslots: uint = mapa_le_le(m + MAPA_OFF_NSLOTS, 4)
+    var k: uint = 0
+    while k < nslots {
+        mapa_slot_grava(m, k, 0)
+        k += 1
+    }
+    let len: uint = mapa_le_campo(m, MAPA_OFF_LEN)
+    var i: uint = 0
+    while i < len {
+        let s: uint = mapa_sondar_entrada(m, i, c)
+        mapa_slot_grava(m, s, i + 1)
+        i += 1
+    }
+}
+
+// aloca um bloco de nc entradas (chaves, valores, slots), copia as len atuais, solta o antigo (heap) e refaz os slots
+// LIMITE: 3 parametros; a montagem tem de ler e gravar os 7 campos do cabecalho na mesma ordem do C
+proc mapa_montar(m: uint, nc: uint, c: MapaCtx) {
+    mapa_conferir_cap(m, nc, c)
+    var ns: uint = MAPA_SLOTS_MIN
+    while ns < 2 * nc {
+        ns = ns * 2
+    }
+    let off_valores: uint = mapa_alinha(nc * c.tam_chave)
+    let off_slots: uint = off_valores + mapa_alinha(nc * c.tam_valor)
+    let b: uint = mapa_bloco(m, off_slots + ns * MAPA_SLOT_BYTES, c)
+    mapa_copia_antigo(m, b, off_valores, c)
+    let antigo: uint = mapa_le_campo(m, MAPA_OFF_CHAVES)
+    let alocador: u32 = mapa_le_le(m + MAPA_OFF_ALOCADOR, 4) as u32
+    if alocador == ALOC_HEAP {
+        mem.mem_liberar(antigo, c.arquivo, c.linha)
+    }
+    mapa_grava_campo(m, MAPA_OFF_CHAVES, b)
+    mapa_grava_campo(m, MAPA_OFF_VALORES, b + off_valores)
+    mapa_grava_campo(m, MAPA_OFF_SLOTS, b + off_slots)
+    mapa_grava_campo(m, MAPA_OFF_CAP, nc)
+    mapa_grava_le(m + MAPA_OFF_NSLOTS, ns, 4)
+    mapa_refazer(m, c)
+}
+
+// insert num map sem alocador (valor zero) = R0007; senao cresce: cap 0..3 vira 8, depois dobra
+proc mapa_crescer(m: uint, c: MapaCtx) {
+    if mapa_le_le(m + MAPA_OFF_ALOCADOR, 4) == 0 {
+        mapa_falha("insert num map sem alocador (valor zero): crie com make(map[K]V, em = heap)", 0, c.arquivo, c.linha)
+    }
+    let cap: uint = mapa_le_campo(m, MAPA_OFF_CAP)
+    var novo: uint = MAPA_CAP_INICIAL
+    if cap >= MAPA_CAP_LIMIAR {
+        novo = cap * 2
+    }
+    mapa_montar(m, novo, c)
+}
+
+// indice denso da chave ou -1 (map vazio nao sonda)
+proc mapa_achar_em(m: uint, ch: MapaChave, c: MapaCtx) -> int {
+    mapa_viva(m, c)
+    if mapa_le_campo(m, MAPA_OFF_LEN) == 0 {
+        return -1
+    }
+    let s: uint = mapa_sondar(m, ch, c)
+    return mapa_indice_do_slot(m, s)
+}
+
+// insere a chave (se nova, no fim do denso) e devolve o indice; o valor fica por conta de quem chama
+proc mapa_inserir_em(m: uint, ch: MapaChave, c: MapaCtx) -> int {
+    mapa_viva(m, c)
+    var i: int = 0
+    if mapa_le_campo(m, MAPA_OFF_LEN) == mapa_le_campo(m, MAPA_OFF_CAP) {
+        i = mapa_achar_em(m, ch, c)
+        if i >= 0 {
+            return i
+        }
+        mapa_crescer(m, c)
+    }
+    let s: uint = mapa_sondar(m, ch, c)
+    i = mapa_indice_do_slot(m, s)
+    if i >= 0 {
+        return i
+    }
+    let novo: uint = mapa_le_campo(m, MAPA_OFF_LEN)
+    mapa_grava_campo(m, MAPA_OFF_LEN, novo + 1)
+    mapa_grava_chave(m, novo, ch, c)
+    mapa_slot_grava(m, s, novo + 1)
+    return novo as int
+}
+
+// remove a chave: ausente nao faz nada; senao fecha o buraco (Knuth R) e faz o swap-remove
+proc mapa_remover_em(m: uint, ch: MapaChave, c: MapaCtx) {
+    mapa_viva(m, c)
+    if mapa_le_campo(m, MAPA_OFF_LEN) == 0 {
+        return
+    }
+    let s: uint = mapa_sondar(m, ch, c)
+    let x: int = mapa_indice_do_slot(m, s)
+    if x < 0 {
+        return
+    }
+    mapa_fechar_buraco(m, s, c)
+    mapa_trocar_ultimo(m, x as uint, c)
+    mapa_grava_campo(m, MAPA_OFF_LEN, mapa_le_campo(m, MAPA_OFF_LEN) - 1)
+}
+
+// make(map[K]V, cap): cap negativo = R0007; cap 0 deixa o cabecalho como esta (como o C)
+// LIMITE: 7 parametros porque a BIR passa a ordem da assinatura de forja_mapa_criar (ponte por nome)
+pub proc mapa_criar(m: uint, alocador: u32, cap: int, tam_chave: int, tam_valor: int, arquivo: cstr, linha: i32) {
+    let c = MapaCtx{tam_chave = tam_chave as uint, tam_valor = tam_valor as uint, texto = false, arquivo = arquivo, linha = linha}
+    mapa_grava_le(m + MAPA_OFF_ALOCADOR, alocador as uint, 4)
+    if cap < 0 {
+        mapa_falha("make com cap negativo", cap, arquivo, linha)
+    }
+    if cap == 0 {
+        return
+    }
+    mapa_grava_campo(m, MAPA_OFF_CAP, 0)
+    mapa_montar(m, cap as uint, c)
+}
+
+// LIMITE: 6 parametros; a ponte do BIR passa a chave por endereco, tamanho, texto e o ponto no fonte
+pub proc mapa_achar(m: uint, chave: uint, tam_chave: int, texto: bool, arquivo: cstr, linha: i32) -> int {
+    let c = MapaCtx{tam_chave = tam_chave as uint, tam_valor = 0, texto = texto, arquivo = arquivo, linha = linha}
+    let ch = MapaChave{endereco = chave, valor = 0, por_valor = false}
+    return mapa_achar_em(m, ch, c)
+}
+
+// chave inteira de 4 bytes por valor (i32, u32, enum); o endereco nao e usado
+pub proc mapa_achar_k4(m: uint, chave: u32, arquivo: cstr, linha: i32) -> int {
+    let c = MapaCtx{tam_chave = 4, tam_valor = 0, texto = false, arquivo = arquivo, linha = linha}
+    let ch = MapaChave{endereco = 0, valor = chave as uint, por_valor = true}
+    return mapa_achar_em(m, ch, c)
+}
+
+pub proc mapa_achar_k8(m: uint, chave: u64, arquivo: cstr, linha: i32) -> int {
+    let c = MapaCtx{tam_chave = 8, tam_valor = 0, texto = false, arquivo = arquivo, linha = linha}
+    let ch = MapaChave{endereco = 0, valor = chave as uint, por_valor = true}
+    return mapa_achar_em(m, ch, c)
+}
+
+// LIMITE: 7 parametros; mesma ordem da assinatura de forja_mapa_inserir (ponte por nome)
+pub proc mapa_inserir(m: uint, chave: uint, tam_chave: int, texto: bool, tam_valor: int, arquivo: cstr, linha: i32) -> int {
+    let c = MapaCtx{tam_chave = tam_chave as uint, tam_valor = tam_valor as uint, texto = texto, arquivo = arquivo, linha = linha}
+    let ch = MapaChave{endereco = chave, valor = 0, por_valor = false}
+    return mapa_inserir_em(m, ch, c)
+}
+
+// LIMITE: 5 parametros (o map, a chave, o tamanho do valor e o ponto no fonte)
+pub proc mapa_inserir_k4(m: uint, chave: u32, tam_valor: int, arquivo: cstr, linha: i32) -> int {
+    let c = MapaCtx{tam_chave = 4, tam_valor = tam_valor as uint, texto = false, arquivo = arquivo, linha = linha}
+    let ch = MapaChave{endereco = 0, valor = chave as uint, por_valor = true}
+    return mapa_inserir_em(m, ch, c)
+}
+
+// LIMITE: 5 parametros (o map, a chave, o tamanho do valor e o ponto no fonte)
+pub proc mapa_inserir_k8(m: uint, chave: u64, tam_valor: int, arquivo: cstr, linha: i32) -> int {
+    let c = MapaCtx{tam_chave = 8, tam_valor = tam_valor as uint, texto = false, arquivo = arquivo, linha = linha}
+    let ch = MapaChave{endereco = 0, valor = chave as uint, por_valor = true}
+    return mapa_inserir_em(m, ch, c)
+}
+
+// LIMITE: 7 parametros; mesma ordem da assinatura de forja_mapa_remover (ponte por nome)
+pub proc mapa_remover(m: uint, chave: uint, tam_chave: int, texto: bool, tam_valor: int, arquivo: cstr, linha: i32) {
+    let c = MapaCtx{tam_chave = tam_chave as uint, tam_valor = tam_valor as uint, texto = texto, arquivo = arquivo, linha = linha}
+    let ch = MapaChave{endereco = chave, valor = 0, por_valor = false}
+    mapa_remover_em(m, ch, c)
+}
+
+// LIMITE: 5 parametros (o map, a chave, o tamanho do valor e o ponto no fonte)
+pub proc mapa_remover_k4(m: uint, chave: u32, tam_valor: int, arquivo: cstr, linha: i32) {
+    let c = MapaCtx{tam_chave = 4, tam_valor = tam_valor as uint, texto = false, arquivo = arquivo, linha = linha}
+    let ch = MapaChave{endereco = 0, valor = chave as uint, por_valor = true}
+    mapa_remover_em(m, ch, c)
+}
+
+// LIMITE: 5 parametros (o map, a chave, o tamanho do valor e o ponto no fonte)
+pub proc mapa_remover_k8(m: uint, chave: u64, tam_valor: int, arquivo: cstr, linha: i32) {
+    let c = MapaCtx{tam_chave = 8, tam_valor = tam_valor as uint, texto = false, arquivo = arquivo, linha = linha}
+    let ch = MapaChave{endereco = 0, valor = chave as uint, por_valor = true}
+    mapa_remover_em(m, ch, c)
+}
+
+// libera as chaves (heap) e zera o cabecalho, guardando o alocador (como *m = (forja_mapa){0} no C)
+pub proc mapa_liberar(m: uint, arquivo: cstr, linha: i32) {
+    let alocador: uint = mapa_le_le(m + MAPA_OFF_ALOCADOR, 4)
+    if (alocador == ALOC_HEAP as uint) and (mapa_le_campo(m, MAPA_OFF_CHAVES) != 0) {
+        mem.mem_liberar(mapa_le_campo(m, MAPA_OFF_CHAVES), arquivo, linha)
+    }
+    var k: uint = 0
+    while k < MAPA_BYTES {
+        mapa_grava_campo(m, k, 0)
+        k += TAM_PONTEIRO
+    }
+    mapa_grava_le(m + MAPA_OFF_ALOCADOR, alocador, 4)
+}
+
+// ---- soa dinamica: as colunas moram num bloco unico; a coluna k comeca na soma de alinha(cap * tams[j]) para j < k ----
+
+// tamanho da coluna k (int64 no .rdata do programa)
+proc soa_tam(tams: uint, k: uint) -> uint {
+    return wasm_rt.memoria_ler_u64(tams + k * TAM_PONTEIRO)
+}
+
+// bytes do bloco de cap linhas, ou -1 quando alguma conta passaria do limite (cap grande demais)
+proc soa_total(tams: uint, ncol: uint, cap: uint) -> int {
+    var total: uint = 0
+    var k: uint = 0
+    while k < ncol {
+        let tam: uint = soa_tam(tams, k)
+        if (tam != 0) and (cap > SOA_CAP_MAX / tam) {
+            return -1
+        }
+        total += mapa_alinha(cap * tam)
+        if total > SOA_TOTAL_MAX {
+            return -1
+        }
+        k += 1
+    }
+    return total as int
+}
+
+// bloco do soa no alocador: frame grava a epoca; heap e frame pelo a64_mem; Arena/Pool pelo caminho de lista
+proc soa_bloco(f: SoaForma, alocador: u32, total: uint, epoca: uint) -> uint {
+    if alocador == ALOC_FRAME {
+        mapa_grava_le(epoca, mem.epoca_frame(), 4)
+    }
+    if (alocador == ALOC_HEAP) or (alocador == ALOC_FRAME) {
+        return mem.mem_alocar(alocador, total as int, f.arquivo, f.linha)
+    }
+    return mem.alocar_lista_em_handle(alocador as uint, total, f.arquivo, f.linha)
+}
+
+// col[k] = bloco + deslocamento da coluna k
+proc soa_distribuir(col: uint, f: SoaForma, bloco: uint) {
+    var off: uint = 0
+    var k: uint = 0
+    while k < f.ncol {
+        mapa_grava_campo(col, k * TAM_PONTEIRO, bloco + off)
+        off += mapa_alinha(f.linhas * soa_tam(f.tams, k))
+        k += 1
+    }
+}
+
+// copia as len linhas das colunas atuais para o bloco novo (de f.linhas linhas)
+proc soa_copiar(col: uint, f: SoaForma, bloco: uint, len: uint) {
+    var off: uint = 0
+    var k: uint = 0
+    while k < f.ncol {
+        let tam: uint = soa_tam(f.tams, k)
+        if len > 0 {
+            mapa_copia_bytes(bloco + off, wasm_rt.memoria_ler_u64(col + k * TAM_PONTEIRO), len * tam)
+        }
+        off += mapa_alinha(f.linhas * tam)
+        k += 1
+    }
+}
+
+// soa[dynamic]S sem alocador (valor zero) = R0007 no crescer; fora do limite = R0007
+// LIMITE: 8 parametros; mesma ordem da assinatura de forja_soa_criar (ponte por nome)
+pub proc soa_criar(col: uint, tams: uint, ncol: u32, cap: int, alocador: u32, epoca: uint, arquivo: cstr, linha: i32) {
+    mapa_grava_le(epoca, 0, 4)
+    if cap < 0 {
+        mapa_falha("make com cap negativo", cap, arquivo, linha)
+    }
+    if cap == 0 {
+        var k: uint = 0
+        while k < (ncol as uint) {
+            mapa_grava_campo(col, k * TAM_PONTEIRO, 0)
+            k += 1
+        }
+        return
+    }
+    let total: int = soa_total(tams, ncol as uint, cap as uint)
+    if total < 0 {
+        mapa_falha("make com cap grande demais para a memoria", cap, arquivo, linha)
+    }
+    let f = SoaForma{tams = tams, ncol = ncol as uint, linhas = cap as uint, arquivo = arquivo, linha = linha}
+    let bloco: uint = soa_bloco(f,alocador, total as uint, epoca)
+    soa_distribuir(col, f,bloco)
+}
+
+// append numa soa: cap 0..3 vira 8, depois dobra; o cap novo volta pelo ponteiro cap (int64 em memoria)
+// LIMITE: 9 parametros; mesma ordem da assinatura de forja_soa_crescer (ponte por nome)
+pub proc soa_crescer(col: uint, tams: uint, ncol: u32, len: int, cap: uint, alocador: u32, epoca: uint, arquivo: cstr, linha: i32) {
+    if alocador == 0 {
+        mapa_falha("append numa soa sem alocador (valor zero): crie com make(soa[dynamic]S, em = heap)", 0, arquivo, linha)
+    }
+    let cap_antigo: uint = wasm_rt.memoria_ler_u64(cap)
+    var linhas: uint = 0
+    var total: int = -1
+    if cap_antigo <= SOA_TOTAL_MAX {
+        linhas = SOA_LINHAS_INICIAL
+        if cap_antigo >= SOA_LINHAS_LIMIAR {
+            linhas = cap_antigo * 2
+        }
+        total = soa_total(tams, ncol as uint, linhas)
+    }
+    if total < 0 {
+        mapa_falha("append: a soa passou do limite de memoria com cap", cap_antigo as int, arquivo, linha)
+    }
+    let f = SoaForma{tams = tams, ncol = ncol as uint, linhas = linhas, arquivo = arquivo, linha = linha}
+    let bloco: uint = soa_bloco(f,alocador, total as uint, epoca)
+    soa_copiar(col, f,bloco, len as uint)
+    let velho: uint = wasm_rt.memoria_ler_u64(col)
+    if (alocador == ALOC_HEAP) and (velho != 0) {
+        mem.mem_liberar(velho, arquivo, linha)
+    }
+    soa_distribuir(col, f,bloco)
+    wasm_rt.memoria_escrever_u64(cap, linhas)
+}
+
+// libera o bloco unico pela primeira coluna (heap); frame e Arena/Pool nao devolvem nada
+pub proc soa_liberar(col: uint, alocador: u32, arquivo: cstr, linha: i32) {
+    let primeira: uint = wasm_rt.memoria_ler_u64(col)
+    if (alocador == ALOC_HEAP) and (primeira != 0) {
+        mem.mem_liberar(primeira, arquivo, linha)
+    }
+}

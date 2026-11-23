@@ -1,0 +1,295 @@
+// driver/consultar_refs.fj - porte de compiler/driver/consultar_refs.c
+// sha256 de driver/consultar_refs.c: d209cf1d1c61ca1432ff2c8354561c080644a6aa8711cda49545181fe9065a7b
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "common"
+import "frontend"
+import "semantic"
+
+// C: driver/consultar_refs.c:13
+proc consulta_uso_eh_do_alvo(u: ^semantic.IndUso, a: ^AlvoRefs) -> bool {
+    if ((u.alvo_tipo as i32) != a.tipo) or (u.alvo != a.decl) {
+        return false
+    }
+    let tipo: u32 = common.c2f_s2u_32(a.tipo)
+    if (tipo == (semantic.IND_CAMPO as u32)) or (tipo == (semantic.IND_MEMBRO as u32)) or (tipo == (semantic.IND_PARAM as u32)) {
+        return u.indice == a.indice
+    }
+    if tipo == (semantic.IND_LOCAL as u32) {
+        return (u.decl_pos == a.decl_pos) and (u.nome == a.nome)
+    }
+    if tipo == (semantic.IND_EMBUTIDO as u32) {
+        return u.nome == a.nome
+    }
+    return true
+}
+
+// C: driver/consultar_refs.c:26
+proc uso_json(q: ^Consulta, u: ^semantic.IndUso) {
+    consulta_abrir_obj(q)
+    consulta_chave_arquivo(q, u.pos)
+    consulta_chave_pos(q, "pos", u.pos)
+    consulta_chave_pos(q, "pos_nome", u.pos_nome)
+    consulta_chave_nome(q, "nome", u.nome)
+    consulta_chave_bool(q, "chamada", u.chamada)
+    if u.dono != none {
+        consulta_chave_id(q, "em", u.dono)
+    } else {
+        consulta_chave_texto(q, "em", none, 0)
+    }
+    consulta_fechar_obj(q)
+}
+
+// C: driver/consultar_refs.c:40
+proc id_do_alvo(q: ^Consulta, a: ^AlvoRefs, id: ^[dynamic]u8) {
+    let nomes: ^common.Interner = &(q.c as ^Compilacao).nomes
+    if a.decl == none {
+        append(id, item = common.interner_texto(nomes, a.nome)[0..<common.interner_tam(nomes, a.nome) as u64])
+        return
+    }
+    semantic.ast_id_base_da_decl(id, &(q.c as ^Compilacao).modulos, nomes, a.decl)
+    if common.c2f_s2u_32(a.tipo) == (semantic.IND_CAMPO as u32) {
+        format(f"/campos[{a.indice}]", into = id)
+    }
+    if common.c2f_s2u_32(a.tipo) == (semantic.IND_MEMBRO as u32) {
+        format(f"/membros[{a.indice}]", into = id)
+    }
+    if common.c2f_s2u_32(a.tipo) == (semantic.IND_PARAM as u32) {
+        format(f"/params[{a.indice}]", into = id)
+    }
+    if common.c2f_s2u_32(a.tipo) == (semantic.IND_LOCAL as u32) {
+        let pos: common.FontePosicao = common.fonte_localizar_no_arquivo(&(q.c as ^Compilacao).fonte, a.decl_pos)
+        format(f"/{common.interner_texto(nomes, a.nome)[0..<transmute(common.interner_tam(nomes, a.nome), to = i32)]}@{pos.linha}:{pos.coluna}", into = id)
+    }
+}
+
+// C: driver/consultar_refs.c:59
+proc consulta_pos_do_alvo(q: ^Consulta, a: ^AlvoRefs) -> u32 {
+    if a.decl == none {
+        return semantic.AST_REF_SEM_POS as u32
+    }
+    let sw_1 = common.c2f_s2u_32(a.tipo)
+    if sw_1 == (semantic.IND_CAMPO as u32) {
+        return ((a.decl as ^frontend.Decl).campos or_else {})[a.indice].pos
+    } else if sw_1 == (semantic.IND_MEMBRO as u32) {
+        return ((a.decl as ^frontend.Decl).membros or_else {})[a.indice].pos
+    } else if sw_1 == (semantic.IND_PARAM as u32) {
+        return ((a.decl as ^frontend.Decl).params or_else {})[a.indice].pos
+    } else if sw_1 == (semantic.IND_LOCAL as u32) {
+        return a.decl_pos
+    } else {
+        return consulta_inicio_decl(q, a.decl)
+    }
+    return 0
+}
+
+// C: driver/consultar_refs.c:71
+proc alvo_json(q: ^Consulta, a: ^AlvoRefs) {
+    var id = make([dynamic]u8, alloc = heap)
+    defer delete(id)
+    let pos: u32 = consulta_pos_do_alvo(q, a)
+    var total: i64 = 0
+    id_do_alvo(q, a, &id)
+    consulta_abrir_obj(q)
+    let categoria: str = semantic.indice_nome_do_alvo(a.tipo)
+    consulta_chave_texto(q, "categoria", categoria, len(categoria) as u64)
+    consulta_chave_nome(q, "nome", a.nome)
+    let id_txt = to_str(&id)
+    defer delete(id_txt)
+    consulta_chave_texto(q, "id", id_txt, len(id_txt) as u64)
+    if pos != (semantic.AST_REF_SEM_POS as u32) {
+        consulta_chave_modulo(q, "modulo", (a.decl as ^frontend.Decl).modulo)
+        consulta_chave_arquivo(q, pos)
+        consulta_chave_pos(q, "pos", pos)
+    }
+    consulta_abrir_lista(q, "usos")
+    var i: u64 = 0
+    while i < (len(q.indice.usos) as u64) {
+        let u: ^semantic.IndUso = &q.indice.usos[i]
+        if consulta_uso_eh_do_alvo(u, a) {
+            uso_json(q, u)
+            total += 1
+        }
+        i += 1
+    }
+    consulta_fechar_lista(q)
+    consulta_chave_int(q, "total", total)
+    consulta_fechar_obj(q)
+}
+
+// C: driver/consultar_refs.c:102
+proc acrescentar_alvo(l: ^ListaAlvos, a: AlvoRefs) {
+    for i in (0 as u32)..<l.n {
+        if (((common.c2f_s2u_32(l.itens[i].tipo) == common.c2f_s2u_32(a.tipo)) and (l.itens[i].decl_pos == a.decl_pos)) and (l.itens[i].indice == a.indice)) and (l.itens[i].nome == a.nome) {
+            return
+        }
+    }
+    if (l.n as u64) < (2048 / 32) { // C2F: sizeof l -> itens C2F: sizeof l -> itens [ 0 ]
+        let antes_1: u32 = l.n
+        l.n += 1
+        l.itens[antes_1] = a
+    }
+}
+
+// C: driver/consultar_refs.c:110
+proc alvo_base(tipo: i32, decl: ?^frontend.Decl, nome: i32) -> AlvoRefs {
+    return AlvoRefs{tipo = tipo, decl = decl, indice = -1, nome = nome, decl_pos = semantic.AST_REF_SEM_POS as u32}
+}
+
+// C: driver/consultar_refs.c:115
+proc alvos_de_campo_ou_membro(d: ?^frontend.Decl, nome: i32, l: ^ListaAlvos) {
+    var i: u32 = 0
+    while ((d as ^frontend.Decl).tipo_no != (frontend.D_ENUM as u8)) and (i < (d as ^frontend.Decl).ncampos) {
+        var a: AlvoRefs = alvo_base(semantic.IND_CAMPO, d, nome)
+        a.indice = transmute(i, to = i32)
+        if ((d as ^frontend.Decl).campos or_else {})[i].nome == nome {
+            acrescentar_alvo(l, a)
+        }
+        i += 1
+    }
+    var i_2: u32 = 0
+    while ((d as ^frontend.Decl).tipo_no == (frontend.D_ENUM as u8)) and (i_2 < (d as ^frontend.Decl).nmembros) {
+        var a: AlvoRefs = alvo_base(semantic.IND_MEMBRO, d, nome)
+        a.indice = transmute(i_2, to = i32)
+        if ((d as ^frontend.Decl).membros or_else {})[i_2].nome == nome {
+            acrescentar_alvo(l, a)
+        }
+        i_2 += 1
+    }
+}
+
+// C: driver/consultar_refs.c:130 (o parametro, mesmo sem uso, e cada local de mesmo nome que algum uso alcanca)
+proc alvos_de_local(q: ^Consulta, d: ?^frontend.Decl, nome: i32, l: ^ListaAlvos) {
+    var i: u32 = 0
+    while i < (d as ^frontend.Decl).nparams {
+        var a: AlvoRefs = alvo_base(semantic.IND_PARAM, d, nome)
+        a.indice = i as i32
+        a.decl_pos = ((d as ^frontend.Decl).params or_else {})[i].pos
+        if ((d as ^frontend.Decl).params or_else {})[i].nome == nome {
+            acrescentar_alvo(l, a)
+        }
+        i += 1
+    }
+    var k: u64 = 0
+    while k < (len(q.indice.usos) as u64) {
+        let u: ^semantic.IndUso = &q.indice.usos[k]
+        var a: AlvoRefs = alvo_base(semantic.IND_LOCAL, d, nome)
+        a.decl_pos = u.decl_pos
+        if (u.alvo_tipo == (semantic.IND_LOCAL as u8)) and (u.alvo == d) and (u.nome == nome) {
+            acrescentar_alvo(l, a)
+        }
+        k += 1
+    }
+}
+
+// C: driver/consultar_refs.c:147
+proc alvos_embutidos(q: ^Consulta, nome: i32, l: ^ListaAlvos) {
+    var i: u64 = 0
+    while i < (len(q.indice.usos) as u64) {
+        let u: ^semantic.IndUso = &q.indice.usos[i]
+        if (u.alvo_tipo == (semantic.IND_EMBUTIDO as u8)) and (u.nome == nome) {
+            acrescentar_alvo(l, alvo_base(semantic.IND_EMBUTIDO, none, nome))
+            return
+        }
+        i += 1
+    }
+}
+
+// C: driver/consultar_refs.c:158 (ponto = indice do ultimo '.' de arg; a esquerda cabe em 512 bytes, como o esquerda[512] do C)
+proc alvos_com_ponto(q: ^Consulta, arg: str, ponto: int, l: ^ListaAlvos) {
+    if ponto >= 512 {
+        return
+    }
+    let esquerda: str = arg[0..<ponto]
+    let d: ?^frontend.Decl = consulta_achar_decl(q, esquerda)
+    let resto: str = arg[(ponto + 1)..<len(arg)]
+    let nome: i32 = common.interner_achar(&(q.c as ^Compilacao).nomes, resto, len(resto) as u32)
+    if (d == none) or (nome < 0) {
+        return
+    }
+    let dec: ^frontend.Decl = d as ^frontend.Decl
+    if (dec.tipo_no == (frontend.D_PROC as u8)) or (dec.tipo_no == (frontend.D_TEST as u8)) {
+        alvos_de_local(q, d, nome, l)
+    } else if (dec.tipo_no == (frontend.D_STRUCT as u8)) or (dec.tipo_no == (frontend.D_UNIAO as u8)) or (dec.tipo_no == (frontend.D_ENUM as u8)) {
+        alvos_de_campo_ou_membro(d, nome, l)
+    }
+}
+
+// C: driver/consultar_refs.c:175 (o nome e o texto depois do ultimo ':' do arg, se ha)
+proc alvos_sem_ponto(q: ^Consulta, arg: str, l: ^ListaAlvos) {
+    let d: ?^frontend.Decl = consulta_achar_decl(q, arg)
+    var dois: int = -1
+    var i: int = 0
+    while i < len(arg) {
+        if arg[i] == 58 { // ':' (strrchr)
+            dois = i
+        }
+        i += 1
+    }
+    var parte: str = arg
+    if dois >= 0 {
+        parte = arg[(dois + 1)..<len(arg)]
+    }
+    let nome: i32 = common.interner_achar(&(q.c as ^Compilacao).nomes, parte, len(parte) as u32)
+    if d != none {
+        let dec: ^frontend.Decl = d as ^frontend.Decl
+        acrescentar_alvo(l, alvo_base(semantic.indice_alvo_da_decl(d), d, dec.nome))
+    } else if nome >= 0 {
+        alvos_embutidos(q, nome, l)
+    }
+}
+
+// C: driver/consultar_refs.c:185 (o ultimo '.' separa "Tipo.campo"; sem '.', o nome e a declaracao ou embutido)
+proc consulta_alvos_de(q: ^Consulta, arg: str, alvos: ^ListaAlvos) {
+    var ponto: int = -1
+    var i: int = 0
+    while i < len(arg) {
+        if arg[i] == 46 { // '.' (strrchr)
+            ponto = i
+        }
+        i += 1
+    }
+    alvos.n = 0
+    if ponto >= 0 {
+        alvos_com_ponto(q, arg, ponto, alvos)
+    } else {
+        alvos_sem_ponto(q, arg, alvos)
+    }
+}
+
+// C: driver/consultar_refs.c:194
+proc consultar_refs(q: ^Consulta, p: ^PedidoConsulta) -> i32 {
+    var alvos: ListaAlvos = ListaAlvos{}
+    consulta_alvos_de(q, (p.arg or_else ""), &alvos)
+    if alvos.n == 0 {
+        return consulta_uso_errado("refs", p.arg, "nao e declaracao do projeto (use nome, Tipo.campo, Enum.membro, proc.parametro ou um embutido)")
+    }
+    consulta_abrir(q, "refs")
+    let arg_1: u64 = len((p.arg or_else "")) as u64
+    let arg_2: ?str = p.arg
+    let arg_3: str = "nome"
+    let arg_4: ^Consulta = q
+    consulta_chave_texto(arg_4, arg_3, arg_2, arg_1)
+    consulta_abrir_lista(q, "alvos")
+    for i in (0 as u32)..<alvos.n {
+        alvo_json(q, &alvos.itens[i])
+    }
+    consulta_fechar_lista(q)
+    consulta_fechar(q)
+    return CONSULTAR_OK
+}
+
+test "consultar_refs: consulta_uso_eh_do_alvo casa local pela posicao da declaracao e pelo nome" {
+    var a: AlvoRefs = AlvoRefs{}
+    a.tipo = semantic.IND_LOCAL
+    a.decl_pos = 40
+    a.nome = 7
+    var u: semantic.IndUso = semantic.IndUso{}
+    u.alvo_tipo = semantic.IND_LOCAL as u8
+    u.decl_pos = 40
+    u.nome = 7
+    expect(consulta_uso_eh_do_alvo(&u, &a))
+    u.decl_pos = 41
+    expect(not consulta_uso_eh_do_alvo(&u, &a))
+}

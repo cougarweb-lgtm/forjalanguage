@@ -1,0 +1,411 @@
+// driver/migrar_comentario.fj - porte de compiler/driver/migrar_comentario.c, compiler/driver/migrar_comentario.h
+// sha256 de driver/migrar_comentario.c: 9c25e6e7b33259d4be70d0fd8b97a8c23ea249d7569b6cf57e60fb8d57ed505e
+// sha256 de driver/migrar_comentario.h: 066209d7dd9c0e5fe8c2c9b4aaa40d9f2d47a93eec4294db981c747eceddf267
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.2.1
+// Changelog: 0.2.1 - G3 V5-D3: parsear liga o RenTrocas no Diag (tolera a forma antiga, como o global do C); import antigo em comentario de topo deixa de dar E0110.
+//            0.2.0 - G3 V5-G1: corpo real. Texto do comentario = bytes do fonte (view, sem copia); Compilacao no heap (new/delete) como o calloc do C;
+//            as listas de ComentariosSaida vivem na Arena (fatia_trocas/fatia_revisoes, molde de arena_fatia_*). Contexto4 sem ?: ponteiros e listas sao diretos.
+
+import "common"
+import "frontend"
+
+struct ComentariosSaida {
+    trocas: ?[]MigrarTroca
+    ntrocas: u32
+    revisoes: ?[]MigrarRevisao
+    nrevisoes: u32
+}
+
+struct Comentario {
+    inicio: u32
+    fim: u32
+    linha: u32
+    coluna: u32
+    sozinho: bool
+}
+
+struct LinhaDoBloco {
+    off: u32
+    linha: u32
+    coluna: u32
+}
+
+struct Bloco {
+    texto: [dynamic]u8
+    linhas: [dynamic]LinhaDoBloco
+}
+
+struct Contexto4 {
+    caminho: str
+    fonte: ^common.Fonte
+    arena: ^common.Arena
+    trocas: [dynamic]MigrarTroca
+    revisoes: [dynamic]MigrarRevisao
+}
+
+struct Analise {
+    c: ?^Compilacao
+    base: u32
+}
+
+const TRECHO_MAX_2: i32 = 160
+const FORMAS_DE_PARSE: i32 = 3
+const PREFIXOS: [3]str = {"", "proc forja_comentario() {\n", "proc forja_comentario() {\nlet forja_valor = "}
+const SUFIXOS: [3]str = {"\n", "\n}\n", "\n}\n"}
+
+// C: driver/migrar_comentario.c:44 (CarregarFonte): copia o texto (com o NUL de sentinela) e indexa as linhas
+proc carregar_fonte_2(f: ^common.Fonte, caminho: str, texto: str, tam: u64) -> bool {
+    let adotado: bool = common.fonte_adotar_texto(f, caminho, texto, tam)
+    _ = common.fonte_indexar_linhas(f)
+    return adotado
+}
+
+// C: driver/migrar_comentario.c:56 (SoEspacoAntes): so espaco ou tab entre o inicio da linha e o comentario
+proc so_espaco_antes(f: ^common.Fonte, inicio: u32, coluna: u32) -> bool {
+    for k in (inicio - (coluna - 1))..<inicio {
+        if (f.texto[k] != 32) and (f.texto[k] != 9) { // ' ' '\t'
+            return false
+        }
+    }
+    return true
+}
+
+// C: driver/migrar_comentario.c:64 (ListarComentarios): o lexer da Forja acha os '//' (os de dentro de texto entre aspas nao contam)
+proc listar_comentarios(f: ^common.Fonte, coms: ^[dynamic]Comentario) {
+    var brutos: [dynamic]frontend.LexerComentario = make([dynamic]frontend.LexerComentario, alloc = heap)
+    var arena: common.Arena = common.Arena{}
+    var nomes: common.Interner = common.Interner{}
+    var diag: common.Diag = common.Diag{}
+    common.interner_iniciar(&nomes, &arena)
+    frontend.lexer_nomes_iniciais(&nomes)
+    var lx: frontend.Lexer = frontend.Lexer{fonte = f, nomes = &nomes, diag = &diag, comentarios = &brutos}
+    _ = frontend.lexer_analisar(&lx)
+    for k in (0 as u64)..<(len(brutos) as u64) {
+        let b: frontend.LexerComentario = brutos[k]
+        var c: Comentario = Comentario{inicio = b.inicio, fim = b.fim}
+        common.fonte_localizar(f, b.inicio, &c.linha, &c.coluna)
+        c.sozinho = so_espaco_antes(f, b.inicio, c.coluna)
+        append(coms, item = c)
+    }
+    frontend.lexer_liberar(&lx)
+    common.interner_liberar(&nomes)
+    common.arena_liberar(&arena)
+    delete(brutos)
+}
+
+// C: driver/migrar_comentario.c:92 (TextoDoComentario): o texto depois do '//', sem o CR do fim (view no fonte)
+proc texto_do_comentario(f: ^common.Fonte, c: ^Comentario) -> []u8 {
+    let ini: u64 = (c.inicio as u64) + 2
+    var fim: u64 = c.fim as u64
+    if (fim > ini) and (f.texto[fim - 1] == 13) {
+        fim -= 1
+    }
+    return f.texto[ini..<fim]
+}
+
+// C: driver/migrar_comentario.c:103 (MontarBloco): as linhas [ini, fim) como um texto so, separadas por LF
+proc montar_bloco(cx: ^Contexto4, coms: []Comentario, ini: u64, fim: u64, b: ^Bloco) {
+    b.linhas = make([dynamic]LinhaDoBloco, alloc = heap)
+    b.texto = make([dynamic]u8, alloc = heap)
+    for i in ini..<fim {
+        let p: []u8 = texto_do_comentario(cx.fonte, &coms[i])
+        append(&b.linhas, item = LinhaDoBloco{off = (len(b.texto) as u64) as u32, linha = coms[i].linha, coluna = coms[i].coluna + 2})
+        append(&b.texto, items = p)
+        if (i + 1) < fim {
+            append(&b.texto, items = as_bytes("\n"))
+        }
+    }
+}
+
+// C: driver/migrar_comentario.c:118 (Parsear): a moldura da forma + o corpo + o sufixo; a Compilacao viva se o parser aceitou, none se nao
+proc parsear(cx: ^Contexto4, corpo: ^[dynamic]u8, forma: i32) -> ?^Compilacao {
+    var tudo: [dynamic]u8 = make([dynamic]u8, alloc = heap)
+    append(&tudo, items = as_bytes(PREFIXOS[forma]))
+    append(&tudo, items = corpo[..])
+    append(&tudo, items = as_bytes(SUFIXOS[forma]))
+    let texto_tudo: str = from_bytes(tudo[..], alloc = heap)
+    delete(tudo)
+    let c: ^Compilacao = new(Compilacao, alloc = heap)
+    let carregada: bool = carregar_fonte_2(&c.fonte, cx.caminho, texto_tudo, len(texto_tudo) as u64)
+    delete(texto_tudo)
+    if not carregada {
+        delete(c)
+        return none
+    }
+    iniciar_compilacao(c)
+    // C2F-70/D0794: o C tolera a forma antiga por global (RodarMigrar, cmd_migrar.c:218); aqui o Diag leva um RenTrocas, que e o que liga a tolerancia (renomeado_recusa_em). Sem ele o import "std:arquivo" do comentario dava E0110 e caia na revisao.
+    let reg: ^common.RenTrocas = common.ren_trocas_novo()
+    defer delete(reg)
+    common.ren_trocas_iniciar(reg)
+    defer common.ren_trocas_liberar(reg)
+    c.diag.trocas = reg
+    let opcoes: ^Opcoes = new(Opcoes, alloc = heap)
+    opcoes.comando = "check"
+    opcoes.entrada = cx.caminho
+    c.opcoes = opcoes
+    c.sem.lista.teto = opcoes_max_erros(opcoes)
+    let ok: bool = analisar_sintaxe(c, false)
+    c.opcoes = none
+    c.diag.trocas = none
+    delete(opcoes)
+    if ok {
+        return c
+    }
+    liberar_compilacao(c)
+    delete(c)
+    return none
+}
+
+// C: driver/migrar_comentario.c:146 (AnalisarBloco): a primeira forma que parseia; a base e o tamanho da moldura dela
+proc analisar_bloco(cx: ^Contexto4, corpo: ^[dynamic]u8, a: ^Analise) -> bool {
+    for forma in (0 as i32)..<FORMAS_DE_PARSE {
+        let c: ?^Compilacao = parsear(cx, corpo, forma)
+        if c == none {
+            continue
+        }
+        a.c = c
+        a.base = (len(PREFIXOS[forma]) as u64) as u32
+        return true
+    }
+    return false
+}
+
+// C: driver/migrar_comentario.c:160 (PosicaoNoArquivo): linha e coluna, no arquivo, do byte u do texto sintetico do bloco
+proc posicao_no_arquivo(b: ^Bloco, u: u32, linha: ^u32, coluna: ^u32) {
+    var l: ?^LinhaDoBloco = &b.linhas[0]
+    for k in (1 as u64)..<(len(b.linhas) as u64) {
+        let prox: ^LinhaDoBloco = &b.linhas[k]
+        if prox.off > u {
+            break
+        }
+        l = prox
+    }
+    linha^ = (l as ^LinhaDoBloco).linha
+    coluna^ = (l as ^LinhaDoBloco).coluna + (u - (l as ^LinhaDoBloco).off)
+}
+
+// C: driver/migrar_comentario.c:175 (TrechoCortado): sem espaco nas pontas, cortado em TRECHO_MAX bytes na fronteira de um caractere UTF-8
+proc trecho_cortado(arena: ^common.Arena, texto: []u8, n_entrada: u64) -> str {
+    var inicio: u64 = 0
+    var n: u64 = n_entrada
+    while (n > 0) and ((texto[inicio] == 32) or (texto[inicio] == 9)) {
+        inicio += 1
+        n -= 1
+    }
+    if n > (TRECHO_MAX_2 as u64) {
+        n = TRECHO_MAX_2 as u64
+        while (n > 0) and ((texto[inicio + n] & 192) == 128) {
+            n -= 1
+        }
+    }
+    while (n > 0) and ((texto[inicio + n - 1] == 32) or (texto[inicio + n - 1] == 9) or (texto[inicio + n - 1] == 13)) {
+        n -= 1
+    }
+    return from_bytes(texto[inicio..<(inicio + n)], alloc = common.arena_mem(arena))
+}
+
+// C: driver/migrar_comentario.c:190 (SomarRevisao): uma revisao: o comentario em (linha, coluna), o trecho dele e as formas (copiadas para a Arena)
+proc somar_revisao(cx: ^Contexto4, linha: u32, coluna: u32, trecho: []u8, formas: ^[dynamic]str) {
+    let nf: int = len(formas)
+    var guardadas: []str = common.arena_fatia_str(cx.arena, nf + 1)
+    for i in 0..<nf {
+        guardadas[i] = formas[i]
+    }
+    append(&cx.revisoes, item = MigrarRevisao{linha = linha, coluna = coluna, trecho = trecho_cortado(cx.arena, trecho, len(trecho) as u64), formas = guardadas, nformas = nf as u32})
+}
+
+// C: driver/migrar_comentario.c:200 (SomarTroca): troca na linha e coluna da forma antiga; so se o texto sintetico confere com o que a regra viu
+proc somar_troca(cx: ^Contexto4, b: ^Bloco, t: ^NomeTroca, base: u32) {
+    let u: u32 = t.off - base
+    let antigo: str = t.antigo or_else ""
+    if ((u as u64) + (t.tam as u64)) > (len(b.texto) as u64) {
+        return
+    }
+    if common.c2f_memcmp(b.texto[(u as u64)..<((u as u64) + (t.tam as u64))], as_bytes(antigo)) != 0 {
+        return
+    }
+    var m: MigrarTroca = MigrarTroca{classe = t.classe, antigo = t.antigo, novo = t.novo, grupo = -1, comentario = true}
+    posicao_no_arquivo(b, u, &m.linha, &m.coluna)
+    m.coluna_fim = m.coluna + t.tam
+    append(&cx.trocas, item = m)
+}
+
+// C: driver/migrar_comentario.c:212 (SomarDuvida): qualificador antigo duvidoso (pode ser variavel): vai para a revisao com o trecho dele como unica forma
+proc somar_duvida(cx: ^Contexto4, b: ^Bloco, d: ^NomeTroca, base: u32) {
+    let u: u32 = d.off - base
+    let trecho: []u8 = b.texto[(u as u64)..<((u as u64) + (d.tam as u64))]
+    let forma: str = from_bytes(trecho, alloc = common.arena_mem(cx.arena))
+    var formas: [dynamic]str = make([dynamic]str, alloc = heap)
+    append(&formas, item = forma)
+    var linha: u32 = 0
+    var coluna: u32 = 0
+    posicao_no_arquivo(b, u, &linha, &coluna)
+    somar_revisao(cx, linha, coluna, trecho, &formas)
+    delete(formas)
+}
+
+// C: driver/migrar_comentario.c:226 (TrocasDoBloco): o bloco parseou; as regras por nome sobre os tokens dele
+proc trocas_do_bloco(cx: ^Contexto4, b: ^Bloco, a: ^Analise) {
+    let cc: ^Compilacao = a.c as ^Compilacao
+    let txt: str = from_bytes(cc.fonte.texto[0..<cc.fonte.tam], alloc = heap)
+    var e: NomesEntrada = NomesEntrada{texto = txt, tokens = cc.lexer.tokens[..], ntokens = len(cc.lexer.tokens) as u64, ini = a.base, fim = a.base + (len(b.texto) as u32)}
+    var trocas: [dynamic]NomeTroca = make([dynamic]NomeTroca, alloc = heap)
+    var duvidas: [dynamic]NomeTroca = make([dynamic]NomeTroca, alloc = heap)
+    nomes_do_codigo(&e, cx.arena, &trocas, &duvidas)
+    for k in (0 as u64)..<(len(trocas) as u64) {
+        somar_troca(cx, b, &trocas[k], a.base)
+    }
+    for k in (0 as u64)..<(len(duvidas) as u64) {
+        somar_duvida(cx, b, &duvidas[k], a.base)
+    }
+    delete(trocas)
+    delete(duvidas)
+    delete(txt)
+}
+
+// C: driver/migrar_comentario.c:241 (RevisarComentario): o comentario nao parseia (prosa ou mistura): so a lista das formas antigas, se ha
+proc revisar_comentario(cx: ^Contexto4, c: ^Comentario) {
+    let bruto: []u8 = texto_do_comentario(cx.fonte, c)
+    let copia: str = from_bytes(bruto, alloc = heap)
+    var formas: [dynamic]str = make([dynamic]str, alloc = heap)
+    nomes_soltos(copia, len(copia) as u64, cx.arena, &formas)
+    if len(formas) > 0 {
+        somar_revisao(cx, c.linha, c.coluna, bruto, &formas)
+    }
+    delete(formas)
+    delete(copia)
+}
+
+// C: driver/migrar_comentario.c:255 (ProcessarLinhas): os comentarios [ini, fim) como um texto so; relatar: se nao parseia, vai para a revisao
+proc processar_linhas(cx: ^Contexto4, coms: []Comentario, ini: u64, fim: u64, relatar: bool) -> bool {
+    var b: Bloco = Bloco{}
+    var a: Analise = Analise{}
+    montar_bloco(cx, coms, ini, fim, &b)
+    let ok: bool = analisar_bloco(cx, &b.texto, &a)
+    if ok {
+        trocas_do_bloco(cx, &b, &a)
+        let cc: ^Compilacao = a.c as ^Compilacao
+        liberar_compilacao(a.c)
+        delete(cc)
+    } else if relatar {
+        revisar_comentario(cx, &coms[ini])
+    }
+    delete(b.texto)
+    delete(b.linhas)
+    return ok
+}
+
+// C: driver/migrar_comentario.c:275 (ProcessarUnidade): o grupo inteiro como um bloco; se nao parseia, cada comentario sozinho
+proc processar_unidade(cx: ^Contexto4, coms: []Comentario, ini: u64, fim: u64) {
+    if ((fim - ini) > 1) and processar_linhas(cx, coms, ini, fim, false) {
+        return
+    }
+    for i in ini..<fim {
+        _ = processar_linhas(cx, coms, i, i + 1, true)
+    }
+}
+
+// C: driver/migrar_comentario.c:282 (ProcessarTodos): comentarios de linha inteira em linhas seguidas formam um bloco; o resto e um bloco por comentario
+proc processar_todos(cx: ^Contexto4, coms: ^[dynamic]Comentario) {
+    let c: []Comentario = coms[..]
+    let total: u64 = len(c) as u64
+    var ini: u64 = 0
+    while ini < total {
+        var fim: u64 = ini + 1
+        while c[ini].sozinho and (fim < total) and c[fim].sozinho and (c[fim].linha == (c[fim - 1].linha + 1)) {
+            fim += 1
+        }
+        processar_unidade(cx, c, ini, fim)
+        ini = fim
+    }
+}
+
+// C: driver/migrar_comentario.c:296 (Exportar): as listas viram fatias da Arena (n + 1, como o C), com as contagens
+proc exportar(cx: ^Contexto4, saida: ^ComentariosSaida) {
+    let nt: int = len(cx.trocas)
+    var t: []MigrarTroca = fatia_trocas(cx.arena, nt + 1)
+    for i in 0..<nt {
+        t[i] = cx.trocas[i]
+    }
+    saida.ntrocas = nt as u32
+    saida.trocas = t
+    let nr: int = len(cx.revisoes)
+    var r: []MigrarRevisao = fatia_revisoes(cx.arena, nr + 1)
+    for i in 0..<nr {
+        r[i] = cx.revisoes[i]
+    }
+    saida.nrevisoes = nr as u32
+    saida.revisoes = r
+}
+
+// Fatia de MigrarTroca na Arena (molde de common.arena_fatia_*, que so cobre tipos basicos)
+proc fatia_trocas(arena: ^common.Arena, n: int) -> []MigrarTroca {
+    var l = make([dynamic]MigrarTroca, alloc = common.arena_mem(arena), cap = n)
+    for i in 0..<n {
+        append(&l, item = MigrarTroca{})
+    }
+    return l[..]
+}
+
+// Fatia de MigrarRevisao na Arena (molde de common.arena_fatia_*)
+proc fatia_revisoes(arena: ^common.Arena, n: int) -> []MigrarRevisao {
+    var l = make([dynamic]MigrarRevisao, alloc = common.arena_mem(arena), cap = n)
+    for i in 0..<n {
+        append(&l, item = MigrarRevisao{})
+    }
+    return l[..]
+}
+
+test "migrar_comentario: trecho cortado (espaco nas pontas e TRECHO_MAX)" {
+    var arena: common.Arena = common.Arena{}
+    let curto: str = trecho_cortado(&arena, as_bytes("  ab cd  "), 9)
+    expect(curto == "ab cd")
+    var buf: [dynamic]u8 = make([dynamic]u8, alloc = heap)
+    for i in 0..<200 {
+        append(&buf, item = 97)
+    }
+    let longo: str = trecho_cortado(&arena, buf[..], 200)
+    expect(len(longo) == 160)
+    delete(buf)
+    common.arena_liberar(&arena)
+}
+
+test "migrar_comentario: texto do comentario sem o CR do fim" {
+    var f: common.Fonte = common.Fonte{}
+    _ = common.fonte_adotar_texto(&f, "x.fj", "x // ab\r", 8)
+    var c: Comentario = Comentario{inicio = 2, fim = 8}
+    let t: []u8 = texto_do_comentario(&f, &c)
+    expect(len(t) == 3)
+    expect(t[0] == 32)
+    expect(t[2] == 98)
+    common.fonte_liberar(&f)
+}
+
+test "migrar_comentario: import antigo em comentario de topo vira troca, sem E0110" {
+    var arena: common.Arena = common.Arena{}
+    var saida: ComentariosSaida = ComentariosSaida{}
+    let fonte: ?str = "// import \"std:arquivo\"\nproc main() {\n}\n"
+    migrar_comentarios("x.fj", fonte, 40, &arena, &saida)
+    expect(saida.ntrocas == 1)
+    expect(saida.nrevisoes == 0)
+    common.arena_liberar(&arena)
+}
+
+// C: driver/migrar_comentario.c:306 (MigrarComentarios): entrada do 'forja migrar --comentarios' para um arquivo inteiro; saida zerada se o fonte nao carrega
+proc migrar_comentarios(caminho: str, texto: ?str, tam: u64, arena: ^common.Arena, saida: ^ComentariosSaida) {
+    saida^ = ComentariosSaida{}
+    var f: common.Fonte = common.Fonte{}
+    if not carregar_fonte_2(&f, caminho, texto or_else "", tam) {
+        return
+    }
+    var coms: [dynamic]Comentario = make([dynamic]Comentario, alloc = heap)
+    var cx: Contexto4 = Contexto4{caminho = caminho, fonte = &f, arena = arena, trocas = make([dynamic]MigrarTroca, alloc = heap), revisoes = make([dynamic]MigrarRevisao, alloc = heap)}
+    listar_comentarios(&f, &coms)
+    processar_todos(&cx, &coms)
+    exportar(&cx, saida)
+    delete(coms)
+    delete(cx.trocas)
+    delete(cx.revisoes)
+    common.fonte_liberar(&f)
+}

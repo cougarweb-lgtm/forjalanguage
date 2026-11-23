@@ -1,0 +1,333 @@
+// ir/lower_lista_fixa.fj - porte de compiler/ir/lower_lista_fixa.c
+// sha256 de ir/lower_lista_fixa.c: bff564a94a4b5515f18e87af693f4699f4ecf63936daefd08cef049fb4bfffbc
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "common"
+import "frontend"
+import "semantic"
+
+struct ItemDaLista {
+    lista: u32 // TipoId
+    ponteiro: Valor
+    n: Valor
+    item: Valor
+}
+
+const PARAMS_DO_SERVICO: i32 = 4
+const NOME_DO_SERVICO: str = "0lista_cheia"
+const SIMBOLO_DO_SERVICO: str = "forja_falha_alocacao"
+// A tabela PARAMETROS (const char *const[4]) vira [4]str e [4]u32 dentro de nome_do_servico (mao, onda IR rodada 2).
+
+// C: ir/lower_lista_fixa.c:27
+proc lw_eh_lista_fixa(c: ^LowerCtx, t: u32) -> bool {
+    var por_ponteiro: bool = false
+    return semantic.tipo_lista_fixa_de(&(c.sem as ^semantic.Semantica).tipos, t, &por_ponteiro) != 0
+}
+
+// C: ir/lower_lista_fixa.c:34
+proc lista_do_tipo(c: ^LowerCtx, t: u32) -> u32 {
+    var por_ponteiro: bool = false
+    return semantic.tipo_lista_fixa_de(&(c.sem as ^semantic.Semantica).tipos, t, &por_ponteiro)
+}
+
+// C: ir/lower_lista_fixa.c:40
+proc instr_com_temp_4(c: ^LowerCtx, op: i32, pos: u32, tipo: u32) -> ^IrInstr {
+    let i: ^IrInstr = lw_nova_instr(c, op, pos)
+    i.destino = lw_novo_temp(c)
+    i.tipo = tipo
+    return i
+}
+
+// C: ir/lower_lista_fixa.c:49
+proc ponteiro_da_lista(c: ^LowerCtx, l: ?^frontend.Expr) -> Valor {
+    if common.c2f_s2u_32(semantic.tipo_classe_de(&(c.sem as ^semantic.Semantica).tipos, (l as ^frontend.Expr).tipo)) == (semantic.TC_PONTEIRO as u32) {
+        return lw_expr(c, l)
+    }
+    if lw_enderecavel(c, l) {
+        return lw_endereco(c, l)
+    }
+    let valor: Valor = lw_expr(c, l)
+    let local: i32 = lw_novo_local(c)
+    let definicao: ^IrInstr = lw_nova_instr(c, IR_LOCAL, (l as ^frontend.Expr).pos_op)
+    definicao.destino = local
+    definicao.tipo = (l as ^frontend.Expr).tipo
+    definicao.mutavel = true
+    definicao.a = valor
+    let arg_1: u32 = semantic.tipo_ponteiro(&(c.sem as ^semantic.Semantica).tipos, (l as ^frontend.Expr).tipo)
+    let arg_2: u32 = (l as ^frontend.Expr).pos_op
+    let arg_3: ^LowerCtx = c
+    let endereco: ^IrInstr = instr_com_temp_4(arg_3, IR_UNARIO, arg_2, arg_1)
+    endereco.op_aux = frontend.OP_ENDERECO as u8
+    endereco.a = lw_valor_local(local, (l as ^frontend.Expr).tipo)
+    return lw_valor_temp(endereco.destino, endereco.tipo)
+}
+
+// C: ir/lower_lista_fixa.c:67
+proc ler_n(c: ^LowerCtx, ponteiro: Valor, pos: u32) -> Valor {
+    let i: ^IrInstr = instr_com_temp_4(c, IR_CAMPO, pos, semantic.TIPO_INT as u32)
+    i.a = ponteiro
+    i.nome = (c.sem as ^semantic.Semantica).nome_n
+    return lw_valor_temp(i.destino, semantic.TIPO_INT as u32)
+}
+
+// C: ir/lower_lista_fixa.c:76
+proc endereco_dos_itens(c: ^LowerCtx, ponteiro: Valor, lista: u32, pos: u32) -> Valor {
+    let arg_1: u32 = semantic.tipo_lista_fixa_array(&(c.sem as ^semantic.Semantica).tipos, lista)
+    let arg_2: ^semantic.Tipos = &(c.sem as ^semantic.Semantica).tipos
+    let tipo: u32 = semantic.tipo_ponteiro(arg_2, arg_1)
+    let i: ^IrInstr = instr_com_temp_4(c, IR_ENDERECO_CAMPO, pos, tipo)
+    i.a = ponteiro
+    i.nome = (c.sem as ^semantic.Semantica).nome_itens
+    return lw_valor_temp(i.destino, tipo)
+}
+
+// C: ir/lower_lista_fixa.c:86
+proc fatia_dos_itens(c: ^LowerCtx, ponteiro: Valor, lista: u32, pos: u32) -> Valor {
+    // itens[0 ..< n]: n <= N sempre, entao os limites sao provados (op_aux 1)
+    let n: Valor = ler_n(c, ponteiro, pos)
+    let itens: Valor = endereco_dos_itens(c, ponteiro, lista, pos)
+    let tipos: ^semantic.Tipos = &(c.sem as ^semantic.Semantica).tipos
+    let tipo_da_fatia: u32 = semantic.tipo_fatia(tipos, semantic.tipo_lista_fixa_elemento(tipos, lista))
+    let i: ^IrInstr = instr_com_temp_4(c, IR_FATIA, pos, tipo_da_fatia)
+    i.a = itens
+    i.b = lw_valor_int(0, semantic.TIPO_INT as u32)
+    i.args = lw_args(c, 1)
+    let args: []Valor = i.args or_else {}
+    args[0] = n
+    i.nargs = 1
+    i.faixa_excl = true
+    i.op_aux = 1
+    return lw_valor_temp(i.destino, i.tipo)
+}
+
+// C: ir/lower_lista_fixa.c:102
+proc fatia_da_expressao(c: ^LowerCtx, l: ?^frontend.Expr) -> Valor {
+    let ponteiro: Valor = ponteiro_da_lista(c, l)
+    let arg_1: u32 = (l as ^frontend.Expr).pos_op
+    let arg_2: u32 = lista_do_tipo(c, (l as ^frontend.Expr).tipo)
+    let arg_3: Valor = ponteiro
+    let arg_4: ^LowerCtx = c
+    return fatia_dos_itens(arg_4, arg_3, arg_2, arg_1)
+}
+
+// C: ir/lower_lista_fixa.c:108
+proc lw_indice_lista_fixa(c: ^LowerCtx, e: ^frontend.Expr) -> Valor {
+    let base: Valor = fatia_da_expressao(c, e.a)
+    let indice: Valor = lw_indice_int(c, e.b)
+    let i: ^IrInstr = instr_com_temp_4(c, IR_ELEMENTO, e.pos_op, e.tipo)
+    i.a = base
+    i.b = indice
+    return lw_valor_temp(i.destino, i.tipo)
+}
+
+// C: ir/lower_lista_fixa.c:118
+proc lw_endereco_lista_fixa(c: ^LowerCtx, e: ?^frontend.Expr) -> Valor {
+    let base: Valor = fatia_da_expressao(c, (e as ^frontend.Expr).a)
+    let indice: Valor = lw_indice_int(c, (e as ^frontend.Expr).b)
+    let arg_1: u32 = semantic.tipo_ponteiro(&(c.sem as ^semantic.Semantica).tipos, (e as ^frontend.Expr).tipo)
+    let arg_2: u32 = (e as ^frontend.Expr).pos_op
+    let arg_3: ^LowerCtx = c
+    let i: ^IrInstr = instr_com_temp_4(arg_3, IR_ENDERECO_ELEMENTO, arg_2, arg_1)
+    i.a = base
+    i.b = indice
+    return lw_valor_temp(i.destino, i.tipo)
+}
+
+// C: ir/lower_lista_fixa.c:128
+proc lw_fatia_lista_fixa(c: ^LowerCtx, e: ^frontend.Expr) -> Valor {
+    let base: Valor = fatia_da_expressao(c, e.a)
+    if e.op == (frontend.FATIA_INTEIRA as u8) {
+        return base
+    }
+    let inicio: Valor = lw_indice_int(c, (e.args or_else {})[0].valor)
+    let fim: Valor = lw_indice_int(c, (e.args or_else {})[1].valor)
+    let i: ^IrInstr = instr_com_temp_4(c, IR_FATIA, e.pos_op, e.tipo)
+    i.a = base
+    i.b = inicio
+    i.args = lw_args(c, 1)
+    let args: []Valor = i.args or_else {}
+    args[0] = fim
+    i.nargs = 1
+    i.faixa_excl = e.op == (frontend.FATIA_EXCL as u8)
+    return lw_valor_temp(i.destino, i.tipo)
+}
+
+// C: ir/lower_lista_fixa.c:144
+proc lw_tamanho_lista_fixa(c: ^LowerCtx, arg: ?^frontend.Expr) -> Valor {
+    let arg_1: u32 = (arg as ^frontend.Expr).pos_op
+    let arg_2: Valor = ponteiro_da_lista(c, arg)
+    let arg_3: ^LowerCtx = c
+    return ler_n(arg_3, arg_2, arg_1)
+}
+
+// C: ir/lower_lista_fixa.c:149
+proc lw_base_lista_fixa(c: ^LowerCtx, e: ?^frontend.Expr, tamanho: ^Valor) -> Valor {
+    let ponteiro: Valor = ponteiro_da_lista(c, e)
+    let lista: u32 = lista_do_tipo(c, (e as ^frontend.Expr).tipo)
+    tamanho^ = ler_n(c, ponteiro, (e as ^frontend.Expr).pos_op)
+    return fatia_dos_itens(c, ponteiro, lista, (e as ^frontend.Expr).pos_op)
+}
+
+// C: ir/lower_lista_fixa.c:160
+proc nome_do_servico(c: ^LowerCtx) -> i32 {
+    // O servico entra como IrExterno interno na 1a vez que um append precisa dele (vaga a mais em lower_fatia_externo)
+    let prog: ^IrPrograma = c.prog as ^IrPrograma
+    let nomes: ^common.Interner = &((c.sem as ^semantic.Semantica).nomes or_else {})[0]
+    let nome: i32 = common.internar(nomes, NOME_DO_SERVICO, len(NOME_DO_SERVICO) as u32)
+    for k in (0 as u32)..<prog.nexternos {
+        if (prog.externos or_else {})[k].nome == nome {
+            return nome
+        }
+    }
+    let nomes_parametros: [4]str = {"oque", "valor", "arquivo", "linha"}
+    let tipos_parametros: [4]u32 = {semantic.TIPO_CSTR as u32, semantic.TIPO_INT as u32, semantic.TIPO_CSTR as u32, semantic.TIPO_I32 as u32}
+    let antes: u32 = prog.nexternos
+    prog.nexternos += 1
+    let externos: []IrExterno = prog.externos or_else {}
+    let e: ^IrExterno = &externos[antes as int]
+    e.nome = nome
+    e.simbolo = common.internar(nomes, SIMBOLO_DO_SERVICO, len(SIMBOLO_DO_SERVICO) as u32)
+    e.retorno = semantic.TIPO_VAZIO as u32
+    e.nparams = PARAMS_DO_SERVICO as u32
+    e.params = lower_fatia_param(c.arena as ^common.Arena, PARAMS_DO_SERVICO as int)
+    let params: []IrParam = e.params or_else {}
+    for k in (0 as u32)..<(PARAMS_DO_SERVICO as u32) {
+        let nome_do_param: i32 = common.internar(nomes, nomes_parametros[k as int], len(nomes_parametros[k as int]) as u32)
+        params[k as int] = IrParam{nome = nome_do_param, tipo = tipos_parametros[k as int]}
+    }
+    e.interno = true
+    return nome
+}
+
+// C: ir/lower_lista_fixa.c:182
+proc texto_cstr(c: ^LowerCtx, texto: ?str) -> Valor {
+    // C: strlen(texto) nao recebe NULL (so as duas constantes de FalharCheia chegam aqui); or_else "" so tira o ?.
+    let t: str = texto or_else ""
+    let nomes: ^common.Interner = &((c.sem as ^semantic.Semantica).nomes or_else {})[0]
+    return lw_valor_texto(common.internar(nomes, t, len(t) as u32), semantic.TIPO_CSTR as u32)
+}
+
+// C: ir/lower_lista_fixa.c:188
+proc falhar_cheia(c: ^LowerCtx, lista: u32, pos: u32) {
+    let sem: ^semantic.Semantica = c.sem as ^semantic.Semantica
+    // SemDescrever (char tipo[96]): o tipo chega cortado em 95 bytes, como no C (descreve_array)
+    let tipo: str = descreve_array(sem, lista)
+    defer delete(tipo)
+    // "append numa %s cheia" cabe em 159 bytes com qualquer tipo de 95: o snprintf do C nao corta
+    let oque: str = format(f"append numa {tipo} cheia", alloc = heap)
+    defer delete(oque)
+    let onde: common.FontePosicao = common.fonte_localizar_no_arquivo(sem.fonte, pos)
+    let i: ^IrInstr = lw_nova_instr(c, IR_CHAMADA, pos)
+    i.nome = nome_do_servico(c)
+    i.tipo = semantic.TIPO_VAZIO as u32
+    i.args = lw_args(c, PARAMS_DO_SERVICO as u32)
+    let args: []Valor = i.args or_else {}
+    args[0] = texto_cstr(c, oque)
+    args[1] = lw_valor_int(semantic.tipo_lista_fixa_n(&sem.tipos, lista) as i64, semantic.TIPO_INT as u32)
+    args[2] = texto_cstr(c, onde.caminho)
+    args[3] = lw_valor_int(onde.linha as i64, semantic.TIPO_I32 as u32)
+    i.nargs = PARAMS_DO_SERVICO as u32
+}
+
+// C: ir/lower_lista_fixa.c:206
+proc comparar_com_capacidade(c: ^LowerCtx, n: Valor, capacidade: i64, pos: u32) -> Valor {
+    let i: ^IrInstr = instr_com_temp_4(c, IR_BINARIO, pos, semantic.TIPO_BOOL as u32)
+    i.op_aux = frontend.OP_MAIOR_IGUAL as u8
+    i.a = n
+    i.b = lw_valor_int(capacidade, semantic.TIPO_INT as u32)
+    return lw_valor_temp(i.destino, semantic.TIPO_BOOL as u32)
+}
+
+// C: ir/lower_lista_fixa.c:216
+proc mais_um(c: ^LowerCtx, n: Valor, pos: u32) -> Valor {
+    let i: ^IrInstr = instr_com_temp_4(c, IR_BINARIO, pos, semantic.TIPO_INT as u32)
+    i.op_aux = frontend.OP_SOMA as u8
+    i.a = n
+    i.b = lw_valor_int(1, semantic.TIPO_INT as u32)
+    return lw_valor_temp(i.destino, semantic.TIPO_INT as u32)
+}
+
+// C: ir/lower_lista_fixa.c:229
+proc gravar_item(c: ^LowerCtx, gravar: ^ItemDaLista, pos: u32) {
+    let lista: u32 = gravar.lista
+    let ponteiro: Valor = gravar.ponteiro
+    let n: Valor = gravar.n
+    let item: Valor = gravar.item
+    let elemento: u32 = semantic.tipo_lista_fixa_elemento(&(c.sem as ^semantic.Semantica).tipos, lista)
+    let itens: Valor = endereco_dos_itens(c, ponteiro, lista, pos)
+    let destino: ^IrInstr = instr_com_temp_4(c, IR_ENDERECO_ELEMENTO, pos, semantic.tipo_ponteiro(&(c.sem as ^semantic.Semantica).tipos, elemento))
+    destino.a = itens
+    destino.b = n
+    destino.op_aux = 1
+    let grava: ^IrInstr = lw_nova_instr(c, IR_GRAVA_PONTEIRO, pos)
+    grava.tipo = elemento
+    grava.a = lw_valor_temp(destino.destino, destino.tipo)
+    grava.b = item
+    grava.nome = -1
+    let novo_n: Valor = mais_um(c, n, pos)
+    let grava_n: ^IrInstr = lw_nova_instr(c, IR_GRAVA_PONTEIRO, pos)
+    grava_n.tipo = semantic.TIPO_INT as u32
+    grava_n.a = ponteiro
+    grava_n.b = novo_n
+    grava_n.nome = (c.sem as ^semantic.Semantica).nome_n
+}
+
+// C: ir/lower_lista_fixa.c:252
+proc lw_append_lista_fixa(c: ^LowerCtx, e: ^frontend.Expr, alvo: ?^frontend.Expr, item_expr: ?^frontend.Expr) -> Valor {
+    let lista: u32 = lista_do_tipo(c, (alvo as ^frontend.Expr).tipo)
+    let ponteiro: Valor = lw_expr(c, alvo)
+    let item: Valor = lw_expr(c, item_expr)
+    let n: Valor = ler_n(c, ponteiro, e.pos_op)
+    let arg_1: u32 = e.pos_op
+    let arg_2: i64 = semantic.tipo_lista_fixa_n(&(c.sem as ^semantic.Semantica).tipos, lista) as i64
+    let arg_3: Valor = n
+    let arg_4: ^LowerCtx = c
+    let cheia: Valor = comparar_com_capacidade(arg_4, arg_3, arg_2, arg_1)
+    let se: ^IrInstr = lw_nova_instr(c, IR_SE, e.pos_op)
+    se.a = cheia
+    let anterior: ^IrBloco = lw_trocar_bloco(c, &se.corpo)
+    falhar_cheia(c, lista, e.pos_op)
+    _ = lw_trocar_bloco(c, anterior)
+    var gravar: ItemDaLista = ItemDaLista{lista = lista, ponteiro = ponteiro, n = n, item = item}
+    gravar_item(c, &gravar, e.pos_op)
+    return lw_valor_nenhum()
+}
+
+// Testes dirigidos (valores do C: lower_lista_fixa.c nome_do_servico). Contexto montado a mao: nomes e externos.
+test "lower_lista_fixa: servico de falha da lista cheia" {
+    var arenas = make([dynamic]common.Arena, alloc = heap)
+    defer delete(arenas)
+    append(&arenas, item = common.Arena{})
+    let arena: ^common.Arena = &arenas[0]
+    var sem = semantic.Semantica{}
+    sem.arena = arena
+    var ins = make([dynamic]common.Interner, alloc = heap)
+    defer delete(ins)
+    append(&ins, item = common.Interner{})
+    common.interner_iniciar(&ins[0], arena)
+    sem.nomes = ins[0..<1]
+    var prog = IrPrograma{}
+    var ext = make([dynamic]IrExterno, alloc = heap)
+    defer delete(ext)
+    for _k in 0..<2 {
+        append(&ext, item = IrExterno{})
+    }
+    prog.externos = ext[0..<2]
+    var lc = LowerCtx{}
+    lc.sem = &sem
+    lc.prog = &prog
+    lc.arena = arena
+    let nome: i32 = nome_do_servico(&lc)
+    expect(common.interner_texto(&ins[0], nome) == "0lista_cheia")
+    expect(prog.nexternos == 1)
+    expect(nome_do_servico(&lc) == nome and prog.nexternos == 1)
+    let e: IrExterno = (prog.externos or_else {})[0]
+    expect(common.interner_texto(&ins[0], e.simbolo) == "forja_falha_alocacao")
+    expect(e.nparams == 4 and e.interno and e.retorno == semantic.TIPO_VAZIO as u32)
+    let ps: []IrParam = e.params or_else {}
+    expect(len(ps) == 4 and common.interner_texto(&ins[0], ps[0].nome) == "oque" and common.interner_texto(&ins[0], ps[3].nome) == "linha")
+    expect(ps[1].tipo == semantic.TIPO_INT as u32 and ps[3].tipo == semantic.TIPO_I32 as u32)
+    common.interner_liberar(&ins[0])
+    common.arena_liberar(arena)
+}

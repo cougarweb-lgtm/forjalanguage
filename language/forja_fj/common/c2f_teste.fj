@@ -1,0 +1,638 @@
+// common/c2f_teste.fj - testes do shim c2f.fj e c2f_saida.fj (so blocos test; sem proc main: o pacote common e quem os carrega em forja test)
+// Os valores esperados vem do diferencial contra o C do E0 (gcc 16, UCRT): scratch dif.c/dif.fj, 3332 linhas iguais, e difs.c/difs.fj para a Saida.
+// Versao: 0.1.1
+// Changelog: 0.1.1 - ERRATA 3 (N1/N7): blocos test de c2f_nul_em, c2f_nul_em_b, c2f_strlen_b, c2f_snprintf. 0.1.0 - P-c2f: um bloco test por proc de c2f.fj e c2f_saida.fj, com os casos de borda do plano (0, negativos, extremos, vazio, byte >= 0x80, CRLF).
+
+import "std:file"
+
+// Compara o texto devolvido pelo shim com o esperado e o libera (o shim devolve str nova no heap).
+proc teste_igual_e_libera(t: str, esperado: str) -> bool {
+    let igual = t == esperado
+    delete(t)
+    return igual
+}
+
+// Os bytes de uma Saida em memoria sao exatamente os esperados?
+proc teste_bytes_iguais(s: ^Saida, esperado: []u8) -> bool {
+    return len(s.buf) == len(esperado) and c2f_memcmp(s.buf[..], esperado) == 0
+}
+
+test "c2f_char_i32" {
+    expect(c2f_char_i32(0) == 0)
+    expect(c2f_char_i32(65) == 65)
+    expect(c2f_char_i32(127) == 127)
+    expect(c2f_char_i32(128) == -128)
+    expect(c2f_char_i32(200) == -56)
+    expect(c2f_char_i32(255) == -1)
+}
+
+test "c2f_s2u" {
+    expect(c2f_s2u_8(-1) == 255)
+    expect(c2f_s2u_8(-128) == 128)
+    expect(c2f_s2u_8(127) == 127)
+    expect(c2f_s2u_8(0) == 0)
+    expect(c2f_s2u_16(-1) == 65535)
+    expect(c2f_s2u_16(-32768) == 32768)
+    expect(c2f_s2u_32(-1) == 4294967295)
+    expect(c2f_s2u_32(-2147483648) == 2147483648)
+    expect(c2f_s2u_32(2147483647) == 2147483647)
+    expect(c2f_s2u_64(-1) == ~(0 as u64))
+    expect(c2f_s2u_64(-9223372036854775807 - 1) == (1 as u64) << 63)
+    expect(c2f_s2u_64(9223372036854775807) == 9223372036854775807)
+}
+
+test "c2f_trunc" {
+    expect(c2f_trunc_u8(0x1FF) == 255)
+    expect(c2f_trunc_u8(0x100) == 0)
+    expect(c2f_trunc_u8(~(0 as u64)) == 255)
+    expect(c2f_trunc_u16(0x12345) == 0x2345)
+    expect(c2f_trunc_u16(0x10000) == 0)
+    expect(c2f_trunc_u32(0x1FFFFFFFF) == 0xFFFFFFFF)
+    expect(c2f_trunc_u32(0x100000000) == 0)
+    expect(c2f_trunc_i8(0x7F) == 127)
+    expect(c2f_trunc_i8(0x80) == -128)
+    expect(c2f_trunc_i8(0x180) == -128)
+    expect(c2f_trunc_i8(0xFF) == -1)
+    expect(c2f_trunc_i16(0x8000) == -32768)
+    expect(c2f_trunc_i16(0x7FFF) == 32767)
+    expect(c2f_trunc_i16(~(0 as u64)) == -1)
+    expect(c2f_trunc_i32(0x80000000) == -2147483648)
+    expect(c2f_trunc_i32(0xFFFFFFFF) == -1)
+    expect(c2f_trunc_i32(0x7FFFFFFF) == 2147483647)
+    expect(c2f_trunc_i32(0x1FFFFFFFF) == -1)
+}
+
+test "c2f_bits_i32" {
+    expect(c2f_e_i32(-1, 15) == 15)
+    expect(c2f_e_i32(-2, -3) == -4)
+    expect(c2f_e_i32(0x12345678, 0) == 0)
+    expect(c2f_ou_i32(-2, 1) == -1)
+    expect(c2f_ou_i32(0, 0) == 0)
+    expect(c2f_xou_i32(-1, 2147483647) == -2147483648)
+    expect(c2f_xou_i32(5, 5) == 0)
+    expect(c2f_nao_i32(0) == -1)
+    expect(c2f_nao_i32(-1) == 0)
+    expect(c2f_nao_i32(5) == -6)
+    expect(c2f_nao_i32(2147483647) == -2147483648)
+}
+
+test "c2f_shift_i32" {
+    expect(c2f_sar_i32(-8, 1) == -4)
+    expect(c2f_sar_i32(-1, 31) == -1)
+    expect(c2f_sar_i32(-2147483648, 31) == -1)
+    expect(c2f_sar_i32(8, 1) == 4)
+    expect(c2f_sar_i32(5, 0) == 5)
+    expect(c2f_sar_i32(-5, 1) == -3)
+    expect(c2f_sar_i32(2147483647, 31) == 0)
+    expect(c2f_sar_i32(-1, 32) == -1)
+    expect(c2f_sar_i32(8, 33) == 4)
+    expect(c2f_sar_i32(-1, 100) == -1)
+    expect(c2f_shl_i32(1, 31) == -2147483648)
+    expect(c2f_shl_i32(1, 32) == 1)
+    expect(c2f_shl_i32(-1, 4) == -16)
+    expect(c2f_shl_i32(1073741824, 1) == -2147483648)
+    expect(c2f_shl_i32(3, 0) == 3)
+}
+
+test "c2f_bits_i64" {
+    expect(c2f_e_i64(-1, 255) == 255)
+    expect(c2f_e_i64(-2, -3) == -4)
+    expect(c2f_ou_i64(-2, 1) == -1)
+    expect(c2f_xou_i64(-1, 9223372036854775807) == -9223372036854775807 - 1)
+    expect(c2f_xou_i64(7, 7) == 0)
+    expect(c2f_nao_i64(0) == -1)
+    expect(c2f_nao_i64(-1) == 0)
+    expect(c2f_nao_i64(9223372036854775807) == -9223372036854775807 - 1)
+}
+
+test "c2f_shift_i64" {
+    expect(c2f_sar_i64(-8, 1) == -4)
+    expect(c2f_sar_i64(-9223372036854775807 - 1, 63) == -1)
+    expect(c2f_sar_i64(9223372036854775807, 63) == 0)
+    expect(c2f_sar_i64(-5, 1) == -3)
+    expect(c2f_sar_i64(-1, 64) == -1)
+    expect(c2f_sar_i64(16, 65) == 8)
+    expect(c2f_shl_i64(1, 63) == -9223372036854775807 - 1)
+    expect(c2f_shl_i64(1, 64) == 1)
+    expect(c2f_shl_i64(-1, 8) == -256)
+    expect(c2f_shl_i64(1, 32) == 4294967296)
+}
+
+test "c2f_b2i" {
+    expect(c2f_b2i32(true) == 1)
+    expect(c2f_b2i32(false) == 0)
+    expect(c2f_b2i32(3 < 4) == 1)
+    expect(c2f_b2u32(true) == 1)
+    expect(c2f_b2u32(false) == 0)
+}
+
+test "c2f_hex_maiusc" {
+    expect(teste_igual_e_libera(c2f_hex_maiusc(0, 1), "0"))
+    expect(teste_igual_e_libera(c2f_hex_maiusc(0, 0), "0"))
+    expect(teste_igual_e_libera(c2f_hex_maiusc(0, -1), "0"))
+    expect(teste_igual_e_libera(c2f_hex_maiusc(255, 2), "FF"))
+    expect(teste_igual_e_libera(c2f_hex_maiusc(10, 2), "0A"))
+    expect(teste_igual_e_libera(c2f_hex_maiusc(10, 1), "A"))
+    expect(teste_igual_e_libera(c2f_hex_maiusc(1, 4), "0001"))
+    expect(teste_igual_e_libera(c2f_hex_maiusc(0xABCDEF, 0), "ABCDEF"))
+    expect(teste_igual_e_libera(c2f_hex_maiusc(0x123, -3), "123"))
+    expect(teste_igual_e_libera(c2f_hex_maiusc(0x123, 2), "123"))
+    expect(teste_igual_e_libera(c2f_hex_maiusc(~(0 as u64), 1), "FFFFFFFFFFFFFFFF"))
+    expect(teste_igual_e_libera(c2f_hex_maiusc(0xFEDCBA9876543210, 16), "FEDCBA9876543210"))
+    expect(teste_igual_e_libera(c2f_hex_maiusc(5, 20), "00000000000000000005"))
+}
+
+test "c2f_pad" {
+    expect(teste_igual_e_libera(c2f_pad_esq("ab", 5), "   ab"))
+    expect(teste_igual_e_libera(c2f_pad_esq("ab", 2), "ab"))
+    expect(teste_igual_e_libera(c2f_pad_esq("ab", 0), "ab"))
+    expect(teste_igual_e_libera(c2f_pad_esq("ab", -3), "ab"))
+    expect(teste_igual_e_libera(c2f_pad_esq("", 3), "   "))
+    expect(teste_igual_e_libera(c2f_pad_esq("", 0), ""))
+    expect(teste_igual_e_libera(c2f_pad_esq("é", 3), " é"))
+    expect(teste_igual_e_libera(c2f_pad_dir("ab", 5), "ab   "))
+    expect(teste_igual_e_libera(c2f_pad_dir("ab", 1), "ab"))
+    expect(teste_igual_e_libera(c2f_pad_dir("", 2), "  "))
+    expect(teste_igual_e_libera(c2f_pad_dir("é", 4), "é  "))
+    expect(teste_igual_e_libera(c2f_pad_dir("abc", -1), "abc"))
+}
+
+test "c2f_com_sinal" {
+    expect(teste_igual_e_libera(c2f_com_sinal(0), "+0"))
+    expect(teste_igual_e_libera(c2f_com_sinal(5), "+5"))
+    expect(teste_igual_e_libera(c2f_com_sinal(-5), "-5"))
+    expect(teste_igual_e_libera(c2f_com_sinal(9223372036854775807), "+9223372036854775807"))
+    expect(teste_igual_e_libera(c2f_com_sinal(-9223372036854775807 - 1), "-9223372036854775808"))
+}
+
+test "c2f_cortar" {
+    expect(teste_igual_e_libera(c2f_cortar("abc", 2), "ab"))
+    expect(teste_igual_e_libera(c2f_cortar("abc", 3), "abc"))
+    expect(teste_igual_e_libera(c2f_cortar("abc", 10), "abc"))
+    expect(teste_igual_e_libera(c2f_cortar("abc", 0), ""))
+    expect(teste_igual_e_libera(c2f_cortar("abc", -1), ""))
+    expect(teste_igual_e_libera(c2f_cortar("", 5), ""))
+    let meio = c2f_cortar("é", 1)
+    expect(len(meio) == 1 and meio[0] == 0xC3)
+    delete(meio)
+}
+
+test "c2f_byte_texto" {
+    expect(teste_igual_e_libera(c2f_byte_texto(65), "A"))
+    expect(teste_igual_e_libera(c2f_byte_texto(10), "\n"))
+    let zero = c2f_byte_texto(0)
+    expect(len(zero) == 1 and zero[0] == 0)
+    delete(zero)
+    let alto = c2f_byte_texto(255)
+    expect(len(alto) == 1 and alto[0] == 255)
+    delete(alto)
+}
+
+test "c2f_strcmp" {
+    expect(c2f_strcmp("a", "b") == -1)
+    expect(c2f_strcmp("b", "a") == 1)
+    expect(c2f_strcmp("a", "a") == 0)
+    expect(c2f_strcmp("", "") == 0)
+    expect(c2f_strcmp("", "a") == -1)
+    expect(c2f_strcmp("a", "") == 1)
+    expect(c2f_strcmp("ab", "abc") == -1)
+    expect(c2f_strcmp("abc", "ab") == 1)
+    expect(c2f_strcmp("A", "a") == -1)
+    expect(c2f_strcmp("z", "é") == -1)
+    expect(c2f_strcmp("é", "z") == 1)
+    expect(c2f_strcmp("é", "éa") == -1)
+    expect(c2f_strcmp("a b", "ab") == -1)
+}
+
+test "c2f_stricmp" {
+    expect(c2f_stricmp("ABC", "abc") == 0)
+    expect(c2f_stricmp("aBc", "AbC") == 0)
+    expect(c2f_stricmp("a", "B") == -1)
+    expect(c2f_stricmp("B", "a") == 1)
+    expect(c2f_stricmp("_", "a") == -1)
+    expect(c2f_stricmp("Z", "_") == 1)
+    expect(c2f_stricmp("é", "É") == 1)
+    expect(c2f_stricmp("é", "é") == 0)
+    expect(c2f_stricmp("é", "z") == 1)
+    expect(c2f_stricmp("ab", "ABC") == -1)
+    expect(c2f_stricmp("", "") == 0)
+    expect(c2f_stricmp("", "a") == -1)
+}
+
+test "c2f_prefixo_igual" {
+    expect(c2f_prefixo_igual("abc", "abd", 2))
+    expect(not c2f_prefixo_igual("abc", "abd", 3))
+    expect(c2f_prefixo_igual("abc", "abc", 100))
+    expect(not c2f_prefixo_igual("abc", "ab", 3))
+    expect(c2f_prefixo_igual("ab", "abc", 2))
+    expect(not c2f_prefixo_igual("ab", "abc", 5))
+    expect(c2f_prefixo_igual("", "", 0))
+    expect(c2f_prefixo_igual("", "", 5))
+    expect(c2f_prefixo_igual("a", "b", 0))
+    expect(c2f_prefixo_igual("é", "é", 9))
+    expect(not c2f_prefixo_igual("é", "è", 2))
+    expect(c2f_prefixo_igual("é", "è", 1))
+}
+
+test "c2f_memcmp" {
+    var a: [4]u8 = {1, 2, 200, 0}
+    var b: [4]u8 = {1, 2, 100, 255}
+    var c: [4]u8 = {1, 2, 200, 0}
+    expect(c2f_memcmp(a[..], b[..]) == 1)
+    expect(c2f_memcmp(b[..], a[..]) == -1)
+    expect(c2f_memcmp(a[..], c[..]) == 0)
+    expect(c2f_memcmp(a[0..<2], b[0..<2]) == 0)
+    expect(c2f_memcmp(a[3..<4], b[3..<4]) == -1)
+    expect(c2f_memcmp(a[0..<2], a[0..<3]) == -1)
+    expect(c2f_memcmp(a[0..<3], a[0..<2]) == 1)
+    expect(c2f_memcmp(a[0..<0], b[0..<0]) == 0)
+    var alto: [1]u8 = {255}
+    var baixo: [1]u8 = {1}
+    expect(c2f_memcmp(alto[..], baixo[..]) == 1)
+}
+
+test "c2f_atoi" {
+    expect(c2f_atoi("0") == 0)
+    expect(c2f_atoi("12") == 12)
+    expect(c2f_atoi("  42abc") == 42)
+    expect(c2f_atoi("\t\n 7") == 7)
+    expect(c2f_atoi("-17") == -17)
+    expect(c2f_atoi("+5") == 5)
+    expect(c2f_atoi("") == 0)
+    expect(c2f_atoi("abc") == 0)
+    expect(c2f_atoi("-") == 0)
+    expect(c2f_atoi("+-5") == 0)
+    expect(c2f_atoi("2147483647") == 2147483647)
+    expect(c2f_atoi("2147483648") == 2147483647)
+    expect(c2f_atoi("-2147483648") == -2147483648)
+    expect(c2f_atoi("-2147483649") == -2147483648)
+    expect(c2f_atoi("99999999999999999999999") == 2147483647)
+    expect(c2f_atoi("0x1F") == 0)
+    expect(c2f_atoi("017") == 17)
+    expect(c2f_atoi("12 34") == 12)
+}
+
+test "c2f_strtoull" {
+    var fim = 0
+    expect(c2f_strtoull("0x1F", 0, &fim) == 31 and fim == 4)
+    expect(c2f_strtoull("0x1F", 16, &fim) == 31 and fim == 4)
+    expect(c2f_strtoull("0x1fz", 0, &fim) == 31 and fim == 4)
+    expect(c2f_strtoull("0X", 0, &fim) == 0 and fim == 0)
+    expect(c2f_strtoull("0x", 16, &fim) == 0 and fim == 0)
+    expect(c2f_strtoull("0xg", 0, &fim) == 0 and fim == 0)
+    expect(c2f_strtoull("017", 0, &fim) == 15 and fim == 3)
+    expect(c2f_strtoull("08", 0, &fim) == 0 and fim == 1)
+    expect(c2f_strtoull("08", 10, &fim) == 8 and fim == 2)
+    expect(c2f_strtoull("zz", 36, &fim) == 1295 and fim == 2)
+    expect(c2f_strtoull("Zz", 36, &fim) == 1295 and fim == 2)
+    expect(c2f_strtoull("-1", 10, &fim) == ~(0 as u64) and fim == 2)
+    expect(c2f_strtoull("18446744073709551615", 10, &fim) == ~(0 as u64) and fim == 20)
+    expect(c2f_strtoull("18446744073709551616", 10, &fim) == ~(0 as u64) and fim == 20)
+    expect(c2f_strtoull("  12 34", 10, &fim) == 12 and fim == 4)
+    expect(c2f_strtoull("", 10, &fim) == 0 and fim == 0)
+    expect(c2f_strtoull("abc", 10, &fim) == 0 and fim == 0)
+    expect(c2f_strtoull("ffffffff", 16, &fim) == 4294967295 and fim == 8)
+    expect(c2f_strtoull("12", 1, &fim) == 0 and fim == 0)
+    expect(c2f_strtoull("12", 37, &fim) == 0 and fim == 0)
+    expect(c2f_strtoull("12", -1, &fim) == 0 and fim == 0)
+    expect(c2f_strtoull("101", 2, &fim) == 5 and fim == 3)
+}
+
+test "c2f_strtol" {
+    var fim = 0
+    expect(c2f_strtol("-2147483648", 10, &fim) == -2147483648 and fim == 11)
+    expect(c2f_strtol("2147483648", 10, &fim) == 2147483647 and fim == 10)
+    expect(c2f_strtol("-2147483649", 10, &fim) == -2147483648 and fim == 11)
+    expect(c2f_strtol("4294967295", 10, &fim) == 2147483647)
+    expect(c2f_strtol("7fffffff", 16, &fim) == 2147483647 and fim == 8)
+    expect(c2f_strtol("-80000000", 16, &fim) == -2147483648 and fim == 9)
+    expect(c2f_strtol("-0x10", 0, &fim) == -16 and fim == 5)
+    expect(c2f_strtol("+5", 10, &fim) == 5 and fim == 2)
+    expect(c2f_strtol("-", 10, &fim) == 0 and fim == 0)
+    expect(c2f_strtol("  -  5", 10, &fim) == 0 and fim == 0)
+    expect(c2f_strtol("123abc456", 10, &fim) == 123 and fim == 3)
+    expect(c2f_strtol("0", 10, &fim) == 0 and fim == 1)
+    expect(c2f_strtol("-0", 10, &fim) == 0 and fim == 2)
+}
+
+test "c2f_strtod" {
+    var fim = 0
+    expect(c2f_strtod("1.5", &fim) == 1.5 and fim == 3)
+    expect(c2f_strtod(".5", &fim) == 0.5 and fim == 2)
+    expect(c2f_strtod("5.", &fim) == 5.0 and fim == 2)
+    expect(c2f_strtod(".", &fim) == 0.0 and fim == 0)
+    expect(c2f_strtod("-.", &fim) == 0.0 and fim == 0)
+    expect(c2f_strtod("", &fim) == 0.0 and fim == 0)
+    expect(c2f_strtod("1e", &fim) == 1.0 and fim == 1)
+    expect(c2f_strtod("1e+", &fim) == 1.0 and fim == 1)
+    expect(c2f_strtod("1e5", &fim) == 100000.0 and fim == 3)
+    expect(c2f_strtod("1E5", &fim) == 100000.0 and fim == 3)
+    expect(c2f_strtod("+.5e1", &fim) == 5.0 and fim == 5)
+    expect(c2f_strtod("1.5abc", &fim) == 1.5 and fim == 3)
+    expect(c2f_strtod("00.5", &fim) == 0.5 and fim == 4)
+    expect(c2f_strtod("  \t 3.14", &fim) == 3.14 and fim == 8)
+    expect(c2f_strtod("0.1", &fim) == 0.1 and fim == 3)
+    expect(transmute(c2f_strtod("0.1", &fim), to = u64) == 0x3FB999999999999A)
+    expect(transmute(c2f_strtod("0.3", &fim), to = u64) == 0x3FD3333333333333)
+    expect(c2f_strtod("9007199254740993", &fim) == 9007199254740992.0 and fim == 16)
+    expect(c2f_strtod("16777217", &fim) == 16777217.0)
+    expect(c2f_strtod("-7.25E+2x", &fim) == -725.0 and fim == 8)
+}
+
+test "c2f_strtod_extremos" {
+    var fim = 0
+    expect(transmute(c2f_strtod("-0", &fim), to = u64) == (1 as u64) << 63 and fim == 2)
+    expect(transmute(c2f_strtod("4.9e-324", &fim), to = u64) == 1 and fim == 8)
+    expect(transmute(c2f_strtod("2.4703282292062327e-324", &fim), to = u64) == 0)
+    expect(transmute(c2f_strtod("2.4703282292062328e-324", &fim), to = u64) == 1)
+    expect(transmute(c2f_strtod("1.7976931348623157e308", &fim), to = u64) == 0x7FEFFFFFFFFFFFFF and fim == 22)
+    expect(transmute(c2f_strtod("1.7976931348623159e308", &fim), to = u64) == 0x7FF0000000000000)
+    expect(transmute(c2f_strtod("1e400", &fim), to = u64) == 0x7FF0000000000000 and fim == 5)
+    expect(transmute(c2f_strtod("-1e400", &fim), to = u64) == (0xFFF as u64) << 52 and fim == 6)
+    expect(transmute(c2f_strtod("1e-400", &fim), to = u64) == 0 and fim == 6)
+    expect(transmute(c2f_strtod("-1e-400", &fim), to = u64) == (1 as u64) << 63 and fim == 7)
+    expect(transmute(c2f_strtod("2.2250738585072011e-308", &fim), to = u64) == 0x000FFFFFFFFFFFFF)
+    expect(transmute(c2f_strtod("inf", &fim), to = u64) == 0x7FF0000000000000 and fim == 3)
+    expect(transmute(c2f_strtod("-INF", &fim), to = u64) == (0xFFF as u64) << 52 and fim == 4)
+    expect(transmute(c2f_strtod("infinity", &fim), to = u64) == 0x7FF0000000000000 and fim == 8)
+    expect(transmute(c2f_strtod("Infinit", &fim), to = u64) == 0x7FF0000000000000 and fim == 3)
+    expect(transmute(c2f_strtod("infx", &fim), to = u64) == 0x7FF0000000000000 and fim == 3)
+    let nan = c2f_strtod("NaN", &fim)
+    expect(nan != nan and fim == 3)
+}
+
+test "c2f_le" {
+    var b: [16]u8 = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 0xFF, 0xFE, 0x80, 0x7F, 0, 1}
+    expect(c2f_ler_u16_le(b[..], 0) == 0x0201)
+    expect(c2f_ler_u16_le(b[..], 10) == 0xFEFF)
+    expect(c2f_ler_u16_le(b[..], 14) == 0x0100)
+    expect(c2f_ler_u32_le(b[..], 1) == 0x05040302)
+    expect(c2f_ler_u32_le(b[..], 10) == 0x7F80FEFF)
+    expect(c2f_ler_u32_le(b[..], 12) == 0x01007F80)
+    expect(c2f_ler_u64_le(b[..], 0) == 0x0807060504030201)
+    expect(c2f_ler_u64_le(b[..], 8) == 0x01007F80FEFF0A09)
+}
+
+test "c2f_gravar_le" {
+    var g: [16]u8 = {}
+    c2f_gravar_u16_le(g[..], 0, 0xABCD)
+    c2f_gravar_u32_le(g[..], 2, 0x89ABCDEF)
+    c2f_gravar_u64_le(g[..], 6, 0xFEDCBA9876543210)
+    c2f_gravar_u16_le(g[..], 14, 0xFFFF)
+    var esperado: [16]u8 = {0xCD, 0xAB, 0xEF, 0xCD, 0xAB, 0x89, 0x10, 0x32, 0x54, 0x76, 0x98, 0xBA, 0xDC, 0xFE, 0xFF, 0xFF}
+    expect(c2f_memcmp(g[..], esperado[..]) == 0)
+    expect(c2f_ler_u16_le(g[..], 0) == 0xABCD)
+    expect(c2f_ler_u32_le(g[..], 2) == 0x89ABCDEF)
+    expect(c2f_ler_u64_le(g[..], 6) == 0xFEDCBA9876543210)
+    c2f_gravar_u16_le(g[..], 0, 0)
+    c2f_gravar_u32_le(g[..], 12, 0)
+    expect(g[0] == 0 and g[1] == 0 and g[12] == 0 and g[15] == 0 and g[11] == 0xBA)
+}
+
+test "c2f_ler_arquivo" {
+    switch cam in file.make_temp_file("c2f", alloc = heap) {
+    case str:
+        var cru: [12]u8 = {97, 13, 10, 98, 10, 26, 255, 128, 0, 101, 110, 100}
+        expect(file.write_all(cam, data = cru[..]) == none)
+        var dados = make([dynamic]u8, alloc = heap)
+        append(&dados, item = 9 as u8)
+        var motivo = ""
+        expect(c2f_ler_arquivo(cam, &dados, &motivo))
+        expect(len(dados) == 12 and c2f_memcmp(dados[..], cru[..]) == 0)
+        expect(file.write_all(cam, data = cru[0..<0]) == none)
+        expect(c2f_ler_arquivo(cam, &dados, &motivo))
+        expect(len(dados) == 0)
+        append(&dados, item = 7 as u8)
+        let sumiu = format(f"{cam}.nao_existe", alloc = heap)
+        expect(not c2f_ler_arquivo(sumiu, &dados, &motivo))
+        expect(motivo == "nao_abre")
+        expect(len(dados) == 1 and dados[0] == 7)
+        delete(sumiu)
+        delete(dados)
+        expect(file.remove_file(cam) == none)
+        delete(cam)
+    case file.FileError:
+        expect(false)
+    }
+}
+
+// ---------------------------------------------------------------- c2f_saida.fj
+
+test "c2f_saida_texto_em_memoria" {
+    let s = c2f_saida_memoria(true)
+    c2f_saida_escrever_texto(s, "a\nb")
+    var e1: [4]u8 = {97, 13, 10, 98}
+    expect(teste_bytes_iguais(s, e1[..]))
+    c2f_saida_escrever_texto(s, "\r\n")
+    c2f_saida_putc(s, 10)
+    c2f_saida_putc(s, 120)
+    c2f_saida_formatar(s, "\n\n")
+    c2f_saida_escrever_texto(s, "")
+    var e2: [14]u8 = {97, 13, 10, 98, 13, 13, 10, 13, 10, 120, 13, 10, 13, 10}
+    expect(teste_bytes_iguais(s, e2[..]))
+    var cru: [6]u8 = {0, 26, 255, 128, 10, 13}
+    clear(&s.buf)
+    c2f_saida_escrever(s, cru[..])
+    var e3: [7]u8 = {0, 26, 255, 128, 13, 10, 13}
+    expect(teste_bytes_iguais(s, e3[..]))
+    expect(c2f_saida_fechar(s) == 0)
+}
+
+test "c2f_saida_binaria" {
+    let s = c2f_saida_memoria(true)
+    c2f_saida_escrever_texto(s, "d\n")
+    c2f_saida_binaria(s)
+    expect(not s.texto)
+    c2f_saida_escrever_texto(s, "e\r\nf\n")
+    c2f_saida_putc(s, 10)
+    var esperado: [10]u8 = {100, 13, 10, 101, 13, 10, 102, 10, 10, 0}
+    expect(len(s.buf) == 9)
+    expect(c2f_memcmp(s.buf[0..<9], esperado[0..<9]) == 0)
+    let b = c2f_saida_memoria(false)
+    c2f_saida_escrever_texto(b, "x\ny")
+    var e4: [3]u8 = {120, 10, 121}
+    expect(teste_bytes_iguais(b, e4[..]))
+    expect(c2f_saida_fechar(b) == 0)
+    expect(c2f_saida_fechar(s) == 0)
+}
+
+test "c2f_saida_stdout_stderr" {
+    let o = c2f_saida_stdout()
+    let e = c2f_saida_stderr()
+    expect(o.tipo == SAIDA_STDOUT and not o.texto) // V4INT: a traducao 0x0A -> 0x0D 0x0A do stdout fica com o rt (variante CRT)
+    expect(e.tipo == SAIDA_STDERR and e.texto)
+    c2f_saida_binaria(o)
+    expect(not o.texto and e.texto)
+    c2f_saida_escrever_texto(o, "")
+    c2f_saida_flush(o)
+    c2f_saida_flush(e)
+    expect(c2f_saida_fechar(o) == 0)
+    expect(c2f_saida_fechar(e) == 0)
+}
+
+// Le o arquivo todo e confere o tamanho e a quantidade de 0x0D (o CRLF do modo texto).
+proc teste_arquivo_tem(caminho: str, tamanho: int, qtd_cr: int) -> bool {
+    var dados = make([dynamic]u8, alloc = heap)
+    defer delete(dados)
+    var motivo = ""
+    if not c2f_ler_arquivo(caminho, &dados, &motivo) {
+        return false
+    }
+    var cr = 0
+    for b in dados {
+        if b == 13 {
+            cr += 1
+        }
+    }
+    return len(dados) == tamanho and cr == qtd_cr
+}
+
+test "c2f_saida_arquivo" {
+    switch cam in file.make_temp_file("c2f_saida", alloc = heap) {
+    case str:
+        // "w" = texto: 2 "\n" viram 2 CRLF; "wb" = cru
+        let w = c2f_saida_abrir(cam, "w") as ^Saida
+        expect(w.tipo == SAIDA_ARQUIVO and w.texto)
+        c2f_saida_escrever_texto(w, "x\ny\n")
+        c2f_saida_flush(w)
+        expect(teste_arquivo_tem(cam, 6, 2))
+        expect(c2f_saida_fechar(w) == 0)
+        let wb = c2f_saida_abrir(cam, "wb") as ^Saida
+        expect(not wb.texto)
+        c2f_saida_escrever_texto(wb, "x\ny\n")
+        expect(c2f_saida_fechar(wb) == 0)
+        expect(teste_arquivo_tem(cam, 4, 0))
+        // "a" e "ab" acrescentam
+        let a = c2f_saida_abrir(cam, "a") as ^Saida
+        c2f_saida_escrever_texto(a, "\n")
+        expect(c2f_saida_fechar(a) == 0)
+        expect(teste_arquivo_tem(cam, 6, 1))
+        let ab = c2f_saida_abrir(cam, "ab") as ^Saida
+        c2f_saida_escrever_texto(ab, "\n")
+        expect(c2f_saida_fechar(ab) == 0)
+        expect(teste_arquivo_tem(cam, 7, 1))
+        // modos que nao sao so escrita, e arquivo que nao abre
+        expect(c2f_saida_abrir(cam, "r") == none)
+        expect(c2f_saida_abrir(cam, "r+") == none)
+        expect(c2f_saida_abrir(cam, "w+") == none)
+        expect(c2f_saida_abrir(cam, "") == none)
+        let impossivel = format(f"{cam}.pasta_que_nao_existe/x.txt", alloc = heap)
+        expect(c2f_saida_abrir(impossivel, "w") == none)
+        delete(impossivel)
+        expect(file.remove_file(cam) == none)
+        delete(cam)
+    case file.FileError:
+        expect(false)
+    }
+}
+
+test "c2f_saida_arquivo_grande" {
+    switch cam in file.make_temp_file("c2f_grande", alloc = heap) {
+    case str:
+        // 30000 linhas de 20 bytes passam do buffer de 64 KiB varias vezes
+        let w = c2f_saida_abrir(cam, "w") as ^Saida
+        var i = 0
+        while i < 30000 {
+            c2f_saida_escrever_texto(w, "0123456789012345678\n")
+            i += 1
+        }
+        expect(c2f_saida_fechar(w) == 0)
+        expect(teste_arquivo_tem(cam, 30000 * 21, 30000))
+        expect(file.remove_file(cam) == none)
+        delete(cam)
+    case file.FileError:
+        expect(false)
+    }
+}
+
+// ---------------------------------------------------------------- sentinela e tamanho de C (ERRATA 3, N1/N7)
+
+test "c2f_nul_em" {
+    expect(c2f_nul_em("abc", 0) == 97)
+    expect(c2f_nul_em("abc", 2) == 99)
+    expect(c2f_nul_em("abc", 3) == 0)
+    expect(c2f_nul_em("abc", 4) == 0)
+    expect(c2f_nul_em("abc", -1) == 0)
+    expect(c2f_nul_em("", 0) == 0)
+    var nb: [3]u8 = {97, 0, 98}
+    let com_nul = from_bytes(nb[..], alloc = heap)
+    expect(c2f_nul_em(com_nul, 0) == 97)
+    expect(c2f_nul_em(com_nul, 1) == 0)
+    expect(c2f_nul_em(com_nul, 2) == 98)
+    expect(c2f_nul_em(com_nul, 3) == 0)
+    delete(com_nul)
+    let alto = c2f_byte_texto(255)
+    expect(c2f_nul_em(alto, 0) == 255)
+    expect(c2f_nul_em(alto, 1) == 0)
+    delete(alto)
+}
+
+test "c2f_nul_em_b" {
+    var b: [3]u8 = {200, 0, 255}
+    expect(c2f_nul_em_b(b[..], 0) == 200)
+    expect(c2f_nul_em_b(b[..], 1) == 0)
+    expect(c2f_nul_em_b(b[..], 2) == 255)
+    expect(c2f_nul_em_b(b[..], 3) == 0)
+    expect(c2f_nul_em_b(b[..], -1) == 0)
+    expect(c2f_nul_em_b(b[0..<0], 0) == 0)
+    expect(c2f_nul_em_b(b[1..<3], 0) == 0)
+    expect(c2f_nul_em_b(b[1..<3], 1) == 255)
+}
+
+test "c2f_strlen_b" {
+    var a: [4]u8 = {65, 66, 0, 67}
+    expect(c2f_strlen_b(a[..]) == 2)
+    expect(c2f_strlen_b(a[0..<3]) == 2)
+    expect(c2f_strlen_b(a[3..<4]) == 1)
+    expect(c2f_strlen_b(a[0..<0]) == 0)
+    var b: [3]u8 = {65, 66, 67}
+    expect(c2f_strlen_b(b[..]) == 3)
+    var c: [3]u8 = {0, 65, 66}
+    expect(c2f_strlen_b(c[..]) == 0)
+    var d: [2]u8 = {0, 0}
+    expect(c2f_strlen_b(d[1..<2]) == 0)
+    var e: [3]u8 = {255, 128, 0}
+    expect(c2f_strlen_b(e[..]) == 2)
+    expect(c2f_strlen_b(e[0..<2]) == 2)
+}
+
+test "c2f_snprintf" {
+    var um: [1]u8 = {99}
+    expect(c2f_snprintf(um[0..<0], "abc") == 3)
+    expect(um[0] == 99)
+    expect(c2f_snprintf(um[..], "abc") == 3)
+    expect(um[0] == 0)
+    var d2: [2]u8 = {9, 9}
+    expect(c2f_snprintf(d2[..], "abc") == 3)
+    var e2: [2]u8 = {97, 0}
+    expect(c2f_memcmp(d2[..], e2[..]) == 0)
+    var d4: [4]u8 = {9, 9, 9, 9}
+    expect(c2f_snprintf(d4[..], "abc") == 3)
+    var e4: [4]u8 = {97, 98, 99, 0}
+    expect(c2f_memcmp(d4[..], e4[..]) == 0)
+    var d3: [3]u8 = {9, 9, 9}
+    expect(c2f_snprintf(d3[..], "abcdef") == 6)
+    var e3: [3]u8 = {97, 98, 0}
+    expect(c2f_memcmp(d3[..], e3[..]) == 0)
+    var dv: [3]u8 = {9, 9, 9}
+    expect(c2f_snprintf(dv[..], "") == 0)
+    var ev: [3]u8 = {0, 9, 9}
+    expect(c2f_memcmp(dv[..], ev[..]) == 0)
+    var dl: [5]u8 = {9, 9, 9, 9, 9}
+    expect(c2f_snprintf(dl[0..<3], "ab") == 2)
+    var el: [5]u8 = {97, 98, 0, 9, 9}
+    expect(c2f_memcmp(dl[..], el[..]) == 0)
+    var nb: [3]u8 = {97, 0, 98}
+    let com_nul = from_bytes(nb[..], alloc = heap)
+    var dn: [4]u8 = {9, 9, 9, 9}
+    expect(c2f_snprintf(dn[..], com_nul) == 1)
+    var en: [4]u8 = {97, 0, 9, 9}
+    expect(c2f_memcmp(dn[..], en[..]) == 0)
+    delete(com_nul)
+    let alto = c2f_byte_texto(255)
+    var da: [2]u8 = {9, 9}
+    expect(c2f_snprintf(da[..], alto) == 1)
+    var ea: [2]u8 = {255, 0}
+    expect(c2f_memcmp(da[..], ea[..]) == 0)
+    delete(alto)
+}

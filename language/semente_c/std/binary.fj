@@ -1,0 +1,223 @@
+// std:binary (A83) -u16/u32/u64 em little e big endian sobre []u8, e varint LEB128 sem sinal e com sinal. Forja pura (sem foreign), igual nos 2 backends.
+// Versao: 0.1.0. Changelog: 0.1.0 - L3 (A83): read_* e write_* de u16/u32/u64 LE e BE, read_uleb128/read_sleb128 e write_uleb128/write_sleb128.
+// Leitura: read_* devolve o valor, ou BinaryError.fora_da_faixa se at < 0 ou se os bytes pedidos nao cabem em b. Nada e lido pela metade.
+// Varint: read_* devolve o valor e o tamanho usado. BinaryError.varint_incompleto se b acaba antes do byte final; BinaryError.varint_longo se passa de 10 bytes ou o valor nao cabe em 64 bits.
+// Escrita: write_* acrescenta bytes no fim de buf (^[dynamic]u8). Quem chama e dono da lista e a libera.
+// Sinal: o varint com sinal divide com piso (sem >> aritmetico em i64, que a Forja nao tem); o byte final leva o bit 6 quando o valor e negativo.
+
+pub enum BinaryError { fora_da_faixa, varint_incompleto, varint_longo }
+
+pub struct UVarint {
+    value: u64 = 0
+    size: int = 0
+}
+
+pub struct SVarint {
+    value: i64 = 0
+    size: int = 0
+}
+
+const BITS_POR_BYTE: u64 = 8
+const BITS_POR_SEGMENTO: u64 = 7
+const BYTE_MASK: u64 = 0xFF
+const SEGMENTO_MASK: u64 = 0x7F
+const LIMITE_SEGMENTO: u64 = 128
+const LIMITE_SEGMENTO_SINAL: i64 = 128
+const CONTINUA_BIT: u8 = 0x80
+const SEGMENTO_BYTE: u8 = 0x7F
+const SINAL_BYTE: u8 = 0x40
+const SINAL_LIMIAR: i64 = 64
+const TODOS_BITS: u64 = 0xFFFFFFFFFFFFFFFF
+const VARINT_MAX_BYTES: int = 10
+const ZERO_I64: i64 = 0
+const MENOS_UM_I64: i64 = -1
+
+// Confere se os n bytes a partir de at cabem em b (at >= 0 e at + n <= len(b)).
+proc cabe(b: []u8, at: int, n: int) -> bool {
+    return at >= 0 and at <= len(b) - n
+}
+
+// Junta n bytes a partir de at, o primeiro no bit mais baixo. Quem chama ja conferiu a faixa.
+proc juntar_le(b: []u8, at: int, n: int) -> u64 {
+    var v: u64 = 0
+    for i in 0..<n {
+        v = v | ((b[at + i] as u64) << ((i as u64) * BITS_POR_BYTE))
+    }
+    return v
+}
+
+// Junta n bytes a partir de at, o primeiro no bit mais alto. Quem chama ja conferiu a faixa.
+proc juntar_be(b: []u8, at: int, n: int) -> u64 {
+    var v: u64 = 0
+    for i in 0..<n {
+        v = (v << BITS_POR_BYTE) | (b[at + i] as u64)
+    }
+    return v
+}
+
+// Acrescenta os n bytes menos significativos de v, o menor primeiro.
+proc escrever_le(buf: ^[dynamic]u8, v: u64, n: int) {
+    for i in 0..<n {
+        append(buf, item = ((v >> ((i as u64) * BITS_POR_BYTE)) & BYTE_MASK) as u8)
+    }
+}
+
+// Acrescenta os n bytes menos significativos de v, o mais significativo primeiro.
+proc escrever_be(buf: ^[dynamic]u8, v: u64, n: int) {
+    for i in 0..<n {
+        let k = n - 1 - i
+        append(buf, item = ((v >> ((k as u64) * BITS_POR_BYTE)) & BYTE_MASK) as u8)
+    }
+}
+
+// u16 little endian em at (2 bytes). Fora da faixa = BinaryError.fora_da_faixa.
+pub proc read_u16_le(b: []u8, at: int) -> u16 ! BinaryError {
+    if not cabe(b, at, 2) {
+        return BinaryError.fora_da_faixa
+    }
+    return juntar_le(b, at, 2) as u16
+}
+
+// u16 big endian em at (2 bytes). Fora da faixa = BinaryError.fora_da_faixa.
+pub proc read_u16_be(b: []u8, at: int) -> u16 ! BinaryError {
+    if not cabe(b, at, 2) {
+        return BinaryError.fora_da_faixa
+    }
+    return juntar_be(b, at, 2) as u16
+}
+
+// u32 little endian em at (4 bytes). Fora da faixa = BinaryError.fora_da_faixa.
+pub proc read_u32_le(b: []u8, at: int) -> u32 ! BinaryError {
+    if not cabe(b, at, 4) {
+        return BinaryError.fora_da_faixa
+    }
+    return juntar_le(b, at, 4) as u32
+}
+
+// u32 big endian em at (4 bytes). Fora da faixa = BinaryError.fora_da_faixa.
+pub proc read_u32_be(b: []u8, at: int) -> u32 ! BinaryError {
+    if not cabe(b, at, 4) {
+        return BinaryError.fora_da_faixa
+    }
+    return juntar_be(b, at, 4) as u32
+}
+
+// u64 little endian em at (8 bytes). Fora da faixa = BinaryError.fora_da_faixa.
+pub proc read_u64_le(b: []u8, at: int) -> u64 ! BinaryError {
+    if not cabe(b, at, 8) {
+        return BinaryError.fora_da_faixa
+    }
+    return juntar_le(b, at, 8)
+}
+
+// u64 big endian em at (8 bytes). Fora da faixa = BinaryError.fora_da_faixa.
+pub proc read_u64_be(b: []u8, at: int) -> u64 ! BinaryError {
+    if not cabe(b, at, 8) {
+        return BinaryError.fora_da_faixa
+    }
+    return juntar_be(b, at, 8)
+}
+
+// Acrescenta value como u16 little endian (2 bytes) no fim de buf.
+pub proc write_u16_le(buf: ^[dynamic]u8, value: u16) {
+    escrever_le(buf, value as u64, 2)
+}
+
+// Acrescenta value como u16 big endian (2 bytes) no fim de buf.
+pub proc write_u16_be(buf: ^[dynamic]u8, value: u16) {
+    escrever_be(buf, value as u64, 2)
+}
+
+// Acrescenta value como u32 little endian (4 bytes) no fim de buf.
+pub proc write_u32_le(buf: ^[dynamic]u8, value: u32) {
+    escrever_le(buf, value as u64, 4)
+}
+
+// Acrescenta value como u32 big endian (4 bytes) no fim de buf.
+pub proc write_u32_be(buf: ^[dynamic]u8, value: u32) {
+    escrever_be(buf, value as u64, 4)
+}
+
+// Acrescenta value como u64 little endian (8 bytes) no fim de buf.
+pub proc write_u64_le(buf: ^[dynamic]u8, value: u64) {
+    escrever_le(buf, value, 8)
+}
+
+// Acrescenta value como u64 big endian (8 bytes) no fim de buf.
+pub proc write_u64_be(buf: ^[dynamic]u8, value: u64) {
+    escrever_be(buf, value, 8)
+}
+
+// Varint LEB128 sem sinal: 7 bits por byte, o menor grupo primeiro; bit 7 ligado = ainda ha byte depois.
+pub proc write_uleb128(buf: ^[dynamic]u8, value: u64) {
+    var resto = value
+    while resto >= LIMITE_SEGMENTO {
+        append(buf, item = ((resto & SEGMENTO_MASK) as u8) | CONTINUA_BIT)
+        resto = resto >> BITS_POR_SEGMENTO
+    }
+    append(buf, item = resto as u8)
+}
+
+// Varint LEB128 com sinal. Divisao com piso: o resto fica em 0..127 e o quociente leva o sinal. Para quando o resto restante so repete o sinal (0 positivo com bit 6 zero, -1 negativo com bit 6 ligado).
+pub proc write_sleb128(buf: ^[dynamic]u8, value: i64) {
+    var resto = value
+    var fim = false
+    while not fim {
+        var q = resto / LIMITE_SEGMENTO_SINAL
+        var r = resto - q * LIMITE_SEGMENTO_SINAL
+        if r < ZERO_I64 {
+            r += LIMITE_SEGMENTO_SINAL
+            q -= 1
+        }
+        if (q == ZERO_I64 and r < SINAL_LIMIAR) or (q == MENOS_UM_I64 and r >= SINAL_LIMIAR) {
+            append(buf, item = r as u8)
+            fim = true
+        } else {
+            append(buf, item = (r as u8) | CONTINUA_BIT)
+            resto = q
+        }
+    }
+}
+
+// Leitura comum dos grupos de 7 bits. O 10o byte (k == 9) so pode trazer o bit 63: sem sinal, o byte tem de ser 0 ou 1; com sinal, 0 (positivo) ou 0x7F (negativo, bits 63..69 iguais). Qualquer outro valor estoura i64/u64.
+proc ler_varint(b: []u8, at: int, com_sinal: bool) -> UVarint ! BinaryError {
+    if not cabe(b, at, 1) {
+        return BinaryError.fora_da_faixa
+    }
+    var valor: u64 = 0
+    var i = at
+    while i < len(b) {
+        let k = i - at
+        let byte = b[i]
+        if k == VARINT_MAX_BYTES - 1 {
+            let ultimo_valido = ((not com_sinal) and (byte <= 1)) or (com_sinal and (byte == 0 or byte == SEGMENTO_BYTE))
+            if not ultimo_valido {
+                return BinaryError.varint_longo
+            }
+        }
+        let pedaco = (byte as u64) & SEGMENTO_MASK
+        valor = valor | (pedaco << ((k as u64) * BITS_POR_SEGMENTO))
+        if byte < CONTINUA_BIT {
+            return UVarint{value = valor, size = k + 1}
+        }
+        i += 1
+    }
+    return BinaryError.varint_incompleto
+}
+
+// Le um varint LEB128 sem sinal em at. Devolve o valor e quantos bytes usou.
+pub proc read_uleb128(b: []u8, at: int) -> UVarint ! BinaryError {
+    return ler_varint(b, at, false)
+}
+
+// Le um varint LEB128 com sinal em at. Estende o sinal a partir do bit 6 do byte final; devolve o valor e quantos bytes usou.
+pub proc read_sleb128(b: []u8, at: int) -> SVarint ! BinaryError {
+    let bruto = try ler_varint(b, at, true)
+    var valor = bruto.value
+    let ultimo = b[at + bruto.size - 1]
+    // Byte final com bit 6 ligado = negativo: preenche de 7*size ate o bit 63. Com 10 bytes o bit 63 ja veio do byte final.
+    if bruto.size < VARINT_MAX_BYTES and ultimo >= SINAL_BYTE {
+        valor = valor | (TODOS_BITS << ((bruto.size as u64) * BITS_POR_SEGMENTO))
+    }
+    return SVarint{value = transmute(valor, to = i64), size = bruto.size}
+}

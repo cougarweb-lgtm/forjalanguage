@@ -1,0 +1,318 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://forja.local/esquemas/debug.jsonl/0.7.0",
+  "title": "Registro do --debug-code <lista>,json (debug.jsonl), versao 0.7.0",
+  "description": "Cada linha do <saida>.debug.jsonl e um objeto JSON com o campo tipo. Os tipos sao: cabecalho (0.7.0: alvo x86_64-windows ou x86_64-linux), formato (0.7.0: PE32+ no Windows; ELF64 no Linux, sem linker_*, seguido dos registros segmento, um por cabecalho de programa PT_LOAD/PT_GNU_STACK, depois dos secao), poda (0.6.0: procs do programa, os que a poda do inalcancavel deixou entrar na BIR e os podados; logo depois do cabecalho), funcao, instr, bir, reloc, secao, import, export (so DLL, 0.4.0: um registro por simbolo do export directory, em ordem ASCII, ordinal base 1, depois dos import), formato, faixa e tempos. O texto do --debug-code (<saida>.debug.txt) sai dos mesmos registros. Ordem do arquivo: cabecalho; poda; por funcao, o registro funcao, as instr dela e a faixa de preenchimento; as faixas do runtime; bir; reloc; formato, secao e import (um registro por simbolo importado, DLL por DLL na ordem dos descritores do .idata: KERNEL32.dll primeiro); tempos (so ele muda de uma execucao para outra). rva e sempre relativo a ImageBase.",
+  "type": "object",
+  "oneOf": [
+    { "$ref": "#/$defs/cabecalho" },
+    { "$ref": "#/$defs/poda" },
+    { "$ref": "#/$defs/funcao" },
+    { "$ref": "#/$defs/instr" },
+    { "$ref": "#/$defs/bir" },
+    { "$ref": "#/$defs/locais" },
+    { "$ref": "#/$defs/linhas" },
+    { "$ref": "#/$defs/reloc" },
+    { "$ref": "#/$defs/secao" },
+    { "$ref": "#/$defs/import" },
+    { "$ref": "#/$defs/export" },
+    { "$ref": "#/$defs/formato" },
+    { "$ref": "#/$defs/formato_elf" },
+    { "$ref": "#/$defs/segmento" },
+    { "$ref": "#/$defs/faixa" },
+    { "$ref": "#/$defs/tempos" }
+  ],
+  "$defs": {
+    "inteiroNaoNegativo": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "hexBytes": {
+      "type": "string",
+      "pattern": "^([0-9a-f]{2})*$",
+      "description": "Bytes crus em hexadecimal minusculo, sem separador. Vazio quando nao ha bytes."
+    },
+    "cabecalho": {
+      "type": "object",
+      "description": "Sempre a 1a linha. forja_versao e a do forja que gerou o exe (a mesma do VERSIONINFO).",
+      "properties": {
+        "tipo": { "const": "cabecalho" },
+        "debug_versao": { "const": "0.7.0" },
+        "forja_versao": { "type": "string", "minLength": 1 },
+        "alvo": { "enum": ["x86_64-windows", "x86_64-linux"] },
+        "modo": { "enum": ["dev", "release"] }
+      },
+      "required": ["tipo", "debug_versao", "forja_versao", "alvo", "modo"],
+      "additionalProperties": false
+    },
+    "poda": {
+      "type": "object",
+      "description": "Poda do inalcancavel (B07, 0.6.0): procs_total = procs do programa (sem os 'test' fora de forja test), procs_gerados = os alcancaveis das raizes (main, exports em --modo dll, 'test' em forja test) que entraram na BIR, procs_podados = total - gerados. A semantica checou todos; so o backend x64 deixa de gerar os podados.",
+      "properties": {
+        "tipo": { "const": "poda" },
+        "procs_total": { "$ref": "#/$defs/inteiroNaoNegativo" },
+        "procs_gerados": { "$ref": "#/$defs/inteiroNaoNegativo" },
+        "procs_podados": { "$ref": "#/$defs/inteiroNaoNegativo" }
+      },
+      "required": ["tipo", "procs_total", "procs_gerados", "procs_podados"],
+      "additionalProperties": false
+    },
+    "funcao": {
+      "type": "object",
+      "properties": {
+        "tipo": { "const": "funcao" },
+        "nome": { "type": "string", "minLength": 1 },
+        "rva": { "$ref": "#/$defs/inteiroNaoNegativo" },
+        "tamanho": { "$ref": "#/$defs/inteiroNaoNegativo", "description": "Bytes da funcao, sem o preenchimento que vem depois." },
+        "quadro": { "$ref": "#/$defs/inteiroNaoNegativo", "description": "Tamanho do quadro N (sub rsp, N), depois do alinhamento de 16." },
+        "sondagem": { "type": "boolean", "description": "True quando N >= 4096 e a sondagem roda antes do sub." },
+        "slots": { "$ref": "#/$defs/inteiroNaoNegativo", "description": "Bytes dos slots dos vregs dentro do quadro." },
+        "maxargs": { "$ref": "#/$defs/inteiroNaoNegativo", "description": "Maior numero de argumentos de uma chamada da funcao." },
+        "push": { "$ref": "#/$defs/inteiroNaoNegativo", "description": "Offset (desde o inicio da funcao) em que o push rbp acaba." },
+        "fpreg": { "$ref": "#/$defs/inteiroNaoNegativo", "description": "Offset em que o mov rbp, rsp acaba." },
+        "alocacao": { "$ref": "#/$defs/inteiroNaoNegativo", "description": "Offset em que o sub rsp, N acaba (= SizeOfProlog do UNWIND_INFO)." },
+        "slots_agregado": {
+          "type": "array",
+          "description": "Slots de memoria do quadro (struct local, escalar com '&'), na ordem dos slots da BIR; vazio quando a funcao nao tem. O endereco do slot e rbp - offset.",
+          "items": {
+            "type": "object",
+            "properties": {
+              "slot": { "$ref": "#/$defs/inteiroNaoNegativo" },
+              "tamanho": { "type": "integer", "minimum": 1 },
+              "alinhamento": { "enum": [1, 2, 4, 8, 16] },
+              "offset": { "type": "integer", "minimum": 1, "description": "Bytes abaixo do rbp em que o slot comeca." }
+            },
+            "required": ["slot", "tamanho", "alinhamento", "offset"],
+            "additionalProperties": false
+          }
+        },
+        "unwind": { "$ref": "#/$defs/hexBytes", "description": "Bytes do UNWIND_INFO da funcao." },
+        "arquivo": { "type": "string" },
+        "linha": { "$ref": "#/$defs/inteiroNaoNegativo", "description": "Linha do 1o comando do corpo (a IrFuncao nao guarda a do proc)." }
+      },
+      "required": ["tipo", "nome", "rva", "tamanho", "quadro", "sondagem", "slots", "maxargs", "push", "fpreg", "alocacao", "slots_agregado", "unwind"],
+      "additionalProperties": false
+    },
+    "instr": {
+      "type": "object",
+      "description": "Uma instrucao de maquina do programa: o mapa rva -> linha do .fj. bytes sao os do exe gravado.",
+      "properties": {
+        "tipo": { "const": "instr" },
+        "funcao": { "type": "string", "minLength": 1 },
+        "rva": { "$ref": "#/$defs/inteiroNaoNegativo" },
+        "bytes": { "$ref": "#/$defs/hexBytes" },
+        "asm": { "type": "string", "minLength": 1 },
+        "bir": {
+          "type": "string",
+          "pattern": "^(b[0-9]+\\.[0-9]+)?$",
+          "description": "Instrucao da BIR que gerou esta: bN.K = K-esima do bloco bN no registro bir da funcao; vazio no prologo e no epilogo."
+        },
+        "arquivo": { "type": "string" },
+        "linha": { "$ref": "#/$defs/inteiroNaoNegativo" },
+        "coluna": { "$ref": "#/$defs/inteiroNaoNegativo" },
+        "origem": { "enum": ["prologo", "sondagem", "codigo", "frio", "epilogo"] },
+        "simbolo": { "type": "string", "minLength": 1, "description": "Simbolo para o qual a instrucao aponta (call, lea [rip+d])." }
+      },
+      "required": ["tipo", "funcao", "rva", "bytes", "asm", "bir", "origem"],
+      "additionalProperties": false
+    },
+    "bir": {
+      "type": "object",
+      "description": "O dump da BIR de uma funcao; funcao vazia e o bloco final 'simbolos:' (os textos do programa).",
+      "properties": {
+        "tipo": { "const": "bir" },
+        "funcao": { "type": "string" },
+        "texto": { "type": "string", "minLength": 1 }
+      },
+      "required": ["tipo", "funcao", "texto"],
+      "additionalProperties": false
+    },
+    "locais": {
+      "type": "object",
+      "description": "So com o item locais (M6 P65a): por funcao da BIR, uma linha 'local <id> <nome> tipo=<classe> tid=<TipoId> casa=slotK|vregN indireto=0|1' por local nomeado do usuario e 'sem_casa=N'.",
+      "properties": {
+        "tipo": { "const": "locais" },
+        "funcao": { "type": "string" },
+        "texto": { "type": "string", "minLength": 1 }
+      },
+      "required": ["tipo", "funcao", "texto"],
+      "additionalProperties": false
+    },
+    "linhas": {
+      "type": "object",
+      "description": "So com o item linhas (M6 P65b, DbgPrograma): um registro por proc .fj (sem o forja_programa). inicio e fim = offsets em .text do programa (fim sem o padding); quadro = N do sub rsp,N. linhas = pares (off, posicao) gravados so quando a posicao muda, em ordem de geracao (blocos frios depois dos quentes, entao off nao e monotono por posicao). parametros e locais = locais do usuario (id < Decl.nlocais); rbp = deslocamento com sinal a partir do rbp; indireto = o home guarda um PONTEIRO para o dado (parametro agregado).",
+      "properties": {
+        "tipo": { "const": "linhas" },
+        "funcao": { "type": "string", "minLength": 1 },
+        "simbolo": { "type": "string", "minLength": 1 },
+        "arquivo": { "type": "string" },
+        "linha": { "$ref": "#/$defs/inteiroNaoNegativo" },
+        "coluna": { "$ref": "#/$defs/inteiroNaoNegativo" },
+        "inicio": { "$ref": "#/$defs/inteiroNaoNegativo" },
+        "fim": { "$ref": "#/$defs/inteiroNaoNegativo" },
+        "quadro": { "$ref": "#/$defs/inteiroNaoNegativo" },
+        "linhas": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "off": { "$ref": "#/$defs/inteiroNaoNegativo" },
+              "arquivo": { "type": "string" },
+              "linha": { "$ref": "#/$defs/inteiroNaoNegativo" },
+              "coluna": { "$ref": "#/$defs/inteiroNaoNegativo" }
+            },
+            "required": ["off", "arquivo", "linha", "coluna"],
+            "additionalProperties": false
+          }
+        },
+        "parametros": { "type": "array", "items": { "$ref": "#/$defs/variavel_dbg" } },
+        "locais": { "type": "array", "items": { "$ref": "#/$defs/variavel_dbg" } }
+      },
+      "required": ["tipo", "funcao", "simbolo", "inicio", "fim", "quadro", "linhas", "parametros", "locais"],
+      "additionalProperties": false
+    },
+    "variavel_dbg": {
+      "type": "object",
+      "properties": {
+        "id": { "$ref": "#/$defs/inteiroNaoNegativo" },
+        "nome": { "type": "string", "minLength": 1 },
+        "tipo": { "type": "string", "minLength": 1 },
+        "tid": { "$ref": "#/$defs/inteiroNaoNegativo" },
+        "rbp": { "type": "integer" },
+        "indireto": { "type": "boolean" }
+      },
+      "required": ["id", "nome", "tipo", "tid", "rbp", "indireto"],
+      "additionalProperties": false
+    },
+    "reloc": {
+      "type": "object",
+      "description": "Relocacao do objeto do programa. rva = RVA do campo na imagem; offset = dentro da secao.",
+      "properties": {
+        "tipo": { "const": "reloc" },
+        "secao": { "type": "string", "minLength": 1 },
+        "offset": { "$ref": "#/$defs/inteiroNaoNegativo" },
+        "rva": { "$ref": "#/$defs/inteiroNaoNegativo" },
+        "kind": { "enum": ["REL32", "ADDR32NB", "ADDR64"] },
+        "simbolo": { "type": "string", "minLength": 1 },
+        "adendo": { "type": "integer" }
+      },
+      "required": ["tipo", "secao", "offset", "rva", "kind", "simbolo", "adendo"],
+      "additionalProperties": false
+    },
+    "secao": {
+      "type": "object",
+      "properties": {
+        "tipo": { "const": "secao" },
+        "nome": { "type": "string", "minLength": 1, "maxLength": 8 },
+        "rva": { "$ref": "#/$defs/inteiroNaoNegativo" },
+        "tamanho_virtual": { "$ref": "#/$defs/inteiroNaoNegativo" },
+        "tamanho_bruto": { "$ref": "#/$defs/inteiroNaoNegativo" },
+        "caracteristicas": { "$ref": "#/$defs/inteiroNaoNegativo", "maximum": 4294967295 }
+      },
+      "required": ["tipo", "nome", "rva", "tamanho_virtual", "tamanho_bruto", "caracteristicas"],
+      "additionalProperties": false
+    },
+    "import": {
+      "type": "object",
+      "properties": {
+        "tipo": { "const": "import" },
+        "dll": { "type": "string", "minLength": 1 },
+        "nome": { "type": "string", "minLength": 1 },
+        "iat_rva": { "$ref": "#/$defs/inteiroNaoNegativo" },
+        "descritor": { "$ref": "#/$defs/inteiroNaoNegativo", "description": "Indice da DLL na tabela de descritores do .idata (0 = a primeira, KERNEL32.dll)." }
+      },
+      "required": ["tipo", "dll", "nome", "iat_rva", "descritor"],
+      "additionalProperties": false
+    },
+    "export": {
+      "type": "object",
+      "properties": {
+        "tipo": { "const": "export" },
+        "nome": { "type": "string", "minLength": 1 },
+        "rva": { "$ref": "#/$defs/inteiroNaoNegativo" },
+        "ordinal": { "type": "integer", "minimum": 1, "description": "Ordinal do export directory (base 1): a posicao do nome na ordem ASCII mais 1." }
+      },
+      "required": ["tipo", "nome", "rva", "ordinal"],
+      "additionalProperties": false
+    },
+    "formato": {
+      "type": "object",
+      "properties": {
+        "tipo": { "const": "formato" },
+        "formato": { "const": "PE32+" },
+        "machine": { "const": "0x8664" },
+        "imagem_base": { "$ref": "#/$defs/inteiroNaoNegativo" },
+        "entrada_rva": { "$ref": "#/$defs/inteiroNaoNegativo" },
+        "tamanho_arquivo": { "$ref": "#/$defs/inteiroNaoNegativo" },
+        "linker_maior": { "$ref": "#/$defs/inteiroNaoNegativo", "maximum": 255, "description": "MajorLinkerVersion do PE: a versao do forja, nunca a de um ligador de fora." },
+        "linker_menor": { "$ref": "#/$defs/inteiroNaoNegativo", "maximum": 255 }
+      },
+      "required": ["tipo", "formato", "machine", "imagem_base", "entrada_rva", "tamanho_arquivo", "linker_maior", "linker_menor"],
+      "additionalProperties": false
+    },
+    "formato_elf": {
+      "type": "object",
+      "description": "Formato do executavel do alvo x86_64-linux (0.7.0): ELF64 LSB ET_EXEC estatico. imagem_base = endereco do 1o PT_LOAD (0x400000); entrada_rva relativo a ele.",
+      "properties": {
+        "tipo": { "const": "formato" },
+        "formato": { "const": "ELF64" },
+        "machine": { "const": "0x3e" },
+        "imagem_base": { "$ref": "#/$defs/inteiroNaoNegativo" },
+        "entrada_rva": { "$ref": "#/$defs/inteiroNaoNegativo" },
+        "tamanho_arquivo": { "$ref": "#/$defs/inteiroNaoNegativo" }
+      },
+      "required": ["tipo", "formato", "machine", "imagem_base", "entrada_rva", "tamanho_arquivo"],
+      "additionalProperties": false
+    },
+    "segmento": {
+      "type": "object",
+      "description": "Um cabecalho de programa do ELF (0.7.0): PT_LOAD separado por permissao (R com os cabecalhos, RX, RW com memsz > filesz pelo .bss) e PT_GNU_STACK (pilha sem execucao). offset congruente a vaddr modulo alinhamento.",
+      "properties": {
+        "tipo": { "const": "segmento" },
+        "tipo_ph": { "enum": ["LOAD", "GNU_STACK"] },
+        "flags": { "enum": ["R", "RX", "RW"] },
+        "offset": { "$ref": "#/$defs/inteiroNaoNegativo" },
+        "vaddr": { "$ref": "#/$defs/inteiroNaoNegativo" },
+        "filesz": { "$ref": "#/$defs/inteiroNaoNegativo" },
+        "memsz": { "$ref": "#/$defs/inteiroNaoNegativo" },
+        "alinhamento": { "$ref": "#/$defs/inteiroNaoNegativo" }
+      },
+      "required": ["tipo", "tipo_ph", "flags", "offset", "vaddr", "filesz", "memsz", "alinhamento"],
+      "additionalProperties": false
+    },
+    "faixa": {
+      "type": "object",
+      "description": "Bytes do .text que nao sao instrucao do programa: o preenchimento (0xCC entre funcoes e o alinhamento antes do runtime) e o .text do runtime embutido.",
+      "properties": {
+        "tipo": { "const": "faixa" },
+        "rva": { "$ref": "#/$defs/inteiroNaoNegativo" },
+        "tamanho": { "type": "integer", "minimum": 1 },
+        "origem": { "enum": ["runtime", "preenchimento"] }
+      },
+      "required": ["tipo", "rva", "tamanho", "origem"],
+      "additionalProperties": false
+    },
+    "tempos": {
+      "type": "object",
+      "description": "Nanossegundos por etapa do build inteiro (0.5.0): as 10 etapas lex, parse, check, ir, bir, isel, regs, codificar, ligar e escrever, mais outros_ns (= total_ns menos a soma das etapas, sempre >= 0), total_ns (medido no instante em que o registro e montado) e linhas (do programa inteiro, raiz e modulos). O gerador funde selecao, alocacao e codificacao instrucao a instrucao, entao as fatias dele sao por funcao: regs_ns = preparo e alocacao, isel_ns = prologo e corpo, codificar_ns = fechamento e montagem do Objeto. Unico registro nao deterministico.",
+      "properties": {
+        "tipo": { "const": "tempos" },
+        "lex_ns": { "$ref": "#/$defs/inteiroNaoNegativo" },
+        "parse_ns": { "$ref": "#/$defs/inteiroNaoNegativo" },
+        "check_ns": { "$ref": "#/$defs/inteiroNaoNegativo" },
+        "ir_ns": { "$ref": "#/$defs/inteiroNaoNegativo" },
+        "bir_ns": { "$ref": "#/$defs/inteiroNaoNegativo" },
+        "isel_ns": { "$ref": "#/$defs/inteiroNaoNegativo" },
+        "regs_ns": { "$ref": "#/$defs/inteiroNaoNegativo" },
+        "codificar_ns": { "$ref": "#/$defs/inteiroNaoNegativo" },
+        "ligar_ns": { "$ref": "#/$defs/inteiroNaoNegativo" },
+        "escrever_ns": { "$ref": "#/$defs/inteiroNaoNegativo" },
+        "outros_ns": { "$ref": "#/$defs/inteiroNaoNegativo" },
+        "total_ns": { "$ref": "#/$defs/inteiroNaoNegativo" },
+        "linhas": { "$ref": "#/$defs/inteiroNaoNegativo" }
+      },
+      "required": ["tipo", "lex_ns", "parse_ns", "check_ns", "ir_ns", "bir_ns", "isel_ns", "regs_ns", "codificar_ns", "ligar_ns", "escrever_ns", "outros_ns", "total_ns", "linhas"],
+      "additionalProperties": false
+    }
+  }
+}

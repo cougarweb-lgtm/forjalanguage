@@ -1,0 +1,326 @@
+// nativo/optimizer/cfg.fj - porte de compiler/nativo/optimizer/cfg.c, compiler/nativo/optimizer/cfg.h
+// sha256 de nativo/optimizer/cfg.c: 364f249900afd698671c995d65ae8399bfb880e5548fafe996fd82ef4710cbbc
+// sha256 de nativo/optimizer/cfg.h: ef2eb8b6de006d1f4c08b9fef32a3283f4fdd9a4f55a8e66564b0aca61fc073f
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "common"
+import "nativo/bir"
+
+// memoria e vivo_memoria sao os donos dos vetores (fim/estado/pilha/entradas e vivo sao vistas neles): a Forja nao tem calloc sem dono.
+struct CfgCtx {
+    f: ?^bir.BirFuncao
+    n: u32
+    fim: ?[]u32
+    estado: ?[]u32
+    pilha: ?[]u32
+    entradas: ?[]u32
+    vivo: ?[]u8
+    topo: u32
+    memoria: [dynamic]u32
+    vivo_memoria: [dynamic]u8
+}
+
+pub const PERCORRER_ARESTAS_FN_CONTAR_ENTRADA: u16 = 1
+pub const PERCORRER_ARESTAS_FN_EMPILHAR_SE_NOVO: u16 = 2
+pub proc chamar_percorrer_arestas_fn(tag: u16, c: ^CfgCtx, alvo: u32) {
+    if tag == 1 {
+        contar_entrada(c, alvo)
+        return
+    }
+    if tag == 2 {
+        empilhar_se_novo(c, alvo)
+        return
+    }
+    common.falha_interna("otim: funcao de arestas desconhecida em chamar_percorrer_arestas_fn")
+}
+
+// C: nativo/optimizer/cfg.c:24
+proc eh_conta_ov(op: u8) -> bool {
+    return (((op == (bir.BIR_ADD_OV as u8)) or (op == (bir.BIR_SUB_OV as u8))) or (op == (bir.BIR_MUL_OV as u8))) or (op == (bir.BIR_NEG_OV as u8))
+}
+
+// C: nativo/optimizer/cfg.c:29
+proc terminador(f: ^bir.BirFuncao, b: u32) -> ^bir.BirInstr {
+    return &f.blocos[b].instrs[f.blocos[b].n - 1]
+}
+
+// C: nativo/optimizer/cfg.c:34
+proc termina_em_armadilha(f: ^bir.BirFuncao, b: u32) -> bool {
+    return terminador(f, b).op == (bir.BIR_ARMADILHA as u8)
+}
+
+// C: nativo/optimizer/cfg.c:40
+proc eh_passagem(f: ^bir.BirFuncao, b: u32) -> bool {
+    let k: ^bir.BirBloco = &f.blocos[b]
+    return (((b != 0) and (not k.frio)) and (k.n == 1)) and (k.instrs[0].op == (bir.BIR_SALTA as u8))
+}
+
+// C: nativo/optimizer/cfg.c:48
+proc seguir_passagens(c: ^CfgCtx, b: u32) -> u32 {
+    var topo: u32 = 0
+    var atual: u32 = b
+    var resultado: u32 = bir.BIR_SEM_BLOCO
+    while true {
+        if (c.estado or_else {})[atual] == 2 {
+            resultado = (c.fim or_else {})[atual]
+            break
+        }
+        if not eh_passagem(c.f as ^bir.BirFuncao, atual) {
+            resultado = atual
+            break
+        }
+        if (c.estado or_else {})[atual] == 1 {
+            break
+        }
+        let p_1 = c.estado or_else {}
+        p_1[atual] = 1
+        let antes_1: u32 = topo
+        topo += 1
+        let p_2 = c.pilha or_else {}
+        p_2[antes_1] = atual
+        atual = (c.f as ^bir.BirFuncao).blocos[atual].instrs[0].alvo[0]
+    }
+    for k in (0 as u32)..<topo {
+        var tern_1: u32 = resultado
+        if resultado == bir.BIR_SEM_BLOCO {
+            tern_1 = (c.pilha or_else {})[k]
+        }
+        let p_3 = c.fim or_else {}
+        p_3[(c.pilha or_else {})[k]] = tern_1
+        let p_4 = c.estado or_else {}
+        p_4[(c.pilha or_else {})[k]] = 2
+    }
+    return (c.fim or_else {})[b]
+}
+
+// C: nativo/optimizer/cfg.c:74
+proc redirecionar_arestas(c: ^CfgCtx) {
+    var b: u32 = 0
+    while b < c.n {
+        let t: ^bir.BirInstr = terminador(c.f as ^bir.BirFuncao, b)
+        if (t.op == (bir.BIR_SALTA as u8)) or (t.op == (bir.BIR_DESVIA as u8)) {
+            t.alvo[0] = seguir_passagens(c, t.alvo[0])
+        }
+        if t.op == (bir.BIR_DESVIA as u8) {
+            t.alvo[1] = seguir_passagens(c, t.alvo[1])
+        }
+        b += 1
+    }
+}
+
+// C: nativo/optimizer/cfg.c:87
+proc percorrer_arestas(blk: ^bir.BirBloco, fn: u16, c: ^CfgCtx) {
+    var k: u32 = 0
+    while k < blk.n {
+        let i: ^bir.BirInstr = &blk.instrs[k]
+        if (i.op == (bir.BIR_SALTA as u8)) or (i.op == (bir.BIR_DESVIA as u8)) or eh_conta_ov(i.op) {
+            chamar_percorrer_arestas_fn(fn, c, i.alvo[0])
+        }
+        if i.op == (bir.BIR_DESVIA as u8) {
+            chamar_percorrer_arestas_fn(fn, c, i.alvo[1])
+        }
+        k += 1
+    }
+}
+
+// C: nativo/optimizer/cfg.c:99
+proc contar_entrada(c: ^CfgCtx, alvo: u32) {
+    let p_1 = c.entradas or_else {}
+    p_1[alvo] += 1
+}
+
+// C: nativo/optimizer/cfg.c:104
+proc empilhar_se_novo(c: ^CfgCtx, alvo: u32) {
+    if not ((c.vivo or_else {})[alvo] != 0) {
+        let p_1 = c.vivo or_else {}
+        p_1[alvo] = 1
+        let antes_1: u32 = c.topo
+        c.topo += 1
+        let p_2 = c.pilha or_else {}
+        p_2[antes_1] = alvo
+    }
+}
+
+// C: nativo/optimizer/cfg.c:113
+proc marcar_alcancavel(c: ^CfgCtx) {
+    let f: ^bir.BirFuncao = c.f as ^bir.BirFuncao
+    c.topo = 0
+    empilhar_se_novo(c, 0)
+    var b: u32 = 1
+    while b < c.n {
+        if termina_em_armadilha(f, b) {
+            empilhar_se_novo(c, b)
+        }
+        b += 1
+    }
+    while c.topo > 0 {
+        c.topo -= 1
+        let atual: u32 = (c.pilha or_else {})[c.topo]
+        let blk: ^bir.BirBloco = &f.blocos[atual]
+        percorrer_arestas(blk, PERCORRER_ARESTAS_FN_EMPILHAR_SE_NOVO, c)
+    }
+}
+
+// C: nativo/optimizer/cfg.c:126
+proc pode_absorver(c: ^CfgCtx, b: u32) -> bool {
+    let t: ^bir.BirInstr = terminador(c.f as ^bir.BirFuncao, b)
+    var alvo: u32 = 0
+    if t.op != (bir.BIR_SALTA as u8) {
+        return false
+    }
+    alvo = t.alvo[0]
+    return ((((alvo != b) and (alvo != 0)) and ((c.entradas or_else {})[alvo] == 1)) and (common.c2f_b2i32((c.f as ^bir.BirFuncao).blocos[alvo].frio) == common.c2f_b2i32((c.f as ^bir.BirFuncao).blocos[b].frio))) and (not termina_em_armadilha(c.f as ^bir.BirFuncao, alvo))
+}
+
+// C: nativo/optimizer/cfg.c:137
+proc absorver(c: ^CfgCtx, b: u32) {
+    let f: ^bir.BirFuncao = c.f as ^bir.BirFuncao
+    let alvo: u32 = terminador(f, b).alvo[0]
+    let dst: ^bir.BirBloco = &f.blocos[b]
+    let src: ^bir.BirBloco = &f.blocos[alvo]
+    let manter: u32 = dst.n - 1
+    truncate(&dst.instrs, manter as int)
+    var k: u32 = 0
+    while k < src.n {
+        append(&dst.instrs, item = src.instrs[k])
+        k += 1
+    }
+    dst.n = manter + src.n
+    dst.cap = (cap(dst.instrs) as u64) as u32
+    delete(src.instrs)
+    src^ = bir.BirBloco{frio = src.frio}
+    let vivo: []u8 = c.vivo or_else {}
+    vivo[alvo] = 0
+}
+
+// C: nativo/optimizer/cfg.c:159
+proc fundir_blocos(c: ^CfgCtx) -> u32 {
+    var fusoes: u32 = 0
+    var b: u32 = 0
+    while b < c.n {
+        while (((c.vivo or_else {})[b] as i32) != 0) and (common.c2f_b2i32(pode_absorver(c, b)) != 0) {
+            absorver(c, b)
+            fusoes += 1
+        }
+        b += 1
+    }
+    return fusoes
+}
+
+// C: nativo/optimizer/cfg.c:172
+proc alocar_contexto(c: ^CfgCtx, f: ^bir.BirFuncao) {
+    let n: u32 = f.nblocos
+    let m: int = n as int
+    c.f = f
+    c.n = n
+    c.memoria = make([dynamic]u32, alloc = heap, cap = 4 * m + 1)
+    var i: int = 0
+    while i < 4 * m {
+        append(&c.memoria, item = 0)
+        i += 1
+    }
+    c.vivo_memoria = make([dynamic]u8, alloc = heap, cap = m + 1)
+    i = 0
+    while i < m {
+        append(&c.vivo_memoria, item = 0)
+        i += 1
+    }
+    let w: []u32 = c.memoria[..]
+    c.fim = w[0..<m]
+    c.estado = w[m..<(2 * m)]
+    c.pilha = w[(2 * m)..<(3 * m)]
+    c.entradas = w[(3 * m)..<(4 * m)]
+    c.vivo = c.vivo_memoria[..]
+    let fim: []u32 = c.fim or_else {}
+    var b: u32 = 0
+    while b < n {
+        fim[b] = b
+        b += 1
+    }
+}
+
+// C: nativo/optimizer/cfg.c:190
+proc compactar(c: ^CfgCtx) {
+    let ordem: []u32 = c.pilha or_else {}
+    let vivo: []u8 = c.vivo or_else {}
+    var n: u32 = 0
+    var b: u32 = 0
+    while b < c.n {
+        if vivo[b] != 0 {
+            ordem[n] = b
+            n += 1
+        }
+        b += 1
+    }
+    if n != c.n {
+        cfg_aplicar_ordem(c.f as ^bir.BirFuncao, ordem[0..<(n as int)])
+    }
+}
+
+// C: nativo/optimizer/cfg.c:202
+proc otim_cfg_aplicar(programa: ^bir.BirPrograma, funcao: ^bir.BirFuncao) {
+    if not cfg_elegivel(programa, funcao) {
+        return
+    }
+    var c = CfgCtx{}
+    alocar_contexto(&c, funcao)
+    defer delete(c.memoria)
+    defer delete(c.vivo_memoria)
+    redirecionar_arestas(&c)
+    marcar_alcancavel(&c)
+    var b: u32 = 0
+    while b < c.n {
+        let vivo: []u8 = c.vivo or_else {}
+        if vivo[b] != 0 {
+            percorrer_arestas(&funcao.blocos[b], PERCORRER_ARESTAS_FN_CONTAR_ENTRADA, &c)
+        }
+        b += 1
+    }
+    _ = fundir_blocos(&c)
+    compactar(&c)
+}
+
+// ---- testes dirigidos (funcoes montadas a mao; helpers com prefixo cfgt_ para nao colidir no pacote)
+proc cfgt_novo_bloco(f: ^bir.BirFuncao, op: i32, alvo0: u32) {
+    append(&f.blocos, item = bir.BirBloco{})
+    let b: ^bir.BirBloco = &f.blocos[f.nblocos]
+    b.instrs = make([dynamic]bir.BirInstr, alloc = heap, cap = 2)
+    append(&b.instrs, item = bir.BirInstr{})
+    let i: ^bir.BirInstr = &b.instrs[0]
+    i.op = op as u8
+    i.alvo[0] = alvo0
+    i.alvo[1] = bir.BIR_SEM_BLOCO
+    b.n = 1
+    b.cap = 2
+    f.nblocos += 1
+}
+
+proc cfgt_libera(f: ^bir.BirFuncao) {
+    var k: u32 = 0
+    while k < f.nblocos {
+        delete(f.blocos[k].instrs)
+        k += 1
+    }
+    delete(f.blocos)
+}
+
+test "cfg_eh_conta_ov" {
+    expect(eh_conta_ov(bir.BIR_ADD_OV as u8))
+    expect(eh_conta_ov(bir.BIR_NEG_OV as u8))
+    expect(not eh_conta_ov(bir.BIR_CHAMA as u8))
+}
+
+test "cfg_absorve_passagem_e_compacta" {
+    var prog = bir.BirPrograma{}
+    var f = bir.BirFuncao{}
+    f.blocos = make([dynamic]bir.BirBloco, alloc = heap, cap = 4)
+    cfgt_novo_bloco(&f, bir.BIR_SALTA, 1)
+    cfgt_novo_bloco(&f, bir.BIR_SALTA, 2)
+    cfgt_novo_bloco(&f, bir.BIR_RETORNA, bir.BIR_SEM_BLOCO)
+    otim_cfg_aplicar(&prog, &f)
+    expect(f.nblocos == 1)
+    expect(f.blocos[0].n == 1)
+    expect(f.blocos[0].instrs[0].op == (bir.BIR_RETORNA as u8))
+    cfgt_libera(&f)
+}

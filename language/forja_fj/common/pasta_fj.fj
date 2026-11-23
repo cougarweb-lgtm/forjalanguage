@@ -1,0 +1,143 @@
+// common/pasta_fj.fj - porte de compiler/common/pasta_fj.c, compiler/common/pasta_fj.h
+// sha256 de common/pasta_fj.c: de97a82a54285c10c43fbb180f528c1f548050895c779162562495ef61f24009
+// sha256 de common/pasta_fj.h: f7e95e9f2924ed96840affe687024849f8c6a290a0c78f34b09fa5aa2e79190c
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.2.0
+// Changelog: 0.2.0 - G3 P-common C1a: corpo real; FindFirstFileA/FindNextFileA -> file.read_dir (C2F-C1), qsort -> sort_by com o comparador (C2F-B0).
+
+import "std:file"
+import "std:os"
+
+const PASTA_CAMINHO_MAX: i32 = 1300
+
+// C: common/pasta_fj.c:17
+// _stricmp -> c2f_stricmp (C2F-30)
+proc tem_extensao_fj(nome: str) -> bool {
+    let n: u64 = len(nome) as u64
+    return (n > 3) and (c2f_stricmp(nome[(n - 3)..<n], ".fj") == 0)
+}
+
+// C: common/pasta_fj.c:24
+// C2F-B0: comparador de qsort (void * -> ^str, os casts somem); ordem de byte do caminho
+proc compara_caminhos(a: ^str, b: ^str) -> i32 {
+    return c2f_strcmp(a^, b^)
+}
+
+// C2F-B0: o par `_menor` do sort_by
+proc compara_caminhos_menor(a: ^str, b: ^str) -> bool {
+    return compara_caminhos(a, b) < 0
+}
+
+// C: common/pasta_fj.c:29
+// C2F-C1: FindFirstFileA/FindNextFileA -> file.read_dir (sem "." e ".."); entrada pasta ou nome sem ".fj" e ignorada como no C. O C so filtrava o atributo DIRECTORY: um link
+// para arquivo entra (aqui kind link entra); nome ANSI da maquina x UTF-8 do read_dir so difere em nome nao ASCII (nota ao main)
+pub proc pasta_listar_fj(arena: ^Arena, pasta: str, caminhos: ^[dynamic]str) {
+    // padrao[PASTA_CAMINHO_MAX + 4] = pasta + "\*": pasta que nao cabe da um padrao cortado e a busca falha no C
+    if (len(pasta) + 2) >= ((PASTA_CAMINHO_MAX + 4) as int) {
+        return
+    }
+    switch lista in file.read_dir(pasta, alloc = heap) {
+    case file.DirList:
+        for i in 0..<len(lista.items) {
+            let achado: file.DirEntry = lista.items[i]
+            if (achado.kind == file.FileKind.dir) or (not tem_extensao_fj(achado.name)) {
+                continue
+            }
+            let completo: str = format(f"{pasta}\\{achado.name}", alloc = heap)
+            // completo[PASTA_CAMINHO_MAX + MAX_PATH + 2]: o que nao cabe (com o NUL) e pulado
+            if len(completo) >= ((PASTA_CAMINHO_MAX + 260 + 2) as int) {
+                delete(completo)
+                continue
+            }
+            append(caminhos, item = from_bytes(as_bytes(completo), alloc = arena_mem(arena)))
+            delete(completo)
+        }
+        delete(lista.items)
+        delete(lista.data)
+    case file.FileError:
+        return
+    }
+    sort_by(caminhos[..], less = compara_caminhos_menor)
+}
+
+// C: common/pasta_fj.c:49
+// o que vem depois da ultima barra (\ ou /); N1: nome = ponteiro -> fatia
+proc nome_do_arquivo(caminho: str) -> str {
+    var inicio: u64 = 0
+    for p in (0 as u64)..<(len(caminho) as u64) {
+        if (caminho[p] == 92) or (caminho[p] == 47) { // '\\' '/'
+            inicio = p + 1
+        }
+    }
+    return caminho[inicio..<(len(caminho) as u64)]
+}
+
+// C: common/pasta_fj.c:59
+// C2F-VOID: Hash64(const void *) -> hash64([]u8, n, semente); texto vira as_bytes
+pub proc pasta_hash_nomes(caminhos: ^[dynamic]str) -> u64 {
+    var hash_c: u64 = HASH64_SEMENTE
+    for i in (0 as u64)..<(len(caminhos) as u64) {
+        let nome: str = nome_do_arquivo(caminhos[i])
+        hash_c = hash64(as_bytes(nome), len(nome) as u64, hash_c)
+        hash_c = hash64(as_bytes("\n"), 1, hash_c)
+    }
+    return hash_c
+}
+
+// C: common/pasta_fj.c:72
+pub proc pasta_hash_de_hoje(pasta: str) -> u64 {
+    var arena: Arena = Arena{}
+    var caminhos = make([dynamic]str, alloc = heap)
+    defer delete(caminhos)
+    pasta_listar_fj(&arena, pasta, &caminhos)
+    let hash_c: u64 = pasta_hash_nomes(&caminhos)
+    arena_liberar(&arena)
+    return hash_c
+}
+
+// Sem teste de unidade no C: pasta propria (relativa ao cwd, removida no fim) com 3 .fj (um em maiuscula), um .txt e uma pasta "sub.fj"; lista ordenada por byte do caminho e hash dos nomes
+// (esperado 0xd77ef417c5702404 = FNV-1a de "D.FJ\n" "a.fj\n" "b.fj\n", calculado fora do Forja)
+test "pasta_fj" {
+    let pasta: str = format(f"forja_pasta_fj_{os.pid()}", alloc = heap)
+    _ = file.remove_dir(pasta, all = true)
+    expect(file.make_dir(pasta) == none)
+    let dado: str = "x"
+    let nomes_dos_arquivos: [5]str = {"b.fj", "a.fj", "c.txt", "D.FJ", "curto.f"}
+    for nome in nomes_dos_arquivos {
+        let arq: str = format(f"{pasta}\\{nome}", alloc = heap)
+        expect(file.write_all(arq, as_bytes(dado)) == none)
+        delete(arq)
+    }
+    let sub: str = format(f"{pasta}\\sub.fj", alloc = heap)
+    expect(file.make_dir(sub) == none)
+    delete(sub)
+
+    var arena: Arena = Arena{}
+    var caminhos = make([dynamic]str, alloc = heap)
+    pasta_listar_fj(&arena, pasta, &caminhos)
+    expect(len(caminhos) == 3)
+    let esperados: [3]str = {"D.FJ", "a.fj", "b.fj"}
+    for i in 0..<3 {
+        let e: str = format(f"{pasta}\\{esperados[i]}", alloc = heap)
+        expect(caminhos[i] == e)
+        delete(e)
+    }
+    expect(pasta_hash_nomes(&caminhos) == 0xd77ef417c5702404)
+    expect(pasta_hash_de_hoje(pasta) == 0xd77ef417c5702404)
+    delete(caminhos)
+    arena_liberar(&arena)
+
+    expect(tem_extensao_fj("a.fj") and tem_extensao_fj("A.Fj") and tem_extensao_fj("xx.FJ"))
+    expect(not tem_extensao_fj(".fj") and not tem_extensao_fj("fj") and not tem_extensao_fj("a.fjx"))
+    expect(nome_do_arquivo("a\\b/c.fj") == "c.fj" and nome_do_arquivo("c.fj") == "c.fj" and nome_do_arquivo("a/") == "")
+
+    var vazia = make([dynamic]str, alloc = heap)
+    var arena_2: Arena = Arena{}
+    let inexistente: str = format(f"{pasta}\\nao_existe", alloc = heap)
+    pasta_listar_fj(&arena_2, inexistente, &vazia)
+    expect(len(vazia) == 0)
+    delete(vazia)
+    delete(inexistente)
+    expect(file.remove_dir(pasta, all = true) == none)
+    delete(pasta)
+}

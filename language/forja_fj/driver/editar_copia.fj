@@ -1,0 +1,251 @@
+// driver/editar_copia.fj - porte de compiler/driver/editar_copia.c
+// sha256 de driver/editar_copia.c: 02c51531903662cb20b080596a0440abf00beced512e42f3ea1c7fa753e2d81e
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.2.0
+// Changelog: 0.2.0 - G3 V5-E1: corpo real. listar_arquivos_3 e lista ^[dynamic] (o arquivo entra por append); pasta_temporaria devolve ?str (heap);
+//            novos e []str (um texto por arquivo do plano, na ordem de p.arquivos); prefixo e ^?str (heap, quem chama faz delete).
+
+import "common"
+import "frontend"
+import "std:file"
+import "std:os"
+
+struct ArquivoDaCopia {
+    abs: ?str
+    editado: i32
+}
+
+// C: driver/editar_copia.c:22
+// Indice da '\' que fecha a maior pasta que 'a' e 'b' dividem, olhando ate 'limite' (0 = nenhuma).
+proc pasta_comum(a: str, b: str, limite: u64) -> u64 {
+    var comum: u64 = 0
+    var k: u64 = 0
+    while (k <= limite) and (k < (len(a) as u64)) and (k < (len(b) as u64)) {
+        if minuscula_ascii(a[k]) != minuscula_ascii(b[k]) {
+            break
+        }
+        if a[k] == 92 { // '\\'
+            comum = k
+        }
+        k += 1
+    }
+    return comum
+}
+
+// C: driver/editar_copia.c:34
+// Os arquivos do projeto (menos os de std e engine) com o caminho absoluto, um por trecho da Fonte; devolve quantos.
+proc listar_arquivos_3(p: ^Plano, lista: ^[dynamic]ArquivoDaCopia) -> u32 {
+    let q: ^Consulta = p.q as ^Consulta
+    let c: ^Compilacao = q.c as ^Compilacao
+    var nt: u32 = 1
+    if c.fonte.ntrechos > 0 {
+        nt = c.fonte.ntrechos
+    }
+    var k: u32 = 0
+    while (k < nt) and (len(lista^) < 4096) {
+        let modulo: u8 = frontend.modulos_pacote_do_arquivo(&c.modulos, k)
+        let origem: u8 = c.modulos.itens[modulo].origem
+        if (origem != (frontend.MOD_STD as u8)) and (origem != (frontend.MOD_ENGINE as u8)) {
+            adicionar_arquivo_da_copia(p, lista, caminho_do_arquivo(q, k))
+        }
+        k += 1
+    }
+    return len(lista^) as u32
+}
+
+// um arquivo do projeto entra na copia com o caminho absoluto (_fullpath); 'editado' = o indice dele no plano, -1 se nao foi editado
+proc adicionar_arquivo_da_copia(p: ^Plano, lista: ^[dynamic]ArquivoDaCopia, caminho: ?str) {
+    var buf: [600]u8 = {}
+    let ab: []u8 = buf[..]
+    caminho_absoluto(ab, 600, caminho)
+    let n: int = common.c2f_strlen_b(ab)
+    if n == 0 {
+        return
+    }
+    var entrada: ArquivoDaCopia = ArquivoDaCopia{abs = from_bytes(ab[0..<n], alloc = heap), editado = -1}
+    for j in (0 as u32)..<p.narquivos {
+        if (p.arquivos[j].caminho or_else "") == (caminho or_else "") {
+            entrada.editado = j as i32
+        }
+    }
+    append(lista, item = entrada)
+}
+
+// C: driver/editar_copia.c:54
+proc pasta_raiz_da_copia(lista: ?[]ArquivoDaCopia) -> u64 {
+    var raiz: u64 = len(((lista or_else {})[0].abs or_else "")) as u64
+    for k in (0 as u32)..<(len((lista or_else {})) as u32) {
+        raiz = pasta_comum(((lista or_else {})[0].abs or_else ""), ((lista or_else {})[k].abs or_else ""), raiz)
+    }
+    return raiz
+}
+
+// C: driver/editar_copia.c:64
+// Pasta do processo (forja_editar_<pid>) dentro da pasta de temp (TMP, depois TEMP); so cria, nao apaga. none = nao criou. Heap: quem chama faz delete.
+proc pasta_temporaria() -> ?str {
+    let base: str = os.env("TMP") or_else (os.env("TEMP") or_else "")
+    if len(base) == 0 {
+        return none
+    }
+    var sep: str = "\\"
+    let ultimo: u8 = as_bytes(base)[len(base) - 1]
+    if (ultimo == 92) or (ultimo == 47) { // '\\' '/'
+        sep = ""
+    }
+    let pid: u32 = os.pid() as u32
+    let pasta: str = format(f"{base}{sep}forja_editar_{pid}", alloc = heap)
+    let erro: ?file.FileError = file.make_dir(pasta)
+    if (erro == none) or ((erro or_else file.FileError.other) == file.FileError.already_exists) {
+        return pasta
+    }
+    delete(pasta)
+    return none
+}
+
+// C: driver/editar_copia.c:76
+// Apaga a pasta e tudo que ha dentro.
+proc remover_arvore(pasta: str) {
+    _ = file.remove_dir(pasta, all = true)
+}
+
+// C: driver/editar_copia.c:97
+// Cria as pastas que faltam entre 'base' (que ja existe) e o arquivo 'destino'; erro ignorado, como no C.
+proc criar_pastas_de(destino: str, base: u64) {
+    let tam: u64 = len(destino) as u64
+    let bytes: []u8 = as_bytes(destino)
+    var k: u64 = base + 1
+    while k < tam {
+        if bytes[k] == 92 { // '\\'
+            _ = file.make_dir(destino[0..<(k as int)])
+        }
+        k += 1
+    }
+}
+
+// C: driver/editar_copia.c:113
+// Grava no destino o texto novo do arquivo (se foi editado) ou o conteudo atual dele. false = nao conseguiu (erro em p.erro).
+proc copiar_um(p: ^Plano, a: ^ArquivoDaCopia, novos: []str, destino: str) -> bool {
+    if a.editado >= 0 {
+        let texto: str = novos[a.editado as u64]
+        if common.arquivo_gravar(destino, texto, len(texto) as u64) {
+            return true
+        }
+        return erro_gravar_copia(p, destino)
+    }
+    let origem: str = a.abs or_else ""
+    switch r in file.read_all(origem, alloc = heap) {
+    case [dynamic]u8:
+        let txt: str = from_bytes(r[..], alloc = heap)
+        delete(r)
+        let ok: bool = common.arquivo_gravar(destino, txt, len(txt) as u64)
+        delete(txt)
+        if ok {
+            return true
+        }
+        return erro_gravar_copia(p, destino)
+    case file.FileError:
+        return erro_ler_copia(p, origem)
+    }
+    return false
+}
+
+proc erro_gravar_copia(p: ^Plano, destino: str) -> bool {
+    let msg: str = format(f"nao consegui gravar a copia '{destino}'", alloc = heap)
+    defer delete(msg)
+    return plano_erro(p, msg)
+}
+
+proc erro_ler_copia(p: ^Plano, origem: str) -> bool {
+    let msg: str = format(f"nao consegui ler '{origem}' para a copia", alloc = heap)
+    defer delete(msg)
+    return plano_erro(p, msg)
+}
+
+// C: driver/editar_copia.c:127
+// LIMITE: parametros 5 (plano e novos sao a entrada; raiz e pasta dizem de onde e para onde copia).
+proc copiar_todos(p: ^Plano, lista: ?[]ArquivoDaCopia, raiz: u64, pasta: str, novos: []str) -> bool {
+    let arquivos: []ArquivoDaCopia = lista or_else {}
+    for k in (0 as u64)..<(len(arquivos) as u64) {
+        let caminho_abs: str = arquivos[k].abs or_else ""
+        let resto: str = caminho_abs[(raiz as int)..<len(caminho_abs)]
+        let destino: str = format(f"{pasta}{resto}", alloc = heap)
+        criar_pastas_de(destino, len(pasta) as u64)
+        let ok: bool = copiar_um(p, &arquivos[k], novos, destino)
+        delete(destino)
+        if not ok {
+            return false
+        }
+    }
+    return true
+}
+
+// C: driver/editar_copia.c:140
+// O check de "depois" numa copia do projeto em %TEMP%: copia o projeto (o texto novo nos editados) e roda "forja check" na raiz da copia; apaga a copia.
+// prefixo recebe (heap: quem chama faz delete) a pasta da copia com barras normais e a barra final, para trocar nos diagnosticos.
+proc editar_verificar_copia(p: ^Plano, novos: []str, arena: ^common.Arena, depois: ^ResultadoCheck, prefixo: ^?str) -> bool {
+    var lista = make([dynamic]ArquivoDaCopia, alloc = heap)
+    defer liberar_lista_da_copia(&lista)
+    let n: u32 = listar_arquivos_3(p, &lista)
+    var pasta: ?str = none
+    if n > 0 {
+        pasta = pasta_temporaria()
+    }
+    if pasta == none {
+        return plano_erro(p, "nao consegui criar a pasta temporaria para o check")
+    }
+    let pasta_txt: str = pasta or_else ""
+    defer delete(pasta or_else "")
+    let raiz: u64 = pasta_raiz_da_copia(lista[..])
+    if raiz < 3 {
+        remover_arvore(pasta_txt)
+        return plano_erro(p, "os arquivos do projeto nao dividem nenhuma pasta (unidades diferentes): nao ha como conferir numa copia")
+    }
+    let abs0: str = lista[0].abs or_else ""
+    let resto0: str = abs0[(raiz as int)..<len(abs0)]
+    let raiz_copia: str = format(f"{pasta_txt}{resto0}", alloc = heap)
+    defer delete(raiz_copia)
+    var ok: bool = copiar_todos(p, lista[..], raiz, pasta_txt, novos)
+    if ok {
+        var erro_buf: [400]u8 = {} // EDITAR_TEXTO_MAX
+        if not corrigir_rodar_check(arena, raiz_copia, depois, erro_buf[..], 400) {
+            ok = erro_check_da_copia(p, erro_buf[..])
+        }
+    }
+    remover_arvore(pasta_txt)
+    let pasta_normal: str = com_barras_normais(pasta_txt)
+    defer delete(pasta_normal)
+    prefixo^ = format(f"{pasta_normal}/", alloc = heap)
+    return ok
+}
+
+// o check da copia nao rodou: a frase leva o inicio do erro (%.300s do C)
+proc erro_check_da_copia(p: ^Plano, erro: []u8) -> bool {
+    let tam: int = min(common.c2f_strlen_b(erro), 300)
+    let resumo: str = from_bytes(erro[0..<tam], alloc = heap)
+    defer delete(resumo)
+    let msg: str = format(f"o check depois da edicao falhou: {resumo}", alloc = heap)
+    defer delete(msg)
+    return plano_erro(p, msg)
+}
+
+// a pasta com as barras normais (o C troca '\' por '/' antes de montar o prefixo); heap
+proc com_barras_normais(texto: str) -> str {
+    var bytes = make([dynamic]u8, alloc = heap)
+    defer delete(bytes)
+    for c in as_bytes(texto) {
+        if c == 92 { // '\\' vira '/'
+            append(&bytes, item = 47) // '/'
+        } else {
+            append(&bytes, item = c)
+        }
+    }
+    return from_bytes(bytes[..], alloc = heap)
+}
+
+// apaga os caminhos absolutos (heap) da lista e a lista
+proc liberar_lista_da_copia(lista: ^[dynamic]ArquivoDaCopia) {
+    for a in lista^ {
+        delete(a.abs or_else "")
+    }
+    delete(lista^)
+}

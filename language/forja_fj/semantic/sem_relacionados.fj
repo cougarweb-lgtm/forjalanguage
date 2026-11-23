@@ -1,0 +1,1332 @@
+// semantic/sem_relacionados.fj - porte de compiler/semantic/sem_relacionados.c
+// sha256 de semantic/sem_relacionados.c: 83db97479c936bef0ab95f1b8d4a5550658d7421f498f2c60a571ddcccf3f67f
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "common"
+import "frontend"
+
+const TIPO_TEXTO_MAX_2: i32 = 40
+const LISTA_MAX: i32 = 56
+const CITADOS_MAX: i32 = 3
+const ALCANCE_DA_CHAMADA: i32 = 600
+const SEM_POS: u32 = 4294967295
+
+// C: semantic/sem_relacionados.c:28
+proc eh_espaco_2(c: u8) -> bool {
+    return (c == 32) or (c == 9) // ' ' '\t'
+}
+
+// C: semantic/sem_relacionados.c:33
+proc pular_espacos_2(s: ^Semantica, i: u32) -> u32 {
+    var i_v: u32 = i
+    while eh_espaco_2(sug_byte((s.fonte as ^common.Fonte).texto, i_v)) {
+        i_v += 1
+    }
+    return i_v
+}
+
+// G3 S8 (sem par no C): InternerAchar(s->nomes, texto, tam) com os bytes do fonte/da causa (o Interner da Forja recebe str: copia de heap por chamada).
+proc rel_achar_nome(s: ^Semantica, bytes: []u8) -> i32 {
+    let nome = from_bytes(bytes, alloc = heap)
+    defer delete(nome)
+    return common.interner_achar(nomes_da_sem(s), nome, len(bytes) as u32)
+}
+
+// G3 S8 (sem par no C): o conjunto "+-*/%<>=!&|~^" do strchr (sem o NUL).
+proc eh_operador_rel(c: u8) -> bool {
+    return (c == 43) or (c == 45) or (c == 42) or (c == 47) or (c == 37) or (c == 60) or (c == 62) or (c == 61) or (c == 33) or (c == 38) or (c == 124) or (c == 126) or (c == 94)
+}
+
+// C: semantic/sem_relacionados.c:40
+// ASSINATURA ALTERADA no lote: fim: ^u32 -> ?^u32 (o C passa NULL quando nao quer o fim).
+proc nome_em(s: ^Semantica, pos: u32, fim: ?^u32) -> i32 {
+    let f: ^common.Fonte = s.fonte as ^common.Fonte
+    let t: []u8 = f.texto
+    var i: u32 = pos
+    let inicial: u8 = sug_byte(t, pos)
+    let eh_letra: bool = ((inicial >= 65) and (inicial <= 90)) or ((inicial >= 97) and (inicial <= 122)) // isalpha
+    if ((pos as u64) >= f.tam) or (not (eh_letra or (inicial == 95))) { // '_'
+        return -1
+    }
+    while char_de_nome(sug_byte(t, i)) {
+        i += 1
+    }
+    if fim != none {
+        let destino: ^u32 = fim as ^u32
+        destino^ = i
+    }
+    return rel_achar_nome(s, t[(pos as int)..<(i as int)])
+}
+
+// C: semantic/sem_relacionados.c:52
+proc pular_prefixos(s: ^Semantica, pos: u32) -> u32 {
+    let t: []u8 = (s.fonte as ^common.Fonte).texto
+    var pos_v: u32 = pos
+    while (sug_byte(t, pos_v) == 94) or (sug_byte(t, pos_v) == 63) or (sug_byte(t, pos_v) == 38) { // '^' '?' '&'
+        pos_v += 1
+    }
+    return pos_v
+}
+
+// C: semantic/sem_relacionados.c:59
+proc inicio_da_cadeia_antes(s: ^Semantica, fim: u32) -> u32 {
+    var fim_v: u32 = fim
+    let t: []u8 = (s.fonte as ^common.Fonte).texto
+    var ini: u32 = 0
+    while (fim_v > 0) and eh_espaco_2(sug_byte(t, fim_v - 1)) {
+        fim_v -= 1
+    }
+    ini = fim_v
+    while (ini > 0) and (char_de_nome(sug_byte(t, ini - 1)) or (sug_byte(t, ini - 1) == 46)) { // '.'
+        ini -= 1
+    }
+    return ini
+}
+
+// C: semantic/sem_relacionados.c:71
+proc raiz_da_cadeia_antes(s: ^Semantica, fim: u32) -> i32 {
+    let ini: u32 = inicio_da_cadeia_antes(s, fim)
+    if ini < fim {
+        return nome_em(s, ini, none)
+    }
+    return -1
+}
+
+// C: semantic/sem_relacionados.c:79
+proc ultimo_nome_antes(s: ^Semantica, fim: u32) -> i32 {
+    let t: []u8 = (s.fonte as ^common.Fonte).texto
+    var fim_v: u32 = fim
+    while (fim_v > 0) and eh_espaco_2(sug_byte(t, fim_v - 1)) {
+        fim_v -= 1
+    }
+    var ini: u32 = fim_v
+    while (ini > 0) and char_de_nome(sug_byte(t, ini - 1)) {
+        ini -= 1
+    }
+    if ini < fim_v {
+        return nome_em(s, ini, none)
+    }
+    return -1
+}
+
+// C: semantic/sem_relacionados.c:90
+proc simbolo_de(s: ^Semantica, nome: i32) -> ?^Simbolo {
+    var tern_1: ?^Simbolo = none
+    if (nome >= 0) and (common.c2f_s2u_32(nome) < s.qtd_nomes) {
+        tern_1 = sem_achar_simbolo(s, nome, 0)
+    }
+    return tern_1
+}
+
+// C: semantic/sem_relacionados.c:96
+proc nome_depois_do_operador(s: ^Semantica, pos: u32) -> i32 {
+    let t: []u8 = (s.fonte as ^common.Fonte).texto
+    var pos_v: u32 = pos
+    while (sug_byte(t, pos_v) != 0) and (eh_operador_rel(sug_byte(t, pos_v)) or (sug_byte(t, pos_v) == 46) or (sug_byte(t, pos_v) == 32) or (sug_byte(t, pos_v) == 9)) { // '.' ' ' '\t'
+        pos_v += 1
+    }
+    return nome_em(s, pos_v, none)
+}
+
+// C: semantic/sem_relacionados.c:104
+proc inicio_da_linha(s: ^Semantica, off: u32) -> u32 {
+    var off_v: u32 = off
+    let t: []u8 = (s.fonte as ^common.Fonte).texto
+    while (off_v > 0) and (sug_byte(t, off_v - 1) != 10) { // '\n'
+        off_v -= 1
+    }
+    return off_v
+}
+
+// C: semantic/sem_relacionados.c:113
+// C2F-37: `fmt, ...` virou `msg: str` (mensagem ja pronta)
+proc adicionar(s: ^Semantica, papel: i32, off: u32, msg: str) {
+    let d: ^common.Diag = s.diag as ^common.Diag
+    let linha: u32 = inicio_da_linha(s, off)
+    for k in 0..<(d.rel.n as int) {
+        if inicio_da_linha(s, d.rel.itens[k].off) == linha {
+            return
+        }
+    }
+    let nota = common.c2f_cortar(msg, (common.DIAG_REL_NOTA_MAX as int) - 1) // char nota[DIAG_REL_NOTA_MAX]
+    defer delete(nota)
+    _ = common.diag_relacionar(d, papel, off, nota)
+}
+
+// C: semantic/sem_relacionados.c:131
+// ASSINATURA ALTERADA no lote (C: `char *saida, size_t cap`): devolve o texto do item, de heap, ja cortado em TIPO_TEXTO_MAX - 1 bytes (o chamador faz delete).
+proc nome_do_item(s: ^Semantica, d: ?^frontend.Decl, k: u32) -> str {
+    let dd: ^frontend.Decl = d as ^frontend.Decl
+    if dd.tipo_no == (frontend.D_ENUM as u8) {
+        return common.c2f_cortar(sem_nome_texto(s, (dd.membros or_else {})[k].nome), (TIPO_TEXTO_MAX_2 as int) - 1)
+    }
+    if dd.tipo_no == (frontend.D_UNIAO as u8) {
+        let descrito = sem_descrever_str(s, (dd.campos or_else {})[k].tipo.tipo)
+        defer delete(descrito)
+        return common.c2f_cortar(descrito, (TIPO_TEXTO_MAX_2 as int) - 1)
+    }
+    return common.c2f_cortar(sem_nome_texto(s, (dd.campos or_else {})[k].nome), (TIPO_TEXTO_MAX_2 as int) - 1)
+}
+
+// C: semantic/sem_relacionados.c:139
+// ASSINATURA ALTERADA no lote (C: `char *saida` de LISTA_MAX + 1): devolve "a, b, c" de heap (o chamador faz delete).
+proc listar_itens(s: ^Semantica, d: ?^frontend.Decl) -> str {
+    let dd: ^frontend.Decl = d as ^frontend.Decl
+    var qtd: u32 = dd.ncampos
+    if dd.tipo_no == (frontend.D_ENUM as u8) {
+        qtd = dd.nmembros
+    }
+    var b = make([dynamic]u8, alloc = heap)
+    defer delete(b)
+    for k in (0 as u32)..<qtd {
+        let item = nome_do_item(s, d, k)
+        defer delete(item)
+        let usado: int = len(b)
+        if ((usado + len(item)) + 5) > (LISTA_MAX as int) {
+            // snprintf(saida + usado, LISTA_MAX - usado, "...")
+            let reticencias = common.c2f_cortar("...", ((LISTA_MAX as int) - usado) - 1)
+            defer delete(reticencias)
+            append(&b, item = reticencias)
+            return to_str(&b)
+        }
+        if k > 0 {
+            append(&b, item = ", ")
+        }
+        append(&b, item = item)
+    }
+    return to_str(&b)
+}
+
+// C: semantic/sem_relacionados.c:156
+proc rotulo_do_tipo(d: ?^frontend.Decl) -> str {
+    let sw_1 = (d as ^frontend.Decl).tipo_no as i32
+    if sw_1 == frontend.D_STRUCT {
+        return "struct"
+    } else if sw_1 == frontend.D_ENUM {
+        return "enum"
+    } else if sw_1 == frontend.D_UNIAO {
+        return "union"
+    } else {
+        return "unidade"
+    }
+    return ""
+}
+
+// C: semantic/sem_relacionados.c:167
+proc relacionar_tipo_decl(s: ^Semantica, d: ?^frontend.Decl) {
+    let dd: ^frontend.Decl = d as ^frontend.Decl
+    var sem_pub: str = ""
+    if ((dd.modulo as i32) != (s.modulo_atual as i32)) and (not dd.publico) {
+        sem_pub = " (sem pub)"
+    }
+    let itens = listar_itens(s, d)
+    defer delete(itens)
+    var separador: str = ""
+    if len(itens) > 0 {
+        separador = ": "
+    }
+    let msg = format(f"{rotulo_do_tipo(d)} '{sem_nome_texto(s, dd.nome)}'{separador}{itens}{sem_pub}", alloc = heap)
+    defer delete(msg)
+    adicionar(s, common.DIAG_REL_TIPO, dd.pos, msg)
+}
+
+// C: semantic/sem_relacionados.c:177
+proc relacionar_simbolo(s: ^Semantica, nome: i32) -> bool {
+    let y: ?^Simbolo = simbolo_de(s, nome)
+    var tern_1: ?^frontend.Decl = none
+    if y != none {
+        tern_1 = (y as ^Simbolo).decl
+    }
+    let d: ?^frontend.Decl = tern_1
+    var sem_pub: str = ""
+    if d == none {
+        return false
+    }
+    var tern_2: str = ""
+    if (((d as ^frontend.Decl).modulo as i32) != (s.modulo_atual as i32)) and (not (d as ^frontend.Decl).publico) {
+        tern_2 = " (sem pub)"
+    }
+    sem_pub = tern_2
+    let sw_1 = (y as ^Simbolo).categoria as i32
+    if sw_1 == SIM_PROC {
+        let msg_1 = format(f"assinatura do proc '{sem_nome_texto(s, nome)}'{sem_pub}", alloc = heap)
+        defer delete(msg_1)
+        adicionar(s, common.DIAG_REL_ASSINATURA, (d as ^frontend.Decl).pos, msg_1)
+        return true
+    } else if sw_1 == SIM_STRUCT or sw_1 == SIM_ENUM or sw_1 == SIM_UNIAO or sw_1 == SIM_UNIDADE {
+        relacionar_tipo_decl(s, d)
+        return true
+    } else if sw_1 == SIM_CONST {
+        let msg_2 = format(f"constante '{sem_nome_texto(s, nome)}'{sem_pub}", alloc = heap)
+        defer delete(msg_2)
+        adicionar(s, common.DIAG_REL_DECLARACAO, (d as ^frontend.Decl).pos, msg_2)
+        return true
+    } else {
+        return false
+    }
+    return false
+}
+
+// C: semantic/sem_relacionados.c:199
+proc relacionar_local(s: ^Semantica, l: ?^LocalInfo) {
+    let ll: ^LocalInfo = l as ^LocalInfo
+    var papel: i32 = common.DIAG_REL_DECLARACAO
+    if tipo_classe_de(&s.tipos, ll.tipo) == TC_PROC {
+        papel = common.DIAG_REL_ASSINATURA
+    }
+    let descrito = sem_descrever_str(s, ll.tipo)
+    defer delete(descrito)
+    let tipo = common.c2f_cortar(descrito, (TIPO_TEXTO_MAX_2 as int) - 1) // char tipo[TIPO_TEXTO_MAX]
+    defer delete(tipo)
+    var rotulo: str = "local"
+    if ll.natureza == (LOC_PARAM as u8) {
+        rotulo = "parametro"
+    }
+    let msg = format(f"{rotulo} '{sem_nome_texto(s, ll.nome)}' declarado aqui como {tipo}", alloc = heap)
+    defer delete(msg)
+    adicionar(s, papel, ll.pos, msg)
+}
+
+// C: semantic/sem_relacionados.c:209
+proc relacionar_nome(s: ^Semantica, nome: i32) -> bool {
+    var l: ?^LocalInfo = none
+    if simbolo_de(s, nome) == none {
+        return false
+    }
+    l = escopo_buscar(&s.escopo, nome)
+    if l != none {
+        relacionar_local(s, l)
+        return true
+    }
+    return relacionar_simbolo(s, nome)
+}
+
+// C: semantic/sem_relacionados.c:225
+proc decl_que_contem(s: ^Semantica, off: u32) -> ?^frontend.Decl {
+    var anterior: ?^frontend.Decl = none
+    var d: ?^frontend.Decl = (s.programa as ^frontend.Programa).primeira
+    while d != none {
+        if ((d as ^frontend.Decl).tipo_no == (frontend.D_IMPORT as u8)) or ((d as ^frontend.Decl).tipo_no == (frontend.D_LINK as u8)) {
+            d = (d as ^frontend.Decl).prox
+            continue
+        }
+        if ((d as ^frontend.Decl).pos <= off) and (off < (d as ^frontend.Decl).pos_fim) {
+            return d
+        }
+        if ((d as ^frontend.Decl).pos <= off) and ((anterior == none) or ((d as ^frontend.Decl).pos > (anterior as ^frontend.Decl).pos)) {
+            anterior = d
+        }
+        d = (d as ^frontend.Decl).prox
+    }
+    return anterior
+}
+
+// C: semantic/sem_relacionados.c:238
+proc relacionar_unidade(s: ^Semantica) {
+    let d: ?^frontend.Decl = decl_que_contem(s, (s.diag as ^common.Diag).off)
+    if d == none {
+        return
+    }
+    if ((d as ^frontend.Decl).tipo_no == (frontend.D_PROC as u8)) or ((d as ^frontend.Decl).tipo_no == (frontend.D_TEST as u8)) {
+        adicionar(s, common.DIAG_REL_ASSINATURA, (d as ^frontend.Decl).pos, "proc que contem o erro")
+    } else {
+        adicionar(s, common.DIAG_REL_DECLARACAO, (d as ^frontend.Decl).pos, "declaracao que contem o erro")
+    }
+}
+
+// C: semantic/sem_relacionados.c:248
+// C2F-INDECIDIVEL: saida (int32_t *, o chamador passa o inicio de um vetor ou `nomes + n`: aqui a fatia)
+proc nomes_citados(s: ^Semantica, saida: []i32, max: u32) -> u32 {
+    let causa: str = (s.diag as ^common.Diag).causa or_else ""
+    let bytes: []u8 = as_bytes(causa)
+    var n: u32 = 0
+    var c: int = 0
+    while n < max {
+        // c = strchr(c, '\''): o proximo apostrofo a partir de c (a busca para no fim do texto)
+        while (c < len(bytes)) and (bytes[c] != 39) {
+            c += 1
+        }
+        if c >= len(bytes) {
+            break
+        }
+        c += 1
+        let ini: int = c
+        while char_de_nome(common.c2f_nul_em_b(bytes, c)) {
+            c += 1
+        }
+        if (common.c2f_nul_em_b(bytes, c) != 39) or (c == ini) { // '\''
+            continue
+        }
+        let id: i32 = rel_achar_nome(s, bytes[ini..<c])
+        if id >= 0 {
+            saida[n] = id
+            n += 1
+        }
+        c += 1
+    }
+    return n
+}
+
+// C: semantic/sem_relacionados.c:264
+proc relacionar_citados(s: ^Semantica) {
+    var citados: [3]i32 = {}
+    let n: u32 = nomes_citados(s, citados[..], CITADOS_MAX as u32)
+    for k in (0 as u32)..<n {
+        _ = relacionar_nome(s, citados[k])
+    }
+}
+
+// C: semantic/sem_relacionados.c:275
+proc relacionar_base(s: ^Semantica, base: i32) {
+    var tern_1: ?^LocalInfo = none
+    if simbolo_de(s, base) != none {
+        tern_1 = escopo_buscar(&s.escopo, base)
+    }
+    let l: ?^LocalInfo = tern_1
+    var tern_2: ?^frontend.Decl = none
+    if l != none {
+        tern_2 = sem_decl_da_struct(s, (l as ^LocalInfo).tipo)
+    }
+    let dono: ?^frontend.Decl = tern_2
+    if not relacionar_nome(s, base) {
+        return
+    }
+    if dono != none {
+        relacionar_tipo_decl(s, dono)
+    }
+}
+
+// C: semantic/sem_relacionados.c:284
+proc rel_e0201(s: ^Semantica) {
+    let t: []u8 = (s.fonte as ^common.Fonte).texto
+    let pos: u32 = (s.diag as ^common.Diag).off
+    if (pos > 0) and (sug_byte(t, pos - 1) == 46) { // '.'
+        relacionar_base(s, raiz_da_cadeia_antes(s, pos - 1))
+        return
+    }
+    let nome: i32 = nome_em(s, pular_prefixos(s, pos), none)
+    if nome >= 0 {
+        _ = relacionar_nome(s, nome)
+    }
+}
+
+// C: semantic/sem_relacionados.c:300
+proc pos_do_item_repetido(d: ?^frontend.Decl, nome: i32, off: u32) -> u32 {
+    for k in (0 as u32)..<(d as ^frontend.Decl).nmembros {
+        if (((d as ^frontend.Decl).membros or_else {})[k].nome == nome) and (((d as ^frontend.Decl).membros or_else {})[k].pos != off) {
+            return ((d as ^frontend.Decl).membros or_else {})[k].pos
+        }
+    }
+    for k in (0 as u32)..<(d as ^frontend.Decl).ncampos {
+        if (((d as ^frontend.Decl).campos or_else {})[k].nome == nome) and (((d as ^frontend.Decl).campos or_else {})[k].pos != off) {
+            return ((d as ^frontend.Decl).campos or_else {})[k].pos
+        }
+    }
+    for k in (0 as u32)..<(d as ^frontend.Decl).nparams {
+        if (((d as ^frontend.Decl).params or_else {})[k].nome == nome) and (((d as ^frontend.Decl).params or_else {})[k].pos != off) {
+            return ((d as ^frontend.Decl).params or_else {})[k].pos
+        }
+    }
+    return SEM_POS
+}
+
+// C: semantic/sem_relacionados.c:315
+proc decl_do_alias(s: ^Semantica, nome: i32, off: u32) -> ?^frontend.Decl {
+    var d: ?^frontend.Decl = (s.programa as ^frontend.Programa).primeira
+    while d != none {
+        if (((((d as ^frontend.Decl).tipo_no == (frontend.D_PROC as u8)) and (common.c2f_b2i32((d as ^frontend.Decl).externo) != 0)) and ((d as ^frontend.Decl).simbolo == nome)) and ((d as ^frontend.Decl).pos_simbolo != off)) and ((d as ^frontend.Decl).pos != off) {
+            return d
+        }
+        d = (d as ^frontend.Decl).prox
+    }
+    return none
+}
+
+// C: semantic/sem_relacionados.c:324
+proc import_do_apelido(s: ^Semantica, nome: i32) -> ?^frontend.Decl {
+    if s.modulos == none {
+        return none
+    }
+    var d: ?^frontend.Decl = (s.programa as ^frontend.Programa).primeira
+    while d != none {
+        let dd: ^frontend.Decl = d as ^frontend.Decl
+        if (dd.tipo_no != (frontend.D_IMPORT as u8)) or ((dd.modulo as i32) != (s.modulo_atual as i32)) or (common.fonte_trecho_do_offset(s.fonte, dd.pos) != s.arquivo_atual) {
+            d = dd.prox
+            continue
+        }
+        var apelido: i32 = dd.nome_a
+        if dd.nome_a < 0 {
+            apelido = (s.modulos or_else {})[0].itens[dd.indice].apelido
+        }
+        if apelido == nome {
+            return d
+        }
+        d = dd.prox
+    }
+    return none
+}
+
+// C: semantic/sem_relacionados.c:335
+proc pos_da_primeira_ocorrencia(s: ^Semantica, nome: i32) -> u32 {
+    let off: u32 = (s.diag as ^common.Diag).off
+    var pos: u32 = 0
+    let y: ?^Simbolo = simbolo_de(s, nome)
+    var tern_1: ?^LocalInfo = none
+    if y != none {
+        tern_1 = escopo_buscar(&s.escopo, nome)
+    }
+    let l: ?^LocalInfo = tern_1
+    let contem: ?^frontend.Decl = decl_que_contem(s, off)
+    var outra: ?^frontend.Decl = none
+    if (l != none) and ((l as ^LocalInfo).pos != off) {
+        return (l as ^LocalInfo).pos
+    }
+    var tern_2: u32 = SEM_POS
+    if contem != none {
+        tern_2 = pos_do_item_repetido(contem, nome, off)
+    }
+    pos = tern_2
+    if pos != SEM_POS {
+        return pos
+    }
+    if ((y != none) and ((y as ^Simbolo).decl != none)) and (((y as ^Simbolo).decl as ^frontend.Decl).pos != off) {
+        return ((y as ^Simbolo).decl as ^frontend.Decl).pos
+    }
+    outra = decl_do_alias(s, nome, off)
+    if outra == none {
+        outra = import_do_apelido(s, nome)
+    }
+    var tern_3: u32 = SEM_POS
+    if outra != none {
+        tern_3 = (outra as ^frontend.Decl).pos
+    }
+    return tern_3
+}
+
+// C: semantic/sem_relacionados.c:352
+proc primeira_ocorrencia(s: ^Semantica, nome: i32) -> bool {
+    let pos: u32 = pos_da_primeira_ocorrencia(s, nome)
+    if pos == SEM_POS {
+        return false
+    }
+    let msg_1 = format(f"primeira ocorrencia de '{sem_nome_texto(s, nome)}'", alloc = heap)
+    defer delete(msg_1)
+    adicionar(s, common.DIAG_REL_USO_ANTERIOR, pos, msg_1)
+    return true
+}
+
+// C: semantic/sem_relacionados.c:362
+proc nome_do_erro(s: ^Semantica) -> i32 {
+    let t: []u8 = (s.fonte as ^common.Fonte).texto
+    let pos: u32 = (s.diag as ^common.Diag).off
+    if sug_byte(t, pos) != 34 { // '"'
+        return nome_em(s, pos, none)
+    }
+    // fim = strchr(t + pos + 1, '"'): o proximo '"' antes do NUL
+    var fim: u32 = pos + 1
+    while (sug_byte(t, fim) != 0) and (sug_byte(t, fim) != 34) {
+        fim += 1
+    }
+    if sug_byte(t, fim) == 34 {
+        return rel_achar_nome(s, t[((pos + 1) as int)..<(fim as int)])
+    }
+    return -1
+}
+
+// C: semantic/sem_relacionados.c:373
+proc rel_e0202(s: ^Semantica) {
+    var nomes: [4]i32 = {}
+    var n: u32 = 0
+    let aqui: i32 = nome_do_erro(s)
+    if aqui >= 0 {
+        nomes[n] = aqui
+        n += 1
+    }
+    n += nomes_citados(s, nomes[(n as int)..<4], CITADOS_MAX as u32)
+    for k in (0 as u32)..<n {
+        if primeira_ocorrencia(s, nomes[k]) {
+            return
+        }
+    }
+}
+
+// C: semantic/sem_relacionados.c:389
+proc relacionar_operandos(s: ^Semantica, pos: u32) {
+    _ = relacionar_nome(s, raiz_da_cadeia_antes(s, pos))
+    _ = relacionar_nome(s, nome_depois_do_operador(s, pos))
+}
+
+// C: semantic/sem_relacionados.c:395
+proc rel_do_uso(s: ^Semantica) {
+    let t: []u8 = (s.fonte as ^common.Fonte).texto
+    let pos: u32 = pular_prefixos(s, (s.diag as ^common.Diag).off)
+    let c: u8 = sug_byte(t, pos)
+    let nome: i32 = nome_em(s, pos, none)
+    if nome >= 0 {
+        _ = relacionar_nome(s, nome)
+    } else if (c != 0) and eh_operador_rel(c) {
+        relacionar_operandos(s, pos)
+    }
+    if (s.diag as ^common.Diag).rel.n == 0 {
+        relacionar_citados(s)
+    }
+}
+
+// C: semantic/sem_relacionados.c:409
+proc chamada_ao_redor(s: ^Semantica, pos: u32) -> i32 {
+    let t: []u8 = (s.fonte as ^common.Fonte).texto
+    var fundo: u32 = 0
+    var i: u32 = pos
+    while (i > 0) and ((pos - i) < (ALCANCE_DA_CHAMADA as u32)) {
+        let c: u8 = sug_byte(t, i - 1)
+        if (c == 41) or (c == 125) { // ')' '}'
+            fundo += 1
+        } else if ((c == 40) or (c == 123)) and (fundo > 0) { // '(' '{'
+            fundo -= 1
+        } else if c == 40 { // '('
+            return ultimo_nome_antes(s, i - 1)
+        } else if c == 123 { // '{'
+            return -1
+        }
+        i -= 1
+    }
+    return -1
+}
+
+// C: semantic/sem_relacionados.c:425
+proc relacionar_campo_citado(s: ^Semantica, estrutura: ?^frontend.Decl) {
+    let est: ^frontend.Decl = estrutura as ^frontend.Decl
+    var citados: [3]i32 = {}
+    let n: u32 = nomes_citados(s, citados[..], CITADOS_MAX as u32)
+    for k in (0 as u32)..<n {
+        for c in (0 as u32)..<est.ncampos {
+            if (est.campos or_else {})[c].nome == citados[k] {
+                let msg = format(f"campo '{sem_nome_texto(s, citados[k])}' da struct '{sem_nome_texto(s, est.nome)}'", alloc = heap)
+                defer delete(msg)
+                adicionar(s, common.DIAG_REL_DECLARACAO, (est.campos or_else {})[c].pos, msg)
+                return
+            }
+        }
+    }
+}
+
+// C: semantic/sem_relacionados.c:441
+proc eh_chamada_ou_literal(s: ^Semantica, pos: u32, nome: i32) -> bool {
+    var fim: u32 = 0
+    var c: u8 = 0
+    if nome < 0 {
+        return false
+    }
+    _ = nome_em(s, pos, &fim)
+    c = sug_byte((s.fonte as ^common.Fonte).texto, pular_espacos_2(s, fim))
+    return (c == 40) or (c == 123) // '(' '{'
+}
+
+// C: semantic/sem_relacionados.c:452
+proc rel_da_chamada(s: ^Semantica) {
+    let pos: u32 = (s.diag as ^common.Diag).off
+    let aqui: i32 = nome_em(s, pos, none)
+    var alvo: i32 = 0
+    if eh_chamada_ou_literal(s, pos, aqui) {
+        alvo = aqui
+    } else {
+        alvo = chamada_ao_redor(s, pos)
+    }
+    if not relacionar_nome(s, alvo) {
+        alvo = aqui // new(No) / make(...): o tipo em pos; frame_reset(1): nenhum (embutido sem declaracao)
+        _ = relacionar_nome(s, alvo)
+    }
+    let y: ?^Simbolo = simbolo_de(s, alvo)
+    if ((y != none) and ((y as ^Simbolo).categoria == (SIM_STRUCT as u8))) and ((y as ^Simbolo).decl != none) {
+        relacionar_campo_citado(s, (y as ^Simbolo).decl)
+    }
+}
+
+// C: semantic/sem_relacionados.c:470
+proc nome_do_valor_do_switch(s: ^Semantica, pos: u32) -> i32 {
+    let t: []u8 = (s.fonte as ^common.Fonte).texto
+    var i: u32 = sem_pos_depois_da_palavra(s, pos)
+    var fim: u32 = 0
+    if nome_em(s, i, &fim) < 0 {
+        return -1
+    }
+    fim = pular_espacos_2(s, fim)
+    if ((sug_byte(t, fim) == 105) and (sug_byte(t, fim + 1) == 110)) and (not char_de_nome(sug_byte(t, fim + 2))) { // 'i' 'n'
+        i = pular_espacos_2(s, fim + 2)
+    }
+    return nome_em(s, i, none)
+}
+
+// C: semantic/sem_relacionados.c:481
+proc rel_do_switch(s: ^Semantica) {
+    var citados: [3]i32 = {}
+    let n: u32 = nomes_citados(s, citados[..], CITADOS_MAX as u32)
+    for k in (0 as u32)..<n {
+        let y: ?^Simbolo = simbolo_de(s, citados[k])
+        if ((y != none) and ((y as ^Simbolo).decl != none)) and (((y as ^Simbolo).categoria == (SIM_ENUM as u8)) or ((y as ^Simbolo).categoria == (SIM_UNIAO as u8))) {
+            relacionar_tipo_decl(s, (y as ^Simbolo).decl)
+        }
+    }
+    _ = relacionar_nome(s, nome_do_valor_do_switch(s, (s.diag as ^common.Diag).off))
+}
+
+// C: semantic/sem_relacionados.c:496
+proc import_citado(s: ^Semantica) -> ?^frontend.Decl {
+    let bytes: []u8 = as_bytes((s.diag as ^common.Diag).causa or_else "")
+    // ini = strchr(causa, '"'); fim = strchr(ini + 1, '"')
+    var ini: int = 0
+    while (ini < len(bytes)) and (bytes[ini] != 34) {
+        ini += 1
+    }
+    var fim: int = ini + 1
+    while (fim < len(bytes)) and (bytes[fim] != 34) {
+        fim += 1
+    }
+    var caminho: i32 = -1
+    if (ini < len(bytes)) and (fim < len(bytes)) {
+        caminho = rel_achar_nome(s, bytes[(ini + 1)..<fim])
+    }
+    if caminho < 0 {
+        return none
+    }
+    var d: ?^frontend.Decl = (s.programa as ^frontend.Programa).primeira
+    while d != none {
+        let dd: ^frontend.Decl = d as ^frontend.Decl
+        if (((dd.tipo_no == (frontend.D_IMPORT as u8)) and (dd.nome == caminho)) and ((dd.modulo as i32) == (s.modulo_atual as i32))) and (common.fonte_trecho_do_offset(s.fonte, dd.pos) == s.arquivo_atual) {
+            return d
+        }
+        d = dd.prox
+    }
+    return none
+}
+
+// C: semantic/sem_relacionados.c:509
+proc rel_e1003(s: ^Semantica) {
+    let nome: i32 = nome_em(s, (s.diag as ^common.Diag).off, none)
+    _ = relacionar_simbolo(s, nome)
+    if (s.diag as ^common.Diag).rel.n > 0 {
+        return
+    }
+    let importado: ?^frontend.Decl = import_citado(s)
+    if importado != none {
+        adicionar(s, common.DIAG_REL_DECLARACAO, (importado as ^frontend.Decl).pos, "import do modulo")
+    }
+}
+
+// C: semantic/sem_relacionados.c:522
+proc sem_relacionar(s: ^Semantica) {
+    let sw_1 = common.c2f_s2u_32((s.diag as ^common.Diag).codigo)
+    if sw_1 == (common.E0201 as u32) {
+        rel_e0201(s)
+    } else if sw_1 == (common.E0202 as u32) {
+        rel_e0202(s)
+    } else if sw_1 == (common.E0301 as u32) or sw_1 == (common.E0310 as u32) or sw_1 == (common.E0311 as u32) {
+        rel_do_uso(s)
+    } else if sw_1 == (common.E0502 as u32) or sw_1 == (common.E0503 as u32) or sw_1 == (common.E0504 as u32) {
+        rel_da_chamada(s)
+    } else if sw_1 == (common.E0607 as u32) {
+        rel_do_switch(s)
+    } else if sw_1 == (common.E1003 as u32) {
+        rel_e1003(s)
+    } else {
+        return
+    }
+    if (s.diag as ^common.Diag).rel.n == 0 {
+        relacionar_unidade(s)
+    }
+}
+
+// C: semantic/sem_relacionados.c:536
+proc sem_relacionar_parecidos(s: ^Semantica, busca: ^common.Parecidos) {
+    for k in (0 as u32)..<busca.qtd {
+        let p: ^common.ParecidoNome = &busca.nomes[k]
+        let tem_pos: bool = (p.pos != common.PARECIDO_SEM_POS) and (p.pos != 0) // pos 0: parametro de tipo proc, sem posicao no fonte
+        if tem_pos {
+            let nome: str = p.texto or_else ""
+            let achado = from_bytes(as_bytes(nome)[0..<(p.tam as int)], alloc = heap)
+            defer delete(achado)
+            let ordem: u32 = k + 1
+            let msg = format(f"parecido #{ordem}: '{achado}' (distancia {p.distancia})", alloc = heap)
+            defer delete(msg)
+            adicionar(s, common.DIAG_REL_PARECIDO, p.pos, msg)
+        }
+    }
+}
+
+// G3 S8: nomes no texto da fonte (nome_em e fim), prefixos, cadeia, operador, linha; valores contados a mao.
+test "sem_relacionados: texto da fonte (nome_em, prefixos, cadeia, operador, linha)" {
+    var sv: Semantica = Semantica{}
+    var f: common.Fonte = common.Fonte{}
+    var d: common.Diag = common.Diag{}
+    var ar: common.Arena = common.Arena{}
+    var nomes: common.Interner = common.Interner{}
+    var prog: frontend.Programa = frontend.Programa{}
+    s8_preparar(&sv, &f, &d, &ar, &nomes, &prog, "foo.bar(baz) 9x _y &x", common.E0201)
+    let foo: i32 = common.internar(&nomes, "foo", 3)
+    let bar: i32 = common.internar(&nomes, "bar", 3)
+    let sob: i32 = common.internar(&nomes, "_y", 2)
+    var fim: u32 = 999
+    expect(nome_em(&sv, 0, &fim) == foo and fim == 3)
+    expect(nome_em(&sv, 4, &fim) == bar and fim == 7)
+    fim = 999
+    expect(nome_em(&sv, 3, &fim) == -1 and fim == 999) // '.' nao inicia nome: o fim nao e escrito
+    expect(nome_em(&sv, 13, &fim) == -1 and fim == 999) // digito nao inicia nome
+    expect(nome_em(&sv, 14, &fim) == -1 and fim == 15) // 'x' nunca foi internado: -1, mas o fim sai
+    expect(nome_em(&sv, 16, none) == sob)
+    expect(nome_em(&sv, 21, &fim) == -1 and nome_em(&sv, 200, none) == -1 and fim == 15) // pos >= tam
+    expect(pular_prefixos(&sv, 19) == 20 and pular_prefixos(&sv, 0) == 0)
+    expect(pular_espacos_2(&sv, 12) == 13 and pular_espacos_2(&sv, 0) == 0)
+    expect(eh_espaco_2(32) and eh_espaco_2(9) and not eh_espaco_2(10) and not eh_espaco_2(97))
+    expect(eh_operador_rel(43) and eh_operador_rel(61) and eh_operador_rel(126) and eh_operador_rel(94) and not eh_operador_rel(46) and not eh_operador_rel(97) and not eh_operador_rel(32))
+    s8_liberar(&f, &nomes, &ar)
+    var sv2: Semantica = Semantica{}
+    var f2: common.Fonte = common.Fonte{}
+    var d2: common.Diag = common.Diag{}
+    var ar2: common.Arena = common.Arena{}
+    var nomes2: common.Interner = common.Interner{}
+    s8_preparar(&sv2, &f2, &d2, &ar2, &nomes2, &prog, "x = a.b.c (\n+ .c &d\nab", common.E0201)
+    let na: i32 = common.internar(&nomes2, "a", 1)
+    let nc: i32 = common.internar(&nomes2, "c", 1)
+    let nd: i32 = common.internar(&nomes2, "d", 1)
+    expect(inicio_da_cadeia_antes(&sv2, 10) == 4) // a.b.c termina antes do espaco e do '('
+    expect(raiz_da_cadeia_antes(&sv2, 10) == na and ultimo_nome_antes(&sv2, 10) == nc)
+    expect(raiz_da_cadeia_antes(&sv2, 3) == -1 and raiz_da_cadeia_antes(&sv2, 4) == -1 and ultimo_nome_antes(&sv2, 3) == -1) // sem cadeia
+    expect(nome_depois_do_operador(&sv2, 12) == nc and nome_depois_do_operador(&sv2, 17) == nd) // pula o operador, o '.' e os espacos
+    expect(inicio_da_linha(&sv2, 15) == 12 and inicio_da_linha(&sv2, 5) == 0 and inicio_da_linha(&sv2, 20) == 20 and inicio_da_linha(&sv2, 19) == 12)
+    s8_liberar(&f2, &nomes2, &ar2)
+}
+
+// G3 S8: adicionar (uma linha so, corte da nota, teto de 5), itens, rotulo e relato de tipo, simbolo, local e nome.
+test "sem_relacionados: adicionar, listar itens, tipo, simbolo, local e nome" {
+    var sv: Semantica = Semantica{}
+    var f: common.Fonte = common.Fonte{}
+    var d: common.Diag = common.Diag{}
+    var ar: common.Arena = common.Arena{}
+    var nomes: common.Interner = common.Interner{}
+    var prog: frontend.Programa = frontend.Programa{}
+    s8_preparar(&sv, &f, &d, &ar, &nomes, &prog, "l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nl9\n", common.E0201)
+    adicionar(&sv, common.DIAG_REL_TIPO, 1, "um")
+    adicionar(&sv, common.DIAG_REL_DECLARACAO, 2, "dois") // a mesma linha (inicio 0): ignorado
+    adicionar(&sv, common.DIAG_REL_ASSINATURA, 4, "tres")
+    expect(d.rel.n == 2 and d.rel.itens[0].off == 1 and (d.rel.itens[0].nota or_else "") == "um" and (d.rel.itens[1].nota or_else "") == "tres" and (d.rel.itens[1].papel as i32) == common.DIAG_REL_ASSINATURA)
+    adicionar(&sv, common.DIAG_REL_PARECIDO, 7, "q1")
+    adicionar(&sv, common.DIAG_REL_PARECIDO, 10, "q2")
+    adicionar(&sv, common.DIAG_REL_PARECIDO, 13, "q3")
+    adicionar(&sv, common.DIAG_REL_PARECIDO, 16, "q4") // o 6o: a lista cheia (5) recusa
+    expect(d.rel.n == 5 and (d.rel.itens[4].nota or_else "") == "q3")
+    d = common.Diag{}
+    let longa = common.c2f_pad_dir("x", 120)
+    defer delete(longa)
+    adicionar(&sv, common.DIAG_REL_TIPO, 0, longa)
+    expect(len(d.rel.itens[0].nota or_else "") == 95) // vsnprintf em char nota[96]
+    // itens de struct: 6 nomes de 9 bytes; o 5o fecha o usado em 53 e a 6o cai em "..." cortado a 2 pontos (cap 56 - 53 = 3)
+    let n1: i32 = common.internar(&nomes, "aaaaaaaaa", 9)
+    let n2: i32 = common.internar(&nomes, "bbbbbbbbb", 9)
+    let n3: i32 = common.internar(&nomes, "ccccccccc", 9)
+    let n4: i32 = common.internar(&nomes, "ddddddddd", 9)
+    let n5: i32 = common.internar(&nomes, "eeeeeeeee", 9)
+    let n6: i32 = common.internar(&nomes, "fffffffff", 9)
+    let cor: i32 = common.internar(&nomes, "Cor", 3)
+    let vazio: i32 = common.internar(&nomes, "Vazio", 5)
+    let uniao: i32 = common.internar(&nomes, "U", 1)
+    let enumeracao: i32 = common.internar(&nomes, "E", 1)
+    let longo: i32 = common.internar(&nomes, "um_nome_de_membro_que_passa_dos_quarenta_bytes_de_tamanho", 56)
+    var gl = make([dynamic]Simbolo, alloc = heap)
+    defer delete(gl)
+    s8_tabelas(&sv, &gl, &nomes)
+    sv.globais = gl[0..<len(gl)]
+    defer delete(sv.tipos.itens)
+    sv.tipos.itens[7] = TipoInfo{classe = TC_STRUCT as u8, a = cor as u32}
+    var cs = make([dynamic]frontend.Campo, alloc = heap)
+    defer delete(cs)
+    for k in 0..<6 {
+        append(&cs, item = frontend.Campo{})
+    }
+    cs[0].nome = n1
+    cs[1].nome = n2
+    cs[2].nome = n3
+    cs[3].nome = n4
+    cs[4].nome = n5
+    cs[5].nome = n6
+    var seis: frontend.Decl = frontend.Decl{}
+    seis.tipo_no = frontend.D_STRUCT as u8
+    seis.nome = cor
+    seis.campos = cs[..]
+    seis.ncampos = 6
+    let lista6 = listar_itens(&sv, &seis)
+    defer delete(lista6)
+    expect(lista6 == "aaaaaaaaa, bbbbbbbbb, ccccccccc, ddddddddd, eeeeeeeee..")
+    seis.ncampos = 5
+    let lista5 = listar_itens(&sv, &seis)
+    defer delete(lista5)
+    expect(lista5 == "aaaaaaaaa, bbbbbbbbb, ccccccccc, ddddddddd, eeeeeeeee") // cabe inteiro (56 nao e maior que 56)
+    seis.ncampos = 3
+    let lista3 = listar_itens(&sv, &seis)
+    defer delete(lista3)
+    expect(lista3 == "aaaaaaaaa, bbbbbbbbb, ccccccccc")
+    seis.ncampos = 0
+    let lista0 = listar_itens(&sv, &seis)
+    defer delete(lista0)
+    expect(lista0 == "")
+    // enum: nomes dos membros; nome com mais de 39 bytes e cortado em 39
+    var ms = make([dynamic]frontend.Membro, alloc = heap)
+    defer delete(ms)
+    append(&ms, item = frontend.Membro{nome = n1})
+    append(&ms, item = frontend.Membro{nome = longo})
+    var en: frontend.Decl = frontend.Decl{}
+    en.tipo_no = frontend.D_ENUM as u8
+    en.nome = enumeracao
+    en.membros = ms[..]
+    en.nmembros = 2
+    let item_longo = nome_do_item(&sv, &en, 1)
+    defer delete(item_longo)
+    expect(len(item_longo) == 39 and item_longo == "um_nome_de_membro_que_passa_dos_quarent")
+    // union: o texto do tipo de cada variante
+    var us = make([dynamic]frontend.Campo, alloc = heap)
+    defer delete(us)
+    append(&us, item = frontend.Campo{})
+    us[0].tipo.tipo = 7
+    var un: frontend.Decl = frontend.Decl{}
+    un.tipo_no = frontend.D_UNIAO as u8
+    un.nome = uniao
+    un.campos = us[..]
+    un.ncampos = 1
+    let item_uniao = nome_do_item(&sv, &un, 0)
+    defer delete(item_uniao)
+    expect(item_uniao == "Cor")
+    expect(rotulo_do_tipo(&seis) == "struct" and rotulo_do_tipo(&en) == "enum" and rotulo_do_tipo(&un) == "union")
+    var proc_decl: frontend.Decl = frontend.Decl{}
+    proc_decl.tipo_no = frontend.D_PROC as u8
+    expect(rotulo_do_tipo(&proc_decl) == "unidade")
+    // relacionar_tipo_decl: "struct 'Cor': a, b", com " (sem pub)" de outro modulo; sem itens nao leva ": "
+    d = common.Diag{}
+    seis.ncampos = 2
+    seis.pos = 3
+    relacionar_tipo_decl(&sv, &seis)
+    expect(d.rel.n == 1 and (d.rel.itens[0].papel as i32) == common.DIAG_REL_TIPO and d.rel.itens[0].off == 3 and (d.rel.itens[0].nota or_else "") == "struct 'Cor': aaaaaaaaa, bbbbbbbbb")
+    d = common.Diag{}
+    seis.modulo = 1
+    relacionar_tipo_decl(&sv, &seis)
+    expect((d.rel.itens[0].nota or_else "") == "struct 'Cor': aaaaaaaaa, bbbbbbbbb (sem pub)")
+    d = common.Diag{}
+    seis.publico = true
+    relacionar_tipo_decl(&sv, &seis)
+    expect((d.rel.itens[0].nota or_else "") == "struct 'Cor': aaaaaaaaa, bbbbbbbbb")
+    d = common.Diag{}
+    var sv_vazio: frontend.Decl = frontend.Decl{}
+    sv_vazio.tipo_no = frontend.D_STRUCT as u8
+    sv_vazio.nome = vazio
+    sv_vazio.pos = 6
+    relacionar_tipo_decl(&sv, &sv_vazio)
+    expect((d.rel.itens[0].nota or_else "") == "struct 'Vazio'")
+    // relacionar_simbolo: proc, struct, const, embutido (sem decl) e categoria sem relato
+    var dproc: frontend.Decl = frontend.Decl{}
+    dproc.pos = 9
+    var dconst: frontend.Decl = frontend.Decl{}
+    dconst.pos = 12
+    seis.pos = 15
+    gl[n1] = Simbolo{categoria = SIM_PROC as u8, decl = &dproc}
+    gl[n2] = Simbolo{categoria = SIM_CONST as u8, decl = &dconst}
+    gl[cor] = Simbolo{categoria = SIM_STRUCT as u8, decl = &seis}
+    gl[n3] = Simbolo{categoria = SIM_PROC_EMBUTIDO as u8}
+    gl[n4] = Simbolo{categoria = SIM_NENHUM as u8, decl = &dproc}
+    d = common.Diag{}
+    expect(relacionar_simbolo(&sv, n1) and relacionar_simbolo(&sv, n2) and relacionar_simbolo(&sv, cor))
+    expect(not relacionar_simbolo(&sv, n3) and not relacionar_simbolo(&sv, n4) and not relacionar_simbolo(&sv, -1) and not relacionar_simbolo(&sv, 9999))
+    expect(d.rel.n == 3 and (d.rel.itens[0].nota or_else "") == "assinatura do proc 'aaaaaaaaa'" and (d.rel.itens[0].papel as i32) == common.DIAG_REL_ASSINATURA)
+    expect((d.rel.itens[1].nota or_else "") == "constante 'bbbbbbbbb'" and (d.rel.itens[1].papel as i32) == common.DIAG_REL_DECLARACAO and (d.rel.itens[2].papel as i32) == common.DIAG_REL_TIPO)
+    // de outro modulo e sem pub: " (sem pub)" no proc e na const
+    d = common.Diag{}
+    dproc.modulo = 1
+    dproc.pos = 3
+    expect(relacionar_simbolo(&sv, n1))
+    expect((d.rel.itens[0].nota or_else "") == "assinatura do proc 'aaaaaaaaa' (sem pub)")
+    // relacionar_local e relacionar_nome (o local tem prioridade sobre o global do mesmo nome)
+    d = common.Diag{}
+    escopo_iniciar(&sv.escopo, &ar, sv.qtd_nomes)
+    defer delete(sv.escopo.pilha)
+    var l1: LocalInfo = LocalInfo{nome = n2, tipo = 7, natureza = LOC_PARAM as u8, pos = 3}
+    escopo_empurrar(&sv.escopo, &l1)
+    expect(relacionar_nome(&sv, n2))
+    expect(d.rel.n == 1 and (d.rel.itens[0].nota or_else "") == "parametro 'bbbbbbbbb' declarado aqui como Cor" and (d.rel.itens[0].papel as i32) == common.DIAG_REL_DECLARACAO and d.rel.itens[0].off == 3)
+    d = common.Diag{}
+    sv.escopo.pilha[0].natureza = LOC_LET as u8
+    sv.escopo.pilha[0].pos = 6
+    expect(relacionar_nome(&sv, n2) and (d.rel.itens[0].nota or_else "") == "local 'bbbbbbbbb' declarado aqui como Cor")
+    expect(not relacionar_nome(&sv, -1) and not relacionar_nome(&sv, n5)) // n5: sem local nem decl global
+    s8_liberar(&f, &nomes, &ar)
+}
+
+// G3 S8: E0201 (campo), E0202 (nome repetido) e E0503 (chamada) de ponta a ponta; oraculo = forja.exe real em r1.fj, r2.fj e r4.fj (notas, papeis e ordem dos relacionados).
+test "sem_relacionados: relacionados de E0201, E0202 e E0503 (oraculo forja check)" {
+    var sv: Semantica = Semantica{}
+    var f: common.Fonte = common.Fonte{}
+    var d: common.Diag = common.Diag{}
+    var ar: common.Arena = common.Arena{}
+    var nomes: common.Interner = common.Interner{}
+    var prog: frontend.Programa = frontend.Programa{}
+    s8_preparar(&sv, &f, &d, &ar, &nomes, &prog, "struct Cor {\n    r: i32\n    g: i32\n}\nproc main() {\n    let c = Cor{r = 1, g = 2}\n    print(c.b)\n}\n", common.E0201)
+    let cor: i32 = common.internar(&nomes, "Cor", 3)
+    let nr: i32 = common.internar(&nomes, "r", 1)
+    let ng: i32 = common.internar(&nomes, "g", 1)
+    let nb: i32 = common.internar(&nomes, "b", 1)
+    let nc: i32 = common.internar(&nomes, "c", 1)
+    var gl = make([dynamic]Simbolo, alloc = heap)
+    defer delete(gl)
+    s8_tabelas(&sv, &gl, &nomes)
+    defer delete(sv.tipos.itens)
+    sv.tipos.itens[7] = TipoInfo{classe = TC_STRUCT as u8, a = cor as u32}
+    var cs = make([dynamic]frontend.Campo, alloc = heap)
+    defer delete(cs)
+    append(&cs, item = frontend.Campo{nome = nr, pos = 17})
+    append(&cs, item = frontend.Campo{nome = ng, pos = 28})
+    var dcor: frontend.Decl = frontend.Decl{}
+    dcor.tipo_no = frontend.D_STRUCT as u8
+    dcor.nome = cor
+    dcor.pos = 7
+    dcor.campos = cs[..]
+    dcor.ncampos = 2
+    gl[cor] = Simbolo{categoria = SIM_STRUCT as u8, decl = &dcor}
+    sv.globais = gl[0..<len(gl)]
+    escopo_iniciar(&sv.escopo, &ar, sv.qtd_nomes)
+    defer delete(sv.escopo.pilha)
+    var local: LocalInfo = LocalInfo{nome = nc, tipo = 7, natureza = LOC_LET as u8, pos = 59}
+    escopo_empurrar(&sv.escopo, &local)
+    var sp: SemParecido = SemParecido{}
+    sem_parecido_iniciar(&sv, common.E0201, 93, nb, &sp)
+    sem_parecidos_de_campos(&sv, &dcor, &sp)
+    expect(not sem_erro_parecido(&sv, &sp, "a struct 'Cor' nao tem o campo 'b'"))
+    expect((d.causa or_else "") == "a struct 'Cor' nao tem o campo 'b' (parecido: 'g', 'r')" and d.sug.n == 0)
+    expect(d.rel.n == 4)
+    expect((d.rel.itens[0].papel as i32) == common.DIAG_REL_PARECIDO and d.rel.itens[0].off == 28 and (d.rel.itens[0].nota or_else "") == "parecido #1: 'g' (distancia 1)")
+    expect((d.rel.itens[1].papel as i32) == common.DIAG_REL_PARECIDO and d.rel.itens[1].off == 17 and (d.rel.itens[1].nota or_else "") == "parecido #2: 'r' (distancia 1)")
+    expect((d.rel.itens[2].papel as i32) == common.DIAG_REL_DECLARACAO and d.rel.itens[2].off == 59 and (d.rel.itens[2].nota or_else "") == "local 'c' declarado aqui como Cor")
+    expect((d.rel.itens[3].papel as i32) == common.DIAG_REL_TIPO and d.rel.itens[3].off == 7 and (d.rel.itens[3].nota or_else "") == "struct 'Cor': r, g")
+    s8_liberar(&f, &nomes, &ar)
+    // E0202: o 2o `let a` repete o nome; a 1a ocorrencia e o local do escopo
+    var sv2: Semantica = Semantica{}
+    var f2: common.Fonte = common.Fonte{}
+    var d2: common.Diag = common.Diag{}
+    var ar2: common.Arena = common.Arena{}
+    var nomes2: common.Interner = common.Interner{}
+    s8_preparar(&sv2, &f2, &d2, &ar2, &nomes2, &prog, "proc main() {\n    let a = 1\n    let a = 2\n    print(a)\n}\n", common.E0202)
+    let na: i32 = common.internar(&nomes2, "a", 1)
+    var gl2 = make([dynamic]Simbolo, alloc = heap)
+    defer delete(gl2)
+    s8_tabelas(&sv2, &gl2, &nomes2)
+    defer delete(sv2.tipos.itens)
+    sv2.globais = gl2[0..<len(gl2)]
+    escopo_iniciar(&sv2.escopo, &ar2, sv2.qtd_nomes)
+    defer delete(sv2.escopo.pilha)
+    var la: LocalInfo = LocalInfo{nome = na, tipo = 4, natureza = LOC_LET as u8, pos = 22}
+    escopo_empurrar(&sv2.escopo, &la)
+    expect(not sem_erro(&sv2, common.E0202, 36, "o nome 'a' ja foi declarado neste proc; a Forja nao tem sombra"))
+    expect(d2.rel.n == 1 and (d2.rel.itens[0].papel as i32) == common.DIAG_REL_USO_ANTERIOR and d2.rel.itens[0].off == 22 and (d2.rel.itens[0].nota or_else "") == "primeira ocorrencia de 'a'")
+    s8_liberar(&f2, &nomes2, &ar2)
+    // E0503: soma(1) com a assinatura do proc soma
+    var sv3: Semantica = Semantica{}
+    var f3: common.Fonte = common.Fonte{}
+    var d3: common.Diag = common.Diag{}
+    var ar3: common.Arena = common.Arena{}
+    var nomes3: common.Interner = common.Interner{}
+    s8_preparar(&sv3, &f3, &d3, &ar3, &nomes3, &prog, "proc soma(a: i32, b: i32) -> i32 {\n    return a + b\n}\nproc main() {\n    print(soma(1))\n}\n", common.E0503)
+    let soma: i32 = common.internar(&nomes3, "soma", 4)
+    var gl3 = make([dynamic]Simbolo, alloc = heap)
+    defer delete(gl3)
+    s8_tabelas(&sv3, &gl3, &nomes3)
+    defer delete(sv3.tipos.itens)
+    var dsoma: frontend.Decl = frontend.Decl{}
+    dsoma.pos = 5
+    gl3[soma] = Simbolo{categoria = SIM_PROC as u8, decl = &dsoma}
+    sv3.globais = gl3[0..<len(gl3)]
+    escopo_iniciar(&sv3.escopo, &ar3, sv3.qtd_nomes)
+    defer delete(sv3.escopo.pilha)
+    expect(not sem_erro(&sv3, common.E0503, 78, "falta o argumento 'b'"))
+    expect(d3.rel.n == 1 and (d3.rel.itens[0].papel as i32) == common.DIAG_REL_ASSINATURA and d3.rel.itens[0].off == 5 and (d3.rel.itens[0].nota or_else "") == "assinatura do proc 'soma'")
+    s8_liberar(&f3, &nomes3, &ar3)
+}
+
+// G3 S8: declaracao que contem o erro, nomes citados na causa, E0607 de ponta a ponta e chamada ao redor.
+test "sem_relacionados: unidade, citados, switch e chamada" {
+    var sv: Semantica = Semantica{}
+    var f: common.Fonte = common.Fonte{}
+    var d: common.Diag = common.Diag{}
+    var ar: common.Arena = common.Arena{}
+    var nomes: common.Interner = common.Interner{}
+    var prog: frontend.Programa = frontend.Programa{}
+    s8_preparar(&sv, &f, &d, &ar, &nomes, &prog, "enum Cor {\n    verde\n    azul\n}\nproc main() {\n    let c = Cor.verde\n    switch c {\n    }\n}\n", common.E0607)
+    let cor: i32 = common.internar(&nomes, "Cor", 3)
+    let verde: i32 = common.internar(&nomes, "verde", 5)
+    let azul: i32 = common.internar(&nomes, "azul", 4)
+    let nc: i32 = common.internar(&nomes, "c", 1)
+    var gl = make([dynamic]Simbolo, alloc = heap)
+    defer delete(gl)
+    s8_tabelas(&sv, &gl, &nomes)
+    defer delete(sv.tipos.itens)
+    sv.tipos.itens[7] = TipoInfo{classe = TC_ENUM as u8, a = cor as u32}
+    var ms = make([dynamic]frontend.Membro, alloc = heap)
+    defer delete(ms)
+    append(&ms, item = frontend.Membro{nome = verde, pos = 15})
+    append(&ms, item = frontend.Membro{nome = azul, pos = 25})
+    var denum: frontend.Decl = frontend.Decl{}
+    denum.tipo_no = frontend.D_ENUM as u8
+    denum.nome = cor
+    denum.pos = 5
+    denum.pos_fim = 31
+    denum.membros = ms[..]
+    denum.nmembros = 2
+    var dimport: frontend.Decl = frontend.Decl{}
+    dimport.tipo_no = frontend.D_IMPORT as u8
+    var dproc: frontend.Decl = frontend.Decl{}
+    dproc.tipo_no = frontend.D_PROC as u8
+    dproc.pos = 46
+    dproc.pos_fim = 90
+    var dconst: frontend.Decl = frontend.Decl{}
+    dconst.tipo_no = frontend.D_CONST as u8
+    dconst.pos = 100
+    denum.prox = &dproc
+    dimport.prox = &denum
+    dproc.prox = &dconst
+    prog.primeira = &dimport
+    gl[cor] = Simbolo{categoria = SIM_ENUM as u8, decl = &denum}
+    sv.globais = gl[0..<len(gl)]
+    escopo_iniciar(&sv.escopo, &ar, sv.qtd_nomes)
+    defer delete(sv.escopo.pilha)
+    // decl_que_contem: o import e pulado; dentro do enum e do proc; depois do fim do proc vale a mais proxima antes; antes de tudo, nenhuma; a const nao tem fim
+    expect((decl_que_contem(&sv, 20) as ^frontend.Decl).tipo_no == (frontend.D_ENUM as u8) and (decl_que_contem(&sv, 50) as ^frontend.Decl).tipo_no == (frontend.D_PROC as u8))
+    expect((decl_que_contem(&sv, 95) as ^frontend.Decl).tipo_no == (frontend.D_PROC as u8)) // 90 <= 95: fora do proc, a mais proxima antes e o proc (pos 46) e nao a const (pos 100)
+    expect((decl_que_contem(&sv, 100) as ^frontend.Decl).tipo_no == (frontend.D_CONST as u8) and (decl_que_contem(&sv, 150) as ^frontend.Decl).tipo_no == (frontend.D_CONST as u8))
+    expect(decl_que_contem(&sv, 2) == none)
+    // relacionar_unidade: o proc ou a declaracao de topo que contem o erro
+    d.off = 50
+    relacionar_unidade(&sv)
+    expect(d.rel.n == 1 and (d.rel.itens[0].papel as i32) == common.DIAG_REL_ASSINATURA and d.rel.itens[0].off == 46 and (d.rel.itens[0].nota or_else "") == "proc que contem o erro")
+    d = common.Diag{}
+    d.off = 20
+    relacionar_unidade(&sv)
+    expect(d.rel.n == 1 and (d.rel.itens[0].papel as i32) == common.DIAG_REL_DECLARACAO and d.rel.itens[0].off == 5 and (d.rel.itens[0].nota or_else "") == "declaracao que contem o erro")
+    d = common.Diag{}
+    d.off = 2
+    relacionar_unidade(&sv)
+    expect(d.rel.n == 0)
+    // nomes_citados: so os internados, ate max; aspas vazias e sem fechar
+    var citados: [3]i32 = {}
+    d.causa = "o 'Cor' e 'azul', nao 'zz' e 'Cor'"
+    expect(nomes_citados(&sv, citados[..], 3) == 3 and citados[0] == cor and citados[1] == azul and citados[2] == cor)
+    expect(nomes_citados(&sv, citados[..], 2) == 2)
+    d.causa = "a '' b 'azul'"
+    expect(nomes_citados(&sv, citados[..], 3) == 1 and citados[0] == azul)
+    d.causa = "x 'abc"
+    expect(nomes_citados(&sv, citados[..], 3) == 0)
+    d.causa = "sem aspas"
+    expect(nomes_citados(&sv, citados[..], 3) == 0)
+    // E0607 de ponta a ponta: o tipo citado (enum com os membros) e o valor do switch (o local c)
+    d = common.Diag{}
+    d.tem = true
+    var local: LocalInfo = LocalInfo{nome = nc, tipo = 7, natureza = LOC_LET as u8, pos = 54}
+    escopo_empurrar(&sv.escopo, &local)
+    expect(not sem_erro(&sv, common.E0607, 72, "o switch nao cobre 'azul' de 'Cor'"))
+    expect(d.rel.n == 2 and (d.rel.itens[0].papel as i32) == common.DIAG_REL_TIPO and d.rel.itens[0].off == 5 and (d.rel.itens[0].nota or_else "") == "enum 'Cor': verde, azul")
+    expect((d.rel.itens[1].papel as i32) == common.DIAG_REL_DECLARACAO and d.rel.itens[1].off == 54 and (d.rel.itens[1].nota or_else "") == "local 'c' declarado aqui como Cor")
+    expect(nome_do_valor_do_switch(&sv, 72) == nc)
+    // E0301/E0310/E0311 (rel_do_uso): sem nome no ponto, cai nos nomes citados
+    d = common.Diag{}
+    d.tem = true
+    d.causa = "tipo 'Cor' diferente"
+    d.off = 69 // espaco do recuo: nao e nome nem operador
+    d.codigo = common.E0301
+    rel_do_uso(&sv)
+    expect(d.rel.n == 1 and (d.rel.itens[0].nota or_else "") == "enum 'Cor': verde, azul")
+    s8_liberar(&f, &nomes, &ar)
+    // chamada ao redor: f(a.soma(1, g(2))) com { } fechando e abrindo bloco
+    var sv2: Semantica = Semantica{}
+    var f2: common.Fonte = common.Fonte{}
+    var d2: common.Diag = common.Diag{}
+    var ar2: common.Arena = common.Arena{}
+    var nomes2: common.Interner = common.Interner{}
+    s8_preparar(&sv2, &f2, &d2, &ar2, &nomes2, &prog, "f(a.soma(1, g(2)))", common.E0502)
+    let soma: i32 = common.internar(&nomes2, "soma", 4)
+    let ng: i32 = common.internar(&nomes2, "g", 1)
+    expect(chamada_ao_redor(&sv2, 14) == ng and chamada_ao_redor(&sv2, 11) == soma and chamada_ao_redor(&sv2, 16) == soma)
+    expect(chamada_ao_redor(&sv2, 0) == -1)
+    s8_liberar(&f2, &nomes2, &ar2)
+    var sv3: Semantica = Semantica{}
+    var f3: common.Fonte = common.Fonte{}
+    var d3: common.Diag = common.Diag{}
+    var ar3: common.Arena = common.Arena{}
+    var nomes3: common.Interner = common.Interner{}
+    s8_preparar(&sv3, &f3, &d3, &ar3, &nomes3, &prog, "a { b } c", common.E0502)
+    expect(chamada_ao_redor(&sv3, 8) == -1) // a chave fechada e reaberta do lado de dentro: acaba o texto sem achar '('
+    expect(chamada_ao_redor(&sv3, 3) == -1) // abre um bloco e nao uma chamada
+    s8_liberar(&f3, &nomes3, &ar3)
+    // switch r in valor {
+    var sv4: Semantica = Semantica{}
+    var f4: common.Fonte = common.Fonte{}
+    var d4: common.Diag = common.Diag{}
+    var ar4: common.Arena = common.Arena{}
+    var nomes4: common.Interner = common.Interner{}
+    s8_preparar(&sv4, &f4, &d4, &ar4, &nomes4, &prog, "switch r in valor {\nswitch x {\nswitch\n", common.E0607)
+    let nvalor: i32 = common.internar(&nomes4, "valor", 5)
+    let nx: i32 = common.internar(&nomes4, "x", 1)
+    let nr: i32 = common.internar(&nomes4, "r", 1)
+    expect(nome_do_valor_do_switch(&sv4, 0) == nvalor) // pula o 'r in'
+    expect(nome_do_valor_do_switch(&sv4, 20) == nx and nome_do_valor_do_switch(&sv4, 31) == -1) // sem nome depois da palavra
+    expect(nr >= 0)
+    s8_liberar(&f4, &nomes4, &ar4)
+}
+
+// G3 S8: nome do erro, item repetido, alias de foreign, imports (apelido e citado), chamada ou literal, campo citado, E1003.
+test "sem_relacionados: repetidos, alias, imports, chamada ou literal, campo citado e E1003" {
+    var sv: Semantica = Semantica{}
+    var f: common.Fonte = common.Fonte{}
+    var d: common.Diag = common.Diag{}
+    var ar: common.Arena = common.Arena{}
+    var nomes: common.Interner = common.Interner{}
+    var prog: frontend.Programa = frontend.Programa{}
+    s8_preparar(&sv, &f, &d, &ar, &nomes, &prog, "ab \"labs\" cd \"\nfoo (x) Bar{ baz\nabrir x\n", common.E1003)
+    let nab: i32 = common.internar(&nomes, "ab", 2)
+    let labs: i32 = common.internar(&nomes, "labs", 4)
+    let foo: i32 = common.internar(&nomes, "foo", 3)
+    let bar: i32 = common.internar(&nomes, "Bar", 3)
+    let baz: i32 = common.internar(&nomes, "baz", 3)
+    let abrir: i32 = common.internar(&nomes, "abrir", 5)
+    let geo: i32 = common.internar(&nomes, "geo", 3)
+    let apelido: i32 = common.internar(&nomes, "gg", 2)
+    let caminho: i32 = common.internar(&nomes, "mods/geo", 8)
+    let nx: i32 = common.internar(&nomes, "x", 1)
+    let outro: i32 = common.internar(&nomes, "outro", 5)
+    var gl = make([dynamic]Simbolo, alloc = heap)
+    defer delete(gl)
+    s8_tabelas(&sv, &gl, &nomes)
+    defer delete(sv.tipos.itens)
+    sv.globais = gl[0..<len(gl)]
+    // nome do erro: o identificador, o texto entre aspas (alias de foreign) ou -1 se a aspa nao fecha
+    d.off = 3
+    expect(nome_do_erro(&sv) == labs)
+    d.off = 13
+    expect(nome_do_erro(&sv) == -1)
+    d.off = 0
+    expect(nome_do_erro(&sv) == nab)
+    // nome seguido de '(' ou '{' (chamada ou literal de struct); com -1 nao
+    expect(eh_chamada_ou_literal(&sv, 15, foo) and eh_chamada_ou_literal(&sv, 23, bar) and not eh_chamada_ou_literal(&sv, 28, baz) and not eh_chamada_ou_literal(&sv, 15, -1))
+    // item repetido: membros, depois campos, depois params; o offset do proprio erro nao conta
+    var ms = make([dynamic]frontend.Membro, alloc = heap)
+    defer delete(ms)
+    append(&ms, item = frontend.Membro{nome = nx, pos = 5})
+    append(&ms, item = frontend.Membro{nome = foo, pos = 6})
+    var cs = make([dynamic]frontend.Campo, alloc = heap)
+    defer delete(cs)
+    append(&cs, item = frontend.Campo{nome = nx, pos = 10})
+    append(&cs, item = frontend.Campo{nome = baz, pos = 12})
+    var ps = make([dynamic]frontend.Param, alloc = heap)
+    defer delete(ps)
+    append(&ps, item = frontend.Param{nome = outro, pos = 20})
+    var dd: frontend.Decl = frontend.Decl{}
+    dd.membros = ms[..]
+    dd.nmembros = 2
+    dd.campos = cs[..]
+    dd.ncampos = 2
+    dd.params = ps[..]
+    dd.nparams = 1
+    expect(pos_do_item_repetido(&dd, nx, 5) == 10 and pos_do_item_repetido(&dd, nx, 10) == 5 and pos_do_item_repetido(&dd, nx, 99) == 5)
+    expect(pos_do_item_repetido(&dd, baz, 12) == SEM_POS and pos_do_item_repetido(&dd, baz, 1) == 12)
+    expect(pos_do_item_repetido(&dd, outro, 20) == SEM_POS and pos_do_item_repetido(&dd, outro, 1) == 20 and pos_do_item_repetido(&dd, abrir, 1) == SEM_POS)
+    // alias de foreign: D_PROC externo cujo simbolo C e o nome, em outro offset que nao o do erro
+    var dalias: frontend.Decl = frontend.Decl{}
+    dalias.tipo_no = frontend.D_PROC as u8
+    dalias.externo = true
+    dalias.simbolo = labs
+    dalias.pos_simbolo = 30
+    dalias.pos = 25
+    var dimp: frontend.Decl = frontend.Decl{}
+    dimp.tipo_no = frontend.D_IMPORT as u8
+    dimp.nome = caminho
+    dimp.nome_a = -1
+    dimp.indice = 1
+    dimp.pos = 3
+    var dimp2: frontend.Decl = frontend.Decl{}
+    dimp2.tipo_no = frontend.D_IMPORT as u8
+    dimp2.nome = outro
+    dimp2.nome_a = apelido
+    dimp2.pos = 40
+    dalias.prox = &dimp
+    dimp.prox = &dimp2
+    prog.primeira = &dalias
+    expect(decl_do_alias(&sv, labs, 99) != none and decl_do_alias(&sv, labs, 30) == none and decl_do_alias(&sv, labs, 25) == none and decl_do_alias(&sv, foo, 99) == none)
+    dalias.externo = false
+    expect(decl_do_alias(&sv, labs, 99) == none)
+    // import do apelido: o escrito (nome_a) ou o do modulo (Modulos.itens[indice].apelido); sem Modulos, nenhum
+    var mods: frontend.Modulos = frontend.Modulos{}
+    mods.itens[1].apelido = geo
+    sv.modulos = slice_from(&mods, len = 1)
+    sv.arquivo_atual = 0
+    expect((import_do_apelido(&sv, geo) as ^frontend.Decl).pos == 3 and (import_do_apelido(&sv, apelido) as ^frontend.Decl).pos == 40 and import_do_apelido(&sv, foo) == none)
+    dimp.modulo = 1 // import de outro modulo: nao e deste arquivo
+    expect(import_do_apelido(&sv, geo) == none)
+    dimp.modulo = 0
+    sv.modulos = none
+    expect(import_do_apelido(&sv, geo) == none)
+    sv.modulos = slice_from(&mods, len = 1)
+    // import citado entre aspas na causa
+    d.causa = "o nome e de \"mods/geo\" (importe)"
+    expect((import_citado(&sv) as ^frontend.Decl).pos == 3)
+    d.causa = "o nome e de \"outro/modulo\""
+    expect(import_citado(&sv) == none)
+    d.causa = "sem aspas"
+    expect(import_citado(&sv) == none)
+    d.causa = "so abre \"mods/geo"
+    expect(import_citado(&sv) == none)
+    // E1003: sem declaracao do nome, o import citado na causa; com a declaracao (proc), a assinatura
+    d = common.Diag{}
+    d.tem = true
+    expect(not sem_erro(&sv, common.E1003, 53, "o nome 'abrir' e do modulo \"mods/geo\": importe-o"))
+    expect(d.rel.n == 1 and (d.rel.itens[0].papel as i32) == common.DIAG_REL_DECLARACAO and d.rel.itens[0].off == 3 and (d.rel.itens[0].nota or_else "") == "import do modulo")
+    d = common.Diag{}
+    d.tem = true
+    var dproc: frontend.Decl = frontend.Decl{}
+    dproc.pos = 53
+    dproc.modulo = 1
+    gl[abrir] = Simbolo{categoria = SIM_PROC as u8, decl = &dproc}
+    sv.modulo_atual = 0
+    expect(not sem_erro(&sv, common.E1003, 32, "o nome 'abrir' e do modulo \"mods/geo\": importe-o"))
+    expect(d.rel.n == 1 and (d.rel.itens[0].papel as i32) == common.DIAG_REL_ASSINATURA and (d.rel.itens[0].nota or_else "") == "assinatura do proc 'abrir' (sem pub)")
+    s8_liberar(&f, &nomes, &ar)
+    // literal de struct: o tipo e o campo citado (Cor{r = 1} com 'g' sem valor zero)
+    var sv2: Semantica = Semantica{}
+    var f2: common.Fonte = common.Fonte{}
+    var d2: common.Diag = common.Diag{}
+    var ar2: common.Arena = common.Arena{}
+    var nomes2: common.Interner = common.Interner{}
+    s8_preparar(&sv2, &f2, &d2, &ar2, &nomes2, &prog, "struct Cor {\n    r: i32\n    g: Dono\n}\nlet c = Cor{r = 1}\n", common.E0504)
+    let cor: i32 = common.internar(&nomes2, "Cor", 3)
+    let nr: i32 = common.internar(&nomes2, "r", 1)
+    let ng: i32 = common.internar(&nomes2, "g", 1)
+    var gl2 = make([dynamic]Simbolo, alloc = heap)
+    defer delete(gl2)
+    s8_tabelas(&sv2, &gl2, &nomes2)
+    defer delete(sv2.tipos.itens)
+    var cs2 = make([dynamic]frontend.Campo, alloc = heap)
+    defer delete(cs2)
+    append(&cs2, item = frontend.Campo{nome = nr, pos = 17})
+    append(&cs2, item = frontend.Campo{nome = ng, pos = 28})
+    var dcor: frontend.Decl = frontend.Decl{}
+    dcor.tipo_no = frontend.D_STRUCT as u8
+    dcor.nome = cor
+    dcor.pos = 7
+    dcor.campos = cs2[..]
+    dcor.ncampos = 2
+    gl2[cor] = Simbolo{categoria = SIM_STRUCT as u8, decl = &dcor}
+    sv2.globais = gl2[0..<len(gl2)]
+    escopo_iniciar(&sv2.escopo, &ar2, sv2.qtd_nomes)
+    defer delete(sv2.escopo.pilha)
+    d2.causa = "o campo 'x' e depois 'g' sem valor zero"
+    relacionar_campo_citado(&sv2, &dcor)
+    expect(d2.rel.n == 1 and (d2.rel.itens[0].papel as i32) == common.DIAG_REL_DECLARACAO and d2.rel.itens[0].off == 28 and (d2.rel.itens[0].nota or_else "") == "campo 'g' da struct 'Cor'")
+    d2 = common.Diag{}
+    d2.tem = true
+    expect(not sem_erro(&sv2, common.E0504, 46, "o campo 'g' nao tem valor zero"))
+    expect(d2.rel.n == 2 and (d2.rel.itens[0].papel as i32) == common.DIAG_REL_TIPO and d2.rel.itens[0].off == 7 and (d2.rel.itens[0].nota or_else "") == "struct 'Cor': r, g")
+    expect((d2.rel.itens[1].papel as i32) == common.DIAG_REL_DECLARACAO and d2.rel.itens[1].off == 28 and (d2.rel.itens[1].nota or_else "") == "campo 'g' da struct 'Cor'")
+    s8_liberar(&f2, &nomes2, &ar2)
+}

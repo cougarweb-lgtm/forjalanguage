@@ -1,0 +1,230 @@
+// Exemplo do vendor:linebreak (libunibreak 8.0.1, tabelas Unicode 17.0.0): quebra de linha (UAX #14) e de grafema (UAX #29).
+// Versao: 0.1.0
+//
+// Sem argumento: roda os casos embutidos e imprime uma linha por caso (linebreak_basico.esperado).
+// Com argumento (caminho do arquivo de casos gerado por exemplos_libs\oraculos\linebreak.py, a partir de LineBreakTest e GraphemeBreakTest 17.0.0):
+//     confere todos os casos oficiais e imprime "line ok N/N" e "grapheme ok N/N"; cada divergencia sai numa linha antes.
+//     Com um 3o argumento ("-strict") a lib usa o modo estrito de CJ: e assim que o LineBreakTest oficial e gerado (19338/19338).
+//     Sem ele, a regra padrao da lib diverge do oficial em CJ (kana pequena: ID em vez de NS; ver doc/architecture.md 4.6 da lib).
+//
+// Letras da saida, UMA POR BYTE do texto: linha M = must_break, A = allow_break, N = no_break, I = inside_char;
+//   grafema B = boundary, N = inside_grapheme, I = inside_char.
+//
+// VERIFICAR: forja run --backend x64 language\exemplos_libs\linebreak_basico.fj
+//            forja run --backend x64 language\exemplos_libs\linebreak_basico.fj -- <casos.txt> -strict   (oficial, pelo oraculo)
+
+import "vendor:linebreak/linebreak"
+import "std:base64" as base64
+import "std:file" as file
+import "std:os" as os
+import "std:text" as text
+
+const LETRA_LINHA_MUST: u8 = 77
+const LETRA_LINHA_ALLOW: u8 = 65
+const LETRA_NO_BREAK: u8 = 78
+const LETRA_INSIDE_CHAR: u8 = 73
+const LETRA_GRAFEMA_BOUNDARY: u8 = 66
+const LETRA_ERRO: u8 = 63
+
+// Letra de um tipo de quebra de linha.
+proc letra_linha(k: linebreak.BreakKind) -> u8 {
+    var letra = LETRA_ERRO
+    switch k {
+    case linebreak.BreakKind.must_break:
+        letra = LETRA_LINHA_MUST
+    case linebreak.BreakKind.allow_break:
+        letra = LETRA_LINHA_ALLOW
+    case linebreak.BreakKind.no_break:
+        letra = LETRA_NO_BREAK
+    case linebreak.BreakKind.inside_char:
+        letra = LETRA_INSIDE_CHAR
+    }
+    return letra
+}
+
+// Letra de um tipo de quebra de grafema.
+proc letra_grafema(k: linebreak.GraphemeKind) -> u8 {
+    var letra = LETRA_ERRO
+    switch k {
+    case linebreak.GraphemeKind.boundary:
+        letra = LETRA_GRAFEMA_BOUNDARY
+    case linebreak.GraphemeKind.inside_grapheme:
+        letra = LETRA_NO_BREAK
+    case linebreak.GraphemeKind.inside_char:
+        letra = LETRA_INSIDE_CHAR
+    }
+    return letra
+}
+
+// Letra do byte `index` de uma lista de quebras de linha; indice ou valor invalido sai LETRA_ERRO.
+proc letra_da_linha(quebras: []u8, index: int) -> u8 {
+    switch k in linebreak.break_at(quebras, index) {
+    case linebreak.BreakKind:
+        return letra_linha(k)
+    case linebreak.LinebreakError:
+        return LETRA_ERRO
+    }
+    return LETRA_ERRO
+}
+
+// Letra do byte `index` de uma lista de quebras de grafema.
+proc letra_do_grafema(quebras: []u8, index: int) -> u8 {
+    switch k in linebreak.grapheme_at(quebras, index) {
+    case linebreak.GraphemeKind:
+        return letra_grafema(k)
+    case linebreak.LinebreakError:
+        return LETRA_ERRO
+    }
+    return LETRA_ERRO
+}
+
+// Linha de letras de um texto (uma letra por byte); o chamador faz delete. `lingua` vai a lib ("" = padrao, "-strict" = CJ estrito).
+proc letras_de_linha(texto: str, lingua: str) -> str {
+    var quebras = linebreak.line_breaks_utf8(texto, lingua, alloc = heap)
+    defer delete(quebras)
+    var letras = make([dynamic]u8, alloc = heap, cap = len(quebras))
+    defer delete(letras)
+    for i in 0..<len(quebras) {
+        append(&letras, item = letra_da_linha(quebras[..], i))
+    }
+    return to_str(&letras)
+}
+
+// Linha de letras de um texto para grafemas (uma letra por byte); o chamador faz delete.
+proc letras_de_grafema(texto: str) -> str {
+    var quebras = linebreak.grapheme_breaks_utf8(texto, lang = "", alloc = heap)
+    defer delete(quebras)
+    var letras = make([dynamic]u8, alloc = heap, cap = len(quebras))
+    defer delete(letras)
+    for i in 0..<len(quebras) {
+        append(&letras, item = letra_do_grafema(quebras[..], i))
+    }
+    return to_str(&letras)
+}
+
+// Imprime os tipos de quebra de linha de um caso embutido.
+proc caso_linha(rotulo: str, texto: str) {
+    let letras = letras_de_linha(texto, "")
+    defer delete(letras)
+    print(f"{rotulo}: {letras}")
+}
+
+// Imprime os tipos de quebra de grafema de um caso embutido.
+proc caso_grafema(rotulo: str, texto: str) {
+    let letras = letras_de_grafema(texto)
+    defer delete(letras)
+    print(f"{rotulo}: {letras}")
+}
+
+// Confere um caso oficial de quebra de linha: hex = UTF-8 do texto, esperado = letras do oraculo.
+proc confere_linha(hex: str, esperado: str, lingua: str) -> bool {
+    switch bytes in base64.hex_decode(hex, alloc = heap) {
+    case [dynamic]u8:
+        defer delete(bytes)
+        let texto = from_bytes(bytes[..], alloc = heap)
+        defer delete(texto)
+        let obtido = letras_de_linha(texto, lingua)
+        defer delete(obtido)
+        if obtido == esperado {
+            return true
+        }
+        print(f"divergencia linha {hex}: esperado {esperado} obtido {obtido}")
+        return false
+    case base64.CodecError:
+        panic("hex invalido no arquivo de casos")
+    }
+    return false
+}
+
+// Confere um caso oficial de quebra de grafema.
+proc confere_grafema(hex: str, esperado: str) -> bool {
+    switch bytes in base64.hex_decode(hex, alloc = heap) {
+    case [dynamic]u8:
+        defer delete(bytes)
+        let texto = from_bytes(bytes[..], alloc = heap)
+        defer delete(texto)
+        let obtido = letras_de_grafema(texto)
+        defer delete(obtido)
+        if obtido == esperado {
+            return true
+        }
+        print(f"divergencia grafema {hex}: esperado {esperado} obtido {obtido}")
+        return false
+    case base64.CodecError:
+        panic("hex invalido no arquivo de casos")
+    }
+    return false
+}
+
+// Confere cada linha "L <hex> <letras>" ou "G <hex> <letras>" do arquivo de casos e imprime os acertos.
+proc confere_texto(texto: str, lingua: str) {
+    var linhas = text.split_lines(texto, alloc = heap)
+    defer delete(linhas)
+    var total_linha: int = 0
+    var ok_linha: int = 0
+    var total_grafema: int = 0
+    var ok_grafema: int = 0
+    for caso in linhas {
+        if len(caso) == 0 {
+            continue
+        }
+        var campos = text.split(caso, " ", alloc = heap)
+        defer delete(campos)
+        if len(campos) != 3 {
+            panic("linha mal formada no arquivo de casos")
+        }
+        if campos[0] == "L" {
+            total_linha += 1
+            if confere_linha(campos[1], campos[2], lingua) {
+                ok_linha += 1
+            }
+        } else {
+            total_grafema += 1
+            if confere_grafema(campos[1], campos[2]) {
+                ok_grafema += 1
+            }
+        }
+    }
+    print(f"line ok {ok_linha}/{total_linha}")
+    print(f"grapheme ok {ok_grafema}/{total_grafema}")
+}
+
+// Le o arquivo de casos e confere tudo.
+proc confere_arquivo(caminho: str, lingua: str) {
+    switch bruto in file.read_all(caminho, alloc = heap) {
+    case [dynamic]u8:
+        defer delete(bruto)
+        let texto = from_bytes(bruto[..], alloc = heap)
+        defer delete(texto)
+        confere_texto(texto, lingua)
+    case file.FileError:
+        panic("arquivo de casos nao abriu")
+    }
+}
+
+proc main() {
+    let argumentos = os.args()
+    if len(argumentos) > 1 {
+        // Sem 3o argumento a lib usa a regra padrao (CJ resolvido como na 'normal'); "-strict" e o modo que casa com o LineBreakTest oficial.
+        var lingua = ""
+        if len(argumentos) > 2 {
+            lingua = argumentos[2]
+        }
+        confere_arquivo(argumentos[1], lingua)
+        return
+    }
+    linebreak.init()
+    let versao = linebreak.unicode_version()
+    print(f"unicode {versao}")
+    // Casos de quebra de linha: espacos, tab, LF (quebra obrigatoria), aspas, CJK e pontuacao.
+    caso_linha("L1", "  \"")
+    caso_linha("L2", "\n \"")
+    caso_linha("L3", "\t \t")
+    caso_linha("L4", "\n \n")
+    caso_linha("L5", "一.一.")
+    caso_linha("L6", "\t )")
+    caso_linha("L7", "   ")
+    // Casos de quebra de grafema: duas quebras de LF e LF seguido de espaco.
+    caso_grafema("G1", "\n\n")
+    caso_grafema("G2", "\n ")
+}

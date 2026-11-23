@@ -1,0 +1,266 @@
+// backend/emit_h.fj - porte de compiler/backend/emit_h.c, compiler/backend/emit_h.h
+// sha256 de backend/emit_h.c: 02b5b52cf133958e7afe60ae7cdd206ff84cf3d39a34539dc810fdd4bd79efb9
+// sha256 de backend/emit_h.h: 20cfb6a4633684676911ccc18a6307122c5c428ec5dee570ac410507608a1313
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "common"
+import "ir"
+import "semantic"
+
+struct CtxH {
+    prog: ?^ir.IrPrograma
+    tipos: ?^semantic.Tipos
+    nomes: ?^common.Interner
+    saida: ?^[dynamic]u8
+    uso: []u8 // C2F-INDECIDIVEL
+}
+
+const USO_PONTEIRO: i32 = 1
+const USO_VALOR: i32 = 2
+const USO_EMITIDA: i32 = 4
+const EMIT_H_VERSAO: str = "0.12.0"
+
+// C: backend/emit_h.c:18
+proc tipo_da_abi(classe: i32) -> ?str {
+    let sw_1 = common.c2f_s2u_32(classe)
+    if sw_1 == (semantic.TC_VAZIO as u32) {
+        return "void"
+    } else if sw_1 == (semantic.TC_BOOL as u32) {
+        return "bool"
+    } else if sw_1 == (semantic.TC_I32 as u32) or sw_1 == (semantic.TC_ENUM as u32) {
+        return "int32_t"
+    } else if sw_1 == (semantic.TC_INT as u32) {
+        return "int64_t"
+    } else if sw_1 == (semantic.TC_REAL as u32) {
+        return "float"
+    } else if sw_1 == (semantic.TC_I8 as u32) {
+        return "int8_t"
+    } else if sw_1 == (semantic.TC_I16 as u32) {
+        return "int16_t"
+    } else if sw_1 == (semantic.TC_U8 as u32) {
+        return "uint8_t"
+    } else if sw_1 == (semantic.TC_U16 as u32) {
+        return "uint16_t"
+    } else if sw_1 == (semantic.TC_U32 as u32) {
+        return "uint32_t"
+    } else if sw_1 == (semantic.TC_UINT as u32) {
+        return "uint64_t"
+    } else if sw_1 == (semantic.TC_F64 as u32) {
+        return "double"
+    } else if sw_1 == (semantic.TC_RAWPTR as u32) {
+        return "void *"
+    } else if sw_1 == (semantic.TC_CSTR as u32) {
+        return "const char *"
+    } else {
+        return none
+    }
+    return none
+}
+
+// C: backend/emit_h.c:40
+proc anexar_tipo_abi(tipos: ^semantic.Tipos, nomes: ^common.Interner, saida: ^[dynamic]u8, tipo: u32) {
+    let info = semantic.tipo_de(tipos, tipo)
+    let classe: u32 = common.c2f_s2u_32(semantic.tipo_classe_de(tipos, tipo))
+    let simples: ?str = tipo_da_abi(semantic.tipo_classe_de(tipos, tipo))
+    if simples != none {
+        append(saida, item = simples or_else "")
+        return
+    }
+    if common.c2f_b2i32(semantic.tipo_opcional_nicho(tipos, tipo)) != 0 {
+        append(saida, item = "const char *")
+        return
+    }
+    if classe == (semantic.TC_STRUCT as u32) {
+        append(saida, item = "struct fj_")
+        append(saida, item = common.interner_texto(nomes, info.a as i32))
+        return
+    }
+    if classe != (semantic.TC_PONTEIRO as u32) and classe != (semantic.TC_ANULAVEL as u32) {
+        let msg_1 = format(f"emit_h: tipo {tipo} de classe {classe} nao atravessa a ABI C (a semantica devia ter recusado, E0901)", alloc = heap)
+        defer delete(msg_1)
+        common.falha_interna(msg_1)
+    }
+    anexar_tipo_abi(tipos, nomes, saida, info.a as u32)
+    append(saida, item = " *")
+}
+
+// C: backend/emit_h.c:65
+proc achar_struct(h: ^CtxH, tipo: u32) -> u32 {
+    let nome: i32 = transmute(semantic.tipo_de(h.tipos as ^semantic.Tipos, tipo).a, to = i32)
+    for k in (0 as u32)..<(h.prog as ^ir.IrPrograma).nstructs {
+        if ((h.prog as ^ir.IrPrograma).structs or_else {})[k].nome == nome {
+            return k
+        }
+    }
+    let msg_1 = format(f"emit_h: struct '{common.interner_texto(h.nomes as ^common.Interner, nome)}' nao esta no IR", alloc = heap)
+    defer delete(msg_1)
+    common.falha_interna(msg_1)
+    return 0
+}
+
+// C: backend/emit_h.c:77
+proc marcar_uso_struct(h: ^CtxH, tipo: u32, atras_de_ponteiro: bool) {
+    let tipos: ^semantic.Tipos = h.tipos as ^semantic.Tipos
+    let classe: u32 = common.c2f_s2u_32(semantic.tipo_classe_de(tipos, tipo))
+    if classe == (semantic.TC_PONTEIRO as u32) or classe == (semantic.TC_ANULAVEL as u32) {
+        marcar_uso_struct(h, semantic.tipo_de(tipos, tipo).a as u32, true)
+        return
+    }
+    if classe != (semantic.TC_STRUCT as u32) {
+        return
+    }
+    let k: u32 = achar_struct(h, tipo)
+    if atras_de_ponteiro {
+        h.uso[k as u64] = h.uso[k as u64] | (USO_PONTEIRO as u8)
+        return
+    }
+    if (h.uso[k as u64] & (USO_VALOR as u8)) != 0 {
+        return
+    }
+    h.uso[k as u64] = h.uso[k as u64] | (USO_VALOR as u8)
+    let prog: ^ir.IrPrograma = h.prog as ^ir.IrPrograma
+    let st: ^ir.IrStruct = &(prog.structs or_else {})[k as u64]
+    var c: u32 = 0
+    while c < st.ncampos {
+        marcar_uso_struct(h, (st.campos or_else {})[c as u64].tipo, false)
+        c += 1
+    }
+}
+
+// C: backend/emit_h.c:100
+proc emitir_definicao_h(h: ^CtxH, k: u32) {
+    if (h.uso[k as u64] & (USO_EMITIDA as u8)) != 0 {
+        return
+    }
+    h.uso[k as u64] = h.uso[k as u64] | (USO_EMITIDA as u8)
+    let tipos: ^semantic.Tipos = h.tipos as ^semantic.Tipos
+    let nomes: ^common.Interner = h.nomes as ^common.Interner
+    let saida: ^[dynamic]u8 = h.saida as ^[dynamic]u8
+    let prog: ^ir.IrPrograma = h.prog as ^ir.IrPrograma
+    let st: ^ir.IrStruct = &(prog.structs or_else {})[k as u64]
+    var c: u32 = 0
+    while c < st.ncampos {
+        let campo_tipo: u32 = (st.campos or_else {})[c as u64].tipo
+        if common.c2f_s2u_32(semantic.tipo_classe_de(tipos, campo_tipo)) == (semantic.TC_STRUCT as u32) {
+            emitir_definicao_h(h, achar_struct(h, campo_tipo))
+        }
+        c += 1
+    }
+    let nome_struct: str = common.interner_texto(nomes, st.nome)
+    format(f"struct fj_{nome_struct} {{ ", into = saida)
+    if st.ncampos == 0 {
+        append(saida, item = "char vazio_; ")
+    }
+    var d: u32 = 0
+    while d < st.ncampos {
+        let campo: ^ir.IrCampo = &(st.campos or_else {})[d as u64]
+        anexar_tipo_abi(tipos, nomes, saida, campo.tipo)
+        let nome_campo: str = common.interner_texto(nomes, campo.nome)
+        format(f" f_{nome_campo}; ", into = saida)
+        d += 1
+    }
+    append(saida, item = "};\n")
+}
+
+// C: backend/emit_h.c:124
+proc declarar_structs(h: ^CtxH) {
+    let prog: ^ir.IrPrograma = h.prog as ^ir.IrPrograma
+    let saida: ^[dynamic]u8 = h.saida as ^[dynamic]u8
+    let nomes: ^common.Interner = h.nomes as ^common.Interner
+    var f: u32 = 0
+    while f < prog.nfuncoes {
+        let fn_c: ^ir.IrFuncao = &(prog.funcoes or_else {})[f as u64]
+        if fn_c.exportado {
+            marcar_uso_struct(h, fn_c.retorno, false)
+            var p: u32 = 0
+            while p < fn_c.nparams {
+                marcar_uso_struct(h, (fn_c.params or_else {})[p as u64].tipo, false)
+                p += 1
+            }
+        }
+        f += 1
+    }
+    var k: u32 = 0
+    while k < prog.nstructs {
+        if h.uso[k as u64] == (USO_PONTEIRO as u8) {
+            let nome_struct: str = common.interner_texto(nomes, (prog.structs or_else {})[k as u64].nome)
+            format(f"struct fj_{nome_struct};\n", into = saida)
+        }
+        k += 1
+    }
+    k = 0
+    while k < prog.nstructs {
+        if (h.uso[k as u64] & (USO_VALOR as u8)) != 0 {
+            emitir_definicao_h(h, k)
+        }
+        k += 1
+    }
+}
+
+// C: backend/emit_h.c:144
+pub proc contar_exportados(prog: ^ir.IrPrograma) -> u32 {
+    var n: u32 = 0
+    for k in (0 as u32)..<prog.nfuncoes {
+        if (prog.funcoes or_else {})[k].exportado {
+            n += 1
+        }
+    }
+    return n
+}
+
+// C: backend/emit_h.c:155
+proc exporta_cstr(prog: ^ir.IrPrograma, tipos: ^semantic.Tipos) -> bool {
+    var k: u32 = 0
+    while k < prog.nfuncoes {
+        let f: ^ir.IrFuncao = &(prog.funcoes or_else {})[k]
+        if (common.c2f_b2i32(f.exportado) != 0) and ((common.c2f_s2u_32(semantic.tipo_classe_de(tipos, f.retorno)) == (semantic.TC_CSTR as u32)) or (common.c2f_b2i32(semantic.tipo_opcional_nicho(tipos, f.retorno)) != 0)) {
+            return true
+        }
+        k += 1
+    }
+    return false
+}
+
+// C: backend/emit_h.c:165
+pub proc emitir_cabecalho(prog: ^ir.IrPrograma, tipos: ^semantic.Tipos, nomes: ^common.Interner, saida: ^[dynamic]u8) {
+    format(f"/* Gerado pela Forja (emit_c {EMIT_H_VERSAO}). Prototipos dos 'pub export proc'. */\n", into = saida)
+    // uso das structs: uma posicao por struct mais uma de folga (o calloc do C)
+    var uso: [dynamic]u8 = make([dynamic]u8, alloc = heap)
+    defer delete(uso)
+    var z: u32 = 0
+    while z <= prog.nstructs {
+        append(&uso, item = 0 as u8)
+        z += 1
+    }
+    var h: CtxH = CtxH{prog = prog, tipos = tipos, nomes = nomes, saida = saida, uso = uso[..]}
+    declarar_structs(&h)
+    var k: u32 = 0
+    while k < prog.nfuncoes {
+        let f: ^ir.IrFuncao = &(prog.funcoes or_else {})[k as u64]
+        if f.exportado {
+            anexar_tipo_abi(tipos, nomes, saida, f.retorno)
+            append(saida, item = " ")
+            let nome_f: str = common.interner_texto(nomes, f.nome)
+            append(saida, item = nome_f)
+            append(saida, item = "(")
+            if f.nparams == 0 {
+                append(saida, item = "void")
+            }
+            var p: u32 = 0
+            while p < f.nparams {
+                if p > 0 {
+                    append(saida, item = ", ")
+                }
+                anexar_tipo_abi(tipos, nomes, saida, (f.params or_else {})[p as u64].tipo)
+                format(f" a{p}", into = saida)
+                p += 1
+            }
+            append(saida, item = ");\n")
+        }
+        k += 1
+    }
+    if exporta_cstr(prog, tipos) {
+        append(saida, item = "void forja_liberar(const char *p);\n")
+    }
+}

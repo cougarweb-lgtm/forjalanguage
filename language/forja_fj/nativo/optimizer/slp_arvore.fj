@@ -1,0 +1,493 @@
+// nativo/optimizer/slp_arvore.fj - porte de compiler/nativo/optimizer/slp_arvore.c
+// sha256 de nativo/optimizer/slp_arvore.c: d26930e48d45ffae0b97fce5ed39a52a7ea383e02eb570d4effb3a81372df207
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "common"
+import "nativo/bir"
+
+struct Folha2 {
+    tipo: u8
+    estavel: bool
+    pos: u32
+    vreg: u32
+    valor: bir.BirOperando
+}
+
+struct Faixa {
+    op: bir.BirOperando
+    upos: u32
+}
+
+const LF_CONST: i32 = 0
+const LF_EXT: i32 = 1
+const LF_CARGA: i32 = 2
+const LF_OP: i32 = 3
+
+// C: nativo/optimizer/slp_arvore.c:30
+proc contar_operando(c: ^SlpCtx, o: ^bir.BirOperando) {
+    let nleit: []u32 = c.nleit
+    if (o.tipo == (bir.BO_VREG as u8)) and (o.id < (c.f as ^bir.BirFuncao).nvregs) {
+        nleit[o.id] += 1
+    }
+}
+
+// C: nativo/optimizer/slp_arvore.c:36
+// Conta sobre as tabelas ja zeradas por slp_tabelas (slp.fj): o calloc do C vira zerar a visao antes de chegar aqui.
+proc slp_contar(c: ^SlpCtx) {
+    let f: ^bir.BirFuncao = c.f as ^bir.BirFuncao
+    let nd: []u32 = c.ndefs or_else {}
+    var b: u32 = 0
+    while b < f.nblocos {
+        var k: u32 = 0
+        while k < f.blocos[b].n {
+            let i: ^bir.BirInstr = &f.blocos[b].instrs[k]
+            if (i.dst != bir.BIR_SEM_VREG) and (i.dst < f.nvregs) {
+                nd[i.dst] += 1
+                c.def_b[i.dst] = b
+                c.def_k[i.dst] = k
+            }
+            contar_operando(c, &i.a)
+            contar_operando(c, &i.b)
+            var a: u32 = 0
+            while a < i.nargs {
+                contar_operando(c, &(i.args or_else {})[a])
+                a += 1
+            }
+            k += 1
+        }
+        b += 1
+    }
+}
+
+// C: nativo/optimizer/slp_arvore.c:64
+// As tabelas sao visoes sobre o dono de slp_funcao: liberar aqui so desfaz as visoes (o dono e deletado la).
+proc slp_liberar(c: ^SlpCtx) {
+    c.ndefs = none
+    c.nleit = c.nleit[0..<0]
+    c.def_b = c.def_b[0..<0]
+    c.def_k = c.def_k[0..<0]
+}
+
+// C: nativo/optimizer/slp_arvore.c:72
+proc slp_def_no_bloco(c: ^SlpCtx, antes: u32, vreg: u32) -> u32 {
+    let b: ^bir.BirBloco = &(c.f as ^bir.BirFuncao).blocos[c.bloco]
+    var k: u32 = antes
+    while k > 0 {
+        if b.instrs[k - 1].dst == vreg {
+            return k - 1
+        }
+        k -= 1
+    }
+    return SLP_SEM
+}
+
+// C: nativo/optimizer/slp_arvore.c:85
+proc passo_do_endereco(c: ^SlpCtx, x: u32, pos: u32, origem: ^u32, soma: ^i32) -> bool {
+    let f: ^bir.BirFuncao = c.f as ^bir.BirFuncao
+    let nd: []u32 = c.ndefs or_else {}
+    if (x >= f.nvregs) or (nd[x] != 1) or ((c.def_b[x] == c.bloco) and (c.def_k[x] >= pos)) {
+        return false
+    }
+    let d: ^bir.BirInstr = &f.blocos[c.def_b[x]].instrs[c.def_k[x]]
+    if (d.classe != (bir.BC_I64 as u8)) or (d.a.tipo != (bir.BO_VREG as u8)) {
+        return false
+    }
+    if d.op == (bir.BIR_COPIA as u8) {
+        origem^ = d.a.id
+        soma^ = 0
+        return true
+    }
+    if (d.op != (bir.BIR_ADD as u8)) or (d.b.tipo != (bir.BO_IMED as u8)) or (d.b.imed < -65536) or (d.b.imed > 65536) {
+        return false
+    }
+    origem^ = d.a.id
+    soma^ = common.c2f_trunc_i32(common.c2f_s2u_64(d.b.imed))
+    return true
+}
+
+// C: nativo/optimizer/slp_arvore.c:108
+// LIMITE: cognitiva acima de 15 (o C tambem: 19). Laco de ate 8 passos com tres formas de parada; partir criaria helper de uso unico.
+proc slp_chave_base(c: ^SlpCtx, vreg: u32, pos: u32) -> SlpChave {
+    let f: ^bir.BirFuncao = c.f as ^bir.BirFuncao
+    let nd: []u32 = c.ndefs or_else {}
+    var off: i32 = 0
+    var v: u32 = vreg
+    var p_v: u32 = pos
+    var volta: u32 = 0
+    while volta < 8 {
+        var origem: u32 = 0
+        var soma: i32 = 0
+        if (v < f.nvregs) and (nd[v] == 1) {
+            let d: ^bir.BirInstr = &f.blocos[c.def_b[v]].instrs[c.def_k[v]]
+            if (d.op == (bir.BIR_END_SLOT as u8)) and (d.a.tipo == (bir.BO_IMED as u8)) {
+                return SlpChave{tipo = SB_SLOT as u8, id = d.a.imed as u32, def = 0, off = off}
+            }
+            if (d.op == (bir.BIR_END_SIMBOLO as u8)) and (d.a.tipo == (bir.BO_SIMBOLO as u8)) {
+                return SlpChave{tipo = SB_SIMBOLO as u8, id = d.a.id, def = 0, off = off}
+            }
+        }
+        if not passo_do_endereco(c, v, p_v, &origem, &soma) {
+            break
+        }
+        if (c.def_b[v] != c.bloco) and (origem < f.nvregs) and (nd[origem] > 1) {
+            break
+        }
+        if c.def_b[v] == c.bloco {
+            p_v = c.def_k[v]
+        }
+        off += soma
+        v = origem
+        volta += 1
+    }
+    return SlpChave{tipo = SB_VREG as u8, id = v, def = slp_def_no_bloco(c, p_v, v), off = off}
+}
+
+// C: nativo/optimizer/slp_arvore.c:135
+proc slp_mesma_chave(x: ^SlpChave, y: ^SlpChave) -> bool {
+    return (((x.tipo as i32) == (y.tipo as i32)) and (x.id == y.id)) and ((x.tipo != (SB_VREG as u8)) or (x.def == y.def))
+}
+
+// C: nativo/optimizer/slp_arvore.c:140
+proc slp_slot_escalarizavel(c: ^SlpCtx, chave: ^SlpChave) -> bool {
+    return ((chave.tipo == (SB_SLOT as u8)) and (chave.id < (c.f as ^bir.BirFuncao).nslots)) and ((c.f as ^bir.BirFuncao).slots[chave.id].tam <= SLP_SLOT_PEQUENO_BYTES)
+}
+
+// C: nativo/optimizer/slp_arvore.c:146
+proc estavel_2(c: ^SlpCtx, v: u32) -> bool {
+    let f: ^bir.BirFuncao = c.f as ^bir.BirFuncao
+    let nd: []u32 = c.ndefs or_else {}
+    if v >= f.nvregs {
+        return false
+    }
+    return ((v < f.nparams) and (nd[v] == 0)) or ((nd[v] == 1) and (c.def_b[v] != c.bloco))
+}
+
+// C: nativo/optimizer/slp_arvore.c:154
+proc canonico(c: ^SlpCtx, v: u32) -> u32 {
+    let f: ^bir.BirFuncao = c.f as ^bir.BirFuncao
+    let nd: []u32 = c.ndefs or_else {}
+    var w: u32 = v
+    var volta: u32 = 0
+    while (volta < 8) and estavel_2(c, w) and (nd[w] == 1) {
+        let d: ^bir.BirInstr = &f.blocos[c.def_b[w]].instrs[c.def_k[w]]
+        if (d.op != (bir.BIR_COPIA as u8)) or (d.a.tipo != (bir.BO_VREG as u8)) or (d.a.classe != d.classe) or (not estavel_2(c, d.a.id)) {
+            break
+        }
+        w = d.a.id
+        volta += 1
+    }
+    return w
+}
+
+// C: nativo/optimizer/slp_arvore.c:168
+proc falhar(pl: ^SlpPlano, motivo: str) -> bool {
+    if pl.motivo == none {
+        pl.motivo = motivo
+    }
+    return false
+}
+
+// C: nativo/optimizer/slp_arvore.c:175
+proc adicionar_pendente(pl: ^SlpPlano, vreg: u32, def: u32) -> bool {
+    for k in (0 as u32)..<pl.npend {
+        if (pl.pend[k].vreg == vreg) and (pl.pend[k].def == def) {
+            return true
+        }
+    }
+    if pl.npend == SLP_PEND_MAX {
+        return falhar(pl, "grande")
+    }
+    let antes_1: u32 = pl.npend
+    pl.npend += 1
+    pl.pend[antes_1] = SlpPendente{vreg = vreg, def = def}
+    return true
+}
+
+// C: nativo/optimizer/slp_arvore.c:187
+proc registrar_2(pl: ^SlpPlano, pos: u32, vreg: u32) -> bool {
+    var k: u32 = 0
+    while k < pl.nsomem {
+        if pl.somem[k] == pos {
+            return falhar(pl, "valor_lido_duas_vezes")
+        }
+        k += 1
+    }
+    if (pl.nsomem == SLP_SOMEM_MAX) or (pl.nlidos == SLP_SOMEM_MAX) {
+        return falhar(pl, "grande")
+    }
+    let antes_1: u32 = pl.nsomem
+    pl.nsomem += 1
+    pl.somem[antes_1] = pos
+    let antes_2: u32 = pl.nlidos
+    pl.nlidos += 1
+    pl.lidos[antes_2] = vreg
+    return true
+}
+
+// C: nativo/optimizer/slp_arvore.c:200
+proc novo_no(pl: ^SlpPlano, no: SlpNo) -> u32 {
+    if pl.nno == SLP_NOS_MAX {
+        _ = falhar(pl, "grande")
+        return SLP_SEM
+    }
+    pl.no[pl.nno] = no
+    let antes_1: u32 = pl.nno
+    pl.nno += 1
+    return antes_1
+}
+
+// C: nativo/optimizer/slp_arvore.c:213
+proc instrucao_da_arvore(i: ^bir.BirInstr, classe: u8) -> bool {
+    if ((((i.classe as i32) != (classe as i32)) or (i.nargs != 0)) or (i.a.tam != 0)) or (i.b.tam != 0) {
+        return false
+    }
+    let sw_1 = i.op as i32
+    if sw_1 == bir.BIR_COPIA {
+        return (i.a.tipo == (bir.BO_VREG as u8)) or (i.a.tipo == (bir.BO_IMED as u8))
+    } else if sw_1 == bir.BIR_CONST {
+        return i.a.tipo == (bir.BO_IMED as u8)
+    } else if sw_1 == bir.BIR_CARREGA or sw_1 == bir.BIR_ADD or sw_1 == bir.BIR_SUB or sw_1 == bir.BIR_MUL or sw_1 == bir.BIR_DIV {
+        return true
+    } else {
+        return false
+    }
+    return false
+}
+
+// C: nativo/optimizer/slp_arvore.c:227
+proc folha_externa(c: ^SlpCtx, pl: ^SlpPlano, vreg: u32, def: u32, fo: ^Folha2) -> bool {
+    var tern_1: u32 = vreg
+    if def == SLP_SEM {
+        tern_1 = canonico(c, vreg)
+    }
+    let canonico: u32 = tern_1
+    if (def == SLP_SEM) and (common.c2f_b2i32(estavel_2(c, canonico)) != 0) {
+        fo^ = Folha2{tipo = LF_EXT as u8, estavel = true, pos = SLP_SEM, vreg = canonico}
+        return true
+    }
+    fo^ = Folha2{tipo = LF_EXT as u8, pos = def, vreg = vreg}
+    return adicionar_pendente(pl, vreg, def)
+}
+
+// C: nativo/optimizer/slp_arvore.c:242
+proc resolver_lane(c: ^SlpCtx, pl: ^SlpPlano, o: bir.BirOperando, upos: u32, fo: ^Folha2) -> bool {
+    var o_v: bir.BirOperando = o
+    var upos_v: u32 = upos
+    for _volta in (0 as u32)..<16 {
+        var i: ?^bir.BirInstr = none
+        var d: u32 = 0
+        if (o_v.tipo == (bir.BO_IMED as u8)) and ((o_v.classe as i32) == (pl.classe as i32)) {
+            fo^ = Folha2{tipo = LF_CONST as u8, valor = o_v}
+            return true
+        }
+        if (o_v.tipo != (bir.BO_VREG as u8)) or ((o_v.classe as i32) != (pl.classe as i32)) {
+            return falhar(pl, "operando")
+        }
+        d = slp_def_no_bloco(c, upos_v, o_v.id)
+        if d == SLP_SEM {
+            return folha_externa(c, pl, o_v.id, SLP_SEM, fo)
+        }
+        i = &(c.f as ^bir.BirFuncao).blocos[c.bloco].instrs[d]
+        if not instrucao_da_arvore(i as ^bir.BirInstr, pl.classe) {
+            return folha_externa(c, pl, o_v.id, d, fo)
+        }
+        if not registrar_2(pl, d, o_v.id) {
+            return false
+        }
+        if (i as ^bir.BirInstr).op == (bir.BIR_COPIA as u8) {
+            o_v = (i as ^bir.BirInstr).a
+            upos_v = d
+            continue
+        }
+        if (i as ^bir.BirInstr).op == (bir.BIR_CONST as u8) {
+            fo^ = Folha2{tipo = LF_CONST as u8, valor = (i as ^bir.BirInstr).a}
+        } else {
+            var tern_1: i32 = LF_OP
+            if (i as ^bir.BirInstr).op == (bir.BIR_CARREGA as u8) {
+                tern_1 = LF_CARGA
+            }
+            fo^ = Folha2{tipo = tern_1 as u8, pos = d}
+        }
+        return true
+    }
+    return falhar(pl, "copias")
+}
+
+// C: nativo/optimizer/slp_arvore.c:278
+// C2F-INDECIDIVEL: fo
+proc empacotar_operacao(c: ^SlpCtx, pl: ^SlpPlano, fo: []Folha2) -> u32 {
+    let blk: ^bir.BirBloco = &(c.f as ^bir.BirFuncao).blocos[c.bloco]
+    var fa: [4]Faixa = {}
+    var fb: [4]Faixa = {}
+    var l: u32 = 0
+    while l < pl.lanes {
+        let i: ^bir.BirInstr = &blk.instrs[fo[l].pos]
+        if i.op != blk.instrs[fo[0].pos].op {
+            _ = falhar(pl, "operacao_mista")
+            return SLP_SEM
+        }
+        fa[l] = Faixa{op = i.a, upos = fo[l].pos}
+        fb[l] = Faixa{op = i.b, upos = fo[l].pos}
+        l += 1
+    }
+    let a: u32 = empacotar(c, pl, fa[..])
+    var b: u32 = SLP_SEM
+    if a != SLP_SEM {
+        b = empacotar(c, pl, fb[..])
+    }
+    if b == SLP_SEM {
+        return SLP_SEM
+    }
+    let filhos: [2]u32 = {a, b}
+    return novo_no(pl, SlpNo{tipo = SN_OPERACAO as u8, op = blk.instrs[fo[0].pos].op, filho = filhos})
+}
+
+// C: nativo/optimizer/slp_arvore.c:302
+// C2F-INDECIDIVEL: fo
+proc empacotar_carga(c: ^SlpCtx, pl: ^SlpPlano, fo: []Folha2) -> u32 {
+    let blk: ^bir.BirBloco = &(c.f as ^bir.BirFuncao).blocos[c.bloco]
+    let i0: ^bir.BirInstr = &blk.instrs[fo[0].pos]
+    var k0: SlpChave = slp_chave_base(c, i0.a.id, fo[0].pos)
+    var tern_1: i32 = 8
+    if pl.classe == (bir.BC_F32 as u8) {
+        tern_1 = 4
+    }
+    let passo: i64 = tern_1 as i64
+    let desloc0: i64 = (i0.desloc as i64) + (k0.off as i64)
+    var contiguas: bool = true
+    var repetidas: bool = true
+    var l: u32 = 0
+    while l < pl.lanes {
+        let i: ^bir.BirInstr = &blk.instrs[fo[l].pos]
+        var k: SlpChave = slp_chave_base(c, i.a.id, fo[l].pos)
+        if (i.a.tipo != (bir.BO_VREG as u8)) or (not slp_mesma_chave(&k0, &k)) {
+            _ = falhar(pl, "bases_diferentes")
+            return SLP_SEM
+        }
+        contiguas = (common.c2f_b2i32(contiguas) != 0) and (((i.desloc as i64) + (k.off as i64)) == (desloc0 + (passo * (l as i64))))
+        repetidas = (common.c2f_b2i32(repetidas) != 0) and (((i.desloc as i64) + (k.off as i64)) == desloc0)
+        l += 1
+    }
+    if ((((common.c2f_b2i32(contiguas) != 0) and (k0.tipo == (SB_SLOT as u8))) and (k0.id < (c.f as ^bir.BirFuncao).nslots)) and (c.escalariza != none)) and (common.c2f_b2i32((c.escalariza or_else {})[k0.id]) != 0) {
+        _ = falhar(pl, "slot_escalarizavel")
+        return SLP_SEM
+    }
+    if (not contiguas) and (not repetidas) {
+        _ = falhar(pl, "lanes_nao_contiguas")
+        return SLP_SEM
+    }
+    if (k0.tipo == (SB_VREG as u8)) and (not adicionar_pendente(pl, k0.id, k0.def)) {
+        return SLP_SEM
+    }
+    var tern_2: i32 = SN_CARGA_REPETIDA
+    if common.c2f_b2i32(contiguas) != 0 {
+        tern_2 = SN_CARGA
+    }
+    return novo_no(pl, SlpNo{tipo = tern_2 as u8, modelo = fo[0].pos})
+}
+
+// C: nativo/optimizer/slp_arvore.c:335
+proc bits_da_constante(o: ^bir.BirOperando, classe: u8) -> u64 {
+    var tern_1: u64 = common.c2f_s2u_64(o.imed)
+    if classe == (bir.BC_F32 as u8) {
+        tern_1 = common.c2f_trunc_u32(common.c2f_s2u_64(o.imed)) as u64
+    }
+    return tern_1
+}
+
+// C: nativo/optimizer/slp_arvore.c:340
+// C2F-INDECIDIVEL: fo
+proc empacotar_constante(pl: ^SlpPlano, fo: []Folha2) -> u32 {
+    var l: u32 = 1
+    while l < pl.lanes {
+        if bits_da_constante(&fo[l].valor, pl.classe) != bits_da_constante(&fo[0].valor, pl.classe) {
+            _ = falhar(pl, "constantes_diferentes")
+            return SLP_SEM
+        }
+        l += 1
+    }
+    return novo_no(pl, SlpNo{tipo = SN_CONSTANTE as u8, valor = fo[0].valor})
+}
+
+// C: nativo/optimizer/slp_arvore.c:351
+// C2F-INDECIDIVEL: fo
+proc empacotar_externo(pl: ^SlpPlano, fo: []Folha2) -> u32 {
+    var l: u32 = 1
+    while l < pl.lanes {
+        if ((fo[l].vreg != fo[0].vreg) or (fo[l].pos != fo[0].pos)) or (common.c2f_b2i32(fo[l].estavel) != common.c2f_b2i32(fo[0].estavel)) {
+            _ = falhar(pl, "valores_diferentes")
+            return SLP_SEM
+        }
+        l += 1
+    }
+    return novo_no(pl, SlpNo{tipo = SN_VREG as u8, valor = bir.BirOperando{tipo = bir.BO_VREG as u8, classe = pl.classe, id = fo[0].vreg}})
+}
+
+// C: nativo/optimizer/slp_arvore.c:363
+// C2F-INDECIDIVEL: fx
+proc empacotar_mesma_definicao(c: ^SlpCtx, pl: ^SlpPlano, fx: []Faixa) -> u32 {
+    var def: u32 = SLP_SEM
+    var l: u32 = 0
+    while l < pl.lanes {
+        if ((fx[l].op.tipo != (bir.BO_VREG as u8)) or ((fx[l].op.classe as i32) != (pl.classe as i32))) or (fx[l].op.id != fx[0].op.id) {
+            return SLP_SEM
+        }
+        if l == 0 {
+            def = slp_def_no_bloco(c, fx[0].upos, fx[0].op.id)
+        }
+        if (def == SLP_SEM) or (slp_def_no_bloco(c, fx[l].upos, fx[l].op.id) != def) {
+            return SLP_SEM
+        }
+        l += 1
+    }
+    if not adicionar_pendente(pl, fx[0].op.id, def) {
+        return SLP_SEM
+    }
+    return novo_no(pl, SlpNo{tipo = SN_VREG as u8, valor = fx[0].op})
+}
+
+// C: nativo/optimizer/slp_arvore.c:380
+// C2F-INDECIDIVEL: fx
+proc empacotar(c: ^SlpCtx, pl: ^SlpPlano, fx: []Faixa) -> u32 {
+    let mesmo: u32 = empacotar_mesma_definicao(c, pl, fx)
+    if (mesmo != SLP_SEM) or (pl.motivo != none) {
+        return mesmo
+    }
+    var fo: [4]Folha2 = {}
+    var l: u32 = 0
+    while l < pl.lanes {
+        if not resolver_lane(c, pl, fx[l].op, fx[l].upos, &fo[l]) {
+            return SLP_SEM
+        }
+        if fo[l].tipo != fo[0].tipo {
+            _ = falhar(pl, "folhas_mistas")
+            return SLP_SEM
+        }
+        l += 1
+    }
+    let tipo: i32 = fo[0].tipo as i32
+    if tipo == LF_OP {
+        return empacotar_operacao(c, pl, fo[..])
+    }
+    if tipo == LF_CARGA {
+        return empacotar_carga(c, pl, fo[..])
+    }
+    if tipo == LF_CONST {
+        return empacotar_constante(pl, fo[..])
+    }
+    return empacotar_externo(pl, fo[..])
+}
+
+// C: nativo/optimizer/slp_arvore.c:403
+proc slp_montar_arvore(c: ^SlpCtx, pl: ^SlpPlano) -> bool {
+    let blk: ^bir.BirBloco = &(c.f as ^bir.BirFuncao).blocos[c.bloco]
+    var raizes: [4]Faixa = {}
+    var l: u32 = 0
+    while l < pl.lanes {
+        raizes[l] = Faixa{op = blk.instrs[pl.loja[l]].b, upos = pl.loja[l]}
+        l += 1
+    }
+    pl.raiz = empacotar(c, pl, raizes[..])
+    return pl.raiz != SLP_SEM
+}

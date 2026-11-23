@@ -1,0 +1,298 @@
+// std:base64 - testes do modulo (lote A). Anexados ao texto de std:base64 SO em forja test std:base64 (o build normal nao os ve).
+// Versao: 0.2.0. Changelog: 0.2.0 - testes de decode_estrito e decode_url_estrito (vetores RFC 4648, padding, folga, caractere e tamanho). 0.1.0 - converte o teste antigo (programa com main que imprimia, comparado a teste.esperado) para blocos test: cada linha esperada virou um expect, mesma cobertura.
+// Sem import e sem proc main: o pedaco fica dentro do modulo, entao chama as procs dele SEM prefixo (encode, decode, hex_encode...).
+
+// Bytes de um texto, numa lista do alocador que o chamador passou (delete so se for heap).
+proc bytes_de(s: str, alloc: Allocator) -> [dynamic]u8 {
+    var out = make([dynamic]u8, alloc = alloc)
+    for i in 0..<len(s) {
+        append(&out, item = s[i])
+    }
+    return out
+}
+
+// true se os bytes de b, em hex minusculo (2 digitos por byte), sao exatamente o texto hex.
+proc hex_bate(b: []u8, hex: str) -> bool {
+    if len(hex) != len(b) * 2 {
+        return false
+    }
+    let digitos = "0123456789abcdef"
+    for i in 0..<len(b) {
+        if hex[i * 2] != digitos[(b[i] >> 4) as int] {
+            return false
+        }
+        if hex[i * 2 + 1] != digitos[(b[i] & 0x0F) as int] {
+            return false
+        }
+    }
+    return true
+}
+
+// true se a e b tem o mesmo tamanho e os mesmos bytes.
+proc bytes_iguais(a: []u8, b: []u8) -> bool {
+    if len(a) != len(b) {
+        return false
+    }
+    for i in 0..<len(a) {
+        if a[i] != b[i] {
+            return false
+        }
+    }
+    return true
+}
+
+// Codifica o texto com encode (padrao, com padding). O str devolvido e do chamador: delete.
+proc enc_texto(s: str) -> str {
+    var b = bytes_de(s, alloc = heap)
+    defer delete(b)
+    return encode(b[..], alloc = heap)
+}
+
+// true se decode(s) devolve bytes que batem com hex (sem erro).
+proc decode_bate(s: str, hex: str) -> bool {
+    var ok = false
+    switch r in decode(s, alloc = heap) {
+    case [dynamic]u8:
+        ok = hex_bate(r[..], hex)
+        delete(r)
+    case CodecError:
+        ok = false
+    }
+    return ok
+}
+
+// true se decode(s) da exatamente o erro esperado.
+proc decode_erro(s: str, esperado: CodecError) -> bool {
+    var ok = false
+    switch r in decode(s, alloc = heap) {
+    case [dynamic]u8:
+        delete(r)
+    case CodecError:
+        ok = r == esperado
+    }
+    return ok
+}
+
+// true se decode_estrito(s) devolve bytes que batem com hex (sem erro).
+proc estrito_bate(s: str, hex: str) -> bool {
+    var ok = false
+    switch r in decode_estrito(s, alloc = heap) {
+    case [dynamic]u8:
+        ok = hex_bate(r[..], hex)
+        delete(r)
+    case CodecError:
+        ok = false
+    }
+    return ok
+}
+
+// true se decode_url_estrito(s) devolve bytes que batem com hex (sem erro).
+proc url_estrito_bate(s: str, hex: str) -> bool {
+    var ok = false
+    switch r in decode_url_estrito(s, alloc = heap) {
+    case [dynamic]u8:
+        ok = hex_bate(r[..], hex)
+        delete(r)
+    case CodecError:
+        ok = false
+    }
+    return ok
+}
+
+// true se decode_estrito(s) da exatamente o erro esperado.
+proc estrito_erro(s: str, esperado: CodecError) -> bool {
+    var ok = false
+    switch r in decode_estrito(s, alloc = heap) {
+    case [dynamic]u8:
+        delete(r)
+    case CodecError:
+        ok = r == esperado
+    }
+    return ok
+}
+
+test "encode padrao com padding: vetores da RFC 4648" {
+    let v0 = enc_texto("")
+    expect(v0 == "")
+    delete(v0)
+    let v1 = enc_texto("f")
+    expect(v1 == "Zg==")
+    delete(v1)
+    let v2 = enc_texto("fo")
+    expect(v2 == "Zm8=")
+    delete(v2)
+    let v3 = enc_texto("foo")
+    expect(v3 == "Zm9v")
+    delete(v3)
+    let v4 = enc_texto("foob")
+    expect(v4 == "Zm9vYg==")
+    delete(v4)
+    let v5 = enc_texto("fooba")
+    expect(v5 == "Zm9vYmE=")
+    delete(v5)
+    let v6 = enc_texto("foobar")
+    expect(v6 == "Zm9vYmFy")
+    delete(v6)
+}
+
+test "encode sem padding" {
+    var f = bytes_de("f", alloc = heap)
+    defer delete(f)
+    let s1 = encode_sem_padding(f[..], alloc = heap)
+    expect(s1 == "Zg")
+    delete(s1)
+    var fo = bytes_de("fo", alloc = heap)
+    defer delete(fo)
+    let s2 = encode_sem_padding(fo[..], alloc = heap)
+    expect(s2 == "Zm8")
+    delete(s2)
+    var foob = bytes_de("foob", alloc = heap)
+    defer delete(foob)
+    let s3 = encode_sem_padding(foob[..], alloc = heap)
+    expect(s3 == "Zm9vYg")
+    delete(s3)
+}
+
+test "encode_url e encode de bytes altos" {
+    var fbffbf: [3]u8 = {0xFB, 0xFF, 0xBF}
+    let u1 = encode_url(fbffbf[..], alloc = heap)
+    expect(u1 == "-_-_")
+    delete(u1)
+    var ffef: [2]u8 = {0xFF, 0xEF}
+    let u2 = encode_url(ffef[..], alloc = heap)
+    expect(u2 == "_-8=")
+    delete(u2)
+    let p1 = encode(ffef[..], alloc = heap)
+    expect(p1 == "/+8=")
+    delete(p1)
+}
+
+test "decode padrao: vetores validos" {
+    expect(decode_bate("Zm9vYmFy", "666f6f626172"))
+    expect(decode_bate("Zm9vYg", "666f6f62"))
+    expect(decode_bate("Zm9", "666f"))
+}
+
+test "decode: caractere e tamanho invalidos" {
+    expect(decode_erro("Zm9!", CodecError.caractere_invalido))
+    expect(decode_erro("Z", CodecError.tamanho_invalido))
+    expect(decode_erro("Zg=", CodecError.tamanho_invalido))
+    expect(decode_erro("Zg===", CodecError.tamanho_invalido))
+}
+
+test "decode_url e alfabeto trocado" {
+    switch r in decode_url("-_-_", alloc = heap) {
+    case [dynamic]u8:
+        expect(hex_bate(r[..], "fbffbf"))
+        delete(r)
+    case CodecError:
+        expect(false)
+    }
+    expect(decode_bate("+/+/", "fbffbf"))
+}
+
+test "hex_encode e hex_decode" {
+    var hexbytes: [5]u8 = {0x00, 0x7F, 0x80, 0xFF, 0x0A}
+    let hx = hex_encode(hexbytes[..], alloc = heap)
+    expect(hx == "007f80ff0a")
+    delete(hx)
+    switch r in hex_decode("DEADbeef", alloc = heap) {
+    case [dynamic]u8:
+        expect(hex_bate(r[..], "deadbeef"))
+        delete(r)
+    case CodecError:
+        expect(false)
+    }
+    switch r in hex_decode("abc", alloc = heap) {
+    case [dynamic]u8:
+        expect(false)
+        delete(r)
+    case CodecError:
+        expect(r == CodecError.tamanho_invalido)
+    }
+    switch r in hex_decode("zz", alloc = heap) {
+    case [dynamic]u8:
+        expect(false)
+        delete(r)
+    case CodecError:
+        expect(r == CodecError.caractere_invalido)
+    }
+}
+
+test "ida e volta de 256 bytes em base64 e hex" {
+    var todos = make([dynamic]u8, alloc = heap, cap = 256)
+    defer delete(todos)
+    for i in 0..<256 {
+        append(&todos, item = i as u8)
+    }
+    let codificado = encode(todos[..], alloc = heap)
+    defer delete(codificado)
+    switch d in decode(codificado, alloc = heap) {
+    case [dynamic]u8:
+        expect(bytes_iguais(d[..], todos[..]))
+        delete(d)
+    case CodecError:
+        expect(false)
+    }
+    let hexcodificado = hex_encode(todos[..], alloc = heap)
+    defer delete(hexcodificado)
+    switch d in hex_decode(hexcodificado, alloc = heap) {
+    case [dynamic]u8:
+        expect(bytes_iguais(d[..], todos[..]))
+        delete(d)
+    case CodecError:
+        expect(false)
+    }
+}
+
+test "decode_estrito: vetores RFC 4648 (alfabeto padrao)" {
+    expect(estrito_bate("", ""))
+    expect(estrito_bate("Zg==", "66"))
+    expect(estrito_bate("Zm8=", "666f"))
+    expect(estrito_bate("Zm9v", "666f6f"))
+    expect(estrito_bate("Zm9vYg==", "666f6f62"))
+    expect(estrito_bate("Zm9vYmE=", "666f6f6261"))
+    expect(estrito_bate("Zm9vYmFy", "666f6f626172"))
+}
+
+test "decode_url_estrito: vetores RFC 4648 e alfabeto URL" {
+    expect(url_estrito_bate("", ""))
+    expect(url_estrito_bate("Zg==", "66"))
+    expect(url_estrito_bate("Zm8=", "666f"))
+    expect(url_estrito_bate("Zm9v", "666f6f"))
+    expect(url_estrito_bate("Zm9vYg==", "666f6f62"))
+    expect(url_estrito_bate("Zm9vYmE=", "666f6f6261"))
+    expect(url_estrito_bate("Zm9vYmFy", "666f6f626172"))
+    expect(url_estrito_bate("-_-_", "fbffbf"))
+    expect(url_estrito_bate("_-8=", "ffef"))
+    switch r in decode_url_estrito("+/+/", alloc = heap) {
+    case [dynamic]u8:
+        expect(false)
+        delete(r)
+    case CodecError:
+        expect(r == CodecError.caractere_invalido)
+    }
+}
+
+test "decode_estrito: padding ausente ou a mais = padding_invalido" {
+    expect(estrito_erro("Zg", CodecError.padding_invalido))
+    expect(estrito_erro("Zm9vYg", CodecError.padding_invalido))
+    expect(estrito_erro("Zm9", CodecError.padding_invalido))
+    expect(estrito_erro("Zg===", CodecError.padding_invalido))
+    expect(estrito_erro("Zm9v==", CodecError.padding_invalido))
+}
+
+test "decode_estrito: bits de folga diferentes de zero = ultimo_simbolo_invalido" {
+    expect(estrito_erro("Zh==", CodecError.ultimo_simbolo_invalido))
+    expect(estrito_erro("Zm9=", CodecError.ultimo_simbolo_invalido))
+    expect(estrito_erro("Zm9vYh==", CodecError.ultimo_simbolo_invalido))
+}
+
+test "decode_estrito: caractere fora do alfabeto, espaco e tamanho %4 == 1" {
+    expect(estrito_erro("Zm9!", CodecError.caractere_invalido))
+    expect(estrito_erro("Zm9 ", CodecError.caractere_invalido))
+    expect(estrito_erro("Zg=A", CodecError.caractere_invalido))
+    expect(estrito_erro("-_-_", CodecError.caractere_invalido))
+    expect(estrito_erro("Z", CodecError.tamanho_invalido))
+    expect(estrito_erro("Zm9vY", CodecError.tamanho_invalido))
+}

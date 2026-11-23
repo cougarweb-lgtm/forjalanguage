@@ -1,0 +1,235 @@
+// nativo/fmt/pe_secoes.fj - porte de compiler/nativo/fmt/pe_secoes.c
+// sha256 de nativo/fmt/pe_secoes.c: ebbe6924449c19eec88c8578b59802dafc3761c349df194bf853adea8c77c953
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.2.0
+// Changelog: 0.2.0 - A4.2: imports_din e necessarias (ELF dinamico) nascem e morrem com a Imagem
+
+import "common"
+
+const PE_DEBUG_TIPO_CODEVIEW: u32 = 2
+const PE_CV_OFF_PONTEIRO: u32 = 24
+const PE_CV_OFF_GUID: u32 = 4
+const PE_CV_TAM_GUID: u32 = 16
+const PE_HASH_PISTAS: u32 = 4
+const PE_HASH_MULT: u64 = 11400714819323198485
+const PE_HASH_GIRO: u32 = 29
+const PE_NOMES_DEBUG: [4]str = {".debug_abbrev", ".debug_info", ".debug_line", ".debug_frame"}
+
+// C: nativo/fmt/pe_secoes.c:23
+proc pe_nome_secao_debug(k: u32) -> str {
+    return PE_NOMES_DEBUG[k]
+}
+
+// C: nativo/fmt/pe_secoes.c:29
+// C2F-INDECIDIVEL: dst (char[8] de saida = ?str de heap-frame; snprintf corta em 7 bytes + NUL)
+proc pe_nome_secao_longo(tab: ^[dynamic]u8, nome: str, dst: ^?str) {
+    if len(tab^) == 0 {
+        pe_zeros(tab, 4)
+    }
+    let tam: u32 = (len(tab^) as u64) as u32
+    let texto: str = format(f"/{tam}", alloc = frame)
+    let corte: u64 = min(len(texto) as u64, 7)
+    dst^ = from_bytes(as_bytes(texto)[0..<corte], alloc = frame)
+    append(tab, items = as_bytes(nome))
+    pe_u8(tab, 0)
+}
+
+// C: nativo/fmt/pe_secoes.c:38
+proc pe_tabela_fechar(tab: ^[dynamic]u8) {
+    if len(tab^) == 0 {
+        return
+    }
+    let tam: u32 = (len(tab^) as u64) as u32
+    for k in (0 as u32)..<4 {
+        tab^[k] = common.c2f_trunc_u8(((tam >> ((8 * k) & 31)) as u64))
+    }
+}
+
+// C: nativo/fmt/pe_secoes.c:50
+proc pe_cv_gravar32(dst: []u8, v: u32) {
+    for k in (0 as u32)..<4 {
+        dst[k] = common.c2f_trunc_u8((v >> ((8 * k) & 31)) as u64)
+    }
+}
+
+// C: nativo/fmt/pe_secoes.c:56
+// C2F-13: o C monta 4 bytes LE em buffer e anexa; pe_u32 anexa os mesmos 4 bytes
+proc pe_cv_anexar32(b: ^[dynamic]u8, v: u32) {
+    pe_u32(b, v as u64)
+}
+
+// C: nativo/fmt/pe_secoes.c:64
+proc pe_code_view_secao(s: ^PeSecao, rva: u32, pdb: ?str) {
+    let caminho: str = pdb or_else ""
+    let tam_rsds: u32 = wrapping_add(wrapping_add(wrapping_add(wrapping_add(4, PE_CV_TAM_GUID), 4), (len(caminho) as u64) as u32), 1)
+    s.nome = pe_nome_secao(".cvinfo")
+    s.caracteristicas = PE_SECAO_LEITURA
+    s.rva = rva
+    pe_cv_anexar32(&s.bytes, 0)
+    pe_cv_anexar32(&s.bytes, 0)
+    pe_cv_anexar32(&s.bytes, 0)
+    pe_cv_anexar32(&s.bytes, PE_DEBUG_TIPO_CODEVIEW)
+    pe_cv_anexar32(&s.bytes, tam_rsds)
+    pe_cv_anexar32(&s.bytes, wrapping_add(rva, PE_CV_TAM_DIRETORIO))
+    pe_cv_anexar32(&s.bytes, 0)
+    append(&s.bytes, items = as_bytes("RSDS"))
+    for _k in (0 as u32)..<PE_CV_TAM_GUID {
+        pe_u8(&s.bytes, 0)
+    }
+    pe_cv_anexar32(&s.bytes, PE_CV_IDADE)
+    append(&s.bytes, items = as_bytes(caminho))
+    pe_u8(&s.bytes, 0)
+    s.tam_virtual = (len(s.bytes) as u64) as u32
+}
+
+// C: nativo/fmt/pe_secoes.c:86
+proc pe_code_view_ponteiro(bytes: ^[dynamic]u8, ptr: u32) {
+    pe_cv_gravar32(bytes^[PE_CV_OFF_PONTEIRO..<(PE_CV_OFF_PONTEIRO + 4)], wrapping_add(ptr, PE_CV_TAM_DIRETORIO))
+}
+
+// C: nativo/fmt/pe_secoes.c:97 (le 8 bytes LE a partir de off; o C faz memcpy, host x86 e LE)
+proc pe_hash_ler64(dados: []u8, off: u64) -> u64 {
+    var w: u64 = 0
+    for k in (0 as u64)..<8 {
+        w = w | ((dados[off + k] as u64) << ((8 * k) as u64))
+    }
+    return w
+}
+
+// C: nativo/fmt/pe_secoes.c:97
+// C2F-13: dados fundido em n (len); 4 pistas, sobra byte a byte na pista 0 (ver o comentario do C)
+proc pe_hash_exe(dados: []u8) -> u64 {
+    let n: u64 = len(dados) as u64
+    var h: [4]u64 = {common.HASH64_SEMENTE, common.HASH64_SEMENTE + 1, common.HASH64_SEMENTE + 2, common.HASH64_SEMENTE + 3}
+    var i: u64 = 0
+    while (i + 32) <= n {
+        for k in (0 as u32)..<PE_HASH_PISTAS {
+            let w: u64 = pe_hash_ler64(dados, i + (8 * (k as u64))) ~ h[k]
+            h[k] = wrapping_mul(rotate_left(w, PE_HASH_GIRO), PE_HASH_MULT)
+        }
+        i += 32
+    }
+    while i < n {
+        h[0] = wrapping_mul(h[0] ~ (dados[i] as u64), 1099511628211)
+        i += 1
+    }
+    h[0] = h[0] ~ n
+    for k in (1 as u32)..<PE_HASH_PISTAS {
+        let mistura: u64 = h[0] ~ h[k]
+        h[0] = wrapping_mul(rotate_left(mistura, PE_HASH_GIRO), PE_HASH_MULT)
+    }
+    return h[0] ~ (h[0] >> 32)
+}
+
+// C: nativo/fmt/pe_secoes.c:120
+// C2F-INDECIDIVEL: saida (?^u8 de 16 bytes; slice_from sobre o ponteiro, so se nao nulo)
+proc pe_code_view_guid(exe: ^[dynamic]u8, ptr: u32, saida: ?^u8) {
+    let h1: u64 = pe_hash_exe(exe^[..])
+    var h1_bytes: [8]u8 = {0, 0, 0, 0, 0, 0, 0, 0}
+    for k in (0 as u64)..<8 {
+        h1_bytes[k] = common.c2f_trunc_u8(h1 >> ((8 * k) as u64))
+    }
+    let h2: u64 = common.hash64(h1_bytes[..], 8, ~h1)
+    let base: u64 = (ptr as u64) + 32
+    for k in (0 as u64)..<8 {
+        exe^[base + k] = common.c2f_trunc_u8(h1 >> ((8 * k) as u64))
+        exe^[base + 8 + k] = common.c2f_trunc_u8(h2 >> ((8 * k) as u64))
+    }
+    if saida != none {
+        var destino: []u8 = slice_from(saida as ^u8, len = PE_CV_TAM_GUID)
+        for k in (0 as u64)..<(PE_CV_TAM_GUID as u64) {
+            destino[k] = exe^[base + k]
+        }
+    }
+}
+
+// C: nativo/fmt/pe_secoes.c:136
+pub proc imagem_iniciar(im: ^Imagem) {
+    im^ = Imagem{}
+    // o C anexa em buffer zerado (BufAnexar aloca); aqui cada lista nasce com alocador
+    for k in (0 as u64)..<(IMAGEM_QTD_DEBUG as u64) {
+        im.dbg[k] = make([dynamic]u8, alloc = heap)
+    }
+    im.dir64 = make([dynamic]u32, alloc = heap)
+    im.exportacoes = make([dynamic]PeExporta, alloc = heap)
+    im.simbolos = make([dynamic]ImagemSimbolo, alloc = heap)
+    im.relativos = make([dynamic]ImagemRelativa, alloc = heap)
+    im.imports_din = make([dynamic]ImagemImportDin, alloc = heap)
+    im.necessarias = make([dynamic]str, alloc = heap)
+}
+
+// C: nativo/fmt/pe_secoes.c:145
+pub proc imagem_liberar(im: ^Imagem) {
+    var i: u32 = 0
+    while i < (im.qtd_secoes + (IMAGEM_QTD_DEBUG as u32)) {
+        if i < im.qtd_secoes {
+            delete(im.secoes[i].bytes)
+        } else {
+            delete(im.dbg[i - im.qtd_secoes])
+        }
+        i += 1
+    }
+    delete(im.dir64)
+    delete(im.exportacoes)
+    delete(im.simbolos)
+    delete(im.relativos)
+    delete(im.imports_din)
+    delete(im.necessarias)
+}
+
+// C: nativo/fmt/pe_secoes.c:155
+// C2F-INDECIDIVEL: dst char[8] vira o str truncado em 8 bytes (o padding a 8 e feito na escrita)
+proc pe_nome_secao(src: str) -> str {
+    let corte: u64 = min(len(src) as u64, PE_TAM_NOME as u64)
+    return from_bytes(as_bytes(src)[0..<corte], alloc = frame)
+}
+
+// C: nativo/fmt/pe_secoes.c:162
+proc imagem_proximo_rva(im: ^Imagem) -> u32 {
+    // A1.2: no AArch64 cada secao comeca em pagina de 16 KiB (segmentos PT_LOAD em paginas distintas)
+    var alinhamento: u32 = PE_ALINHAMENTO_SECAO
+    if im.pagina != 0 {
+        alinhamento = im.pagina
+    }
+    if im.qtd_secoes == 0 {
+        return alinhamento
+    }
+    let ult: ^PeSecao = &im.secoes[im.qtd_secoes - 1]
+    return pe_alinhar(ult.rva + ult.tam_virtual, alinhamento)
+}
+
+// C: nativo/fmt/pe_secoes.c:170
+pub proc imagem_secao(im: ^Imagem, pedido: ^PeSecaoPedido, erro: ^common.Diag) -> u32 {
+    if im.qtd_secoes >= (IMAGEM_MAX_SECOES as u32) {
+        common.falha_interna(format(f"pe: a imagem passou de {IMAGEM_MAX_SECOES} secoes", alloc = frame))
+    }
+    let rva: u32 = imagem_proximo_rva(im)
+    let nome_pedido: str = pedido.nome or_else ""
+    var tam_dados: u32 = 0
+    if pedido.bytes != none {
+        let fonte_dados: ^[dynamic]u8 = pedido.bytes as ^[dynamic]u8
+        tam_dados = (len(fonte_dados^) as u64) as u32
+    }
+    var tam_virtual: u32 = pedido.tam_virtual
+    if tam_virtual < tam_dados {
+        tam_virtual = tam_dados
+    }
+    if tam_virtual == 0 {
+        let nome_curto: str = pe_nome_secao(nome_pedido)
+        let msg: str = format(f"secao '{nome_curto}' sem bytes", alloc = frame)
+        _ = common.diag_relatar(erro, common.X0905, 0, msg)
+        return 0
+    }
+    let s: ^PeSecao = &im.secoes[im.qtd_secoes as u64]
+    im.qtd_secoes += 1
+    s.nome = pe_nome_secao(nome_pedido)
+    s.caracteristicas = pedido.caracteristicas
+    s.rva = rva
+    s.tam_virtual = tam_virtual
+    if tam_dados > 0 {
+        let fonte_copia: ^[dynamic]u8 = pedido.bytes as ^[dynamic]u8
+        s.bytes = make([dynamic]u8, alloc = heap)
+        append(&s.bytes, items = fonte_copia^[..])
+    }
+    return rva
+}

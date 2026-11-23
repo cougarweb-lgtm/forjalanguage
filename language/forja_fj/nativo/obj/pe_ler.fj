@@ -1,0 +1,282 @@
+// nativo/obj/pe_ler.fj - porte de compiler/nativo/obj/pe_ler.c, compiler/nativo/obj/pe_ler.h
+// sha256 de nativo/obj/pe_ler.c: 87ccc6adc1174d17f014fed1368de9d47c5820fd2a1cd22058f39c89b50449e5
+// sha256 de nativo/obj/pe_ler.h: f73ca14cdeb06518f753325b7749e43526b1c1f14007a07ca5f6440e79beaba9
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "common"
+
+struct PeExportacao {
+    nome: ?str
+    ordinal: u32
+    rva: u32
+    forwarder: ?str
+}
+
+struct PeExportacoes {
+    textos: common.Arena
+    itens: [dynamic]PeExportacao
+}
+
+struct PelTabelas {
+    nomes: ?[]u8
+    ordinais: ?[]u8
+    funcoes: ?[]u8
+    qtd_nomes: u32
+    qtd_funcoes: u32
+    base: u32
+}
+
+struct PeLeitor {
+    b: ?[]u8
+    n: u64
+    secoes: u64
+    qtd_secoes: u32
+    dir_rva: u32
+    dir_tam: u32
+    t: PelTabelas
+    saida: ?^PeExportacoes
+    erro: ?^common.Diag
+}
+
+const PEL_OFF_LFANEW: u32 = 60
+const PEL_TAM_DOS: u32 = 64
+const PEL_OFF_NSECOES: u32 = 6
+const PEL_OFF_TAM_OPCIONAL: u32 = 20
+const PEL_OFF_OPCIONAL: u32 = 24
+const PEL_OFF_MAQUINA: u32 = 4
+const PEL_MAGIC_PE32: u32 = 267
+const PEL_MAGIC_PE32_MAIS: u32 = 523
+const PEL_MAQUINA_AMD64: u32 = 34404
+const PEL_OFF_QTD_DIRETORIOS: u32 = 108
+const PEL_OFF_DIRETORIOS: u32 = 112
+const PEL_TAM_DIRETORIO: u32 = 8
+const PEL_TAM_SECAO: u32 = 40
+const PEL_OFF_SECAO_TAM_VIRTUAL: u32 = 8
+const PEL_OFF_SECAO_RVA: u32 = 12
+const PEL_OFF_SECAO_BRUTO: u32 = 16
+const PEL_OFF_SECAO_PTR: u32 = 20
+const PEL_TAM_DIR_EXPORT: u32 = 40
+const PEL_OFF_EXP_BASE: u32 = 16
+const PEL_OFF_EXP_QTD_FUNCOES: u32 = 20
+const PEL_OFF_EXP_QTD_NOMES: u32 = 24
+const PEL_OFF_EXP_FUNCOES: u32 = 28
+const PEL_OFF_EXP_NOMES: u32 = 32
+const PEL_OFF_EXP_ORDINAIS: u32 = 36
+const PEL_TAM_RVA: u32 = 4
+const PEL_TAM_ORDINAL: u32 = 2
+
+// C: nativo/obj/pe_ler.c:56
+// C2F-INDECIDIVEL: p
+proc pel_le16(p: []u8) -> u16 {
+    return common.c2f_trunc_u16(common.c2f_s2u_64(common.c2f_ou_i32(p[0] as i32, common.c2f_shl_i32(p[1] as i32, 8)) as i64))
+}
+
+// C: nativo/obj/pe_ler.c:61
+// C2F-INDECIDIVEL: p
+proc pel_le32(p: []u8) -> u32 {
+    return (((p[0] as u32) | ((p[1] as u32) << 8)) | ((p[2] as u32) << 16)) | ((p[3] as u32) << 24)
+}
+
+// C: nativo/obj/pe_ler.c:66
+proc pel_cabe(l: ^PeLeitor, off: u64, len_c: u64) -> bool {
+    return (off <= l.n) and (len_c <= (l.n - off))
+}
+
+// C: nativo/obj/pe_ler.c:71
+proc pel_malformado(l: ^PeLeitor, motivo: str) -> bool {
+    let msg_1 = format(f"PE malformado: {motivo}", alloc = heap)
+    defer delete(msg_1)
+    return common.diag_relatar(l.erro as ^common.Diag, common.X0105, 0, msg_1)
+}
+
+// C: nativo/obj/pe_ler.c:77
+// C2F-33: a faixa vira fatia do buffer ate o fim (o C so usa len_c bytes; o texto precisa do resto)
+proc pel_faixa(l: ^PeLeitor, rva: u32, len_c: u64) -> ?[]u8 {
+    let bytes: []u8 = l.b or_else {}
+    var i: u32 = 0
+    while i < l.qtd_secoes {
+        let s: u64 = l.secoes + ((i as u64) * (PEL_TAM_SECAO as u64))
+        let sec_rva: u32 = common.c2f_ler_u32_le(bytes, (s + (PEL_OFF_SECAO_RVA as u64)) as int)
+        let bruto: u32 = common.c2f_ler_u32_le(bytes, (s + (PEL_OFF_SECAO_BRUTO as u64)) as int)
+        if (rva >= sec_rva) and ((rva - sec_rva) < bruto) {
+            let ptr: u64 = common.c2f_ler_u32_le(bytes, (s + (PEL_OFF_SECAO_PTR as u64)) as int) as u64
+            let off: u64 = ptr + ((rva - sec_rva) as u64)
+            if not pel_cabe(l, off, len_c) {
+                return none
+            }
+            return bytes[(off as int)..<(l.n as int)]
+        }
+        i += 1
+    }
+    return none
+}
+
+// C: nativo/obj/pe_ler.c:91
+// C2F-33: o texto sai copiado na arena de saida (o C so guardava ponteiro; o copia de forwarder e nome vira esta)
+proc pel_texto(l: ^PeLeitor, rva: u32) -> ?str {
+    let faixa: ?[]u8 = pel_faixa(l, rva, 1)
+    if faixa == none {
+        return none
+    }
+    let bytes: []u8 = faixa or_else {}
+    let saida: ^PeExportacoes = l.saida as ^PeExportacoes
+    var k: int = 0
+    while k < len(bytes) {
+        if bytes[k] == 0 {
+            return from_bytes(bytes[0..<k], alloc = common.arena_mem(&saida.textos))
+        }
+        k += 1
+    }
+    return none
+}
+
+// C: nativo/obj/pe_ler.c:100
+proc pel_conferir_opcional(l: ^PeLeitor, pe: u64) -> bool {
+    let bytes: []u8 = l.b or_else {}
+    let magic: u32 = common.c2f_ler_u16_le(bytes, (pe + (PEL_OFF_OPCIONAL as u64)) as int) as u32
+    let maquina: u32 = common.c2f_ler_u16_le(bytes, (pe + (PEL_OFF_MAQUINA as u64)) as int) as u32
+    if magic == PEL_MAGIC_PE32 {
+        return common.diag_relatar(l.erro as ^common.Diag, common.X0105, 0, "biblioteca de 32 bits (PE32); o backend nativo liga so x64")
+    }
+    if magic != PEL_MAGIC_PE32_MAIS {
+        return pel_malformado(l, "Magic do cabecalho opcional desconhecido")
+    }
+    if maquina != PEL_MAQUINA_AMD64 {
+        let msg_1 = format(f"biblioteca para a maquina 0x{maquina:x}; o backend nativo liga so x64 (0x8664)", alloc = heap)
+        defer delete(msg_1)
+        return common.diag_relatar(l.erro as ^common.Diag, common.X0105, 0, msg_1)
+    }
+    return true
+}
+
+// C: nativo/obj/pe_ler.c:114
+proc pel_guardar_tabelas(l: ^PeLeitor, pe: u64) -> bool {
+    let bytes: []u8 = l.b or_else {}
+    let opcional: u64 = pe + (PEL_OFF_OPCIONAL as u64)
+    let tam_opcional: u64 = common.c2f_ler_u16_le(bytes, (pe + (PEL_OFF_TAM_OPCIONAL as u64)) as int) as u64
+    l.qtd_secoes = common.c2f_ler_u16_le(bytes, (pe + (PEL_OFF_NSECOES as u64)) as int) as u32
+    l.secoes = opcional + tam_opcional
+    if (not pel_cabe(l, l.secoes, (l.qtd_secoes as u64) * (PEL_TAM_SECAO as u64))) or (not pel_cabe(l, opcional, tam_opcional)) {
+        return pel_malformado(l, "tabela de secoes truncada")
+    }
+    if (tam_opcional < ((PEL_OFF_DIRETORIOS + PEL_TAM_DIRETORIO) as u64)) or (common.c2f_ler_u32_le(bytes, (opcional + (PEL_OFF_QTD_DIRETORIOS as u64)) as int) == 0) {
+        return true
+    }
+    l.dir_rva = common.c2f_ler_u32_le(bytes, (opcional + (PEL_OFF_DIRETORIOS as u64)) as int)
+    l.dir_tam = common.c2f_ler_u32_le(bytes, (opcional + ((PEL_OFF_DIRETORIOS + PEL_TAM_RVA) as u64)) as int)
+    return true
+}
+
+// C: nativo/obj/pe_ler.c:129
+proc pel_tem_assinatura_mz(l: ^PeLeitor) -> bool {
+    return ((common.c2f_b2i32(pel_cabe(l, 0, PEL_TAM_DOS as u64)) != 0) and ((l.b or_else {})[0] == 77)) and ((l.b or_else {})[1] == 90) // 'M' 'Z'
+}
+
+// C: nativo/obj/pe_ler.c:134
+proc pel_abrir(l: ^PeLeitor) -> bool {
+    if not pel_tem_assinatura_mz(l) {
+        return pel_malformado(l, "sem assinatura MZ")
+    }
+    let bytes: []u8 = l.b or_else {}
+    let pe: u64 = common.c2f_ler_u32_le(bytes, PEL_OFF_LFANEW as int) as u64
+    if not pel_cabe(l, pe, (PEL_OFF_OPCIONAL + PEL_TAM_ORDINAL) as u64) {
+        return pel_malformado(l, "sem assinatura PE")
+    }
+    // C: memcmp(b + pe, "PE\0\0", 4): 'P' 'E' 0 0
+    if (bytes[pe] != 80) or (bytes[pe + 1] != 69) or (bytes[pe + 2] != 0) or (bytes[pe + 3] != 0) {
+        return pel_malformado(l, "sem assinatura PE")
+    }
+    if not pel_conferir_opcional(l, pe) {
+        return false
+    }
+    return pel_guardar_tabelas(l, pe)
+}
+
+// C: nativo/obj/pe_ler.c:145
+proc pel_abrir_tabelas(l: ^PeLeitor) -> bool {
+    let d: ?[]u8 = pel_faixa(l, l.dir_rva, PEL_TAM_DIR_EXPORT as u64)
+    if d == none {
+        return pel_malformado(l, "diretorio de exportacao fora do arquivo")
+    }
+    let dir: []u8 = d or_else {}
+    l.t.base = common.c2f_ler_u32_le(dir, PEL_OFF_EXP_BASE as int)
+    l.t.qtd_funcoes = common.c2f_ler_u32_le(dir, PEL_OFF_EXP_QTD_FUNCOES as int)
+    l.t.qtd_nomes = common.c2f_ler_u32_le(dir, PEL_OFF_EXP_QTD_NOMES as int)
+    if l.t.qtd_nomes == 0 {
+        return true
+    }
+    l.t.nomes = pel_faixa(l, common.c2f_ler_u32_le(dir, PEL_OFF_EXP_NOMES as int), (l.t.qtd_nomes as u64) * (PEL_TAM_RVA as u64))
+    l.t.ordinais = pel_faixa(l, common.c2f_ler_u32_le(dir, PEL_OFF_EXP_ORDINAIS as int), (l.t.qtd_nomes as u64) * (PEL_TAM_ORDINAL as u64))
+    l.t.funcoes = pel_faixa(l, common.c2f_ler_u32_le(dir, PEL_OFF_EXP_FUNCOES as int), (l.t.qtd_funcoes as u64) * (PEL_TAM_RVA as u64))
+    if (l.t.nomes == none) or (l.t.ordinais == none) or (l.t.funcoes == none) {
+        return pel_malformado(l, "tabela de exportacao fora do arquivo")
+    }
+    return true
+}
+
+// C: nativo/obj/pe_ler.c:165
+// C2F: RVA dentro do diretorio de exportacao = forwarder; o texto ja sai copiado na arena (pel_texto)
+proc pel_forwarder(l: ^PeLeitor, rva: u32) -> ?str {
+    if (rva < l.dir_rva) or ((rva - l.dir_rva) >= l.dir_tam) {
+        return none
+    }
+    return pel_texto(l, rva)
+}
+
+// C: nativo/obj/pe_ler.c:173
+proc pel_ler_item(l: ^PeLeitor, i: u32) -> bool {
+    let ordinais: []u8 = l.t.ordinais or_else {}
+    let nomes: []u8 = l.t.nomes or_else {}
+    let funcoes: []u8 = l.t.funcoes or_else {}
+    let indice: u32 = common.c2f_ler_u16_le(ordinais, (i as int) * (PEL_TAM_ORDINAL as int)) as u32
+    let nome: ?str = pel_texto(l, common.c2f_ler_u32_le(nomes, (i as int) * (PEL_TAM_RVA as int)))
+    if (nome == none) or (indice >= l.t.qtd_funcoes) {
+        return pel_malformado(l, "nome ou ordinal da tabela de exportacao fora do arquivo")
+    }
+    let rva: u32 = common.c2f_ler_u32_le(funcoes, (indice as int) * (PEL_TAM_RVA as int))
+    let saida: ^PeExportacoes = l.saida as ^PeExportacoes
+    append(&saida.itens, item = PeExportacao{})
+    let e: ^PeExportacao = &saida.itens[len(saida.itens) - 1]
+    e.nome = nome
+    e.ordinal = common.c2f_trunc_u32((l.t.base as u64) + (indice as u64))
+    e.rva = rva
+    e.forwarder = pel_forwarder(l, rva)
+    return true
+}
+
+// C: nativo/obj/pe_ler.c:189
+proc pel_ler_itens(l: ^PeLeitor) -> bool {
+    var i: u32 = 0
+    while i < l.t.qtd_nomes {
+        if not pel_ler_item(l, i) {
+            return false
+        }
+        i += 1
+    }
+    return true
+}
+
+// C: nativo/obj/pe_ler.c:198
+// C2F-70: o PeLeitor do C vira var local; a lista de itens nasce com alocador e o texto vai na arena de saida
+proc pe_ler_exportacoes(bytes: ^u8, n: u64, saida: ^PeExportacoes, erro: ^common.Diag) -> bool {
+    var l = PeLeitor{b = slice_from(bytes, len = n as int), n = n, saida = saida, erro = erro}
+    saida.textos = common.Arena{}
+    saida.itens = make([dynamic]PeExportacao, alloc = heap)
+    if not pel_abrir(&l) {
+        return false
+    }
+    if (l.dir_rva == 0) or (l.dir_tam == 0) {
+        return true
+    }
+    if not pel_abrir_tabelas(&l) {
+        return false
+    }
+    return pel_ler_itens(&l)
+}
+
+// C: nativo/obj/pe_ler.c:212
+proc pe_exportacoes_liberar(saida: ^PeExportacoes) {
+    delete(saida.itens)
+    common.arena_liberar(&saida.textos)
+}

@@ -1,0 +1,192 @@
+// std:base64 (T16) -base64 padrao e URL-safe, com e sem padding (RFC 4648), e hex minusculo (RFC 4648 secao 8). Forja pura (sem foreign), igual nos 2 backends.
+// Versao: 0.1.0. Changelog: 0.1.0 - L3 (T16): encode, encode_sem_padding, encode_url, encode_url_sem_padding, decode, decode_url, hex_encode, hex_decode e CodecError.
+// Posse: encode/hex_encode devolvem texto DONO do alocador que o chamador passou (delete so se for heap); decode/hex_decode devolvem lista DONA desse alocador. Em erro nada fica alocado.
+// decode aceita padding opcional: se houver '=', o total de caracteres tem de ser multiplo de 4. Entrada invalida = CodecError (nunca panic). Bits de folga no fim nao sao conferidos (aceita entrada nao canonica).
+// hex_decode aceita maiusculas e minusculas; hex_encode sai minusculo.
+
+pub enum CodecError { tamanho_invalido, caractere_invalido }
+
+const ALFABETO_PADRAO: str = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+const ALFABETO_URL: str = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+const DIGITOS_HEX: str = "0123456789abcdef"
+const SEXTETO_INVALIDO: u32 = 64
+const SEXTETOS_NO_ALFABETO: int = 64
+const BITS_SEXTETO: u32 = 6
+const BITS_BYTE: u32 = 8
+const BITS_NIBBLE: u32 = 4
+const DESLOCA_NIBBLE_U8: u8 = 4
+const TRIO: int = 3
+const QUARTETO: int = 4
+const PADDING_MAX: int = 2
+const IGUAL: u8 = 61
+const MASCARA_SEXTETO: u32 = 0x3F
+const MASCARA_BYTE: u32 = 0xFF
+const MASCARA_ACUMULO: u32 = 0xFFFF
+const MASCARA_NIBBLE: u8 = 0x0F
+const HEX_INVALIDO: u32 = 16
+const HEX_MAXIMO: u32 = 15
+const ASCII_ZERO: u8 = 48
+const ASCII_NOVE: u8 = 57
+const ASCII_A_MAIUSCULA: u8 = 65
+const ASCII_F_MAIUSCULA: u8 = 70
+const ASCII_A_MINUSCULA: u8 = 97
+const ASCII_F_MINUSCULA: u8 = 102
+const OFFSET_DIGITO: u32 = 48
+const OFFSET_MAIUSCULA: u32 = 55
+const OFFSET_MINUSCULA: u32 = 87
+
+// Posicao 0..63 de c no alfabeto, ou SEXTETO_INVALIDO se nao esta nele.
+proc sexteto(c: u8, alfabeto: str) -> u32 {
+    for k in 0..<SEXTETOS_NO_ALFABETO {
+        if alfabeto[k] == c {
+            return k as u32
+        }
+    }
+    return SEXTETO_INVALIDO
+}
+
+// Valor 0..15 do digito hex c (maiuscula ou minuscula), ou HEX_INVALIDO.
+proc valor_hex(c: u8) -> u32 {
+    if c >= ASCII_ZERO and c <= ASCII_NOVE {
+        return (c as u32) - OFFSET_DIGITO
+    }
+    if c >= ASCII_A_MINUSCULA and c <= ASCII_F_MINUSCULA {
+        return (c as u32) - OFFSET_MINUSCULA
+    }
+    if c >= ASCII_A_MAIUSCULA and c <= ASCII_F_MAIUSCULA {
+        return (c as u32) - OFFSET_MAIUSCULA
+    }
+    return HEX_INVALIDO
+}
+
+// Codifica b no alfabeto dado, em grupos de 3 bytes; com_padding fecha o quarteto com '='.
+proc codifica(b: []u8, alfabeto: str, com_padding: bool, alloc: Allocator) -> str {
+    var out = make([dynamic]u8, alloc = heap)
+    defer delete(out)
+    let n = len(b)
+    var i = 0
+    while i + TRIO <= n {
+        let v = ((b[i] as u32) << 16) | ((b[i + 1] as u32) << 8) | (b[i + 2] as u32)
+        append(&out, item = alfabeto[((v >> 18) & MASCARA_SEXTETO) as int])
+        append(&out, item = alfabeto[((v >> 12) & MASCARA_SEXTETO) as int])
+        append(&out, item = alfabeto[((v >> 6) & MASCARA_SEXTETO) as int])
+        append(&out, item = alfabeto[(v & MASCARA_SEXTETO) as int])
+        i += TRIO
+    }
+    let resto = n - i
+    if resto == 1 {
+        let v = (b[i] as u32) << 16
+        append(&out, item = alfabeto[((v >> 18) & MASCARA_SEXTETO) as int])
+        append(&out, item = alfabeto[((v >> 12) & MASCARA_SEXTETO) as int])
+        if com_padding {
+            append(&out, item = IGUAL)
+            append(&out, item = IGUAL)
+        }
+    }
+    if resto == 2 {
+        let v = ((b[i] as u32) << 16) | ((b[i + 1] as u32) << 8)
+        append(&out, item = alfabeto[((v >> 18) & MASCARA_SEXTETO) as int])
+        append(&out, item = alfabeto[((v >> 12) & MASCARA_SEXTETO) as int])
+        append(&out, item = alfabeto[((v >> 6) & MASCARA_SEXTETO) as int])
+        if com_padding {
+            append(&out, item = IGUAL)
+        }
+    }
+    return from_bytes(out[..], alloc = alloc)
+}
+
+// Decodifica s no alfabeto dado. Confere o comprimento antes dos caracteres; em erro, libera a lista antes de devolver o erro.
+proc decodifica(s: str, alfabeto: str, alloc: Allocator) -> [dynamic]u8 ! CodecError {
+    let n = len(s)
+    var fim = n
+    var pad = 0
+    while fim > 0 and pad < PADDING_MAX and s[fim - 1] == IGUAL {
+        fim -= 1
+        pad += 1
+    }
+    if pad > 0 and n % QUARTETO != 0 {
+        return CodecError.tamanho_invalido
+    }
+    if fim % QUARTETO == 1 {
+        return CodecError.tamanho_invalido
+    }
+    var out = make([dynamic]u8, alloc = alloc)
+    var acumulo: u32 = 0
+    var bits: u32 = 0
+    for i in 0..<fim {
+        let v = sexteto(s[i], alfabeto)
+        if v == SEXTETO_INVALIDO {
+            delete(out)
+            return CodecError.caractere_invalido
+        }
+        acumulo = ((acumulo << BITS_SEXTETO) | v) & MASCARA_ACUMULO
+        bits += BITS_SEXTETO
+        if bits >= BITS_BYTE {
+            bits -= BITS_BYTE
+            append(&out, item = ((acumulo >> bits) & MASCARA_BYTE) as u8)
+        }
+    }
+    return out
+}
+
+// base64 padrao (RFC 4648 secao 4), com '=' no fim.
+pub proc encode(b: []u8, alloc: Allocator) -> str {
+    return codifica(b, ALFABETO_PADRAO, true, alloc)
+}
+
+// base64 padrao sem '='.
+pub proc encode_sem_padding(b: []u8, alloc: Allocator) -> str {
+    return codifica(b, ALFABETO_PADRAO, false, alloc)
+}
+
+// base64 URL-safe (RFC 4648 secao 5: '-' e '_' no lugar de '+' e '/'), com '='.
+pub proc encode_url(b: []u8, alloc: Allocator) -> str {
+    return codifica(b, ALFABETO_URL, true, alloc)
+}
+
+// base64 URL-safe sem '='.
+pub proc encode_url_sem_padding(b: []u8, alloc: Allocator) -> str {
+    return codifica(b, ALFABETO_URL, false, alloc)
+}
+
+// Decodifica base64 padrao (padding opcional). Caractere fora do alfabeto = CodecError.caractere_invalido; comprimento impossivel = CodecError.tamanho_invalido.
+pub proc decode(s: str, alloc: Allocator) -> [dynamic]u8 ! CodecError {
+    return decodifica(s, ALFABETO_PADRAO, alloc)
+}
+
+// Decodifica base64 URL-safe (padding opcional). Mesmos erros de decode.
+pub proc decode_url(s: str, alloc: Allocator) -> [dynamic]u8 ! CodecError {
+    return decodifica(s, ALFABETO_URL, alloc)
+}
+
+// Hex minusculo: 2 digitos por byte, sem prefixo.
+pub proc hex_encode(b: []u8, alloc: Allocator) -> str {
+    var out = make([dynamic]u8, alloc = heap)
+    defer delete(out)
+    for i in 0..<len(b) {
+        append(&out, item = DIGITOS_HEX[(b[i] >> DESLOCA_NIBBLE_U8) as int])
+        append(&out, item = DIGITOS_HEX[(b[i] & MASCARA_NIBBLE) as int])
+    }
+    return from_bytes(out[..], alloc = alloc)
+}
+
+// Decodifica hex (maiusculas ou minusculas). Comprimento impar = CodecError.tamanho_invalido; digito fora de 0-9a-fA-F = CodecError.caractere_invalido.
+pub proc hex_decode(s: str, alloc: Allocator) -> [dynamic]u8 ! CodecError {
+    let n = len(s)
+    if n % 2 != 0 {
+        return CodecError.tamanho_invalido
+    }
+    var out = make([dynamic]u8, alloc = alloc)
+    var i = 0
+    while i < n {
+        let alto = valor_hex(s[i])
+        let baixo = valor_hex(s[i + 1])
+        if alto > HEX_MAXIMO or baixo > HEX_MAXIMO {
+            delete(out)
+            return CodecError.caractere_invalido
+        }
+        append(&out, item = ((alto << BITS_NIBBLE) | baixo) as u8)
+        i += 2
+    }
+    return out
+}

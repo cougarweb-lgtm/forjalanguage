@@ -1,0 +1,439 @@
+// driver/editar_renomear.fj - porte de compiler/driver/editar_renomear.c
+// sha256 de driver/editar_renomear.c: 7b1f067fdd98231a7d5bc316b12cfb27d2258e3d6f72d382045cc23121a038e4
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "common"
+import "frontend"
+import "semantic"
+import "std:text"
+
+struct MarcaDeId {
+    marca: ?str
+    tipo: i32
+}
+
+const SEM_TOKEN: i64 = 4294967295
+const DECL_TXT_MAX: i32 = 512
+
+// C: driver/editar_renomear.c:16
+proc token_em_2(q: ^Consulta, i: u32) -> ^frontend.Token {
+    return &q.fim.toks[i as u64]
+}
+
+// C: driver/editar_renomear.c:21
+proc par_em(q: ^Consulta, i: u32) -> u32 {
+    return q.fim.par[i as u64]
+}
+
+// C: driver/editar_renomear.c:27
+proc token_depois(q: ^Consulta, off: u32) -> u32 {
+    var lo: u32 = 0
+    var hi: u32 = (len(q.fim.toks) as u64) as u32
+    while lo < hi {
+        let meio: u32 = lo + ((hi - lo) / 2)
+        if token_em_2(q, meio).off < off {
+            lo = meio + 1
+        } else {
+            hi = meio
+        }
+    }
+    return lo
+}
+
+// C: driver/editar_renomear.c:40
+proc token_exato(q: ^Consulta, off: u32) -> u32 {
+    let i: u32 = token_depois(q, off)
+    var tern_1: u32 = SEM_TOKEN as u32
+    if ((i as u64) < (len(q.fim.toks) as u64)) and (token_em_2(q, i).off == off) {
+        tern_1 = i
+    }
+    return tern_1
+}
+
+// C: driver/editar_renomear.c:47
+// Letra, digito, '_' ou byte de UTF-8 (>= 0x80); o 1o caractere nao pode ser digito.
+proc nome_valido(nome: str) -> bool {
+    let bytes_do_nome: []u8 = as_bytes(nome)
+    if len(bytes_do_nome) == 0 {
+        return false
+    }
+    if (bytes_do_nome[0] >= 48) and (bytes_do_nome[0] <= 57) {
+        return false
+    }
+    for c in bytes_do_nome {
+        if not caractere_de_nome(c) {
+            return false
+        }
+    }
+    return true
+}
+
+proc caractere_de_nome(c: u8) -> bool {
+    return ((c >= 97) and (c <= 122)) or ((c >= 65) and (c <= 90)) or ((c >= 48) and (c <= 57)) or (c == 95) or (c >= 128)
+}
+
+// C: driver/editar_renomear.c:65
+proc total_do_tipo(d: ?^frontend.Decl, tipo: i32) -> u32 {
+    if common.c2f_s2u_32(tipo) == (semantic.IND_CAMPO as u32) {
+        var tern_1: u32 = (d as ^frontend.Decl).ncampos
+        if (d as ^frontend.Decl).tipo_no == (frontend.D_ENUM as u8) {
+            tern_1 = 0
+        }
+        return tern_1
+    }
+    if common.c2f_s2u_32(tipo) == (semantic.IND_MEMBRO as u32) {
+        var tern_2: u32 = 0
+        if (d as ^frontend.Decl).tipo_no == (frontend.D_ENUM as u8) {
+            tern_2 = (d as ^frontend.Decl).nmembros
+        }
+        return tern_2
+    }
+    return (d as ^frontend.Decl).nparams
+}
+
+// C: driver/editar_renomear.c:72
+proc nome_do_item(d: ?^frontend.Decl, tipo: i32, i: u32) -> i32 {
+    if common.c2f_s2u_32(tipo) == (semantic.IND_CAMPO as u32) {
+        return ((d as ^frontend.Decl).campos or_else {})[i].nome
+    }
+    if common.c2f_s2u_32(tipo) == (semantic.IND_MEMBRO as u32) {
+        return ((d as ^frontend.Decl).membros or_else {})[i].nome
+    }
+    return ((d as ^frontend.Decl).params or_else {})[i].nome
+}
+
+// strtoul do C no Windows (unsigned long de 32 bits): satura em 4294967295; negativo cai no mesmo teto.
+proc numero_de_texto(s: str, fim: ^int) -> u32 {
+    let v: u64 = common.c2f_strtoull(s, 10, fim)
+    if v > 4294967295 {
+        return 4294967295
+    }
+    return v as u32
+}
+
+// C: driver/editar_renomear.c:80
+// "<decl>/campos[i]", "<decl>/membros[i]" ou "<decl>/params[i]": a 1a marca achada decide (true = e essa forma).
+proc alvo_por_marca(q: ^Consulta, texto: str, l: ^ListaAlvos) -> bool {
+    let marcas: [3]MarcaDeId = {MarcaDeId{marca = "/campos[", tipo = semantic.IND_CAMPO}, MarcaDeId{marca = "/membros[", tipo = semantic.IND_MEMBRO}, MarcaDeId{marca = "/params[", tipo = semantic.IND_PARAM}}
+    for marca_k in marcas {
+        let marca: str = marca_k.marca or_else ""
+        let achou: ?int = text.str_index_of(texto, marca)
+        if achou == none {
+            continue
+        }
+        let ate_decl: int = achou or_else 0
+        if ate_decl >= (DECL_TXT_MAX as int) {
+            return true
+        }
+        let decl: ?^frontend.Decl = consulta_achar_decl(q, texto[0..<ate_decl])
+        let ini_indice: int = ate_decl + len(marca)
+        var fim_numero: int = 0
+        let indice: u32 = numero_de_texto(texto[ini_indice..<len(texto)], &fim_numero)
+        if (decl == none) or (indice >= total_do_tipo(decl, marca_k.tipo)) {
+            return true
+        }
+        l.itens[0] = AlvoRefs{tipo = marca_k.tipo, decl = decl, indice = indice as i32, nome = nome_do_item(decl, marca_k.tipo, indice), decl_pos = semantic.AST_REF_SEM_POS as u32}
+        l.n = 1
+        return true
+    }
+    return false
+}
+
+// C: driver/editar_renomear.c:103
+// "<proc>/<nome>@linha:coluna" (o id de um local em 'consultar refs'): so os locais com essa linha e coluna.
+proc alvo_local_por_id(q: ^Consulta, texto: str, l: ^ListaAlvos) -> bool {
+    let achou_arroba: ?int = text.str_index_of(texto, "@")
+    if achou_arroba == none {
+        return false
+    }
+    let bytes_texto: []u8 = as_bytes(texto)
+    let arroba: int = achou_arroba or_else 0
+    var barra: int = arroba
+    while (barra > 0) and (bytes_texto[barra] != 47) {
+        barra -= 1
+    }
+    if (bytes_texto[barra] != 47) or (arroba >= (DECL_TXT_MAX as int)) {
+        return true
+    }
+    let nome_proc: str = texto[0..<barra]
+    let nome_local: str = texto[(barra + 1)..<arroba]
+    let arg: str = format(f"{nome_proc}.{nome_local}", alloc = heap)
+    defer delete(arg)
+    var fim_linha: int = 0
+    let linha: u32 = numero_de_texto(texto[(arroba + 1)..<len(texto)], &fim_linha)
+    let dois_pontos: int = (arroba + 1) + fim_linha
+    var coluna: u32 = 0
+    if (dois_pontos < len(texto)) and (bytes_texto[dois_pontos] == 58) {
+        var fim_coluna: int = 0
+        coluna = numero_de_texto(texto[(dois_pontos + 1)..<len(texto)], &fim_coluna)
+    }
+    var todos: ListaAlvos = ListaAlvos{}
+    consulta_alvos_de(q, arg, &todos)
+    let f: ^common.Fonte = &(q.c as ^Compilacao).fonte
+    var k: u32 = 0
+    while k < todos.n {
+        let it: AlvoRefs = todos.itens[k as u64]
+        let pos: common.FontePosicao = common.fonte_localizar_no_arquivo(f, it.decl_pos)
+        if (it.tipo == semantic.IND_LOCAL) and (pos.linha == linha) and (pos.coluna == coluna) {
+            l.itens[l.n as u64] = it
+            l.n += 1
+        }
+        k += 1
+    }
+    return true
+}
+
+// C: driver/editar_renomear.c:127
+proc resolver_alvo(p: ^Plano, texto: str, alvo: ^AlvoRefs) -> bool {
+    var l: ListaAlvos = ListaAlvos{}
+    l.n = 0
+    if (not alvo_local_por_id(p.q as ^Consulta, texto, &l)) and (not alvo_por_marca(p.q as ^Consulta, texto, &l)) {
+        consulta_alvos_de(p.q as ^Consulta, texto, &l)
+    }
+    if l.n == 0 {
+        let msg_1 = format(f"'{texto}' nao e declaracao do projeto (use nome, Tipo.campo, Enum.membro, proc.parametro ou o id de 'forja consultar refs')", alloc = heap)
+        defer delete(msg_1)
+        return plano_erro(p, msg_1)
+    }
+    if l.n > 1 {
+        let msg_2 = format(f"'{texto}' designa {l.n} alvos (locais de mesmo nome): use o id do 'forja consultar refs' (\"proc/nome@linha:coluna\")", alloc = heap)
+        defer delete(msg_2)
+        return plano_erro(p, msg_2)
+    }
+    alvo^ = l.itens[0]
+    return true
+}
+
+// C: driver/editar_renomear.c:139
+proc nome_da_decl_eh(q: ^Consulta, d: ?^frontend.Decl, texto: str) -> bool {
+    let nome_decl: i32 = (d as ^frontend.Decl).nome
+    if nome_decl < 0 {
+        return false
+    }
+    let tam_nome: int = common.interner_tam(&(q.c as ^Compilacao).nomes, nome_decl) as int
+    if tam_nome != len(texto) {
+        return false
+    }
+    let nome_txt: str = common.interner_texto(&(q.c as ^Compilacao).nomes, nome_decl)[0..<tam_nome]
+    return nome_txt == texto
+}
+
+// C: driver/editar_renomear.c:145
+proc alvo_renomeavel(p: ^Plano, a: ^AlvoRefs) -> bool {
+    let d: ?^frontend.Decl = a.decl
+    if (common.c2f_s2u_32(a.tipo) == (semantic.IND_EMBUTIDO as u32)) or (d == none) {
+        let msg_1 = format(f"e um nome embutido da linguagem: nao se renomeia", alloc = heap)
+        defer delete(msg_1)
+        return plano_erro(p, msg_1)
+    }
+    if ((p.q as ^Consulta).c as ^Compilacao).modulos.itens[(d as ^frontend.Decl).modulo].origem == (frontend.MOD_STD as u8) {
+        let msg_2 = format(f"a declaracao e da biblioteca padrao embutida no forja: nao se renomeia", alloc = heap)
+        defer delete(msg_2)
+        return plano_erro(p, msg_2)
+    }
+    if ((((d as ^frontend.Decl).tipo_no == (frontend.D_TEST as u8)) or ((d as ^frontend.Decl).tipo_no == (frontend.D_LINK as u8))) or ((d as ^frontend.Decl).tipo_no == (frontend.D_IMPORT as u8))) or ((d as ^frontend.Decl).tipo_no == (frontend.D_ASSERT as u8)) {
+        let msg_3 = format(f"so se renomeia proc, struct, enum, union, const, unit, campo, membro, parametro e local", alloc = heap)
+        defer delete(msg_3)
+        return plano_erro(p, msg_3)
+    }
+    if (d as ^frontend.Decl).externo {
+        let msg_4 = format(f"a declaracao e de um bloco 'foreign': o nome dela e o simbolo C, nao se renomeia", alloc = heap)
+        defer delete(msg_4)
+        return plano_erro(p, msg_4)
+    }
+    if ((common.c2f_s2u_32(a.tipo) == (semantic.IND_PROC as u32)) and ((d as ^frontend.Decl).modulo == 0)) and (common.c2f_b2i32(nome_da_decl_eh(p.q as ^Consulta, d, "main")) != 0) {
+        let msg_5 = format(f"o main da raiz e a entrada do programa: nao se renomeia", alloc = heap)
+        defer delete(msg_5)
+        return plano_erro(p, msg_5)
+    }
+    return true
+}
+
+// C: driver/editar_renomear.c:160
+proc offset_do_local(q: ^Consulta, a: ^AlvoRefs) -> u32 {
+    var i: u32 = token_depois(q, a.decl_pos)
+    while (i as u64) < (len(q.fim.toks) as u64) {
+        let t: ^frontend.Token = token_em_2(q, i)
+        if (t.tipo == (frontend.TK_IDENT as u8)) and (t.sym == a.nome) {
+            return t.off
+        }
+        i += 1
+    }
+    return semantic.AST_REF_SEM_POS as u32
+}
+
+// C: driver/editar_renomear.c:171
+proc offset_nome_do_alvo(q: ^Consulta, a: ^AlvoRefs) -> u32 {
+    let sw_1 = common.c2f_s2u_32(a.tipo)
+    if sw_1 == (semantic.IND_CAMPO as u32) {
+        return ((a.decl as ^frontend.Decl).campos or_else {})[a.indice].pos
+    } else if sw_1 == (semantic.IND_MEMBRO as u32) {
+        return ((a.decl as ^frontend.Decl).membros or_else {})[a.indice].pos
+    } else if sw_1 == (semantic.IND_PARAM as u32) {
+        return ((a.decl as ^frontend.Decl).params or_else {})[a.indice].pos
+    } else if sw_1 == (semantic.IND_LOCAL as u32) {
+        return offset_do_local(q, a)
+    } else {
+        return (a.decl as ^frontend.Decl).pos
+    }
+    return 0
+}
+
+// C: driver/editar_renomear.c:185
+proc offset_do_nome_no_uso(q: ^Consulta, pos: u32, nome: i32) -> u32 {
+    var i: u32 = token_exato(q, pos)
+    if i == (SEM_TOKEN as u32) {
+        return pos
+    }
+    while (((token_em_2(q, i).sym != nome) and (((i + 2) as u64) < (len(q.fim.toks) as u64))) and (token_em_2(q, i + 1).tipo == (frontend.TK_DOT as u8))) and (token_em_2(q, i + 2).tipo == (frontend.TK_IDENT as u8)) {
+        i += 2
+    }
+    var tern_1: u32 = pos
+    if token_em_2(q, i).sym == nome {
+        tern_1 = token_em_2(q, i).off
+    }
+    return tern_1
+}
+
+// C: driver/editar_renomear.c:194
+proc trocar_usos(p: ^Plano, a: ^AlvoRefs, novo: str) -> bool {
+    let q: ?^Consulta = p.q
+    let tam: u64 = common.interner_tam(&((q as ^Consulta).c as ^Compilacao).nomes, a.nome) as u64
+    var i: u64 = 0
+    while i < (len((q as ^Consulta).indice.usos) as u64) {
+        let u: ^semantic.IndUso = &(q as ^Consulta).indice.usos[i]
+        var pos: u32 = 0
+        if not consulta_uso_eh_do_alvo(u, a) {
+            i += 1
+            continue
+        }
+        pos = offset_do_nome_no_uso(q as ^Consulta, u.pos_nome, a.nome)
+        if not plano_trocar_offsets(p, pos, pos + (tam as u32), novo) {
+            return false
+        }
+        i += 1
+    }
+    return true
+}
+
+// C: driver/editar_renomear.c:211
+proc eh_tipo_de_retorno(q: ^Consulta, i: u32) -> bool {
+    var i_v: u32 = i
+    while ((i_v >= 2) and (token_em_2(q, i_v - 1).tipo == (frontend.TK_DOT as u8))) and (token_em_2(q, i_v - 2).tipo == (frontend.TK_IDENT as u8)) {
+        i_v -= 2
+    }
+    return (i_v >= 1) and ((token_em_2(q, i_v - 1).tipo == (frontend.TK_ARROW as u8)) or (token_em_2(q, i_v - 1).tipo == (frontend.TK_BANG as u8)))
+}
+
+// C: driver/editar_renomear.c:219
+proc rotulos_no_par(p: ^Plano, pos_nome: u32, abre: i32, a: ^AlvoRefs, novo: str) -> bool {
+    let q: ?^Consulta = p.q
+    let nome: u32 = token_exato(q as ^Consulta, pos_nome)
+    var fecha: u32 = 0
+    let tam: u64 = common.interner_tam(&((q as ^Consulta).c as ^Compilacao).nomes, a.nome) as u64
+    if ((nome == (SEM_TOKEN as u32)) or (((nome + 1) as u64) >= (len((q as ^Consulta).fim.toks) as u64))) or ((token_em_2(q as ^Consulta, nome + 1).tipo as u32) != common.c2f_s2u_32(abre)) {
+        return true
+    }
+    if (common.c2f_s2u_32(abre) == (frontend.TK_LBRACE as u32)) and (common.c2f_b2i32(eh_tipo_de_retorno(q as ^Consulta, nome)) != 0) {
+        return true
+    }
+    fecha = par_em(q as ^Consulta, nome + 1)
+    var j: u32 = nome + 2
+    while (fecha != (frontend.AST_FIM_NENHUM as u32)) and (j < fecha) {
+        let t: ^frontend.Token = token_em_2(q as ^Consulta, j)
+        if (par_em(q as ^Consulta, j) != (frontend.AST_FIM_NENHUM as u32)) and (par_em(q as ^Consulta, j) > j) {
+            j = par_em(q as ^Consulta, j)
+            j += 1
+            continue
+        }
+        if ((t.tipo != (frontend.TK_IDENT as u8)) or (t.sym != a.nome)) or (token_em_2(q as ^Consulta, j + 1).tipo != (frontend.TK_ASSIGN as u8)) {
+            j += 1
+            continue
+        }
+        if not plano_trocar_offsets(p, t.off, t.off + (tam as u32), novo) {
+            return false
+        }
+        j += 1
+    }
+    return true
+}
+
+// C: driver/editar_renomear.c:242
+// Parametro: o argumento nomeado das chamadas do proc. Campo: o rotulo dos literais da struct.
+proc trocar_rotulos(p: ^Plano, a: ^AlvoRefs, novo: str) -> bool {
+    let q: ^Consulta = p.q as ^Consulta
+    let param: bool = a.tipo == semantic.IND_PARAM
+    if (not param) and (a.tipo != semantic.IND_CAMPO) {
+        return true
+    }
+    var abre: i32 = frontend.TK_LBRACE
+    if param {
+        abre = frontend.TK_LPAREN
+    }
+    var k: int = 0
+    while k < len(q.indice.usos) {
+        let u: ^semantic.IndUso = &q.indice.usos[k]
+        k += 1
+        let alvo_tipo: i32 = u.alvo_tipo as i32
+        var serve: bool = (alvo_tipo == semantic.IND_STRUCT) or (alvo_tipo == semantic.IND_UNIAO)
+        if param {
+            serve = (alvo_tipo == semantic.IND_PROC) and u.chamada
+        }
+        if (u.alvo != a.decl) or (not serve) {
+            continue
+        }
+        if not rotulos_no_par(p, u.pos_nome, abre, a, novo) {
+            return false
+        }
+    }
+    return true
+}
+
+// C: driver/editar_renomear.c:258
+// Renomeia a declaracao, os usos que o indice acha e os rotulos "nome =" de argumento e de literal.
+proc editar_renomear(p: ^Plano, texto: str, novo: str) -> bool {
+    if not nome_valido(novo) {
+        let msg_1 = format(f"'{novo}' nao e um nome valido (letras, digitos e '_', sem comecar por digito)", alloc = heap)
+        defer delete(msg_1)
+        return plano_erro(p, msg_1)
+    }
+    var alvo: AlvoRefs = AlvoRefs{}
+    if (not resolver_alvo(p, texto, &alvo)) or (not alvo_renomeavel(p, &alvo)) {
+        return false
+    }
+    let q: ^Consulta = p.q as ^Consulta
+    let nomes: ^common.Interner = &(q.c as ^Compilacao).nomes
+    let tam_antigo: int = common.interner_tam(nomes, alvo.nome) as int
+    let antigo_txt: str = common.interner_texto(nomes, alvo.nome)[0..<tam_antigo]
+    if antigo_txt == novo {
+        let msg_2 = format(f"o nome novo '{novo}' e igual ao atual", alloc = heap)
+        defer delete(msg_2)
+        return plano_erro(p, msg_2)
+    }
+    let off: u32 = offset_nome_do_alvo(q, &alvo)
+    if off == (semantic.AST_REF_SEM_POS as u32) {
+        let msg_3 = format(f"nao achei onde '{texto}' e declarado", alloc = heap)
+        defer delete(msg_3)
+        return plano_erro(p, msg_3)
+    }
+    let fim_nome: u32 = off + (tam_antigo as u32)
+    return plano_trocar_offsets(p, off, fim_nome, novo) and trocar_usos(p, &alvo, novo) and trocar_rotulos(p, &alvo, novo)
+}
+
+test "nome_valido: letra, digito, _ e byte acima de 127; nao comeca por digito" {
+    expect(nome_valido("ab_9"))
+    expect(nome_valido("_x"))
+    expect(nome_valido("ação"))
+    expect(not nome_valido("9a"))
+    expect(not nome_valido("a-b"))
+    expect(not nome_valido(""))
+}
+
+test "numero_de_texto: le os digitos e satura no teto do unsigned long" {
+    var fim: int = 0
+    expect(numero_de_texto("12:3", &fim) == 12)
+    expect(fim == 2)
+    expect(numero_de_texto("7", &fim) == 7)
+    expect(numero_de_texto("4294967296", &fim) == 4294967295)
+}

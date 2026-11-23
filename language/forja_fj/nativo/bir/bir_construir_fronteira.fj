@@ -1,0 +1,816 @@
+// nativo/bir/bir_construir_fronteira.fj - porte de compiler/nativo/bir/bir_construir_fronteira.c
+// sha256 de nativo/bir/bir_construir_fronteira.c: df71b260ffb9f5150fa340322e69c1f3541e61745ad54869a6c251b4a0aea35b
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "common"
+import "ir"
+import "semantic"
+
+struct BirPonte {
+    simbolo: u32
+    formato: ?str
+    arquivo: u32
+    linha: u32
+}
+
+struct ParamDaPonte {
+    k: u32
+    vreg: u32
+}
+
+struct DescritoresDaPonte {
+    arg: [16]AbiSysvArg
+    campos: [16][16]AbiSysvCampo
+    ret: AbiSysvArg
+    campos_ret: [16]AbiSysvCampo
+}
+
+const PREFIXO_TRAMPOLIM: str = "fjt_"
+const PREFIXO_WRAPPER: str = "fjtw_"
+const PREFIXO_TRAMPOLIM_MS: str = "fjtm_"
+const PARAM_BLOCO: u32 = 0
+const PARAM_PILHA: u32 = 1
+const TEXTO_PARAMETRO_CALLBACK: str = "parametro '%s' do callback '%s'"
+const TEXTO_PARAMETRO_EXPORT: str = "parametro '%s' do proc exportado '%s'"
+const TEXTO_CALLBACK_MAX: i32 = 320
+const NOME_LIBERAR: str = "forja_liberar"
+const NOME_RELATAR: str = "forja_relatar_vazamentos"
+const FOLHAS_SYSV_MAX: u32 = 16
+
+// C: nativo/bir/bir_construir_fronteira.c:44
+proc funcao_do_proc(c: ^BirCtx, nome: i32) -> ?^ir.IrFuncao {
+    for k in (0 as u32)..<((c.e as ^BirEntrada).ir as ^ir.IrPrograma).nfuncoes {
+        if (((c.e as ^BirEntrada).ir as ^ir.IrPrograma).funcoes or_else {})[k].nome == nome {
+            return &(((c.e as ^BirEntrada).ir as ^ir.IrPrograma).funcoes or_else {})[k]
+        }
+    }
+    return none
+}
+
+// C: nativo/bir/bir_construir_fronteira.c:54
+proc simbolo_com_prefixo(c: ^BirCtx, prefixo: str, nome: i32) -> u32 {
+    let proc_c: str = common.interner_texto((c.e as ^BirEntrada).nomes as ^common.Interner, nome)
+    let mem_p = common.arena_mem(&(c.p as ^BirPrograma).arena)
+    var bytes = make([dynamic]u8, alloc = mem_p, cap = len(prefixo) + len(proc_c))
+    for k in 0..<len(prefixo) {
+        append(&bytes, item = as_bytes(prefixo)[k])
+    }
+    for k in 0..<len(proc_c) {
+        append(&bytes, item = as_bytes(proc_c)[k])
+    }
+    let texto: str = from_bytes(bytes[..], alloc = mem_p)
+    return bir_simbolo_global(c, texto)
+}
+
+// C: nativo/bir/bir_construir_fronteira.c:66
+proc simbolo_do_trampolim(c: ^BirCtx, nome: i32) -> u32 {
+    return simbolo_com_prefixo(c, PREFIXO_TRAMPOLIM, nome)
+}
+
+// C: nativo/bir/bir_construir_fronteira.c:72
+proc indice_do_trampolim(c: ^BirCtx, nome: i32) -> u32 {
+    for k in (0 as u32)..<((c.e as ^BirEntrada).ir as ^ir.IrPrograma).ntrampolins {
+        if (((c.e as ^BirEntrada).ir as ^ir.IrPrograma).trampolins or_else {})[k].nome == nome {
+            return k
+        }
+    }
+    return 4294967295
+}
+
+// C: nativo/bir/bir_construir_fronteira.c:81
+proc bir_operando_proc(c: ^BirCtx, v: ^ir.Valor, saida: ^BirOperando) -> bool {
+    if indice_do_trampolim(c, v.id) == 4294967295 {
+        let nome_proc: str = common.interner_texto((c.e as ^BirEntrada).nomes as ^common.Interner, v.id)
+        let bruto: str = format(f"V_PROC '{nome_proc}' sem IrTrampolim", alloc = heap)
+        defer delete(bruto)
+        let causa: str = common.c2f_cortar(bruto, (TEXTO_CALLBACK_MAX - 1) as int)
+        defer delete(causa)
+        return bir_falha_inconsistente(c, causa)
+    }
+    let endereco: u32 = bir_novo_vreg(c, BC_I64 as u8)
+    _ = bir_emitir_pedido(c, BirPedido{op = BIR_END_SIMBOLO as u8, dst = endereco, a = op_simbolo(simbolo_do_trampolim(c, v.id))})
+    saida^ = op_vreg(endereco, BC_I64 as u8)
+    return true
+}
+
+// C: nativo/bir/bir_construir_fronteira.c:99
+proc bir_comparador_do_runtime(c: ^BirCtx, i: ^ir.IrInstr, v: ^ir.Valor, saida: ^BirOperando) -> bool {
+    var proc_c: BirOperando = BirOperando{}
+    if (not bir_operando_de(c, i, v, &proc_c)) or (not bir_operando_vreg(c, proc_c, saida)) {
+        return false
+    }
+    if not (c.p as ^BirPrograma).sysv {
+        return true
+    }
+    c.comparador_runtime = true
+    saida^ = op_vreg(bir_conta_nova(c, BC_I64 as u8, BirPedido{op = BIR_ADD as u8, a = saida^, b = op_imed(-16, BC_I64 as u8)}), BC_I64 as u8)
+    return true
+}
+
+// Texto heap do formato da ponte: o formato so vem de TEXTO_PARAMETRO_CALLBACK ou TEXTO_PARAMETRO_EXPORT (dois literais), por isso despacha por igualdade em vez de formatar em runtime
+proc texto_do_parametro_da_ponte(formato: str, nome_param: str, proc_nome: str) -> str {
+    if formato == TEXTO_PARAMETRO_CALLBACK {
+        return format(f"parametro '{nome_param}' do callback '{proc_nome}'", alloc = heap)
+    }
+    return format(f"parametro '{nome_param}' do proc exportado '{proc_nome}'", alloc = heap)
+}
+
+test "bir_construir_fronteira: tamanhos SysV do escalar e do slot" {
+    expect(tam_escalar_sysv(BC_I8 as u8) == 1)
+    expect(tam_escalar_sysv(BC_I16 as u8) == 2)
+    expect(tam_escalar_sysv(BC_I32 as u8) == 4)
+    expect(tam_escalar_sysv(BC_I64 as u8) == 8)
+    expect(tam_do_slot_sysv(0) == 0)
+    expect(tam_do_slot_sysv(1) == 8)
+    expect(tam_do_slot_sysv(9) == 16)
+}
+
+test "bir_construir_fronteira: descritor escalar grava pelo slice" {
+    var campos: [1]AbiSysvCampo = {AbiSysvCampo{}}
+    let arg = descritor_escalar_sysv(campos[..], BC_I32 as u8)
+    expect(arg.tam == 4)
+    expect(arg.n_campos == 1)
+    expect(campos[0].alinhamento == 4)
+    expect(campos[0].classe == ABI_SYSV_INTEIRO)
+}
+
+test "bir_construir_fronteira: texto da ponte por formato" {
+    let cb = texto_do_parametro_da_ponte(TEXTO_PARAMETRO_CALLBACK, "x", "f")
+    defer delete(cb)
+    let ex = texto_do_parametro_da_ponte(TEXTO_PARAMETRO_EXPORT, "x", "f")
+    defer delete(ex)
+    expect(cb == "parametro 'x' do callback 'f'")
+    expect(ex == "parametro 'x' do proc exportado 'f'")
+}
+
+// C: nativo/bir/bir_construir_fronteira.c:127
+proc guarda_parametro(c: ^BirCtx, ponte: ^BirPonte, irf: ?^ir.IrFuncao, param: ^ParamDaPonte) {
+    let proc_nome: str = common.nome_modulo_exibicao(common.interner_texto((c.e as ^BirEntrada).nomes as ^common.Interner, (irf as ^ir.IrFuncao).nome))
+    let nome_param: str = common.interner_texto((c.e as ^BirEntrada).nomes as ^common.Interner, ((irf as ^ir.IrFuncao).params or_else {})[param.k].nome)
+    let oque: str = texto_do_parametro_da_ponte(ponte.formato or_else "", nome_param, proc_nome)
+    defer delete(oque)
+    if len(oque) >= (TEXTO_CALLBACK_MAX as int) {
+        let msg: str = format(f"bir: texto da ponte '{proc_nome}' passou de {TEXTO_CALLBACK_MAX} bytes", alloc = heap)
+        defer delete(msg)
+        common.falha_interna(msg)
+    }
+    var origem = BirOrigemNulo{oque = oque, arquivo = bir_arquivo_do_trecho(c, ponte.arquivo), linha = ponte.linha}
+    bir_falha_se_nulo(c, param.vreg, &origem)
+}
+
+// C: nativo/bir/bir_construir_fronteira.c:139
+proc argumento_da_ponte(c: ^BirCtx, ponte: ^BirPonte, irf: ?^ir.IrFuncao, param: ^ParamDaPonte) -> BirOperando {
+    let k: u32 = param.k
+    var arg: BirOperando = op_vreg(param.vreg, ((c.f as ^BirFuncao).classe_vreg or_else {})[param.vreg])
+    let classe: i32 = semantic.tipo_classe_de((c.e as ^BirEntrada).tipos as ^semantic.Tipos, ((irf as ^ir.IrFuncao).params or_else {})[k].tipo)
+    if (c.f as ^BirFuncao).param_tam != none {
+        if ((c.f as ^BirFuncao).param_tam or_else {})[k] != 0 {
+            arg.tam = ((c.f as ^BirFuncao).param_tam or_else {})[k]
+            return arg
+        }
+    }
+    if ((c.p as ^BirPrograma).modo == (BM_DEV as u8)) or (c.p as ^BirPrograma).checagem {
+        if (classe == semantic.TC_PONTEIRO) or (classe == semantic.TC_CSTR) {
+            guarda_parametro(c, ponte, irf, param)
+        }
+    }
+    return bir_estender_estreito(arg, ((irf as ^ir.IrFuncao).params or_else {})[k].tipo)
+}
+
+// C: nativo/bir/bir_construir_fronteira.c:154
+proc emitir_chamada(c: ^BirCtx, irf: ?^ir.IrFuncao, args: ?[]BirOperando, retorno: u8) -> ^BirInstr {
+    let chama: ^BirInstr = bir_emitir(c, BIR_CHAMA, retorno)
+    chama.simbolo = c.simbolo_do_nome[((irf as ^ir.IrFuncao).nome) as int]
+    chama.args = args
+    chama.nargs = (irf as ^ir.IrFuncao).nparams
+    return chama
+}
+
+// C: nativo/bir/bir_construir_fronteira.c:165
+proc chamar_com_retorno_agregado_2(c: ^BirCtx, irf: ?^ir.IrFuncao, args: ?[]BirOperando) -> bool {
+    var forma: BirSlot = BirSlot{}
+    var destino: BirOperando = BirOperando{}
+    var endereco: u32 = 0
+    if not bir_forma(c, (irf as ^ir.IrFuncao).retorno, &forma) {
+        return false
+    }
+    endereco = bir_novo_vreg(c, BC_I64 as u8)
+    _ = bir_emitir_end_slot(c, bir_novo_slot(c, forma.tam, forma.alinhamento), endereco)
+    destino = op_vreg(endereco, BC_I64 as u8)
+    destino.tam = (c.f as ^BirFuncao).retorno_tam
+    let p_1 = emitir_chamada(c, irf, args, BC_NADA as u8)
+    p_1.a = destino
+    bir_retorna(c, &destino)
+    return true
+}
+
+// C: nativo/bir/bir_construir_fronteira.c:183
+proc chamar_e_devolver(c: ^BirCtx, irf: ?^ir.IrFuncao, args: ?[]BirOperando) -> bool {
+    let retorno: u8 = (c.f as ^BirFuncao).retorno
+    var valor: BirOperando = BirOperando{}
+    var dst: u32 = 0
+    if (c.f as ^BirFuncao).retorno_tam != 0 {
+        return chamar_com_retorno_agregado_2(c, irf, args)
+    }
+    if retorno == (BC_NADA as u8) {
+        _ = emitir_chamada(c, irf, args, BC_NADA as u8)
+        bir_retorna(c, none)
+        return true
+    }
+    dst = bir_novo_vreg(c, retorno)
+    let p_1 = emitir_chamada(c, irf, args, retorno)
+    p_1.dst = dst
+    valor = op_vreg(dst, retorno)
+    bir_retorna(c, &valor)
+    return true
+}
+
+// Alvo wasm (reactor): ponteiro, rawptr, cstr e ?^T atravessam a fronteira como i32 (offset na memoria linear, convencao do wasm32);
+// dentro do modulo o ponteiro segue i64 (a BIR so conhece i64), entao a ponte estende na entrada e trunca na saida.
+// Trampolim de proc valor (formato CALLBACK) fica com os tipos nativos da BIR (ponteiro i64): so o call_indirect o chama, e ele monta o tipo dos operandos.
+proc ponteiro_na_fronteira_wasm(c: ^BirCtx, ponte: ^BirPonte, tipo: u32) -> bool {
+    if not (c.e as ^BirEntrada).wasm {
+        return false
+    }
+    if (ponte.formato or_else "") == TEXTO_PARAMETRO_CALLBACK {
+        return false
+    }
+    let classe: i32 = semantic.tipo_classe_de((c.e as ^BirEntrada).tipos as ^semantic.Tipos, tipo)
+    // ?cstr (nicho, none = 0) tambem e offset i32 (0.37.0; antes saia i64/BigInt por engano de classe)
+    return (classe == semantic.TC_PONTEIRO) or (classe == semantic.TC_RAWPTR) or (classe == semantic.TC_CSTR) or (classe == semantic.TC_ANULAVEL) or (common.c2f_b2i32(semantic.tipo_opcional_nicho((c.e as ^BirEntrada).tipos as ^semantic.Tipos, tipo)) != 0)
+}
+
+// Retorno de ponteiro no wasm: a chamada devolve i64 e a ponte devolve o i32 truncado (o offset cabe em 32 bits)
+proc chamar_e_devolver_ponteiro_wasm(c: ^BirCtx, irf: ?^ir.IrFuncao, args: ?[]BirOperando) -> bool {
+    let dst: u32 = bir_novo_vreg(c, BC_I64 as u8)
+    let chama: ^BirInstr = emitir_chamada(c, irf, args, BC_I64 as u8)
+    chama.dst = dst
+    let estreito: u32 = bir_conta_nova(c, BC_I32 as u8, BirPedido{op = BIR_TRUNC as u8, a = op_vreg(dst, BC_I64 as u8)})
+    let ponte_atual: ^BirFuncao = c.f as ^BirFuncao
+    ponte_atual.retorno = BC_I32 as u8
+    var valor: BirOperando = op_vreg(estreito, BC_I32 as u8)
+    bir_retorna(c, &valor)
+    return true
+}
+
+// 0.41.0: struct por valor na fronteira do reactor wasm (array e struct aninhada em export ja sao E0901 em qualquer alvo, checagem do .h). Parametro agregado = i32 com o offset de um bloco do host (o proc interno le dali, sem copia:
+// o parametro e imutavel e a chamada e sincrona); retorno agregado = i32 extra INICIAL (sret, offset onde o proc escreve o resultado) e a funcao wasm devolve void.
+// Layout = o de `bir_forma` (igual ao do x64 e ao de um ^T). Os demais agregados (union, tupla, ?T nao-nicho, T ! E, str, fatia...) seguem em X0001 (wasm_exportar_procs).
+proc assinatura_agregada_embrulhavel_wasm(c: ^BirCtx, ponte: ^BirPonte, ir_f: ^ir.IrFuncao) -> bool {
+    if (not (c.e as ^BirEntrada).wasm) or ((ponte.formato or_else "") == TEXTO_PARAMETRO_CALLBACK) {
+        return false
+    }
+    let tipos: ^semantic.Tipos = (c.e as ^BirEntrada).tipos as ^semantic.Tipos
+    var tem_agregado: bool = false
+    var k: u32 = 0
+    while k <= ir_f.nparams {
+        var tipo: u32 = ir_f.retorno
+        if k < ir_f.nparams {
+            tipo = (ir_f.params or_else {})[k].tipo
+        }
+        k += 1
+        if not bir_eh_agregado(tipos, tipo) {
+            continue
+        }
+        let classe: i32 = semantic.tipo_classe_de(tipos, tipo)
+        if (classe != semantic.TC_STRUCT) and (classe != semantic.TC_ARRAY) {
+            return false
+        }
+        tem_agregado = true
+    }
+    return tem_agregado
+}
+
+// C: nativo/bir/bir_construir_fronteira.c:203
+proc construir_ponte(c: ^BirCtx, irf: ?^ir.IrFuncao, ponte: ^BirPonte) -> bool {
+    let p: ^BirPrograma = c.p as ^BirPrograma
+    let ir_f: ^ir.IrFuncao = irf as ^ir.IrFuncao
+    let embrulha: bool = assinatura_agregada_embrulhavel_wasm(c, ponte, ir_f)
+    let sret: bool = embrulha and bir_eh_agregado((c.e as ^BirEntrada).tipos as ^semantic.Tipos, ir_f.retorno)
+    var desloc: u32 = 0
+    if sret {
+        desloc = 1
+    }
+    let k_f: u32 = p.nfuncoes
+    p.nfuncoes += 1
+    var fs: []BirFuncao = p.funcoes or_else {}
+    fs[k_f] = BirFuncao{simbolo = ponte.simbolo, nparams = ir_f.nparams + desloc, pos = BIR_SEM_POS, blocos = make([dynamic]BirBloco, alloc = heap, cap = BLOCOS_INICIAL as int), slots = make([dynamic]BirSlot, alloc = heap, cap = BLOCOS_INICIAL as int)}
+    c.f = &fs[k_f]
+    c.cap_vregs = 0
+    c.atual = none
+    if sret {
+        _ = bir_novo_vreg(c, BC_I32 as u8)
+    }
+    if not bir_preparar_assinatura(c, irf) {
+        return false
+    }
+    var classes_param: []u8 = (c.f as ^BirFuncao).classe_vreg or_else {}
+    for k in (0 as u32)..<ir_f.nparams {
+        let tipo_k: u32 = (ir_f.params or_else {})[k].tipo
+        if ponteiro_na_fronteira_wasm(c, ponte, tipo_k) or (embrulha and bir_eh_agregado((c.e as ^BirEntrada).tipos as ^semantic.Tipos, tipo_k)) {
+            classes_param[k + desloc] = BC_I32 as u8
+        }
+    }
+    c.cur = bir_novo_bloco(c, false)
+    // P46c: thread de fora ganha o fio antes de tudo
+    var chamada = BirChamadaRt{funcao = "forja_fio_da_ponte", retorno = BC_NADA as u8, nargs = 0}
+    _ = bir_chamar_runtime(c, &chamada, none)
+    var args: []BirOperando = arena_fatia_bir_operando(&p.arena, ir_f.nparams as int)
+    for k in (0 as u32)..<ir_f.nparams {
+        let tipo_k: u32 = (ir_f.params or_else {})[k].tipo
+        var param = ParamDaPonte{k = k, vreg = k + desloc}
+        if ponteiro_na_fronteira_wasm(c, ponte, tipo_k) or (embrulha and bir_eh_agregado((c.e as ^BirEntrada).tipos as ^semantic.Tipos, tipo_k)) {
+            param.vreg = bir_conta_nova(c, BC_I64 as u8, BirPedido{op = BIR_EXT_Z as u8, a = op_vreg(k + desloc, BC_I32 as u8)})
+        }
+        args[k] = argumento_da_ponte(c, ponte, irf, &param)
+    }
+    var ok: bool = true
+    if sret {
+        let tam_ret: u32 = (c.f as ^BirFuncao).retorno_tam
+        var destino: BirOperando = op_vreg(bir_conta_nova(c, BC_I64 as u8, BirPedido{op = BIR_EXT_Z as u8, a = op_vreg(0, BC_I32 as u8)}), BC_I64 as u8)
+        destino.tam = tam_ret
+        let chama: ^BirInstr = emitir_chamada(c, irf, args, BC_NADA as u8)
+        chama.a = destino
+        bir_retorna(c, none)
+    } else if ponteiro_na_fronteira_wasm(c, ponte, ir_f.retorno) {
+        ok = chamar_e_devolver_ponteiro_wasm(c, irf, args)
+    } else {
+        ok = chamar_e_devolver(c, irf, args)
+    }
+    if embrulha {
+        // a ponte wasm ja nao tem agregado por valor (so i32): sem isto o validador de memoria e as passagens de copia a enxergariam
+        let ponte_atual: ^BirFuncao = c.f as ^BirFuncao
+        ponte_atual.param_tam = none
+        ponte_atual.retorno_tam = 0
+        if sret {
+            ponte_atual.retorno = BC_NADA as u8
+        }
+    }
+    return ok
+}
+
+// C: nativo/bir/bir_construir_fronteira.c:224
+proc tam_escalar_sysv(classe: u8) -> u32 {
+    let sw_1 = classe as i32
+    if sw_1 == BC_I8 {
+        return 1
+    } else if sw_1 == BC_I16 {
+        return 2
+    } else if sw_1 == BC_I32 or sw_1 == BC_F32 {
+        return 4
+    } else {
+        return 8
+    }
+    return 0
+}
+
+// C: nativo/bir/bir_construir_fronteira.c:235
+proc tipo_sysv_atendido(c: ^BirCtx, tipo: u32) -> bool {
+    var classe: u8 = 0
+    if bir_classe_do_tipo((c.e as ^BirEntrada).tipos as ^semantic.Tipos, tipo, &classe) {
+        return true
+    }
+    return (common.c2f_b2i32(bir_eh_agregado((c.e as ^BirEntrada).tipos as ^semantic.Tipos, tipo)) != 0) and (bir_descritor_sysv(c, tipo) != none)
+}
+
+// C: nativo/bir/bir_construir_fronteira.c:245
+proc assinatura_sysv(c: ^BirCtx, irf: ?^ir.IrFuncao) -> bool {
+    if (irf as ^ir.IrFuncao).nparams > ABI_SYSV_MAX_ARGS {
+        return false
+    }
+    if ((irf as ^ir.IrFuncao).retorno != (semantic.TIPO_VAZIO as u32)) and (not tipo_sysv_atendido(c, (irf as ^ir.IrFuncao).retorno)) {
+        return false
+    }
+    var k: u32 = 0
+    while k < (irf as ^ir.IrFuncao).nparams {
+        if not tipo_sysv_atendido(c, ((irf as ^ir.IrFuncao).params or_else {})[k].tipo) {
+            return false
+        }
+        k += 1
+    }
+    return true
+}
+
+// C: nativo/bir/bir_construir_fronteira.c:258
+// campos: fatia de 1 elemento que guarda o descritor (o C passa o endereco de 1 AbiSysvCampo)
+proc descritor_escalar_sysv(campos: []AbiSysvCampo, classe: u8) -> AbiSysvArg {
+    let tam: u32 = tam_escalar_sysv(classe)
+    campos[0].classe = ABI_SYSV_INTEIRO
+    if bir_classe_eh_real(classe as i32) {
+        campos[0].classe = ABI_SYSV_SSE
+    }
+    campos[0].deslocamento = 0
+    campos[0].alinhamento = tam
+    return AbiSysvArg{tam = tam, campos = campos, n_campos = 1}
+}
+
+// C: nativo/bir/bir_construir_fronteira.c:277
+// C2F-INDECIDIVEL: campos
+proc descrever_tipo_sysv(c: ^BirCtx, tipo: u32, arg: ^AbiSysvArg, campos: []AbiSysvCampo) {
+    var classe: u8 = 0
+    if bir_classe_do_tipo((c.e as ^BirEntrada).tipos as ^semantic.Tipos, tipo, &classe) {
+        arg^ = descritor_escalar_sysv(campos, classe)
+        return
+    }
+    let desc: ^BirSysv = bir_descritor_sysv(c, tipo) as ^BirSysv
+    arg^ = AbiSysvArg{tam = desc.tam, campos = campos, n_campos = desc.n}
+    let folhas: []BirFolhaSysv = desc.folhas or_else {}
+    for f in (0 as u32)..<desc.n {
+        campos[f] = AbiSysvCampo{classe = ABI_SYSV_INTEIRO, deslocamento = folhas[f].deslocamento, alinhamento = folhas[f].alinhamento}
+        if folhas[f].sse != 0 {
+            campos[f].classe = ABI_SYSV_SSE
+        }
+    }
+}
+
+// C: nativo/bir/bir_construir_fronteira.c:295
+proc planejar_entrada_sysv(c: ^BirCtx, irf: ?^ir.IrFuncao, plano: ^AbiSysvPlano) -> bool {
+    let ir_f: ^ir.IrFuncao = irf as ^ir.IrFuncao
+    var d = DescritoresDaPonte{}
+    for k in (0 as u32)..<ir_f.nparams {
+        descrever_tipo_sysv(c, ((ir_f.params or_else {})[k]).tipo, &d.arg[k], d.campos[k][..])
+    }
+    d.ret = AbiSysvArg{}
+    if ir_f.retorno != (semantic.TIPO_VAZIO as u32) {
+        descrever_tipo_sysv(c, ir_f.retorno, &d.ret, d.campos_ret[..])
+    }
+    if abi_sysv_planejar(d.arg[0..<ir_f.nparams], &d.ret, plano) {
+        return true
+    }
+    return bir_falha_inconsistente(c, "callback SysV: plano da ABI nao fecha")
+}
+
+// C: nativo/bir/bir_construir_fronteira.c:308
+proc carregar_parametro_sysv(c: ^BirCtx, plano: ^AbiSysvPlano, k: u32, classe: u8) -> u32 {
+    let dst: u32 = bir_novo_vreg(c, classe)
+    let na_pilha: bool = plano.arg[k].na_memoria
+    var tern_1: u32 = 0
+    if common.c2f_b2i32(na_pilha) != 0 {
+        tern_1 = plano.off[k]
+    } else {
+        tern_1 = abi_sysv_bloco_arg(plano.arg[k].reg[0])
+    }
+    let desloc: u32 = tern_1
+    var tern_2: u32 = PARAM_BLOCO
+    if common.c2f_b2i32(na_pilha) != 0 {
+        tern_2 = PARAM_PILHA
+    }
+    bir_emitir_carrega(c, dst, tern_2, transmute(desloc, to = i32))
+    return dst
+}
+
+// C: nativo/bir/bir_construir_fronteira.c:319
+proc tam_do_slot_sysv(tam: u32) -> u32 {
+    return (((tam + ABI_SYSV_BYTES_EIGHTBYTE) - 1) / ABI_SYSV_BYTES_EIGHTBYTE) * ABI_SYSV_BYTES_EIGHTBYTE
+}
+
+// C: nativo/bir/bir_construir_fronteira.c:325
+proc copiar_agregado_do_bloco(c: ^BirCtx, plano: ^AbiSysvPlano, k: u32, tam: u32) -> u32 {
+    let arg_1: u32 = bir_novo_vreg(c, BC_I64 as u8)
+    let arg_2: u32 = bir_novo_slot(c, tam_do_slot_sysv(tam), ABI_SYSV_BYTES_EIGHTBYTE)
+    let arg_3: ^BirCtx = c
+    let endereco: u32 = bir_emitir_end_slot(arg_3, arg_2, arg_1)
+    var e: u32 = 0
+    while e < plano.arg[k].n_eightbytes {
+        let valor: u32 = bir_novo_vreg(c, BC_I64 as u8)
+        bir_emitir_carrega(c, valor, PARAM_BLOCO, transmute(abi_sysv_bloco_arg(plano.arg[k].reg[e]), to = i32))
+        bir_emitir_grava(c, endereco, transmute(e * ABI_SYSV_BYTES_EIGHTBYTE, to = i32), op_vreg(valor, BC_I64 as u8))
+        e += 1
+    }
+    return endereco
+}
+
+// C: nativo/bir/bir_construir_fronteira.c:339
+proc endereco_da_pilha_sysv(c: ^BirCtx, plano: ^AbiSysvPlano, k: u32) -> u32 {
+    return bir_conta_nova(c, BC_I64 as u8, BirPedido{op = BIR_ADD as u8, a = op_vreg(PARAM_PILHA, BC_I64 as u8), b = op_imed(plano.off[k] as i64, BC_I64 as u8)})
+}
+
+// C: nativo/bir/bir_construir_fronteira.c:345
+proc argumento_agregado_sysv(c: ^BirCtx, plano: ^AbiSysvPlano, irf: ?^ir.IrFuncao, k: u32) -> BirOperando {
+    var forma: BirSlot = BirSlot{}
+    var arg: BirOperando = BirOperando{}
+    _ = bir_forma(c, ((irf as ^ir.IrFuncao).params or_else {})[k].tipo, &forma)
+    var tern_1: u32 = 0
+    if common.c2f_b2i32(plano.arg[k].na_memoria) != 0 {
+        tern_1 = endereco_da_pilha_sysv(c, plano, k)
+    } else {
+        tern_1 = copiar_agregado_do_bloco(c, plano, k, forma.tam)
+    }
+    arg = op_vreg(tern_1, BC_I64 as u8)
+    arg.tam = forma.tam
+    return arg
+}
+
+// C: nativo/bir/bir_construir_fronteira.c:356
+proc argumentos_do_bloco_sysv(c: ^BirCtx, ponte: ^BirPonte, irf: ?^ir.IrFuncao, plano: ^AbiSysvPlano) -> ?[]BirOperando {
+    let ir_f: ^ir.IrFuncao = irf as ^ir.IrFuncao
+    var args: []BirOperando = arena_fatia_bir_operando(&(c.p as ^BirPrograma).arena, ir_f.nparams as int)
+    var classe: u8 = 0
+    for k in (0 as u32)..<ir_f.nparams {
+        if bir_classe_do_tipo((c.e as ^BirEntrada).tipos as ^semantic.Tipos, ((ir_f.params or_else {})[k]).tipo, &classe) {
+            var param = ParamDaPonte{k = k, vreg = carregar_parametro_sysv(c, plano, k, classe)}
+            args[k] = argumento_da_ponte(c, ponte, irf, &param)
+        } else {
+            args[k] = argumento_agregado_sysv(c, plano, irf, k)
+        }
+    }
+    return args
+}
+
+// C: nativo/bir/bir_construir_fronteira.c:371
+proc gravar_retorno_no_bloco(c: ^BirCtx, irf: ?^ir.IrFuncao, plano: ^AbiSysvPlano, vreg: u32) {
+    let classe: u8 = ((c.f as ^BirFuncao).classe_vreg or_else {})[vreg]
+    var valor: BirOperando = op_vreg(vreg, classe)
+    if ((classe as i32) >= BC_I8) and ((classe as i32) <= BC_I32) {
+        var tern_1: i32 = BIR_EXT_S
+        if common.c2f_b2i32(semantic.tipo_eh_sem_sinal((irf as ^ir.IrFuncao).retorno)) != 0 {
+            tern_1 = BIR_EXT_Z
+        }
+        valor = op_vreg(bir_conta_nova(c, BC_I64 as u8, BirPedido{op = tern_1 as u8, a = valor}), BC_I64 as u8)
+    }
+    bir_emitir_grava(c, PARAM_BLOCO, transmute(abi_sysv_bloco_ret(plano.ret.reg[0]), to = i32), valor)
+}
+
+// C: nativo/bir/bir_construir_fronteira.c:382
+proc chamar_com_destino_sysv(c: ^BirCtx, irf: ?^ir.IrFuncao, args: ?[]BirOperando, endereco: u32) {
+    var forma: BirSlot = BirSlot{}
+    var destino: BirOperando = op_vreg(endereco, BC_I64 as u8)
+    _ = bir_forma(c, (irf as ^ir.IrFuncao).retorno, &forma)
+    destino.tam = forma.tam
+    let p_1 = emitir_chamada(c, irf, args, BC_NADA as u8)
+    p_1.a = destino
+}
+
+// C: nativo/bir/bir_construir_fronteira.c:393
+proc gravar_eightbytes_do_retorno(c: ^BirCtx, plano: ^AbiSysvPlano, endereco: u32) {
+    var e: u32 = 0
+    while e < plano.ret.n_eightbytes {
+        let valor: u32 = bir_novo_vreg(c, BC_I64 as u8)
+        bir_emitir_carrega(c, valor, endereco, transmute(e * ABI_SYSV_BYTES_EIGHTBYTE, to = i32))
+        let arg_1: BirOperando = op_vreg(valor, BC_I64 as u8)
+        let arg_2: i32 = transmute(abi_sysv_bloco_ret(plano.ret.reg[e]), to = i32)
+        let arg_3: ^BirCtx = c
+        bir_emitir_grava(arg_3, PARAM_BLOCO, arg_2, arg_1)
+        e += 1
+    }
+}
+
+// C: nativo/bir/bir_construir_fronteira.c:405
+proc chamar_e_gravar_agregado_sysv(c: ^BirCtx, irf: ?^ir.IrFuncao, args: ?[]BirOperando, plano: ^AbiSysvPlano) {
+    var forma: BirSlot = BirSlot{}
+    var endereco: u32 = 0
+    _ = bir_forma(c, (irf as ^ir.IrFuncao).retorno, &forma)
+    if plano.oculto {
+        endereco = bir_novo_vreg(c, BC_I64 as u8)
+        bir_emitir_carrega(c, endereco, PARAM_BLOCO, transmute(abi_sysv_bloco_arg(ABI_SYSV_RDI), to = i32))
+        let arg_1: BirOperando = op_vreg(endereco, BC_I64 as u8)
+        let arg_2: i32 = transmute(abi_sysv_bloco_ret(ABI_SYSV_RAX), to = i32)
+        let arg_3: ^BirCtx = c
+        bir_emitir_grava(arg_3, PARAM_BLOCO, arg_2, arg_1)
+        chamar_com_destino_sysv(c, irf, args, endereco)
+        return
+    }
+    let arg_4: u32 = bir_novo_vreg(c, BC_I64 as u8)
+    let arg_5: u32 = bir_novo_slot(c, tam_do_slot_sysv(forma.tam), ABI_SYSV_BYTES_EIGHTBYTE)
+    let arg_6: ^BirCtx = c
+    endereco = bir_emitir_end_slot(arg_6, arg_5, arg_4)
+    chamar_com_destino_sysv(c, irf, args, endereco)
+    gravar_eightbytes_do_retorno(c, plano, endereco)
+}
+
+// C: nativo/bir/bir_construir_fronteira.c:423
+proc chamar_e_gravar_sysv(c: ^BirCtx, irf: ?^ir.IrFuncao, args: ?[]BirOperando, plano: ^AbiSysvPlano) {
+    var classe: u8 = BC_NADA as u8
+    var dst: u32 = 0
+    if (irf as ^ir.IrFuncao).retorno == (semantic.TIPO_VAZIO as u32) {
+        _ = emitir_chamada(c, irf, args, BC_NADA as u8)
+    } else if bir_classe_do_tipo((c.e as ^BirEntrada).tipos as ^semantic.Tipos, (irf as ^ir.IrFuncao).retorno, &classe) {
+        dst = bir_novo_vreg(c, classe)
+        let p_1 = emitir_chamada(c, irf, args, classe)
+        p_1.dst = dst
+        gravar_retorno_no_bloco(c, irf, plano, dst)
+    } else {
+        chamar_e_gravar_agregado_sysv(c, irf, args, plano)
+    }
+    bir_retorna(c, none)
+}
+
+// C: nativo/bir/bir_construir_fronteira.c:440
+proc construir_ponte_sysv(c: ^BirCtx, irf: ?^ir.IrFuncao, ponte: ^BirPonte) -> bool {
+    let p: ^BirPrograma = c.p as ^BirPrograma
+    let ir_f: ^ir.IrFuncao = irf as ^ir.IrFuncao
+    let k_f: u32 = p.nfuncoes
+    p.nfuncoes += 1
+    let wrapper: u32 = simbolo_com_prefixo(c, PREFIXO_WRAPPER, ir_f.nome)
+    var plano = AbiSysvPlano{}
+    if not planejar_entrada_sysv(c, irf, &plano) {
+        return false
+    }
+    var fs: []BirFuncao = p.funcoes or_else {}
+    fs[k_f] = BirFuncao{simbolo = wrapper, nparams = 2, pos = BIR_SEM_POS, blocos = make([dynamic]BirBloco, alloc = heap, cap = BLOCOS_INICIAL as int), slots = make([dynamic]BirSlot, alloc = heap, cap = BLOCOS_INICIAL as int)}
+    c.f = &fs[k_f]
+    c.cap_vregs = 0
+    c.atual = none
+    _ = bir_novo_vreg(c, BC_I64 as u8)
+    _ = bir_novo_vreg(c, BC_I64 as u8)
+    c.cur = bir_novo_bloco(c, false)
+    var chamada = BirChamadaRt{funcao = "forja_fio_da_ponte", retorno = BC_NADA as u8, nargs = 0}
+    _ = bir_chamar_runtime(c, &chamada, none)
+    chamar_e_gravar_sysv(c, irf, argumentos_do_bloco_sysv(c, ponte, irf, &plano), &plano)
+    let entradas: []BirEntradaSysv = p.entradas_sysv or_else {}
+    let k_e: u32 = p.nentradas_sysv
+    p.nentradas_sysv += 1
+    entradas[k_e] = BirEntradaSysv{stub = ponte.simbolo, wrapper = wrapper, win64 = BIR_SEM_SIMBOLO}
+    return true
+}
+
+// C: nativo/bir/bir_construir_fronteira.c:463
+proc construir_trampolim(c: ^BirCtx, t: ^ir.IrTrampolim) -> bool {
+    let irf: ?^ir.IrFuncao = funcao_do_proc(c, t.nome)
+    var ponte: BirPonte = BirPonte{simbolo = simbolo_do_trampolim(c, t.nome), formato = TEXTO_PARAMETRO_CALLBACK, arquivo = t.arquivo, linha = t.linha}
+    if irf == none {
+        return bir_falha_inconsistente(c, "trampolim de proc inexistente")
+    }
+    if (not (c.p as ^BirPrograma).sysv) or (not assinatura_sysv(c, irf)) {
+        return construir_ponte(c, irf, &ponte)
+    }
+    if not construir_ponte_sysv(c, irf, &ponte) {
+        return false
+    }
+    if not c.comparador_runtime {
+        return true
+    }
+    ponte.simbolo = simbolo_com_prefixo(c, PREFIXO_TRAMPOLIM_MS, t.nome)
+    let ptr_1: ^BirPrograma = c.p as ^BirPrograma
+    let ptr_2: ^BirPrograma = c.p as ^BirPrograma
+    let p_1 = ptr_1.entradas_sysv or_else {}
+    p_1[ptr_2.nentradas_sysv - 1].win64 = ponte.simbolo
+    return construir_ponte(c, irf, &ponte)
+}
+
+// C: nativo/bir/bir_construir_fronteira.c:481
+proc bir_construir_trampolins(c: ^BirCtx) -> bool {
+    let p: ^BirPrograma = c.p as ^BirPrograma
+    let ir_p: ^ir.IrPrograma = (c.e as ^BirEntrada).ir as ^ir.IrPrograma
+    if p.sysv {
+        p.entradas_sysv = arena_fatia_bir_entrada_sysv(&p.arena, (ir_p.ntrampolins + 1) as int)
+    }
+    for k in (0 as u32)..<ir_p.ntrampolins {
+        if (c.alcance != none) and (not bir_alcance_trampolim(c.alcance, k)) {
+            continue
+        }
+        if not construir_trampolim(c, &((ir_p.trampolins or_else {})[k])) {
+            return false
+        }
+    }
+    return true
+}
+
+// C: nativo/bir/bir_construir_fronteira.c:496
+proc contar_exports(ir_c: ^ir.IrPrograma) -> u32 {
+    var n: u32 = 0
+    for k in (0 as u32)..<ir_c.nfuncoes {
+        if (ir_c.funcoes or_else {})[k].exportado {
+            n += 1
+        }
+    }
+    return n
+}
+
+// C: nativo/bir/bir_construir_fronteira.c:508
+proc exporta_texto(c: ^BirCtx) -> bool {
+    var k: u32 = 0
+    while k < ((c.e as ^BirEntrada).ir as ^ir.IrPrograma).nfuncoes {
+        let f: ^ir.IrFuncao = &(((c.e as ^BirEntrada).ir as ^ir.IrPrograma).funcoes or_else {})[k]
+        if (common.c2f_b2i32(f.exportado) != 0) and ((common.c2f_s2u_32(semantic.tipo_classe_de((c.e as ^BirEntrada).tipos as ^semantic.Tipos, f.retorno)) == (semantic.TC_CSTR as u32)) or (common.c2f_b2i32(semantic.tipo_opcional_nicho((c.e as ^BirEntrada).tipos as ^semantic.Tipos, f.retorno)) != 0)) {
+            return true
+        }
+        k += 1
+    }
+    return false
+}
+
+// C: nativo/bir/bir_construir_fronteira.c:520
+proc construir_liberar(c: ^BirCtx) -> bool {
+    let p: ^BirPrograma = c.p as ^BirPrograma
+    let k_f: u32 = p.nfuncoes
+    p.nfuncoes += 1
+    let simbolo_liberar: u32 = bir_simbolo_global(c, NOME_LIBERAR)
+    let fs = p.funcoes or_else {}
+    fs[k_f] = BirFuncao{simbolo = simbolo_liberar, nparams = 1, pos = BIR_SEM_POS, blocos = make([dynamic]BirBloco, alloc = heap, cap = BLOCOS_INICIAL as int), slots = make([dynamic]BirSlot, alloc = heap, cap = BLOCOS_INICIAL as int)}
+    c.f = &fs[k_f]
+    c.cap_vregs = 0
+    c.atual = none
+    // wasm (0.37.0): o cstr atravessa a fronteira como offset i32; a ponte estende para o i64 que o runtime espera
+    let no_wasm: bool = (c.e as ^BirEntrada).wasm
+    var classe_param: u8 = BC_I64 as u8
+    if no_wasm {
+        classe_param = BC_I32 as u8
+    }
+    _ = bir_novo_vreg(c, classe_param)
+    c.cur = bir_novo_bloco(c, false)
+    // C passa o texto direto ao strlen; sem caminho (none) o C cairia, aqui vira "" (decisao registrada)
+    let arquivo: str = bir_arquivo_do_trecho(c, 0) or_else ""
+    var args: []BirOperando = arena_fatia_bir_operando(&p.arena, 3)
+    args[0] = op_vreg(0, BC_I64 as u8)
+    if no_wasm {
+        args[0] = op_vreg(bir_conta_nova(c, BC_I64 as u8, BirPedido{op = BIR_EXT_Z as u8, a = op_vreg(0, BC_I32 as u8)}), BC_I64 as u8)
+    }
+    args[1] = op_vreg(bir_vreg_do_texto(c, arquivo, (len(arquivo) as u64) as u32), BC_I64 as u8)
+    args[2] = op_imed(0, BC_I32 as u8)
+    // BirChamarRuntime (aloca) com retorno NADA: dst = BIR_SEM_VREG, simbolo runtime, args e nargs = 3
+    let chama: ^BirInstr = bir_emitir(c, BIR_CHAMA, BC_NADA as u8)
+    chama.simbolo = bir_simbolo_runtime(c, "forja_mem_liberar")
+    chama.dst = BIR_SEM_VREG
+    chama.args = args
+    chama.nargs = 3
+    bir_retorna(c, none)
+    return true
+}
+
+// 0.38.0 (so wasm, dev): forja_relatar_vazamentos() -> i32 chama o runtime vazamentos_relatar (R0009 no stderr, devolve os pontos) e trunca o i64 para i32
+proc construir_relatar(c: ^BirCtx) {
+    let p: ^BirPrograma = c.p as ^BirPrograma
+    let k_f: u32 = p.nfuncoes
+    p.nfuncoes += 1
+    let fs = p.funcoes or_else {}
+    fs[k_f] = BirFuncao{simbolo = bir_simbolo_global(c, NOME_RELATAR), retorno = BC_I32 as u8, pos = BIR_SEM_POS, blocos = make([dynamic]BirBloco, alloc = heap, cap = BLOCOS_INICIAL as int), slots = make([dynamic]BirSlot, alloc = heap, cap = BLOCOS_INICIAL as int)}
+    c.f = &fs[k_f]
+    c.cap_vregs = 0
+    c.atual = none
+    c.cur = bir_novo_bloco(c, false)
+    let dst: u32 = bir_novo_vreg(c, BC_I64 as u8)
+    let chama: ^BirInstr = bir_emitir(c, BIR_CHAMA, BC_I64 as u8)
+    chama.simbolo = bir_simbolo_runtime(c, "forja_vazamentos_relatar")
+    chama.dst = dst
+    chama.nargs = 0
+    let estreito: u32 = bir_conta_nova(c, BC_I32 as u8, BirPedido{op = BIR_TRUNC as u8, a = op_vreg(dst, BC_I64 as u8)})
+    var valor: BirOperando = op_vreg(estreito, BC_I32 as u8)
+    bir_retorna(c, &valor)
+}
+
+// C: nativo/bir/bir_construir_fronteira.c:541
+proc construir_export(c: ^BirCtx, irf: ^ir.IrFuncao) -> bool {
+    let nome: str = common.interner_texto((c.e as ^BirEntrada).nomes as ^common.Interner, irf.nome)
+    let ptr_1: ^BirPrograma = c.p as ^BirPrograma
+    let ptr_2: ^BirPrograma = c.p as ^BirPrograma
+    let antes_1: u32 = ptr_2.nexportados
+    ptr_2.nexportados += 1
+    let p_1 = ptr_1.exportados or_else {}
+    p_1[antes_1] = nome
+    var lit_1 = BirPonte{simbolo = bir_simbolo_global(c, nome), formato = TEXTO_PARAMETRO_EXPORT, arquivo = 0, linha = irf.linha}
+    return construir_ponte(c, irf, &lit_1)
+}
+
+// C: nativo/bir/bir_construir_fronteira.c:550
+proc construir_info(c: ^BirCtx) {
+    let p: ^BirPrograma = c.p as ^BirPrograma
+    let k_f: u32 = p.nfuncoes
+    p.nfuncoes += 1
+    let simbolo_info: u32 = bir_simbolo_global(c, DLL_INFO_NOME)
+    let fs = p.funcoes or_else {}
+    fs[k_f] = BirFuncao{simbolo = simbolo_info, retorno = BC_I64 as u8, pos = BIR_SEM_POS, blocos = make([dynamic]BirBloco, alloc = heap, cap = BLOCOS_INICIAL as int), slots = make([dynamic]BirSlot, alloc = heap, cap = BLOCOS_INICIAL as int)}
+    c.f = &fs[k_f]
+    c.cap_vregs = 0
+    c.atual = none
+    c.cur = bir_novo_bloco(c, false)
+    let vreg: u32 = bir_novo_vreg(c, BC_I64 as u8)
+    let dados: u32 = bir_simbolo_global(c, DLL_INFO_SIMBOLO_DADOS)
+    _ = bir_emitir_pedido(c, BirPedido{op = BIR_END_SIMBOLO as u8, dst = vreg, a = op_simbolo(dados)})
+    var valor: BirOperando = op_vreg(vreg, BC_I64 as u8)
+    bir_retorna(c, &valor)
+}
+
+// C: nativo/bir/bir_construir_fronteira.c:567
+proc bir_construir_exports(c: ^BirCtx) -> bool {
+    let p: ^BirPrograma = c.p as ^BirPrograma
+    let ir_p: ^ir.IrPrograma = (c.e as ^BirEntrada).ir as ^ir.IrPrograma
+    p.exportados = common.arena_fatia_str(&p.arena, (contar_exports(ir_p) + 2) as int)
+    for k in (0 as u32)..<ir_p.nfuncoes {
+        if (ir_p.funcoes or_else {})[k].exportado {
+            if not construir_export(c, &((ir_p.funcoes or_else {})[k])) {
+                return false
+            }
+        }
+    }
+    let exportados: []str = p.exportados or_else {}
+    // wasm: sem forja_dll_info (os dados dele vivem no .rdata do obj, que o wasm nao tem; so serve ao std:reload); forja_liberar existe desde a 0.37.0
+    if not (c.e as ^BirEntrada).wasm {
+        exportados[p.nexportados] = DLL_INFO_NOME
+        p.nexportados += 1
+        construir_info(c)
+    }
+    // 0.38.0: so dev (o rastro do R0009 nao existe no release); o wasm_gerar tira o export se o programa nao aloca no heap
+    if (c.e as ^BirEntrada).wasm and (p.modo == (BM_DEV as u8)) {
+        exportados[p.nexportados] = NOME_RELATAR
+        p.nexportados += 1
+        construir_relatar(c)
+    }
+    if not exporta_texto(c) {
+        return true
+    }
+    exportados[p.nexportados] = NOME_LIBERAR
+    p.nexportados += 1
+    return construir_liberar(c)
+}

@@ -1,0 +1,72 @@
+// teste_tick.fj 0.1.1 (10/11/2026) - testes de unidade do engine:mundo_tick (M0-b): passo fixo exato, teto de 5 ticks por quadro e fila de eventos por tick.
+// Roda por `forja test` (sem janela, sem GPU, sem relogio). O proc main so existe porque o forja test exige um programa.
+// Changelog: 0.1.1 - G18: tick.Evento virou tick.EventoTick. 0.1.0 - M0-b da trilha M0 (engine:mundo_tick).
+// Verificar: $env:FORJA_ENGINE='C:\ENGINE_GAME3D\engine'; & "$env:TEMP\forja_f2_fim\forja.exe" test C:\ENGINE_GAME3D\testes_mundo\teste_tick.fj
+import "motor/mundo" as mundo
+import "motor/mundo_tick" as tick
+
+const TT_UM_SEGUNDO_NS: u64 = 1000000000
+const TT_TRES_TICKS_NS: u64 = 50000000
+const TT_MEIO_TICK_NS: u64 = 8333334
+
+proc main() {
+    print(0)
+}
+
+proc evento_em(t: u64, dado: i64) -> tick.EventoTick {
+    return tick.EventoTick{tick = t, tipo = tick.TipoEvento.criada, entidade = mundo.Entidade{indice = 1, geracao = 1}, dado = dado}
+}
+
+// dado do evento de numero `ordem` no tick, ou -1 se nao existe.
+proc dado_de(f: ^tick.FilaEventos, t: u64, ordem: u32) -> i64 {
+    var dado: i64 = -1
+    switch ev in tick.fila_do_tick(f, tick = t, ordem = ordem) {
+        case tick.EventoTick:
+            dado = ev.dado
+        case tick.ErroFila:
+            dado = -1
+    }
+    return dado
+}
+
+test "constantes: 60 Hz e teto de 5 ticks" {
+    expect(tick.TICK_HZ == 60 and tick.TICK_MAX_POR_QUADRO == 5)
+}
+
+test "passo exato: 50 ms sao 3 ticks sem sobra e duas metades de tick fecham 1" {
+    var r = tick.relogio_novo()
+    expect(tick.relogio_acumular(&r, dt_ns = TT_TRES_TICKS_NS) == 3)
+    expect(tick.relogio_acumular(&r, dt_ns = TT_MEIO_TICK_NS) == 0)
+    expect(tick.relogio_acumular(&r, dt_ns = TT_MEIO_TICK_NS) == 1)
+    expect(tick.relogio_acumular(&r, dt_ns = 0) == 0)
+}
+
+test "teto: 1 s devolve 5 ticks e o atraso a mais e descartado" {
+    var r = tick.relogio_novo()
+    expect(tick.relogio_acumular(&r, dt_ns = TT_UM_SEGUNDO_NS) == 5)
+    expect(tick.relogio_acumular(&r, dt_ns = 0) == 0)
+    expect(tick.relogio_acumular(&r, dt_ns = 1000000000000000) == 5)
+}
+
+test "tempo em ticks: so relogio_avancar anda" {
+    var r = tick.relogio_novo()
+    expect(tick.relogio_tick(&r) == 0)
+    _ = tick.relogio_acumular(&r, dt_ns = TT_UM_SEGUNDO_NS)
+    expect(tick.relogio_tick(&r) == 0)
+    tick.relogio_avancar(&r)
+    tick.relogio_avancar(&r)
+    expect(tick.relogio_tick(&r) == 2)
+}
+
+test "fila de eventos: contagem e ordem por tick" {
+    var f = tick.fila_nova(8)
+    tick.fila_publicar(&f, ev = evento_em(3, dado = 30))
+    tick.fila_publicar(&f, ev = evento_em(3, dado = 31))
+    tick.fila_publicar(&f, ev = evento_em(4, dado = 40))
+    expect(tick.fila_total(&f) == 3)
+    expect(tick.fila_contar_tick(&f, tick = 3) == 2 and tick.fila_contar_tick(&f, tick = 4) == 1)
+    expect(tick.fila_contar_tick(&f, tick = 5) == 0)
+    expect(dado_de(&f, t = 3, ordem = 0) == 30 and dado_de(&f, t = 3, ordem = 1) == 31)
+    expect(dado_de(&f, t = 4, ordem = 0) == 40 and dado_de(&f, t = 3, ordem = 2) == -1)
+    frame_reset()
+}

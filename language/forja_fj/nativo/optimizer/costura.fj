@@ -1,0 +1,855 @@
+// nativo/optimizer/costura.fj - porte de compiler/nativo/optimizer/costura.c, compiler/nativo/optimizer/costura.h
+// sha256 de nativo/optimizer/costura.c: ea2a7bdef7d2e3efcf09a12a591fae7d505d75cf61f7b0f492e1204ce3b270f6
+// sha256 de nativo/optimizer/costura.h: d70ee29016d01ecacf823732f1b49b181989a8ae1ab7fbd2f2aa45d62b6bdd86
+// gerado por c2forja esqueleto 0.3.2; stubs portados e linhas do gerado conferidas contra o C (O7)
+// Versao: 0.1.0
+
+import "nativo/bir"
+
+// Os vetores de CosCtx sao vistas (?[]) sobre os [dynamic] *_mem, que sao os donos: a Forja nao tem calloc sem dono.
+// faixas e um vetor de COSTURA_RAIZES_MAX (C: CosFaixa *faixas), nao um ponteiro para um so elemento.
+struct CosCtx {
+    f: ?^bir.BirFuncao
+    nvregs: u32
+    nblocos: u32
+    nraizes: u32
+    raiz_de: ?[]i32
+    saida: ?[]CosForma
+    entrada: ?[]CosFaixa
+    ramo: ?[]CosFaixa
+    feito: ?[]u8
+    ov_alvo: ?[]u8
+    tab: ?[]CosForma
+    faixas: ?[]CosFaixa
+    dup_blocos: u32
+    dup_instrs: u32
+    mudou: bool
+    raiz_de_mem: [dynamic]i32
+    saida_mem: [dynamic]CosForma
+    entrada_mem: [dynamic]CosFaixa
+    ramo_mem: [dynamic]CosFaixa
+    feito_mem: [dynamic]u8
+    ov_alvo_mem: [dynamic]u8
+    tab_mem: [dynamic]CosForma
+    faixas_mem: [dynamic]CosFaixa
+}
+
+// C: nativo/optimizer/costura.c:43
+proc eh_conta_ov_4(op: u8) -> bool {
+    return (((op == (bir.BIR_ADD_OV as u8)) or (op == (bir.BIR_SUB_OV as u8))) or (op == (bir.BIR_MUL_OV as u8))) or (op == (bir.BIR_NEG_OV as u8))
+}
+
+// C: nativo/optimizer/costura.c:48
+proc terminador_2(f: ^bir.BirFuncao, b: u32) -> ^bir.BirInstr {
+    return &f.blocos[b].instrs[f.blocos[b].n - 1]
+}
+
+// C: nativo/optimizer/costura.c:54
+proc eh_definicao(op: u8) -> bool {
+    return ((((((op != (bir.BIR_SALTA as u8)) and (op != (bir.BIR_DESVIA as u8))) and (op != (bir.BIR_RETORNA as u8))) and (op != (bir.BIR_ARMADILHA as u8))) and (op != (bir.BIR_GRAVA as u8))) and (op != (bir.BIR_COPIA_MEM as u8))) and (op != (bir.BIR_ZERA_MEM as u8))
+}
+
+// C: nativo/optimizer/costura.c:60
+proc eh_puro(op: u8) -> bool {
+    let sw_1 = op as i32
+    if sw_1 == bir.BIR_CONST or sw_1 == bir.BIR_COPIA or sw_1 == bir.BIR_ADD or sw_1 == bir.BIR_SUB or sw_1 == bir.BIR_MUL or sw_1 == bir.BIR_AND or sw_1 == bir.BIR_OR or sw_1 == bir.BIR_XOR or sw_1 == bir.BIR_NEG or sw_1 == bir.BIR_NOT or sw_1 == bir.BIR_CMP or sw_1 == bir.BIR_EXT_S or sw_1 == bir.BIR_EXT_Z or sw_1 == bir.BIR_TRUNC {
+        return true
+    }
+    return false
+}
+
+// C: nativo/optimizer/costura.c:72
+proc eh_candidato(f: ^bir.BirFuncao, b: u32) -> bool {
+    let k: ^bir.BirBloco = &f.blocos[b]
+    if (b == 0) or k.frio or (k.n < 2) or (k.n > COSTURA_BLOCO_INSTR_MAX) {
+        return false
+    }
+    let t: ^bir.BirInstr = &k.instrs[k.n - 1]
+    if (t.op != (bir.BIR_DESVIA as u8)) or (t.alvo[0] == t.alvo[1]) {
+        return false
+    }
+    var j: u32 = 0
+    while (j + 1) < k.n {
+        if not eh_puro(k.instrs[j].op) {
+            return false
+        }
+        j += 1
+    }
+    return true
+}
+
+// C: nativo/optimizer/costura.c:90
+proc aresta_ramo(f: ^bir.BirFuncao, p: u32, r: u32, b: u32) -> bool {
+    let t: ^bir.BirInstr = terminador_2(f, p)
+    if t.op == (bir.BIR_SALTA as u8) {
+        return (r == 0) and (t.alvo[0] == b)
+    }
+    return (t.op == (bir.BIR_DESVIA as u8)) and (t.alvo[r] == b)
+}
+
+// C: nativo/optimizer/costura.c:99
+proc vreg_i64(c: ^CosCtx, v: u32) -> bool {
+    return (v < c.nvregs) and (((c.f as ^bir.BirFuncao).classe_vreg or_else {})[v] == (bir.BC_I64 as u8))
+}
+
+// C: nativo/optimizer/costura.c:105
+proc forma_afim(c: ^CosCtx, tab: []CosForma, i: ^bir.BirInstr, subtrai: bool) -> CosForma {
+    var v: u32 = 0
+    var d: i64 = 0
+    var saida = CosForma{}
+    if (i.a.tipo == (bir.BO_VREG as u8)) and (i.b.tipo == (bir.BO_IMED as u8)) {
+        v = i.a.id
+        d = i.b.imed
+    } else if (not subtrai) and (i.a.tipo == (bir.BO_IMED as u8)) and (i.b.tipo == (bir.BO_VREG as u8)) {
+        v = i.b.id
+        d = i.a.imed
+    } else {
+        return cos_sem_forma()
+    }
+    if not vreg_i64(c, v) {
+        return cos_sem_forma()
+    }
+    let base: CosForma = cos_forma_de(c.raiz_de or_else {}, tab, v)
+    if subtrai {
+        if d == ((-9223372036854775807) - 1) {
+            return cos_sem_forma()
+        }
+        d = -d
+    }
+    if cos_forma_soma(base, d, &saida) {
+        return saida
+    }
+    return cos_sem_forma()
+}
+
+// C: nativo/optimizer/costura.c:132
+proc forma_da_instr(c: ^CosCtx, tab: []CosForma, i: ^bir.BirInstr) -> CosForma {
+    if not vreg_i64(c, i.dst) {
+        return cos_sem_forma()
+    }
+    let sw_1 = i.op as i32
+    if sw_1 == bir.BIR_COPIA {
+        if (i.a.tipo == (bir.BO_VREG as u8)) and vreg_i64(c, i.a.id) {
+            return cos_forma_de(c.raiz_de or_else {}, tab, i.a.id)
+        }
+        return cos_sem_forma()
+    } else if sw_1 == bir.BIR_ADD {
+        return forma_afim(c, tab, i, false)
+    } else if sw_1 == bir.BIR_SUB {
+        return forma_afim(c, tab, i, true)
+    }
+    return cos_sem_forma()
+}
+
+// C: nativo/optimizer/costura.c:151
+proc espelho(cond: u8) -> u8 {
+    let sw_1 = cond as i32
+    if sw_1 == bir.BCOND_LT_S {
+        return bir.BCOND_GT_S as u8
+    } else if sw_1 == bir.BCOND_GT_S {
+        return bir.BCOND_LT_S as u8
+    } else if sw_1 == bir.BCOND_LE_S {
+        return bir.BCOND_GE_S as u8
+    } else if sw_1 == bir.BCOND_GE_S {
+        return bir.BCOND_LE_S as u8
+    }
+    return cond
+}
+
+// C: nativo/optimizer/costura.c:162
+proc cond_sinalizada(cond: u8) -> bool {
+    return (((((cond == (bir.BCOND_EQ as u8)) or (cond == (bir.BCOND_NE as u8))) or (cond == (bir.BCOND_LT_S as u8))) or (cond == (bir.BCOND_LE_S as u8))) or (cond == (bir.BCOND_GT_S as u8))) or (cond == (bir.BCOND_GE_S as u8))
+}
+
+// C: nativo/optimizer/costura.c:167
+proc registrar_cond(c: ^CosCtx, tab: []CosForma, cond: ^CosCond, i: ^bir.BirInstr) {
+    var f = CosForma{}
+    var k: i64 = 0
+    var op: u8 = 0
+    cond.valida = false
+    if not cond_sinalizada(i.aux) {
+        return
+    }
+    if (i.a.tipo == (bir.BO_VREG as u8)) and (i.b.tipo == (bir.BO_IMED as u8)) and vreg_i64(c, i.a.id) {
+        f = cos_forma_de(c.raiz_de or_else {}, tab, i.a.id)
+        k = i.b.imed
+        op = i.aux
+    } else if (i.a.tipo == (bir.BO_IMED as u8)) and (i.b.tipo == (bir.BO_VREG as u8)) and vreg_i64(c, i.b.id) {
+        f = cos_forma_de(c.raiz_de or_else {}, tab, i.b.id)
+        k = i.a.imed
+        op = espelho(i.aux)
+    } else {
+        return
+    }
+    if f.raiz < 0 {
+        return
+    }
+    cond^ = CosCond{valida = true, vreg = i.dst, forma = f, k = k, cond = op}
+}
+
+// C: nativo/optimizer/costura.c:193
+proc passo_instrucao(c: ^CosCtx, tab: []CosForma, cond: ^CosCond, i: ^bir.BirInstr) {
+    if (not eh_definicao(i.op)) or (i.dst >= c.nvregs) {
+        return
+    }
+    if cond.valida and (i.dst == cond.vreg) {
+        cond.valida = false
+    }
+    if i.op == (bir.BIR_CMP as u8) {
+        registrar_cond(c, tab, cond, i)
+        tab[i.dst] = cos_sem_forma()
+        return
+    }
+    tab[i.dst] = forma_da_instr(c, tab, i)
+}
+
+// C: nativo/optimizer/costura.c:207
+proc entrada_conhecida(c: ^CosCtx, b: u32) -> bool {
+    var arestas: u32 = 0
+    if (b == 0) or (((c.ov_alvo or_else {})[b] as i32) != 0) {
+        return false
+    }
+    var p: u32 = 0
+    while p < c.nblocos {
+        for r in (0 as u32)..<2 {
+            if not aresta_ramo(c.f as ^bir.BirFuncao, p, r, b) {
+                continue
+            }
+            if not ((c.feito or_else {})[p] != 0) {
+                return false
+            }
+            arestas += 1
+        }
+        p += 1
+    }
+    return arestas > 0
+}
+
+// C: nativo/optimizer/costura.c:226
+proc mesclar_aresta(c: ^CosCtx, aresta: u32, primeira: bool, ent: []CosFaixa) {
+    let nr: int = c.nraizes as int
+    let nv: int = c.nvregs as int
+    let ram: []CosFaixa = c.ramo or_else {}
+    let sai: []CosForma = c.saida or_else {}
+    let tab: []CosForma = c.tab or_else {}
+    let ini_ram: int = (aresta as int) * nr
+    let ini_sai: int = ((aresta / 2) as int) * nv
+    var k: int = 0
+    while k < nr {
+        if primeira or (ram[ini_ram + k].lo < ent[k].lo) {
+            ent[k].lo = ram[ini_ram + k].lo
+        }
+        if primeira or (ram[ini_ram + k].hi > ent[k].hi) {
+            ent[k].hi = ram[ini_ram + k].hi
+        }
+        k += 1
+    }
+    var v: int = 0
+    while v < nv {
+        if primeira {
+            tab[v] = sai[ini_sai + v]
+        } else {
+            tab[v] = cos_mescla_forma(tab[v], sai[ini_sai + v])
+        }
+        v += 1
+    }
+}
+
+// C: nativo/optimizer/costura.c:242
+proc mesclar_entrada(c: ^CosCtx, b: u32) {
+    var primeira: bool = true
+    let nr: int = c.nraizes as int
+    let ini: int = (b as int) * nr
+    let entrada: []CosFaixa = c.entrada or_else {}
+    var p: u32 = 0
+    while p < c.nblocos {
+        for r in (0 as u32)..<2 {
+            if not aresta_ramo(c.f as ^bir.BirFuncao, p, r, b) {
+                continue
+            }
+            mesclar_aresta(c, (p * 2) + r, primeira, entrada[ini..<(ini + nr)])
+            primeira = false
+        }
+        p += 1
+    }
+}
+
+// C: nativo/optimizer/costura.c:258
+proc sem_informacao(c: ^CosCtx, b: u32) {
+    let nr: int = c.nraizes as int
+    let nv: int = c.nvregs as int
+    let ini: int = (b as int) * nr
+    let entrada: []CosFaixa = c.entrada or_else {}
+    let tab: []CosForma = c.tab or_else {}
+    var k: int = 0
+    while k < nr {
+        entrada[ini + k] = CosFaixa{lo = (-9223372036854775807) - 1, hi = 9223372036854775807}
+        k += 1
+    }
+    var v: int = 0
+    while v < nv {
+        tab[v] = cos_sem_forma()
+        v += 1
+    }
+}
+
+// C: nativo/optimizer/costura.c:268
+proc calcular_entrada(c: ^CosCtx, b: u32) {
+    if entrada_conhecida(c, b) {
+        mesclar_entrada(c, b)
+    } else {
+        sem_informacao(c, b)
+    }
+}
+
+// Copia vetor de formas (C: memcpy de CosForma; dst e src tem o mesmo tamanho).
+proc copiar_formas(dst: []CosForma, src: []CosForma) {
+    var k: int = 0
+    while k < len(src) {
+        dst[k] = src[k]
+        k += 1
+    }
+}
+
+// Copia vetor de faixas (C: memcpy de CosFaixa; dst e src tem o mesmo tamanho).
+proc copiar_faixas(dst: []CosFaixa, src: []CosFaixa) {
+    var k: int = 0
+    while k < len(src) {
+        dst[k] = src[k]
+        k += 1
+    }
+}
+
+// C: nativo/optimizer/costura.c:277
+proc analisar_bloco(c: ^CosCtx, b: u32) {
+    let f: ^bir.BirFuncao = c.f as ^bir.BirFuncao
+    let blk: ^bir.BirBloco = &f.blocos[b]
+    let t: ^bir.BirInstr = &blk.instrs[blk.n - 1]
+    let nr: int = c.nraizes as int
+    let nv: int = c.nvregs as int
+    let tab: []CosForma = c.tab or_else {}
+    var cond = CosCond{}
+    calcular_entrada(c, b)
+    var j: u32 = 0
+    while (j + 1) < blk.n {
+        passo_instrucao(c, tab, &cond, &blk.instrs[j])
+        j += 1
+    }
+    let saida: []CosForma = c.saida or_else {}
+    copiar_formas(saida[((b as int) * nv)..<(((b as int) + 1) * nv)], tab)
+    let ramo: []CosFaixa = c.ramo or_else {}
+    let entrada: []CosFaixa = c.entrada or_else {}
+    let ini_entrada: int = (b as int) * nr
+    var r: u32 = 0
+    while r < 2 {
+        let ini_ramo: int = (((b as int) * 2) + (r as int)) * nr
+        copiar_faixas(ramo[ini_ramo..<(ini_ramo + nr)], entrada[ini_entrada..<(ini_entrada + nr)])
+        if (t.op == (bir.BIR_DESVIA as u8)) and cond.valida and (cond.vreg == t.a.id) {
+            cos_refinar(&cond, r == 0, ramo[ini_ramo..<(ini_ramo + nr)])
+        }
+        r += 1
+    }
+    let feito: []u8 = c.feito or_else {}
+    feito[b] = 1
+}
+
+// C: nativo/optimizer/costura.c:298
+proc alvo_decidido(c: ^CosCtx, b: u32, p: u32, r: u32) -> i64 {
+    let f: ^bir.BirFuncao = c.f as ^bir.BirFuncao
+    let k: ^bir.BirBloco = &f.blocos[b]
+    let t: ^bir.BirInstr = &k.instrs[k.n - 1]
+    let nr: int = c.nraizes as int
+    let nv: int = c.nvregs as int
+    let tab: []CosForma = c.tab or_else {}
+    let saida: []CosForma = c.saida or_else {}
+    let ramo: []CosFaixa = c.ramo or_else {}
+    let faixas: []CosFaixa = c.faixas or_else {}
+    var cond = CosCond{}
+    copiar_formas(tab, saida[((p as int) * nv)..<(((p as int) + 1) * nv)])
+    let ini_ramo: int = (((p as int) * 2) + (r as int)) * nr
+    copiar_faixas(faixas, ramo[ini_ramo..<(ini_ramo + nr)])
+    var j: u32 = 0
+    while (j + 1) < k.n {
+        passo_instrucao(c, tab, &cond, &k.instrs[j])
+        j += 1
+    }
+    if (not cond.valida) or (cond.vreg != t.a.id) {
+        return -1
+    }
+    let decisao: i32 = cos_decide(&cond, faixas)
+    if decisao < 0 {
+        return -1
+    }
+    if decisao == 1 {
+        return t.alvo[0] as i64
+    }
+    return t.alvo[1] as i64
+}
+
+// C: nativo/optimizer/costura.c:318
+proc redirecionar_aresta(f: ^bir.BirFuncao, p: u32, b: u32, nova: u32) {
+    let t: ^bir.BirInstr = terminador_2(f, p)
+    if (t.op == (bir.BIR_SALTA as u8)) and (t.alvo[0] == b) {
+        t.alvo[0] = nova
+    }
+    if t.op == (bir.BIR_DESVIA as u8) {
+        if t.alvo[0] == b {
+            t.alvo[0] = nova
+        }
+        if t.alvo[1] == b {
+            t.alvo[1] = nova
+        }
+    }
+}
+
+// C: nativo/optimizer/costura.c:333
+// Bloco novo: as instrucoes sao copiadas por indice (o append de blocos pode mover o vetor, R-B5); o DESVIA original vira SALTA ao sucessor.
+proc duplicar_na_aresta(c: ^CosCtx, b: u32, p: u32, sucessor: u32) {
+    let f: ^bir.BirFuncao = c.f as ^bir.BirFuncao
+    let nova: u32 = f.nblocos
+    let n: u32 = f.blocos[b].n - 1
+    let termina: bir.BirInstr = f.blocos[b].instrs[n]
+    append(&f.blocos, item = bir.BirBloco{})
+    let nb: ^bir.BirBloco = &f.blocos[nova]
+    nb.instrs = make([dynamic]bir.BirInstr, alloc = heap, cap = (n as int) + 1)
+    var k: u32 = 0
+    while k < n {
+        append(&nb.instrs, item = f.blocos[b].instrs[k])
+        k += 1
+    }
+    var salta = bir.BirInstr{}
+    salta.op = bir.BIR_SALTA as u8
+    salta.classe = bir.BC_NADA as u8
+    salta.dst = bir.BIR_SEM_VREG
+    salta.simbolo = bir.BIR_SEM_SIMBOLO
+    salta.alvo[0] = sucessor
+    salta.alvo[1] = bir.BIR_SEM_BLOCO
+    salta.pos = termina.pos
+    salta.ir = termina.ir
+    append(&nb.instrs, item = salta)
+    nb.n = n + 1
+    nb.cap = n + 1
+    nb.frio = false
+    f.nblocos = nova + 1
+    f.cap_blocos = nova + 1
+    redirecionar_aresta(f, p, b, nova)
+    c.dup_blocos += 1
+    c.dup_instrs += n
+    c.mudou = true
+}
+
+// C: nativo/optimizer/costura.c:355
+proc cabe_no_orcamento(c: ^CosCtx, b: u32) -> bool {
+    return (c.dup_blocos < COSTURA_DUP_BLOCOS_MAX) and ((c.dup_instrs + ((c.f as ^bir.BirFuncao).blocos[b].n - 1)) <= COSTURA_DUP_INSTR_MAX)
+}
+
+// C: nativo/optimizer/costura.c:361
+proc tentar_aresta(c: ^CosCtx, b: u32, p: u32, r: u32) {
+    if ((((p == b) or (not ((c.feito or_else {})[p] != 0))) or (c.f as ^bir.BirFuncao).blocos[p].frio) or (not aresta_ramo(c.f as ^bir.BirFuncao, p, r, b))) or (not cabe_no_orcamento(c, b)) {
+        return
+    }
+    let t: ^bir.BirInstr = terminador_2(c.f as ^bir.BirFuncao, p)
+    if (t.op == (bir.BIR_DESVIA as u8)) and (t.alvo[0] == t.alvo[1]) {
+        return
+    }
+    let sucessor: i64 = alvo_decidido(c, b, p, r)
+    if (sucessor < 0) or (sucessor == (b as i64)) {
+        return
+    }
+    duplicar_na_aresta(c, b, p, sucessor as u32)
+}
+
+// C: nativo/optimizer/costura.c:378
+proc decidir_arestas(c: ^CosCtx) {
+    var b: u32 = 1
+    while b < c.nblocos {
+        if eh_candidato(c.f as ^bir.BirFuncao, b) {
+            var p: u32 = 0
+            while p < c.nblocos {
+                tentar_aresta(c, b, p, 0)
+                tentar_aresta(c, b, p, 1)
+                p += 1
+            }
+        }
+        b += 1
+    }
+}
+
+// C: nativo/optimizer/costura.c:391
+proc marcar_candidatos_raiz(c: ^CosCtx) {
+    let f: ^bir.BirFuncao = c.f as ^bir.BirFuncao
+    let raiz: []i32 = c.raiz_de or_else {}
+    var v: u32 = 0
+    while v < c.nvregs {
+        raiz[v] = -1
+        v += 1
+    }
+    var k: u32 = 0
+    while (k < f.nparams) and (k < c.nvregs) {
+        if (f.classe_vreg or_else {})[k] == (bir.BC_I64 as u8) {
+            if (f.param_tam == none) or ((f.param_tam or_else {})[k] == 0) {
+                raiz[k] = -2
+            }
+        }
+        k += 1
+    }
+    var b: u32 = 0
+    while b < f.nblocos {
+        var j: u32 = 0
+        while j < f.blocos[b].n {
+            let i: ^bir.BirInstr = &f.blocos[b].instrs[j]
+            if eh_definicao(i.op) and (i.dst < c.nvregs) and (raiz[i.dst] == -2) {
+                raiz[i.dst] = -1
+            }
+            j += 1
+        }
+        b += 1
+    }
+}
+
+// C: nativo/optimizer/costura.c:412
+// Numera as raizes restantes ate COSTURA_RAIZES_MAX; o que sobra de -2 vira -1.
+proc numerar_raizes(c: ^CosCtx) {
+    let raiz: []i32 = c.raiz_de or_else {}
+    c.nraizes = 0
+    var v: u32 = 0
+    while v < c.nvregs {
+        if raiz[v] == -2 {
+            if c.nraizes < COSTURA_RAIZES_MAX {
+                raiz[v] = c.nraizes as i32
+                c.nraizes += 1
+            } else {
+                raiz[v] = -1
+            }
+        }
+        v += 1
+    }
+}
+
+// C: nativo/optimizer/costura.c:422
+proc achar_raizes(c: ^CosCtx) {
+    marcar_candidatos_raiz(c)
+    numerar_raizes(c)
+}
+
+// C: nativo/optimizer/costura.c:428
+proc tem_candidato(f: ^bir.BirFuncao) -> bool {
+    var b: u32 = 1
+    while b < f.nblocos {
+        if eh_candidato(f, b) {
+            return true
+        }
+        b += 1
+    }
+    return false
+}
+
+// C: nativo/optimizer/costura.c:437
+proc marcar_ov_alvos(c: ^CosCtx) {
+    let f: ^bir.BirFuncao = c.f as ^bir.BirFuncao
+    let ov: []u8 = c.ov_alvo or_else {}
+    var b: u32 = 0
+    while b < c.nblocos {
+        var j: u32 = 0
+        while j < f.blocos[b].n {
+            let i: ^bir.BirInstr = &f.blocos[b].instrs[j]
+            if eh_conta_ov_4(i.op) {
+                ov[i.alvo[0]] = 1
+            }
+            j += 1
+        }
+        b += 1
+    }
+}
+
+// Zera um [dynamic] de i32 com n posicoes (dono do vetor; a vista e tirada depois).
+proc zerar_i32(v: ^[dynamic]i32, n: int) {
+    v^ = make([dynamic]i32, alloc = heap, cap = n + 1)
+    var k: int = 0
+    while k < n {
+        append(v, item = 0)
+        k += 1
+    }
+}
+
+// Zera um [dynamic] de u8 com n posicoes.
+proc zerar_u8(v: ^[dynamic]u8, n: int) {
+    v^ = make([dynamic]u8, alloc = heap, cap = n + 1)
+    var k: int = 0
+    while k < n {
+        append(v, item = 0)
+        k += 1
+    }
+}
+
+// Zera um [dynamic] de CosForma com n posicoes.
+proc zerar_formas(v: ^[dynamic]CosForma, n: int) {
+    v^ = make([dynamic]CosForma, alloc = heap, cap = n + 1)
+    var k: int = 0
+    while k < n {
+        append(v, item = CosForma{})
+        k += 1
+    }
+}
+
+// Zera um [dynamic] de CosFaixa com n posicoes.
+proc zerar_faixas(v: ^[dynamic]CosFaixa, n: int) {
+    v^ = make([dynamic]CosFaixa, alloc = heap, cap = n + 1)
+    var k: int = 0
+    while k < n {
+        append(v, item = CosFaixa{})
+        k += 1
+    }
+}
+
+// C: nativo/optimizer/costura.c:450
+// Aloca as tabelas; false se a funcao e grande demais (nblocos x nvregs > COSTURA_CELULAS_MAX): nada e alocado e a funcao fica como esta.
+proc alocar_ctx(c: ^CosCtx, f: ^bir.BirFuncao) -> bool {
+    c.f = f
+    c.nvregs = f.nvregs
+    c.nblocos = f.nblocos
+    if (c.nblocos as u64) * (c.nvregs as u64) > (COSTURA_CELULAS_MAX as u64) {
+        return false
+    }
+    let nb: int = c.nblocos as int
+    let nv: int = c.nvregs as int
+    let nr: int = COSTURA_RAIZES_MAX as int
+    zerar_i32(&c.raiz_de_mem, nv)
+    zerar_formas(&c.saida_mem, nb * nv)
+    zerar_faixas(&c.entrada_mem, nb * nr)
+    zerar_faixas(&c.ramo_mem, nb * 2 * nr)
+    zerar_u8(&c.feito_mem, nb)
+    zerar_u8(&c.ov_alvo_mem, nb)
+    zerar_formas(&c.tab_mem, nv)
+    zerar_faixas(&c.faixas_mem, nr)
+    c.raiz_de = c.raiz_de_mem[..]
+    c.saida = c.saida_mem[..]
+    c.entrada = c.entrada_mem[..]
+    c.ramo = c.ramo_mem[..]
+    c.feito = c.feito_mem[..]
+    c.ov_alvo = c.ov_alvo_mem[..]
+    c.tab = c.tab_mem[..]
+    c.faixas = c.faixas_mem[..]
+    return true
+}
+
+// C: nativo/optimizer/costura.c:468
+// So chamada depois de alocar_ctx com sucesso (os [dynamic] existem).
+proc liberar_ctx(c: ^CosCtx) {
+    delete(c.raiz_de_mem)
+    delete(c.saida_mem)
+    delete(c.entrada_mem)
+    delete(c.ramo_mem)
+    delete(c.feito_mem)
+    delete(c.ov_alvo_mem)
+    delete(c.tab_mem)
+    delete(c.faixas_mem)
+}
+
+// C: nativo/optimizer/costura.c:481
+// Empilha os alvos de saida da instrucao que ainda nao estao marcados.
+proc empilhar_alvos(i: ^bir.BirInstr, vivo: []u8, pilha: []u32, topo: ^u32) {
+    var alvos: u32 = 0
+    if i.op == (bir.BIR_DESVIA as u8) {
+        alvos = 2
+    } else if (i.op == (bir.BIR_SALTA as u8)) or eh_conta_ov_4(i.op) {
+        alvos = 1
+    }
+    var a: u32 = 0
+    while a < alvos {
+        if vivo[i.alvo[a]] == 0 {
+            vivo[i.alvo[a]] = 1
+            let antes: u32 = topo^
+            topo^ += 1
+            pilha[antes] = i.alvo[a]
+        }
+        a += 1
+    }
+}
+
+// C: nativo/optimizer/costura.c:494
+// Marca o alcancavel a partir do bloco 0 e dos blocos que terminam em ARMADILHA (ficam sempre, com o que alcancam, como no cfg).
+proc marcar_alcancaveis(f: ^bir.BirFuncao, vivo: []u8, pilha: []u32) {
+    var topo: u32 = 0
+    vivo[0] = 1
+    let antes_1: u32 = topo
+    topo += 1
+    pilha[antes_1] = 0
+    var b: u32 = 1
+    while b < f.nblocos {
+        if terminador_2(f, b).op == (bir.BIR_ARMADILHA as u8) {
+            vivo[b] = 1
+            let antes_2: u32 = topo
+            topo += 1
+            pilha[antes_2] = b
+        }
+        b += 1
+    }
+    while topo > 0 {
+        topo -= 1
+        let k: ^bir.BirBloco = &f.blocos[pilha[topo]]
+        var j: u32 = 0
+        while j < k.n {
+            empilhar_alvos(&k.instrs[j], vivo, pilha, &topo)
+            j += 1
+        }
+    }
+}
+
+// C: nativo/optimizer/costura.c:515
+// Tira os blocos que nao estao marcados; so mexe na funcao se algum sumiu (cfg_aplicar_ordem mantem a ordem de id).
+proc compactar_inalcancaveis(f: ^bir.BirFuncao) {
+    let n: u32 = f.nblocos
+    var m: u32 = 0
+    var vivo_mem = make([dynamic]u8, alloc = heap, cap = (n as int) + 1)
+    defer delete(vivo_mem)
+    var ordem_mem = make([dynamic]u32, alloc = heap, cap = (n as int) + 1)
+    defer delete(ordem_mem)
+    var k: u32 = 0
+    while k < n {
+        append(&vivo_mem, item = 0)
+        append(&ordem_mem, item = 0)
+        k += 1
+    }
+    let vivo: []u8 = vivo_mem[..]
+    let ordem: []u32 = ordem_mem[..]
+    marcar_alcancaveis(f, vivo, ordem)
+    k = 0
+    while k < n {
+        if vivo[k] != 0 {
+            ordem[m] = k
+            m += 1
+        }
+        k += 1
+    }
+    if m != n {
+        cfg_aplicar_ordem(f, ordem[0..<(m as int)])
+    }
+}
+
+// C: nativo/optimizer/costura.c:532
+proc otim_costura_aplicar(programa: ^bir.BirPrograma, funcao: ^bir.BirFuncao) {
+    var c = CosCtx{}
+    if (not cfg_elegivel(programa, funcao)) or (not tem_candidato(funcao)) {
+        return
+    }
+    if not alocar_ctx(&c, funcao) {
+        return
+    }
+    defer liberar_ctx(&c)
+    achar_raizes(&c)
+    if c.nraizes > 0 {
+        marcar_ov_alvos(&c)
+        var b: u32 = 0
+        while b < c.nblocos {
+            analisar_bloco(&c, b)
+            b += 1
+        }
+        decidir_arestas(&c)
+        if c.mudou {
+            compactar_inalcancaveis(funcao)
+        }
+    }
+}
+
+// ---- testes dirigidos (helpers com prefixo costt_ para nao colidir no pacote)
+// Bloco de uma instrucao (terminador op) que salta para alvo0; ids seguem a ordem de criacao, como cfgt_novo_bloco.
+proc costt_bloco(f: ^bir.BirFuncao, op: i32, alvo0: u32) {
+    append(&f.blocos, item = bir.BirBloco{})
+    let b: ^bir.BirBloco = &f.blocos[f.nblocos]
+    b.instrs = make([dynamic]bir.BirInstr, alloc = heap, cap = 2)
+    append(&b.instrs, item = bir.BirInstr{})
+    let i: ^bir.BirInstr = &b.instrs[0]
+    i.op = op as u8
+    i.alvo[0] = alvo0
+    i.alvo[1] = bir.BIR_SEM_BLOCO
+    b.n = 1
+    b.cap = (cap(b.instrs) as u64) as u32
+    f.nblocos += 1
+}
+
+proc costt_libera(f: ^bir.BirFuncao) {
+    var k: u32 = 0
+    while k < f.nblocos {
+        delete(f.blocos[k].instrs)
+        k += 1
+    }
+    delete(f.blocos)
+}
+
+// Grafo de teste: 0 SALTA->2; 1 RETORNA (inalcancavel); 2 RETORNA; 3 ARMADILHA (fica sempre).
+proc costt_grafo(f: ^bir.BirFuncao) {
+    f.blocos = make([dynamic]bir.BirBloco, alloc = heap, cap = 4)
+    costt_bloco(f, bir.BIR_SALTA, 2)
+    costt_bloco(f, bir.BIR_RETORNA, bir.BIR_SEM_BLOCO)
+    costt_bloco(f, bir.BIR_RETORNA, bir.BIR_SEM_BLOCO)
+    costt_bloco(f, bir.BIR_ARMADILHA, bir.BIR_SEM_BLOCO)
+}
+
+test "costura_eh_puro_definicao_e_conta_ov" {
+    expect(eh_puro(bir.BIR_CONST as u8))
+    expect(eh_puro(bir.BIR_CMP as u8))
+    expect(eh_puro(bir.BIR_TRUNC as u8))
+    expect(not eh_puro(bir.BIR_GRAVA as u8))
+    expect(not eh_puro(bir.BIR_ARMADILHA as u8))
+    expect(not eh_puro(bir.BIR_CHAMA as u8))
+    expect(not eh_definicao(bir.BIR_SALTA as u8))
+    expect(not eh_definicao(bir.BIR_GRAVA as u8))
+    expect(eh_definicao(bir.BIR_ADD as u8))
+    expect(eh_conta_ov_4(bir.BIR_ADD_OV as u8))
+    expect(not eh_conta_ov_4(bir.BIR_ADD as u8))
+}
+
+test "costura_espelho_e_condicao_sinalizada" {
+    expect(espelho(bir.BCOND_LT_S as u8) == (bir.BCOND_GT_S as u8))
+    expect(espelho(bir.BCOND_GE_S as u8) == (bir.BCOND_LE_S as u8))
+    expect(espelho(bir.BCOND_EQ as u8) == (bir.BCOND_EQ as u8))
+    expect(cond_sinalizada(bir.BCOND_NE as u8))
+}
+
+test "costura_teto_de_celulas_e_numerar_raizes" {
+    var f = bir.BirFuncao{}
+    f.nblocos = 1
+    f.nvregs = 262145
+    var c = CosCtx{}
+    expect(not alocar_ctx(&c, &f))
+    f.nvregs = 10
+    expect(alocar_ctx(&c, &f))
+    let raiz: []i32 = c.raiz_de or_else {}
+    var k: u32 = 0
+    while k < 10 {
+        raiz[k] = -2
+        k += 1
+    }
+    numerar_raizes(&c)
+    expect(c.nraizes == 8)
+    expect(raiz[7] == 7)
+    expect(raiz[8] == -1)
+    expect(raiz[9] == -1)
+    liberar_ctx(&c)
+}
+
+test "costura_marca_alcancaveis_e_compacta" {
+    var f = bir.BirFuncao{}
+    costt_grafo(&f)
+    var vivo_mem = make([dynamic]u8, alloc = heap, cap = 5)
+    var pil_mem = make([dynamic]u32, alloc = heap, cap = 5)
+    var k: u32 = 0
+    while k < 4 {
+        append(&vivo_mem, item = 0)
+        append(&pil_mem, item = 0)
+        k += 1
+    }
+    marcar_alcancaveis(&f, vivo_mem[..], pil_mem[..])
+    expect(vivo_mem[0] == 1)
+    expect(vivo_mem[1] == 0)
+    expect(vivo_mem[2] == 1)
+    expect(vivo_mem[3] == 1)
+    delete(vivo_mem)
+    delete(pil_mem)
+    compactar_inalcancaveis(&f)
+    expect(f.nblocos == 3)
+    expect(f.blocos[0].instrs[0].alvo[0] == 1)
+    expect(f.blocos[2].instrs[0].op == (bir.BIR_ARMADILHA as u8))
+    costt_libera(&f)
+}

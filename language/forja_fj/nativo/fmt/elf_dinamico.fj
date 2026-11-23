@@ -1,0 +1,387 @@
+// nativo/fmt/elf_dinamico.fj - A4.2: partes do ELF dinamico do alvo aarch64-linux-android (PIE e .so que o Bionic carrega)
+// Versao: 0.1.0
+// Changelog: 0.1.0 - A4.2: .dynamic (DT_NEEDED, DT_SONAME, DT_RUNPATH, DT_HASH, BIND_NOW), .rela.dyn (RELATIVE + GLOB_DAT), .hash SysV, .dynsym,
+//                    .dynstr e .interp do exe, num bloco unico no PT_LOAD RW final (coberto pelo PT_GNU_RELRO); cabecalhos de secao com sh_link certo.
+// Contrato: elf_din_medir so faz contas (vale no elf_planejar do depurador, sem alocar); elf_din_montar gera os bytes do bloco,
+// na ordem .dynamic, .rela.dyn, .hash, .dynsym, .dynstr, .interp (offsets relativos a p.off_dyn / p.va_dyn).
+
+import "common"
+
+pub struct ElfDinamicoPlano {
+    nsym: u32 // simbolos do .dynsym sem o nulo (exports e depois imports)
+    nbucket: u32
+    nsec: u32 // cabecalhos de secao do bloco (5, mais .interp no exe)
+    tam_dyn: u64
+    tam_rela: u64
+    tam_hash: u64
+    tam_sym: u64
+    tam_str: u64
+    tam_interp: u64
+    off_rela: u64
+    off_hash: u64
+    off_sym: u64
+    off_str: u64
+    off_interp: u64
+    total: u64
+}
+
+struct ElfDinPartes {
+    dyn: [dynamic]u8
+    rela: [dynamic]u8
+    hash: [dynamic]u8
+    sym: [dynamic]u8
+    str: [dynamic]u8
+    off_needed: [dynamic]u32
+    off_soname: u32
+    off_runpath: u32
+}
+
+struct ElfDinSecao {
+    nome: u32
+    tipo: u32
+    flags: u32
+    off: u64
+    tam: u64
+    link: u32
+    info: u32
+    alinhamento: u64
+    entsize: u64
+}
+
+const ELF_PT_INTERP: u32 = 3
+const ELF_PT_GNU_RELRO: u32 = 1685382482
+const ELF_SHT_HASH: u32 = 5
+const ELF_SHT_DYNSYM: u32 = 11
+const ELF_DT_NEEDED: u32 = 1
+const ELF_DT_HASH: u32 = 4
+const ELF_DT_STRTAB: u32 = 5
+const ELF_DT_SYMTAB: u32 = 6
+const ELF_DT_STRSZ: u32 = 10
+const ELF_DT_SYMENT: u32 = 11
+const ELF_DT_SONAME: u32 = 14
+const ELF_DT_RUNPATH: u32 = 29
+const ELF_DT_FLAGS: u32 = 30
+const ELF_DF_BIND_NOW: u32 = 8
+const ELF_DF_1_NOW: u32 = 1
+const ELF_R_A64_GLOB_DAT: u64 = 1025
+const ELF_R_A64_RELATIVE: u64 = 1027
+const ELF_DIN_DT_FIXAS: u32 = 11 // HASH STRTAB SYMTAB STRSZ SYMENT RELA RELASZ RELAENT FLAGS FLAGS_1 NULL
+const ELF_DIN_SECOES: u32 = 5 // .hash .dynsym .dynstr .rela.dyn .dynamic
+const ELF_DIN_LIB_EXTRA: u64 = 6 // "lib" + nome + ".so"
+const ELF_DIN_INTERP: str = "/system/bin/linker64"
+const ELF_DIN_NOMES: [6]str = {".interp", ".hash", ".dynsym", ".dynstr", ".rela.dyn", ".dynamic"}
+const ELF_DIN_TAM_U32: u32 = 4
+const ELF_DIN_ALINHA_HASH: u64 = 8
+
+// o exe leva .interp; o .so (dll) nao
+proc elf_din_tem_interp(im: ^Imagem) -> bool {
+    return not im.dll
+}
+
+proc elf_din_nome_do_simbolo(im: ^Imagem, k: u64) -> str {
+    let nexp: u64 = len(im.exportacoes) as u64
+    if k < nexp {
+        return im.exportacoes[k].nome or_else ""
+    }
+    return im.imports_din[k - nexp].nome or_else ""
+}
+
+proc elf_din_tam_dynstr(im: ^Imagem) -> u64 {
+    var n: u64 = 1
+    for k in (0 as u64)..<(len(im.necessarias) as u64) {
+        n += (len(im.necessarias[k]) as u64) + ELF_DIN_LIB_EXTRA + 1
+    }
+    if im.soname != none {
+        n += (len(im.soname or_else "") as u64) + 1
+    }
+    if im.runpath != none {
+        n += (len(im.runpath or_else "") as u64) + 1
+    }
+    for k in (0 as u64)..<((len(im.exportacoes) + len(im.imports_din)) as u64) {
+        n += (len(elf_din_nome_do_simbolo(im, k)) as u64) + 1
+    }
+    return n
+}
+
+// So contas: tamanhos e offsets (relativos ao inicio do bloco) de cada parte; nao aloca
+pub proc elf_din_medir(im: ^Imagem, d: ^ElfDinamicoPlano) {
+    var ndt: u32 = ELF_DIN_DT_FIXAS + (len(im.necessarias) as u32)
+    if im.soname != none {
+        ndt += 1
+    }
+    if im.runpath != none {
+        ndt += 1
+    }
+    d.nsym = (len(im.exportacoes) + len(im.imports_din)) as u32
+    d.nbucket = d.nsym + 1
+    d.tam_dyn = (ndt as u64) * (ELF_TAM_DT as u64)
+    d.tam_rela = ((len(im.relativos) + len(im.imports_din)) as u64) * (ELF_TAM_RELA as u64)
+    d.off_rela = d.tam_dyn
+    d.off_hash = d.off_rela + d.tam_rela
+    d.tam_hash = elf_alinhar(((2 + d.nbucket + d.nsym + 1) * ELF_DIN_TAM_U32) as u64, ELF_DIN_ALINHA_HASH)
+    d.off_sym = d.off_hash + d.tam_hash
+    d.tam_sym = ((d.nsym + 1) as u64) * (ELF_TAM_SIM as u64)
+    d.off_str = d.off_sym + d.tam_sym
+    d.tam_str = elf_din_tam_dynstr(im)
+    d.off_interp = d.off_str + d.tam_str
+    d.tam_interp = 0
+    d.nsec = ELF_DIN_SECOES
+    if elf_din_tem_interp(im) {
+        d.tam_interp = (len(ELF_DIN_INTERP) as u64) + 1
+        d.nsec += 1
+    }
+    d.total = d.off_interp + d.tam_interp
+}
+
+proc elf_din_anexar_u32(b: ^[dynamic]u8, v: u32) {
+    for k in (0 as u32)..<ELF_DIN_TAM_U32 {
+        append(b, item = ((v >> (k * ELF_BITS_BYTE)) & 255) as u8)
+    }
+}
+
+// hash SysV do nome (DT_HASH)
+proc elf_din_hash_sysv(nome: str) -> u32 {
+    var h: u32 = 0
+    let bytes: []u8 = as_bytes(nome)
+    for i in (0 as u64)..<(len(bytes) as u64) {
+        h = wrapping_add(h << 4, bytes[i] as u32)
+        let g: u32 = h & 4026531840
+        if g != 0 {
+            h = h ~ (g >> 24)
+        }
+        h = h & (~g)
+    }
+    return h
+}
+
+// indice do cabecalho de secao (1 = primeira da Imagem) da secao que contem o rva; 0 se nenhuma
+proc elf_din_secao_do_rva(im: ^Imagem, rva: u32) -> u32 {
+    for i in (0 as u32)..<im.qtd_secoes {
+        let s: ^PeSecao = &im.secoes[i]
+        if (rva >= s.rva) and (rva < (s.rva + s.tam_virtual)) {
+            return i + 1
+        }
+    }
+    return 0
+}
+
+// .dynstr e .dynsym: o nulo, os exports (definidos) e os imports (indefinidos); anota os offsets dos nomes de NEEDED/SONAME/RUNPATH
+proc elf_din_simbolos(im: ^Imagem, pt: ^ElfDinPartes) {
+    append(&pt.str, item = 0 as u8)
+    for k in (0 as u64)..<(len(im.necessarias) as u64) {
+        append(&pt.off_needed, item = len(pt.str) as u32)
+        append(&pt.str, items = as_bytes("lib"))
+        append(&pt.str, items = as_bytes(im.necessarias[k]))
+        append(&pt.str, items = as_bytes(".so"))
+        append(&pt.str, item = 0 as u8)
+    }
+    if im.soname != none {
+        pt.off_soname = elf_nome(&pt.str, im.soname or_else "")
+    }
+    if im.runpath != none {
+        pt.off_runpath = elf_nome(&pt.str, im.runpath or_else "")
+    }
+    var nulo: [ST_QTD]u64 = {}
+    elf_anexar_registro(&pt.sym, ELF_T_SYM, nulo[..])
+    for k in (0 as u64)..<(len(im.exportacoes) as u64) {
+        let rva: u32 = im.exportacoes[k].rva
+        let sh: u32 = elf_din_secao_do_rva(im, rva)
+        var tipo: u32 = 1 // STT_OBJECT
+        if (sh > 0) and (elf_classe_de(&im.secoes[sh - 1]) == CLASSE_RX) {
+            tipo = ELF_STT_FUNC
+        }
+        var v: [ST_QTD]u64 = {}
+        v[ST_NAME] = elf_nome(&pt.str, im.exportacoes[k].nome or_else "") as u64
+        v[ST_INFO] = ((ELF_STB_GLOBAL << 4) | tipo) as u64
+        v[ST_SHNDX] = sh as u64
+        v[ST_VALUE] = pe_base_da_imagem(im) + (rva as u64)
+        elf_anexar_registro(&pt.sym, ELF_T_SYM, v[..])
+    }
+    for k in (0 as u64)..<(len(im.imports_din) as u64) {
+        var v: [ST_QTD]u64 = {}
+        v[ST_NAME] = elf_nome(&pt.str, im.imports_din[k].nome or_else "") as u64
+        v[ST_INFO] = ((ELF_STB_GLOBAL << 4) | ELF_STT_FUNC) as u64
+        elf_anexar_registro(&pt.sym, ELF_T_SYM, v[..])
+    }
+}
+
+// .hash SysV: nbucket, nchain, buckets e cadeias (um simbolo por entrada; o nulo e a entrada 0)
+proc elf_din_hash(im: ^Imagem, d: ^ElfDinamicoPlano, pt: ^ElfDinPartes) {
+    var cadeia = make([dynamic]u32, alloc = heap)
+    defer delete(cadeia)
+    var balde = make([dynamic]u32, alloc = heap)
+    defer delete(balde)
+    for _i in (0 as u32)..<(d.nsym + 1) {
+        append(&cadeia, item = 0 as u32)
+    }
+    for _i in (0 as u32)..<d.nbucket {
+        append(&balde, item = 0 as u32)
+    }
+    for k in (0 as u64)..<(d.nsym as u64) {
+        let b: u64 = (elf_din_hash_sysv(elf_din_nome_do_simbolo(im, k)) % d.nbucket) as u64
+        cadeia[k + 1] = balde[b]
+        balde[b] = (k + 1) as u32
+    }
+    elf_din_anexar_u32(&pt.hash, d.nbucket)
+    elf_din_anexar_u32(&pt.hash, d.nsym + 1)
+    for i in (0 as u64)..<(len(balde) as u64) {
+        elf_din_anexar_u32(&pt.hash, balde[i])
+    }
+    for i in (0 as u64)..<(len(cadeia) as u64) {
+        elf_din_anexar_u32(&pt.hash, cadeia[i])
+    }
+    elf_preencher(&pt.hash, d.tam_hash)
+}
+
+// .rela.dyn: RELATIVE de cada endereco absoluto em dado e GLOB_DAT de cada celula importada da .got
+proc elf_din_rela(im: ^Imagem, p: ^ElfPlano, pt: ^ElfDinPartes) {
+    var relativa: u64 = ELF_R_RELATIVE as u64
+    if p.maquina == (ELF_EM_AARCH64 as u64) {
+        relativa = ELF_R_A64_RELATIVE
+    }
+    for k in (0 as u64)..<(len(im.relativos) as u64) {
+        let r: ^ImagemRelativa = &im.relativos[k]
+        elf_anexar_quad(&pt.rela, pe_base_da_imagem(im) + (r.rva as u64))
+        elf_anexar_quad(&pt.rela, relativa)
+        elf_anexar_quad(&pt.rela, r.valor)
+    }
+    let primeiro_import: u64 = (len(im.exportacoes) as u64) + 1
+    for k in (0 as u64)..<(len(im.imports_din) as u64) {
+        elf_anexar_quad(&pt.rela, pe_base_da_imagem(im) + (im.imports_din[k].rva as u64))
+        elf_anexar_quad(&pt.rela, ((primeiro_import + k) << 32) | ELF_R_A64_GLOB_DAT)
+        elf_anexar_quad(&pt.rela, 0)
+    }
+}
+
+proc elf_din_entrada(b: ^[dynamic]u8, tag: u32, valor: u64) {
+    elf_anexar_quad(b, tag as u64)
+    elf_anexar_quad(b, valor)
+}
+
+// .dynamic: NEEDED, SONAME, RUNPATH, HASH, STRTAB, SYMTAB, STRSZ, SYMENT, RELA, RELASZ, RELAENT, FLAGS (BIND_NOW), FLAGS_1 (NOW, PIE no exe), NULL
+proc elf_din_dynamic(im: ^Imagem, p: ^ElfPlano, pt: ^ElfDinPartes) {
+    let d: ^ElfDinamicoPlano = &p.din
+    for k in (0 as u64)..<(len(pt.off_needed) as u64) {
+        elf_din_entrada(&pt.dyn, ELF_DT_NEEDED, pt.off_needed[k] as u64)
+    }
+    if im.soname != none {
+        elf_din_entrada(&pt.dyn, ELF_DT_SONAME, pt.off_soname as u64)
+    }
+    if im.runpath != none {
+        elf_din_entrada(&pt.dyn, ELF_DT_RUNPATH, pt.off_runpath as u64)
+    }
+    elf_din_entrada(&pt.dyn, ELF_DT_HASH, p.va_dyn + d.off_hash)
+    elf_din_entrada(&pt.dyn, ELF_DT_STRTAB, p.va_dyn + d.off_str)
+    elf_din_entrada(&pt.dyn, ELF_DT_SYMTAB, p.va_dyn + d.off_sym)
+    elf_din_entrada(&pt.dyn, ELF_DT_STRSZ, d.tam_str)
+    elf_din_entrada(&pt.dyn, ELF_DT_SYMENT, ELF_TAM_SIM as u64)
+    elf_din_entrada(&pt.dyn, ELF_DT_RELA, p.va_dyn + d.off_rela)
+    elf_din_entrada(&pt.dyn, ELF_DT_RELASZ, d.tam_rela)
+    elf_din_entrada(&pt.dyn, ELF_DT_RELAENT, ELF_TAM_RELA as u64)
+    elf_din_entrada(&pt.dyn, ELF_DT_FLAGS, ELF_DF_BIND_NOW as u64)
+    var flags_1: u32 = ELF_DF_1_NOW
+    if elf_din_tem_interp(im) {
+        flags_1 = flags_1 | ELF_DF_1_PIE
+    }
+    elf_din_entrada(&pt.dyn, ELF_DT_FLAGS_1, flags_1 as u64)
+    elf_din_entrada(&pt.dyn, ELF_DT_NULL, 0)
+}
+
+// Gera os bytes do bloco dinamico (todo o PT_LOAD RW final) e os anexa a `b`; o tamanho confere com elf_din_medir
+pub proc elf_din_montar(im: ^Imagem, p: ^ElfPlano, b: ^[dynamic]u8) {
+    var pt: ElfDinPartes = ElfDinPartes{}
+    pt.dyn = make([dynamic]u8, alloc = heap)
+    pt.rela = make([dynamic]u8, alloc = heap)
+    pt.hash = make([dynamic]u8, alloc = heap)
+    pt.sym = make([dynamic]u8, alloc = heap)
+    pt.str = make([dynamic]u8, alloc = heap)
+    pt.off_needed = make([dynamic]u32, alloc = heap)
+    elf_din_simbolos(im, &pt)
+    elf_din_hash(im, &p.din, &pt)
+    elf_din_rela(im, p, &pt)
+    elf_din_dynamic(im, p, &pt)
+    append(b, items = pt.dyn[..])
+    append(b, items = pt.rela[..])
+    append(b, items = pt.hash[..])
+    append(b, items = pt.sym[..])
+    append(b, items = pt.str[..])
+    if elf_din_tem_interp(im) {
+        append(b, items = as_bytes(ELF_DIN_INTERP))
+        append(b, item = 0 as u8)
+    }
+    if (len(pt.dyn) as u64) != p.din.tam_dyn or (len(pt.rela) as u64) != p.din.tam_rela or (len(pt.str) as u64) != p.din.tam_str or (len(pt.sym) as u64) != p.din.tam_sym {
+        common.falha_interna("elf dinamico: tamanho medido diferente do montado")
+    }
+    delete(pt.dyn)
+    delete(pt.rela)
+    delete(pt.hash)
+    delete(pt.sym)
+    delete(pt.str)
+    delete(pt.off_needed)
+}
+
+// nomes das secoes do bloco no .shstrtab, na ordem em que os cabecalhos saem (.interp so no exe)
+pub proc elf_din_nomes(im: ^Imagem, shstr: ^[dynamic]u8, nomes: ^[6]u32) {
+    var k: u32 = 0
+    if not elf_din_tem_interp(im) {
+        k = 1
+    }
+    var i: u32 = 0
+    while k < 6 {
+        nomes[i] = elf_nome(shstr, ELF_DIN_NOMES[k])
+        i += 1
+        k += 1
+    }
+}
+
+proc elf_din_shdr(b: ^[dynamic]u8, p: ^ElfPlano, s: ElfDinSecao) {
+    var sh: [SH_QTD]u64 = {}
+    sh[SH_NAME] = s.nome as u64
+    sh[SH_TYPE] = s.tipo as u64
+    sh[SH_FLAGS] = s.flags as u64
+    sh[SH_ADDR] = p.va_dyn + s.off
+    sh[SH_OFFSET] = p.off_dyn + s.off
+    sh[SH_SIZE] = s.tam
+    sh[SH_LINK] = s.link as u64
+    sh[SH_INFO] = s.info as u64
+    sh[SH_ADDRALIGN] = s.alinhamento
+    sh[SH_ENTSIZE] = s.entsize
+    elf_anexar_registro(b, ELF_T_SHDR, sh[..])
+}
+
+// cabecalhos de secao do bloco: .interp (exe), .hash, .dynsym, .dynstr, .rela.dyn, .dynamic; sh_link/sh_info como o ld
+pub proc elf_din_anexar_shdr(b: ^[dynamic]u8, im: ^Imagem, p: ^ElfPlano, nomes: []u32) {
+    let d: ^ElfDinamicoPlano = &p.din
+    var n: u32 = 0
+    var primeiro: u32 = im.qtd_secoes + 1
+    if elf_din_tem_interp(im) {
+        elf_din_shdr(b, p, ElfDinSecao{nome = nomes[n], tipo = ELF_SHT_PROGBITS, flags = ELF_SHF_ALLOC, off = d.off_interp, tam = d.tam_interp, alinhamento = 1})
+        n += 1
+        primeiro += 1
+    }
+    let so_alloc: u32 = ELF_SHF_ALLOC
+    let link_sym: u32 = primeiro + 1
+    let link_str: u32 = primeiro + 2
+    elf_din_shdr(b, p, ElfDinSecao{nome = nomes[n], tipo = ELF_SHT_HASH, flags = so_alloc, off = d.off_hash, tam = d.tam_hash, link = link_sym, alinhamento = ELF_ALINHA_TABELA as u64, entsize = ELF_DIN_TAM_U32 as u64})
+    elf_din_shdr(b, p, ElfDinSecao{nome = nomes[n + 1], tipo = ELF_SHT_DYNSYM, flags = so_alloc, off = d.off_sym, tam = d.tam_sym, link = link_str, info = ELF_PRIMEIRO_GLOBAL, alinhamento = ELF_ALINHA_TABELA as u64, entsize = ELF_TAM_SIM as u64})
+    elf_din_shdr(b, p, ElfDinSecao{nome = nomes[n + 2], tipo = ELF_SHT_STRTAB, flags = so_alloc, off = d.off_str, tam = d.tam_str, alinhamento = 1})
+    elf_din_shdr(b, p, ElfDinSecao{nome = nomes[n + 3], tipo = ELF_SHT_RELA, flags = so_alloc, off = d.off_rela, tam = d.tam_rela, link = link_sym, alinhamento = ELF_ALINHA_TABELA as u64, entsize = ELF_TAM_RELA as u64})
+    elf_din_shdr(b, p, ElfDinSecao{nome = nomes[n + 4], tipo = ELF_SHT_DYNAMIC, flags = so_alloc | ELF_SHF_WRITE, off = 0, tam = d.tam_dyn, link = link_str, alinhamento = ELF_ALINHA_TABELA as u64, entsize = ELF_TAM_DT as u64})
+}
+
+// segmentos do bloco dinamico: PT_INTERP (o exe; vai logo depois do PT_PHDR), PT_LOAD RW com o bloco inteiro, PT_DYNAMIC e PT_GNU_RELRO
+pub proc elf_din_segmento_interp(p: ^ElfPlano) -> ElfSegmento {
+    let d: ^ElfDinamicoPlano = &p.din
+    return ElfSegmento{tipo = ELF_PT_INTERP, flags = ELF_PF_R, offset = p.off_dyn + d.off_interp, vaddr = p.va_dyn + d.off_interp, filesz = d.tam_interp, memsz = d.tam_interp, alinhamento = 1}
+}
+
+pub proc elf_din_segmento_relro(p: ^ElfPlano) -> ElfSegmento {
+    return ElfSegmento{tipo = ELF_PT_GNU_RELRO, flags = ELF_PF_R, offset = p.off_dyn, vaddr = p.va_dyn, filesz = p.din.total, memsz = p.din.total, alinhamento = 1}
+}
+
+test "elf_din_hash_sysv_conhecido" {
+    // valores do hash SysV publicado: "" = 0, "printf" = 0x077905a6, "exit" = 0x0006cf04
+    expect(elf_din_hash_sysv("") == 0)
+    expect(elf_din_hash_sysv("printf") == 0x077905a6)
+    expect(elf_din_hash_sysv("exit") == 0x0006cf04)
+}

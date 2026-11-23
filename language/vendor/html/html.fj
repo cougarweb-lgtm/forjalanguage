@@ -1,0 +1,232 @@
+// html 0.1.0 - HTML5 e seletores CSS para a Forja, por cima do lexbor 3.0.0 (Apache-2.0) em vendor\liblexbor.a (Windows) e vendor\linux\liblexbor.a (Linux).
+// Versao: 0.1.0
+// Changelog: 0.1.0 - primeira versao: parse/close, DOM plano por indice (root, node_count, kind, parent, first_child, next_sibling),
+//            tag/namespace/attr_count/attr_name/attr_value/text, find_all (seletores CSS), css_parse/css_close com regras e declaracoes, version.
+//
+// COMO USAR (o .fj raiz do programa precisa de uma pasta vendor\ ao lado; ver MEM-FORJA-GUIA-10):
+//     import "vendor:html/html"
+//     ...
+//     let doc = try html.parse("<div id=a><p>oi</p></div>")
+//     defer html.close(doc)
+//     let achados = try html.find_all(doc, html.root(doc), "div > p", alloc = heap)
+//     defer delete(achados)
+//
+// NODO = i32 (indice no vetor plano; o no 0 e o documento; -1 = nenhum). Os nomes NodeKind/HtmlError sao os da API.
+//
+// TEXTO: todo parametro de texto publico e `str` (bytes UTF-8). Texto devolvido (tag, nomes, valores, texto, seletor, declaracoes)
+//   e `str` EMPRESTADO: vale ate html.close (ou css_close) do dono; nao faca delete. Texto ausente = "".
+//
+// DONOS: parse e css_parse devolvem um dono (Document / Sheet); chame close/css_close uma vez.
+//
+// ERROS: HtmlError{out_of_memory, invalid_selector}. Seletor invalido em find_all e o unico erro de consulta.
+//
+// VERIFICAR: forja run language\exemplos_libs\html_basico.fj (oraculo: language\exemplos_libs\oraculos\html.py)
+
+import "vendor:html/html_c" as lc
+
+pub enum HtmlError {
+    out_of_memory
+    invalid_selector
+}
+
+pub enum NodeKind {
+    document
+    element
+    text
+    comment
+    doctype
+    other
+}
+
+pub struct Document {
+    handle: ?^lc.LexborfDoc
+}
+
+pub struct Sheet {
+    handle: ?^lc.LexborfSheet
+}
+
+const TIPO_ELEMENTO: i32 = 1
+const TIPO_TEXTO: i32 = 3
+const TIPO_COMENTARIO: i32 = 8
+const TIPO_DOCUMENTO: i32 = 9
+const TIPO_DOCTYPE: i32 = 10
+
+// Ponteiro e tamanho de um texto para a C; texto vazio passa NULL (nao existe &x[0] de fatia vazia).
+proc ponteiro_de(bytes: []u8) -> ?^u8 {
+    if len(bytes) == 0 {
+        return none
+    }
+    return &bytes[0]
+}
+
+// Texto emprestado de um ?cstr devolvido pela cola; nulo vira "".
+proc texto_de(p: ?cstr) -> str {
+    switch s in p {
+    case cstr:
+        return s as str
+    case none:
+        return ""
+    }
+    return ""
+}
+
+// Parseia HTML (UTF-8). Dono: chame close(doc) uma vez.
+pub proc parse(text: str) -> Document ! HtmlError {
+    let bytes = as_bytes(text)
+    let doc = Document{handle = lc.lexborf_parse(ponteiro_de(bytes), len(bytes) as u64)}
+    if doc.handle == none {
+        return HtmlError.out_of_memory
+    }
+    return doc
+}
+
+// Libera o documento e tudo o que ele guarda (texto emprestado deixa de valer).
+pub proc close(doc: Document) {
+    lc.lexborf_free(doc.handle)
+}
+
+// Versao do lexbor em uso (texto da lib, vive o programa inteiro).
+pub proc version() -> str {
+    return texto_de(lc.lexborf_version())
+}
+
+// No raiz (documento). Sempre 0.
+pub proc root(doc: Document) -> i32 {
+    return 0
+}
+
+pub proc node_count(doc: Document) -> i32 {
+    return lc.lexborf_node_count(doc.handle)
+}
+
+// Tipo do no pelo numero do lexbor, traduzido para NodeKind.
+pub proc kind(doc: Document, node: i32) -> NodeKind {
+    let tipo = lc.lexborf_node_type(doc.handle, node)
+    if tipo == TIPO_ELEMENTO {
+        return NodeKind.element
+    }
+    if tipo == TIPO_TEXTO {
+        return NodeKind.text
+    }
+    if tipo == TIPO_COMENTARIO {
+        return NodeKind.comment
+    }
+    if tipo == TIPO_DOCUMENTO {
+        return NodeKind.document
+    }
+    if tipo == TIPO_DOCTYPE {
+        return NodeKind.doctype
+    }
+    return NodeKind.other
+}
+
+pub proc parent(doc: Document, node: i32) -> i32 {
+    return lc.lexborf_parent(doc.handle, node)
+}
+
+pub proc first_child(doc: Document, node: i32) -> i32 {
+    return lc.lexborf_first_child(doc.handle, node)
+}
+
+pub proc next_sibling(doc: Document, node: i32) -> i32 {
+    return lc.lexborf_next_sibling(doc.handle, node)
+}
+
+// Nome local em minusculas do elemento (ou nome do doctype); "" se o no nao tem nome.
+pub proc tag(doc: Document, node: i32) -> str {
+    return texto_de(lc.lexborf_tag_name(doc.handle, node, none))
+}
+
+// 1 = html, 2 = mathml, 3 = svg, 0 = outro.
+pub proc namespace(doc: Document, node: i32) -> i32 {
+    return lc.lexborf_namespace(doc.handle, node)
+}
+
+pub proc attr_count(doc: Document, node: i32) -> i32 {
+    return lc.lexborf_attr_count(doc.handle, node)
+}
+
+// Nome do atributo k (0 a attr_count-1), na ordem do documento.
+pub proc attr_name(doc: Document, node: i32, k: i32) -> str {
+    return texto_de(lc.lexborf_attr_name(doc.handle, node, k, none))
+}
+
+pub proc attr_value(doc: Document, node: i32, k: i32) -> str {
+    return texto_de(lc.lexborf_attr_value(doc.handle, node, k, none))
+}
+
+// Dado de texto ou comentario; "" para os demais nos.
+pub proc text(doc: Document, node: i32) -> str {
+    return texto_de(lc.lexborf_text(doc.handle, node, none))
+}
+
+// Descendentes de `root` (sem o proprio root) que casam com o seletor CSS, em ordem de documento.
+// Dono da lista: delete(lista). Seletor invalido = HtmlError.invalid_selector.
+pub proc find_all(doc: Document, root: i32, selector: str, alloc: Allocator) -> [dynamic]i32 ! HtmlError {
+    let bytes = as_bytes(selector)
+    let total = lc.lexborf_find_all(doc.handle, root, ponteiro_de(bytes), len(bytes) as u64, none, 0)
+    if total < 0 {
+        return HtmlError.invalid_selector
+    }
+    var lista = make([dynamic]i32, alloc = alloc, cap = total as int)
+    if total == 0 {
+        return lista
+    }
+    resize(&lista, total as int)
+    let gravados = lc.lexborf_find_all(doc.handle, root, ponteiro_de(bytes), len(bytes) as u64, &lista[0], total)
+    if gravados < 0 {
+        return HtmlError.invalid_selector
+    }
+    return lista
+}
+
+// Parseia uma folha CSS. Dono: chame css_close(folha) uma vez.
+pub proc css_parse(text: str) -> Sheet ! HtmlError {
+    let bytes = as_bytes(text)
+    let folha = Sheet{handle = lc.lexborf_css_parse(ponteiro_de(bytes), len(bytes) as u64)}
+    if folha.handle == none {
+        return HtmlError.out_of_memory
+    }
+    return folha
+}
+
+pub proc css_close(folha: Sheet) {
+    lc.lexborf_css_free(folha.handle)
+}
+
+// Regras de estilo de topo (@media e outras at-rules ficam fora; ver atrule_count).
+pub proc rule_count(folha: Sheet) -> i32 {
+    return lc.lexborf_css_rule_count(folha.handle)
+}
+
+pub proc atrule_count(folha: Sheet) -> i32 {
+    return lc.lexborf_css_atrule_count(folha.handle)
+}
+
+// Seletor serializado da regra r (lista de seletores separada por ", ").
+pub proc rule_selector(folha: Sheet, r: i32) -> str {
+    return texto_de(lc.lexborf_css_rule_selector(folha.handle, r, none))
+}
+
+// Especificidade empacotada: A = (v >> 18) & 0x1FF, B = (v >> 9) & 0x1FF, C = v & 0x1FF.
+pub proc rule_specificity(folha: Sheet, r: i32) -> i32 {
+    return lc.lexborf_css_rule_specificity(folha.handle, r)
+}
+
+pub proc decl_count(folha: Sheet, r: i32) -> i32 {
+    return lc.lexborf_css_decl_count(folha.handle, r)
+}
+
+pub proc decl_name(folha: Sheet, r: i32, k: i32) -> str {
+    return texto_de(lc.lexborf_css_decl_name(folha.handle, r, k, none))
+}
+
+// Valor serializado, sem o " !important" (ver decl_important).
+pub proc decl_value(folha: Sheet, r: i32, k: i32) -> str {
+    return texto_de(lc.lexborf_css_decl_value(folha.handle, r, k, none))
+}
+
+pub proc decl_important(folha: Sheet, r: i32, k: i32) -> bool {
+    return lc.lexborf_css_decl_important(folha.handle, r, k) != 0
+}

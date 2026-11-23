@@ -1,0 +1,244 @@
+// nativo/obj/coff_diretivas.fj - porte de compiler/nativo/obj/coff_diretivas.c
+// sha256 de nativo/obj/coff_diretivas.c: 4b8b2ca87419ccef18a095de704632fbd62fa0e7d4a1974631ae8f5c32263c83
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "common"
+
+struct DirPrefixo {
+    prefixo: str
+    tipo: i32
+}
+
+struct DirTrecho {
+    p: []u8
+    len_c: u64
+}
+
+const DIR_NOME_DIRETIVA: str = ".drectve"
+const DIR_BASE_DECIMAL: u32 = 10
+// C2F-33: os textos sao []u8 (a Forja nao tem visao str de bytes nem fatia de str)
+const DIR_PREFIXOS: [3]DirPrefixo = {DirPrefixo{prefixo = "defaultlib:", tipo = DIRETIVA_BIBLIOTECA}, DirPrefixo{prefixo = "export:", tipo = DIRETIVA_EXPORTA}, DirPrefixo{prefixo = "aligncomm:", tipo = DIRETIVA_ALINHA_COMUM}}
+
+// C: nativo/obj/coff_diretivas.c:27
+// C2F: isspace da locale C (9 a 13 e 32) e o '\0' do fim
+proc dir_branco(c: u8) -> bool {
+    return (c == 0) or (c == 32) or ((c >= 9) and (c <= 13))
+}
+
+// C: nativo/obj/coff_diretivas.c:32
+proc dir_pular_brancos(t: []u8, n: u64, pos: u64) -> u64 {
+    var pos_v: u64 = pos
+    while (pos_v < n) and (common.c2f_b2i32(dir_branco(t[pos_v])) != 0) {
+        pos_v += 1
+    }
+    return pos_v
+}
+
+// C: nativo/obj/coff_diretivas.c:40
+proc dir_fim_do_token(t: []u8, n: u64, pos: u64) -> u64 {
+    var pos_v: u64 = pos
+    var aspas: bool = false
+    while (pos_v < n) and ((common.c2f_b2i32(aspas) != 0) or (not dir_branco(t[pos_v]))) {
+        if t[pos_v] == 34 { // '"'
+            aspas = not aspas
+        }
+        pos_v += 1
+    }
+    return pos_v
+}
+
+// C: nativo/obj/coff_diretivas.c:46
+// C2F: tolower da locale C (so ASCII)
+proc dir_minuscula(c: u8) -> u8 {
+    if (c >= 65) and (c <= 90) { // 'A' a 'Z'
+        return c + 32
+    }
+    return c
+}
+
+// C: nativo/obj/coff_diretivas.c:51
+proc dir_igual(a: []u8, b: str, n: u64) -> bool {
+    let bb: []u8 = as_bytes(b)
+    var k: u64 = 0
+    while k < n {
+        if dir_minuscula(a[k]) != dir_minuscula(bb[k]) {
+            return false
+        }
+        k += 1
+    }
+    return true
+}
+
+// C: nativo/obj/coff_diretivas.c:61
+// C2F-33: copia sem as aspas para a arena (a Forja guarda o tamanho; sem NUL)
+proc dir_nome(arena: ^common.Arena, p: []u8, len_c: u64) -> str {
+    var sem_aspas: [dynamic]u8 = make([dynamic]u8, alloc = heap)
+    var k: u64 = 0
+    while k < len_c {
+        if p[k] != 34 { // '"'
+            append(&sem_aspas, item = p[k])
+        }
+        k += 1
+    }
+    let nome: str = from_bytes(sem_aspas[..], alloc = common.arena_mem(arena))
+    delete(sem_aspas)
+    return nome
+}
+
+// C: nativo/obj/coff_diretivas.c:74
+proc dir_anexar(saida: ^[dynamic]CoffDiretiva, tipo: i32, nome: str, valor: u32) {
+    append(saida, item = CoffDiretiva{})
+    saida[len(saida^) - 1] = CoffDiretiva{tipo = tipo, nome = nome, valor = valor}
+}
+
+// C: nativo/obj/coff_diretivas.c:80
+proc dir_numero(p: []u8, len_c: u64, valor: ^u32) -> bool {
+    var v: u64 = 0
+    var k: u64 = 0
+    while ((k < len_c) and (common.c2f_char_i32(p[k]) >= 48)) and (common.c2f_char_i32(p[k]) <= 57) {
+        v = (v * (DIR_BASE_DECIMAL as u64)) + common.c2f_s2u_64((common.c2f_char_i32(p[k]) - 48) as i64) // '0'
+        if v > 4294967295 {
+            return false
+        }
+        k += 1 // '0' '9'
+    }
+    valor^ = v as u32
+    return true
+}
+
+// C: nativo/obj/coff_diretivas.c:94
+// C2F: memchr de ',' no trecho; sem virgula, o nome e o trecho inteiro
+proc dir_tam_nome(p: []u8, len_c: u64) -> u64 {
+    var k: u64 = 0
+    while k < len_c {
+        if p[k] == 44 { // ','
+            return k
+        }
+        k += 1
+    }
+    return len_c
+}
+
+// C: nativo/obj/coff_diretivas.c:107
+proc dir_anexar_por_tipo(arena: ^common.Arena, tipo: i32, t: ^DirTrecho, saida: ^[dynamic]CoffDiretiva) -> bool {
+    let nome_tam: u64 = dir_tam_nome(t.p, t.len_c)
+    var valor: u32 = 0
+    if tipo == DIRETIVA_ALINHA_COMUM {
+        if nome_tam == t.len_c {
+            return false
+        }
+        let resto: []u8 = t.p[((nome_tam + 1) as int)..<(t.len_c as int)]
+        if not dir_numero(resto, t.len_c - nome_tam - 1, &valor) {
+            return false
+        }
+        dir_anexar(saida, tipo, dir_nome(arena, t.p, nome_tam), valor)
+        return true
+    }
+    if tipo == DIRETIVA_BIBLIOTECA {
+        dir_anexar(saida, tipo, dir_nome(arena, t.p, t.len_c), 0)
+        return true
+    }
+    if tipo == DIRETIVA_EXPORTA {
+        dir_anexar(saida, tipo, dir_nome(arena, t.p, nome_tam), 0)
+        return true
+    }
+    return false
+}
+
+// C: nativo/obj/coff_diretivas.c:130
+proc dir_conhecida(arena: ^common.Arena, tok: []u8, len_c: u64, saida: ^[dynamic]CoffDiretiva) -> bool {
+    for k in (0 as u64)..<(len(DIR_PREFIXOS) as u64) {
+        let p: u64 = len(DIR_PREFIXOS[k].prefixo) as u64
+        if (len_c >= p) and dir_igual(tok, DIR_PREFIXOS[k].prefixo, p) {
+            var resto: DirTrecho = DirTrecho{p = tok[(p as int)..<(len_c as int)], len_c = len_c - p}
+            return dir_anexar_por_tipo(arena, DIR_PREFIXOS[k].tipo, &resto, saida)
+        }
+    }
+    return false
+}
+
+// C: nativo/obj/coff_diretivas.c:143
+proc dir_marca(tok: []u8, len_c: u64) -> u8 {
+    if (len_c > 1) and ((tok[0] == 47) or (tok[0] == 45)) { // '/' '-'
+        return tok[0]
+    }
+    return 0 // '\0'
+}
+
+// C: nativo/obj/coff_diretivas.c:151
+// C2F: so o "-l<nome>" do gcc vale com '-'; o '/' do MSVC nunca e -l
+proc dir_tratar(arena: ^common.Arena, tok: []u8, len_c: u64, saida: ^[dynamic]CoffDiretiva) {
+    let marca: u8 = dir_marca(tok, len_c)
+    if (marca != 0) and dir_conhecida(arena, tok[1..<(len_c as int)], len_c - 1, saida) {
+        return
+    }
+    if (marca == 45) and (len_c > 2) and (tok[1] == 108) { // '-' 'l'
+        dir_anexar(saida, DIRETIVA_BIBLIOTECA, dir_nome(arena, tok[2..<(len_c as int)], len_c - 2), 0)
+        return
+    }
+    dir_anexar(saida, DIRETIVA_IGNORADA, dir_nome(arena, tok, len_c), 0)
+}
+
+// C: nativo/obj/coff_diretivas.c:163
+proc coff_diretivas_ler(texto: []u8, n: u64, arena: ^common.Arena, saida: ^[dynamic]CoffDiretiva) {
+    var pos: u64 = dir_pular_brancos(texto, n, 0)
+    while pos < n {
+        let fim: u64 = dir_fim_do_token(texto, n, pos)
+        dir_tratar(arena, texto[(pos as int)..<(fim as int)], fim - pos, saida)
+        pos = dir_pular_brancos(texto, n, fim)
+    }
+}
+
+// C: nativo/obj/coff_diretivas.c:176
+// C2F: as BIBLIOTECA entram em saida como str (copia na arena do destino)
+proc dir_anotar_bibliotecas(texto: []u8, n: u64, arena: ^common.Arena, saida: ^[dynamic]str) {
+    var itens: [dynamic]CoffDiretiva = make([dynamic]CoffDiretiva, alloc = heap)
+    coff_diretivas_ler(texto, n, arena, &itens)
+    for k in (0 as u64)..<(len(itens) as u64) {
+        if itens[k].tipo == DIRETIVA_BIBLIOTECA {
+            append(saida, item = itens[k].nome or_else "")
+        }
+    }
+    delete(itens)
+}
+
+// C: nativo/obj/coff_diretivas.c:191
+proc dir_secao_diretiva(l: ^CoffLeitor, i: u32, arena: ^common.Arena, saida: ^[dynamic]str) -> bool {
+    let h: []u8 = coff_cabecalho_secao(l, i)
+    let nome: ?str = coff_nome_secao(l, h[0..<(COFF_TAM_NOME as int)], arena)
+    if nome == none {
+        return coff_falha(l.erro as ^common.Diag, "nome de secao fora da tabela de strings")
+    }
+    if common.c2f_strcmp(nome or_else "", DIR_NOME_DIRETIVA) != 0 {
+        return true
+    }
+    let ptr: u64 = common.c2f_ler_u32_le(h, COFF_OFF_SEC_PTR as int) as u64
+    let raw: u64 = common.c2f_ler_u32_le(h, COFF_OFF_SEC_RAW as int) as u64
+    if not coff_cabe(l.n, ptr, raw) {
+        return coff_falha(l.erro as ^common.Diag, "dados da secao .drectve fora do arquivo")
+    }
+    let bytes: []u8 = l.b or_else {}
+    dir_anotar_bibliotecas(bytes[(ptr as int)..<(((ptr + raw)) as int)], raw, arena, saida)
+    return true
+}
+
+// C: nativo/obj/coff_diretivas.c:209
+// C2F-70: o CoffLeitor do C vira var local (sem objeto); as bibliotecas vao para a lista do destino
+proc coff_bibliotecas_do_membro(b: ^u8, n: u64, destino: ^CoffDestinoNomes, erro: ^common.Diag) -> bool {
+    var l = CoffLeitor{b = slice_from(b, len = n as int), n = n, erro = erro}
+    if not coff_ler_cabecalho(&l) {
+        return false
+    }
+    coff_ler_tabela_strings(&l)
+    let arena: ^common.Arena = destino.arena as ^common.Arena
+    let lista: ^[dynamic]str = destino.lista as ^[dynamic]str
+    var i: u32 = 0
+    while i < l.nsec {
+        if not dir_secao_diretiva(&l, i, arena, lista) {
+            return false
+        }
+        i += 1
+    }
+    return true
+}

@@ -1,0 +1,376 @@
+// nativo/dbg/dwarf_tipos.fj - porte de compiler/nativo/dbg/dwarf_tipos.c
+// sha256 de nativo/dbg/dwarf_tipos.c: 03321c01148fd8736800ec75c516447f75d78ac8785145bdc3e0e875592d0419
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "common"
+import "ir"
+import "semantic"
+
+struct BaseEscalar {
+    classe: i32
+    nome: ?str
+    codif: u8
+}
+
+struct DwarfLista {
+    nome: ?str
+    id: u32 // TipoId
+    elem: u32 // TipoId
+    qtd: u32
+}
+
+const DW_ATE_BOOLEAN: i32 = 2
+const DW_ATE_FLOAT: i32 = 4
+const DW_ATE_SIGNED: i32 = 5
+const DW_ATE_UNSIGNED: i32 = 7
+const DWARF_TAM_PONTEIRO: i32 = 8
+const DWARF_MEMBROS_LISTA: i32 = 5
+const NOMES_LISTA: [5]str = {"ptr", "len", "cap", "alocador", "epoca"}
+// C2F:? tabela BASES (const BaseEscalar[10]): ponteiro nao nulo
+
+// C: nativo/dbg/dwarf_tipos.c:31
+proc dwarf_classe(x: ^DwarfCtx, id: u32) -> i32 {
+    if id >= x.tipos.ntipos {
+        let msg_1 = format(f"dwarf: tipo {id} fora da tabela", alloc = heap)
+        defer delete(msg_1)
+        common.falha_interna(msg_1)
+    }
+    return semantic.tipo_classe_de((x.s as ^DwarfSemantica).tipos as ^semantic.Tipos, id)
+}
+
+// C: nativo/dbg/dwarf_tipos.c:38
+proc dwarf_tam(x: ^DwarfCtx, id: u32) -> u32 {
+    var tern_1: u32 = 0
+    if id < x.lay.qtd {
+        tern_1 = (x.lay.tipos or_else {})[id].tam
+    }
+    return tern_1
+}
+
+// C: nativo/dbg/dwarf_tipos.c:44
+proc dwarf_indice(x: ^DwarfCtx, tipo: u8, id: u32) -> u32 {
+    let n: u32 = x.tipos.ntipos
+    if tipo == (DWARF_ITEM_VOID as u8) {
+        return 2 * n
+    }
+    if id >= n {
+        let msg_1 = format(f"dwarf: tipo {id} fora do registro de DIE", alloc = heap)
+        defer delete(msg_1)
+        common.falha_interna(msg_1)
+    }
+    var tern_1: u32 = n + id
+    if tipo == (DWARF_ITEM_TIPO as u8) {
+        tern_1 = id
+    }
+    return tern_1
+}
+
+// C: nativo/dbg/dwarf_tipos.c:56
+proc dwarf_ref_item(x: ^DwarfCtx, b: ^[dynamic]u8, tipo: u8, id: u32) {
+    let indice: u32 = dwarf_indice(x, tipo, id)
+    append(&x.tipos.refs, item = DwarfRef{})
+    let r: ^DwarfRef = &x.tipos.refs[len(x.tipos.refs) - 1]
+    var it: ?^DwarfItem = none
+    r.pos = len(b^) as u64
+    r.indice = indice
+    dwarf_bytes_u32(b, 0)
+    if (x.tipos.na_fila or_else {})[indice] != 0 {
+        return
+    }
+    let p_1 = x.tipos.na_fila or_else {}
+    p_1[indice] = 1
+    append(&x.tipos.fila, item = DwarfItem{})
+    it = &x.tipos.fila[len(x.tipos.fila) - 1]
+    let ptr_1: ^DwarfItem = it as ^DwarfItem
+    ptr_1.tipo = tipo
+    let ptr_2: ^DwarfItem = it as ^DwarfItem
+    ptr_2.id = id
+}
+
+// C: nativo/dbg/dwarf_tipos.c:73
+proc dwarf_ref_tipo(x: ^DwarfCtx, b: ^[dynamic]u8, id: u32) {
+    var info: ?^semantic.TipoInfo = none
+    let sw_1 = common.c2f_s2u_32(dwarf_classe(x, id))
+    if sw_1 == (semantic.TC_PONTEIRO as u32) or sw_1 == (semantic.TC_ANULAVEL as u32) {
+        info = semantic.tipo_de((x.s as ^DwarfSemantica).tipos as ^semantic.Tipos, id)
+        dwarf_ref_item(x, b, DWARF_ITEM_PONTEIRO as u8, (info as ^semantic.TipoInfo).a)
+    } else if sw_1 == (semantic.TC_RAWPTR as u32) or sw_1 == (semantic.TC_CSTR as u32) {
+        dwarf_ref_item(x, b, DWARF_ITEM_VOID as u8, 0)
+    } else {
+        dwarf_ref_item(x, b, DWARF_ITEM_TIPO as u8, id)
+    }
+}
+
+// C: nativo/dbg/dwarf_tipos.c:92
+proc dwarf_emitir_base(b: ^[dynamic]u8, nome: ?str, tam: u32, codif: u8) {
+    dwarf_bytes_uleb(b, DWARF_ABREV_BASE as u64)
+    dwarf_bytes_texto(b, nome)
+    dwarf_bytes_uleb(b, tam as u64)
+    dwarf_bytes_u8(b, codif)
+}
+
+// C: nativo/dbg/dwarf_tipos.c:101
+// Grava a codificacao do escalar e devolve o nome dele (a tabela BASES do C, por classe).
+proc dwarf_base_com(codif: ^u8, nome: str, codificacao: i32) -> ?str {
+    codif^ = codificacao as u8
+    return nome
+}
+
+// C: nativo/dbg/dwarf_tipos.c:101
+// Nome e codificacao de um escalar; none = nao e escalar. O real sai como f32 ou f64 pelo tamanho.
+proc dwarf_nome_escalar(c: i32, tam: u32, codif: ^u8) -> ?str {
+    let cu: u32 = common.c2f_s2u_32(c)
+    if cu == (semantic.TC_REAL as u32) {
+        if tam == 4 {
+            return dwarf_base_com(codif, "f32", DW_ATE_FLOAT)
+        }
+        return dwarf_base_com(codif, "f64", DW_ATE_FLOAT)
+    }
+    if cu == (semantic.TC_BOOL as u32) {
+        return dwarf_base_com(codif, "bool", DW_ATE_BOOLEAN)
+    }
+    if cu == (semantic.TC_I8 as u32) {
+        return dwarf_base_com(codif, "i8", DW_ATE_SIGNED)
+    }
+    if cu == (semantic.TC_I16 as u32) {
+        return dwarf_base_com(codif, "i16", DW_ATE_SIGNED)
+    }
+    if cu == (semantic.TC_I32 as u32) {
+        return dwarf_base_com(codif, "i32", DW_ATE_SIGNED)
+    }
+    if cu == (semantic.TC_INT as u32) {
+        return dwarf_base_com(codif, "int", DW_ATE_SIGNED)
+    }
+    if cu == (semantic.TC_U8 as u32) {
+        return dwarf_base_com(codif, "u8", DW_ATE_UNSIGNED)
+    }
+    if cu == (semantic.TC_U16 as u32) {
+        return dwarf_base_com(codif, "u16", DW_ATE_UNSIGNED)
+    }
+    if cu == (semantic.TC_U32 as u32) {
+        return dwarf_base_com(codif, "u32", DW_ATE_UNSIGNED)
+    }
+    if cu == (semantic.TC_UINT as u32) {
+        return dwarf_base_com(codif, "uint", DW_ATE_UNSIGNED)
+    }
+    if cu == (semantic.TC_F64 as u32) {
+        return dwarf_base_com(codif, "f64", DW_ATE_FLOAT)
+    }
+    return none
+}
+
+// C: nativo/dbg/dwarf_tipos.c:116
+proc dwarf_cabecalho_estrutura(b: ^[dynamic]u8, nome: str, tam: u32) {
+    dwarf_bytes_uleb(b, DWARF_ABREV_ESTRUTURA as u64)
+    dwarf_bytes_texto(b, nome)
+    dwarf_bytes_uleb(b, tam as u64)
+}
+
+// C: nativo/dbg/dwarf_tipos.c:124
+proc dwarf_emitir_vetor(x: ^DwarfCtx, b: ^[dynamic]u8, elem: u32, n: u32) {
+    dwarf_bytes_uleb(b, DWARF_ABREV_VETOR as u64)
+    dwarf_ref_tipo(x, b, elem)
+    dwarf_bytes_uleb(b, DWARF_ABREV_INTERVALO as u64)
+    dwarf_bytes_uleb(b, n as u64)
+    dwarf_bytes_u8(b, 0)
+}
+
+// C: nativo/dbg/dwarf_tipos.c:137
+proc dwarf_membro_lista(x: ^DwarfCtx, b: ^[dynamic]u8, l: ^DwarfLista, k: u32) {
+    dwarf_bytes_uleb(b, DWARF_ABREV_MEMBRO as u64)
+    dwarf_bytes_texto(b, NOMES_LISTA[k])
+    if k == 0 {
+        dwarf_ref_item(x, b, DWARF_ITEM_PONTEIRO as u8, l.elem)
+    } else {
+        var tern_1: i32 = semantic.TIPO_U32
+        if k <= 2 {
+            tern_1 = semantic.TIPO_INT
+        }
+        dwarf_ref_item(x, b, DWARF_ITEM_TIPO as u8, common.c2f_s2u_32(tern_1))
+    }
+    dwarf_bytes_uleb(b, ir.layout_offset_campo(&x.lay, l.id, k) as u64)
+}
+
+// C: nativo/dbg/dwarf_tipos.c:148
+proc dwarf_emitir_lista_fixa(x: ^DwarfCtx, b: ^[dynamic]u8, l: ^DwarfLista) {
+    let qtd_layout: u32 = ir.layout_qtd_membros(&x.lay, l.id)
+    let arg_1: u32 = dwarf_tam(x, l.id)
+    let arg_2: str = (l.nome or_else "")
+    let arg_3: ^[dynamic]u8 = b
+    dwarf_cabecalho_estrutura(arg_3, arg_2, arg_1)
+    var k: u32 = 0
+    while (k < l.qtd) and (k < qtd_layout) {
+        dwarf_membro_lista(x, b, l, k)
+        k += 1
+    }
+    dwarf_bytes_u8(b, 0)
+}
+
+// C: nativo/dbg/dwarf_tipos.c:158
+proc dwarf_achar_enum(ir_c: ^ir.IrPrograma, nome: i32) -> ?^ir.IrEnum {
+    for k in (0 as u32)..<ir_c.nenums {
+        if (ir_c.enums or_else {})[k].nome == nome {
+            return &(ir_c.enums or_else {})[k]
+        }
+    }
+    return none
+}
+
+// C: nativo/dbg/dwarf_tipos.c:168
+proc dwarf_emitir_estrutura(x: ^DwarfCtx, b: ^[dynamic]u8, id: u32) -> bool {
+    let s: ?^ir.IrStruct = ir.layout_estrutura((x.s as ^DwarfSemantica).tipos as ^semantic.Tipos, (x.s as ^DwarfSemantica).ir as ^ir.IrPrograma, id)
+    let info: ^semantic.TipoInfo = semantic.tipo_de((x.s as ^DwarfSemantica).tipos as ^semantic.Tipos, id)
+    if (s == none) or (common.c2f_b2i32((s as ^ir.IrStruct).opaco) != 0) {
+        return false
+    }
+    let arg_1: u32 = dwarf_tam(x, id)
+    let arg_2: str = common.interner_texto((x.s as ^DwarfSemantica).nomes as ^common.Interner, transmute(info.a, to = i32))
+    let arg_3: ^[dynamic]u8 = b
+    dwarf_cabecalho_estrutura(arg_3, arg_2, arg_1)
+    var k: u32 = 0
+    while k < (s as ^ir.IrStruct).ncampos {
+        dwarf_bytes_uleb(b, DWARF_ABREV_MEMBRO as u64)
+        dwarf_bytes_texto(b, common.interner_texto((x.s as ^DwarfSemantica).nomes as ^common.Interner, ((s as ^ir.IrStruct).campos or_else {})[k].nome))
+        dwarf_ref_tipo(x, b, ((s as ^ir.IrStruct).campos or_else {})[k].tipo)
+        dwarf_bytes_uleb(b, ir.layout_offset_campo(&x.lay, id, k) as u64)
+        k += 1
+    }
+    dwarf_bytes_u8(b, 0)
+    return true
+}
+
+// C: nativo/dbg/dwarf_tipos.c:187
+proc dwarf_emitir_enum(x: ^DwarfCtx, b: ^[dynamic]u8, id: u32) -> bool {
+    let info: ^semantic.TipoInfo = semantic.tipo_de((x.s as ^DwarfSemantica).tipos as ^semantic.Tipos, id)
+    let e: ?^ir.IrEnum = dwarf_achar_enum((x.s as ^DwarfSemantica).ir as ^ir.IrPrograma, transmute(info.a, to = i32))
+    if e == none {
+        return false
+    }
+    dwarf_bytes_uleb(b, DWARF_ABREV_ENUM as u64)
+    dwarf_bytes_texto(b, common.interner_texto((x.s as ^DwarfSemantica).nomes as ^common.Interner, transmute(info.a, to = i32)))
+    dwarf_bytes_uleb(b, dwarf_tam(x, id) as u64)
+    var k: u32 = 0
+    while k < (e as ^ir.IrEnum).nmembros {
+        dwarf_bytes_uleb(b, DWARF_ABREV_ENUMERADOR as u64)
+        dwarf_bytes_texto(b, common.interner_texto((x.s as ^DwarfSemantica).nomes as ^common.Interner, ((e as ^ir.IrEnum).membros or_else {})[k]))
+        var tern_1: i64 = k as i64
+        if (e as ^ir.IrEnum).valores != none {
+            tern_1 = ((e as ^ir.IrEnum).valores or_else {})[k]
+        }
+        dwarf_bytes_sleb(b, tern_1)
+        k += 1
+    }
+    dwarf_bytes_u8(b, 0)
+    return true
+}
+
+// C: nativo/dbg/dwarf_tipos.c:207
+proc dwarf_emitir_composto(x: ^DwarfCtx, b: ^[dynamic]u8, id: u32, c: i32) {
+    if (common.c2f_s2u_32(c) == (semantic.TC_STRUCT as u32)) and (common.c2f_b2i32(dwarf_emitir_estrutura(x, b, id)) != 0) {
+        return
+    }
+    if (common.c2f_s2u_32(c) == (semantic.TC_ENUM as u32)) and (common.c2f_b2i32(dwarf_emitir_enum(x, b, id)) != 0) {
+        return
+    }
+    dwarf_emitir_vetor(x, b, semantic.TIPO_U8 as u32, dwarf_tam(x, id))
+}
+
+// C: nativo/dbg/dwarf_tipos.c:217
+proc dwarf_emitir_tipo(x: ^DwarfCtx, b: ^[dynamic]u8, id: u32) {
+    let info: ^semantic.TipoInfo = semantic.tipo_de((x.s as ^DwarfSemantica).tipos as ^semantic.Tipos, id)
+    let c: i32 = dwarf_classe(x, id)
+    let tam: u32 = dwarf_tam(x, id)
+    var codif: u8 = 0
+    let base: ?str = dwarf_nome_escalar(c, tam, &codif)
+    if base != none {
+        dwarf_emitir_base(b, base, tam, codif)
+    } else if common.c2f_s2u_32(c) == (semantic.TC_TEXTO as u32) {
+        var lit_1 = DwarfLista{nome = "str", id = id, elem = semantic.TIPO_U8 as u32, qtd = 2}
+        dwarf_emitir_lista_fixa(x, b, &lit_1)
+    } else if common.c2f_s2u_32(c) == (semantic.TC_FATIA as u32) {
+        var lit_2 = DwarfLista{nome = "[]T", id = id, elem = info.a, qtd = 2}
+        dwarf_emitir_lista_fixa(x, b, &lit_2)
+    } else if common.c2f_s2u_32(c) == (semantic.TC_DINAMICO as u32) {
+        var lit_3 = DwarfLista{nome = "[dynamic]T", id = id, elem = info.a, qtd = DWARF_MEMBROS_LISTA as u32}
+        dwarf_emitir_lista_fixa(x, b, &lit_3)
+    } else if common.c2f_s2u_32(c) == (semantic.TC_ARRAY as u32) {
+        dwarf_emitir_vetor(x, b, info.a, info.b)
+    } else {
+        dwarf_emitir_composto(x, b, id, c)
+    }
+}
+
+// C: nativo/dbg/dwarf_tipos.c:240
+proc dwarf_emitir_item(x: ^DwarfCtx, it: DwarfItem) {
+    let b: ^[dynamic]u8 = dwarf_buf_secao(x, x.sec_info)
+    let p_1 = x.tipos.off or_else {}
+    p_1[dwarf_indice(x, it.tipo, it.id)] = (len(b^) as u64) as u32
+    if it.tipo == (DWARF_ITEM_VOID as u8) {
+        dwarf_bytes_uleb(b, DWARF_ABREV_PONTEIRO_VOID as u64)
+        dwarf_bytes_uleb(b, DWARF_TAM_PONTEIRO as u64)
+    } else if it.tipo == (DWARF_ITEM_PONTEIRO as u8) {
+        dwarf_bytes_uleb(b, DWARF_ABREV_PONTEIRO as u64)
+        dwarf_bytes_uleb(b, DWARF_TAM_PONTEIRO as u64)
+        dwarf_ref_tipo(x, b, it.id)
+    } else {
+        dwarf_emitir_tipo(x, b, it.id)
+    }
+}
+
+// C: nativo/dbg/dwarf_tipos.c:257
+// C: nativo/dbg/dwarf_tipos.c:257
+// Registro de DIEs: off e na_fila tem 2n+1 entradas (TIPO, PONTEIRO e VOID); tudo da arena, off comeca em DWARF_SEM_DIE.
+proc dwarf_tipos_iniciar(x: ^DwarfCtx) {
+    let tipos: ^semantic.Tipos = (x.s as ^DwarfSemantica).tipos as ^semantic.Tipos
+    let n: u32 = len(tipos.itens) as u32
+    let tam: u64 = 2 * (n as u64) + 1
+    x.tipos.ntipos = n
+    x.tipos.off = common.arena_fatia_u32(&x.arena, tam as int)
+    x.tipos.na_fila = common.arena_fatia_u8(&x.arena, tam as int)
+    let off = x.tipos.off or_else {}
+    let na_fila = x.tipos.na_fila or_else {}
+    var i: u64 = 0
+    while i < tam {
+        off[i] = DWARF_SEM_DIE
+        na_fila[i] = 0
+        i += 1
+    }
+    x.tipos.fila = make([dynamic]DwarfItem, alloc = heap)
+    x.tipos.refs = make([dynamic]DwarfRef, alloc = heap)
+}
+
+test "dwarf_nome_escalar_real_pelo_tamanho" {
+    var codif: u8 = 0
+    let nome = dwarf_nome_escalar(semantic.TC_REAL as i32, 4, &codif)
+    expect((nome or_else "") == "f32")
+    expect(codif == 4)
+    expect((dwarf_nome_escalar(semantic.TC_REAL as i32, 8, &codif) or_else "") == "f64")
+}
+
+// C: nativo/dbg/dwarf_tipos.c:274
+proc dwarf_escrever_tipos(x: ^DwarfCtx) {
+    var i: u64 = 0
+    while i < (len(x.tipos.fila) as u64) {
+        let it: DwarfItem = x.tipos.fila[i]
+        dwarf_emitir_item(x, it)
+        i += 1
+    }
+}
+
+// C: nativo/dbg/dwarf_tipos.c:283
+proc dwarf_patch_refs(x: ^DwarfCtx) {
+    let b: ^[dynamic]u8 = dwarf_buf_secao(x, x.sec_info)
+    var i: u64 = 0
+    while i < (len(x.tipos.refs) as u64) {
+        let r: ^DwarfRef = &x.tipos.refs[i]
+        let alvo: u32 = (x.tipos.off or_else {})[r.indice]
+        if alvo == DWARF_SEM_DIE {
+            let msg_1 = format(f"dwarf: referencia a tipo sem DIE (indice {r.indice})", alloc = heap)
+            defer delete(msg_1)
+            common.falha_interna(msg_1)
+        }
+        dwarf_patch_u32(b, r.pos, alvo)
+        i += 1
+    }
+}

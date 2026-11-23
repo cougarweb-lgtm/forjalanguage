@@ -1,0 +1,77 @@
+// std:process no Linux (M5 P28b-2) - kill mata o GRUPO do filho (kill(-pid, SIGKILL)): o sh em segundo plano deixa um neto (sleep) vivo, e o neto morre junto com o filho; exit_code = 128 + 9.
+// Equivalente Windows: std\process\testes.fj "spawn, read_available, kill e close" (la o Job leva a arvore).
+import "std:os" as sys
+import "std:process" as pr
+import "std:text" as tx
+
+// true se o processo `pid` existe (kill -0 nao envia sinal).
+proc vivo(pid: int) -> bool {
+    let script = format(f"kill -0 {pid}", alloc = heap)
+    var args: [2]str = {"-c", script}
+    let cmd = pr.Command{program = "/bin/sh", args = args[..], env = {}, cwd = "", timeout_ms = 0}
+    var existe = false
+    switch r in pr.run(cmd, alloc = heap) {
+    case pr.Output:
+        existe = r.code == 0
+        delete(r.stdout)
+        delete(r.stderr)
+    case pr.ProcessError:
+        existe = false
+    }
+    delete(script)
+    return existe
+}
+
+// O pid que o filho imprimiu na 1a linha (com o LF no fim); -1 se nao der para ler.
+proc pid_da_linha(bytes: []u8) -> int {
+    let linha = from_bytes(bytes[0..<len(bytes) - 1], alloc = heap)
+    var pid = -1
+    switch r in tx.parse_int(linha) {
+    case int:
+        pid = r
+    case tx.ParseError:
+        pid = -1
+    }
+    delete(linha)
+    return pid
+}
+
+proc main() {
+    var args: [2]str = {"-c", "sleep 30 & echo $!; wait"}
+    let cmd = pr.Command{program = "/bin/sh", args = args[..], env = {}, cwd = "", timeout_ms = 0}
+    switch p in pr.spawn(cmd) {
+    case pr.Process:
+        var saida = make([dynamic]u8, alloc = heap)
+        var erro = make([dynamic]u8, alloc = heap)
+        var tentativas = 0
+        var completo = false
+        while not completo and tentativas < 500 {
+            _ = pr.read_available(p, out = &saida, err = &erro)
+            completo = len(saida) > 1 and saida[len(saida) - 1] == 10
+            if not completo {
+                _ = pr.wait(p, timeout_ms = 20)
+            }
+            tentativas += 1
+        }
+        let pid = pid_da_linha(saida[..])
+        let filho_rodando = not pr.wait(p, timeout_ms = 0)
+        let neto_vivo = vivo(pid)
+        print(f"antes: filho vivo={filho_rodando} neto vivo={neto_vivo}")
+        pr.kill(p)
+        let terminou = pr.wait(p, timeout_ms = 3000)
+        print(f"kill: terminou={terminou} code={pr.exit_code(p)}")
+        var k = 0
+        while vivo(pid) and k < 150 {
+            sys.sleep_ms(20)
+            k += 1
+        }
+        let neto_morto = not vivo(pid)
+        print(f"depois: neto morto={neto_morto}")
+        pr.close(p)
+        pr.close(p)
+        delete(saida)
+        delete(erro)
+    case pr.ProcessError:
+        print("erro")
+    }
+}

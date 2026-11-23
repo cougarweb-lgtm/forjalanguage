@@ -1,0 +1,692 @@
+// std:json 0.2.0 - JSON para a Forja, feito por cima do cJSON 1.7.19 (MIT) em vendor\libcjson.a.
+// Versao: 0.2.0
+// Changelog: 0.2.0 - S2g-json (J01+J02): texto publico em `str` (nome de campo, valor, parse_file), rotulos index/value/text/path (os antigos indice/valor/texto/caminho dao E0110: forja migrar),
+//                    push_bool/push_null/push_list, remove_field/remove_item, get_path e path_text/path_int/path_number/path_bool, membro JsonError.invalid_path.
+//            0.1.0 - primeira versao (parse/close, leitura, escrita, dump).
+//
+// COMO USAR (o .fj raiz do programa precisa de uma pasta vendor\ ao lado; ver MEM-FORJA-GUIA-10):
+//     import "vendor:json/json"
+//     ...
+//     let doc = try json.parse("{\"a\": {\"b\": [10, 20]}}")
+//     defer json.close(doc)
+//     let a = try json.field_int(doc, name = "a")            // campo direto
+//     let v = try json.path_int(doc, path = "a.b[1]")        // caminho: 20
+//     var onde: int = 0
+//     let t = json.path_text(doc, path = "a.x[0]", at = &onde)  // erro: onde = 2 (inicio do segmento "x")
+// Os nomes antigos em portugues (abrir, fechar, campo_inteiro, nome = ..., indice = ..., valor = ..., ErroJson, TipoJson...) dao E0110: rode forja migrar (tabela compiler\common\renomeados.c).
+//
+// TEXTO: todo parametro de texto publico e `str` (literal serve direto), menos `parse(text: cstr)`, que e a forma C (ja termina em NUL); `parse_str(text: str)` e a forma str.
+//   O cJSON copia nome e valor, entao cada proc copia o str para um cstr em heap, usa e libera dentro dele; nada vaza e nada fica com o chamador.
+//
+// DONOS E EMPRESTADOS (a regra que evita vazamento e ponteiro solto):
+//   - parse, parse_str, parse_file, new_object e new_list devolvem um Json DONO: chame json.close(doc) uma vez.
+//   - field, item, get_path, set_object, set_list, push_object e push_list devolvem uma VISTA (dono = false) de dentro do dono:
+//     vale ate o close do dono; json.close numa vista nao faz nada. remove_field/remove_item apagam o filho: as vistas dele (e do que ele continha) deixam de valer.
+//   - text, field_text, path_text e key devolvem um str EMPRESTADO do documento: vale ate o close (ou ate o filho ser removido). Para guardar, copie
+//     com format(f"{s}", alloc = heap).
+//   - dump devolve um str NOVO em heap: o chamador faz delete.
+// Um objeto/lista anexado a outro (set_*, push_*) pertence ao pai; so o pai e fechado.
+// Erro: JsonError. Nada aqui devolve ponteiro cru; o campo no do Json e interno, nao mexa.
+// Limite: o cJSON guarda o ultimo erro de parse numa variavel global (nao e seguro para abrir JSON em 2 threads).
+// Fora: replace_field/replace_item e insert_item (um Json dono anexado a outro nao tem como ser marcado como "ja entregue" no tipo: o `close` do dono original liberaria de novo).
+//
+// CAMINHO (get_path e path_*): segmentos de campo separados por `.` e indice de lista `[n]` (n inteiro >= 0, sem sinal nem espaco): "a.b[2].c", "[0].x", "m[1][2]"; "" = o proprio j.
+//   O nome do campo vai ate o proximo `.` ou `[` (campo com ponto, colchete ou vazio no nome nao e suportado: use field/item). Erros: wrong_type (campo em nao-objeto, `[n]` em nao-lista),
+//   missing (campo ou indice inexistente), invalid_path (sintaxe: "a..b", "a.", ".a", "a.[0]", "[x]", "[", "[-1]", "a]", ...). `at: ?^int` (opcional) recebe, SO quando ha erro, a posicao em BYTES de path onde o erro foi
+//   achado: o inicio do segmento que falhou (em "a." e "a..b", onde o nome era esperado). Nos path_*, um erro de LEITURA do valor final (wrong_type) aponta o inicio do ultimo segmento.
+//
+// VERIFICAR: python language\vendor\json\verificar_json.py   (ou: forja test language\exemplos_libs\teste_json.fj)
+
+import "vendor:json/cjson" as cj
+
+pub enum JsonError {
+    invalid
+    missing
+    wrong_type
+    out_of_memory
+    file
+    invalid_path
+}
+
+pub enum JsonKind {
+    null
+    boolean
+    number
+    text
+    list
+    object
+    outro
+}
+
+pub struct Json {
+    no: ?^cj.CJson
+    dono: bool
+}
+
+const JSON_ARQUIVO_MAXIMO: i32 = 268435456
+const PATH_DOT: u8 = 46
+const PATH_OPEN: u8 = 91
+const PATH_CLOSE: u8 = 93
+const PATH_DIGIT_ZERO: u8 = 48
+const PATH_DIGIT_NINE: u8 = 57
+const PATH_INDEX_CAP: int = 100000000000000
+const PATH_INDEX_MAX: int = 2147483647
+
+// Posicao do caminho: no atual, proximo byte e se um `.` acabou de ser lido (o proximo segmento tem de ser um nome).
+struct PathCursor {
+    node: Json
+    pos: int = 0
+    need_name: bool = false
+}
+
+foreign {
+    link "msvcrt"
+    opaque JsonArquivoC
+    proc json_c_fopen = "fopen"(caminho: cstr, modo: cstr) -> ?^JsonArquivoC
+    proc json_c_fclose = "fclose"(arquivo: ?^JsonArquivoC) -> i32
+    proc json_c_fseek = "fseek"(arquivo: ?^JsonArquivoC, deslocamento: i32, origem: i32) -> i32
+    proc json_c_ftell = "ftell"(arquivo: ?^JsonArquivoC) -> i32
+    proc json_c_fread = "fread"(destino: rawptr, tamanho: u64, quantidade: u64, arquivo: ?^JsonArquivoC) -> u64
+    proc json_c_malloc = "malloc"(bytes: u64) -> rawptr
+    proc json_c_free = "free"(bloco: rawptr)
+}
+
+// ---------------------------------------------------------------- parse e close
+
+// Texto JSON (cstr, termina em NUL) -> documento dono. Erro: invalid.
+pub proc parse(text: cstr) -> Json ! JsonError {
+    let lido = cj.cJSON_Parse(text)
+    if lido == none {
+        return JsonError.invalid
+    }
+    return Json{no = lido, dono = true}
+}
+
+// str -> documento dono (copia o texto para ganhar o NUL final). Erro: invalid.
+pub proc parse_str(text: str) -> Json ! JsonError {
+    let copia = format_c(f"{text}", alloc = heap)
+    defer delete(copia)
+    return parse(copia)
+}
+
+// Le o arquivo inteiro e abre. Erros: file (nao abriu, vazio, maior que 256 MiB, leitura curta), out_of_memory, invalid.
+pub proc parse_file(path: str) -> Json ! JsonError {
+    let path_c = format_c(f"{path}", alloc = heap)
+    defer delete(path_c)
+    let aberto = json_c_fopen(path_c, modo = "rb")
+    switch a in aberto {
+    case ^JsonArquivoC:
+        _ = json_c_fseek(a, deslocamento = 0, origem = 2)
+        let tamanho = json_c_ftell(a)
+        _ = json_c_fseek(a, deslocamento = 0, origem = 0)
+        if tamanho <= 0 or tamanho > JSON_ARQUIVO_MAXIMO {
+            _ = json_c_fclose(a)
+            return JsonError.file
+        }
+        let bloco = json_c_malloc((tamanho as u64) + 1)
+        let bytes = bloco as ^u8
+        let janela = slice_from(bytes, len = tamanho + 1)
+        let lidos = json_c_fread(bloco, tamanho = 1, quantidade = tamanho as u64, arquivo = a)
+        _ = json_c_fclose(a)
+        if lidos != (tamanho as u64) {
+            json_c_free(bloco)
+            return JsonError.file
+        }
+        janela[tamanho] = 0
+        let doc = parse(bloco as cstr)
+        json_c_free(bloco)
+        return try doc
+    case none:
+        return JsonError.file
+    }
+    return JsonError.file
+}
+
+// Fecha um documento DONO. Em vista (dono = false) nao faz nada.
+pub proc close(doc: Json) {
+    if doc.dono {
+        cj.cJSON_Delete(doc.no)
+    }
+}
+
+// ---------------------------------------------------------------- ler
+
+// Tipo do valor: null, boolean, number, text, list, object (outro = vazio/invalido).
+pub proc kind(j: Json) -> JsonKind {
+    if cj.cJSON_IsNull(j.no) != 0 {
+        return JsonKind.null
+    }
+    if cj.cJSON_IsBool(j.no) != 0 {
+        return JsonKind.boolean
+    }
+    if cj.cJSON_IsNumber(j.no) != 0 {
+        return JsonKind.number
+    }
+    if cj.cJSON_IsString(j.no) != 0 {
+        return JsonKind.text
+    }
+    if cj.cJSON_IsArray(j.no) != 0 {
+        return JsonKind.list
+    }
+    if cj.cJSON_IsObject(j.no) != 0 {
+        return JsonKind.object
+    }
+    return JsonKind.outro
+}
+
+// Vista do campo `name` de um objeto. Erros: wrong_type (j nao e objeto), missing (nao tem o campo).
+pub proc field(j: Json, name: str) -> Json ! JsonError {
+    if cj.cJSON_IsObject(j.no) == 0 {
+        return JsonError.wrong_type
+    }
+    let name_c = format_c(f"{name}", alloc = heap)
+    defer delete(name_c)
+    let achado = cj.cJSON_GetObjectItemCaseSensitive(j.no, string = name_c)
+    switch c in achado {
+    case ^cj.CJson:
+        return Json{no = c, dono = false}
+    case none:
+        return JsonError.missing
+    }
+    return JsonError.missing
+}
+
+// true se o objeto tem o campo `name`.
+pub proc has_field(j: Json, name: str) -> bool {
+    if cj.cJSON_IsObject(j.no) == 0 {
+        return false
+    }
+    let name_c = format_c(f"{name}", alloc = heap)
+    defer delete(name_c)
+    return cj.cJSON_HasObjectItem(j.no, string = name_c) != 0
+}
+
+// Quantidade de elementos de uma lista (ou de campos de um objeto); 0 para outros tipos.
+pub proc size(j: Json) -> i32 {
+    if cj.cJSON_IsArray(j.no) == 0 and cj.cJSON_IsObject(j.no) == 0 {
+        return 0
+    }
+    return cj.cJSON_GetArraySize(j.no)
+}
+
+// Vista do elemento `index` (0..size-1) de uma lista. Erros: wrong_type (nao e lista), missing (indice fora).
+pub proc item(j: Json, index: i32) -> Json ! JsonError {
+    if cj.cJSON_IsArray(j.no) == 0 {
+        return JsonError.wrong_type
+    }
+    if index < 0 or index >= cj.cJSON_GetArraySize(j.no) {
+        return JsonError.missing
+    }
+    let achado = cj.cJSON_GetArrayItem(j.no, index = index)
+    switch c in achado {
+    case ^cj.CJson:
+        return Json{no = c, dono = false}
+    case none:
+        return JsonError.missing
+    }
+    return JsonError.missing
+}
+
+// Nome (chave) do campo `index` de um objeto: str emprestado. Erros: wrong_type, missing.
+pub proc key(j: Json, index: i32) -> str ! JsonError {
+    if cj.cJSON_IsObject(j.no) == 0 {
+        return JsonError.wrong_type
+    }
+    if index < 0 or index >= cj.cJSON_GetArraySize(j.no) {
+        return JsonError.missing
+    }
+    let achado = cj.cJSON_GetArrayItem(j.no, index = index)
+    switch c in achado {
+    case ^cj.CJson:
+        let nome = c.string as cstr
+        return nome as str
+    case none:
+        return JsonError.missing
+    }
+    return JsonError.missing
+}
+
+// Valor numerico (todo numero JSON e f64). Erro: wrong_type.
+pub proc number(j: Json) -> f64 ! JsonError {
+    if cj.cJSON_IsNumber(j.no) == 0 {
+        return JsonError.wrong_type
+    }
+    return cj.cJSON_GetNumberValue(j.no)
+}
+
+// Valor inteiro (trunca a parte fracionaria). Erro: wrong_type.
+pub proc integer(j: Json) -> i64 ! JsonError {
+    let n = try number(j)
+    return n as i64
+}
+
+// Texto emprestado do documento. Erro: wrong_type.
+pub proc text(j: Json) -> str ! JsonError {
+    if cj.cJSON_IsString(j.no) == 0 {
+        return JsonError.wrong_type
+    }
+    let lido = cj.cJSON_GetStringValue(j.no)
+    switch s in lido {
+    case cstr:
+        return s as str
+    case none:
+        return JsonError.wrong_type
+    }
+    return JsonError.wrong_type
+}
+
+// true/false. Erro: wrong_type.
+pub proc boolean(j: Json) -> bool ! JsonError {
+    if cj.cJSON_IsBool(j.no) == 0 {
+        return JsonError.wrong_type
+    }
+    return cj.cJSON_IsTrue(j.no) != 0
+}
+
+// Atalhos field + leitura (a combinacao mais comum). Erros: os de field e os da leitura.
+pub proc field_number(j: Json, name: str) -> f64 ! JsonError {
+    let c = try field(j, name = name)
+    return try number(c)
+}
+
+pub proc field_int(j: Json, name: str) -> i64 ! JsonError {
+    let c = try field(j, name = name)
+    return try integer(c)
+}
+
+pub proc field_text(j: Json, name: str) -> str ! JsonError {
+    let c = try field(j, name = name)
+    return try text(c)
+}
+
+pub proc field_bool(j: Json, name: str) -> bool ! JsonError {
+    let c = try field(j, name = name)
+    return try boolean(c)
+}
+
+// ---------------------------------------------------------------- caminho
+
+// Grava em at (se foi pedido) a posicao do erro.
+proc path_report_at(at: ?^int, offset: int) {
+    switch p in at {
+    case ^int:
+        p^ = offset
+    case none:
+    }
+}
+
+// Fim do nome de campo que comeca em from: o 1o `.` ou `[` (ou o fim do caminho).
+proc path_name_end(path: str, from: int) -> int {
+    var i = from
+    let n = len(path)
+    while i < n and path[i] != PATH_DOT and path[i] != PATH_OPEN and path[i] != PATH_CLOSE {
+        i += 1
+    }
+    return i
+}
+
+// Le "[n]" com `[` em from: devolve o indice e a posicao seguinte; (-1, -1) se a sintaxe esta errada. Numero gigante satura (o item devolve missing).
+proc path_index_parse(path: str, from: int) -> (value: int, next: int) {
+    var i = from + 1
+    var value: int = 0
+    let n = len(path)
+    while i < n and path[i] >= PATH_DIGIT_ZERO and path[i] <= PATH_DIGIT_NINE {
+        if value < PATH_INDEX_CAP {
+            value = value * 10 + ((path[i] - PATH_DIGIT_ZERO) as int)
+        }
+        i += 1
+    }
+    if i == from + 1 or i >= n or path[i] != PATH_CLOSE {
+        return -1, -1
+    }
+    return value, i + 1
+}
+
+// Um segmento de campo em c.pos: entra no campo e anda o cursor.
+proc path_step_field(c: ^PathCursor, path: str, at: ?^int) -> ! JsonError {
+    let start = c.pos
+    let end = path_name_end(path, from = start)
+    if end == start {
+        path_report_at(at, start)
+        return JsonError.invalid_path
+    }
+    switch r in field(c.node, name = path[start..<end]) {
+    case Json:
+        c.node = r
+        c.pos = end
+        c.need_name = false
+    case JsonError:
+        path_report_at(at, start)
+        return r
+    }
+}
+
+// Um segmento "[n]" em c.pos: entra no elemento e anda o cursor.
+proc path_step_index(c: ^PathCursor, path: str, at: ?^int) -> ! JsonError {
+    let start = c.pos
+    let value, next = path_index_parse(path, from = start)
+    if c.need_name or next < 0 {
+        path_report_at(at, start)
+        return JsonError.invalid_path
+    }
+    switch r in item(c.node, index = min(value, PATH_INDEX_MAX) as i32) {
+    case Json:
+        c.node = r
+        c.pos = next
+    case JsonError:
+        path_report_at(at, start)
+        return r
+    }
+}
+
+// Um passo do caminho em c.pos: o `.` separador, um "[n]" ou um nome de campo.
+proc path_advance(c: ^PathCursor, path: str, at: ?^int) -> ! JsonError {
+    let start = c.pos
+    if path[start] == PATH_DOT {
+        if start == 0 or c.need_name {
+            path_report_at(at, start)
+            return JsonError.invalid_path
+        }
+        c.need_name = true
+        c.pos = start + 1
+    } else if path[start] == PATH_OPEN {
+        try path_step_index(c, path = path, at = at)
+    } else {
+        try path_step_field(c, path = path, at = at)
+    }
+}
+
+// Vista do valor em `path` ("a.b[2].c"; "" = o proprio j). Erros: wrong_type, missing, invalid_path; at = onde (ver o cabecalho).
+pub proc get_path(j: Json, path: str, at: ?^int = none) -> Json ! JsonError {
+    var c = PathCursor{node = j}
+    let n = len(path)
+    while c.pos < n {
+        try path_advance(&c, path = path, at = at)
+    }
+    if c.need_name {
+        path_report_at(at, n)
+        return JsonError.invalid_path
+    }
+    return c.node
+}
+
+// Inicio do ultimo segmento de path (o byte depois do ultimo `.`, ou o `[` do ultimo indice; 0 se ha um segmento so).
+proc path_last_start(path: str) -> int {
+    var i = len(path) - 1
+    while i >= 0 {
+        if path[i] == PATH_DOT {
+            return i + 1
+        }
+        if path[i] == PATH_OPEN {
+            return i
+        }
+        i -= 1
+    }
+    return 0
+}
+
+// get_path + leitura do valor final. Erros: os do caminho e os da leitura (wrong_type: at = inicio do ultimo segmento).
+pub proc path_text(j: Json, path: str, at: ?^int = none) -> str ! JsonError {
+    let node = try get_path(j, path = path, at = at)
+    switch r in text(node) {
+    case str:
+        return r
+    case JsonError:
+        path_report_at(at, path_last_start(path))
+        return r
+    }
+    return JsonError.wrong_type
+}
+
+pub proc path_int(j: Json, path: str, at: ?^int = none) -> i64 ! JsonError {
+    let node = try get_path(j, path = path, at = at)
+    switch r in integer(node) {
+    case i64:
+        return r
+    case JsonError:
+        path_report_at(at, path_last_start(path))
+        return r
+    }
+    return JsonError.wrong_type
+}
+
+pub proc path_number(j: Json, path: str, at: ?^int = none) -> f64 ! JsonError {
+    let node = try get_path(j, path = path, at = at)
+    switch r in number(node) {
+    case f64:
+        return r
+    case JsonError:
+        path_report_at(at, path_last_start(path))
+        return r
+    }
+    return JsonError.wrong_type
+}
+
+pub proc path_bool(j: Json, path: str, at: ?^int = none) -> bool ! JsonError {
+    let node = try get_path(j, path = path, at = at)
+    switch r in boolean(node) {
+    case bool:
+        return r
+    case JsonError:
+        path_report_at(at, path_last_start(path))
+        return r
+    }
+    return JsonError.wrong_type
+}
+
+// ---------------------------------------------------------------- criar e escrever
+
+// Objeto novo e vazio, DONO.
+pub proc new_object() -> Json ! JsonError {
+    let novo = cj.cJSON_CreateObject()
+    if novo == none {
+        return JsonError.out_of_memory
+    }
+    return Json{no = novo, dono = true}
+}
+
+// Lista nova e vazia, DONA.
+pub proc new_list() -> Json ! JsonError {
+    let novo = cj.cJSON_CreateArray()
+    if novo == none {
+        return JsonError.out_of_memory
+    }
+    return Json{no = novo, dono = true}
+}
+
+// Poe `name: value` no objeto (se o nome ja existe, o cJSON acrescenta outro; use nomes distintos ou remove_field antes).
+pub proc set_number(object: Json, name: str, value: f64) -> ! JsonError {
+    if cj.cJSON_IsObject(object.no) == 0 {
+        return JsonError.wrong_type
+    }
+    let name_c = format_c(f"{name}", alloc = heap)
+    defer delete(name_c)
+    let criado = cj.cJSON_AddNumberToObject(object.no, name = name_c, number = value)
+    if criado == none {
+        return JsonError.out_of_memory
+    }
+}
+
+pub proc set_text(object: Json, name: str, value: str) -> ! JsonError {
+    if cj.cJSON_IsObject(object.no) == 0 {
+        return JsonError.wrong_type
+    }
+    let name_c = format_c(f"{name}", alloc = heap)
+    defer delete(name_c)
+    let value_c = format_c(f"{value}", alloc = heap)
+    defer delete(value_c)
+    let criado = cj.cJSON_AddStringToObject(object.no, name = name_c, string = value_c)
+    if criado == none {
+        return JsonError.out_of_memory
+    }
+}
+
+pub proc set_bool(object: Json, name: str, value: bool) -> ! JsonError {
+    if cj.cJSON_IsObject(object.no) == 0 {
+        return JsonError.wrong_type
+    }
+    var flag: i32 = 0
+    if value {
+        flag = 1
+    }
+    let name_c = format_c(f"{name}", alloc = heap)
+    defer delete(name_c)
+    let criado = cj.cJSON_AddBoolToObject(object.no, name = name_c, boolean = flag)
+    if criado == none {
+        return JsonError.out_of_memory
+    }
+}
+
+pub proc set_null(object: Json, name: str) -> ! JsonError {
+    if cj.cJSON_IsObject(object.no) == 0 {
+        return JsonError.wrong_type
+    }
+    let name_c = format_c(f"{name}", alloc = heap)
+    defer delete(name_c)
+    let criado = cj.cJSON_AddNullToObject(object.no, name = name_c)
+    if criado == none {
+        return JsonError.out_of_memory
+    }
+}
+
+// Cria um objeto/lista filho dentro do objeto e devolve a VISTA dele para preencher. Pertence ao pai.
+pub proc set_object(object: Json, name: str) -> Json ! JsonError {
+    if cj.cJSON_IsObject(object.no) == 0 {
+        return JsonError.wrong_type
+    }
+    let name_c = format_c(f"{name}", alloc = heap)
+    defer delete(name_c)
+    let criado = cj.cJSON_AddObjectToObject(object.no, name = name_c)
+    switch c in criado {
+    case ^cj.CJson:
+        return Json{no = c, dono = false}
+    case none:
+        return JsonError.out_of_memory
+    }
+    return JsonError.out_of_memory
+}
+
+pub proc set_list(object: Json, name: str) -> Json ! JsonError {
+    if cj.cJSON_IsObject(object.no) == 0 {
+        return JsonError.wrong_type
+    }
+    let name_c = format_c(f"{name}", alloc = heap)
+    defer delete(name_c)
+    let criado = cj.cJSON_AddArrayToObject(object.no, name = name_c)
+    switch c in criado {
+    case ^cj.CJson:
+        return Json{no = c, dono = false}
+    case none:
+        return JsonError.out_of_memory
+    }
+    return JsonError.out_of_memory
+}
+
+// Apaga o campo `name` do objeto e libera o filho (as vistas dele deixam de valer). Erros: wrong_type (nao e objeto), missing (nao tem o campo).
+pub proc remove_field(object: Json, name: str) -> ! JsonError {
+    if cj.cJSON_IsObject(object.no) == 0 {
+        return JsonError.wrong_type
+    }
+    let name_c = format_c(f"{name}", alloc = heap)
+    defer delete(name_c)
+    if cj.cJSON_GetObjectItemCaseSensitive(object.no, string = name_c) == none {
+        return JsonError.missing
+    }
+    cj.cJSON_DeleteItemFromObjectCaseSensitive(object.no, string = name_c)
+}
+
+// Acrescenta um valor ao fim da lista. Se o cJSON recusar, libera o item criado (sem vazar).
+proc json_anexar(list: Json, criado: ?^cj.CJson) -> Json ! JsonError {
+    switch c in criado {
+    case ^cj.CJson:
+        if cj.cJSON_AddItemToArray(list.no, item = c) == 0 {
+            cj.cJSON_Delete(c)
+            return JsonError.out_of_memory
+        }
+        return Json{no = c, dono = false}
+    case none:
+        return JsonError.out_of_memory
+    }
+    return JsonError.out_of_memory
+}
+
+pub proc push_number(list: Json, value: f64) -> ! JsonError {
+    if cj.cJSON_IsArray(list.no) == 0 {
+        return JsonError.wrong_type
+    }
+    let _anexado = try json_anexar(list, criado = cj.cJSON_CreateNumber(value))
+}
+
+pub proc push_text(list: Json, value: str) -> ! JsonError {
+    if cj.cJSON_IsArray(list.no) == 0 {
+        return JsonError.wrong_type
+    }
+    let value_c = format_c(f"{value}", alloc = heap)
+    defer delete(value_c)
+    let _anexado = try json_anexar(list, criado = cj.cJSON_CreateString(value_c))
+}
+
+pub proc push_bool(list: Json, value: bool) -> ! JsonError {
+    if cj.cJSON_IsArray(list.no) == 0 {
+        return JsonError.wrong_type
+    }
+    var flag: i32 = 0
+    if value {
+        flag = 1
+    }
+    let _anexado = try json_anexar(list, criado = cj.cJSON_CreateBool(flag))
+}
+
+pub proc push_null(list: Json) -> ! JsonError {
+    if cj.cJSON_IsArray(list.no) == 0 {
+        return JsonError.wrong_type
+    }
+    let _anexado = try json_anexar(list, criado = cj.cJSON_CreateNull())
+}
+
+pub proc push_object(list: Json) -> Json ! JsonError {
+    if cj.cJSON_IsArray(list.no) == 0 {
+        return JsonError.wrong_type
+    }
+    return try json_anexar(list, criado = cj.cJSON_CreateObject())
+}
+
+pub proc push_list(list: Json) -> Json ! JsonError {
+    if cj.cJSON_IsArray(list.no) == 0 {
+        return JsonError.wrong_type
+    }
+    return try json_anexar(list, criado = cj.cJSON_CreateArray())
+}
+
+// Apaga o elemento `index` da lista e libera o filho (as vistas dele e dos que o seguem deixam de valer como posicao). Erros: wrong_type (nao e lista), missing (indice fora).
+pub proc remove_item(list: Json, index: i32) -> ! JsonError {
+    if cj.cJSON_IsArray(list.no) == 0 {
+        return JsonError.wrong_type
+    }
+    if index < 0 or index >= cj.cJSON_GetArraySize(list.no) {
+        return JsonError.missing
+    }
+    cj.cJSON_DeleteItemFromArray(list.no, which = index)
+}
+
+// ---------------------------------------------------------------- gerar texto
+
+// Texto JSON do valor: str NOVO em heap (o chamador faz delete). pretty = true indenta. Erro: out_of_memory.
+pub proc dump(j: Json, pretty: bool) -> str ! JsonError {
+    var bruto: ?cstr = none
+    if pretty {
+        bruto = cj.cJSON_Print(j.no)
+    } else {
+        bruto = cj.cJSON_PrintUnformatted(j.no)
+    }
+    switch c in bruto {
+    case cstr:
+        let visto = c as str
+        let copia = format(f"{visto}", alloc = heap)
+        cj.cJSON_free(c as rawptr)
+        return copia
+    case none:
+        return JsonError.out_of_memory
+    }
+    return JsonError.out_of_memory
+}

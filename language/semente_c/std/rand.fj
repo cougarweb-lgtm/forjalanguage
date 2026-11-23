@@ -1,0 +1,154 @@
+// std:rand - numeros pseudoaleatorios com semente (IA1-S2d1, A20). API em ingles (ADR-39); Forja pura (so chama std:os para a semente do relogio), igual nos 2 backends e nos 2 sistemas.
+// Versao: 0.3.0. Changelog: 0.3.0 - S2b: so comentario (linha 8): shuffle e choice sao embutidos do compilador; below e chamado pelo compilador. 0.2.0 - B01e2: perm ganha `alloc: Allocator` (ultimo parametro, sem padrao). 0.1.0 - IA1-S2d1: Rng (xoshiro256**), seed (SplitMix64), seed_from_clock, next_u64, next_u32, next_float, next_bool, below (Lemire), int_range, float_range, perm.
+// Gerador: xoshiro256** de Blackman e Vigna (dominio publico), 256 bits de estado, periodo 2^256 - 1; a semente de 64 bits vira o estado por SplitMix64 (o jeito recomendado pelos autores; o estado nunca fica todo zero).
+// Reprodutivel: a mesma semente da a mesma sequencia, bit a bit, nos 2 backends, em dev e release, em qualquer sistema. So seed_from_clock nao e reprodutivel (depende do relogio).
+// Rng e um valor mutavel de 4 campos u64: crie com seed(...) ou seed_from_clock() e passe por endereco (`var r = rand.seed(42)`, `rand.next_u64(&r)`). Os campos s0..s3 sao detalhe interno: nao leia nem escreva (nao ha campo privado na linguagem).
+// Copiar o Rng (`let b = a`) copia o estado: as duas copias passam a produzir a MESMA sequencia, cada uma por si.
+// NAO e criptografico: nao use para senha, token ou chave. Aleatorio de seguranca e os.random_bytes (outro passo).
+// shuffle(s, rng = &r) e choice(s, rng = &r) sao embutidos do compilador (S2b); o compilador chama below deste modulo: nao renomear nem mudar a assinatura. uuid e random_bytes ficam fora deste modulo.
+import "std:os" as os
+
+// Estado do xoshiro256**. O valor padrao (Rng{}) e o estado de seed(0): nunca o estado todo zero, que travaria o gerador em 0.
+pub struct Rng {
+    s0: u64 = 0xe220a8397b1dcdaf
+    s1: u64 = 0x6e789e6aa1b965f4
+    s2: u64 = 0x06c45d188009454f
+    s3: u64 = 0xf88bb8a8724c81ec
+}
+
+const SPLITMIX_GAMMA: u64 = 0x9E3779B97F4A7C15
+const SPLITMIX_MULTIPLIER_1: u64 = 0xBF58476D1CE4E5B9
+const SPLITMIX_MULTIPLIER_2: u64 = 0x94D049BB133111EB
+const SPLITMIX_SHIFT_1: u64 = 30
+const SPLITMIX_SHIFT_2: u64 = 27
+const SPLITMIX_SHIFT_3: u64 = 31
+const STARSTAR_MULTIPLIER_1: u64 = 5
+const STARSTAR_MULTIPLIER_2: u64 = 9
+const STARSTAR_ROTATE_1: u64 = 7
+const STARSTAR_ROTATE_2: u64 = 45
+const STARSTAR_SHIFT: u64 = 17
+const HIGH_HALF_SHIFT: u64 = 32
+const SIGN_SHIFT: u64 = 63
+const FLOAT_BITS_DROPPED: u64 = 11
+const ZERO_U64: u64 = 0
+const ONE_U64: u64 = 1
+// 2^53 e 2^-53: a mantissa do f64 tem 53 bits; (next_u64 >> 11) * 2^-53 e uniforme em [0, 1) e exato.
+const TWO_POW_53: f64 = 9007199254740992.0
+const ZERO_FLOAT: f64 = 0.0
+
+// Um passo do SplitMix64 sobre o estado dado: avanca o estado e devolve a saida misturada.
+proc splitmix_next(state: ^u64) -> u64 {
+    state^ = wrapping_add(state^, b = SPLITMIX_GAMMA)
+    var z = state^
+    z = wrapping_mul(z ~ (z >> SPLITMIX_SHIFT_1), b = SPLITMIX_MULTIPLIER_1)
+    z = wrapping_mul(z ~ (z >> SPLITMIX_SHIFT_2), b = SPLITMIX_MULTIPLIER_2)
+    return z ~ (z >> SPLITMIX_SHIFT_3)
+}
+
+// Gerador novo a partir de uma semente de 64 bits (qualquer valor, inclusive 0). A mesma semente da sempre a mesma sequencia.
+pub proc seed(value: u64) -> Rng {
+    var state = value
+    var rng = Rng{}
+    rng.s0 = splitmix_next(&state)
+    rng.s1 = splitmix_next(&state)
+    rng.s2 = splitmix_next(&state)
+    rng.s3 = splitmix_next(&state)
+    return rng
+}
+
+// Gerador novo com a semente tirada da hora de parede (os.wall_time_ns). NAO e reprodutivel; duas chamadas no mesmo instante do relogio dao o mesmo gerador. Para sequencia repetivel use seed(valor).
+pub proc seed_from_clock() -> Rng {
+    return seed(transmute(os.wall_time_ns(), to = u64))
+}
+
+// Proximo u64 uniforme (xoshiro256**: result = rotl(s1 * 5, 7) * 9). Avanca o gerador.
+pub proc next_u64(rng: ^Rng) -> u64 {
+    let result = wrapping_mul(rotate_left(wrapping_mul(rng.s1, b = STARSTAR_MULTIPLIER_1), n = STARSTAR_ROTATE_1), b = STARSTAR_MULTIPLIER_2)
+    let t = rng.s1 << STARSTAR_SHIFT
+    rng.s2 = rng.s2 ~ rng.s0
+    rng.s3 = rng.s3 ~ rng.s1
+    rng.s1 = rng.s1 ~ rng.s2
+    rng.s0 = rng.s0 ~ rng.s3
+    rng.s2 = rng.s2 ~ t
+    rng.s3 = rotate_left(rng.s3, n = STARSTAR_ROTATE_2)
+    return result
+}
+
+// Proximo u32 uniforme: os 32 bits ALTOS de um next_u64 (os baixos do xoshiro256** sao um pouco mais fracos).
+pub proc next_u32(rng: ^Rng) -> u32 {
+    return (next_u64(rng) >> HIGH_HALF_SHIFT) as u32
+}
+
+// Proximo f64 uniforme em [0, 1): (next_u64 >> 11) / 2^53; nunca devolve 1.0.
+pub proc next_float(rng: ^Rng) -> f64 {
+    let mantissa = (next_u64(rng) >> FLOAT_BITS_DROPPED) as f64
+    return mantissa / TWO_POW_53
+}
+
+// Proximo bool: o bit mais alto de um next_u64.
+pub proc next_bool(rng: ^Rng) -> bool {
+    return (next_u64(rng) >> SIGN_SHIFT) == ONE_U64
+}
+
+// u64 uniforme em [0, n), sem vies (metodo de Lemire: produto de 128 bits e rejeicao por limiar; quase sempre 1 chamada de next_u64). n == 0 e erro de quem chama: panic (R0003).
+pub proc below(rng: ^Rng, n: u64) -> u64 {
+    if n == ZERO_U64 {
+        panic("below: n deve ser maior que zero")
+    }
+    var x = next_u64(rng)
+    var low = wrapping_mul(x, b = n)
+    if low < n {
+        // Limiar de rejeicao: (2^64 - n) mod n; so sorteios com low abaixo dele seriam desiguais.
+        let threshold = wrapping_sub(ZERO_U64, b = n) % n
+        while low < threshold {
+            x = next_u64(rng)
+            low = wrapping_mul(x, b = n)
+        }
+    }
+    return mul_hi_u64(x, b = n)
+}
+
+// int uniforme em [min, max], INCLUSIVO nas duas pontas. min > max e erro de quem chama: panic (R0003). Aceita o intervalo cheio (menor int ate o maior int): devolve um next_u64 reinterpretado.
+pub proc int_range(rng: ^Rng, min: int, max: int) -> int {
+    if min > max {
+        panic("int_range: min deve ser menor ou igual a max")
+    }
+    let low_bits = transmute(min, to = u64)
+    // Largura em u64 com volta: max - min + 1; da 0 so no intervalo cheio (2^64 valores).
+    let width = wrapping_add(wrapping_sub(transmute(max, to = u64), b = low_bits), b = ONE_U64)
+    if width == ZERO_U64 {
+        return transmute(next_u64(rng), to = int)
+    }
+    return transmute(wrapping_add(low_bits, b = below(rng, n = width)), to = int)
+}
+
+// f64 uniforme em [min, max). min >= max (ou NaN) e largura max - min nao finita sao erro de quem chama: panic (R0003). O fim aberto vale mesmo com arredondamento (se cair em max, sorteia de novo).
+pub proc float_range(rng: ^Rng, min: f64, max: f64) -> f64 {
+    if not (min < max) {
+        panic("float_range: min deve ser menor que max")
+    }
+    let width = max - min
+    // Largura infinita (min e max de sinais opostos e enormes): inf - inf e NaN, enquanto finito - finito e 0.
+    if width - width != ZERO_FLOAT {
+        panic("float_range: max - min estoura f64")
+    }
+    var value = min + next_float(rng) * width
+    while value >= max {
+        value = min + next_float(rng) * width
+    }
+    return value
+}
+
+// Permutacao aleatoria de 0..<n (Fisher-Yates, uniforme). A lista e DONA do alocador que o chamador passou: delete(lista) e permitido em qualquer alloc. n == 0 da lista vazia valida; n < 0 e erro de quem chama: panic (R0003).
+pub proc perm(rng: ^Rng, n: int, alloc: Allocator) -> [dynamic]int {
+    if n < 0 {
+        panic("perm: n nao pode ser negativo")
+    }
+    var items = make([dynamic]int, alloc = alloc, cap = n)
+    for i in 0..<n {
+        append(&items, item = i)
+        let j = below(rng, n = (i + 1) as u64) as int
+        swap(items, i = i, j = j)
+    }
+    return items
+}

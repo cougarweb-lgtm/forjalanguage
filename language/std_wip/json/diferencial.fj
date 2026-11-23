@@ -1,0 +1,199 @@
+import "json" as loc
+import "vendor:json/json" as ref
+import "std:mem"
+import "std:text" as tx
+
+// Diferencial: o mesmo corpus no std_wip (json) e no vendor:json (cJSON).
+// Para cada documento imprime se os dois concordam em valido/invalido e, se valido, nos valores (forma canonica).
+// Forma canonica: null, true/false, numero (f64), "texto", [a,b], {"chave":valor}; invalido = <invalido>.
+
+proc canon_nosso(j: loc.Json, a: mem.Arena, saida: ^[dynamic]str) {
+    let tipo = loc.kind(j)
+    if tipo == loc.JsonKind.number {
+        let v = loc.number(j) or_else 0.0
+        append(saida, item = format(f"{v}", alloc = a))
+    } else if tipo == loc.JsonKind.boolean {
+        let b = loc.boolean(j) or_else false
+        if b {
+            append(saida, item = "true")
+        } else {
+            append(saida, item = "false")
+        }
+    } else if tipo == loc.JsonKind.text {
+        let t = loc.text(j) or_else ""
+        append(saida, item = "\"")
+        append(saida, item = t)
+        append(saida, item = "\"")
+    } else if tipo == loc.JsonKind.list {
+        append(saida, item = "[")
+        let n = loc.size(j)
+        var i: i32 = 0
+        while i < n {
+            if i > 0 {
+                append(saida, item = ",")
+            }
+            switch c in loc.item(j, i) {
+            case loc.Json:
+                canon_nosso(c, a, saida)
+            case loc.JsonError:
+                append(saida, item = "?")
+            }
+            i += 1
+        }
+        append(saida, item = "]")
+    } else if tipo == loc.JsonKind.object {
+        append(saida, item = "{")
+        let n = loc.size(j)
+        var i: i32 = 0
+        while i < n {
+            if i > 0 {
+                append(saida, item = ",")
+            }
+            let chave = loc.key(j, i) or_else ""
+            append(saida, item = "\"")
+            append(saida, item = chave)
+            append(saida, item = "\":")
+            switch c in loc.field(j, name = chave) {
+            case loc.Json:
+                canon_nosso(c, a, saida)
+            case loc.JsonError:
+                append(saida, item = "?")
+            }
+            i += 1
+        }
+        append(saida, item = "}")
+    } else if tipo == loc.JsonKind.null {
+        append(saida, item = "null")
+    } else {
+        append(saida, item = "?")
+    }
+}
+
+proc canon_vendor(j: ref.Json, a: mem.Arena, saida: ^[dynamic]str) {
+    let tipo = ref.kind(j)
+    if tipo == ref.JsonKind.number {
+        let v = ref.number(j) or_else 0.0
+        append(saida, item = format(f"{v}", alloc = a))
+    } else if tipo == ref.JsonKind.boolean {
+        let b = ref.boolean(j) or_else false
+        if b {
+            append(saida, item = "true")
+        } else {
+            append(saida, item = "false")
+        }
+    } else if tipo == ref.JsonKind.text {
+        let t = ref.text(j) or_else ""
+        append(saida, item = "\"")
+        append(saida, item = t)
+        append(saida, item = "\"")
+    } else if tipo == ref.JsonKind.list {
+        append(saida, item = "[")
+        let n = ref.size(j)
+        var i: i32 = 0
+        while i < n {
+            if i > 0 {
+                append(saida, item = ",")
+            }
+            switch c in ref.item(j, i) {
+            case ref.Json:
+                canon_vendor(c, a, saida)
+            case ref.JsonError:
+                append(saida, item = "?")
+            }
+            i += 1
+        }
+        append(saida, item = "]")
+    } else if tipo == ref.JsonKind.object {
+        append(saida, item = "{")
+        let n = ref.size(j)
+        var i: i32 = 0
+        while i < n {
+            if i > 0 {
+                append(saida, item = ",")
+            }
+            let chave = ref.key(j, i) or_else ""
+            append(saida, item = "\"")
+            append(saida, item = chave)
+            append(saida, item = "\":")
+            switch c in ref.field(j, name = chave) {
+            case ref.Json:
+                canon_vendor(c, a, saida)
+            case ref.JsonError:
+                append(saida, item = "?")
+            }
+            i += 1
+        }
+        append(saida, item = "}")
+    } else if tipo == ref.JsonKind.null {
+        append(saida, item = "null")
+    } else {
+        append(saida, item = "?")
+    }
+}
+
+// Forma canonica do documento pelo modulo do std_wip; "<invalido>" se nao parseia.
+proc canon_doc_nosso(doc: str, a: mem.Arena) -> str {
+    switch r in loc.parse(doc, alloc = a) {
+    case loc.Json:
+        var partes = make([dynamic]str, alloc = heap)
+        defer delete(partes)
+        canon_nosso(r, a, &partes)
+        return tx.concat(partes[..], alloc = a)
+    case loc.JsonError:
+        return "<invalido>"
+    }
+    return "<invalido>"
+}
+
+// Forma canonica pelo vendor:json (cJSON); "<invalido>" se nao parseia.
+proc canon_doc_vendor(doc: str, a: mem.Arena) -> str {
+    switch r in ref.parse_str(doc) {
+    case ref.Json:
+        var partes = make([dynamic]str, alloc = heap)
+        defer delete(partes)
+        canon_vendor(r, a, &partes)
+        let canon = tx.concat(partes[..], alloc = a)
+        ref.close(r)
+        return canon
+    case ref.JsonError:
+        return "<invalido>"
+    }
+    return "<invalido>"
+}
+
+// Compara um documento; true se os dois concordam.
+proc compara(n: int, doc: str, a: mem.Arena) -> bool {
+    let cn = canon_doc_nosso(doc, a)
+    let cv = canon_doc_vendor(doc, a)
+    if cn == cv {
+        print(f"{n} concordam {cn}")
+        return true
+    }
+    if cn == "<invalido>" {
+        print(f"{n} DIVERGE: nosso invalido, vendor valido {cv}")
+    } else if cv == "<invalido>" {
+        print(f"{n} DIVERGE: nosso valido {cn}, vendor invalido")
+    } else {
+        print(f"{n} DIVERGE valores: nosso {cn} vendor {cv}")
+    }
+    return false
+}
+
+proc main() {
+    let a = mem.arena_create()
+    let abre501 = tx.repeat("[", 501, alloc = a)
+    let fecha501 = tx.repeat("]", 501, alloc = a)
+    let abre500 = tx.repeat("[", 500, alloc = a)
+    let fecha500 = tx.repeat("]", 500, alloc = a)
+    let profundo501 = format(f"{abre501}{fecha501}", alloc = a)
+    let profundo500 = format(f"{abre500}{fecha500}", alloc = a)
+    let docs: [50]str = {"{}", "[]", "0", "-0", "\"\\u00e9\"", "\"\\ud83d\\ude00\"", "[1,2,3]", "{\"a\":{\"b\":[10,20.5]}}", "true", "false", "null", "1e2", "-1.5E-3", "9007199254740993", "[[[[]]]]", "{\"\":0}", "  \n\t[ 1 , 2 ]  \r\n", "\"a\\/b\\\\c\\\"d\\b\\f\\n\\r\\t\"", "[{\"k\":null},{\"k\":false}]", "1e400", "123456789012345678901234567890", "[1,]", "01", "[01]", "1.", ".5", "+1", "\"\\u00e\"", "\"\\ud83d\"", "\"\\ude00\"", "\"abc", "{\"a\" 1}", "{\"a\":1,}", "[1 2]", "nul", "tru", "{} x", "\"\\x41\"", "\"a\tb\"", "-", "1e", "[", "\"x\"", profundo501, profundo500, "{\n\"a\":\n[1,\n2]\n}", "{\n  \"a\": 1,\n  \"b\" 2\n}", "1E+2", "\"\\u0000\"", "[1, 2, 3"}
+    var concordam = 0
+    for i, doc in docs {
+        if compara(i + 1, doc, a) {
+            concordam += 1
+        }
+    }
+    print(f"concordam {concordam} de 50")
+    mem.arena_destroy(a)
+}

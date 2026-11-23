@@ -1,0 +1,83 @@
+// std:compressao 0.1.0 - compressao zlib (deflate) para a Forja, por cima do zlib 1.4 (licenca zlib) em vendor\libz.a.
+//
+// COMO USAR (o .fj raiz precisa de vendor\ ao lado: libz.a, compression\compression.fj, compression\zlib.fj; ver MEM-FORJA-GUIA-10):
+//     import "vendor:compression/compression"   (o caminho antigo vendor:compressao/compressao e o qualificador compressao. dao E0110: rode forja migrar)
+//     var original: [64]u8 = {}
+//     var pequeno: [128]u8 = {}
+//     let n = try compression.compress(original[..], dst = pequeno[..], level = 6)   // n = bytes gravados em `pequeno`
+//     var volta: [64]u8 = {}
+//     let m = try compression.decompress(pequeno[0..<n], dst = volta[..])            // m = bytes gravados em `volta`
+// Os nomes em portugues (comprimir, descomprimir, limite, ErroZlib, origem/destino/nivel = ...) dao E0110: rode forja migrar (tabela compiler\common\renomeados.c).
+//
+// Entrada e saida sao fatias []u8 de buffers SEUS (array local, make([dynamic]u8) ou slice_from): a lib nao aloca nada.
+// Dimensione o destino de compress com compression.bound(tamanho_original). Erro: ZlibError.
+// Limite do zlib 1.4 por chamada: ate 4 GiB menos 1 (uLong de 32 bits no Windows).
+//
+// VERIFICAR: python language\exemplos_libs\verificar_libs.py --so compressao_basico   (ou: forja run language\exemplos_libs\compressao_basico.fj)
+
+import "vendor:compression/zlib" as zl
+
+pub enum ZlibError {
+    dest_too_small
+    invalid_data
+    out_of_memory
+    parametro
+}
+
+// Tamanho de destino que sempre basta para comprimir `size` bytes.
+pub proc bound(size: i64) -> i64 {
+    return zl.compressBound(size as u32) as i64
+}
+
+// Comprime `src` em `dst` (level 0 = sem compressao, 1 = rapido, 6 = padrao, 9 = maximo).
+// Devolve quantos bytes foram gravados em `dst`. Erros: dest_too_small, out_of_memory, parametro.
+pub proc compress(src: []u8, dst: []u8, level: i32) -> i64 ! ZlibError {
+    if len(src) == 0 or len(dst) == 0 or level < 0 or level > 9 {
+        return ZlibError.parametro
+    }
+    var gravados: u32 = len(dst) as u32
+    let codigo = zl.compress2(&dst[0], dest_len = &gravados, source = &src[0], source_len = len(src) as u32, level = level)
+    if codigo == zl.Z_OK {
+        return gravados as i64
+    }
+    if codigo == zl.Z_BUF_ERROR {
+        return ZlibError.dest_too_small
+    }
+    if codigo == zl.Z_MEM_ERROR {
+        return ZlibError.out_of_memory
+    }
+    return ZlibError.parametro
+}
+
+// Descomprime `src` (formato zlib) em `dst`. Devolve os bytes gravados. Erros: dest_too_small, invalid_data, out_of_memory.
+pub proc decompress(src: []u8, dst: []u8) -> i64 ! ZlibError {
+    if len(src) == 0 or len(dst) == 0 {
+        return ZlibError.parametro
+    }
+    var gravados: u32 = len(dst) as u32
+    let codigo = zl.uncompress(&dst[0], dest_len = &gravados, source = &src[0], source_len = len(src) as u32)
+    if codigo == zl.Z_OK {
+        return gravados as i64
+    }
+    if codigo == zl.Z_BUF_ERROR {
+        return ZlibError.dest_too_small
+    }
+    if codigo == zl.Z_MEM_ERROR {
+        return ZlibError.out_of_memory
+    }
+    return ZlibError.invalid_data
+}
+
+// CRC-32 dos bytes (valor inicial 0; encadeie passando o resultado anterior em `previous`).
+pub proc crc(data: []u8, previous: u32) -> u32 {
+    if len(data) == 0 {
+        return previous
+    }
+    return zl.crc32(previous, buf = &data[0], len = len(data) as u32)
+}
+
+// Versao do zlib embutido, por exemplo "1.4".
+pub proc versao() -> str {
+    let v = zl.zlibVersion()
+    return (v or_else "?") as str
+}

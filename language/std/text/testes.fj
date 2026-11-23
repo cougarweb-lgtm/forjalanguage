@@ -1,0 +1,824 @@
+// std:text - testes do modulo (S4 P5). Anexados ao texto de std:text SO em forja test std:text (o build normal nao os ve).
+// Versao: 0.3.0. Changelog: 0.3.0 - G06: testes de to_valid_lossy (56 casos do oraculo Python bytes.decode('utf-8','replace')), utf16be_encode e utf16be_decode (BOM, par substituto, erros). 0.2.0 - G3-L3: +16 testes de parse_float com arredondamento correto (bits esperados fixos, sem depender de Python); 0.1.0 - S4 P5: contrato das fixtures 213 e 214, 252..258, 261..263 (parse_bool, parse_uint, parse_int_base), 266..270 e a parte de classes de byte (255), com os valores do .esperado. Sem os de panic (260, 264, 265, 271), sem builder (246..251, 259), sem alocador (321, 322, 350) e sem 245 (clone/from_bytes sao builtins, nao std:text).
+// Sem import e sem proc main: o pedaco fica dentro do modulo, entao chama as procs dele SEM prefixo tx.
+// Os helpers *_igual e *_falha devolvem bool: o erro do ! ParseError vira falso em vez de quebrar o teste.
+
+proc parse_int_igual(s: str, esperado: int) -> bool {
+    var ok = false
+    switch r in parse_int(s) {
+    case int: ok = r == esperado
+    case ParseError: ok = false
+    }
+    return ok
+}
+
+proc parse_int_falha(s: str, esperado: ParseError) -> bool {
+    var ok = false
+    switch r in parse_int(s) {
+    case int: ok = false
+    case ParseError: ok = r == esperado
+    }
+    return ok
+}
+
+proc parse_float_igual(s: str, esperado: f64) -> bool {
+    var ok = false
+    switch r in parse_float(s) {
+    case f64: ok = r == esperado
+    case ParseError: ok = false
+    }
+    return ok
+}
+
+proc parse_float_falha(s: str, esperado: ParseError) -> bool {
+    var ok = false
+    switch r in parse_float(s) {
+    case f64: ok = false
+    case ParseError: ok = r == esperado
+    }
+    return ok
+}
+
+// parse_float_bits: os bits do f64 lidos de s (a prova do arredondamento correto, G3-L3); verdadeiro so se s foi lido sem erro e deu esses bits. Os esperados vem do float() do Python.
+proc parse_float_bits(s: str, esperado: u64) -> bool {
+    var ok = false
+    switch r in parse_float(s) {
+    case f64:
+        let bits: u64 = transmute(r, to = u64)
+        ok = bits == esperado
+    case ParseError: ok = false
+    }
+    return ok
+}
+
+// Decimal exato de 2^-1075, o meio-ponto entre 0 e o menor subnormal (sem o expoente: e-324): empate, vai para o par (0).
+const EMPATE_MEIO_SUBNORMAL: str = "2.4703282292062327208828439643411068618252990130716238221279284125033775363510437593264991818081799618989828234772285886546332835517796989819938739800539093906315035659515570226392290858392449105184435931802849936536152500319370457678249219365623669863658480757001585769269903706311928279558551332927834338409351978015531246597263579574622766465272827220056374006485499977096599470454020828166226237857393450736339007967761930577506740176324673600968951340535537458516661134223766678604162159680461914467291840300530057530849048765391711386591646239524912623653881879636239373280423891018672348497668235089863388587925628302755995657524455507255189313690836254779186948667994968324049705821028513185451396213837722826145437693412532098591327667236328125"
+
+proc parse_bool_igual(s: str, esperado: bool) -> bool {
+    var ok = false
+    switch r in parse_bool(s) {
+    case bool: ok = r == esperado
+    case ParseError: ok = false
+    }
+    return ok
+}
+
+proc parse_int_base_igual(s: str, base: int, esperado: int) -> bool {
+    var ok = false
+    switch r in parse_int_base(s, base) {
+    case int: ok = r == esperado
+    case ParseError: ok = false
+    }
+    return ok
+}
+
+test "parse_int valores e sinais" {
+    expect(parse_int_igual("123", 123))
+    expect(parse_int_igual("-45", -45))
+    expect(parse_int_igual("+7", 7))
+    expect(parse_int_igual("007", 7))
+    expect(parse_int_igual("9223372036854775807", 9223372036854775807))
+    expect(parse_int_igual("-9223372036854775808", -9223372036854775807 - 1))
+}
+
+test "parse_int erros: vazio, invalido e estouro" {
+    expect(parse_int_falha("", ParseError.empty))
+    expect(parse_int_falha("-", ParseError.invalid))
+    expect(parse_int_falha("12a", ParseError.invalid))
+    expect(parse_int_falha(" 1", ParseError.invalid))
+    expect(parse_int_falha("9223372036854775808", ParseError.overflow))
+    expect(parse_int_falha("-9223372036854775809", ParseError.overflow))
+}
+
+test "parse_float valores exatos" {
+    expect(parse_float_igual("3.14", 3.14))
+    expect(parse_float_igual("-0.5", -0.5))
+    expect(parse_float_igual("1e3", 1000.0))
+    expect(parse_float_igual("2.5E-3", 0.0025))
+    expect(parse_float_igual("+10", 10.0))
+    expect(parse_float_igual(".5", 0.5))
+    expect(parse_float_igual("5.", 5.0))
+    expect(parse_float_igual("1e22", 10000000000000000000000.0))
+    expect(parse_float_igual("1e-400", 0.0))
+}
+
+test "parse_float erros" {
+    expect(parse_float_falha("", ParseError.empty))
+    expect(parse_float_falha("abc", ParseError.invalid))
+    expect(parse_float_falha("1e", ParseError.invalid))
+    expect(parse_float_falha(".", ParseError.invalid))
+    expect(parse_float_falha("1 ", ParseError.invalid))
+    expect(parse_float_falha("1e400", ParseError.overflow))
+}
+
+// ---- parse_float com arredondamento correto (G3-L3): bits esperados fixos, conferidos com o float() do Python.
+
+test "parse_float menor subnormal e metade dele" {
+    expect(parse_float_bits("5e-324", 0x0000000000000001))
+    expect(parse_float_bits("4.9406564584124654e-324", 0x0000000000000001))
+    expect(parse_float_bits("2.4703282292062327e-324", 0x0000000000000000))
+    expect(parse_float_bits("2.4703282292062328e-324", 0x0000000000000001))
+    expect(parse_float_bits("3e-324", 0x0000000000000001))
+    expect(parse_float_bits("1e-323", 0x0000000000000002))
+    expect(parse_float_bits("1.5e-323", 0x0000000000000003))
+}
+
+test "parse_float fronteira entre subnormal e normal" {
+    expect(parse_float_bits("2.2250738585072011e-308", 0x000FFFFFFFFFFFFF))
+    expect(parse_float_bits("2.2250738585072014e-308", 0x0010000000000000))
+    expect(parse_float_bits("1e-310", 0x000012688B70E62B))
+}
+
+test "parse_float maior finito e estouro" {
+    expect(parse_float_bits("1.7976931348623157e308", 0x7FEFFFFFFFFFFFFF))
+    expect(parse_float_bits("1.7976931348623158e308", 0x7FEFFFFFFFFFFFFF))
+    expect(parse_float_falha("1.7976931348623159e308", ParseError.overflow))
+    expect(parse_float_falha("-1.7976931348623159e308", ParseError.overflow))
+    expect(parse_float_falha("1e309", ParseError.overflow))
+    expect(parse_float_falha("-1e309", ParseError.overflow))
+    expect(parse_float_bits("1e308", 0x7FE1CCF385EBC8A0))
+}
+
+test "parse_float abaixo do menor subnormal vira zero com o sinal" {
+    expect(parse_float_bits("1e-400", 0x0000000000000000))
+    expect(parse_float_bits("-1e-400", 0x8000000000000000))
+    expect(parse_float_bits("4.35e-325", 0x0000000000000000))
+    expect(parse_float_bits("0.000001e-318", 0x0000000000000000))
+    expect(parse_float_bits("1e-99999", 0x0000000000000000))
+}
+
+test "parse_float zeros e menos zero" {
+    expect(parse_float_bits("0", 0x0000000000000000))
+    expect(parse_float_bits("-0", 0x8000000000000000))
+    expect(parse_float_bits("-0.0e100", 0x8000000000000000))
+    expect(parse_float_bits("0e5", 0x0000000000000000))
+    expect(parse_float_bits("000.000", 0x0000000000000000))
+}
+
+test "parse_float 2^53 mais 1 empata para o par" {
+    expect(parse_float_bits("9007199254740992", 0x4340000000000000))
+    expect(parse_float_bits("9007199254740993", 0x4340000000000000))
+    expect(parse_float_bits("9007199254740994", 0x4340000000000001))
+    expect(parse_float_bits("9007199254740995", 0x4340000000000002))
+    expect(parse_float_bits("18014398509481985", 0x4350000000000000))
+}
+
+test "parse_float 19 digitos e o maior u64" {
+    expect(parse_float_bits("9223372036854775807", 0x43E0000000000000))
+    expect(parse_float_bits("18446744073709551615", 0x43F0000000000000))
+    expect(parse_float_bits("10000000000000000000", 0x43E158E460913D00))
+    expect(parse_float_bits("123456789012345678901234567890e-5", 0x44F056E0F36A6444))
+}
+
+test "parse_float empate exato acima de 19 digitos (a mantissa e a seguinte)" {
+    expect(parse_float_bits("1.00000000000000011102230246251565404236316680908203125", 0x3FF0000000000000))
+    expect(parse_float_bits("1.00000000000000011102230246251565404236316680908203126", 0x3FF0000000000001))
+    expect(parse_float_bits("1.00000000000000011102230246251565404236316680908203124", 0x3FF0000000000000))
+    expect(parse_float_bits("0.9999999999999999444888487687421729788184165954589843750", 0x3FF0000000000000))
+}
+
+test "parse_float casos classicos do Eisel-Lemire e do fast_float" {
+    expect(parse_float_bits("1e23", 0x44B52D02C7E14AF6))
+    expect(parse_float_bits("9.9999999999999999e22", 0x44B52D02C7E14AF6))
+    expect(parse_float_bits("8.5070591730234616e+37", 0x47D0000000000000))
+    expect(parse_float_bits("7.2057594037927933e16", 0x4370000000000000))
+    expect(parse_float_bits("0.1", 0x3FB999999999999A))
+    expect(parse_float_bits("3.14159265358979323846264338327950288419716939937510", 0x400921FB54442D18))
+}
+
+test "parse_float exponente com sinal, maiuscula e zeros a esquerda" {
+    expect(parse_float_bits("1E5", 0x40F86A0000000000))
+    expect(parse_float_bits("+1e+5", 0x40F86A0000000000))
+    expect(parse_float_bits("1e-0005", 0x3EE4F8B588E368F1))
+    expect(parse_float_bits("00001.50000", 0x3FF8000000000000))
+    expect(parse_float_bits(".5e1", 0x4014000000000000))
+}
+
+test "parse_float meio-ponto exato de subnormal de 750 digitos" {
+    let texto = format(f"{EMPATE_MEIO_SUBNORMAL}e-324", alloc = heap)
+    defer delete(texto)
+    expect(parse_float_bits(texto, 0x0000000000000000))
+}
+
+test "parse_float meio-ponto de subnormal mais um digito vai para cima" {
+    let texto = format(f"{EMPATE_MEIO_SUBNORMAL}1e-324", alloc = heap)
+    defer delete(texto)
+    expect(parse_float_bits(texto, 0x0000000000000001))
+}
+
+test "parse_float resto nao nulo depois de 800 digitos desempata para cima" {
+    let zeros = repeat("0", 60, alloc = heap)
+    defer delete(zeros)
+    let texto = format(f"{EMPATE_MEIO_SUBNORMAL}{zeros}1e-324", alloc = heap)
+    defer delete(texto)
+    expect(parse_float_bits(texto, 0x0000000000000001))
+    let so_zeros = format(f"{EMPATE_MEIO_SUBNORMAL}{zeros}e-324", alloc = heap)
+    defer delete(so_zeros)
+    expect(parse_float_bits(so_zeros, 0x0000000000000000))
+}
+
+test "parse_float mantissa de mil digitos com expoente que compensa" {
+    let zeros = repeat("0", 999, alloc = heap)
+    defer delete(zeros)
+    let inteiro = format(f"1{zeros}e-999", alloc = heap)
+    defer delete(inteiro)
+    expect(parse_float_bits(inteiro, 0x3FF0000000000000))
+    let fracao = format(f"0.{zeros}1e1000", alloc = heap)
+    defer delete(fracao)
+    expect(parse_float_bits(fracao, 0x3FF0000000000000))
+}
+
+test "parse_float casas depois do ponto alem de 19 digitos" {
+    expect(parse_float_bits("0.3333333333333333333333333333", 0x3FD5555555555555))
+    expect(parse_float_bits("0.1000000000000000055511151231257827021181583404541015625", 0x3FB999999999999A))
+    expect(parse_float_bits("2.718281828459045235360287471352662497757", 0x4005BF0A8B145769))
+}
+
+test "parse_float forma invalida continua invalida" {
+    expect(parse_float_falha("1e", ParseError.invalid))
+    expect(parse_float_falha("1e+", ParseError.invalid))
+    expect(parse_float_falha("1.2.3", ParseError.invalid))
+    expect(parse_float_falha("0x10", ParseError.invalid))
+    expect(parse_float_falha("inf", ParseError.invalid))
+    expect(parse_float_falha("1_000", ParseError.invalid))
+}
+
+test "parse_bool aceita as formas do strconv" {
+    expect(parse_bool_igual("TRUE", true))
+    expect(parse_bool_igual("t", true))
+    expect(parse_bool_igual("0", false))
+    expect(parse_bool_igual("False", false))
+    expect(parse_bool_igual("yes", true) == false)
+}
+
+test "parse_int_base bases e prefixos" {
+    expect(parse_int_base_igual("ff", 16, 255))
+    expect(parse_int_base_igual("0x1f", 0, 31))
+    expect(parse_int_base_igual("-0b101", 0, -5))
+    expect(parse_int_base_igual("zz", 36, 1295))
+    expect(parse_int_base_igual("12", 2, 0) == false)
+}
+
+test "split guarda campos vazios" {
+    var partes = split("a,,b,", ",", alloc = heap)
+    defer delete(partes)
+    expect(len(partes) == 4)
+    expect(partes[1] == "")
+    expect(partes[2] == "b")
+    expect(partes[3] == "")
+    var vazio = split("", ",", alloc = heap)
+    defer delete(vazio)
+    expect(len(vazio) == 1)
+}
+
+test "split corta por substring" {
+    var sobreposto = split("aaa", "aa", alloc = heap)
+    defer delete(sobreposto)
+    expect(len(sobreposto) == 2)
+    expect(sobreposto[0] == "")
+    expect(sobreposto[1] == "a")
+    var dois_tracos = split("--", "--", alloc = heap)
+    defer delete(dois_tracos)
+    expect(len(dois_tracos) == 2)
+    var sem_sep = split("abc", "", alloc = heap)
+    defer delete(sem_sep)
+    expect(len(sem_sep) == 1)
+    expect(sem_sep[0] == "abc")
+}
+
+test "join junta com separador" {
+    var xs: [3]str = {"a", "bb", "ccc"}
+    let todos = join(xs[..], ", ", alloc = heap)
+    defer delete(todos)
+    expect(todos == "a, bb, ccc")
+    let um = join(xs[1..<2], "|", alloc = heap)
+    defer delete(um)
+    expect(um == "bb")
+    var sete: [7]str = {"1", "2", "3", "4", "5", "6", "7"}
+    let junto = join(sete[..], "", alloc = heap)
+    defer delete(junto)
+    expect(junto == "1234567")
+}
+
+test "busca de substring em bytes" {
+    expect(str_contains("banana", "an"))
+    let primeira = str_index_of("banana", "an") or_else -1
+    let ultima = str_last_index_of("banana", "an") or_else -1
+    expect(primeira == 1)
+    expect(ultima == 3)
+    expect(str_count("aaaa", "aa") == 2)
+    expect(str_count("abc", "") == 4)
+    expect(starts_with("abc", ""))
+    expect(ends_with("café", "é"))
+    expect(str_contains("abc", "z") == false)
+}
+
+test "busca de byte e de conjunto" {
+    let zero = index_byte("banana", 98) or_else -1
+    let tres = index_byte("a\nb\r\nc", 13) or_else -1
+    expect(zero == 0)
+    expect(tres == 3)
+    let a_banana = index_any("banana", "a") or_else -1
+    let quebra = index_any("a\nb\r\nc", "\r\n") or_else -1
+    let dois = index_any("  ab  ", "ab") or_else -1
+    let nenhum = index_any("abc", "xyz") or_else -1
+    expect(a_banana == 1)
+    expect(quebra == 1)
+    expect(dois == 2)
+    expect(nenhum == -1)
+}
+
+test "trim devolve vista sem espaco" {
+    expect(trim("  hi  ") == "hi")
+    expect(trim_left("  hi  ") == "hi  ")
+    expect(trim_right("  hi  ") == "  hi")
+    expect(trim("\t\n x y \r\n") == "x y")
+    expect(trim("") == "")
+}
+
+test "trim_prefix trim_suffix trim_chars" {
+    expect(trim_prefix("xxhixx", "xx") == "hixx")
+    expect(trim_prefix("xxhixx", "x") == "xhixx")
+    expect(trim_prefix("x", "x") == "")
+    expect(trim_prefix("xxhixx", "") == "xxhixx")
+    expect(trim_suffix("xxhixx", "xx") == "xxhi")
+    expect(trim_chars("xxhixx", "x") == "hi")
+    expect(trim_chars("  é  ", "é") == "  é  ")
+    expect(trim_chars("  é  ", " ") == "é")
+}
+
+test "cut parte no primeiro separador" {
+    let antes, depois, achou = cut("a=b=c", "=")
+    expect(antes == "a")
+    expect(depois == "b=c")
+    expect(achou)
+    let sem_antes, sem_depois, sem_achou = cut("a=b=c", "==")
+    expect(sem_antes == "a=b=c")
+    expect(sem_depois == "")
+    expect(sem_achou == false)
+    let vazio_antes, vazio_depois, vazio_achou = cut("", "")
+    expect(vazio_antes == "")
+    expect(vazio_depois == "")
+    expect(vazio_achou)
+}
+
+test "classes de byte" {
+    expect(is_digit(48))
+    expect(is_digit(58) == false)
+    expect(is_upper(65))
+    expect(is_lower(97))
+    expect(is_alpha(122))
+    expect(is_alnum(48))
+    expect(is_hex_digit(70))
+    expect(is_hex_digit(71) == false)
+    expect(is_space(9))
+    expect(is_space(11))
+    expect(is_space(65) == false)
+    expect(is_print(32))
+    expect(is_print(127) == false)
+}
+
+test "next_line le linhas sem terminador" {
+    var resto = "a\r\nb\r\n"
+    let primeira = next_line(&resto) or_else ""
+    expect(primeira == "a")
+    let segunda = next_line(&resto) or_else ""
+    expect(segunda == "b")
+    expect(next_line(&resto) == none)
+    var com_cr = "a\r"
+    let solta = next_line(&com_cr) or_else ""
+    expect(len(solta) == 2)
+}
+
+test "next_field corta por separador" {
+    var campos = "a,,b"
+    let c1 = next_field(&campos, ",") or_else "x"
+    let c2 = next_field(&campos, ",") or_else "x"
+    let c3 = next_field(&campos, ",") or_else "x"
+    expect(c1 == "a")
+    expect(c2 == "")
+    expect(c3 == "b")
+    expect(next_field(&campos, ",") == none)
+    var duplo = "a::b::"
+    let d1 = next_field(&duplo, "::") or_else "x"
+    let d2 = next_field(&duplo, "::") or_else "x"
+    expect(d1 == "a")
+    expect(d2 == "b")
+    expect(next_field(&duplo, "::") == none)
+    var inteiro = "a,b"
+    let todo = next_field(&inteiro, "") or_else "x"
+    expect(todo == "a,b")
+}
+
+test "split_lines e fields" {
+    var linhas = split_lines("a\r\nb\r\n", alloc = heap)
+    defer delete(linhas)
+    expect(len(linhas) == 2)
+    expect(linhas[1] == "b")
+    var vazias = split_lines("\n\n", alloc = heap)
+    defer delete(vazias)
+    expect(len(vazias) == 2)
+    var campos = fields("  a  b ", alloc = heap)
+    defer delete(campos)
+    expect(len(campos) == 2)
+    expect(campos[0] == "a")
+    expect(campos[1] == "b")
+    var nenhum = fields("\n\t \r", alloc = heap)
+    defer delete(nenhum)
+    expect(len(nenhum) == 0)
+}
+
+test "split_n e split_any" {
+    var dois = split_n("a,b,c", ",", 2, alloc = heap)
+    defer delete(dois)
+    expect(len(dois) == 2)
+    expect(dois[1] == "b,c")
+    var nenhum = split_n("a,b,c", ",", 0, alloc = heap)
+    defer delete(nenhum)
+    expect(len(nenhum) == 0)
+    var tudo = split_n("a,b,c", ",", 10, alloc = heap)
+    defer delete(tudo)
+    expect(len(tudo) == 3)
+    var qualquer = split_any("a,b;;c", ",;", alloc = heap)
+    defer delete(qualquer)
+    expect(len(qualquer) == 4)
+    expect(qualquer[2] == "")
+    expect(qualquer[3] == "c")
+}
+
+test "replace troca sem sobreposicao" {
+    let um = replace("aaa", "aa", "X", alloc = heap)
+    defer delete(um)
+    expect(um == "Xa")
+    let vazio = replace("abc", "", "Z", alloc = heap)
+    defer delete(vazio)
+    expect(vazio == "abc")
+    let banana = replace("banana", "an", "-", alloc = heap)
+    defer delete(banana)
+    expect(banana == "b--a")
+}
+
+test "replace_n e replace_table" {
+    let dois = replace_n("aaaa", "a", "X", 2, alloc = heap)
+    defer delete(dois)
+    expect(dois == "XXaa")
+    let nenhum = replace_n("aaaa", "a", "X", 0, alloc = heap)
+    defer delete(nenhum)
+    expect(nenhum == "aaaa")
+    var encadeada: [2]Replacement = {Replacement{old = "a", new = "b"}, Replacement{old = "b", new = "c"}}
+    let passada = replace_table("abc", encadeada[..], alloc = heap)
+    defer delete(passada)
+    expect(passada == "bcc")
+    var html: [3]Replacement = {Replacement{old = "&", new = "&amp;"}, Replacement{old = "<", new = "&lt;"}, Replacement{old = ">", new = "&gt;"}}
+    let escapado = replace_table("a<b&&c>d", html[..], alloc = heap)
+    defer delete(escapado)
+    expect(escapado == "a&lt;b&amp;&amp;c&gt;d")
+}
+
+test "repeat e concat" {
+    let tres = repeat("ab", 3, alloc = heap)
+    defer delete(tres)
+    expect(tres == "ababab")
+    let zero = repeat("ab", 0, alloc = heap)
+    defer delete(zero)
+    expect(zero == "")
+    let negativo = repeat("ab", -5, alloc = heap)
+    defer delete(negativo)
+    expect(negativo == "")
+    var pecas: [3]str = {"a", "", "bc"}
+    let junto = concat(pecas[..], alloc = heap)
+    defer delete(junto)
+    expect(junto == "abc")
+    let so = concat(pecas[2..<3], alloc = heap)
+    defer delete(so)
+    expect(so == "bc")
+}
+
+test "to_upper e to_lower so ASCII" {
+    let maiusculo = to_upper("aBc-1 é", alloc = heap)
+    defer delete(maiusculo)
+    expect(maiusculo == "ABC-1 é")
+    let minusculo = to_lower("ABC-é", alloc = heap)
+    defer delete(minusculo)
+    expect(minusculo == "abc-é")
+}
+
+test "equal_fold e compare por byte" {
+    expect(equal_fold("Go", "GO"))
+    expect(equal_fold("é", "É") == false)
+    expect(compare("a", "b") == -1)
+    expect(compare("ab", "a") == 1)
+    expect(compare("", "") == 0)
+    expect(compare("z", "é") == -1)
+}
+
+test "decode le runa e tamanho" {
+    let runa1, tam1 = decode("aé€😀", 1)
+    expect(runa1 == 233)
+    expect(tam1 == 2)
+    let runa2, tam2 = decode("aé€😀", 3)
+    expect(runa2 == 8364)
+    expect(tam2 == 3)
+    let runa3, tam3 = decode("aé€😀", 6)
+    expect(runa3 == 128512)
+    expect(tam3 == 4)
+    var solto: [1]u8 = {128}
+    let invalido = from_bytes(solto[..], alloc = heap)
+    defer delete(invalido)
+    let runa4, tam4 = decode(invalido, 0)
+    expect(runa4 == 65533)
+    expect(tam4 == 1)
+}
+
+test "encode e from_rune" {
+    var buf = make([dynamic]u8, alloc = heap)
+    defer delete(buf)
+    encode(233, &buf)
+    expect(len(buf) == 2)
+    expect(buf[0] == 195)
+    expect(buf[1] == 169)
+    let sozinha = from_rune(0xD800, alloc = heap)
+    defer delete(sozinha)
+    expect(len(sozinha) == 3)
+    expect(sozinha[0] == 239)
+}
+
+test "rune_count valid_utf8 e next_rune" {
+    expect(rune_count("aé€😀") == 4)
+    expect(valid_utf8("aé€😀"))
+    var bruto: [2]u8 = {97, 255}
+    let quebrado = from_bytes(bruto[..], alloc = heap)
+    defer delete(quebrado)
+    expect(rune_count(quebrado) == 2)
+    expect(valid_utf8(quebrado) == false)
+    var resto = "aé"
+    let r1 = next_rune(&resto) or_else 0
+    let r2 = next_rune(&resto) or_else 0
+    expect(r1 == 97)
+    expect(r2 == 233)
+    expect(next_rune(&resto) == none)
+}
+
+test "str_reverse inverte por runa" {
+    let inv = str_reverse("aé€", alloc = heap)
+    defer delete(inv)
+    expect(inv == "€éa")
+    var bruto: [3]u8 = {97, 255, 98}
+    let quebrado = from_bytes(bruto[..], alloc = heap)
+    defer delete(quebrado)
+    let virado = str_reverse(quebrado, alloc = heap)
+    defer delete(virado)
+    expect(virado[0] == 98)
+    expect(virado[1] == 255)
+    expect(virado[2] == 97)
+}
+
+test "pad e center contam runas" {
+    let esquerda = pad_left("a", 3, alloc = heap)
+    defer delete(esquerda)
+    expect(esquerda == "  a")
+    let direita = pad_right("a", 3, alloc = heap)
+    defer delete(direita)
+    expect(direita == "a  ")
+    let centro = center("a", 4, alloc = heap)
+    defer delete(centro)
+    expect(centro == " a  ")
+    let estrela = pad_left("é", 3, 42, alloc = heap)
+    defer delete(estrela)
+    expect(estrela == "**é")
+    let curto = pad_right("abc", 2, alloc = heap)
+    defer delete(curto)
+    expect(curto == "abc")
+}
+
+// Valor do digito hex c (minusculo), 0..15.
+proc digito_hex(c: u8) -> u8 {
+    if c >= 0x61 {
+        return c - 0x57
+    }
+    return c - 0x30
+}
+
+// Bytes do texto hex (2 digitos por byte) numa lista do alocador que o chamador passou.
+proc bytes_de_hex(h: str, alloc: Allocator) -> [dynamic]u8 {
+    var out = make([dynamic]u8, alloc = alloc)
+    var i = 0
+    while i + 1 < len(h) {
+        append(&out, item = (digito_hex(h[i]) << 4) | digito_hex(h[i + 1]))
+        i += 2
+    }
+    return out
+}
+
+// true se a e b tem o mesmo tamanho e os mesmos bytes.
+proc mesmos_bytes(a: []u8, b: []u8) -> bool {
+    if len(a) != len(b) {
+        return false
+    }
+    for i in 0..<len(a) {
+        if a[i] != b[i] {
+            return false
+        }
+    }
+    return true
+}
+
+// true se to_valid_lossy(bytes da entrada hex) bate com os bytes UTF-8 esperados (hex).
+proc lossy_bate(entrada: str, esperado: str) -> bool {
+    var b = bytes_de_hex(entrada, alloc = heap)
+    defer delete(b)
+    let saida = to_valid_lossy(b[..], alloc = heap)
+    defer delete(saida)
+    var exp = bytes_de_hex(esperado, alloc = heap)
+    defer delete(exp)
+    return mesmos_bytes(as_bytes(saida), exp[..])
+}
+
+// true se utf16be_encode(texto, com_bom) bate com os bytes esperados (hex).
+proc utf16_encode_bate(s: str, com_bom: bool, hex: str) -> bool {
+    var saida = utf16be_encode(s, com_bom = com_bom, alloc = heap)
+    defer delete(saida)
+    var esperado = bytes_de_hex(hex, alloc = heap)
+    defer delete(esperado)
+    return mesmos_bytes(saida[..], esperado[..])
+}
+
+// true se utf16be_decode(bytes hex) da o texto esperado, sem erro.
+proc utf16_texto_bate(hex: str, esperado: str) -> bool {
+    var b = bytes_de_hex(hex, alloc = heap)
+    defer delete(b)
+    var ok = false
+    switch r in utf16be_decode(b[..], alloc = heap) {
+    case str:
+        ok = r == esperado
+        delete(r)
+    case Utf16Error:
+        ok = false
+    }
+    return ok
+}
+
+// true se utf16be_decode(bytes hex) da exatamente o erro esperado.
+proc utf16_erro_bate(hex: str, esperado: Utf16Error) -> bool {
+    var b = bytes_de_hex(hex, alloc = heap)
+    defer delete(b)
+    var ok = false
+    switch r in utf16be_decode(b[..], alloc = heap) {
+    case str:
+        delete(r)
+    case Utf16Error:
+        ok = r == esperado
+    }
+    return ok
+}
+
+test "to_valid_lossy: 56 casos do oraculo (bytes.decode utf-8 replace)" {
+    expect(lossy_bate("", ""))
+    expect(lossy_bate("c0af", "efbfbdefbfbd"))
+    expect(lossy_bate("c1bf", "efbfbdefbfbd"))
+    expect(lossy_bate("e08080", "efbfbdefbfbdefbfbd"))
+    expect(lossy_bate("eda080", "efbfbdefbfbdefbfbd"))
+    expect(lossy_bate("edbfbf", "efbfbdefbfbdefbfbd"))
+    expect(lossy_bate("f08fbfbf", "efbfbdefbfbdefbfbdefbfbd"))
+    expect(lossy_bate("f4908080", "efbfbdefbfbdefbfbdefbfbd"))
+    expect(lossy_bate("f5808080", "efbfbdefbfbdefbfbdefbfbd"))
+    expect(lossy_bate("fffe", "efbfbdefbfbd"))
+    expect(lossy_bate("f09f98", "efbfbd"))
+    expect(lossy_bate("e282", "efbfbd"))
+    expect(lossy_bate("e228a1", "efbfbd28efbfbd"))
+    expect(lossy_bate("e28241", "efbfbd41"))
+    expect(lossy_bate("6162e282", "6162efbfbd"))
+    expect(lossy_bate("8080", "efbfbdefbfbd"))
+    expect(lossy_bate("c3", "efbfbd"))
+    expect(lossy_bate("c328", "efbfbd28"))
+    expect(lossy_bate("f09f9880", "f09f9880"))
+    expect(lossy_bate("e4b8ad", "e4b8ad"))
+    expect(lossy_bate("efbfbd", "efbfbd"))
+    expect(lossy_bate("c2a9", "c2a9"))
+    expect(lossy_bate("f0808080", "efbfbdefbfbdefbfbdefbfbd"))
+    expect(lossy_bate("ed9fbf", "ed9fbf"))
+    expect(lossy_bate("ee8080", "ee8080"))
+    expect(lossy_bate("e0a080", "e0a080"))
+    expect(lossy_bate("f48fbfbf", "f48fbfbf"))
+    expect(lossy_bate("f48fbf", "efbfbd"))
+    expect(lossy_bate("e09fbf", "efbfbdefbfbdefbfbd"))
+    expect(lossy_bate("f09080", "efbfbd"))
+    expect(lossy_bate("eda0", "efbfbdefbfbd"))
+    expect(lossy_bate("c3c3a7", "efbfbdc3a7"))
+    expect(lossy_bate("41ff42", "41efbfbd42"))
+    expect(lossy_bate("e080", "efbfbdefbfbd"))
+    expect(lossy_bate("f1808041", "efbfbd41"))
+    expect(lossy_bate("e282ac", "e282ac"))
+    expect(lossy_bate("f09f98e2", "efbfbdefbfbd"))
+    expect(lossy_bate("c0", "efbfbd"))
+    expect(lossy_bate("80", "efbfbd"))
+    expect(lossy_bate("fe", "efbfbd"))
+    expect(lossy_bate("ecbfbf", "ecbfbf"))
+    expect(lossy_bate("f0908080", "f0908080"))
+    expect(lossy_bate("e0bf", "efbfbd"))
+    expect(lossy_bate("eda080edb080", "efbfbdefbfbdefbfbdefbfbdefbfbdefbfbd"))
+    expect(lossy_bate("f09f9880f0", "f09f9880efbfbd"))
+    expect(lossy_bate("c3a9c3", "c3a9efbfbd"))
+    expect(lossy_bate("e180e228a1", "efbfbdefbfbd28efbfbd"))
+    expect(lossy_bate("f5e0d5ff", "efbfbdefbfbdefbfbdefbfbd"))
+    expect(lossy_bate("9e41", "efbfbd41"))
+    expect(lossy_bate("5090ef", "50efbfbdefbfbd"))
+    expect(lossy_bate("f4", "efbfbd"))
+    expect(lossy_bate("cdf5bc90f4", "efbfbdefbfbdefbfbdefbfbdefbfbd"))
+    expect(lossy_bate("bfbc", "efbfbdefbfbd"))
+    expect(lossy_bate("a1", "efbfbd"))
+    expect(lossy_bate("f5f48feb", "efbfbdefbfbdefbfbd"))
+    expect(lossy_bate("c1", "efbfbd"))
+    expect(lossy_bate("c0f0", "efbfbdefbfbd"))
+}
+
+test "utf16be_encode: BMP, BOM, par substituto e vazio" {
+    expect(utf16_encode_bate("A", false, "0041"))
+    expect(utf16_encode_bate("A", true, "feff0041"))
+    expect(utf16_encode_bate("é", false, "00e9"))
+    expect(utf16_encode_bate("€", false, "20ac"))
+    expect(utf16_encode_bate("😀", false, "d83dde00"))
+    expect(utf16_encode_bate("", true, "feff"))
+    expect(utf16_encode_bate("", false, ""))
+}
+
+test "utf16be_decode: BOM consumido e par substituto" {
+    expect(utf16_texto_bate("0041", "A"))
+    expect(utf16_texto_bate("feff0041", "A"))
+    expect(utf16_texto_bate("feff", ""))
+    expect(utf16_texto_bate("20ac00e9", "€é"))
+    expect(utf16_texto_bate("d83dde00", "😀"))
+    expect(utf16_texto_bate("feffd83dde000041", "😀A"))
+}
+
+test "utf16be_decode: erros explicitos" {
+    expect(utf16_erro_bate("004100", Utf16Error.comprimento_impar))
+    expect(utf16_erro_bate("dc00", Utf16Error.substituto_solto))
+    expect(utf16_erro_bate("d83d0041", Utf16Error.substituto_solto))
+    expect(utf16_erro_bate("d83d", Utf16Error.substituto_solto))
+}
+
+// html_escape e html_unescape (R1 do marco rede): os helpers conferem o texto e liberam o que alocaram (alloc heap, sem vazamento).
+proc html_escape_igual(s: str, esperado: str) -> bool {
+    let texto = html_escape(s, alloc = heap)
+    let ok = texto == esperado
+    delete(texto)
+    return ok
+}
+
+proc html_unescape_igual(s: str, esperado: str) -> bool {
+    let texto = html_unescape(s, alloc = heap)
+    let ok = texto == esperado
+    delete(texto)
+    return ok
+}
+
+// Escapa e desfaz: tem de voltar ao original.
+proc html_ida_e_volta_ok(original: str) -> bool {
+    let escapado = html_escape(original, alloc = heap)
+    let volta = html_unescape(escapado, alloc = heap)
+    let ok = volta == original
+    delete(escapado)
+    delete(volta)
+    return ok
+}
+
+test "html_escape troca & < > \" e '" {
+    expect(html_escape_igual("<a href=\"x\">&'</a>", "&lt;a href=&quot;x&quot;&gt;&amp;&#39;&lt;/a&gt;"))
+}
+
+test "html_escape deixa o resto como esta" {
+    expect(html_escape_igual("abc é 123 ~", "abc é 123 ~"))
+    expect(html_escape_igual("", ""))
+}
+
+test "html_escape nao escapa duas vezes o que ja e entidade" {
+    expect(html_escape_igual("&amp;", "&amp;amp;"))
+}
+
+test "html_unescape desfaz as 5 entidades nomeadas" {
+    expect(html_unescape_igual("&amp;&lt;&gt;&quot;&apos;", "&<>\"'"))
+}
+
+test "html_unescape numerico decimal e hexadecimal" {
+    expect(html_unescape_igual("&#65;&#x42;&#X43;&#x1F600;", "ABC😀"))
+    expect(html_unescape_igual("&#233;&#xe9;", "éé"))
+}
+
+test "html_unescape deixa invalido como texto" {
+    expect(html_unescape_igual("&foo; &#; &#x; &#0; &#xD800; &#1114112; &#x110000; &amp", "&foo; &#; &#x; &#0; &#xD800; &#1114112; &#x110000; &amp"))
+}
+
+test "html_unescape: '&' sem entidade e ';' solto ficam como estao" {
+    expect(html_unescape_igual("texto & solto; ok", "texto & solto; ok"))
+    expect(html_unescape_igual("&#00000000065;", "&#00000000065;"))
+}
+
+test "html_escape e html_unescape voltam ao original" {
+    expect(html_ida_e_volta_ok("<é>&\"'a&amp;b"))
+    expect(html_ida_e_volta_ok(""))
+}
+
+test "html_unescape de texto escapado por html_escape" {
+    expect(html_unescape_igual("&lt;p&gt;Ana &amp; Ze&lt;/p&gt;", "<p>Ana & Ze</p>"))
+}

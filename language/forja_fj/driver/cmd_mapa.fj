@@ -1,0 +1,410 @@
+// driver/cmd_mapa.fj - porte de compiler/driver/cmd_mapa.c, compiler/driver/cmd_mapa.h
+// sha256 de driver/cmd_mapa.c: c20df5ce6eba7c4bafda9c7d4ee747ba02abb6abdf5ffbc40fc17b1cf73c0c20
+// sha256 de driver/cmd_mapa.h: 20e219d937c80c0bbe315397742f03e21fcc55f3d9223372d91e45d8a26578a5
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "common"
+import "frontend"
+import "semantic"
+
+const MAPA_USO: str = "uso: forja mapa [<pasta | arq.fj>] [--json | --resumo] [--modulo <caminho>] [--limite <N>]\n"
+
+// C: driver/cmd_mapa.c:22
+// Erro de uso: o motivo na 1a linha do stderr e o uso logo abaixo; devolve CONSULTAR_USO.
+proc uso_errado_6(motivo: ?str) -> i32 {
+    let texto: str = motivo or_else ""
+    let msg = format(f"forja: mapa: {texto}\n{MAPA_USO}", alloc = heap)
+    defer delete(msg)
+    let err = common.c2f_saida_stderr()
+    defer saida_soltar(err)
+    common.c2f_saida_formatar(err, msg)
+    return CONSULTAR_USO
+}
+
+// C: driver/cmd_mapa.c:29
+// "--limite N": inteiro positivo; 0 = invalido. strtoul do C (sem sinal) lido pelo shim c2f_strtoull.
+proc ler_limite(texto: str) -> u32 {
+    var fim: int = 0
+    let n: u64 = common.c2f_strtoull(texto, 10, &fim)
+    if (len(texto) == 0) or (fim != len(texto)) or (n == 0) or (n > 100000) {
+        return 0
+    }
+    return common.c2f_trunc_u32(n)
+}
+
+// C: driver/cmd_mapa.c:38
+// Le uma opcao com valor (argv[k] e a opcao): devolve o motivo do erro ou none.
+proc ler_opcao_com_valor(argc: i32, argv: []str, k: ^i32, p: ^PedidoConsulta) -> ?str {
+    if (k^ + 1) >= argc {
+        return "a opcao exige um valor"
+    }
+    if argv[k^] == "--modulo" {
+        k^ += 1
+        p.modulo = argv[k^]
+        return none
+    }
+    k^ += 1
+    p.limite = ler_limite(argv[k^])
+    if p.limite == 0 {
+        return "--limite exige um inteiro positivo"
+    }
+    return none
+}
+
+// C: driver/cmd_mapa.c:50
+proc conferir_combinacao(p: ^PedidoConsulta, json_c: bool, resumo: bool) -> ?str {
+    if (common.c2f_b2i32(json_c) != 0) and (common.c2f_b2i32(resumo) != 0) {
+        return "--json e --resumo nao vao juntos"
+    }
+    if (common.c2f_b2i32(json_c) != 0) and (p.limite != 0) {
+        return "--limite so vale com --resumo"
+    }
+    p.resumo = not json_c
+    return none
+}
+
+// C: driver/cmd_mapa.c:59
+// json_c = --json escrito; p.resumo = --resumo escrito ou nenhum dos dois (o padrao). Devolve o motivo do uso errado ou none.
+proc ler_argumentos_5(argc: i32, argv: []str, p: ^PedidoConsulta, json_c: ^bool) -> ?str {
+    var resumo: bool = false
+    p^ = PedidoConsulta{}
+    p.pergunta = "mapa"
+    var k: i32 = 0
+    while k < argc {
+        if argv[k] == "--json" {
+            json_c^ = true
+        } else if argv[k] == "--resumo" {
+            resumo = true
+        } else if (argv[k] == "--modulo") or (argv[k] == "--limite") {
+            let motivo: ?str = ler_opcao_com_valor(argc, argv, &k, p)
+            if motivo != none {
+                return motivo
+            }
+        } else if common.c2f_prefixo_igual(argv[k], "--", 2) {
+            return "opcao desconhecida (valem --json, --resumo, --modulo e --limite)"
+        } else if p.alvo == none {
+            p.alvo = argv[k]
+        } else {
+            return "argumentos demais"
+        }
+        k += 1
+    }
+    return conferir_combinacao(p, json_c^, resumo)
+}
+
+// C: driver/cmd_mapa.c:81
+proc mapa_eh_tipo(d: ?^frontend.Decl) -> bool {
+    return (((d as ^frontend.Decl).tipo_no == (frontend.D_STRUCT as u8)) or ((d as ^frontend.Decl).tipo_no == (frontend.D_ENUM as u8))) or ((d as ^frontend.Decl).tipo_no == (frontend.D_UNIAO as u8))
+}
+
+// C: driver/cmd_mapa.c:86
+proc mapa_no_escopo(q: ^Consulta, modulo: i32, so: i32) -> bool {
+    if so >= 0 {
+        return modulo == so
+    }
+    return (q.c as ^Compilacao).modulos.itens[modulo].origem != (frontend.MOD_STD as u8)
+}
+
+// C: driver/cmd_mapa.c:92
+// Tamanho do projeto: modulos e linhas/bytes contam os do projeto (std e externos so em 'externos'); simbolos, api, tipos e testes saem das declaracoes do projeto.
+proc mapa_medir(q: ^Consulta, t: ^MapaTamanho) {
+    t^ = MapaTamanho{}
+    var k: u32 = 0
+    while k < (q.c as ^Compilacao).modulos.n {
+        if (q.c as ^Compilacao).modulos.itens[k].origem == (frontend.MOD_STD as u8) {
+            t.externos += 1
+        } else {
+            t.modulos += 1
+            t.linhas += consulta_linhas_do_modulo(q, common.c2f_trunc_u8(k as u64))
+            t.bytes += consulta_bytes_do_modulo(q, common.c2f_trunc_u8(k as u64))
+        }
+        k += 1
+    }
+    var d: ?^frontend.Decl = ((q.c as ^Compilacao).sem.programa as ^frontend.Programa).primeira
+    while d != none {
+        if (q.c as ^Compilacao).modulos.itens[(d as ^frontend.Decl).modulo].origem != (frontend.MOD_STD as u8) {
+            t.simbolos += common.c2f_b2u32(consulta_eh_simbolo(d))
+            t.publicos += common.c2f_b2u32(consulta_eh_api(d))
+            t.tipos += common.c2f_b2u32(mapa_eh_tipo(d))
+            t.testes += common.c2f_b2u32((d as ^frontend.Decl).tipo_no == (frontend.D_TEST as u8))
+        }
+        d = (d as ^frontend.Decl).prox
+    }
+}
+
+// C: driver/cmd_mapa.c:113
+proc tamanho_json(q: ^Consulta) {
+    var t: MapaTamanho = MapaTamanho{}
+    mapa_medir(q, &t)
+    append(&q.saida, item = ", \"tamanho\": {")
+    format(f"\"modulos\": {t.modulos}, \"externos\": {t.externos}, \"linhas\": {t.linhas}, \"bytes\": {t.bytes}, ", into = &q.saida)
+    format(f"\"simbolos\": {t.simbolos}, \"publicos\": {t.publicos}, \"tipos\": {t.tipos}, \"testes\": {t.testes}}}", into = &q.saida)
+}
+
+// C: driver/cmd_mapa.c:125
+proc entradas_json(q: ^Consulta, so: i32) {
+    consulta_abrir_lista(q, "entrada")
+    var d: ?^frontend.Decl = ((q.c as ^Compilacao).sem.programa as ^frontend.Programa).primeira
+    while d != none {
+        let entrada: ?str = consulta_entrada_de(q, d)
+        if (entrada != none) and (common.c2f_b2i32(mapa_no_escopo(q, (d as ^frontend.Decl).modulo as i32, so)) != 0) {
+            consulta_entrada_json(q, d, entrada)
+        }
+        d = (d as ^frontend.Decl).prox
+    }
+    consulta_fechar_lista(q)
+}
+
+// C: driver/cmd_mapa.c:135
+proc modulos_json(q: ^Consulta) {
+    var ordem: [255]u8 = {} // 255 = frontend.MODULOS_MAX (a Forja so aceita literal ou const do arquivo no tamanho)
+    let n: i32 = consulta_ordem_dos_modulos(q, ordem[..])
+    consulta_abrir_lista(q, "modulos")
+    var i: i32 = 0
+    while i < n {
+        consulta_modulo_json(q, ordem[i])
+        i += 1
+    }
+    consulta_fechar_lista(q)
+}
+
+// C: driver/cmd_mapa.c:145
+proc modulo_tem_api(q: ^Consulta, modulo: u8) -> bool {
+    var d: ?^frontend.Decl = ((q.c as ^Compilacao).sem.programa as ^frontend.Programa).primeira
+    while d != none {
+        if (((d as ^frontend.Decl).modulo as i32) == (modulo as i32)) and (common.c2f_b2i32(consulta_eh_api(d)) != 0) {
+            return true
+        }
+        d = (d as ^frontend.Decl).prox
+    }
+    return false
+}
+
+// C: driver/cmd_mapa.c:153
+proc api_json(q: ^Consulta, so: i32) {
+    var ordem: [255]u8 = {} // 255 = frontend.MODULOS_MAX
+    let n: i32 = consulta_ordem_dos_modulos(q, ordem[..])
+    consulta_abrir_lista(q, "api")
+    var i: i32 = 0
+    while i < n {
+        if mapa_no_escopo(q, ordem[i] as i32, so) and modulo_tem_api(q, ordem[i]) {
+            consulta_abrir_obj(q)
+            consulta_chave_modulo(q, "modulo", ordem[i])
+            _ = consulta_api_do_modulo_json(q, ordem[i])
+            consulta_fechar_obj(q)
+        }
+        i += 1
+    }
+    consulta_fechar_lista(q)
+}
+
+// C: driver/cmd_mapa.c:169
+proc campos_do_tipo_json(q: ^Consulta, d: ?^frontend.Decl) {
+    var tern_1: str = "campos"
+    if (d as ^frontend.Decl).tipo_no == (frontend.D_UNIAO as u8) {
+        tern_1 = "variantes"
+    }
+    consulta_abrir_lista(q, tern_1)
+    var i: u32 = 0
+    while i < (d as ^frontend.Decl).ncampos {
+        consulta_abrir_obj(q)
+        if (d as ^frontend.Decl).tipo_no == (frontend.D_STRUCT as u8) {
+            consulta_chave_nome(q, "nome", ((d as ^frontend.Decl).campos or_else {})[i].nome)
+        }
+        consulta_chave_tipo(q, "tipo", ((d as ^frontend.Decl).campos or_else {})[i].tipo.tipo)
+        consulta_fechar_obj(q)
+        i += 1
+    }
+    consulta_fechar_lista(q)
+}
+
+// C: driver/cmd_mapa.c:181
+proc membros_do_tipo_json(q: ^Consulta, d: ?^frontend.Decl) {
+    consulta_abrir_lista(q, "membros")
+    var i: u32 = 0
+    while i < (d as ^frontend.Decl).nmembros {
+        consulta_abrir_obj(q)
+        consulta_chave_nome(q, "nome", ((d as ^frontend.Decl).membros or_else {})[i].nome)
+        if (d as ^frontend.Decl).op == 1 {
+            consulta_chave_int(q, "valor", ((d as ^frontend.Decl).membros or_else {})[i].valor)
+        } else {
+            consulta_chave_texto(q, "valor", none, 0)
+        }
+        consulta_fechar_obj(q)
+        i += 1
+    }
+    consulta_fechar_lista(q)
+}
+
+// C: driver/cmd_mapa.c:194
+proc tipo_json(q: ^Consulta, d: ?^frontend.Decl) {
+    consulta_abrir_obj(q)
+    consulta_chave_nome(q, "nome", (d as ^frontend.Decl).nome)
+    let arg_1: u64 = len(semantic.indice_categoria(d)) as u64
+    let arg_2: str = semantic.indice_categoria(d)
+    let arg_3: str = "categoria"
+    let arg_4: ^Consulta = q
+    consulta_chave_texto(arg_4, arg_3, arg_2, arg_1)
+    consulta_chave_id(q, "id", d)
+    consulta_chave_modulo(q, "modulo", (d as ^frontend.Decl).modulo)
+    consulta_chave_bool(q, "publico", (d as ^frontend.Decl).publico)
+    consulta_chave_arquivo_se_pacote(q, (d as ^frontend.Decl).pos)
+    consulta_chave_pos(q, "pos", consulta_inicio_decl(q, d))
+    if (d as ^frontend.Decl).tipo_no == (frontend.D_ENUM as u8) {
+        membros_do_tipo_json(q, d)
+    } else {
+        campos_do_tipo_json(q, d)
+    }
+    consulta_fechar_obj(q)
+}
+
+// C: driver/cmd_mapa.c:209
+proc tipos_json(q: ^Consulta, so: i32) {
+    consulta_abrir_lista(q, "tipos")
+    var d: ?^frontend.Decl = ((q.c as ^Compilacao).sem.programa as ^frontend.Programa).primeira
+    while d != none {
+        if (common.c2f_b2i32(mapa_eh_tipo(d)) != 0) and (common.c2f_b2i32(mapa_no_escopo(q, (d as ^frontend.Decl).modulo as i32, so)) != 0) {
+            tipo_json(q, d)
+        }
+        d = (d as ^frontend.Decl).prox
+    }
+    consulta_fechar_lista(q)
+}
+
+// C: driver/cmd_mapa.c:218
+proc testes_json(q: ^Consulta, so: i32) {
+    consulta_abrir_lista(q, "testes")
+    var d: ?^frontend.Decl = ((q.c as ^Compilacao).sem.programa as ^frontend.Programa).primeira
+    while d != none {
+        if (common.c2f_b2i32(consulta_eh_teste_do_projeto(q, d)) != 0) and (common.c2f_b2i32(mapa_no_escopo(q, (d as ^frontend.Decl).modulo as i32, so)) != 0) {
+            consulta_teste_json(q, d)
+        }
+        d = (d as ^frontend.Decl).prox
+    }
+    consulta_fechar_lista(q)
+}
+
+// C: driver/cmd_mapa.c:228
+proc dependencias_json(q: ^Consulta) {
+    consulta_abrir_obj(q)
+    consulta_abrir_lista(q, "externas")
+    var k: u32 = 1
+    while k < (q.c as ^Compilacao).modulos.n {
+        if (q.c as ^Compilacao).modulos.itens[k].origem != (frontend.MOD_ARQUIVO as u8) {
+            consulta_item_modulo(q, k as u8)
+        }
+        k += 1
+    }
+    consulta_fechar_lista(q)
+    consulta_links_json(q, "links", -1)
+    consulta_fechar_obj(q)
+}
+
+// C: driver/cmd_mapa.c:240
+proc mapa_json(q: ^Consulta, so: i32) -> i32 {
+    consulta_abrir(q, "mapa")
+    tamanho_json(q)
+    entradas_json(q, so)
+    modulos_json(q)
+    api_json(q, so)
+    tipos_json(q, so)
+    testes_json(q, so)
+    append(&q.saida, item = ", \"dependencias\": ")
+    q.primeiro = true
+    dependencias_json(q)
+    consulta_fechar(q)
+    return CONSULTAR_OK
+}
+
+// C: driver/cmd_mapa.c:256
+// O _setmode(stdout, binario) do C (cmd_mapa.c:261, depois da validacao do modulo) e common.c2f_stdout_binario.
+proc mapa_responder(q: ^Consulta, p: ^PedidoConsulta) -> i32 {
+    var so: i32 = -1
+    if p.modulo != none {
+        so = consulta_achar_modulo(q, p.modulo)
+    }
+    if (p.modulo != none) and (so < 0) {
+        return consulta_uso_errado("mapa", p.modulo, "nao e modulo do projeto (use o caminho do import, ex.: std:mem)")
+    }
+    common.c2f_stdout_binario()
+    if p.resumo {
+        return mapa_resumo(q, p, so)
+    }
+    return mapa_json(q, so)
+}
+
+// C: driver/cmd_mapa.c:265
+proc rodar_mapa(argc: i32, argv: []str) -> i32 {
+    var p: PedidoConsulta = PedidoConsulta{}
+    var json_c: bool = false
+    let motivo: ?str = ler_argumentos_5(argc, argv, &p, &json_c)
+    if motivo != none {
+        return uso_errado_6(motivo)
+    }
+    return consulta_executar(&p, FUNCAO_RESPOSTA_MAPA_RESPONDER)
+}
+
+test "ler_limite: inteiro de 1 a 100000 como o strtoul do C, o resto e 0" {
+    expect(ler_limite("5") == 5)
+    expect(ler_limite("100000") == 100000)
+    expect(ler_limite("0") == 0)
+    expect(ler_limite("") == 0)
+    expect(ler_limite("100001") == 0)
+    expect(ler_limite("5x") == 0)
+    expect(ler_limite("abc") == 0)
+    expect(ler_limite("-5") == 0)
+    expect(ler_limite("+3") == 3)
+    expect(ler_limite(" 7") == 7)
+}
+
+test "ler_opcao_com_valor: --modulo e --limite com valor; valor que falta ou invalido vira motivo" {
+    var p: PedidoConsulta = PedidoConsulta{}
+    var k: i32 = 0
+    var a1: [2]str = {"--limite", "10"}
+    expect(ler_opcao_com_valor(2, a1[..], &k, &p) == none)
+    expect((p.limite == 10) and (k == 1))
+    var k2: i32 = 0
+    var a2: [1]str = {"--limite"}
+    expect((ler_opcao_com_valor(1, a2[..], &k2, &p) or_else "") == "a opcao exige um valor")
+    var k3: i32 = 0
+    var a3: [2]str = {"--limite", "0"}
+    expect((ler_opcao_com_valor(2, a3[..], &k3, &p) or_else "") == "--limite exige um inteiro positivo")
+    var k4: i32 = 0
+    var a4: [2]str = {"--modulo", "std:mem"}
+    expect(ler_opcao_com_valor(2, a4[..], &k4, &p) == none)
+    expect((p.modulo or_else "") == "std:mem")
+}
+
+test "ler_argumentos_5: combinacoes de --json, --resumo, --limite, alvo e os motivos de uso errado" {
+    var p: PedidoConsulta = PedidoConsulta{}
+    var j1: bool = false
+    var a1: [1]str = {"--json"}
+    expect(ler_argumentos_5(1, a1[..], &p, &j1) == none)
+    expect(j1 and (not p.resumo) and ((p.pergunta or_else "") == "mapa"))
+    var j2: bool = false
+    var a2: [1]str = {"proj"}
+    expect(ler_argumentos_5(1, a2[..], &p, &j2) == none)
+    expect((not j2) and p.resumo and ((p.alvo or_else "") == "proj"))
+    var j3: bool = false
+    var a3: [2]str = {"--json", "--resumo"}
+    expect((ler_argumentos_5(2, a3[..], &p, &j3) or_else "") == "--json e --resumo nao vao juntos")
+    var j4: bool = false
+    var a4: [3]str = {"--json", "--limite", "3"}
+    expect((ler_argumentos_5(3, a4[..], &p, &j4) or_else "") == "--limite so vale com --resumo")
+    var j5: bool = false
+    var a5: [1]str = {"--xyz"}
+    expect((ler_argumentos_5(1, a5[..], &p, &j5) or_else "") == "opcao desconhecida (valem --json, --resumo, --modulo e --limite)")
+    var j6: bool = false
+    var a6: [2]str = {"a", "b"}
+    expect((ler_argumentos_5(2, a6[..], &p, &j6) or_else "") == "argumentos demais")
+    var j7: bool = false
+    var a7: [3]str = {"--resumo", "--limite", "5"}
+    expect(ler_argumentos_5(3, a7[..], &p, &j7) == none)
+    expect((p.limite == 5) and p.resumo and (not j7))
+}
+
+test "uso_errado_6: devolve CONSULTAR_USO com e sem motivo" {
+    expect(uso_errado_6("motivo") == CONSULTAR_USO)
+    expect(uso_errado_6(none) == CONSULTAR_USO)
+}

@@ -1,0 +1,338 @@
+// nativo/wasm/wasm_intr.fj - intrinsecos do runtime em Forja (modulo std:wasm_rt) no alvo wasm32-wasip1
+// Versao: 0.4.0 (0.40.0: floor/ceil/trunc (f64 e f32) viram opcode inline pela tabela wasm_math_opcode, e round (f64 e f32, metade para longe de zero) vira sequencia inline em wasm_intr_round; 0.39.0: wasm_eh_as_real_direto/wasm_emitir_as_real_direto = forja_as_i32/i64_de_f64 em release e forja_math_floor viram opcode inline; W2: endereco_de, ponteiro_de, heap_base, memoria_paginas, memoria_crescer, modo_dev, trunc_i32, trunc_i64)
+// Contrato: o runtime em Forja declara estes simbolos em `foreign` sem link; a CHAMA da BIR a eles (simbolo BS_RUNTIME, nome forja_rt_*) vira
+// instrucao wasm no lugar do call. Ponteiro e inteiro de endereco sao i64 na BIR, entao endereco_de e ponteiro_de so copiam o valor.
+// copiar/preencher nao estao aqui: o runtime os declara com alias "memory.copy"/"memory.fill" (wasm_mem.fj).
+// trunc_i32/trunc_i64 = i32/i64.trunc_sat_f64_s: a saturacao do release (NaN = 0); o `as` de real para inteiro do proprio runtime chamaria
+// forja_as_*_de_f64 de novo, por isso o runtime usa estes.
+// Verificacao: python tests\nativo\wasm\verificar_wasm.py --modos dev,release --filtro rt_
+
+import "common"
+import "nativo/bir"
+import "nativo/fmt" as pefmt
+
+const INTR_ENDERECO_DE: str = "forja_rt_endereco_de"
+const INTR_PONTEIRO_DE: str = "forja_rt_ponteiro_de"
+const INTR_HEAP_BASE: str = "forja_rt_heap_base"
+const INTR_MEMORIA_PAGINAS: str = "forja_rt_memoria_paginas"
+const INTR_MEMORIA_CRESCER: str = "forja_rt_memoria_crescer"
+const INTR_MODO_DEV: str = "forja_rt_modo_dev"
+const INTR_TRUNC_I32: str = "forja_rt_trunc_i32"
+const INTR_TRUNC_I64: str = "forja_rt_trunc_i64"
+const INTR_FLOOR: str = "forja_rt_floor"
+const AS_REAL_I32: str = "forja_as_i32_de_f64"
+const AS_REAL_I64: str = "forja_as_i64_de_f64"
+const MATH_FLOOR_F64: str = "forja_math_floor"
+const MATH_CEIL_F64: str = "forja_math_ceil"
+const MATH_TRUNC_F64: str = "forja_math_trunc"
+const MATH_ROUND_F64: str = "forja_math_round"
+const MATH_FLOOR_F32: str = "forja_math_floorf"
+const MATH_CEIL_F32: str = "forja_math_ceilf"
+const MATH_TRUNC_F32: str = "forja_math_truncf"
+const MATH_ROUND_F32: str = "forja_math_roundf"
+// forja_rt_sair(codigo: int) -> int: i32.wrap_i64, call proc_exit (indice 0), unreachable; o "resultado" nunca existe, e o local.set depois do unreachable valida (pilha polimorfica)
+const INTR_SAIR: str = "forja_rt_sair"
+const INDICE_PROC_EXIT: u32 = 0
+// 0.34.0: forja_rt_args_tamanhos(argc_ptr, buf_tam_ptr) / forja_rt_args_obter(argv_ptr, buf_ptr) -> int: WASI args_sizes_get e args_get, importadas so quando uma funcao
+// viva as chama (wasm_alcance.fj); os indices 2 e 3 sao FINAIS (o modulo tem 4 imports so nesse caso), por isso a chamada sai com o indice literal, como o proc_exit
+const INTR_ARGS_TAMANHOS: str = "forja_rt_args_tamanhos"
+const INTR_ARGS_OBTER: str = "forja_rt_args_obter"
+const INDICE_ARGS_TAMANHOS: u32 = 2
+const INDICE_ARGS_OBTER: u32 = 3
+const OP_F64_FLOOR: u8 = 0x9C
+const OP_F64_CEIL: u8 = 0x9B
+const OP_F64_TRUNC: u8 = 0x9D
+const OP_F64_ABS: u8 = 0x99
+const OP_F64_ADD: u8 = 0xA0
+const OP_F64_SUB: u8 = 0xA1
+const OP_F64_COPYSIGN: u8 = 0xA6
+const OP_F64_GE: u8 = 0x66
+const OP_F32_FLOOR: u8 = 0x8E
+const OP_F32_CEIL: u8 = 0x8D
+const OP_F32_TRUNC: u8 = 0x8F
+const OP_F32_ABS: u8 = 0x8B
+const OP_F32_ADD: u8 = 0x92
+const OP_F32_SUB: u8 = 0x93
+const OP_F32_COPYSIGN: u8 = 0x98
+const OP_F32_GE: u8 = 0x60
+// 1.0 e 0.5 pelos bits do IEEE (f64 em 8 bytes, f32 em 4), como o wasm_real_bytes espera
+const REAL_UM_F64: u64 = 0x3FF0000000000000
+const REAL_MEIO_F64: u64 = 0x3FE0000000000000
+const REAL_UM_F32: u64 = 0x3F800000
+const REAL_MEIO_F32: u64 = 0x3F000000
+const OP_MEMORY_SIZE: u8 = 0x3F
+const OP_MEMORY_GROW: u8 = 0x40
+const OP_PREFIXO_FC: u8 = 0xFC
+const SUB_I32_TRUNC_SAT_F64_S: u32 = 2
+const SUB_I64_TRUNC_SAT_F64_S: u32 = 6
+const INTR_INDICE_MEMORIA: u8 = 0 // unica memoria do modulo
+// Global i64 imutavel com o primeiro endereco livre depois dos dados (o gerador o cria logo depois do $sp, que e o global 0)
+pub const GLOBAL_HEAP_BASE: u32 = 1
+
+pub proc wasm_eh_intrinseco(nome: str) -> bool {
+    return (nome == INTR_ENDERECO_DE) or (nome == INTR_PONTEIRO_DE) or (nome == INTR_HEAP_BASE) or (nome == INTR_MEMORIA_PAGINAS) or (nome == INTR_MEMORIA_CRESCER) or (nome == INTR_MODO_DEV) or (nome == INTR_TRUNC_I32) or (nome == INTR_TRUNC_I64) or (nome == INTR_FLOOR) or (nome == INTR_SAIR) or wasm_eh_intrinseco_args(nome)
+}
+
+// Os dois intrinsecos de argumentos do programa (WASI args_*)
+pub proc wasm_eh_intrinseco_args(nome: str) -> bool {
+    return (nome == INTR_ARGS_TAMANHOS) or (nome == INTR_ARGS_OBTER)
+}
+
+// Numero de argumentos do intrinseco
+proc wasm_intr_nargs(nome: str) -> u32 {
+    if (nome == INTR_HEAP_BASE) or (nome == INTR_MEMORIA_PAGINAS) or (nome == INTR_MODO_DEV) {
+        return 0
+    }
+    if wasm_eh_intrinseco_args(nome) {
+        return 2
+    }
+    return 1
+}
+
+// Classe do resultado: bool (i8) em modo_dev, i32 em trunc_i32, i64 nos demais
+proc wasm_intr_classe(nome: str) -> i32 {
+    if nome == INTR_MODO_DEV {
+        return bir.BC_I8
+    }
+    if nome == INTR_TRUNC_I32 {
+        return bir.BC_I32
+    }
+    if nome == INTR_FLOOR {
+        return bir.BC_F64
+    }
+    return bir.BC_I64
+}
+
+// O resultado da CHAMA vai para o vreg destino
+proc wasm_intr_guardar_resultado(ins: ^bir.BirInstr, corpo: ^[dynamic]u8) {
+    append(corpo, item = OP_LOCAL_SET)
+    pefmt.wasm_leb_u32(corpo, ins.dst)
+}
+
+// trunc_sat do operando real (f64): i32 em trunc_i32, i64 em trunc_i64
+proc wasm_intr_trunc(nome: str, arg: bir.BirOperando, corpo: ^[dynamic]u8) -> bool {
+    if not wasm_real_empilhar(arg, corpo) {
+        return false
+    }
+    append(corpo, item = OP_PREFIXO_FC)
+    if nome == INTR_TRUNC_I32 {
+        pefmt.wasm_leb_u32(corpo, SUB_I32_TRUNC_SAT_F64_S)
+    } else {
+        pefmt.wasm_leb_u32(corpo, SUB_I64_TRUNC_SAT_F64_S)
+    }
+    return true
+}
+
+// Intrinsecos de memoria (sem o modo e sem trunc): endereco_de, ponteiro_de, heap_base, memoria_paginas, memoria_crescer
+proc wasm_intr_memoria(nome: str, args: []bir.BirOperando, corpo: ^[dynamic]u8) -> bool {
+    if (nome == INTR_ENDERECO_DE) or (nome == INTR_PONTEIRO_DE) {
+        return wasm_empilhar(args[0], corpo)
+    }
+    if nome == INTR_HEAP_BASE {
+        append(corpo, item = OP_GLOBAL_GET)
+        pefmt.wasm_leb_u32(corpo, GLOBAL_HEAP_BASE)
+        return true
+    }
+    if nome == INTR_MEMORIA_PAGINAS {
+        append(corpo, item = OP_MEMORY_SIZE)
+        append(corpo, item = INTR_INDICE_MEMORIA)
+        append(corpo, item = OP_I64_EXTEND_I32_U)
+        return true
+    }
+    // memory.grow devolve as paginas antigas ou -1; o -1 tem de voltar com sinal
+    if not wasm_mem_empilhar_argumento(args[0], corpo) {
+        return false
+    }
+    append(corpo, item = OP_MEMORY_GROW)
+    append(corpo, item = INTR_INDICE_MEMORIA)
+    append(corpo, item = OP_I64_EXTEND_I32_S)
+    return true
+}
+
+// args_sizes_get / args_get: os 2 enderecos (i64 na BIR) viram i32, a chamada devolve o errno (i32) que volta como i64 sem sinal
+proc wasm_intr_args(nome: str, args: []bir.BirOperando, corpo: ^[dynamic]u8) -> bool {
+    for k in 0..<2 {
+        if not wasm_empilhar(args[k], corpo) {
+            return false
+        }
+        append(corpo, item = OP_I32_WRAP_I64)
+    }
+    append(corpo, item = OP_CALL)
+    if nome == INTR_ARGS_TAMANHOS {
+        pefmt.wasm_leb_u32(corpo, INDICE_ARGS_TAMANHOS)
+    } else {
+        pefmt.wasm_leb_u32(corpo, INDICE_ARGS_OBTER)
+    }
+    append(corpo, item = OP_I64_EXTEND_I32_U)
+    return true
+}
+
+// 0.40.0: floor/ceil/trunc de f64 e f32 saem como opcode (f64.floor 0x9C, f64.ceil 0x9B, f64.trunc 0x9D; f32 0x8E, 0x8D, 0x8F) no lugar da CHAMA.
+// Tabela nome -> opcode por classe (f64 e f32 tem opcodes proprios); 0 = nome fora da tabela
+proc wasm_math_opcode(nome: str, eh_f64: bool) -> u8 {
+    if eh_f64 {
+        if nome == MATH_FLOOR_F64 {
+            return OP_F64_FLOOR
+        }
+        if nome == MATH_CEIL_F64 {
+            return OP_F64_CEIL
+        }
+        if nome == MATH_TRUNC_F64 {
+            return OP_F64_TRUNC
+        }
+        return 0
+    }
+    if nome == MATH_FLOOR_F32 {
+        return OP_F32_FLOOR
+    }
+    if nome == MATH_CEIL_F32 {
+        return OP_F32_CEIL
+    }
+    if nome == MATH_TRUNC_F32 {
+        return OP_F32_TRUNC
+    }
+    return 0
+}
+
+// round do C (metade para longe de zero): nao e o nearest 0x9E/0x90, que e half-even; tem sequencia propria em wasm_intr_round
+proc wasm_math_eh_round(nome: str, eh_f64: bool) -> bool {
+    if eh_f64 {
+        return nome == MATH_ROUND_F64
+    }
+    return nome == MATH_ROUND_F32
+}
+
+// Empilha 1.0 ou 0.5 (REAL_*) no tipo real da classe: f64.const / f32.const com os bits
+proc wasm_intr_constante(bits_f64: u64, bits_f32: u64, eh_f64: bool, corpo: ^[dynamic]u8) {
+    if eh_f64 {
+        append(corpo, item = OP_F64_CONST)
+        wasm_real_bytes(corpo, bits_f64, 8)
+    } else {
+        append(corpo, item = OP_F32_CONST)
+        wasm_real_bytes(corpo, bits_f32, 4)
+    }
+}
+
+// round do C = t + copysign(1, x) se |x - t| >= 0.5, senao t, com t = trunc(x). Pilha: [t + copysign(1, x)] [t] [|x - t| >= 0.5] select.
+// x entra repetido (operando e vreg ou imediato, repetir e barato); e a mesma sequencia em f64 e f32, so mudam os opcodes e as constantes
+proc wasm_intr_round(x: bir.BirOperando, eh_f64: bool, corpo: ^[dynamic]u8) -> bool {
+    var op_trunc: u8 = OP_F32_TRUNC
+    var op_copysign: u8 = OP_F32_COPYSIGN
+    var op_add: u8 = OP_F32_ADD
+    var op_sub: u8 = OP_F32_SUB
+    var op_abs: u8 = OP_F32_ABS
+    var op_ge: u8 = OP_F32_GE
+    if eh_f64 {
+        op_trunc = OP_F64_TRUNC
+        op_copysign = OP_F64_COPYSIGN
+        op_add = OP_F64_ADD
+        op_sub = OP_F64_SUB
+        op_abs = OP_F64_ABS
+        op_ge = OP_F64_GE
+    }
+    // t + copysign(1, x)
+    if not wasm_real_empilhar(x, corpo) {
+        return false
+    }
+    append(corpo, item = op_trunc)
+    wasm_intr_constante(REAL_UM_F64, REAL_UM_F32, eh_f64, corpo)
+    if not wasm_real_empilhar(x, corpo) {
+        return false
+    }
+    append(corpo, item = op_copysign)
+    append(corpo, item = op_add)
+    // t
+    if not wasm_real_empilhar(x, corpo) {
+        return false
+    }
+    append(corpo, item = op_trunc)
+    // |x - t| >= 0.5
+    if not wasm_real_empilhar(x, corpo) {
+        return false
+    }
+    if not wasm_real_empilhar(x, corpo) {
+        return false
+    }
+    append(corpo, item = op_trunc)
+    append(corpo, item = op_sub)
+    append(corpo, item = op_abs)
+    wasm_intr_constante(REAL_MEIO_F64, REAL_MEIO_F32, eh_f64, corpo)
+    append(corpo, item = op_ge)
+    append(corpo, item = OP_SELECT)
+    return true
+}
+
+// 0.39.0: em release, real -> i32 e real -> int (forja_as_i32_de_f64 / forja_as_i64_de_f64) saem como i32/i64.trunc_sat_f64_s no lugar da CHAMA:
+// e o mesmo resultado do runtime em release (satura, NaN = 0) sem a chamada, que o V8 nao embutia nos lacos quentes (kernel do Abyssal 2x mais lento).
+// Em dev a chamada fica (R0002 com arquivo:linha). Fora do contrato (nargs, classe) a chamada normal segue.
+// 0.40.0: a lista de nomes mora em bir.bir_chamada_opcode_wasm (o inliner da BIR a le tambem: CHAMA que vira opcode nao e chamada)
+pub proc wasm_eh_as_real_direto(prog: ^bir.BirPrograma, ins: ^bir.BirInstr, nome: str) -> bool {
+    return bir.bir_chamada_opcode_wasm(prog, ins, nome)
+}
+
+// Emite o trunc_sat do operando real (args[0], f64) e guarda no destino
+pub proc wasm_emitir_as_real_direto(ins: ^bir.BirInstr, nome: str, corpo: ^[dynamic]u8, erro: ^common.Diag) -> bool {
+    let args: []bir.BirOperando = ins.args or_else {}
+    let eh_f64: bool = (ins.classe as i32) == bir.BC_F64
+    if wasm_math_eh_round(nome, eh_f64) {
+        if not wasm_intr_round(args[0], eh_f64, corpo) {
+            return wasm_nao_suportado(erro, ins.pos, nome)
+        }
+        wasm_intr_guardar_resultado(ins, corpo)
+        return true
+    }
+    if not wasm_real_empilhar(args[0], corpo) {
+        return wasm_nao_suportado(erro, ins.pos, nome)
+    }
+    let opcode: u8 = wasm_math_opcode(nome, eh_f64)
+    if opcode != 0 {
+        append(corpo, item = opcode)
+        wasm_intr_guardar_resultado(ins, corpo)
+        return true
+    }
+    append(corpo, item = OP_PREFIXO_FC)
+    if nome == AS_REAL_I32 {
+        pefmt.wasm_leb_u32(corpo, SUB_I32_TRUNC_SAT_F64_S)
+    } else {
+        pefmt.wasm_leb_u32(corpo, SUB_I64_TRUNC_SAT_F64_S)
+    }
+    wasm_intr_guardar_resultado(ins, corpo)
+    return true
+}
+
+// Emite o intrinseco `nome` no lugar da CHAMA; qualquer forma fora do contrato (nargs, classe do retorno) devolve X0001
+pub proc wasm_emitir_intrinseco(prog: ^bir.BirPrograma, ins: ^bir.BirInstr, nome: str, corpo: ^[dynamic]u8, erro: ^common.Diag) -> bool {
+    let args: []bir.BirOperando = ins.args or_else {}
+    if (ins.nargs != wasm_intr_nargs(nome)) or ((ins.classe as i32) != wasm_intr_classe(nome)) {
+        return wasm_nao_suportado(erro, ins.pos, nome)
+    }
+    var ok: bool = true
+    if nome == INTR_MODO_DEV {
+        append(corpo, item = OP_I32_CONST)
+        if (prog.modo as i32) == (bir.BM_RELEASE as i32) {
+            pefmt.wasm_leb_s32(corpo, 0)
+        } else {
+            pefmt.wasm_leb_s32(corpo, 1)
+        }
+    } else if (nome == INTR_TRUNC_I32) or (nome == INTR_TRUNC_I64) {
+        ok = wasm_intr_trunc(nome, args[0], corpo)
+    } else if nome == INTR_FLOOR {
+        ok = wasm_real_empilhar(args[0], corpo)
+        append(corpo, item = OP_F64_FLOOR)
+    } else if nome == INTR_SAIR {
+        ok = wasm_empilhar(args[0], corpo)
+        append(corpo, item = OP_I32_WRAP_I64)
+        append(corpo, item = OP_CALL)
+        pefmt.wasm_leb_u32(corpo, INDICE_PROC_EXIT)
+        append(corpo, item = OP_UNREACHABLE)
+    } else if wasm_eh_intrinseco_args(nome) {
+        ok = wasm_intr_args(nome, args, corpo)
+    } else {
+        ok = wasm_intr_memoria(nome, args, corpo)
+    }
+    if not ok {
+        return wasm_nao_suportado(erro, ins.pos, nome)
+    }
+    wasm_intr_guardar_resultado(ins, corpo)
+    return true
+}

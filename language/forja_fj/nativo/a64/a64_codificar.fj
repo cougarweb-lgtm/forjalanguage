@@ -1,0 +1,461 @@
+// nativo/a64/a64_codificar.fj - encoder puro das formas A64 (AArch64 base, ARMv8.0-A): uma palavra u32 por forma.
+// Versao: 0.2.0
+// Changelog: 0.2.0 - A1.3(iii): forma FCSEL (125, layout 28: type, rm, cond, rn, rd) e A64_LAY_QTD 29.
+//            0.1.0 - A1.1 (language\gaveta\contrato_a64.txt §2.3-§2.5): tabela de 125 formas (base + layout de campos
+//                    por posicao, §2.4); a64_codificar(forma, campos) por tabela (despacho R4); a64_cod_adr (split do imm21
+//                    em immlo/immhi); a64_bitmask (DecodeBitMasks da ARM ARM ao contrario); a64_mov_imm (MOVZ/MOVN + MOVK);
+//                    a64_fmov_imm8 (VFPExpandImm). O N das formas BITF e espelho do sf (bit 22), como manda §2.4.
+// Convencao: campos.v[k] = k-esimo argumento da forma na ordem do layout (sf primeiro quando houver). Campo fora da
+//            largura e mascarado. Testes no fim do arquivo (forja test); oraculo: diferencial_capstone.py (gerar_vetores.fj
+//            carrega a copia deste arquivo ate a linha ==== TESTES ====).
+
+pub struct A64Campos {
+    v: [8]u64
+}
+
+const A64F_ADD_IMM: u32 = 0
+const A64F_ADDS_IMM: u32 = 1
+const A64F_SUB_IMM: u32 = 2
+const A64F_SUBS_IMM: u32 = 3
+const A64F_ADD_REG: u32 = 4
+const A64F_ADDS_REG: u32 = 5
+const A64F_SUB_REG: u32 = 6
+const A64F_SUBS_REG: u32 = 7
+const A64F_ADD_EXT: u32 = 8
+const A64F_AND_REG: u32 = 9
+const A64F_ORR_REG: u32 = 10
+const A64F_EOR_REG: u32 = 11
+const A64F_ANDS_REG: u32 = 12
+const A64F_AND_IMM: u32 = 13
+const A64F_ORR_IMM: u32 = 14
+const A64F_EOR_IMM: u32 = 15
+const A64F_ANDS_IMM: u32 = 16
+const A64F_MOVN: u32 = 17
+const A64F_MOVZ: u32 = 18
+const A64F_MOVK: u32 = 19
+const A64F_SBFM: u32 = 20
+const A64F_BFM: u32 = 21
+const A64F_UBFM: u32 = 22
+const A64F_LSLV: u32 = 23
+const A64F_LSRV: u32 = 24
+const A64F_ASRV: u32 = 25
+const A64F_UDIV: u32 = 26
+const A64F_SDIV: u32 = 27
+const A64F_MADD: u32 = 28
+const A64F_MSUB: u32 = 29
+const A64F_SMULH: u32 = 30
+const A64F_UMULH: u32 = 31
+const A64F_SMULL: u32 = 32
+const A64F_UMULL: u32 = 33
+const A64F_CSEL: u32 = 34
+const A64F_CSINC: u32 = 35
+const A64F_CSINV: u32 = 36
+const A64F_CSNEG: u32 = 37
+const A64F_B: u32 = 38
+const A64F_BL: u32 = 39
+const A64F_B_COND: u32 = 40
+const A64F_CBZ: u32 = 41
+const A64F_CBNZ: u32 = 42
+const A64F_TBZ: u32 = 43
+const A64F_TBNZ: u32 = 44
+const A64F_BR: u32 = 45
+const A64F_BLR: u32 = 46
+const A64F_RET: u32 = 47
+const A64F_SVC: u32 = 48
+const A64F_BRK: u32 = 49
+const A64F_NOP: u32 = 50
+const A64F_DMB_ISH: u32 = 51
+const A64F_ADR: u32 = 52
+const A64F_ADRP: u32 = 53
+const A64F_STRB: u32 = 54
+const A64F_LDRB: u32 = 55
+const A64F_LDRSB_X: u32 = 56
+const A64F_LDRSB_W: u32 = 57
+const A64F_STRH: u32 = 58
+const A64F_LDRH: u32 = 59
+const A64F_LDRSH_X: u32 = 60
+const A64F_LDRSH_W: u32 = 61
+const A64F_STR_W: u32 = 62
+const A64F_LDR_W: u32 = 63
+const A64F_LDRSW: u32 = 64
+const A64F_STR_X: u32 = 65
+const A64F_LDR_X: u32 = 66
+const A64F_STR_S: u32 = 67
+const A64F_LDR_S: u32 = 68
+const A64F_STR_D: u32 = 69
+const A64F_LDR_D: u32 = 70
+const A64F_STR_Q: u32 = 71
+const A64F_LDR_Q: u32 = 72
+const A64F_STURB: u32 = 73
+const A64F_LDURB: u32 = 74
+const A64F_LDURSB_X: u32 = 75
+const A64F_LDURSB_W: u32 = 76
+const A64F_STURH: u32 = 77
+const A64F_LDURH: u32 = 78
+const A64F_LDURSH_X: u32 = 79
+const A64F_LDURSH_W: u32 = 80
+const A64F_STUR_W: u32 = 81
+const A64F_LDUR_W: u32 = 82
+const A64F_LDURSW: u32 = 83
+const A64F_STUR_X: u32 = 84
+const A64F_LDUR_X: u32 = 85
+const A64F_STUR_S: u32 = 86
+const A64F_LDUR_S: u32 = 87
+const A64F_STUR_D: u32 = 88
+const A64F_LDUR_D: u32 = 89
+const A64F_STUR_Q: u32 = 90
+const A64F_LDUR_Q: u32 = 91
+const A64F_STP_X: u32 = 92
+const A64F_LDP_X: u32 = 93
+const A64F_STP_X_PRE: u32 = 94
+const A64F_LDP_X_PRE: u32 = 95
+const A64F_STP_X_POS: u32 = 96
+const A64F_LDP_X_POS: u32 = 97
+const A64F_STP_D: u32 = 98
+const A64F_LDP_D: u32 = 99
+const A64F_STP_W: u32 = 100
+const A64F_FADD: u32 = 101
+const A64F_FSUB: u32 = 102
+const A64F_FMUL: u32 = 103
+const A64F_FDIV: u32 = 104
+const A64F_FSQRT: u32 = 105
+const A64F_FNEG: u32 = 106
+const A64F_FABS: u32 = 107
+const A64F_FMOV_REG: u32 = 108
+const A64F_FCMP: u32 = 109
+const A64F_FCVT_S_D: u32 = 110
+const A64F_FCVT_D_S: u32 = 111
+const A64F_SCVTF: u32 = 112
+const A64F_UCVTF: u32 = 113
+const A64F_FCVTZS: u32 = 114
+const A64F_FCVTZU: u32 = 115
+const A64F_FMOV_XD_DN: u32 = 116
+const A64F_FMOV_DD_XN: u32 = 117
+const A64F_FMOV_WD_SN: u32 = 118
+const A64F_FMOV_SD_WN: u32 = 119
+const A64F_FMOV_IMM: u32 = 120
+const A64F_FRINTM: u32 = 121
+const A64F_FRINTP: u32 = 122
+const A64F_FRINTZ: u32 = 123
+const A64F_FRINTA: u32 = 124
+const A64F_FCSEL: u32 = 125
+const A64_FORMAS_QTD: u32 = 126
+const A64_FORMA_BASE: [126]u32 = {0x11000000, 0x31000000, 0x51000000, 0x71000000, 0x0B000000, 0x2B000000, 0x4B000000, 0x6B000000, 0x0B200000, 0x0A000000, 0x2A000000, 0x4A000000, 0x6A000000, 0x12000000, 0x32000000, 0x52000000, 0x72000000, 0x12800000, 0x52800000, 0x72800000, 0x13000000, 0x33000000, 0x53000000, 0x1AC02000, 0x1AC02400, 0x1AC02800, 0x1AC00800, 0x1AC00C00, 0x1B000000, 0x1B008000, 0x9B407C00, 0x9BC07C00, 0x9B207C00, 0x9BA07C00, 0x1A800000, 0x1A800400, 0x5A800000, 0x5A800400, 0x14000000, 0x94000000, 0x54000000, 0x34000000, 0x35000000, 0x36000000, 0x37000000, 0xD61F0000, 0xD63F0000, 0xD65F0000, 0xD4000001, 0xD4200000, 0xD503201F, 0xD5033BBF, 0x10000000, 0x90000000, 0x39000000, 0x39400000, 0x39800000, 0x39C00000, 0x79000000, 0x79400000, 0x79800000, 0x79C00000, 0xB9000000, 0xB9400000, 0xB9800000, 0xF9000000, 0xF9400000, 0xBD000000, 0xBD400000, 0xFD000000, 0xFD400000, 0x3D800000, 0x3DC00000, 0x38000000, 0x38400000, 0x38800000, 0x38C00000, 0x78000000, 0x78400000, 0x78800000, 0x78C00000, 0xB8000000, 0xB8400000, 0xB8800000, 0xF8000000, 0xF8400000, 0xBC000000, 0xBC400000, 0xFC000000, 0xFC400000, 0x3C800000, 0x3CC00000, 0xA9000000, 0xA9400000, 0xA9800000, 0xA9C00000, 0xA8800000, 0xA8C00000, 0x6D000000, 0x6D400000, 0x29000000, 0x1E202800, 0x1E203800, 0x1E200800, 0x1E201800, 0x1E21C000, 0x1E214000, 0x1E20C000, 0x1E204000, 0x1E202000, 0x1E22C000, 0x1E624000, 0x1E220000, 0x1E230000, 0x1E380000, 0x1E390000, 0x9E660000, 0x9E670000, 0x1E260000, 0x1E270000, 0x1E201000, 0x1E254000, 0x1E24C000, 0x1E25C000, 0x1E264000, 0x1E200C00}
+const A64_FORMA_LAY: [126]u32 = {0, 0, 0, 0, 1, 1, 1, 1, 2, 3, 3, 3, 3, 4, 4, 4, 4, 6, 6, 6, 5, 5, 5, 7, 7, 7, 7, 7, 8, 8, 9, 9, 9, 9, 10, 10, 10, 10, 11, 11, 12, 13, 13, 14, 14, 15, 15, 15, 16, 16, 17, 17, 18, 18, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 19, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 21, 21, 21, 21, 21, 21, 21, 21, 21, 22, 22, 22, 22, 23, 23, 23, 23, 24, 25, 25, 26, 26, 26, 26, 25, 25, 25, 25, 27, 23, 23, 23, 23, 28}
+const A64_LAY_QTD: u32 = 29
+const A64L_ADDI: int = 0
+const A64L_ADDR: int = 1
+const A64L_ADDX: int = 2
+const A64L_LOGR: int = 3
+const A64L_LOGI: int = 4
+const A64L_BITF: int = 5
+const A64L_MOVW: int = 6
+const A64L_DP3: int = 7
+const A64L_MADD: int = 8
+const A64L_MUL3: int = 9
+const A64L_CSEL: int = 10
+const A64L_B26: int = 11
+const A64L_BCOND: int = 12
+const A64L_CBZ: int = 13
+const A64L_TBZ: int = 14
+const A64L_RN: int = 15
+const A64L_IMM16: int = 16
+const A64L_NADA: int = 17
+const A64L_ADR: int = 18
+const A64L_LDST: int = 19
+const A64L_LDUR: int = 20
+const A64L_LDP: int = 21
+const A64L_FP2: int = 22
+const A64L_FP1: int = 23
+const A64L_FCMP: int = 24
+const A64L_RNRD: int = 25
+const A64L_FPINT: int = 26
+const A64L_FMOVI: int = 27
+const A64L_FCSEL: int = 28
+const A64_LAY_ARGS: [29]u32 = {5, 6, 6, 7, 6, 5, 4, 4, 5, 3, 5, 1, 2, 3, 4, 1, 1, 0, 3, 3, 3, 4, 4, 3, 4, 2, 4, 3, 5}
+const A64_LAY_ESPELHO: [29]u32 = {0, 0, 0, 0, 0, 22, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
+const A64_LAY_DESLOC: [29][8]u32 = {{31, 22, 10, 5, 0, 0, 0, 0}, {31, 22, 16, 10, 5, 0, 0, 0}, {31, 16, 13, 10, 5, 0, 0, 0}, {31, 22, 21, 16, 10, 5, 0, 0}, {31, 22, 16, 10, 5, 0, 0, 0}, {31, 16, 10, 5, 0, 0, 0, 0}, {31, 21, 5, 0, 0, 0, 0, 0}, {31, 16, 5, 0, 0, 0, 0, 0}, {31, 16, 10, 5, 0, 0, 0, 0}, {16, 5, 0, 0, 0, 0, 0, 0}, {31, 16, 12, 5, 0, 0, 0, 0}, {0, 0, 0, 0, 0, 0, 0, 0}, {5, 0, 0, 0, 0, 0, 0, 0}, {31, 5, 0, 0, 0, 0, 0, 0}, {31, 19, 5, 0, 0, 0, 0, 0}, {5, 0, 0, 0, 0, 0, 0, 0}, {5, 0, 0, 0, 0, 0, 0, 0}, {0, 0, 0, 0, 0, 0, 0, 0}, {29, 5, 0, 0, 0, 0, 0, 0}, {10, 5, 0, 0, 0, 0, 0, 0}, {12, 5, 0, 0, 0, 0, 0, 0}, {15, 10, 5, 0, 0, 0, 0, 0}, {22, 16, 5, 0, 0, 0, 0, 0}, {22, 5, 0, 0, 0, 0, 0, 0}, {22, 16, 5, 3, 0, 0, 0, 0}, {5, 0, 0, 0, 0, 0, 0, 0}, {31, 22, 5, 0, 0, 0, 0, 0}, {22, 13, 0, 0, 0, 0, 0, 0}, {22, 16, 12, 5, 0, 0, 0, 0}}
+const A64_LAY_LARG: [29][8]u32 = {{1, 1, 12, 5, 5, 0, 0, 0}, {1, 2, 5, 6, 5, 5, 0, 0}, {1, 5, 3, 3, 5, 5, 0, 0}, {1, 2, 1, 5, 6, 5, 5, 0}, {1, 1, 6, 6, 5, 5, 0, 0}, {1, 6, 6, 5, 5, 0, 0, 0}, {1, 2, 16, 5, 0, 0, 0, 0}, {1, 5, 5, 5, 0, 0, 0, 0}, {1, 5, 5, 5, 5, 0, 0, 0}, {5, 5, 5, 0, 0, 0, 0, 0}, {1, 5, 4, 5, 5, 0, 0, 0}, {26, 0, 0, 0, 0, 0, 0, 0}, {19, 4, 0, 0, 0, 0, 0, 0}, {1, 19, 5, 0, 0, 0, 0, 0}, {1, 5, 14, 5, 0, 0, 0, 0}, {5, 0, 0, 0, 0, 0, 0, 0}, {16, 0, 0, 0, 0, 0, 0, 0}, {0, 0, 0, 0, 0, 0, 0, 0}, {2, 19, 5, 0, 0, 0, 0, 0}, {12, 5, 5, 0, 0, 0, 0, 0}, {9, 5, 5, 0, 0, 0, 0, 0}, {7, 5, 5, 5, 0, 0, 0, 0}, {1, 5, 5, 5, 0, 0, 0, 0}, {1, 5, 5, 0, 0, 0, 0, 0}, {1, 5, 5, 1, 0, 0, 0, 0}, {5, 5, 0, 0, 0, 0, 0, 0}, {1, 1, 5, 5, 0, 0, 0, 0}, {1, 8, 5, 0, 0, 0, 0, 0}, {1, 5, 4, 5, 5, 0, 0, 0}}
+
+// mascara de w bits (0..64)
+proc a64_mascara(w: u32) -> u64 {
+    if w >= 64 {
+        return 18446744073709551615
+    }
+    return (1 as u64 << (w as u64)) - 1
+}
+
+// OR dos campos (mascarados) nas posicoes do layout lay
+proc a64_campos_em_bits(lay: int, c: ^A64Campos) -> u32 {
+    var acc: u32 = 0
+    var k: int = 0
+    let n = A64_LAY_ARGS[lay] as int
+    while k < n {
+        let w = A64_LAY_LARG[lay][k]
+        let s = A64_LAY_DESLOC[lay][k]
+        let campo = (c.v[k] & a64_mascara(w)) << (s as u64)
+        acc = acc | (campo as u32)
+        k += 1
+    }
+    return acc
+}
+
+// palavra da forma: base | campos. Layout com espelho (BITF) copia o sf para o bit do N.
+pub proc a64_codificar(forma: u32, c: ^A64Campos) -> u32 {
+    let lay = A64_FORMA_LAY[forma as int] as int
+    var palavra: u32 = A64_FORMA_BASE[forma as int]
+    palavra = palavra | a64_campos_em_bits(lay, c)
+    let espelho = A64_LAY_ESPELHO[lay] as u64
+    if espelho != 0 {
+        palavra = palavra | (((c.v[0] & 1) << espelho) as u32)
+    }
+    return palavra
+}
+
+// ADR/ADRP: separa o imm21 (bytes ou paginas) em immlo (2 bits, bit 29) e immhi (19 bits, bit 5)
+pub proc a64_cod_adr(forma: u32, imm21: i64, rd: u32) -> u32 {
+    var c = A64Campos{v = {0, 0, 0, 0, 0, 0, 0, 0}}
+    var positivo = imm21
+    if imm21 < 0 {
+        positivo = imm21 + 2097152
+    }
+    let bruto = positivo as u64
+    c.v[0] = bruto & 3
+    c.v[1] = (bruto >> 2) & 524287
+    c.v[2] = rd as u64
+    return a64_codificar(forma, &c)
+}
+
+// contagem de bits 1 de v
+proc a64_popcount(v: u64) -> u32 {
+    var x = v
+    var n: u32 = 0
+    while x != 0 {
+        n += (x & 1) as u32
+        x = x >> 1
+    }
+    return n
+}
+
+// tamanho do menor elemento (2..bits, potencia de 2) que, repetido, reconstroi valor
+proc a64_replica(el: u64, e: u32, bits: u32) -> u64 {
+    var r: u64 = 0
+    var i: u32 = 0
+    while i < bits {
+        r = r | (el << (i as u64))
+        i += e
+    }
+    return r
+}
+
+proc a64_tamanho_elemento(valor: u64, bits: u32) -> u32 {
+    var e: u32 = 2
+    while e < bits {
+        if a64_replica(valor & a64_mascara(e), e, bits) == valor {
+            return e
+        }
+        e = e * 2
+    }
+    return bits
+}
+
+// bit mais baixo do unico bloco de 1s do elemento (circular dentro de e bits); -1 se nao for um bloco unico
+proc a64_inicio_bloco(el: u64, e: u32) -> int {
+    var achados: int = 0
+    var inicio: int = -1
+    var i: u32 = 0
+    while i < e {
+        let atual = (el >> (i as u64)) & 1
+        let antes = (i + e - 1) % e
+        let anterior = (el >> (antes as u64)) & 1
+        if (atual == 1) and (anterior == 0) {
+            achados += 1
+            inicio = i as int
+        }
+        i += 1
+    }
+    if achados != 1 {
+        return -1
+    }
+    return inicio
+}
+
+// valor e imediato logico de bits (32 ou 64)? Se sim, grava N/immr/imms (ARM ARM DecodeBitMasks ao contrario).
+// LIMITE: 5 parametros, assinatura do contrato §2.3 (os tres campos saem por ponteiro).
+pub proc a64_bitmask(valor: u64, bits: u32, n: ^u32, immr: ^u32, imms: ^u32) -> bool {
+    if (bits != 32) and (bits != 64) {
+        return false
+    }
+    if (bits == 32) and ((valor >> 32) != 0) {
+        return false
+    }
+    if (valor == 0) or (valor == a64_mascara(bits)) {
+        return false
+    }
+    let e = a64_tamanho_elemento(valor, bits)
+    let el = valor & a64_mascara(e)
+    let uns = a64_popcount(el)
+    let p = a64_inicio_bloco(el, e)
+    if (p < 0) or (uns == e) {
+        return false
+    }
+    var rot: u32 = 0
+    if p > 0 {
+        rot = e - (p as u32)
+    }
+    let s = uns - 1
+    if e == 64 {
+        n^ = 1
+        imms^ = s
+    } else {
+        n^ = 0
+        imms^ = 64 - 2 * e + s
+    }
+    immr^ = rot
+    return true
+}
+
+// meia-palavra i (16 bits) de valor
+proc a64_meia(valor: u64, i: int) -> u64 {
+    return (valor >> ((i as u64) * 16)) & 65535
+}
+
+proc a64_conta_meias(valor: u64, meias: int, alvo: u64) -> int {
+    var n: int = 0
+    var i: int = 0
+    while i < meias {
+        if a64_meia(valor, i) == alvo {
+            n += 1
+        }
+        i += 1
+    }
+    return n
+}
+
+// palavra MOVZ/MOVN/MOVK: sf (x), hw (0..3), imm16 e rd
+proc a64_palavra_movw(forma: u32, x: bool, hw: int, imm16: u64, rd: u32) -> u32 {
+    var c = A64Campos{v = {0, 0, 0, 0, 0, 0, 0, 0}}
+    if x {
+        c.v[0] = 1
+    }
+    c.v[1] = hw as u64
+    c.v[2] = imm16
+    c.v[3] = rd as u64
+    return a64_codificar(forma, &c)
+}
+
+// materializa valor em destino: MOVN quando ha mais meias 0xFFFF que 0x0000, senao MOVZ; MOVK nas demais.
+// Grava as palavras em saida e devolve quantas (1..4). x=false: 32 bits (sf=0), so as duas meias baixas.
+pub proc a64_mov_imm(destino: u32, valor: u64, x: bool, saida: ^[4]u32) -> u32 {
+    var meias: int = 2
+    if x {
+        meias = 4
+    }
+    var forma: u32 = A64F_MOVZ
+    var fundo: u64 = 0
+    if a64_conta_meias(valor, meias, 65535) > a64_conta_meias(valor, meias, 0) {
+        forma = A64F_MOVN
+        fundo = 65535
+    }
+    var n: int = 0
+    var i: int = 0
+    while i < meias {
+        let h = a64_meia(valor, i)
+        if h != fundo {
+            var forma_w: u32 = A64F_MOVK
+            var imm: u64 = h
+            if n == 0 {
+                forma_w = forma
+                if fundo == 65535 {
+                    imm = 65535 - h
+                }
+            }
+            saida^[n] = a64_palavra_movw(forma_w, x, i, imm, destino)
+            n += 1
+        }
+        i += 1
+    }
+    if n == 0 {
+        saida^[0] = a64_palavra_movw(forma, x, 0, 0, destino)
+        n = 1
+    }
+    return n as u32
+}
+
+// VFPExpandImm (ARM ARM): imm8 -> bits de f32 (dupla = false) ou f64 (dupla = true)
+proc a64_vfp_expandir(imm8: u32, dupla: bool) -> u64 {
+    let a = ((imm8 >> 7) & 1) as u64
+    let b = ((imm8 >> 6) & 1) as u64
+    let cd = ((imm8 >> 4) & 3) as u64
+    let efgh = (imm8 & 15) as u64
+    if dupla {
+        let expo = ((1 - b) << 10) | ((b * 255) << 2) | cd
+        return (a << 63) | (expo << 52) | (efgh << 48)
+    }
+    let expo32 = ((1 - b) << 7) | ((b * 31) << 2) | cd
+    return (a << 31) | (expo32 << 23) | (efgh << 19)
+}
+
+// procura imm8 (0..255) cuja expansao e `bits` (f32: 32 bits baixos). Verdadeiro = representavel; grava imm8.
+pub proc a64_fmov_imm8(bits: u64, dupla: bool, imm8: ^u32) -> bool {
+    var alvo = bits
+    if not dupla {
+        alvo = bits & 4294967295
+    }
+    var i: u32 = 0
+    while i < 256 {
+        if a64_vfp_expandir(i, dupla) == alvo {
+            imm8^ = i
+            return true
+        }
+        i += 1
+    }
+    return false
+}
+
+// ==== TESTES ====
+
+test "a64_codificar: ADD x0,x1,#1; RET; NOP; MOVZ x0,#1 batem com a ARM ARM" {
+    var c = A64Campos{v = {1, 0, 1, 1, 0, 0, 0, 0}}
+    expect(a64_codificar(A64F_ADD_IMM, &c) == 0x91000420)
+    var r = A64Campos{v = {30, 0, 0, 0, 0, 0, 0, 0}}
+    expect(a64_codificar(A64F_RET, &r) == 0xD65F03C0)
+    var z = A64Campos{v = {0, 0, 0, 0, 0, 0, 0, 0}}
+    expect(a64_codificar(A64F_NOP, &z) == 0xD503201F)
+    var m = A64Campos{v = {1, 0, 1, 0, 0, 0, 0, 0}}
+    expect(a64_codificar(A64F_MOVZ, &m) == 0xD2800020)
+}
+
+test "a64_codificar: espelho do sf no N do UBFM (ubfm x0,x1,#0,#7 = 0xD3401C20)" {
+    var c = A64Campos{v = {1, 0, 7, 1, 0, 0, 0, 0}}
+    expect(a64_codificar(A64F_UBFM, &c) == 0xD3401C20)
+}
+
+test "a64_bitmask: 0x5555... = N0 immr0 imms60; 0xFF = N1 immr0 imms7; 1 = N1 imms0; 0 e tudo-1 recusados" {
+    var n: u32 = 9
+    var r: u32 = 9
+    var s: u32 = 9
+    expect(a64_bitmask(6148914691236517205, 64, &n, &r, &s))
+    expect(n == 0 and r == 0 and s == 60)
+    expect(a64_bitmask(255, 64, &n, &r, &s))
+    expect(n == 1 and r == 0 and s == 7)
+    expect(a64_bitmask(1, 64, &n, &r, &s))
+    expect(n == 1 and r == 0 and s == 0)
+    expect(not a64_bitmask(0, 64, &n, &r, &s))
+    expect(not a64_bitmask(18446744073709551615, 64, &n, &r, &s))
+}
+
+test "a64_mov_imm: 0x12345678 (w) = MOVZ + MOVK; -65536 (x) = um MOVN" {
+    var saida: [4]u32 = {0, 0, 0, 0}
+    expect(a64_mov_imm(0, 305419896, false, &saida) == 2)
+    expect(saida[0] == 0x528ACF00 and saida[1] == 0x72A24680)
+    expect(a64_mov_imm(0, 18446744073709486080, true, &saida) == 1)
+    expect(saida[0] == 0x929FFFE0)
+}
+
+test "a64_fmov_imm8: 1.0 (f64) = imm8 0x70; 0 nao e representavel" {
+    var i: u32 = 0
+    expect(a64_fmov_imm8(4607182418800017408, true, &i))
+    expect(i == 0x70)
+    expect(not a64_fmov_imm8(0, true, &i))
+}

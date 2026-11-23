@@ -1,0 +1,180 @@
+CARTAO FORJA - forja 0.23.0 (Linguagem v1.13). Por TEMA.
+Blocos ```fj compilam como estao (raiz com proc main). Marca depois de fj: Exxxx = 1o erro do check; Rxxxx = erro de execucao; exit=N = codigo de saida.
+
+== formato ==
+Corpo de if/for/while/switch/proc/test em linhas separadas depois de `{`; chaves sempre; sem `;`; sem parenteses em if/while/for. Nomes ASCII (acento so dentro de aspas): tipos e unidades PascalCase, constantes MAIUSCULO, resto snake_case (E0102). Comentario so `//`. Inteiros 0xFF 0b1010 (sem `_`). Logica `and or not`; `true false none`. Reservadas: const let var proc struct enum union unit pub export import as foreign test if else for in while switch case default break continue return defer try or_else and or not. Nao existem: `&& || ! ; ++ ?: nil range string fn def := /* */`.
+
+== declarar ==
+```fj
+const MAX: i32 = 9
+unit Metros: f32
+proc main() {
+    let a = 1
+    var n: i32 = 0
+    let d: Metros = 2.0
+    n += 1
+    print(MAX + n + (a as i32) + (d as i32))
+}
+```
+`let` imutavel, `var` mutavel (so `var` aceita atribuicao: E0705), `const` pede tipo. Inteiro puro = `int` (64 bits); real puro = `f32`. `var` nunca alterada = E0707; local nunca lida = E0708; retorno descartado = E0709: `_ = f()`. Tipos: i8 i16 i32 i64 u8 u16 u32 u64 int uint f32 f64 bool str cstr rawptr. Sem conversao implicita: `int + i32` = E0301, use `as`; bits crus `transmute(x, to = T)`; `& | ~ << >>` so em sem sinal (`a ~ b` = xor; `~a` = not); `& << >>` pesam como `*`, `| ~` como `+`. `unit Metros: f32`: `+ - ==` na mesma unidade, trocar so com `as`. Faixa `vida: i32 in 0..=100 = 100`. `size_of(T) align_of(T) offset_of(T.campo)`, `static_assert(cond, msg = "txt")`.
+
+== proc ==
+```fj
+struct Grifo {
+    vida: i32 in 0..=100 = 100
+}
+proc mover(g: ^Grifo, dt: int, correr: bool = false) -> int {
+    g.vida -= 1
+    return dt
+}
+proc par(n: int) -> (q: int, r: int) {
+    return n / 2, n - n / 2 * 2
+}
+proc main() {
+    var g = Grifo{vida = 50}
+    print(mover(&g, dt = 2))
+    let q, _ = par(7)
+    print(q)
+}
+```
+Argumento posicional (na ordem) OU `nome = valor`; posicional depois de nomeado = E0502; os com padrao podem faltar. Parametro e imutavel (para alterar, `^T`: `&x`, `p^`, `p.campo`). `Tipo{campo = valor}`. Retorno multiplo 2..8 nomeado; `let a, b = f()`, `_` descarta.
+```fj E0502
+proc soma(a: int, b: int) -> int {
+    return a + b
+}
+proc main() {
+    print(soma(a = 1, 2))
+}
+```
+
+== fluxo ==
+`if a { } else if b { } else { }`, `for i in 0..<n`, `for i in 1..=n`, `while c`, `break`, `continue`, `defer f(x)` (fim do bloco, ordem inversa). `switch x { case A: ... }` cobre todos os casos ou tem `default` (E0607); enum sempre qualificado `Cor.verde`. `union Forma { Circulo, i32 }`: `let f: Forma = 9 as i32`; `switch c in f { case Circulo: ... }`.
+
+== erro ==
+```fj
+enum Erro { nao_achou }
+proc achar(id: i32) -> i32 ! Erro {
+    if id == 0 {
+        return Erro.nao_achou
+    }
+    return id * 10
+}
+proc dobro(id: i32) -> i32 ! Erro {
+    let v = try achar(id)
+    return v * 2
+}
+proc main() {
+    print(achar(0) or_else -1)
+    switch r in dobro(4) {
+    case i32:
+        print(r)
+    case Erro:
+        print("nao achou")
+    }
+}
+```
+`T ! E` valor ou erro; `! E` so erro. `try` repassa (o proc tem de devolver `! E` do MESMO E); `or_else` da o padrao; `switch r in f()` trata os dois. Opcional `?T`: `none` ou valor; `switch`, `x or_else 0`, `x == none`. `assert(cond, msg = "texto")` (msg cstr) vale tambem em release; falso e R0003 com exit 101 (`panic("texto")` idem); `expect(cond)` so dentro de `test` (E0801). `proc main() -> ! E` com erro sai 1 (R0004); outro codigo: `os.exit(n)`.
+
+== memoria ==
+```fj
+import "std:mem"
+struct Bala {
+    dano: int = 1
+}
+proc main() {
+    let b = new(Bala, alloc = heap)
+    defer delete(b)
+    var l = make([dynamic]int, alloc = heap, cap = 4)
+    defer delete(l)
+    append(&l, item = 7)
+    let a = mem.arena_create()
+    defer mem.arena_destroy(a)
+    let c = new(Bala, alloc = a)
+    print(b.dano + c.dano + l[0])
+}
+```
+Toda alocacao diz `alloc = heap | frame | scope |<Arena> | <Pool>`. `heap`: dono unico, exige `delete`/`defer delete` ou entrega (E0317); vazamento em dev = R0009. `frame`: 16 MiB, `frame_reset()`. `scope`: solta no fim do bloco; so em `let`/`var` (E0316). Lista/map/soa sao DONOS, sem copia (E0311): `&l` altera, `l[..]` empresta. Guarde o resultado de `new`/`make` (E0310); `append(&l, ...)` recebe o ENDERECO. Ponteiro `&l[i]`, fatia `l[..]` ou `get_ptr(&m, ...)` nao sobrevive a append/insert/remove/delete/clear/resize da colecao (E0913): guarde o indice. Nao mude `l` no `for &x in l`. `delete(p)` de nome zera o nome (duplo = no-op; uso depois = R0005). Impossivel = R0007; mal usada = R0008 (dev).
+
+== colecoes ==
+```fj
+proc main() {
+    var a: [3]int = {1, 2, 3}
+    var f: [dynamic, 2]int = {}
+    var m = make(map[str]int, alloc = heap)
+    defer delete(m)
+    insert(&m, key = "x", value = 5)
+    append(&f, item = a[1])
+    var s: bit_set[Cor] = {Cor.azul}
+    insert(&s, key = Cor.verde)
+    print(get(m, key = "x") or_else 0)
+    print(len(a[1..<3]) + len(f) + len(s))
+}
+enum Cor { verde, azul }
+```
+`[N]T` e valor (N exato, `{}` = zero); fatia `[]T` e visao (`a[..]`, `a[lo..<hi]`); `for x in a`, `for &x in a`, `for i, x in a`; indice fora = R0006 (release: salvo `--checagem nao`). `[dynamic, N]T`: capacidade fixa (cheia = R0007). `map[K]V` (chave inteiro/enum/bool/str; `get` devolve `?V`; `m[k]` nao existe; `map[str]` nao copia a chave (use arena); nao mude o map dentro do `for`, E0318). `bit_set[Enum]` ate 64 membros. `soa[N]S` (`a.campo` = coluna), `matrix[R, C]T`, `[N]T` numerico (`v.xy`), `quat{w = 1.0}`.
+Embutidos. Convencoes: lista `&l` (var); `s` = fatia `l[..]`/array; `less = proc(^T, ^T) -> bool`; `rng = &r` de std:rand.
+lista: cap clear reserve resize truncate pop(?T) insert_at ordered_remove unordered_remove remove_value dedup; map: has get_ptr keys values remove; busca: index_of last_index_of contains count index_by find_by any_by all_by count_by min_of max_of sum avg; mexer: copy fill swap reverse replace_value clone; ordem: sort sort_by sort_by_key binary_search shuffle choice heap_push heap_pop heap_push_by heap_pop_by; conjunto map[K]bool: set_union set_intersect set_diff.
+inteiros (2 do mesmo tipo): wrapping_add wrapping_sub wrapping_mul (volta); saturating_add saturating_sub saturating_mul (trava); checked_add checked_sub checked_mul (?T); overflowing_add overflowing_sub overflowing_mul (`v, estourou`); rotate_left rotate_right count_ones leading_zeros trailing_zeros byte_swap mul_hi_u64. Gerais: len min max clamp abs sqrt transpose conj eprint.
+```fj
+proc antes(a: ^int, b: ^int) -> bool {
+    return a^ < b^
+}
+proc main() {
+    var l = make([dynamic]int, alloc = heap)
+    defer delete(l)
+    append(&l, item = 3)
+    append(&l, item = 1)
+    sort_by(l[..], less = antes)
+    print((wrapping_add(250 as u8, 10 as u8) as int) + sum(l[..]) + (pop(&l) or_else 0))
+}
+```
+
+== texto ==
+```fj
+proc main() {
+    let s = format(f"vida {7} x={3:03}", alloc = heap)
+    defer delete(s)
+    print(s)
+    print(s == "vida 7 x=003")
+}
+```
+`str` = bytes UTF-8 imutaveis (`len`, `==`; sem `+`). `"..."` nunca interpola; so `f"{expr:[0][larg][.prec][x]}"` (`{{ }}`), 1o argumento de `print`, `format`, `format_c`. Real sem precisao (`print(x)`, `f"{x}"`) mostra o MENOR texto que volta ao mesmo valor, sempre posicional, `3.0` sai `3`; `nan inf -inf -0`; `{x:.N}` (N 0..30) e exato; `format(..., alloc = heap)` -> `str`, `format_c` -> `cstr`; ambos pedem `delete`. Builder: `var buf = make([dynamic]u8, alloc = heap)`, `append(&buf, item = "txt")`, `format(f"...", into = &buf)`, `to_str(&buf)` move os bytes para `str` (`delete(s)`); `from_bytes(b, alloc)`, `as_bytes(s)`. `cstr` so para C: `c as str` empresta; `str` -> `cstr` so por `format_c`.
+
+== foreign ==
+```fj
+foreign {
+    opaque File
+    proc fopen(caminho: cstr, modo: cstr) -> ?^File creates
+    proc fclose(f: ?^File) -> i32 destroys f
+    proc c_remove = "remove"(caminho: cstr) -> i32
+}
+proc main() {
+    print(c_remove("nao_existe.tmp") != 0)
+}
+```
+Posse de handle de lib C, no maximo uma clausula (E0912): `creates` (retorno = handle novo), `creates p` (parametro de saida `^H`), `destroys p`, `takes p` (a lib vira dona); sem clausula = emprestimo; `ends` (sem parametro) encerra a lib inteira e o que ela guarda ate la nao vaza. O nome do proc e o simbolo C (alias `proc nome = "simbolo"(...)` se colide com a Forja); mesmo simbolo em 2 modulos exige assinatura identica (E0202). Atravessam: inteiros, reais, bool, `^T`, `?^T`, `cstr`, `?cstr`, `rawptr`, struct, enum, callback `proc(a: rawptr) -> i32` (passe o NOME), `opaque` (so `^T`); nao: `str`, listas, map, soa, matrix. `cstr`/`^T` devolvido por C e emprestado (`delete` = E0310; nulo = R0005: `?cstr`/`?^T`). Vetor C: `slice_from(p, len = n)`. Header grande: `forja ligar x.h --link lib -o x.fj` (`--propor`). Nao reinvente a std: `exit` = `std:os`, `fopen` = `std:file`, `atoi` = `text.parse_int`.
+
+== modulos ==
+`import "dir"` = pacote (`.fj` diretos da pasta; `pub` so de fora), `import "dir/mod"` (relativo a raiz),`import "std:mem" as m`, `import "vendor:x/y"`, `import "engine:x"`. Uso `geo.nome`; so `pub` aparece (E1003); `main`/`pub export` so na raiz (E1004); ciclo E1002; import sem uso E1005. `#load("arq")` = arquivo (ate 16 MiB) como `str` constante. `Allocator` = tipo de `alloc`. Erro de lib = `T ! XxxError`.
+std:async pool de threads; std:atomic AtomicI32/I64/U64/Ptr; std:base64 e hex; std:binary inteiros, LEB128; std:csv ler/escrever; std:file `read_all`, `write_all`, `lock`, pastas; std:flags linha de comando; std:fmt numero, moeda, data com Locale; std:hash fnv1a xxh64 crc32; std:json `parse` `dump`; std:linalg Vec2..4 Mat4; std:math libm, `PI`; std:mem Arena Pool `track_handle`; std:net UDP e TCP IPv4; std:os `args` `env` `exit` `cwd` `pid` `cpu_count` `mem_available` `pid_alive`; std:path base dir join; std:process `run` `spawn` `wait_any` `cpu_times`; std:reload hot reload de DLL (Windows: `open` `symbol` `reload` `changed` `close`); std:rand `seed(n) -> Rng`; std:sha sha256 hmac; std:sync Mutex Cond; std:text `split` `trim` `parse_int`, UTF-8, HTML; std:thread `spawn` `join`; std:time `now`, fuso; std:url `encode` `decode` `parse`; std:uuid v4 v7.
+vendor:net/net (HTTP/HTTPS): `http_get` `http_post` `http_request`; vendor:net/mail (e-mail): `build_message` `send` `imap_open`; `shutdown` libera cada vendor. Exemplos: exemplos_libs\*_local.fj.
+Procs e tipos de um modulo: `forja consultar api std:<modulo>` (hot reload: `forja consultar api std:reload`; secao foreign de `forja spec`).
+
+== testes ==
+`test "dobro" { expect(2 * 2 == 4) }`; `forja test arq.fj [--filtro texto] [--json]` (exit 1 se falha); `expect` falho nao derruba os outros; vazamento R0009.
+
+== saida ==
+```fj
+import "std:os"
+proc main() {
+    let a = os.args()
+    print(len(a))
+    if len(a) > 5 {
+        os.exit(2)
+    }
+}
+```
+`os.exit(code)` (0..255, outro = R0012) descarrega stdout e nao relata vazamento. `file.read_all(path, alloc = heap)` devolve `[dynamic]u8 ! FileError` (lista DONA); `write_all(path, data = d[..])` devolve `?FileError`. Stderr: `os.print_stderr(text)`, `os.write_stderr(bytes)`, `eprint(f"...")`.
+
+== cli ==
+`forja check [--max-erros N] [--stdin] a.fj` (silencio + exit 0 = ok) | `run [--release] a.fj [-- args]` | `build [--modo exe|dll] [--release] a.fj -o saida` | `test` | `ast` | `explicar CODIGO` | `consultar api std:<m>` | `ligar x.h --link lib` | `migrar <a.fj|pasta> [--aplicar]` | `--versao`. Backend unico: x64 (`--backend c` e `--modo c` = X0003, exit 2); `--checagem sim|nao` (release; padrao sim). `--modo dll` exporta `forja_dll_info` (hash da interface). `build|run|test --perfil` (exe; dev ou release) grava `<exe>.perfil.txt` (agregado por proc, o que a IA le) e `.perfil.json` (Perfetto); `FORJA_PERFIL_SAIDA=<base>` troca o caminho; com `--modo dll` ou `--suporte` = exit 2. Saida: 0 ok, 1 diagnostico, 2 uso/E-S, 3 interno, 101 falha de execucao, 102 `--limite-tempo <seg>` (R0013), 103 `--limite-mem <MiB>` (R0014), 104 `--limite-saida` (R0015). Diagnostico = 1 linha JSON no stdout; erro de execucao = JSON no stderr. Linux: `build --target x86_64-linux` (`run` nao executa: X0003).

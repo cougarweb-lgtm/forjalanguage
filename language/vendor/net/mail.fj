@@ -1,0 +1,1138 @@
+// vendor:net/mail 0.4.0 - e-mail: montagem em MIME (RFC 5322, 2045, 2047 e 2231) em Forja pura, envio por SMTP e leitura por IMAP e POP3 (libcurl 8.23.0 de vendor\libcurl.a).
+// Uso: let texto = try mail.build_message(&msg, boundary = "fronteira", alloc = a)   (msg: mail.Message preenchido)
+// Envio: var cfg = mail.SmtpConfig{url = "smtp://servidor:587", user = "u", password = "s"}; try mail.send(&cfg, &msg, alloc = a)
+//   smtp:// + starttls (padrao) sobe para TLS pelo comando STARTTLS e recusa servidor sem ele (MailError.tls); starttls = false fica em texto claro;
+//   smtps:// e TLS implicito. user vazio = sem autenticacao. ca_file = PEM de CA propria (vazio = repositorio do Windows; com ele o curl nao consulta a revogacao).
+//   Envelope: MAIL FROM = o endereco de msg.from; RCPT TO = to + cc + bcc (bcc so vai no envelope, nunca no texto). O boundary e gerado a cada envio (uuid v4).
+//   Erros do curl viram MailError: auth (LOGIN_DENIED), rejected (MAIL FROM, RCPT TO ou DATA recusado pelo servidor; o curl os devolve como SEND_ERROR), timeout, tls, cannot_resolve, cannot_connect, protocol (resposta ilegivel ou conexao cortada), other.
+//   timeout_ms limita a conexao e tambem o envio inteiro. send nao guarda memoria: os temporarios vao e voltam do heap (alloc existe so por simetria com build_message).
+// Leitura: var cfg = mail.MailConfig{url = "imaps://servidor:993", user = "u", password = "s"}   (mesma forma do SmtpConfig: starttls = true sobe imap:// e pop3:// por STARTTLS/STLS e recusa servidor sem ele = MailError.tls; ca_file e timeout_ms valem igual)
+//   IMAP: var s = try mail.imap_open(&cfg); defer mail.mail_close(&s)   (conecta e autentica na hora: senha errada = MailError.auth)
+//     mail.imap_folders(&s, alloc = a) -> [dynamic]str; mail.imap_search(&s, folder = "INBOX", criteria = "UNSEEN", alloc = a) -> [dynamic]int (UIDs; criteria = texto de UID SEARCH, sem CR/LF);
+//     mail.imap_fetch(&s, folder, uid, alloc = a) -> str (mensagem crua); mail.imap_mark_read(&s, folder, uid) (UID STORE +FLAGS (\Seen));
+//     mail.imap_delete(&s, folder, uid) (UID STORE +FLAGS (\Deleted) e EXPUNGE: o EXPUNGE tira da pasta TODA mensagem marcada \Deleted, nao so a do uid).
+//   POP3: var s = try mail.pop3_open(&cfg); mail.pop3_list(&s, alloc = a) -> [dynamic]Pop3Item{number, size}; mail.pop3_fetch(&s, n, alloc = a) -> str;
+//     mail.pop3_delete(&s, n) (so marca: o servidor apaga quando a sessao fecha, no mail_close).
+//   mail.message_header(raw, "Subject", alloc = a) -> ?str: valor do cabecalho com as linhas dobradas juntas, sem decodificar RFC 2047.
+//   Uma MailSession guarda UMA conexao (mesmo handle do curl) entre os comandos; nao e segura entre threads (uma sessao por thread). mail_close envia LOGOUT/QUIT, libera o handle e pode ser chamado duas vezes.
+//   Erros do curl na leitura: auth (LOGIN_DENIED na abertura), not_found (uid ou mensagem que nao existe, ou pasta inexistente: o curl a reporta como login negado depois de aberta), rejected (servidor recusou o comando: QUOTE_ERROR, REMOTE_ACCESS_DENIED), timeout, tls, cannot_resolve, cannot_connect, protocol, other (inclui CR/LF em pasta ou criterio e sessao do outro protocolo ou ja fechada).
+// Posse: build_message devolve o texto DONO do alloc passado (Arena libera de uma vez; com heap pede delete). As listas e textos da leitura tambem sao DONOS do alloc (com heap: delete em cada str da lista de pastas e na lista).
+// Cabecalho com acento vira RFC 2047 (=?UTF-8?B?...?=); nome de anexo com acento ou aspas vira RFC 2231 (name*= / filename*=UTF-8''...).
+// Enderecos: "addr" ou "Nome <addr>"; addr com um so '@' e sem espaco, '<' ou '>'; CR/LF ou forma errada = MailError.invalid_address.
+// CR/LF em qualquer outro campo de cabecalho (assunto, Message-ID, boundary, tipo ou nome de anexo) = MailError.other. Bcc nunca vai no texto.
+// Message-ID vazio = <AAAAMMDDhhmmss.boundary@forja.local> (data em UTC). Date pelo std:time (format_rfc5322).
+// Texto: LF vira CRLF; ASCII puro vai 7bit; com acento vai em base64. Base64 quebrado em 76 colunas, CRLF. Anexo sempre base64.
+// Versao: 0.4.0. Changelog: 0.4.0 - R10d (R0009 no dev Linux): shutdown() chama curl_global_cleanup. 0.3.0 - R8 (marco rede): MailConfig, MailSession, imap_open/folders/search/fetch/mark_read/delete, pop3_open/list/fetch/delete, Pop3Item, mail_close e message_header; os ajustes de URL/credencial/TLS do SMTP passam a servir aos 3 protocolos. 0.2.0 - R7 (marco rede): SmtpConfig e send (SMTP com STARTTLS, smtps, AUTH, bcc so no envelope, boundary unico por envio). 0.1.0 - R6 (marco rede): Attachment, Message, MailError e build_message (MIME em Forja pura, boundary dado pelo chamador).
+// Limite: palavra RFC 2047 vai inteira (passa de 75 colunas em assunto muito longo); nome de endereco sem virgula ou aspas (sem quoted-string).
+// Limite da leitura: nome de pasta IMAP volta como o servidor mandou (sem decodificar UTF-7 modificado, sem aspas escapadas nem literal); so busca por UID; sem IDLE, APPEND nem anexos separados (a mensagem vem crua).
+
+import "std:base64" as b64
+import "std:os"
+import "std:text"
+import "std:time" as tm
+import "std:url" as url
+import "std:uuid"
+import "vendor:net/curl_ponte" as cu
+
+// O .exe liga o libcurl (Schannel): estas DLLs do Windows entram mesmo quando o programa so importa vendor:net/mail.
+foreign {
+    link "ws2_32"
+    link "crypt32"
+    link "bcrypt"
+    link "advapi32"
+    link "secur32"
+    link "iphlpapi"
+}
+
+const BYTE_LF: u8 = 10
+const BYTE_CR: u8 = 13
+const BYTE_ARROBA: u8 = 64
+const BYTE_ASCII_LIMITE: u8 = 128
+const LINHA_BASE64: int = 76
+
+pub enum MailError {
+    invalid_address
+    cannot_resolve
+    cannot_connect
+    timeout
+    tls
+    auth
+    rejected
+    protocol
+    not_found
+    out_of_memory
+    other
+}
+
+// Anexo: nome (sem caminho), tipo MIME e bytes crus (a fatia e vista: o dono e quem chamou).
+pub struct Attachment {
+    name: str
+    content_type: str
+    data: []u8
+}
+
+// Mensagem a montar. date_utc + offset_s dao a data do cabecalho; message_id vazio = derivado.
+pub struct Message {
+    from: str
+    to: []str
+    cc: []str
+    bcc: []str
+    reply_to: str = ""
+    subject: str
+    text: str
+    html: str = ""
+    attachments: []Attachment
+    date_utc: tm.DateTime
+    offset_s: int
+    message_id: str = ""
+}
+
+// true se o texto tem CR ou LF (injecao de cabecalho).
+proc tem_quebra(s: str) -> bool {
+    return text.index_any(s, "\r\n") != none
+}
+
+// true se todo byte de s e ASCII (menor que 128).
+proc ascii_puro(s: str) -> bool {
+    for i in 0..<len(s) {
+        if s[i] >= BYTE_ASCII_LIMITE {
+            return false
+        }
+    }
+    return true
+}
+
+// Quantos '@' ha em s.
+proc contar_arrobas(s: str) -> int {
+    var total = 0
+    for i in 0..<len(s) {
+        if s[i] == BYTE_ARROBA {
+            total += 1
+        }
+    }
+    return total
+}
+
+// O addr de "Nome <addr>" (ou o proprio texto sem '<'); none se o '<' nao fecha com '>'.
+proc endereco_puro(entrada: str) -> ?str {
+    let _, depois, achou = text.cut(entrada, "<")
+    if not achou {
+        return entrada
+    }
+    let addr, resto, fechou = text.cut(depois, ">")
+    if not fechou or len(text.trim(resto)) != 0 {
+        return none
+    }
+    return addr
+}
+
+// addr com um so '@' e sem espaco, '<' ou '>'.
+proc addr_valido(addr: str) -> bool {
+    return len(addr) > 0 and contar_arrobas(addr) == 1 and text.index_any(addr, " <>") == none
+}
+
+// Endereco inteiro valido: sem CR/LF e com addr valido.
+proc endereco_valido(entrada: str) -> bool {
+    if tem_quebra(entrada) {
+        return false
+    }
+    switch addr in endereco_puro(entrada) {
+    case str:
+        return addr_valido(addr)
+    case none:
+        return false
+    }
+    return false
+}
+
+// Todos os enderecos de uma lista passam.
+proc lista_valida(lista: []str) -> bool {
+    for e in lista {
+        if not endereco_valido(e) {
+            return false
+        }
+    }
+    return true
+}
+
+// From e To (ao menos um) e Reply-To (se houver) e Cc e Bcc passam.
+proc enderecos_validos(msg: ^Message) -> bool {
+    if len(msg.to) == 0 or not endereco_valido(msg.from) {
+        return false
+    }
+    if len(msg.reply_to) > 0 and not endereco_valido(msg.reply_to) {
+        return false
+    }
+    return lista_valida(msg.to) and lista_valida(msg.cc) and lista_valida(msg.bcc)
+}
+
+// Assunto, Message-ID, boundary, tipo e nome de anexo sem CR/LF (eles vao direto para o cabecalho).
+proc textos_sem_quebra(msg: ^Message, boundary: str) -> bool {
+    if tem_quebra(msg.subject) or tem_quebra(msg.message_id) or tem_quebra(boundary) {
+        return false
+    }
+    for a in msg.attachments {
+        if tem_quebra(a.name) or tem_quebra(a.content_type) {
+            return false
+        }
+    }
+    return true
+}
+
+// Acrescenta texto ao buffer da mensagem.
+proc acrescentar(buf: ^[dynamic]u8, texto: str) {
+    append(buf, item = texto)
+}
+
+// Inicio de uma linha de cabecalho: "Nome: ".
+proc abrir_cabecalho(buf: ^[dynamic]u8, nome: str) {
+    acrescentar(buf, nome)
+    acrescentar(buf, ": ")
+}
+
+// Fim de linha de cabecalho ou de parte: CRLF.
+proc fechar_linha(buf: ^[dynamic]u8) {
+    acrescentar(buf, "\r\n")
+}
+
+// Texto de cabecalho: ASCII vai cru; com acento vira uma palavra RFC 2047 em base64.
+proc escrever_palavra(buf: ^[dynamic]u8, valor: str) {
+    if ascii_puro(valor) {
+        acrescentar(buf, valor)
+        return
+    }
+    acrescentar(buf, "=?UTF-8?B?")
+    let codigo = b64.encode(as_bytes(valor), alloc = heap)
+    defer delete(codigo)
+    acrescentar(buf, codigo)
+    acrescentar(buf, "?=")
+}
+
+// Endereco no cabecalho: "addr" cru; "Nome <addr>" com o nome em RFC 2047 quando tem acento.
+proc escrever_endereco(buf: ^[dynamic]u8, entrada: str) {
+    let antes, _, achou = text.cut(entrada, "<")
+    if not achou {
+        acrescentar(buf, entrada)
+        return
+    }
+    let nome = text.trim(antes)
+    if len(nome) > 0 {
+        escrever_palavra(buf, nome)
+        acrescentar(buf, " ")
+    }
+    acrescentar(buf, "<")
+    acrescentar(buf, endereco_puro(entrada) or_else "")
+    acrescentar(buf, ">")
+}
+
+// Lista de enderecos separada por ", ".
+proc escrever_lista(buf: ^[dynamic]u8, nome: str, lista: []str) {
+    abrir_cabecalho(buf, nome)
+    for i, e in lista {
+        if i > 0 {
+            acrescentar(buf, ", ")
+        }
+        escrever_endereco(buf, e)
+    }
+    fechar_linha(buf)
+}
+
+// Date RFC 5322 no fuso informado (std:time.format_rfc5322).
+proc escrever_data(buf: ^[dynamic]u8, msg: ^Message) {
+    let data = tm.format_rfc5322(msg.date_utc, msg.offset_s, alloc = heap)
+    defer delete(data)
+    abrir_cabecalho(buf, "Date")
+    acrescentar(buf, data)
+    fechar_linha(buf)
+}
+
+// <AAAAMMDDhhmmss.boundary@forja.local> a partir da data UTC.
+proc escrever_id_derivado(buf: ^[dynamic]u8, dt: tm.DateTime, boundary: str) {
+    let carimbo = format(f"{dt.year:04}{dt.month:02}{dt.day:02}{dt.hour:02}{dt.minute:02}{dt.second:02}", alloc = heap)
+    defer delete(carimbo)
+    acrescentar(buf, "<")
+    acrescentar(buf, carimbo)
+    acrescentar(buf, ".")
+    acrescentar(buf, boundary)
+    acrescentar(buf, "@forja.local>")
+}
+
+// Message-ID: o do chamador, ou o derivado quando vazio.
+proc escrever_message_id(buf: ^[dynamic]u8, msg: ^Message, boundary: str) {
+    abrir_cabecalho(buf, "Message-ID")
+    if len(msg.message_id) > 0 {
+        acrescentar(buf, msg.message_id)
+    } else {
+        escrever_id_derivado(buf, msg.date_utc, boundary)
+    }
+    fechar_linha(buf)
+}
+
+// Cabecalhos da mensagem, na ordem Date, From, To, Cc, Reply-To, Subject, Message-ID e MIME-Version.
+proc escrever_cabecalhos(buf: ^[dynamic]u8, msg: ^Message, boundary: str) {
+    escrever_data(buf, msg)
+    abrir_cabecalho(buf, "From")
+    escrever_endereco(buf, msg.from)
+    fechar_linha(buf)
+    escrever_lista(buf, "To", msg.to)
+    if len(msg.cc) > 0 {
+        escrever_lista(buf, "Cc", msg.cc)
+    }
+    if len(msg.reply_to) > 0 {
+        abrir_cabecalho(buf, "Reply-To")
+        escrever_endereco(buf, msg.reply_to)
+        fechar_linha(buf)
+    }
+    abrir_cabecalho(buf, "Subject")
+    escrever_palavra(buf, msg.subject)
+    fechar_linha(buf)
+    escrever_message_id(buf, msg, boundary = boundary)
+    acrescentar(buf, "MIME-Version: 1.0\r\n")
+}
+
+// Texto com LF virado CRLF e CRLF no fim (so se houver texto). Um CR que ja vem antes de LF nao duplica.
+proc normalizar_quebras(texto: str, alloc: Allocator) -> str {
+    var out = make([dynamic]u8, alloc = heap)
+    defer delete(out)
+    for i in 0..<len(texto) {
+        let c = texto[i]
+        if c == BYTE_LF and (i == 0 or texto[i - 1] != BYTE_CR) {
+            append(&out, item = BYTE_CR)
+        }
+        append(&out, item = c)
+    }
+    if len(out) > 0 and out[len(out) - 1] != BYTE_LF {
+        append(&out, item = BYTE_CR)
+        append(&out, item = BYTE_LF)
+    }
+    return from_bytes(out[..], alloc = alloc)
+}
+
+// Bytes em base64, com linhas de 76 colunas, cada uma fechada com CRLF.
+proc escrever_base64(buf: ^[dynamic]u8, dados: []u8) {
+    let codigo = b64.encode(dados, alloc = heap)
+    defer delete(codigo)
+    var inicio = 0
+    while inicio < len(codigo) {
+        var fim = inicio + LINHA_BASE64
+        if fim > len(codigo) {
+            fim = len(codigo)
+        }
+        acrescentar(buf, codigo[inicio..<fim])
+        fechar_linha(buf)
+        inicio = fim
+    }
+}
+
+// Parte de texto (text/plain ou text/html): Content-Type, Content-Transfer-Encoding e o corpo (7bit se ASCII, base64 se nao).
+proc escrever_parte_texto(buf: ^[dynamic]u8, tipo: str, corpo: str) {
+    let normal = normalizar_quebras(corpo, alloc = heap)
+    defer delete(normal)
+    acrescentar(buf, "Content-Type: ")
+    acrescentar(buf, tipo)
+    acrescentar(buf, "; charset=UTF-8\r\n")
+    if ascii_puro(normal) {
+        acrescentar(buf, "Content-Transfer-Encoding: 7bit\r\n\r\n")
+        acrescentar(buf, normal)
+        return
+    }
+    acrescentar(buf, "Content-Transfer-Encoding: base64\r\n\r\n")
+    escrever_base64(buf, as_bytes(normal))
+}
+
+// Parametro de cabecalho (name, filename): entre aspas se ASCII simples; senao RFC 2231 (nome*=UTF-8''...).
+proc escrever_parametro(buf: ^[dynamic]u8, nome_parametro: str, valor: str) {
+    if ascii_puro(valor) and text.index_any(valor, "\"\\") == none {
+        acrescentar(buf, "; ")
+        acrescentar(buf, nome_parametro)
+        acrescentar(buf, "=\"")
+        acrescentar(buf, valor)
+        acrescentar(buf, "\"")
+        return
+    }
+    let codificado = url.encode(valor, alloc = heap)
+    defer delete(codificado)
+    acrescentar(buf, "; ")
+    acrescentar(buf, nome_parametro)
+    acrescentar(buf, "*=UTF-8''")
+    acrescentar(buf, codificado)
+}
+
+// Parte de anexo: Content-Type com name, Content-Transfer-Encoding base64, Content-Disposition com filename e os bytes.
+proc escrever_anexo(buf: ^[dynamic]u8, anexo: Attachment) {
+    abrir_cabecalho(buf, "Content-Type")
+    acrescentar(buf, anexo.content_type)
+    escrever_parametro(buf, "name", anexo.name)
+    fechar_linha(buf)
+    acrescentar(buf, "Content-Transfer-Encoding: base64\r\n")
+    abrir_cabecalho(buf, "Content-Disposition")
+    acrescentar(buf, "attachment")
+    escrever_parametro(buf, "filename", anexo.name)
+    fechar_linha(buf)
+    fechar_linha(buf)
+    escrever_base64(buf, anexo.data)
+}
+
+// Linha de delimitador: "--limite" + CRLF.
+proc escrever_delimitador(buf: ^[dynamic]u8, limite: str) {
+    acrescentar(buf, "--")
+    acrescentar(buf, limite)
+    fechar_linha(buf)
+}
+
+// Corpo de texto: alternativo (text/plain e text/html, os dois com texto) ou uma parte so.
+proc escrever_parte_corpo(buf: ^[dynamic]u8, msg: ^Message, limite: str) {
+    if len(msg.text) > 0 and len(msg.html) > 0 {
+        acrescentar(buf, "Content-Type: multipart/alternative; boundary=\"")
+        acrescentar(buf, limite)
+        acrescentar(buf, "\"\r\n\r\n")
+        escrever_delimitador(buf, limite)
+        escrever_parte_texto(buf, "text/plain", msg.text)
+        escrever_delimitador(buf, limite)
+        escrever_parte_texto(buf, "text/html", msg.html)
+        acrescentar(buf, "--")
+        acrescentar(buf, limite)
+        acrescentar(buf, "--\r\n")
+        return
+    }
+    if len(msg.html) > 0 {
+        escrever_parte_texto(buf, "text/html", msg.html)
+        return
+    }
+    escrever_parte_texto(buf, "text/plain", msg.text)
+}
+
+// Corpo com anexos: multipart/mixed com o corpo de texto e cada anexo numa parte.
+proc escrever_misto(buf: ^[dynamic]u8, msg: ^Message, limite: str) {
+    acrescentar(buf, "Content-Type: multipart/mixed; boundary=\"")
+    acrescentar(buf, limite)
+    acrescentar(buf, "\"\r\n\r\n")
+    escrever_delimitador(buf, limite)
+    let limite_alternativo = format(f"{limite}-alt", alloc = heap)
+    defer delete(limite_alternativo)
+    escrever_parte_corpo(buf, msg, limite = limite_alternativo)
+    for anexo in msg.attachments {
+        escrever_delimitador(buf, limite)
+        escrever_anexo(buf, anexo)
+    }
+    acrescentar(buf, "--")
+    acrescentar(buf, limite)
+    acrescentar(buf, "--\r\n")
+}
+
+// Corpo: sem anexo, o texto direto nos cabecalhos da mensagem; com anexo, multipart/mixed.
+proc escrever_corpo(buf: ^[dynamic]u8, msg: ^Message, limite: str) {
+    if len(msg.attachments) == 0 {
+        escrever_parte_corpo(buf, msg, limite = limite)
+        return
+    }
+    escrever_misto(buf, msg, limite = limite)
+}
+
+// Monta a mensagem MIME. O texto e DONO do alloc passado (heap pede delete). boundary separa as partes e nao pode ter CR/LF.
+// Erros: invalid_address (endereco com CR/LF, sem @, com espaco ou forma errada, ou To vazio); other (CR/LF em assunto, Message-ID, boundary, tipo ou nome de anexo).
+pub proc build_message(msg: ^Message, boundary: str, alloc: Allocator) -> str ! MailError {
+    if not enderecos_validos(msg) {
+        return MailError.invalid_address
+    }
+    if not textos_sem_quebra(msg, boundary = boundary) {
+        return MailError.other
+    }
+    var buf = make([dynamic]u8, alloc = heap)
+    defer delete(buf)
+    escrever_cabecalhos(&buf, msg, boundary = boundary)
+    escrever_corpo(&buf, msg, limite = boundary)
+    return from_bytes(buf[..], alloc = alloc)
+}
+
+// ---- Envio por SMTP (0.2.0) ----
+
+// Servidor SMTP: url "smtp://host:587" ou "smtps://host:465"; user vazio = sem autenticacao; starttls so vale em smtp://.
+// ca_file = PEM de autoridade certificadora (vazio = repositorio do sistema). timeout_ms limita a conexao e tambem o envio inteiro.
+pub struct SmtpConfig {
+    url: str
+    user: str
+    password: str
+    starttls: bool = true
+    ca_file: str = ""
+    timeout_ms: int = 30000
+}
+
+// Servidor de leitura (IMAP ou POP3): a mesma forma do SmtpConfig. url "imap://host:143", "imaps://host:993", "pop3://host:110" ou "pop3s://host:995"; starttls so vale em imap:// e pop3://.
+// Tambem e a forma interna que os ajustes do curl enxergam: o send converte o SmtpConfig nela.
+pub struct MailConfig {
+    url: str
+    user: str
+    password: str
+    starttls: bool = true
+    ca_file: str = ""
+    timeout_ms: int = 30000
+}
+
+// Estado do callback de leitura: o texto da mensagem e quanto dele o curl ja levou.
+struct Leitor {
+    texto: str
+    posicao: int
+}
+
+// Chamado pelo libcurl para encher o proximo pedaco do DATA; devolver 0 diz que a mensagem acabou.
+proc ler_mensagem(dados: rawptr, tamanho: u64, quantidade: u64, usuario: rawptr) -> u64 {
+    let leitor = usuario as ^Leitor
+    var levar = len(leitor.texto) - leitor.posicao
+    let capacidade = (tamanho * quantidade) as int
+    if levar > capacidade {
+        levar = capacidade
+    }
+    if levar <= 0 {
+        return 0
+    }
+    var destino = slice_from(dados as ^u8, len = levar)
+    for i in 0..<levar {
+        destino[i] = leitor.texto[leitor.posicao + i]
+    }
+    leitor.posicao += levar
+    return levar as u64
+}
+
+// Define uma opcao de texto do curl (o curl copia o texto) a partir de um str.
+proc definir_texto(maneja: ^cu.CurlfManeja, opcao: i32, valor: str) -> i32 {
+    let c = format_c(f"{valor}", alloc = heap)
+    let codigo = cu.curlf_opt_texto(maneja, opcao = opcao, valor = c)
+    delete(c)
+    return codigo
+}
+
+// Traduz o CURLcode de uma transferencia SMTP para MailError. No SMTP do curl 8.23, MAIL FROM, RCPT TO e DATA recusados pelo servidor (4xx/5xx)
+// voltam como SEND_ERROR (smtp.c: "MAIL failed", "RCPT failed", "DATA failed"); por isso SEND_ERROR vira rejected aqui, nao protocol.
+proc traduzir_erro_smtp(codigo: i32) -> MailError {
+    if codigo == cu.CURLF_E_LOGIN_DENIED {
+        return MailError.auth
+    }
+    if codigo == cu.CURLF_E_REMOTE_ACCESS_DENIED or codigo == cu.CURLF_E_UPLOAD_FAILED or codigo == cu.CURLF_E_SEND_ERROR {
+        return MailError.rejected
+    }
+    if codigo == cu.CURLF_E_OPERATION_TIMEDOUT {
+        return MailError.timeout
+    }
+    if codigo == cu.CURLF_E_SSL_CONNECT_ERROR or codigo == cu.CURLF_E_PEER_FAILED_VERIFICATION or codigo == cu.CURLF_E_USE_SSL_FAILED {
+        return MailError.tls
+    }
+    if codigo == cu.CURLF_E_COULDNT_RESOLVE_HOST {
+        return MailError.cannot_resolve
+    }
+    if codigo == cu.CURLF_E_COULDNT_CONNECT {
+        return MailError.cannot_connect
+    }
+    if codigo == cu.CURLF_E_WEIRD_SERVER_REPLY or codigo == cu.CURLF_E_QUOTE_ERROR or codigo == cu.CURLF_E_GOT_NOTHING or codigo == cu.CURLF_E_RECV_ERROR {
+        return MailError.protocol
+    }
+    return MailError.other
+}
+
+// Texto unico por envio ("forja-" + uuid v4): separa as partes da mensagem sem repetir entre envios.
+proc gerar_boundary() -> str ! MailError {
+    var aleatorio: [16]u8 = {}
+    if os.random_bytes(aleatorio[..]) != none {
+        return MailError.other
+    }
+    switch id in uuid.v4(aleatorio[..]) {
+    case [16]u8:
+        let texto = uuid.format_uuid(id, alloc = heap)
+        defer delete(texto)
+        return format(f"forja-{texto}", alloc = heap)
+    case uuid.UuidError:
+        return MailError.other
+    }
+    return MailError.other
+}
+
+// "<addr>" (o endereco puro de "Nome <addr>") em texto de C; pede delete.
+proc endereco_para_curl(entrada: str) -> cstr {
+    let puro = endereco_puro(entrada) or_else ""
+    return format_c(f"<{puro}>", alloc = heap)
+}
+
+// "<addr>" acrescentado ao fim da lista do curl dada.
+proc acrescentar_endereco(lista: ?^cu.CurlfLista, entrada: str) -> ?^cu.CurlfLista {
+    let linha = endereco_para_curl(entrada)
+    let nova = cu.curlf_lista_acrescentar(lista, texto = linha)
+    delete(linha)
+    return nova
+}
+
+// Todos os destinatarios do envelope (to, cc e depois bcc) numa lista do curl (none se nao ha). O curl NAO copia a lista: so liberar depois da transferencia.
+proc montar_destinatarios(msg: ^Message) -> ?^cu.CurlfLista {
+    var lista: ?^cu.CurlfLista = none
+    for e in msg.to {
+        lista = acrescentar_endereco(lista, entrada = e)
+    }
+    for e in msg.cc {
+        lista = acrescentar_endereco(lista, entrada = e)
+    }
+    for e in msg.bcc {
+        lista = acrescentar_endereco(lista, entrada = e)
+    }
+    return lista
+}
+
+// URL, sem sinais e tempos. Devolve o primeiro CURLcode diferente de zero, ou 0.
+proc configurar_basico(maneja: ^cu.CurlfManeja, cfg: ^MailConfig) -> i32 {
+    var codigo = definir_texto(maneja, opcao = cu.CURLF_OPT_URL, valor = cfg.url)
+    if codigo == 0 {
+        codigo = cu.curlf_opt_inteiro(maneja, opcao = cu.CURLF_OPT_NOSIGNAL, valor = 1)
+    }
+    if codigo == 0 {
+        codigo = cu.curlf_opt_inteiro(maneja, opcao = cu.CURLF_OPT_CONNECTTIMEOUT_MS, valor = cfg.timeout_ms as c_long)
+    }
+    if codigo == 0 {
+        codigo = cu.curlf_opt_inteiro(maneja, opcao = cu.CURLF_OPT_TIMEOUT_MS, valor = cfg.timeout_ms as c_long)
+    }
+    return codigo
+}
+
+// Usuario e senha (so se user nao e vazio).
+proc configurar_credenciais(maneja: ^cu.CurlfManeja, cfg: ^MailConfig) -> i32 {
+    if len(cfg.user) == 0 {
+        return 0
+    }
+    let codigo = definir_texto(maneja, opcao = cu.CURLF_OPT_USERNAME, valor = cfg.user)
+    if codigo != 0 {
+        return codigo
+    }
+    return definir_texto(maneja, opcao = cu.CURLF_OPT_PASSWORD, valor = cfg.password)
+}
+
+// true para as URLs de texto claro que sobem para TLS por comando (STARTTLS no SMTP e no IMAP, STLS no POP3).
+proc url_sobe_por_comando(url: str) -> bool {
+    return text.starts_with(url, "smtp://") or text.starts_with(url, "imap://") or text.starts_with(url, "pop3://")
+}
+
+// STARTTLS obrigatorio em smtp://, imap:// e pop3:// (USE_SSL ALL); CA propria sem consulta de revogacao (a CA de teste nao tem CRL).
+proc configurar_tls(maneja: ^cu.CurlfManeja, cfg: ^MailConfig) -> i32 {
+    var codigo: i32 = 0
+    if cfg.starttls and url_sobe_por_comando(cfg.url) {
+        codigo = cu.curlf_opt_inteiro(maneja, opcao = cu.CURLF_OPT_USE_SSL, valor = cu.CURLF_USESSL_ALL as c_long)
+    }
+    if codigo == 0 and len(cfg.ca_file) > 0 {
+        codigo = definir_texto(maneja, opcao = cu.CURLF_OPT_CAINFO, valor = cfg.ca_file)
+    }
+    if codigo == 0 and len(cfg.ca_file) > 0 {
+        codigo = cu.curlf_opt_inteiro(maneja, opcao = cu.CURLF_OPT_SSL_OPTIONS, valor = cu.CURLF_SSLOPT_NO_REVOKE as c_long)
+    }
+    return codigo
+}
+
+// Envelope: remetente e destinatarios.
+proc configurar_envelope(maneja: ^cu.CurlfManeja, msg: ^Message, destinatarios: ?^cu.CurlfLista) -> i32 {
+    let remetente = endereco_para_curl(msg.from)
+    let codigo = cu.curlf_opt_texto(maneja, opcao = cu.CURLF_OPT_MAIL_FROM, valor = remetente)
+    delete(remetente)
+    if codigo != 0 {
+        return codigo
+    }
+    return cu.curlf_opt_lista(maneja, opcao = cu.CURLF_OPT_MAIL_RCPT, lista = destinatarios)
+}
+
+// DATA: envio (UPLOAD) com o tamanho conhecido e o callback de leitura sobre o Leitor.
+proc configurar_dados(maneja: ^cu.CurlfManeja, leitor: ^Leitor) -> i32 {
+    var codigo = cu.curlf_opt_inteiro(maneja, opcao = cu.CURLF_OPT_UPLOAD, valor = 1)
+    if codigo == 0 {
+        codigo = cu.curlf_opt_inteiro64(maneja, opcao = cu.CURLF_OPT_INFILESIZE_LARGE, valor = len(leitor.texto) as i64)
+    }
+    if codigo == 0 {
+        codigo = cu.curlf_opt_ponteiro(maneja, opcao = cu.CURLF_OPT_READDATA, valor = leitor as rawptr)
+    }
+    if codigo == 0 {
+        codigo = cu.curlf_opt_leitura(maneja, opcao = cu.CURLF_OPT_READFUNCTION, retorno = ler_mensagem)
+    }
+    return codigo
+}
+
+// Configura tudo e roda o envio. Devolve o primeiro CURLcode diferente de zero, ou 0.
+proc configurar_e_enviar(maneja: ^cu.CurlfManeja, cfg: ^MailConfig, msg: ^Message, leitor: ^Leitor, destinatarios: ?^cu.CurlfLista) -> i32 {
+    var codigo = configurar_basico(maneja, cfg = cfg)
+    if codigo == 0 {
+        codigo = configurar_credenciais(maneja, cfg = cfg)
+    }
+    if codigo == 0 {
+        codigo = configurar_tls(maneja, cfg = cfg)
+    }
+    if codigo == 0 {
+        codigo = configurar_envelope(maneja, msg = msg, destinatarios = destinatarios)
+    }
+    if codigo == 0 {
+        codigo = configurar_dados(maneja, leitor = leitor)
+    }
+    if codigo == 0 {
+        codigo = cu.curlf_executar(maneja)
+    }
+    return codigo
+}
+
+// Cria a maneja, envia o texto ja montado e a libera. Devolve o CURLcode (0 = entregue ao servidor).
+proc enviar_texto(cfg: ^MailConfig, msg: ^Message, texto: str) -> i32 ! MailError {
+    let criada = cu.curlf_iniciar()
+    switch m in criada {
+    case ^cu.CurlfManeja:
+        var leitor = Leitor{texto = texto, posicao = 0}
+        let destinatarios = montar_destinatarios(msg)
+        let codigo = configurar_e_enviar(m, cfg = cfg, msg = msg, leitor = &leitor, destinatarios = destinatarios)
+        cu.curlf_lista_liberar(destinatarios)
+        cu.curlf_fechar(m)
+        return codigo
+    case none:
+        return MailError.out_of_memory
+    }
+    return MailError.out_of_memory
+}
+
+// Monta a mensagem (boundary novo a cada envio) e a envia por SMTP; devolve so o erro. Erros: os de build_message (invalid_address, other) e os do servidor ou da conexao
+// (auth, rejected, timeout, tls, cannot_resolve, cannot_connect, protocol, out_of_memory, other). O alloc nao e usado: so os temporarios do envio, que voltam ao heap.
+pub proc send(cfg: ^SmtpConfig, msg: ^Message, alloc: Allocator) -> ! MailError {
+    let boundary = try gerar_boundary()
+    defer delete(boundary)
+    let texto = try build_message(msg, boundary = boundary, alloc = heap)
+    defer delete(texto)
+    var ajustes = MailConfig{url = cfg.url, user = cfg.user, password = cfg.password, starttls = cfg.starttls, ca_file = cfg.ca_file, timeout_ms = cfg.timeout_ms}
+    let codigo = try enviar_texto(&ajustes, msg = msg, texto = texto)
+    if codigo != 0 {
+        return traduzir_erro_smtp(codigo)
+    }
+}
+
+// ---- Leitura por IMAP e POP3 (0.3.0) ----
+
+const BYTE_ESPACO: u8 = 32
+const BYTE_TAB: u8 = 9
+
+// Uma conexao aberta com o servidor: o handle do curl (dono) e a URL do servidor sem a barra final (texto no heap, do dono da sessao). imap diz o protocolo.
+pub struct MailSession {
+    maneja: ?^cu.CurlfManeja
+    base: str
+    imap: bool
+    autenticada: bool
+}
+
+// Uma linha do LIST do POP3: numero da mensagem (1, 2, ...) e tamanho em bytes.
+pub struct Pop3Item {
+    number: int
+    size: int
+}
+
+// Onde o callback do curl junta a resposta do pedido em andamento.
+struct Coleta {
+    dados: [dynamic]u8
+}
+
+// Chamado pelo libcurl a cada pedaco da resposta (lista de pastas, resultado da busca, mensagem); devolver menos que tamanho*quantidade aborta com WRITE_ERROR.
+proc coletar_resposta(dados: rawptr, tamanho: u64, quantidade: u64, usuario: rawptr) -> u64 {
+    let coleta = usuario as ^Coleta
+    let total = tamanho * quantidade
+    if total > 0 {
+        append(&coleta.dados, items = slice_from(dados as ^u8, len = total as int))
+    }
+    return total
+}
+
+// Traduz o CURLcode de um pedido de leitura. Diferente do SMTP: comando recusado (QUOTE_ERROR) e rejected, e SEND_ERROR e conexao cortada (protocol).
+// Com a sessao ja autenticada, LOGIN_DENIED so pode ser o SELECT de uma pasta que nao existe (o curl o reporta assim): vira not_found.
+proc traduzir_erro_leitura(codigo: i32, autenticada: bool) -> MailError {
+    if codigo == cu.CURLF_E_REMOTE_FILE_NOT_FOUND or (codigo == cu.CURLF_E_LOGIN_DENIED and autenticada) {
+        return MailError.not_found
+    }
+    if codigo == cu.CURLF_E_QUOTE_ERROR {
+        return MailError.rejected
+    }
+    if codigo == cu.CURLF_E_SEND_ERROR {
+        return MailError.protocol
+    }
+    return traduzir_erro_smtp(codigo)
+}
+
+// Opcoes que valem para todos os pedidos da sessao: URL, tempos, credenciais, TLS e a funcao que coleta a resposta.
+proc configurar_sessao(maneja: ^cu.CurlfManeja, cfg: ^MailConfig) -> i32 {
+    var codigo = configurar_basico(maneja, cfg = cfg)
+    if codigo == 0 {
+        codigo = configurar_credenciais(maneja, cfg = cfg)
+    }
+    if codigo == 0 {
+        codigo = configurar_tls(maneja, cfg = cfg)
+    }
+    if codigo == 0 {
+        codigo = cu.curlf_opt_escrita(maneja, opcao = cu.CURLF_OPT_WRITEFUNCTION, retorno = coletar_resposta)
+    }
+    return codigo
+}
+
+// Comando proprio do pedido ("" = nenhum: o curl usa o do endereco, LIST ou RETR) e se a resposta e so uma linha (sem corpo). Vale so para este pedido: o seguinte reajusta.
+proc configurar_comando(maneja: ^cu.CurlfManeja, comando: str, sem_corpo: bool) -> i32 {
+    var codigo: i32 = 0
+    if len(comando) > 0 {
+        codigo = definir_texto(maneja, opcao = cu.CURLF_OPT_CUSTOMREQUEST, valor = comando)
+    } else {
+        codigo = cu.curlf_opt_ponteiro(maneja, opcao = cu.CURLF_OPT_CUSTOMREQUEST, valor = none)
+    }
+    var valor_sem_corpo: c_long = 0
+    if sem_corpo {
+        valor_sem_corpo = 1
+    }
+    if codigo == 0 {
+        codigo = cu.curlf_opt_inteiro(maneja, opcao = cu.CURLF_OPT_NOBODY, valor = valor_sem_corpo)
+    }
+    return codigo
+}
+
+// Ajusta e executa um pedido na conexao da sessao. Devolve o primeiro CURLcode diferente de zero, ou 0.
+proc preparar_e_executar(maneja: ^cu.CurlfManeja, url: str, comando: str, sem_corpo: bool, coleta: ^Coleta) -> i32 {
+    var codigo = definir_texto(maneja, opcao = cu.CURLF_OPT_URL, valor = url)
+    if codigo == 0 {
+        codigo = configurar_comando(maneja, comando = comando, sem_corpo = sem_corpo)
+    }
+    if codigo == 0 {
+        codigo = cu.curlf_opt_ponteiro(maneja, opcao = cu.CURLF_OPT_WRITEDATA, valor = coleta as rawptr)
+    }
+    if codigo == 0 {
+        codigo = cu.curlf_executar(maneja)
+    }
+    return codigo
+}
+
+// Faz um pedido pela sessao e devolve a resposta recebida (texto DONO do alloc). Sessao fechada = other.
+proc pedir(s: ^MailSession, url: str, comando: str, sem_corpo: bool, alloc: Allocator) -> str ! MailError {
+    switch m in s.maneja {
+    case ^cu.CurlfManeja:
+        var coleta = Coleta{dados = make([dynamic]u8, alloc = alloc)}
+        let codigo = preparar_e_executar(m, url = url, comando = comando, sem_corpo = sem_corpo, coleta = &coleta)
+        if codigo != 0 {
+            delete(coleta.dados)
+            return traduzir_erro_leitura(codigo, autenticada = s.autenticada)
+        }
+        return to_str(&coleta.dados)
+    case none:
+        return MailError.other
+    }
+    return MailError.other
+}
+
+// Faz um pedido cuja resposta nao interessa (so se deu certo).
+proc executar_comando(s: ^MailSession, url: str, comando: str, sem_corpo: bool) -> ! MailError {
+    let resposta = try pedir(s, url = url, comando = comando, sem_corpo = sem_corpo, alloc = heap)
+    delete(resposta)
+}
+
+// Endereco do servidor da sessao mais o caminho (pasta, numero da mensagem ou vazio); texto no heap, quem chama da delete.
+proc endereco_da_sessao(s: ^MailSession, caminho: str) -> str {
+    return format(f"{s.base}/{caminho}", alloc = heap)
+}
+
+// Endereco de uma pasta IMAP (nome em percentual, o curl o decodifica) com um sufixo (";UID=n" ou ""); texto no heap, quem chama da delete.
+proc endereco_da_pasta(s: ^MailSession, folder: str, sufixo: str) -> str {
+    let pasta = url.encode(folder, alloc = heap)
+    defer delete(pasta)
+    let caminho = format(f"{pasta}{sufixo}", alloc = heap)
+    defer delete(caminho)
+    return endereco_da_sessao(s, caminho = caminho)
+}
+
+// Fecha a sessao: o curl envia LOGOUT (IMAP) ou QUIT (POP3), que no POP3 e quando o servidor apaga o que foi marcado; libera o handle e a URL. Pode ser chamado de novo sem efeito.
+pub proc mail_close(s: ^MailSession) {
+    switch m in s.maneja {
+    case ^cu.CurlfManeja:
+        cu.curlf_fechar(m)
+        s.maneja = none
+        delete(s.base)
+        s.base = ""
+    case none:
+        return
+    }
+}
+
+// Libera o estado global do libcurl (Mbed TLS/PSA) para o runtime do dev nao contar como R0009.
+// Chamar so depois que TODAS as threads que usam mail terminaram e cada MailSession fechou (mail_close); usar mail de novo depois e valido.
+pub proc shutdown() {
+    cu.curl_global_cleanup()
+}
+
+// URL do servidor sem a barra final, no heap.
+proc base_sem_barra(url_do_servidor: str) -> str {
+    let sem_barra = text.trim_suffix(url_do_servidor, "/")
+    return format(f"{sem_barra}", alloc = heap)
+}
+
+// Cria o handle, ajusta e conecta: um NOOP (IMAP) ou NOOP sem corpo (POP3) autentica na hora. Em erro nada fica aberto.
+proc abrir_sessao(cfg: ^MailConfig, imap: bool) -> MailSession ! MailError {
+    switch criada in cu.curlf_iniciar() {
+    case ^cu.CurlfManeja:
+        let codigo = configurar_sessao(criada, cfg = cfg)
+        if codigo != 0 {
+            cu.curlf_fechar(criada)
+            return traduzir_erro_leitura(codigo, autenticada = false)
+        }
+        var sessao = MailSession{maneja = criada, base = base_sem_barra(cfg.url), imap = imap, autenticada = false}
+        let raiz = endereco_da_sessao(&sessao, caminho = "")
+        defer delete(raiz)
+        switch resposta in pedir(&sessao, url = raiz, comando = "NOOP", sem_corpo = not imap, alloc = heap) {
+        case str:
+            delete(resposta)
+            sessao.autenticada = true
+            return sessao
+        case MailError:
+            mail_close(&sessao)
+            return resposta
+        }
+    case none:
+        return MailError.out_of_memory
+    }
+    return MailError.out_of_memory
+}
+
+// Abre a sessao IMAP (url imap:// ou imaps://): conecta e autentica. Erros: auth (senha errada), tls, timeout, cannot_connect, cannot_resolve, protocol, other (url de outro protocolo).
+pub proc imap_open(cfg: ^MailConfig) -> MailSession ! MailError {
+    if not text.starts_with(cfg.url, "imap://") and not text.starts_with(cfg.url, "imaps://") {
+        return MailError.other
+    }
+    return abrir_sessao(cfg, imap = true)
+}
+
+// Abre a sessao POP3 (url pop3:// ou pop3s://): conecta e autentica. Erros como os do imap_open.
+pub proc pop3_open(cfg: ^MailConfig) -> MailSession ! MailError {
+    if not text.starts_with(cfg.url, "pop3://") and not text.starts_with(cfg.url, "pop3s://") {
+        return MailError.other
+    }
+    return abrir_sessao(cfg, imap = false)
+}
+
+// Nome da pasta de uma linha "* LIST (\atributos) "/" "Nome"" (vista da linha); "" se a linha nao e de LIST.
+proc nome_da_pasta(linha: str) -> str {
+    if not text.starts_with(linha, "* LIST ") {
+        return ""
+    }
+    let _, depois_dos_atributos, achou_atributos = text.cut(linha, ") ")
+    if not achou_atributos {
+        return ""
+    }
+    let _, nome, achou_nome = text.cut(depois_dos_atributos, " ")
+    if not achou_nome {
+        return ""
+    }
+    return text.trim_chars(nome, "\"")
+}
+
+// Os nomes das pastas da resposta do LIST, copiados no alloc.
+proc extrair_pastas(bruto: str, alloc: Allocator) -> [dynamic]str {
+    var pastas = make([dynamic]str, alloc = alloc)
+    var resto = bruto
+    var linha = text.next_line(&resto)
+    while linha != none {
+        let nome = nome_da_pasta(linha or_else "")
+        if len(nome) > 0 {
+            append(&pastas, item = format(f"{nome}", alloc = alloc))
+        }
+        linha = text.next_line(&resto)
+    }
+    return pastas
+}
+
+// Lista as pastas do servidor IMAP. Os nomes (e a lista) sao DONOS do alloc.
+pub proc imap_folders(s: ^MailSession, alloc: Allocator) -> [dynamic]str ! MailError {
+    if not s.imap {
+        return MailError.other
+    }
+    let raiz = endereco_da_sessao(s, caminho = "")
+    defer delete(raiz)
+    let resposta = try pedir(s, url = raiz, comando = "", sem_corpo = false, alloc = heap)
+    defer delete(resposta)
+    return extrair_pastas(resposta, alloc = alloc)
+}
+
+// Acrescenta os UIDs de uma linha "* SEARCH 12 13" (as demais linhas nao fazem nada).
+proc acrescentar_uids(uids: ^[dynamic]int, linha: str) {
+    if not text.starts_with(linha, "* SEARCH") {
+        return
+    }
+    var campos = text.trim_prefix(linha, "* SEARCH")
+    var campo = text.next_field(&campos, " ")
+    while campo != none {
+        let uid = text.parse_int(campo or_else "") or_else -1
+        if uid >= 0 {
+            append(uids, item = uid)
+        }
+        campo = text.next_field(&campos, " ")
+    }
+}
+
+// Os UIDs da resposta do UID SEARCH, no alloc.
+proc extrair_uids(bruto: str, alloc: Allocator) -> [dynamic]int {
+    var uids = make([dynamic]int, alloc = alloc)
+    var resto = bruto
+    var linha = text.next_line(&resto)
+    while linha != none {
+        acrescentar_uids(&uids, linha = linha or_else "")
+        linha = text.next_line(&resto)
+    }
+    return uids
+}
+
+// Busca por UID na pasta: criteria e o texto do UID SEARCH ("UNSEEN", "ALL", "FROM x"...), sem CR/LF. Devolve os UIDs (lista DONA do alloc).
+pub proc imap_search(s: ^MailSession, folder: str, criteria: str, alloc: Allocator) -> [dynamic]int ! MailError {
+    if not s.imap or tem_quebra(folder) or tem_quebra(criteria) {
+        return MailError.other
+    }
+    let endereco = endereco_da_pasta(s, folder = folder, sufixo = "")
+    defer delete(endereco)
+    let comando = format(f"UID SEARCH {criteria}", alloc = heap)
+    defer delete(comando)
+    let resposta = try pedir(s, url = endereco, comando = comando, sem_corpo = false, alloc = heap)
+    defer delete(resposta)
+    return extrair_uids(resposta, alloc = alloc)
+}
+
+// A mensagem crua (cabecalhos e corpo, CRLF) de um UID da pasta; texto DONO do alloc.
+pub proc imap_fetch(s: ^MailSession, folder: str, uid: int, alloc: Allocator) -> str ! MailError {
+    if not s.imap or tem_quebra(folder) or uid < 1 {
+        return MailError.other
+    }
+    let sufixo = format(f";UID={uid}", alloc = heap)
+    defer delete(sufixo)
+    let endereco = endereco_da_pasta(s, folder = folder, sufixo = sufixo)
+    defer delete(endereco)
+    return pedir(s, url = endereco, comando = "", sem_corpo = false, alloc = alloc)
+}
+
+// Marca a mensagem como lida (UID STORE +FLAGS (\Seen)).
+pub proc imap_mark_read(s: ^MailSession, folder: str, uid: int) -> ! MailError {
+    if not s.imap or tem_quebra(folder) or uid < 1 {
+        return MailError.other
+    }
+    let endereco = endereco_da_pasta(s, folder = folder, sufixo = "")
+    defer delete(endereco)
+    let comando = format(f"UID STORE {uid} +FLAGS (\\Seen)", alloc = heap)
+    defer delete(comando)
+    try executar_comando(s, url = endereco, comando = comando, sem_corpo = false)
+}
+
+// Apaga a mensagem: UID STORE +FLAGS (\Deleted) e EXPUNGE. O EXPUNGE tira da pasta TODA mensagem marcada \Deleted, nao so a deste uid.
+pub proc imap_delete(s: ^MailSession, folder: str, uid: int) -> ! MailError {
+    if not s.imap or tem_quebra(folder) or uid < 1 {
+        return MailError.other
+    }
+    let endereco = endereco_da_pasta(s, folder = folder, sufixo = "")
+    defer delete(endereco)
+    let comando = format(f"UID STORE {uid} +FLAGS (\\Deleted)", alloc = heap)
+    defer delete(comando)
+    try executar_comando(s, url = endereco, comando = comando, sem_corpo = false)
+    try executar_comando(s, url = endereco, comando = "EXPUNGE", sem_corpo = false)
+}
+
+// Acrescenta o item de uma linha "1 187" do LIST do POP3 (linha de outro formato nao faz nada).
+proc acrescentar_item_pop3(itens: ^[dynamic]Pop3Item, linha: str) {
+    let numero, tamanho, achou = text.cut(text.trim(linha), " ")
+    if not achou {
+        return
+    }
+    let n = text.parse_int(numero) or_else -1
+    let bytes = text.parse_int(text.trim(tamanho)) or_else -1
+    if n >= 1 and bytes >= 0 {
+        append(itens, item = Pop3Item{number = n, size = bytes})
+    }
+}
+
+// Os itens da resposta do LIST do POP3, no alloc.
+proc extrair_itens_pop3(bruto: str, alloc: Allocator) -> [dynamic]Pop3Item {
+    var itens = make([dynamic]Pop3Item, alloc = alloc)
+    var resto = bruto
+    var linha = text.next_line(&resto)
+    while linha != none {
+        acrescentar_item_pop3(&itens, linha = linha or_else "")
+        linha = text.next_line(&resto)
+    }
+    return itens
+}
+
+// Lista as mensagens da caixa POP3 (numero e tamanho). A lista e DONA do alloc.
+pub proc pop3_list(s: ^MailSession, alloc: Allocator) -> [dynamic]Pop3Item ! MailError {
+    if s.imap {
+        return MailError.other
+    }
+    let raiz = endereco_da_sessao(s, caminho = "")
+    defer delete(raiz)
+    let resposta = try pedir(s, url = raiz, comando = "", sem_corpo = false, alloc = heap)
+    defer delete(resposta)
+    return extrair_itens_pop3(resposta, alloc = alloc)
+}
+
+// A mensagem n (RETR) crua; texto DONO do alloc. Numero fora da caixa = protocol (o libcurl devolve WEIRD_SERVER_REPLY ao -ERR do RETR).
+pub proc pop3_fetch(s: ^MailSession, n: int, alloc: Allocator) -> str ! MailError {
+    if s.imap or n < 1 {
+        return MailError.other
+    }
+    let numero = format(f"{n}", alloc = heap)
+    defer delete(numero)
+    let endereco = endereco_da_sessao(s, caminho = numero)
+    defer delete(endereco)
+    return pedir(s, url = endereco, comando = "", sem_corpo = false, alloc = alloc)
+}
+
+// Marca a mensagem n para apagar (DELE n): o servidor so apaga de fato quando a sessao fecha (mail_close).
+pub proc pop3_delete(s: ^MailSession, n: int) -> ! MailError {
+    if s.imap or n < 1 {
+        return MailError.other
+    }
+    let raiz = endereco_da_sessao(s, caminho = "")
+    defer delete(raiz)
+    let comando = format(f"DELE {n}", alloc = heap)
+    defer delete(comando)
+    try executar_comando(s, url = raiz, comando = comando, sem_corpo = true)
+}
+
+// true se a linha continua o cabecalho anterior (comeca com espaco ou tab).
+proc cabecalho_continua(linha: str) -> bool {
+    return len(linha) > 0 and (linha[0] == BYTE_ESPACO or linha[0] == BYTE_TAB)
+}
+
+// O que vem depois do ':' se a linha e do cabecalho `name` (sem diferenciar caixa); none se e de outro ou continuacao.
+proc valor_do_cabecalho(linha: str, name: str) -> ?str {
+    if cabecalho_continua(linha) {
+        return none
+    }
+    let nome_da_linha, valor, achou = text.cut(linha, ":")
+    if achou and text.equal_fold(nome_da_linha, name) {
+        return valor
+    }
+    return none
+}
+
+// Valor do cabecalho `name` da mensagem crua (sem diferenciar caixa), com as linhas dobradas juntas (o CRLF sai, o espaco da continuacao fica) e sem espacos nas pontas;
+// RFC 2047 NAO e decodificado. none se o cabecalho nao esta antes da linha vazia. O texto e DONO do alloc.
+pub proc message_header(raw: str, name: str, alloc: Allocator) -> ?str {
+    var valor = make([dynamic]u8, alloc = heap)
+    defer delete(valor)
+    var achou = false
+    var resto = raw
+    var linha = text.next_line(&resto)
+    while linha != none {
+        let atual = linha or_else ""
+        if len(atual) == 0 {
+            break
+        }
+        if achou {
+            if not cabecalho_continua(atual) {
+                break
+            }
+            acrescentar(&valor, atual)
+        } else {
+            let inicio = valor_do_cabecalho(atual, name = name)
+            if inicio != none {
+                achou = true
+                acrescentar(&valor, inicio or_else "")
+            }
+        }
+        linha = text.next_line(&resto)
+    }
+    if not achou {
+        return none
+    }
+    let junto = from_bytes(valor[..], alloc = heap)
+    defer delete(junto)
+    return format(f"{text.trim(junto)}", alloc = alloc)
+}

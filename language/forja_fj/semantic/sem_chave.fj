@@ -1,0 +1,193 @@
+// semantic/sem_chave.fj - porte de compiler/semantic/sem_chave.c
+// sha256 de semantic/sem_chave.c: 76e4a9bd84677c5c50c4be19a5121f64e4b4f31c73dc48a4316e6c72b12c19a3
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "common"
+import "frontend"
+
+// C: semantic/sem_chave.c:17
+proc decl_eh_simbolo_de_topo(d: ?^frontend.Decl) -> bool {
+    let sw_1 = (d as ^frontend.Decl).tipo_no as i32
+    if sw_1 == frontend.D_UNIDADE_BASE or sw_1 == frontend.D_UNIDADE_DERIV or sw_1 == frontend.D_CONST or sw_1 == frontend.D_STRUCT or sw_1 == frontend.D_ENUM or sw_1 == frontend.D_PROC or sw_1 == frontend.D_UNIAO {
+        return (d as ^frontend.Decl).nome >= 0
+    } else {
+        return false
+    }
+    return false
+}
+
+// C: semantic/sem_chave.c:26
+// Foreign da std com nome forja_*: o simbolo C ja existe no runtime (o lowering o trata como interno).
+proc eh_externo_interno_da_std(s: ^Semantica, d: ?^frontend.Decl) -> bool {
+    if not (d as ^frontend.Decl).externo {
+        return false
+    }
+    if (modulos_da_sem(s).itens[(d as ^frontend.Decl).modulo].origem as i32) != frontend.MOD_STD {
+        return false
+    }
+    return common.c2f_prefixo_igual(common.interner_texto(nomes_da_sem(s), (d as ^frontend.Decl).nome), "forja_", 6)
+}
+
+// C: semantic/sem_chave.c:31
+proc decl_tem_prefixo(s: ^Semantica, d: ?^frontend.Decl) -> bool {
+    if ((d as ^frontend.Decl).modulo == 0) or (not decl_eh_simbolo_de_topo(d)) {
+        return false
+    }
+    if ((d as ^frontend.Decl).tipo_no == (frontend.D_PROC as u8)) and ((common.c2f_b2i32((d as ^frontend.Decl).exportado) != 0) or (common.c2f_b2i32(eh_externo_interno_da_std(s, d)) != 0)) {
+        return false
+    }
+    return true
+}
+
+// C: semantic/sem_chave.c:38
+// C2F-07: char texto[NOME_MODULO_TAG_MAX + 280] = [376]u8
+proc internar_chave(s: ^Semantica, tag: str, d: ?^frontend.Decl) -> i32 {
+    let nomes: ^common.Interner = nomes_da_sem(s)
+    let nome: i32 = (d as ^frontend.Decl).nome
+    let nome_texto: str = common.interner_texto(nomes, nome)
+    var texto: [376]u8 = {}
+    let tam: u64 = common.nome_modulo_chave(tag, nome_texto, common.interner_tam(nomes, nome) as u64, texto[..], 376)
+    if tam == 0 {
+        let msg_1 = format(f"nome de simbolo longo demais para a chave por modulo: {nome_texto}", alloc = heap)
+        defer delete(msg_1)
+        common.falha_interna(msg_1)
+    }
+    let chave = from_bytes(texto[0..<tam], alloc = heap)
+    defer delete(chave)
+    return common.internar(nomes, chave, tam as u32)
+}
+
+// C: semantic/sem_chave.c:47
+// Toda Decl sai com chave: o proprio nome, ou o nome com o prefixo do modulo. Sem modulos importados nada muda.
+// C2F-07: tags (char[MODULOS_MAX][96]) = [255]str de heap, liberadas no fim
+proc sem_chaves_preencher(s: ^Semantica) {
+    var tags: [255]str = {}
+    var caminhos: [255]str = {}
+    let ha_modulos: bool = (s.modulos != none) and (s.qtd_modulos > 1)
+    let nomes: ^common.Interner = nomes_da_sem(s)
+    if ha_modulos {
+        for k in (0 as u32)..<s.qtd_modulos {
+            caminhos[k] = common.interner_texto(nomes, modulos_da_sem(s).itens[k].caminho)
+        }
+        common.nome_modulo_tags(caminhos[0..<s.qtd_modulos], tags[0..<s.qtd_modulos])
+    }
+    s.chave_ini = len(nomes.nomes) as u32
+    var d: ?^frontend.Decl = (s.programa as ^frontend.Programa).primeira
+    while d != none {
+        let decl: ^frontend.Decl = d as ^frontend.Decl
+        if ha_modulos and decl_tem_prefixo(s, d) {
+            decl.chave = internar_chave(s, tags[decl.modulo], d)
+        } else {
+            decl.chave = decl.nome
+        }
+        d = decl.prox
+    }
+    s.chave_fim = len(nomes.nomes) as u32
+    if ha_modulos {
+        for k in (0 as u32)..<s.qtd_modulos {
+            let velha: str = tags[k]
+            delete(velha)
+        }
+    }
+}
+
+// C: semantic/sem_chave.c:65
+// Cadeia de homonimos: por id de nome, as declaracoes de topo dos modulos importados (a raiz mora em globais[nome]). Roda depois de qtd_nomes fixada.
+proc sem_homonimos_iniciar(s: ^Semantica) {
+    if (s.modulos == none) or (s.qtd_modulos <= 1) {
+        return
+    }
+    s.homonimos = frontend.arena_fatia_ptr_decl(s.arena as ^common.Arena, s.qtd_nomes as int)
+    let homonimos = s.homonimos or_else {}
+    var d: ?^frontend.Decl = (s.programa as ^frontend.Programa).primeira
+    while d != none {
+        let decl: ^frontend.Decl = d as ^frontend.Decl
+        if (decl.modulo != 0) and decl_eh_simbolo_de_topo(d) {
+            decl.homonimo = homonimos[decl.nome]
+            homonimos[decl.nome] = d
+        }
+        d = decl.prox
+    }
+}
+
+// Auxiliar dos test: acrescenta a declaracao ao programa da Semantica (igual ao Declarar do teste_common_nome_modulo.c)
+proc declarar_chave_teste(s: ^Semantica, d: ^frontend.Decl, tipo_no: i32, modulo: u8, nome: str) {
+    d.tipo_no = tipo_no as u8
+    d.modulo = modulo
+    d.nome = common.internar(nomes_da_sem(s), nome, len(nome) as u32)
+    d.chave = -7
+    d.simbolo = -1
+    let prog: ^frontend.Programa = s.programa as ^frontend.Programa
+    if prog.ultima != none {
+        let ultima: ^frontend.Decl = prog.ultima as ^frontend.Decl
+        ultima.prox = d
+    } else {
+        prog.primeira = d
+    }
+    prog.ultima = d
+}
+
+// Do TestaDeclChave do teste_common_nome_modulo.c, mais a cadeia de homonimos
+test "sem_chave: Decl.chave pelo pre-passo e homonimos" {
+    var arena: common.Arena = common.Arena{}
+    var nomes: common.Interner = common.Interner{}
+    var mods: frontend.Modulos = frontend.Modulos{}
+    var prog: frontend.Programa = frontend.Programa{}
+    var s: Semantica = Semantica{}
+    common.interner_iniciar(&nomes, &arena)
+    mods.nomes = &nomes
+    mods.n = 4
+    mods.itens[0] = frontend.Modulo{caminho = common.internar(&nomes, "raiz", 4), origem = frontend.MOD_RAIZ as u8}
+    mods.itens[1] = frontend.Modulo{caminho = common.internar(&nomes, "vendor:db", 9), origem = frontend.MOD_VENDOR as u8}
+    mods.itens[2] = frontend.Modulo{caminho = common.internar(&nomes, "std:os", 6), origem = frontend.MOD_STD as u8}
+    mods.itens[3] = frontend.Modulo{caminho = common.internar(&nomes, "pasta/db", 8), origem = frontend.MOD_ARQUIVO as u8}
+    s.modulos = slice_from(&mods, len = 1)
+    s.qtd_modulos = 4
+    s.nomes = slice_from(&nomes, len = 1)
+    s.arena = &arena
+    s.programa = &prog
+    var decls = make([dynamic]frontend.Decl, alloc = common.arena_mem(&arena), cap = 9)
+    for i in 0..<9 {
+        append(&decls, item = frontend.Decl{})
+    }
+    let raiz: ^frontend.Decl = &decls[0]
+    let principal: ^frontend.Decl = &decls[1]
+    let db_close: ^frontend.Decl = &decls[2]
+    let db_struct: ^frontend.Decl = &decls[3]
+    let db_export: ^frontend.Decl = &decls[4]
+    let std_interno: ^frontend.Decl = &decls[5]
+    let std_foreign: ^frontend.Decl = &decls[6]
+    let arq_close: ^frontend.Decl = &decls[7]
+    let teste: ^frontend.Decl = &decls[8]
+    declarar_chave_teste(&s, raiz, frontend.D_PROC, 0, "close")
+    declarar_chave_teste(&s, principal, frontend.D_PROC, 0, "main")
+    declarar_chave_teste(&s, db_close, frontend.D_PROC, 1, "close")
+    declarar_chave_teste(&s, db_struct, frontend.D_STRUCT, 1, "Config")
+    declarar_chave_teste(&s, db_export, frontend.D_PROC, 1, "abrir_banco")
+    declarar_chave_teste(&s, std_interno, frontend.D_PROC, 2, "forja_ler")
+    declarar_chave_teste(&s, std_foreign, frontend.D_PROC, 2, "puts")
+    declarar_chave_teste(&s, arq_close, frontend.D_PROC, 3, "close")
+    declarar_chave_teste(&s, teste, frontend.D_TEST, 1, "x")
+    db_export.exportado = true
+    std_interno.externo = true
+    std_foreign.externo = true
+    sem_chaves_preencher(&s)
+    expect(raiz.chave == raiz.nome and principal.chave == principal.nome) // raiz e main: sem prefixo
+    expect(common.interner_texto(&nomes, db_close.chave) == "2db_close")
+    expect(common.interner_texto(&nomes, db_struct.chave) == "2db_Config")
+    expect(db_export.chave == db_export.nome) // proc export: sem prefixo
+    expect(std_interno.chave == std_interno.nome) // foreign interno da std (forja_*): sem prefixo
+    expect(common.interner_texto(&nomes, std_foreign.chave) == "2os_puts") // foreign de modulo: o wrapper leva a chave
+    expect(common.interner_texto(&nomes, arq_close.chave) == "4db_3_close") // tag "db" repetida: o modulo 3 ganha "db_3"
+    expect(db_close.chave != arq_close.chave and db_close.chave != raiz.chave)
+    expect(teste.chave == teste.nome) // test nao e simbolo de topo
+    expect(s.chave_fim > s.chave_ini and (s.chave_fim - s.chave_ini) == 4) // so 4 chaves novas: 2db_close, 2db_Config, 2os_puts, 4db_3_close
+    s.qtd_nomes = len(nomes.nomes) as u32
+    sem_homonimos_iniciar(&s)
+    let homonimos = s.homonimos or_else {}
+    expect(homonimos[raiz.nome] == arq_close and arq_close.homonimo == db_close and db_close.homonimo == none) // cadeia dos modulos importados; a raiz nao entra
+    expect(homonimos[principal.nome] == none and homonimos[teste.nome] == none)
+    common.interner_liberar(&nomes)
+    common.arena_liberar(&arena)
+}

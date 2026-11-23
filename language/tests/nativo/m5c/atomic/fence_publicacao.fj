@@ -1,0 +1,62 @@
+// fence_publicacao.fj - M5 P50: publicacao entre 2 threads com fence e store/load release/acquire, 100000 voltas. O leitor nunca pode ver a flag sem o dado. Saida esperada: "fence OK".
+import "std:thread"
+import "std:atomic"
+
+struct Canal {
+    dado: int = 0
+    flag: atomic.AtomicI32
+    ack: atomic.AtomicI32
+    erros: atomic.AtomicI32
+}
+
+proc produtor(p: rawptr) -> u32 {
+    let c = p as ^Canal
+    for k in 1..=100000 {
+        c.dado = k
+        atomic.fence(atomic.Ordem.release)
+        atomic.store_i32(&c.flag, k as i32, atomic.Ordem.release)
+        while atomic.load_i32(&c.ack, atomic.Ordem.acquire) != k as i32 {
+        }
+    }
+    return 0
+}
+
+proc leitor(p: rawptr) -> u32 {
+    let c = p as ^Canal
+    for k in 1..=100000 {
+        while atomic.load_i32(&c.flag, atomic.Ordem.acquire) != k as i32 {
+        }
+        atomic.fence(atomic.Ordem.acquire)
+        if c.dado != k {
+            _ = atomic.add_i32(&c.erros, 1, atomic.Ordem.seq_cst)
+        }
+        atomic.store_i32(&c.ack, k as i32, atomic.Ordem.release)
+    }
+    return 0
+}
+
+proc main() {
+    var c = Canal{}
+    var filhas = make([dynamic]thread.Thread, alloc = heap, cap = 2)
+    defer delete(filhas)
+    switch t in thread.spawn(produtor, &c as rawptr) {
+    case thread.Thread:
+        append(&filhas, item = t)
+    case thread.ThreadError:
+        print("falhou")
+    }
+    switch t in thread.spawn(leitor, &c as rawptr) {
+    case thread.Thread:
+        append(&filhas, item = t)
+    case thread.ThreadError:
+        print("falhou")
+    }
+    for t in filhas {
+        _ = thread.join(t)
+    }
+    if atomic.load_i32(&c.erros, atomic.Ordem.seq_cst) == 0 {
+        print("fence OK")
+    } else {
+        print("fence errado")
+    }
+}

@@ -1,0 +1,137 @@
+// driver/cmd_ast.fj - porte de compiler/driver/cmd_ast.c, compiler/driver/cmd_ast.h
+// sha256 de driver/cmd_ast.c: 830c7f94d9aa6a16ef30cac3f2ee0edcdd60ea3dcad056565da577afd3e953f5
+// sha256 de driver/cmd_ast.h: 7b46586bd4c015151c30286fb30ce54193b05fc92a2ac080ed60b769bd08dc85
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.2.0
+// Changelog: 0.2.0 - G3 P-driver DA: corpo real; SaidaDiag unico (C2F-70) chega por `sd` em rodar_ast, ast_analisada e ast_sintatica; caminho_main (buffer estatico) vira
+//            texto no alocador frame (vive ate o fim do processo, como o estatico do C).
+
+import "std:file"
+import "common"
+import "semantic"
+import "nativo"
+
+// C2F-23: MAX_PATH + 16 = 276 bytes do caminho_main; o snprintf corta em 275
+const CAMINHO_MAIN_MAX: int = 275
+
+// C: driver/cmd_ast.c:17
+// Escreve a AST da compilacao 'c' em stdout. sem != none: --tipos. refs: ligacoes (ou none).
+proc imprimir_ast(o: ^Opcoes, c: ?^Compilacao, sem: ?^semantic.Semantica, refs: ?^semantic.AstRefs) -> i32 {
+    let cc: ^Compilacao = c as ^Compilacao
+    var pedido: semantic.AstPedido = semantic.AstPedido{programa = &cc.parser.programa, fonte = &cc.fonte, nomes = &cc.nomes, modulos = &cc.modulos, diag = &cc.diag, sem = sem, refs = refs, no = o.no, projeto = o.projeto, sem_pos = o.sem_pos}
+    var saida = make([dynamic]u8, alloc = heap)
+    defer delete(saida)
+    var erro: str = ""
+    if not semantic.ast_imprimir(&pedido, &saida, &erro) {
+        let msg = format(f"forja: {erro}\n", alloc = heap)
+        defer delete(msg)
+        driver_stderr_texto(msg)
+        return nativo.SAIDA_USO
+    }
+    // fwrite(saida.dados, 1, saida.tam, stdout): stdout em modo texto (CRLF)
+    let out = common.c2f_saida_stdout()
+    common.c2f_saida_escrever(out, saida[..])
+    _ = common.c2f_saida_fechar(out)
+    return nativo.SAIDA_OK
+}
+
+// C: driver/cmd_ast.c:35
+// --tipos: a propria arvore analisada (com a reescrita da semantica), que tem de analisar sem erro.
+proc ast_analisada(o: ^Opcoes, c: ?^Compilacao, sd: ^common.SaidaDiag) -> i32 {
+    var refs: semantic.AstRefs = semantic.AstRefs{}
+    var codigo: i32 = 0
+    if (not analisar_sintaxe(c, true)) or (not analisar_semantica(c as ^Compilacao)) {
+        return relatar_falha(c, sd)
+    }
+    semantic.ast_refs_montar(&refs, &(c as ^Compilacao).sem)
+    codigo = imprimir_ast(o, c, &(c as ^Compilacao).sem, &refs)
+    semantic.ast_refs_liberar(&refs)
+    return codigo
+}
+
+// C: driver/cmd_ast.c:48
+// Segunda compilacao do mesmo arquivo, com modulos e semantica, so para ler as ligacoes. none se a sintaxe ou a carga dos modulos falha (sem "ref").
+// O dono do resultado e o chamador (liberar_compilacao + delete). C2F-21: calloc -> new (zerado); o "memoria esgotada" do C nao existe aqui.
+proc compilar_para_ligacoes(o: ^Opcoes) -> ?^Compilacao {
+    let a: ^Compilacao = new(Compilacao, alloc = heap)
+    if not common.fonte_ler(&a.fonte, o.entrada) {
+        delete(a)
+        return none
+    }
+    iniciar_compilacao(a)
+    a.opcoes = o
+    a.sem.lista.teto = opcoes_max_erros(o)
+    if not analisar_sintaxe(a, true) {
+        liberar_compilacao(a)
+        delete(a)
+        return none
+    }
+    // O erro de semantica nao importa aqui: valem as ligacoes feitas antes dele. Mas se a carga dos modulos falhou (#load ausente, E1007)
+    // a semantica volta antes de ligar o programa (sem.programa == none) e nao ha ligacao nenhuma a ler: devolve none, como na falha da sintaxe.
+    if (not analisar_semantica(a)) and (a.sem.programa == none) {
+        liberar_compilacao(a)
+        delete(a)
+        return none
+    }
+    return a
+}
+
+// C: driver/cmd_ast.c:70
+// Sem --tipos: a AST do parser, sem a reescrita da semantica (embrulha, opc_teste, swizzle...), com as ligacoes da segunda compilacao.
+proc ast_sintatica(o: ^Opcoes, c: ?^Compilacao, sd: ^common.SaidaDiag) -> i32 {
+    var refs: semantic.AstRefs = semantic.AstRefs{}
+    var codigo: i32 = 0
+    if not analisar_sintaxe(c, o.projeto) {
+        return relatar_falha(c, sd)
+    }
+    let achada: ?^Compilacao = compilar_para_ligacoes(o)
+    if achada == none {
+        return imprimir_ast(o, c, none, none)
+    }
+    let a: ^Compilacao = achada as ^Compilacao
+    semantic.ast_refs_montar(&refs, &a.sem)
+    codigo = imprimir_ast(o, c, none, &refs)
+    semantic.ast_refs_liberar(&refs)
+    liberar_compilacao(a)
+    delete(a)
+    return codigo
+}
+
+// C: driver/cmd_ast.c:87
+proc rodar_ast(o: ^Opcoes, c: ?^Compilacao, sd: ^common.SaidaDiag) -> i32 {
+    if o.tipos {
+        return ast_analisada(o, c, sd)
+    }
+    return ast_sintatica(o, c, sd)
+}
+
+// C: driver/cmd_ast.c:95
+// GetFileAttributesA com FILE_ATTRIBUTE_DIRECTORY -> file.is_dir (link e juncao de pasta nao contam como pasta aqui: o stat nao segue link; o C contava)
+proc eh_pasta_2(caminho: str) -> bool {
+    return file.is_dir(caminho)
+}
+
+// C: driver/cmd_ast.c:101
+// C2F-70: caminho_main (global char[276]) -> texto do alocador frame, cortado em 275 bytes como o snprintf
+proc ast_resolver_entrada(o: ^Opcoes) -> bool {
+    if o.entrada == none {
+        driver_stderr_texto("forja: ast --projeto precisa do arquivo .fj de entrada ou da pasta do projeto\n")
+        return false
+    }
+    let entrada: str = o.entrada or_else ""
+    if not eh_pasta_2(entrada) {
+        return true
+    }
+    let completo = format(f"{entrada}\\main.fj", alloc = heap)
+    defer delete(completo)
+    let caminho_main: str = from_bytes(as_bytes(completo)[0..<min(len(completo), CAMINHO_MAIN_MAX)], alloc = frame)
+    if not file.exists(caminho_main) {
+        let msg = format(f"forja: a pasta {entrada} nao tem main.fj (forja ast <pasta> usa o main.fj da pasta)\n", alloc = heap)
+        defer delete(msg)
+        driver_stderr_texto(msg)
+        return false
+    }
+    o.entrada = caminho_main
+    o.projeto = true
+    return true
+}

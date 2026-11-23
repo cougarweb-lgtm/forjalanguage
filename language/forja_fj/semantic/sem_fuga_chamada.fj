@@ -1,0 +1,250 @@
+// semantic/sem_fuga_chamada.fj - porte de compiler/semantic/sem_fuga_chamada.c
+// sha256 de semantic/sem_fuga_chamada.c: 5a1695bf511274579dff300f778080edce6fb96c2799b26f3a00663052207ead
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "common"
+import "frontend"
+
+struct AlvoDaChamada {
+    guarda: []u64 // C2F-INDECIDIVEL
+    nparams: u32
+    callee: ?^frontend.Decl
+}
+
+const GUARDA_APPEND: [3]u64 = {2, 0, 0}
+const GUARDA_INSERT: [4]u64 = {6, 0, 0, 0}
+
+// C: semantic/sem_fuga_chamada.c:12
+proc propagar_para_apontados(f: ^Fuga, origem: ^frontend.Expr) {
+    var k: u32 = 0
+    while k < f.nl {
+        if fuga_tem((f.p or_else {}), k) {
+            fuga_unir_em(f, k, f.v, origem)
+        }
+        k += 1
+    }
+}
+
+// C: semantic/sem_fuga_chamada.c:21
+proc fuga_armazenar(f: ^Fuga, g: ^FugaGravacao) -> bool {
+    var sum: FugaSumidouro = FugaSumidouro{}
+    propagar_para_apontados(f, g.valor as ^frontend.Expr)
+    fuga_registrar_guarda(f, f.p or_else {}, f.v)
+    let bit: i32 = fuga_primeiro_local(f, f.v)
+    if (bit < 0) or (not fuga_sumidouro_de(f, f.p or_else {}, g.pos, &sum)) {
+        return true
+    }
+    f.candidato = true
+    if f.silencioso {
+        return true
+    }
+    if g.callee != none {
+        let callee: ^frontend.Decl = g.callee as ^frontend.Decl
+        sum = FugaSumidouro{tipo = SUM_CALLEE as u8, nome = (callee.params or_else {})[g.param].nome, pos = g.pos, callee = callee.nome}
+    }
+    return fuga_reportar(f, g.valor, common.c2f_s2u_32(bit), &sum)
+}
+
+// C: semantic/sem_fuga_chamada.c:43
+// S6: GUARDA_APPEND/GUARDA_INSERT sao `static const uint64_t[]` e fatia de const e E0301; o chamador (efeitos_da_chamada) entrega `a.guarda` apontando para um [4]u64 dele e a tabela e copiada ali. GUARDA_APPEND tem 3 entradas e o laco do C le guarda[3] (leitura alem da tabela, observada 0 no forja.exe: `append(&l, item = &x)` nao da E0706): aqui guarda[3] = 0.
+proc embutido_que_guarda(e: ?^frontend.Expr, a: ^AlvoDaChamada) -> bool {
+    let id: i32 = (e as ^frontend.Expr).ref_id
+    if id == frontend.EMB_APPEND {
+        for i in 0..<3 {
+            a.guarda[i] = GUARDA_APPEND[i]
+        }
+        a.guarda[3] = 0
+    } else if id == frontend.EMB_INSERT {
+        for i in 0..<4 {
+            a.guarda[i] = GUARDA_INSERT[i]
+        }
+    } else {
+        return false
+    }
+    a.nparams = 3
+    a.callee = none
+    return true
+}
+
+// C: semantic/sem_fuga_chamada.c:52
+proc resolver_alvo(f: ^Fuga, e: ?^frontend.Expr, a: ^AlvoDaChamada) -> bool {
+    let chamada: ^frontend.Expr = e as ^frontend.Expr
+    if chamada.ref == (frontend.REF_EMBUTIDO as u8) {
+        return embutido_que_guarda(e, a)
+    }
+    if chamada.ref != (frontend.REF_PROC as u8) {
+        return false
+    }
+    let d: ?^frontend.Decl = sem_achar_simbolo(f.s as ^Semantica, chamada.nome, chamada.modulo).decl
+    var r: ?^FugaResumo = none
+    if d != none {
+        r = fuga_resumo_de(f, d)
+    }
+    if r == none {
+        return false
+    }
+    a^ = AlvoDaChamada{guarda = (r as ^FugaResumo).guarda or_else {}, nparams = (r as ^FugaResumo).nparams, callee = d}
+    return true
+}
+
+// C: semantic/sem_fuga_chamada.c:63
+proc argumento_de(e: ?^frontend.Expr, parametro: u32) -> ?^frontend.Arg {
+    for i in (0 as u32)..<(e as ^frontend.Expr).nargs {
+        if ((e as ^frontend.Expr).args or_else {})[i].indice == transmute(parametro, to = i32) {
+            return &((e as ^frontend.Expr).args or_else {})[i]
+        }
+    }
+    return none
+}
+
+// C: semantic/sem_fuga_chamada.c:72
+proc guardar_parametro(f: ^Fuga, e: ?^frontend.Expr, a: ^AlvoDaChamada, i: u32) -> bool {
+    let arg: ?^frontend.Arg = argumento_de(e, i)
+    if (arg == none) or (not fuga_rastreia(f, ((arg as ^frontend.Arg).valor as ^frontend.Expr).tipo)) {
+        return true
+    }
+    fuga_zerar(f, f.v)
+    fuga_avaliar(f, (arg as ^frontend.Arg).valor, f.v)
+    var g: FugaGravacao = FugaGravacao{valor = (arg as ^frontend.Arg).valor, pos = (e as ^frontend.Expr).pos, callee = a.callee, param = transmute(i, to = i32)}
+    return fuga_armazenar(f, &g)
+}
+
+// C: semantic/sem_fuga_chamada.c:82
+proc guardar_no_destino(f: ^Fuga, e: ?^frontend.Expr, a: ^AlvoDaChamada, d: u32) -> bool {
+    let p: []u64 = f.p or_else {}
+    fuga_zerar(f, p)
+    if d == a.nparams {
+        fuga_ligar_flag(f, p, FUGA_HEAP)
+    } else {
+        let destino: ?^frontend.Arg = argumento_de(e, d)
+        if destino == none {
+            return true
+        }
+        fuga_avaliar(f, (destino as ^frontend.Arg).valor, p)
+    }
+    var i: u32 = 0
+    while (i < a.nparams) and (i < (FUGA_PARAMS_MAX as u32)) {
+        if (((a.guarda[d] >> ((i as u64) & 63)) & 1) != 0) and (not guardar_parametro(f, e, a, i)) {
+            return false
+        }
+        i += 1
+    }
+    return true
+}
+
+// C: semantic/sem_fuga_chamada.c:98
+proc efeitos_da_chamada(f: ^Fuga, e: ?^frontend.Expr) -> bool {
+    var tabela_embutido: [4]u64 = {}
+    var a: AlvoDaChamada = AlvoDaChamada{guarda = tabela_embutido[..], nparams = 0, callee = none}
+    if not resolver_alvo(f, e, &a) {
+        return true
+    }
+    var d: u32 = 0
+    while d <= a.nparams {
+        if (a.guarda[d] != 0) and (not guardar_no_destino(f, e, &a, d)) {
+            return false
+        }
+        d += 1
+    }
+    return true
+}
+
+// C: semantic/sem_fuga_chamada.c:111
+proc visitar_chamadas(f: ^Fuga, e: ?^frontend.Expr) -> bool {
+    if e == none {
+        return true
+    }
+    if (not visitar_chamadas(f, (e as ^frontend.Expr).a)) or (not visitar_chamadas(f, (e as ^frontend.Expr).b)) {
+        return false
+    }
+    var i: u32 = 0
+    while i < (e as ^frontend.Expr).nargs {
+        if not visitar_chamadas(f, ((e as ^frontend.Expr).args or_else {})[i].valor) {
+            return false
+        }
+        i += 1
+    }
+    return ((e as ^frontend.Expr).tipo_no != (frontend.EX_CHAMADA as u8)) or (common.c2f_b2i32(efeitos_da_chamada(f, e)) != 0)
+}
+
+// C: semantic/sem_fuga_chamada.c:122
+proc fuga_efeitos(f: ^Fuga, st: ?^frontend.Stmt) -> bool {
+    return ((common.c2f_b2i32(visitar_chamadas(f, (st as ^frontend.Stmt).alvo)) != 0) and (common.c2f_b2i32(visitar_chamadas(f, (st as ^frontend.Stmt).expr)) != 0)) and (common.c2f_b2i32(visitar_chamadas(f, (st as ^frontend.Stmt).expr2)) != 0)
+}
+
+// ---------------------------------------------------------------- G3 S6: testes dos efeitos de chamada
+
+test "sem_fuga_chamada: embutido_que_guarda (append/insert tem tabela; clear nao) e efeito de append(&y, item = &x)" {
+    let c = s6_cen_novo("proc g(a: ^int, b: ^int) {}\n")
+    defer s6_cen_liberar(c)
+    let s: ^Semantica = &c.s
+    // tabelas dos embutidos: append {2,0,0,[3]=0} ; insert {6,0,0,0}; ambos com 3 parametros e sem callee
+    var tabela: [4]u64 = {9, 9, 9, 9}
+    var a: AlvoDaChamada = AlvoDaChamada{guarda = tabela[..], nparams = 0, callee = none}
+    let n_ap = s6_nome(c, "append")
+    let t_p: u32 = tipo_ponteiro(&s.tipos, TIPO_INT as u32)
+    let t_dp: u32 = tipo_dinamico(&s.tipos, t_p)
+    let t_pdp: u32 = tipo_ponteiro(&s.tipos, t_dp)
+    let nome_y = s6_ex_nome(s, s6_nome(c, "y"), 3, t_dp, 0)
+    let end_y = s6_ex_unario(s, frontend.OP_ENDERECO, nome_y, t_pdp, 0)
+    let end_x = s6_ex_unario(s, frontend.OP_ENDERECO, s6_ex_nome(s, s6_nome(c, "x"), 2, TIPO_INT as u32, 0), t_p, 0)
+    let chm = s6_ex_embutido2(s, frontend.EMB_APPEND, n_ap, 50, end_y, end_x)
+    expect(embutido_que_guarda(chm, &a))
+    expect(tabela[0] == 2 and tabela[1] == 0 and tabela[2] == 0 and tabela[3] == 0 and a.nparams == 3 and a.callee == none)
+    chm.ref_id = frontend.EMB_INSERT
+    expect(embutido_que_guarda(chm, &a))
+    expect(tabela[0] == 6 and tabela[3] == 0 and a.nparams == 3)
+    chm.ref_id = frontend.EMB_CLEAR
+    expect(not embutido_que_guarda(chm, &a))
+    chm.ref = frontend.REF_PROC as u8 // proc sem resumo (nenhuma decl no simbolo): nao tem alvo
+    var d: AlvoDaChamada = AlvoDaChamada{guarda = tabela[..], nparams = 0, callee = none}
+    var tab: FugaTabela = FugaTabela{}
+    tab.rascunho = make([dynamic]u64, alloc = heap)
+    defer delete(tab.rascunho)
+    var f: Fuga = Fuga{}
+    fuga_iniciar(&f, s, s6_decl_g(c), &tab)
+    defer delete(f.prov)
+    expect(not resolver_alvo(&f, chm, &d))
+    chm.ref = 0
+    expect(not resolver_alvo(&f, chm, &d)) // nem embutido nem proc
+    // efeito: y e [dynamic]^int rastreado; append(&y, item = &x) liga o LOCAL x ao conjunto de y e nao e sumidouro (y e local)
+    declarar(&f, 3, s6_nome(c, "y"), 5, t_dp)
+    declarar(&f, 2, s6_nome(c, "x"), 4, TIPO_INT as u32)
+    let ap = s6_ex_embutido2(s, frontend.EMB_APPEND, n_ap, 50, end_y, end_x)
+    f.mudou = false
+    expect(efeitos_da_chamada(&f, ap))
+    expect(fuga_tem(fuga_conj_de(&f, 3), 2) and f.mudou and not f.candidato)
+    expect(not c.diag.tem)
+    // clear nao guarda nada
+    f.mudou = false
+    let limpa = s6_ex_embutido2(s, frontend.EMB_CLEAR, s6_nome(c, "clear"), 50, end_y, end_x)
+    expect(efeitos_da_chamada(&f, limpa) and not f.mudou)
+}
+
+// append(l, item = &x) com `l` parametro: o endereco de x vai para memoria do chamador (E0706; valor da saida real do forja.exe)
+test "sem_fuga_chamada: E0706 append(l, item = &x) com l parametro (memoria do parametro l)" {
+    let c = s6_cen_novo("proc g(l: ^[dynamic]^int) {\n    var x: int = 1\n    append(l, item = &x)\n}\n")
+    defer s6_cen_liberar(c)
+    let s: ^Semantica = &c.s
+    let t_p: u32 = tipo_ponteiro(&s.tipos, TIPO_INT as u32)
+    let t_pdp: u32 = tipo_ponteiro(&s.tipos, tipo_dinamico(&s.tipos, t_p))
+    let nome_l = s6_ex_nome(s, s6_nome(c, "l"), 0, t_pdp, 58)
+    nome_l.ref = frontend.REF_PARAM as u8
+    let end_x = s6_ex_unario(s, frontend.OP_ENDERECO, s6_ex_nome(s, s6_nome(c, "x"), 1, TIPO_INT as u32, 69), t_p, 68)
+    let st_x = s6_st_local(s, frontend.ST_VAR, 32, s6_nome(c, "x"), 1, TIPO_INT as u32, s6_ex_int(s, 45))
+    let corpo = s6_liga(st_x, s6_ch(s, 51, s6_ex_embutido2(s, frontend.EMB_APPEND, s6_nome(c, "append"), 51, nome_l, end_x)))
+    var nl: [2]i32 = {s6_nome(c, "l"), s6_nome(c, "x")}
+    let d = s6_decl_proc(s, s6_nome(c, "g"), nl[..], 1, corpo)
+    var um: [1]i32 = {s6_nome(c, "l")}
+    d.params = s6_params(s, um[..], t_pdp)
+    var tab: FugaTabela = FugaTabela{}
+    tab.rascunho = make([dynamic]u64, alloc = heap)
+    defer delete(tab.rascunho)
+    expect(not sem_fuga_proc(s, d, &tab, true)) // volta silenciosa: candidato, nada relatado
+    expect(not c.diag.tem)
+    expect(not sem_fuga_proc(s, d, &tab, false))
+    expect(c.diag.tem and c.diag.codigo == common.E0706 and c.diag.off == 68)
+    expect((c.diag.causa or_else "") == "'x' e local de 'g' e o endereco sai por memoria do parametro l: x -> memoria do parametro l")
+    expect((c.diag.extras or_else "") == "\"cadeia\": [\"x (local, 2:9)\", \"memoria do parametro l (3:5)\"]")
+}

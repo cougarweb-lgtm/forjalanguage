@@ -1,0 +1,314 @@
+// std:reload - hot reload de uma DLL Forja no Windows (M8 H2, D-M8-3 e D-M8-4). API em ingles (ADR-39); o corpo chama o runtime forja_reload_* (rt_reload_win.c; no Linux rt_reload_linux.c so tem stubs).
+// Versao: 0.1.1. Changelog: 0.1.1 - sombra com sequencia n tentada pela propria copia (shadow_copy) no lugar da geracao no nome: duas Library da mesma DLL no mesmo processo nao colidem mais (a copia sobre uma sombra carregada falha e tenta n + 1). 0.1.0 - M8 H2: primeira versao. ReloadError, Library, open, symbol, changed, reload, generation, interface_text e close. So kernel32 (LoadLibraryExW, GetProcAddress, FreeLibrary, CopyFileW, CreateFileW, GetFileAttributesExW, FindFirstFileW, DeleteFileW).
+// Como funciona: open carrega uma COPIA SOMBRA da DLL (`<pasta da dll>\.forja_quente\<nome>_<pid>_<n>.dll`), nunca a original: o compilador pode regravar a original enquanto a copia roda. A geracao comeca em 0 no open e sobe 1 a cada reload que deu certo.
+// O n do nome NAO e a geracao: e o menor inteiro a partir de 0 em que a copia deu certo (copiar sobre uma sombra carregada falha com copy_failed e shadow_copy tenta n + 1). Assim duas Library da mesma DLL no mesmo processo usam sombras diferentes, e o reload nao cai na sombra da geracao que ainda esta carregada.
+// Limites: (b) o host serializa open e reload da mesma Library (group_wait antes do reload); duas threads abrindo a MESMA DLL ao mesmo tempo nao foram provadas. (c) a limpeza usa o padrao `<nome>_*.dll`, que tambem pega sombras de outra Library do mesmo processo; o DeleteFileW recusa a sombra carregada, que fica no lugar.
+// Interface: a DLL feita por `forja build --modo dll` exporta forja_dll_info (magic 0x494A4446, formato 1, hash FNV-1a 64 do texto canonico da interface). open guarda o hash; reload so troca se o hash da DLL nova for IGUAL (parametro renomeado = mesmo hash; campo ou tipo mudado = interface_changed e a DLL velha segue). DLL sem forja_dll_info valido = no_info.
+// Contrato com o host: (1) o host REBUSCA os simbolos (symbol) sempre que generation(lib) muda: o ponteiro da geracao velha morre no reload. (2) Antes de reload, o host faz group_wait de todo grupo (std:async) que roda codigo da DLL: reload descarrega a DLL velha com FreeLibrary. (3) As variaveis globais (var de topo) da DLL recomecam a cada troca: o estado mora no host, num ^Estado que atravessa o export (POD, E0901). (4) Dependencias da DLL (outras DLLs) sao achadas pela busca normal do processo, nao pela pasta da copia sombra.
+// Posse: Library e um valor SEM memoria alocada (caminhos em vetores fixos, 1024 bytes); quem abre fecha: open e creates do handle e close o destroys, entao Library aberta e nao fechada = R0009 handle em dev (mesmo contrato do std:file). open recebe o alocador so para os textos temporarios; interface_text devolve texto DONO do alocador do chamador: quem recebe faz delete.
+// Linux: o ELF estatico nao tem loader dinamico; open, e portanto tudo, devolve unsupported_target.
+import "std:os" as os
+
+foreign {
+    proc forja_reload_estado(caminho: ^u8, tamanho: ^u64, escrita: ^u64) -> i32
+    proc forja_reload_livre(caminho: ^u8) -> i32
+    proc forja_reload_copiar(origem: ^u8, pasta: ^u8, destino: ^u8) -> i32
+    proc forja_reload_carregar(caminho: ^u8) -> u64 creates
+    proc forja_reload_simbolo(modulo: u64, nome: ^u8) -> rawptr
+    proc forja_reload_descarregar(modulo: u64) destroys modulo
+    proc forja_reload_info(modulo: u64, hash: ^u64, texto_len: ^i64) -> i32
+    proc forja_reload_texto(modulo: u64, destino: ^u8, n: i64) -> i64
+    proc forja_reload_limpar(pasta: ^u8, padrao: ^u8) -> i32
+}
+
+// Erro de cada operacao: not_found = a DLL nao existe; copy_failed = a copia sombra falhou; load_failed = o sistema recusou carregar a copia; no_info = sem forja_dll_info valido (nao e DLL Forja deste compilador); interface_changed = o hash da interface mudou; missing_symbol = symbol nao achou o nome; unsupported_target = Linux.
+pub enum ReloadError { not_found, copy_failed, load_failed, no_info, interface_changed, missing_symbol, unsupported_target }
+
+// Codigos neutros do runtime (rt_reload_win.c): 0 = ok.
+const RELOAD_CODIGO_NAO_ACHADO: i32 = 1
+const RELOAD_CODIGO_COPIA: i32 = 2
+const RELOAD_CODIGO_NAO_SUPORTADO: i32 = 4
+const RELOAD_CODIGO_SEM_INFO: i32 = 6
+// Tamanhos fixos dos textos: caminho (UTF-8 com NUL) e nome do padrao da sombra.
+const RELOAD_CAMINHO_MAX: int = 1024
+const RELOAD_PADRAO_MAX: int = 256
+const RELOAD_NOME_MAX: int = 256
+// Quantas sequencias n o open/reload tentam antes de desistir (todas falharam = copy_failed).
+const RELOAD_SEQUENCIA_MAX: int = 64
+const BYTE_BARRA_INVERTIDA: u8 = 92
+const BYTE_BARRA: u8 = 47
+const BYTE_PONTO: u8 = 46
+
+// Uma DLL aberta para hot reload. Os campos sao internos: use as procs deste modulo.
+pub struct Library {
+    handle: u64
+    path: [1024]u8
+    shadow: [1024]u8
+    generation: int
+    hash: u64
+    size: u64
+    mtime: u64
+}
+
+// Nomes da sombra de sequencia n: pasta, arquivo e padrao (`<nome>_*.dll`, sem n) para apagar as antigas.
+struct ShadowNames {
+    dir: [1024]u8
+    file: [1024]u8
+    pattern: [256]u8
+}
+
+proc reload_error(codigo: i32) -> ReloadError {
+    if codigo == RELOAD_CODIGO_NAO_ACHADO {
+        return ReloadError.not_found
+    }
+    if codigo == RELOAD_CODIGO_COPIA {
+        return ReloadError.copy_failed
+    }
+    if codigo == RELOAD_CODIGO_NAO_SUPORTADO {
+        return ReloadError.unsupported_target
+    }
+    if codigo == RELOAD_CODIGO_SEM_INFO {
+        return ReloadError.no_info
+    }
+    return ReloadError.load_failed
+}
+
+// Copia o texto para dst com o NUL no fim; false se nao cabe.
+proc store(dst: []u8, text: str) -> bool {
+    let bytes = as_bytes(text)
+    if len(bytes) >= len(dst) {
+        return false
+    }
+    var i = 0
+    for b in bytes {
+        dst[i] = b
+        i += 1
+    }
+    dst[i] = 0
+    return true
+}
+
+// Tamanho do texto de um vetor terminado em NUL.
+proc text_len(buf: []u8) -> int {
+    var n = 0
+    while n < len(buf) and buf[n] != 0 {
+        n += 1
+    }
+    return n
+}
+
+// Caminho absoluto de path gravado em lib.path. 0 = ok, senao codigo do runtime (1 = nao cabe ou nao resolve).
+proc init_path(lib: ^Library, path: str, alloc: Allocator) -> i32 {
+    var codigo = RELOAD_CODIGO_NAO_ACHADO
+    switch r in os.abs_path(path, alloc = alloc) {
+    case str:
+        if store(lib.path[..], r) {
+            codigo = 0
+        }
+        delete(r)
+    case os.OsError:
+        codigo = RELOAD_CODIGO_NAO_ACHADO
+    }
+    return codigo
+}
+
+// Preenche os nomes da sombra de sequencia n a partir de `<pasta>\<nome>.<ext>`. 0 = ok; 1 = caminho sem pasta ou nome que nao cabe.
+proc shadow_names(path_buf: []u8, sequencia: int, names: ^ShadowNames) -> i32 {
+    let path = from_bytes(path_buf[0..<text_len(path_buf)], alloc = heap)
+    defer delete(path)
+    var cut = len(path) - 1
+    while cut >= 0 and path[cut] != BYTE_BARRA_INVERTIDA and path[cut] != BYTE_BARRA {
+        cut -= 1
+    }
+    if cut < 0 {
+        return RELOAD_CODIGO_NAO_ACHADO
+    }
+    let dir = path[0..<cut]
+    let name = path[cut + 1..<len(path)]
+    var dot = len(name) - 1
+    while dot > 0 and name[dot] != BYTE_PONTO {
+        dot -= 1
+    }
+    var stem = name
+    if dot > 0 {
+        stem = name[0..<dot]
+    }
+    let dir_text = format(f"{dir}\\.forja_quente", alloc = heap)
+    defer delete(dir_text)
+    let file_text = format(f"{dir_text}\\{stem}_{os.pid()}_{sequencia}.dll", alloc = heap)
+    defer delete(file_text)
+    let pattern_text = format(f"{stem}_*.dll", alloc = heap)
+    defer delete(pattern_text)
+    let coube = store(names.dir[..], dir_text) and store(names.file[..], file_text) and store(names.pattern[..], pattern_text)
+    if not coube {
+        return RELOAD_CODIGO_NAO_ACHADO
+    }
+    return 0
+}
+
+// Copia a original para a primeira sombra que aceita a copia: tenta n = 0, 1, ... (a sombra carregada por este processo recusa a copia). Deixa em names o destino que deu certo. 0 = ok; senao codigo do runtime (so a falha de copia tenta o proximo n; copy_failed se todos ate RELOAD_SEQUENCIA_MAX falham).
+proc shadow_copy(lib: ^Library, names: ^ShadowNames) -> i32 {
+    var sequencia = 0
+    while sequencia < RELOAD_SEQUENCIA_MAX {
+        var codigo = shadow_names(lib.path[..], sequencia, names)
+        if codigo != 0 {
+            return codigo
+        }
+        codigo = forja_reload_copiar(&lib.path[0], &names.dir[0], &names.file[0])
+        if codigo != RELOAD_CODIGO_COPIA {
+            return codigo
+        }
+        sequencia += 1
+    }
+    return RELOAD_CODIGO_COPIA
+}
+
+// Apaga as sombras desta DLL que nao estejam carregadas (as travadas o sistema recusa e ficam).
+proc clean_shadows(names: ^ShadowNames) {
+    _ = forja_reload_limpar(&names.dir[0], &names.pattern[0])
+}
+
+// Abre a DLL: guarda o caminho absoluto, apaga sombras antigas, copia para a primeira sombra que aceita (shadow_copy), carrega a copia e confere forja_dll_info. Arquivo inexistente = not_found; sem forja_dll_info = no_info.
+// Posse: quem recebe a Library faz close (R0009 handle em dev).
+pub proc open(path: str, alloc: Allocator) -> Library ! ReloadError {
+    if len(path) == 0 {
+        return ReloadError.not_found
+    }
+    var lib = Library{handle = 0, generation = 0, hash = 0, size = 0, mtime = 0}
+    var codigo = init_path(&lib, path, alloc = alloc)
+    if codigo != 0 {
+        return reload_error(codigo)
+    }
+    codigo = forja_reload_estado(&lib.path[0], &lib.size, &lib.mtime)
+    if codigo != 0 {
+        return reload_error(codigo)
+    }
+    var names = ShadowNames{}
+    codigo = shadow_names(lib.path[..], 0, &names)
+    if codigo != 0 {
+        return reload_error(codigo)
+    }
+    clean_shadows(&names)
+    codigo = shadow_copy(&lib, &names)
+    if codigo != 0 {
+        return reload_error(codigo)
+    }
+    let h = forja_reload_carregar(&names.file[0])
+    if h == 0 {
+        clean_shadows(&names)
+        return ReloadError.load_failed
+    }
+    var text_size: i64 = 0
+    codigo = forja_reload_info(h, &lib.hash, &text_size)
+    if codigo != 0 {
+        forja_reload_descarregar(h)
+        clean_shadows(&names)
+        return reload_error(codigo)
+    }
+    lib.handle = h
+    lib.shadow = names.file
+    return lib
+}
+
+// Endereco da proc exportada `name` na geracao atual. Nome ausente = missing_symbol. O host rebusca sempre que generation(lib) muda.
+pub proc symbol(lib: ^Library, name: str) -> rawptr ! ReloadError {
+    var buf: [256]u8 = {}
+    if not store(buf[..], name) {
+        return ReloadError.missing_symbol
+    }
+    let p = forja_reload_simbolo(lib.handle, &buf[0])
+    if p == none {
+        return ReloadError.missing_symbol
+    }
+    return p
+}
+
+// A DLL original mudou (tamanho ou data diferente do ultimo estado conhecido) E ja pode ser lida (abre com share 0: o escritor terminou). Barato: um stat por chamada.
+pub proc changed(lib: ^Library) -> bool {
+    var size: u64 = 0
+    var mtime: u64 = 0
+    if forja_reload_estado(&lib.path[0], &size, &mtime) != 0 {
+        return false
+    }
+    if size == lib.size and mtime == lib.mtime {
+        return false
+    }
+    return forja_reload_livre(&lib.path[0]) == 0
+}
+
+// Troca pela DLL nova: copia a original para a primeira sombra que aceita (shadow_copy; o n nao e a geracao), carrega a copia e confere forja_dll_info. none = trocou (geracao + 1, FreeLibrary da velha). Qualquer erro, ou hash diferente (interface_changed), descarrega a nova e a velha segue valendo.
+// Depois de a copia dar certo o estado (tamanho e data) da original e registrado mesmo que a troca seja recusada: changed volta a false ate o arquivo mudar de novo.
+// O host ja fez group_wait de todo grupo que roda codigo da DLL; depois deste none, rebusca os simbolos.
+pub proc reload(lib: ^Library) -> ?ReloadError {
+    var size: u64 = 0
+    var mtime: u64 = 0
+    var codigo = forja_reload_estado(&lib.path[0], &size, &mtime)
+    if codigo != 0 {
+        return reload_error(codigo)
+    }
+    let generation = lib.generation + 1
+    var names = ShadowNames{}
+    codigo = shadow_copy(lib, &names)
+    if codigo != 0 {
+        return reload_error(codigo)
+    }
+    lib.size = size
+    lib.mtime = mtime
+    let h = forja_reload_carregar(&names.file[0])
+    if h == 0 {
+        clean_shadows(&names)
+        return ReloadError.load_failed
+    }
+    var hash: u64 = 0
+    var text_size: i64 = 0
+    codigo = forja_reload_info(h, &hash, &text_size)
+    if codigo != 0 {
+        forja_reload_descarregar(h)
+        clean_shadows(&names)
+        return reload_error(codigo)
+    }
+    if hash != lib.hash {
+        forja_reload_descarregar(h)
+        clean_shadows(&names)
+        return ReloadError.interface_changed
+    }
+    let old = lib.handle
+    lib.handle = h
+    lib.shadow = names.file
+    lib.generation = generation
+    forja_reload_descarregar(old)
+    clean_shadows(&names)
+    return none
+}
+
+// Geracao atual: 0 logo depois do open, +1 a cada reload que trocou.
+pub proc generation(lib: ^Library) -> int {
+    return lib.generation
+}
+
+// Texto canonico da interface da geracao atual (uma linha por pub export proc e por tipo alcancado), o mesmo de que o hash e feito. Vazio se a DLL nao o expoe.
+// Posse: o texto e DONO do alocador que o chamador passou: quem recebe faz delete.
+pub proc interface_text(lib: ^Library, alloc: Allocator) -> str {
+    var probe: [1]u8 = {}
+    let n = forja_reload_texto(lib.handle, &probe[0], 0)
+    if n <= 0 {
+        return format(f"", alloc = alloc)
+    }
+    var data = make([dynamic]u8, alloc = alloc, len = n as int)
+    defer delete(data)
+    _ = forja_reload_texto(lib.handle, &data[0], n)
+    return to_str(&data)
+}
+
+// Descarrega a DLL (FreeLibrary da copia atual), apaga as sombras que nao estejam travadas e zera o handle: fechar de novo nao faz nada.
+pub proc close(lib: ^Library) {
+    if lib.handle == 0 {
+        return
+    }
+    forja_reload_descarregar(lib.handle)
+    lib.handle = 0
+    var names = ShadowNames{}
+    if shadow_names(lib.path[..], 0, &names) == 0 {
+        clean_shadows(&names)
+    }
+}

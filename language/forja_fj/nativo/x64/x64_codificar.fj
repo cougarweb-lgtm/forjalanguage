@@ -1,0 +1,548 @@
+// nativo/x64/x64_codificar.fj - porte de compiler/nativo/x64/x64_codificar.c
+// sha256 de nativo/x64/x64_codificar.c: 4f21c09db1ae296e0f95d0981e2eba90fd095b28f8e83952c5a07d7e221545f6
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.2.0
+// Changelog: 0.2.0 - L0b (V3/G3): tabela FORMAS_X64 (137 linhas) e as constantes FE_* do fadec (valores do
+//                    encoder do C, extraidos com gcc em 19/11/2026); operando_para_fe, operandos_para_fe,
+//                    ajustar_bytes_codificados e x64_codificar_instr portados sobre a ponte foreign de fadec_envelope.fj.
+//                    operandos_para_fe devolve [3]i64 (o C enche um vetor de saida) e recebe endereco: i64 no lugar de
+//                    dst ^u8 (o rel32 so usa a diferenca de enderecos). ajustar_bytes_codificados recebe o slice ja com
+//                    tamanho tam (C2F-13).
+// Verificacao: forja check da copia + forja test --filtro x64_codificar (oraculo: compiler\nativo\x64 via gcc).
+
+import "common"
+
+const X64_REL32_BASE_JMP: u32 = 5
+const X64_REL32_BASE_JCC: u32 = 6
+const X64_DISP_RIP_BYTES: u32 = 4
+const X64_IMED_COLIDE_MIN: i32 = 516
+const X64_IMED_COLIDE_MAX: i32 = 519
+const X64_IMED_SUBSTITUTO: i32 = 65536
+const FL_NADA: i32 = 0
+
+// FE_* do fadec (fadec-enc.h): registradores (FeReg) e mnemonicos (FeMnem, u64).
+const FE_AX: i64 = 256
+const FE_IP: i64 = 288
+const FE_XMM0: i64 = 1536
+
+const FE_ADD32RI: u64 = 290622913453752451
+const FE_ADD32RR: u64 = 11258999068426241
+const FE_ADD64RI: u64 = 434738101533802627
+const FE_ADD64RR: u64 = 11258999072620545
+const FE_AND32RI: u64 = 2308235546515735683
+const FE_AND32RR: u64 = 11258999068426273
+const FE_AND64RI: u64 = 2452350734595785859
+const FE_AND64RR: u64 = 11258999072620577
+const FE_CALL: u64 = 36591746972385512
+const FE_CALLM: u64 = 2251799813686015
+const FE_CALLR: u64 = 2251799813686015
+const FE_CDQ: u64 = 153
+const FE_CMOVCC32RR: u64 = 13510798882177088
+const FE_CMOVCC64RR: u64 = 13510798886371392
+const FE_CMP32RI: u64 = 3821445021312223107
+const FE_CMP32RR: u64 = 11258999068426297
+const FE_CMP64RI: u64 = 3965560209392273283
+const FE_CMP64RR: u64 = 11258999072620601
+const FE_CQO: u64 = 4194457
+const FE_DIV32R: u64 = 2251799813687031
+const FE_DIV64R: u64 = 2251799817881335
+const FE_IDIV32R: u64 = 2251799813687287
+const FE_IDIV64R: u64 = 2251799817881591
+const FE_IMUL32RR: u64 = 13510798882177199
+const FE_IMUL32RRI: u64 = 4697395148835782763
+const FE_IMUL64R: u64 = 2251799817881079
+const FE_IMUL64RR: u64 = 13510798886371503
+const FE_IMUL64RRI: u64 = 4841510336915832939
+const FE_INT3: u64 = 204
+const FE_JMP: u64 = 18410856014178943211
+const FE_JCC: u64 = 18410856014178943088
+const FE_LEA64RM: u64 = 13510798886305933
+const FE_MOV16MR: u64 = 11258999068950665
+const FE_MOV32MR: u64 = 11258999068426377
+const FE_MOV32RI: u64 = 8890668614382780600
+const FE_MOV32RM: u64 = 13510798882111627
+const FE_MOV32RR: u64 = 11258999068426377
+const FE_MOV64MR: u64 = 11258999072620681
+const FE_MOV64RI: u64 = 8937956410474365127
+const FE_MOV64RM: u64 = 13510798886305931
+const FE_MOV64RR: u64 = 11258999072620681
+const FE_MOV8MR: u64 = 11329367812604040
+const FE_MOVSXR32M16: u64 = 13510798882177215
+const FE_MOVSXR32M8: u64 = 13510798882177214
+const FE_MOVSXR32R16: u64 = 13510798882177215
+const FE_MOVSXR32R8: u64 = 13581167626354878
+const FE_MOVSXR64M16: u64 = 13510798886371519
+const FE_MOVSXR64M8: u64 = 13510798886371518
+const FE_MOVSXR64R32: u64 = 13510798886305891
+const FE_MOVZXR32M16: u64 = 13510798882177207
+const FE_MOVZXR32M8: u64 = 13510798882177206
+const FE_MOVZXR32R16: u64 = 13510798882177207
+const FE_MOVZXR32R8: u64 = 13581167626354870
+const FE_MUL32R: u64 = 2251799813686519
+const FE_MUL64R: u64 = 2251799817880823
+const FE_NEG32R: u64 = 2251799813686263
+const FE_NEG64R: u64 = 2251799817880567
+const FE_NOT32R: u64 = 2251799813686007
+const FE_NOT64R: u64 = 2251799817880311
+const FE_OR32RI: u64 = 795026071719248259
+const FE_OR32RR: u64 = 11258999068426249
+const FE_OR64RI: u64 = 939141259799298435
+const FE_OR64RR: u64 = 11258999072620553
+const FE_POPR: u64 = 4350477240039899224
+const FE_PUSHR: u64 = 4206362051964043344
+const FE_RET: u64 = 195
+const FE_SAR32RI: u64 = 12761090281642657745
+const FE_SAR64RI: u64 = 12905205469722707921
+const FE_SETCC8R: u64 = 2286984185839760
+const FE_SHL32RI: u64 = 11896399153187521745
+const FE_SHL32RR: u64 = 9007199254742227
+const FE_SHL64RI: u64 = 12040514341267571921
+const FE_SHL64RR: u64 = 9007199258936531
+const FE_SHR32RI: u64 = 12328744717415089617
+const FE_SHR32RR: u64 = 9007199254742483
+const FE_SHR64RI: u64 = 12472859905495139793
+const FE_SHR64RR: u64 = 9007199258936787
+const FE_SSE_ADDPDRR: u64 = 13510798882701400
+const FE_SSE_ADDPSRR: u64 = 13510798882177112
+const FE_SSE_ADDSDRR: u64 = 13510798883225688
+const FE_SSE_ADDSSRR: u64 = 13510798884274264
+const FE_SSE_CVTSD2SSRR: u64 = 13510798883225690
+const FE_SSE_CVTSI2SD32RR: u64 = 13510798883225642
+const FE_SSE_CVTSI2SD64RR: u64 = 13510798887419946
+const FE_SSE_CVTSI2SS32RR: u64 = 13510798884274218
+const FE_SSE_CVTSI2SS64RR: u64 = 13510798888468522
+const FE_SSE_CVTSS2SDRR: u64 = 13510798884274266
+const FE_SSE_DIVPDRR: u64 = 13510798882701406
+const FE_SSE_DIVPSRR: u64 = 13510798882177118
+const FE_SSE_DIVSDRR: u64 = 13510798883225694
+const FE_SSE_DIVSSRR: u64 = 13510798884274270
+const FE_SSE_MAXSDRR: u64 = 13510798883225695
+const FE_SSE_MAXSSRR: u64 = 13510798884274271
+const FE_SSE_MINSDRR: u64 = 13510798883225693
+const FE_SSE_MINSSRR: u64 = 13510798884274269
+const FE_SSE_MOVAPSRR: u64 = 13510798882177064
+const FE_SSE_MOVD_G2XRR: u64 = 13510798882701422
+const FE_SSE_MOVD_X2GRR: u64 = 11258999069016190
+const FE_SSE_MOVQ_G2XRR: u64 = 13510798886895726
+const FE_SSE_MOVQ_X2GRR: u64 = 11258999073210494
+const FE_SSE_MOVSDMR: u64 = 11258999069540369
+const FE_SSE_MOVSDRM: u64 = 13510798883225616
+const FE_SSE_MOVSDRR: u64 = 13510798883225616
+const FE_SSE_MOVSSMR: u64 = 11258999070588945
+const FE_SSE_MOVSSRM: u64 = 13510798884274192
+const FE_SSE_MOVSSRR: u64 = 13510798884274192
+const FE_SSE_MOVUPSMR: u64 = 11258999068491793
+const FE_SSE_MOVUPSRM: u64 = 13510798882177040
+const FE_SSE_MULPDRR: u64 = 13510798882701401
+const FE_SSE_MULPSRR: u64 = 13510798882177113
+const FE_SSE_MULSDRR: u64 = 13510798883225689
+const FE_SSE_MULSSRR: u64 = 13510798884274265
+const FE_SSE_SHUFPSRRI: u64 = 13651536370532550
+const FE_SSE_SQRTSDRR: u64 = 13510798883225681
+const FE_SSE_SQRTSSRR: u64 = 13510798884274257
+const FE_SSE_SUBPDRR: u64 = 13510798882701404
+const FE_SSE_SUBPSRR: u64 = 13510798882177116
+const FE_SSE_SUBSDRR: u64 = 13510798883225692
+const FE_SSE_SUBSSRR: u64 = 13510798884274268
+const FE_SSE_UCOMISDRR: u64 = 13510798882701358
+const FE_SSE_UCOMISSRR: u64 = 13510798882177070
+const FE_SSE_UNPCKLPDRR: u64 = 13510798882701332
+const FE_SSE_XORPSRM: u64 = 13510798882177111
+const FE_SSE_XORPSRR: u64 = 13510798882177111
+const FE_SUB32RI: u64 = 2812638704781231491
+const FE_SUB32RR: u64 = 11258999068426281
+const FE_SUB64RI: u64 = 2956753892861281667
+const FE_SUB64RR: u64 = 11258999072620585
+const FE_TEST32RR: u64 = 11258999068426373
+const FE_TEST64MR: u64 = 11258999072620677
+const FE_TEST64RR: u64 = 11258999072620677
+const FE_TEST8RR: u64 = 11364552184692868
+const FE_UD2: u64 = 65547
+const FE_XOR32RI: u64 = 3317041863046727299
+const FE_XOR32RR: u64 = 11258999068426289
+const FE_XOR64RI: u64 = 3461157051126777475
+const FE_XOR64RR: u64 = 11258999072620593
+
+// C: nativo/x64/x64_codificar.c:37 (const FormaX64 FORMAS_X64[FX_QTD]); a ordem bate com o enum X64Forma.
+const FORMAS_X64: [137]FormaX64 = {
+    FormaX64{id = FX_MOV32_RR, mnemonico = FE_MOV32RR, nops = 2, tipo = {MO_REG, MO_REG, MO_NADA}, largura = {32, 32, 0}, flags = FL_NADA as u8, molde = "mov %0, %1"},
+    FormaX64{id = FX_MOV64_RR, mnemonico = FE_MOV64RR, nops = 2, tipo = {MO_REG, MO_REG, MO_NADA}, largura = {64, 64, 0}, flags = FL_NADA as u8, molde = "mov %0, %1"},
+    FormaX64{id = FX_MOV32_RM, mnemonico = FE_MOV32RM, nops = 2, tipo = {MO_REG, MO_MEM, MO_NADA}, largura = {32, 32, 0}, flags = FL_NADA as u8, molde = "mov %0, %1"},
+    FormaX64{id = FX_MOV64_RM, mnemonico = FE_MOV64RM, nops = 2, tipo = {MO_REG, MO_MEM, MO_NADA}, largura = {64, 64, 0}, flags = FL_NADA as u8, molde = "mov %0, %1"},
+    FormaX64{id = FX_MOVZX32_RM8, mnemonico = FE_MOVZXR32M8, nops = 2, tipo = {MO_REG, MO_MEM, MO_NADA}, largura = {32, 8, 0}, flags = FL_NADA as u8, molde = "movzx %0, %1"},
+    FormaX64{id = FX_MOV8_MR, mnemonico = FE_MOV8MR, nops = 2, tipo = {MO_MEM, MO_REG, MO_NADA}, largura = {8, 8, 0}, flags = FL_NADA as u8, molde = "mov %0, %1"},
+    FormaX64{id = FX_MOV32_MR, mnemonico = FE_MOV32MR, nops = 2, tipo = {MO_MEM, MO_REG, MO_NADA}, largura = {32, 32, 0}, flags = FL_NADA as u8, molde = "mov %0, %1"},
+    FormaX64{id = FX_MOV64_MR, mnemonico = FE_MOV64MR, nops = 2, tipo = {MO_MEM, MO_REG, MO_NADA}, largura = {64, 64, 0}, flags = FL_NADA as u8, molde = "mov %0, %1"},
+    FormaX64{id = FX_MOV32_RI, mnemonico = FE_MOV32RI, nops = 2, tipo = {MO_REG, MO_IMED, MO_NADA}, largura = {32, 0, 0}, flags = FL_NADA as u8, molde = "mov %0, %1"},
+    FormaX64{id = FX_MOV64_RI, mnemonico = FE_MOV64RI, nops = 2, tipo = {MO_REG, MO_IMED, MO_NADA}, largura = {64, 0, 0}, flags = FL_NADA as u8, molde = "mov %0, %1"},
+    FormaX64{id = FX_MOVZX32_RR8, mnemonico = FE_MOVZXR32R8, nops = 2, tipo = {MO_REG, MO_REG, MO_NADA}, largura = {32, 8, 0}, flags = FL_NADA as u8, molde = "movzx %0, %1"},
+    FormaX64{id = FX_MOVSXD64_RR32, mnemonico = FE_MOVSXR64R32, nops = 2, tipo = {MO_REG, MO_REG, MO_NADA}, largura = {64, 32, 0}, flags = FL_NADA as u8, molde = "movsxd %0, %1"},
+    FormaX64{id = FX_LEA64_RM, mnemonico = FE_LEA64RM, nops = 2, tipo = {MO_REG, MO_MEM, MO_NADA}, largura = {64, 0, 0}, flags = X64_FL_RIP as u8, molde = "lea %0, %1"},
+    FormaX64{id = FX_ADD32_RR, mnemonico = FE_ADD32RR, nops = 2, tipo = {MO_REG, MO_REG, MO_NADA}, largura = {32, 32, 0}, flags = FL_NADA as u8, molde = "add %0, %1"},
+    FormaX64{id = FX_ADD64_RR, mnemonico = FE_ADD64RR, nops = 2, tipo = {MO_REG, MO_REG, MO_NADA}, largura = {64, 64, 0}, flags = FL_NADA as u8, molde = "add %0, %1"},
+    FormaX64{id = FX_SUB32_RR, mnemonico = FE_SUB32RR, nops = 2, tipo = {MO_REG, MO_REG, MO_NADA}, largura = {32, 32, 0}, flags = FL_NADA as u8, molde = "sub %0, %1"},
+    FormaX64{id = FX_SUB64_RR, mnemonico = FE_SUB64RR, nops = 2, tipo = {MO_REG, MO_REG, MO_NADA}, largura = {64, 64, 0}, flags = FL_NADA as u8, molde = "sub %0, %1"},
+    FormaX64{id = FX_AND32_RR, mnemonico = FE_AND32RR, nops = 2, tipo = {MO_REG, MO_REG, MO_NADA}, largura = {32, 32, 0}, flags = FL_NADA as u8, molde = "and %0, %1"},
+    FormaX64{id = FX_AND64_RR, mnemonico = FE_AND64RR, nops = 2, tipo = {MO_REG, MO_REG, MO_NADA}, largura = {64, 64, 0}, flags = FL_NADA as u8, molde = "and %0, %1"},
+    FormaX64{id = FX_OR32_RR, mnemonico = FE_OR32RR, nops = 2, tipo = {MO_REG, MO_REG, MO_NADA}, largura = {32, 32, 0}, flags = FL_NADA as u8, molde = "or %0, %1"},
+    FormaX64{id = FX_OR64_RR, mnemonico = FE_OR64RR, nops = 2, tipo = {MO_REG, MO_REG, MO_NADA}, largura = {64, 64, 0}, flags = FL_NADA as u8, molde = "or %0, %1"},
+    FormaX64{id = FX_XOR32_RR, mnemonico = FE_XOR32RR, nops = 2, tipo = {MO_REG, MO_REG, MO_NADA}, largura = {32, 32, 0}, flags = FL_NADA as u8, molde = "xor %0, %1"},
+    FormaX64{id = FX_XOR64_RR, mnemonico = FE_XOR64RR, nops = 2, tipo = {MO_REG, MO_REG, MO_NADA}, largura = {64, 64, 0}, flags = FL_NADA as u8, molde = "xor %0, %1"},
+    FormaX64{id = FX_CMP32_RR, mnemonico = FE_CMP32RR, nops = 2, tipo = {MO_REG, MO_REG, MO_NADA}, largura = {32, 32, 0}, flags = FL_NADA as u8, molde = "cmp %0, %1"},
+    FormaX64{id = FX_CMP64_RR, mnemonico = FE_CMP64RR, nops = 2, tipo = {MO_REG, MO_REG, MO_NADA}, largura = {64, 64, 0}, flags = FL_NADA as u8, molde = "cmp %0, %1"},
+    FormaX64{id = FX_ADD32_RI, mnemonico = FE_ADD32RI, nops = 2, tipo = {MO_REG, MO_IMED, MO_NADA}, largura = {32, 0, 0}, flags = FL_NADA as u8, molde = "add %0, %1"},
+    FormaX64{id = FX_ADD64_RI, mnemonico = FE_ADD64RI, nops = 2, tipo = {MO_REG, MO_IMED, MO_NADA}, largura = {64, 0, 0}, flags = FL_NADA as u8, molde = "add %0, %1"},
+    FormaX64{id = FX_SUB32_RI, mnemonico = FE_SUB32RI, nops = 2, tipo = {MO_REG, MO_IMED, MO_NADA}, largura = {32, 0, 0}, flags = FL_NADA as u8, molde = "sub %0, %1"},
+    FormaX64{id = FX_SUB64_RI, mnemonico = FE_SUB64RI, nops = 2, tipo = {MO_REG, MO_IMED, MO_NADA}, largura = {64, 0, 0}, flags = FL_NADA as u8, molde = "sub %0, %1"},
+    FormaX64{id = FX_AND32_RI, mnemonico = FE_AND32RI, nops = 2, tipo = {MO_REG, MO_IMED, MO_NADA}, largura = {32, 0, 0}, flags = FL_NADA as u8, molde = "and %0, %1"},
+    FormaX64{id = FX_AND64_RI, mnemonico = FE_AND64RI, nops = 2, tipo = {MO_REG, MO_IMED, MO_NADA}, largura = {64, 0, 0}, flags = FL_NADA as u8, molde = "and %0, %1"},
+    FormaX64{id = FX_OR32_RI, mnemonico = FE_OR32RI, nops = 2, tipo = {MO_REG, MO_IMED, MO_NADA}, largura = {32, 0, 0}, flags = FL_NADA as u8, molde = "or %0, %1"},
+    FormaX64{id = FX_OR64_RI, mnemonico = FE_OR64RI, nops = 2, tipo = {MO_REG, MO_IMED, MO_NADA}, largura = {64, 0, 0}, flags = FL_NADA as u8, molde = "or %0, %1"},
+    FormaX64{id = FX_XOR32_RI, mnemonico = FE_XOR32RI, nops = 2, tipo = {MO_REG, MO_IMED, MO_NADA}, largura = {32, 0, 0}, flags = FL_NADA as u8, molde = "xor %0, %1"},
+    FormaX64{id = FX_XOR64_RI, mnemonico = FE_XOR64RI, nops = 2, tipo = {MO_REG, MO_IMED, MO_NADA}, largura = {64, 0, 0}, flags = FL_NADA as u8, molde = "xor %0, %1"},
+    FormaX64{id = FX_CMP32_RI, mnemonico = FE_CMP32RI, nops = 2, tipo = {MO_REG, MO_IMED, MO_NADA}, largura = {32, 0, 0}, flags = FL_NADA as u8, molde = "cmp %0, %1"},
+    FormaX64{id = FX_CMP64_RI, mnemonico = FE_CMP64RI, nops = 2, tipo = {MO_REG, MO_IMED, MO_NADA}, largura = {64, 0, 0}, flags = FL_NADA as u8, molde = "cmp %0, %1"},
+    FormaX64{id = FX_IMUL32_RR, mnemonico = FE_IMUL32RR, nops = 2, tipo = {MO_REG, MO_REG, MO_NADA}, largura = {32, 32, 0}, flags = FL_NADA as u8, molde = "imul %0, %1"},
+    FormaX64{id = FX_IMUL64_RR, mnemonico = FE_IMUL64RR, nops = 2, tipo = {MO_REG, MO_REG, MO_NADA}, largura = {64, 64, 0}, flags = FL_NADA as u8, molde = "imul %0, %1"},
+    FormaX64{id = FX_MUL32_R, mnemonico = FE_MUL32R, nops = 1, tipo = {MO_REG, MO_NADA, MO_NADA}, largura = {32, 0, 0}, flags = FL_NADA as u8, molde = "mul %0"},
+    FormaX64{id = FX_MUL64_R, mnemonico = FE_MUL64R, nops = 1, tipo = {MO_REG, MO_NADA, MO_NADA}, largura = {64, 0, 0}, flags = FL_NADA as u8, molde = "mul %0"},
+    FormaX64{id = FX_NEG32_R, mnemonico = FE_NEG32R, nops = 1, tipo = {MO_REG, MO_NADA, MO_NADA}, largura = {32, 0, 0}, flags = FL_NADA as u8, molde = "neg %0"},
+    FormaX64{id = FX_NEG64_R, mnemonico = FE_NEG64R, nops = 1, tipo = {MO_REG, MO_NADA, MO_NADA}, largura = {64, 0, 0}, flags = FL_NADA as u8, molde = "neg %0"},
+    FormaX64{id = FX_TEST8_RR, mnemonico = FE_TEST8RR, nops = 2, tipo = {MO_REG, MO_REG, MO_NADA}, largura = {8, 8, 0}, flags = FL_NADA as u8, molde = "test %0, %1"},
+    FormaX64{id = FX_TEST32_RR, mnemonico = FE_TEST32RR, nops = 2, tipo = {MO_REG, MO_REG, MO_NADA}, largura = {32, 32, 0}, flags = FL_NADA as u8, molde = "test %0, %1"},
+    FormaX64{id = FX_TEST64_RR, mnemonico = FE_TEST64RR, nops = 2, tipo = {MO_REG, MO_REG, MO_NADA}, largura = {64, 64, 0}, flags = FL_NADA as u8, molde = "test %0, %1"},
+    FormaX64{id = FX_TEST64_MR, mnemonico = FE_TEST64MR, nops = 2, tipo = {MO_MEM, MO_REG, MO_NADA}, largura = {64, 64, 0}, flags = FL_NADA as u8, molde = "test %0, %1"},
+    FormaX64{id = FX_SETCC8_R, mnemonico = FE_SETCC8R, nops = 1, tipo = {MO_REG, MO_NADA, MO_NADA}, largura = {8, 0, 0}, flags = X64_FL_CC as u8, molde = "set%k %0"},
+    FormaX64{id = FX_JCC_REL32, mnemonico = FE_JCC, nops = 1, tipo = {MO_BLOCO, MO_NADA, MO_NADA}, largura = {0, 0, 0}, flags = (X64_FL_CC + X64_FL_REL32) as u8, molde = "j%k %0"},
+    FormaX64{id = FX_JMP_REL32, mnemonico = FE_JMP, nops = 1, tipo = {MO_BLOCO, MO_NADA, MO_NADA}, largura = {0, 0, 0}, flags = X64_FL_REL32 as u8, molde = "jmp %0"},
+    FormaX64{id = FX_CALL_REL32, mnemonico = FE_CALL, nops = 1, tipo = {MO_SIMBOLO, MO_NADA, MO_NADA}, largura = {0, 0, 0}, flags = X64_FL_REL32 as u8, molde = "call %0"},
+    FormaX64{id = FX_RET, mnemonico = FE_RET, nops = 0, tipo = {MO_NADA, MO_NADA, MO_NADA}, largura = {0, 0, 0}, flags = FL_NADA as u8, molde = "ret"},
+    FormaX64{id = FX_PUSH64_R, mnemonico = FE_PUSHR, nops = 1, tipo = {MO_REG, MO_NADA, MO_NADA}, largura = {64, 0, 0}, flags = FL_NADA as u8, molde = "push %0"},
+    FormaX64{id = FX_POP64_R, mnemonico = FE_POPR, nops = 1, tipo = {MO_REG, MO_NADA, MO_NADA}, largura = {64, 0, 0}, flags = FL_NADA as u8, molde = "pop %0"},
+    FormaX64{id = FX_UD2, mnemonico = FE_UD2, nops = 0, tipo = {MO_NADA, MO_NADA, MO_NADA}, largura = {0, 0, 0}, flags = FL_NADA as u8, molde = "ud2"},
+    FormaX64{id = FX_INT3, mnemonico = FE_INT3, nops = 0, tipo = {MO_NADA, MO_NADA, MO_NADA}, largura = {0, 0, 0}, flags = FL_NADA as u8, molde = "int3"},
+    FormaX64{id = FX_MOVSX32_RM8, mnemonico = FE_MOVSXR32M8, nops = 2, tipo = {MO_REG, MO_MEM, MO_NADA}, largura = {32, 8, 0}, flags = FL_NADA as u8, molde = "movsx %0, %1"},
+    FormaX64{id = FX_MOVSX32_RM16, mnemonico = FE_MOVSXR32M16, nops = 2, tipo = {MO_REG, MO_MEM, MO_NADA}, largura = {32, 16, 0}, flags = FL_NADA as u8, molde = "movsx %0, %1"},
+    FormaX64{id = FX_MOVSX64_RM8, mnemonico = FE_MOVSXR64M8, nops = 2, tipo = {MO_REG, MO_MEM, MO_NADA}, largura = {64, 8, 0}, flags = FL_NADA as u8, molde = "movsx %0, %1"},
+    FormaX64{id = FX_MOVSX64_RM16, mnemonico = FE_MOVSXR64M16, nops = 2, tipo = {MO_REG, MO_MEM, MO_NADA}, largura = {64, 16, 0}, flags = FL_NADA as u8, molde = "movsx %0, %1"},
+    FormaX64{id = FX_MOVZX32_RM16, mnemonico = FE_MOVZXR32M16, nops = 2, tipo = {MO_REG, MO_MEM, MO_NADA}, largura = {32, 16, 0}, flags = FL_NADA as u8, molde = "movzx %0, %1"},
+    FormaX64{id = FX_MOVZX32_RR16, mnemonico = FE_MOVZXR32R16, nops = 2, tipo = {MO_REG, MO_REG, MO_NADA}, largura = {32, 16, 0}, flags = FL_NADA as u8, molde = "movzx %0, %1"},
+    FormaX64{id = FX_MOV16_MR, mnemonico = FE_MOV16MR, nops = 2, tipo = {MO_MEM, MO_REG, MO_NADA}, largura = {16, 16, 0}, flags = FL_NADA as u8, molde = "mov %0, %1"},
+    FormaX64{id = FX_MOVSX32_RR8, mnemonico = FE_MOVSXR32R8, nops = 2, tipo = {MO_REG, MO_REG, MO_NADA}, largura = {32, 8, 0}, flags = FL_NADA as u8, molde = "movsx %0, %1"},
+    FormaX64{id = FX_MOVSX32_RR16, mnemonico = FE_MOVSXR32R16, nops = 2, tipo = {MO_REG, MO_REG, MO_NADA}, largura = {32, 16, 0}, flags = FL_NADA as u8, molde = "movsx %0, %1"},
+    FormaX64{id = FX_CDQ, mnemonico = FE_CDQ, nops = 0, tipo = {MO_NADA, MO_NADA, MO_NADA}, largura = {0, 0, 0}, flags = FL_NADA as u8, molde = "cdq"},
+    FormaX64{id = FX_CQO, mnemonico = FE_CQO, nops = 0, tipo = {MO_NADA, MO_NADA, MO_NADA}, largura = {0, 0, 0}, flags = FL_NADA as u8, molde = "cqo"},
+    FormaX64{id = FX_IDIV32_R, mnemonico = FE_IDIV32R, nops = 1, tipo = {MO_REG, MO_NADA, MO_NADA}, largura = {32, 0, 0}, flags = FL_NADA as u8, molde = "idiv %0"},
+    FormaX64{id = FX_IDIV64_R, mnemonico = FE_IDIV64R, nops = 1, tipo = {MO_REG, MO_NADA, MO_NADA}, largura = {64, 0, 0}, flags = FL_NADA as u8, molde = "idiv %0"},
+    FormaX64{id = FX_DIV32_R, mnemonico = FE_DIV32R, nops = 1, tipo = {MO_REG, MO_NADA, MO_NADA}, largura = {32, 0, 0}, flags = FL_NADA as u8, molde = "div %0"},
+    FormaX64{id = FX_DIV64_R, mnemonico = FE_DIV64R, nops = 1, tipo = {MO_REG, MO_NADA, MO_NADA}, largura = {64, 0, 0}, flags = FL_NADA as u8, molde = "div %0"},
+    FormaX64{id = FX_SHL32_RCL, mnemonico = FE_SHL32RR, nops = 2, tipo = {MO_REG, MO_REG, MO_NADA}, largura = {32, 8, 0}, flags = FL_NADA as u8, molde = "shl %0, %1"},
+    FormaX64{id = FX_SHL64_RCL, mnemonico = FE_SHL64RR, nops = 2, tipo = {MO_REG, MO_REG, MO_NADA}, largura = {64, 8, 0}, flags = FL_NADA as u8, molde = "shl %0, %1"},
+    FormaX64{id = FX_SHR32_RCL, mnemonico = FE_SHR32RR, nops = 2, tipo = {MO_REG, MO_REG, MO_NADA}, largura = {32, 8, 0}, flags = FL_NADA as u8, molde = "shr %0, %1"},
+    FormaX64{id = FX_SHR64_RCL, mnemonico = FE_SHR64RR, nops = 2, tipo = {MO_REG, MO_REG, MO_NADA}, largura = {64, 8, 0}, flags = FL_NADA as u8, molde = "shr %0, %1"},
+    FormaX64{id = FX_NOT32_R, mnemonico = FE_NOT32R, nops = 1, tipo = {MO_REG, MO_NADA, MO_NADA}, largura = {32, 0, 0}, flags = FL_NADA as u8, molde = "not %0"},
+    FormaX64{id = FX_NOT64_R, mnemonico = FE_NOT64R, nops = 1, tipo = {MO_REG, MO_NADA, MO_NADA}, largura = {64, 0, 0}, flags = FL_NADA as u8, molde = "not %0"},
+    FormaX64{id = FX_SHL32_RI, mnemonico = FE_SHL32RI, nops = 2, tipo = {MO_REG, MO_IMED, MO_NADA}, largura = {32, 0, 0}, flags = FL_NADA as u8, molde = "shl %0, %1"},
+    FormaX64{id = FX_SHL64_RI, mnemonico = FE_SHL64RI, nops = 2, tipo = {MO_REG, MO_IMED, MO_NADA}, largura = {64, 0, 0}, flags = FL_NADA as u8, molde = "shl %0, %1"},
+    FormaX64{id = FX_SHR32_RI, mnemonico = FE_SHR32RI, nops = 2, tipo = {MO_REG, MO_IMED, MO_NADA}, largura = {32, 0, 0}, flags = FL_NADA as u8, molde = "shr %0, %1"},
+    FormaX64{id = FX_SHR64_RI, mnemonico = FE_SHR64RI, nops = 2, tipo = {MO_REG, MO_IMED, MO_NADA}, largura = {64, 0, 0}, flags = FL_NADA as u8, molde = "shr %0, %1"},
+    FormaX64{id = FX_MOVSS_XM, mnemonico = FE_SSE_MOVSSRM, nops = 2, tipo = {MO_XMM, MO_MEM, MO_NADA}, largura = {128, 32, 0}, flags = FL_NADA as u8, molde = "movss %0, %1"},
+    FormaX64{id = FX_MOVSD_XM, mnemonico = FE_SSE_MOVSDRM, nops = 2, tipo = {MO_XMM, MO_MEM, MO_NADA}, largura = {128, 64, 0}, flags = FL_NADA as u8, molde = "movsd %0, %1"},
+    FormaX64{id = FX_MOVSS_MX, mnemonico = FE_SSE_MOVSSMR, nops = 2, tipo = {MO_MEM, MO_XMM, MO_NADA}, largura = {32, 128, 0}, flags = FL_NADA as u8, molde = "movss %0, %1"},
+    FormaX64{id = FX_MOVSD_MX, mnemonico = FE_SSE_MOVSDMR, nops = 2, tipo = {MO_MEM, MO_XMM, MO_NADA}, largura = {64, 128, 0}, flags = FL_NADA as u8, molde = "movsd %0, %1"},
+    FormaX64{id = FX_MOVSS_XX, mnemonico = FE_SSE_MOVSSRR, nops = 2, tipo = {MO_XMM, MO_XMM, MO_NADA}, largura = {128, 128, 0}, flags = FL_NADA as u8, molde = "movss %0, %1"},
+    FormaX64{id = FX_MOVSD_XX, mnemonico = FE_SSE_MOVSDRR, nops = 2, tipo = {MO_XMM, MO_XMM, MO_NADA}, largura = {128, 128, 0}, flags = FL_NADA as u8, molde = "movsd %0, %1"},
+    FormaX64{id = FX_ADDSS_XX, mnemonico = FE_SSE_ADDSSRR, nops = 2, tipo = {MO_XMM, MO_XMM, MO_NADA}, largura = {128, 128, 0}, flags = FL_NADA as u8, molde = "addss %0, %1"},
+    FormaX64{id = FX_SUBSS_XX, mnemonico = FE_SSE_SUBSSRR, nops = 2, tipo = {MO_XMM, MO_XMM, MO_NADA}, largura = {128, 128, 0}, flags = FL_NADA as u8, molde = "subss %0, %1"},
+    FormaX64{id = FX_MULSS_XX, mnemonico = FE_SSE_MULSSRR, nops = 2, tipo = {MO_XMM, MO_XMM, MO_NADA}, largura = {128, 128, 0}, flags = FL_NADA as u8, molde = "mulss %0, %1"},
+    FormaX64{id = FX_DIVSS_XX, mnemonico = FE_SSE_DIVSSRR, nops = 2, tipo = {MO_XMM, MO_XMM, MO_NADA}, largura = {128, 128, 0}, flags = FL_NADA as u8, molde = "divss %0, %1"},
+    FormaX64{id = FX_ADDSD_XX, mnemonico = FE_SSE_ADDSDRR, nops = 2, tipo = {MO_XMM, MO_XMM, MO_NADA}, largura = {128, 128, 0}, flags = FL_NADA as u8, molde = "addsd %0, %1"},
+    FormaX64{id = FX_SUBSD_XX, mnemonico = FE_SSE_SUBSDRR, nops = 2, tipo = {MO_XMM, MO_XMM, MO_NADA}, largura = {128, 128, 0}, flags = FL_NADA as u8, molde = "subsd %0, %1"},
+    FormaX64{id = FX_MULSD_XX, mnemonico = FE_SSE_MULSDRR, nops = 2, tipo = {MO_XMM, MO_XMM, MO_NADA}, largura = {128, 128, 0}, flags = FL_NADA as u8, molde = "mulsd %0, %1"},
+    FormaX64{id = FX_DIVSD_XX, mnemonico = FE_SSE_DIVSDRR, nops = 2, tipo = {MO_XMM, MO_XMM, MO_NADA}, largura = {128, 128, 0}, flags = FL_NADA as u8, molde = "divsd %0, %1"},
+    FormaX64{id = FX_UCOMISS_XX, mnemonico = FE_SSE_UCOMISSRR, nops = 2, tipo = {MO_XMM, MO_XMM, MO_NADA}, largura = {128, 128, 0}, flags = FL_NADA as u8, molde = "ucomiss %0, %1"},
+    FormaX64{id = FX_UCOMISD_XX, mnemonico = FE_SSE_UCOMISDRR, nops = 2, tipo = {MO_XMM, MO_XMM, MO_NADA}, largura = {128, 128, 0}, flags = FL_NADA as u8, molde = "ucomisd %0, %1"},
+    FormaX64{id = FX_CVTSI2SS_XR32, mnemonico = FE_SSE_CVTSI2SS32RR, nops = 2, tipo = {MO_XMM, MO_REG, MO_NADA}, largura = {128, 32, 0}, flags = FL_NADA as u8, molde = "cvtsi2ss %0, %1"},
+    FormaX64{id = FX_CVTSI2SS_XR64, mnemonico = FE_SSE_CVTSI2SS64RR, nops = 2, tipo = {MO_XMM, MO_REG, MO_NADA}, largura = {128, 64, 0}, flags = FL_NADA as u8, molde = "cvtsi2ss %0, %1"},
+    FormaX64{id = FX_CVTSI2SD_XR32, mnemonico = FE_SSE_CVTSI2SD32RR, nops = 2, tipo = {MO_XMM, MO_REG, MO_NADA}, largura = {128, 32, 0}, flags = FL_NADA as u8, molde = "cvtsi2sd %0, %1"},
+    FormaX64{id = FX_CVTSI2SD_XR64, mnemonico = FE_SSE_CVTSI2SD64RR, nops = 2, tipo = {MO_XMM, MO_REG, MO_NADA}, largura = {128, 64, 0}, flags = FL_NADA as u8, molde = "cvtsi2sd %0, %1"},
+    FormaX64{id = FX_CVTSS2SD_XX, mnemonico = FE_SSE_CVTSS2SDRR, nops = 2, tipo = {MO_XMM, MO_XMM, MO_NADA}, largura = {128, 128, 0}, flags = FL_NADA as u8, molde = "cvtss2sd %0, %1"},
+    FormaX64{id = FX_CVTSD2SS_XX, mnemonico = FE_SSE_CVTSD2SSRR, nops = 2, tipo = {MO_XMM, MO_XMM, MO_NADA}, largura = {128, 128, 0}, flags = FL_NADA as u8, molde = "cvtsd2ss %0, %1"},
+    FormaX64{id = FX_XORPS_XM, mnemonico = FE_SSE_XORPSRM, nops = 2, tipo = {MO_XMM, MO_MEM, MO_NADA}, largura = {128, 128, 0}, flags = FL_NADA as u8, molde = "xorps %0, %1"},
+    FormaX64{id = FX_XORPS_XX, mnemonico = FE_SSE_XORPSRR, nops = 2, tipo = {MO_XMM, MO_XMM, MO_NADA}, largura = {128, 128, 0}, flags = FL_NADA as u8, molde = "xorps %0, %1"},
+    FormaX64{id = FX_MOVD_XR, mnemonico = FE_SSE_MOVD_G2XRR, nops = 2, tipo = {MO_XMM, MO_REG, MO_NADA}, largura = {128, 32, 0}, flags = FL_NADA as u8, molde = "movd %0, %1"},
+    FormaX64{id = FX_MOVD_RX, mnemonico = FE_SSE_MOVD_X2GRR, nops = 2, tipo = {MO_REG, MO_XMM, MO_NADA}, largura = {32, 128, 0}, flags = FL_NADA as u8, molde = "movd %0, %1"},
+    FormaX64{id = FX_MOVQ_XR, mnemonico = FE_SSE_MOVQ_G2XRR, nops = 2, tipo = {MO_XMM, MO_REG, MO_NADA}, largura = {128, 64, 0}, flags = FL_NADA as u8, molde = "movq %0, %1"},
+    FormaX64{id = FX_MOVQ_RX, mnemonico = FE_SSE_MOVQ_X2GRR, nops = 2, tipo = {MO_REG, MO_XMM, MO_NADA}, largura = {64, 128, 0}, flags = FL_NADA as u8, molde = "movq %0, %1"},
+    FormaX64{id = FX_MOVUPS_XM, mnemonico = FE_SSE_MOVUPSRM, nops = 2, tipo = {MO_XMM, MO_MEM, MO_NADA}, largura = {128, 128, 0}, flags = FL_NADA as u8, molde = "movups %0, %1"},
+    FormaX64{id = FX_MOVUPS_MX, mnemonico = FE_SSE_MOVUPSMR, nops = 2, tipo = {MO_MEM, MO_XMM, MO_NADA}, largura = {128, 128, 0}, flags = FL_NADA as u8, molde = "movups %0, %1"},
+    FormaX64{id = FX_MOVAPS_XX, mnemonico = FE_SSE_MOVAPSRR, nops = 2, tipo = {MO_XMM, MO_XMM, MO_NADA}, largura = {128, 128, 0}, flags = FL_NADA as u8, molde = "movaps %0, %1"},
+    FormaX64{id = FX_SQRTSS_XX, mnemonico = FE_SSE_SQRTSSRR, nops = 2, tipo = {MO_XMM, MO_XMM, MO_NADA}, largura = {128, 128, 0}, flags = FL_NADA as u8, molde = "sqrtss %0, %1"},
+    FormaX64{id = FX_SQRTSD_XX, mnemonico = FE_SSE_SQRTSDRR, nops = 2, tipo = {MO_XMM, MO_XMM, MO_NADA}, largura = {128, 128, 0}, flags = FL_NADA as u8, molde = "sqrtsd %0, %1"},
+    FormaX64{id = FX_CALL_M64, mnemonico = FE_CALLM, nops = 1, tipo = {MO_MEM, MO_NADA, MO_NADA}, largura = {64, 0, 0}, flags = FL_NADA as u8, molde = "call %0"},
+    FormaX64{id = FX_CALL_R64, mnemonico = FE_CALLR, nops = 1, tipo = {MO_REG, MO_NADA, MO_NADA}, largura = {64, 0, 0}, flags = FL_NADA as u8, molde = "call %0"},
+    FormaX64{id = FX_IMUL32_RRI, mnemonico = FE_IMUL32RRI, nops = 3, tipo = {MO_REG, MO_REG, MO_IMED}, largura = {32, 32, 0}, flags = FL_NADA as u8, molde = "imul %0, %1, %2"},
+    FormaX64{id = FX_IMUL64_RRI, mnemonico = FE_IMUL64RRI, nops = 3, tipo = {MO_REG, MO_REG, MO_IMED}, largura = {64, 64, 0}, flags = FL_NADA as u8, molde = "imul %0, %1, %2"},
+    FormaX64{id = FX_SAR32_RI, mnemonico = FE_SAR32RI, nops = 2, tipo = {MO_REG, MO_IMED, MO_NADA}, largura = {32, 0, 0}, flags = FL_NADA as u8, molde = "sar %0, %1"},
+    FormaX64{id = FX_SAR64_RI, mnemonico = FE_SAR64RI, nops = 2, tipo = {MO_REG, MO_IMED, MO_NADA}, largura = {64, 0, 0}, flags = FL_NADA as u8, molde = "sar %0, %1"},
+    FormaX64{id = FX_IMUL64_R, mnemonico = FE_IMUL64R, nops = 1, tipo = {MO_REG, MO_NADA, MO_NADA}, largura = {64, 0, 0}, flags = FL_NADA as u8, molde = "imul %0"},
+    FormaX64{id = FX_CMOV32_RR, mnemonico = FE_CMOVCC32RR, nops = 2, tipo = {MO_REG, MO_REG, MO_NADA}, largura = {32, 32, 0}, flags = X64_FL_CC as u8, molde = "cmov%k %0, %1"},
+    FormaX64{id = FX_CMOV64_RR, mnemonico = FE_CMOVCC64RR, nops = 2, tipo = {MO_REG, MO_REG, MO_NADA}, largura = {64, 64, 0}, flags = X64_FL_CC as u8, molde = "cmov%k %0, %1"},
+    FormaX64{id = FX_MINSS_XX, mnemonico = FE_SSE_MINSSRR, nops = 2, tipo = {MO_XMM, MO_XMM, MO_NADA}, largura = {128, 128, 0}, flags = FL_NADA as u8, molde = "minss %0, %1"},
+    FormaX64{id = FX_MAXSS_XX, mnemonico = FE_SSE_MAXSSRR, nops = 2, tipo = {MO_XMM, MO_XMM, MO_NADA}, largura = {128, 128, 0}, flags = FL_NADA as u8, molde = "maxss %0, %1"},
+    FormaX64{id = FX_MINSD_XX, mnemonico = FE_SSE_MINSDRR, nops = 2, tipo = {MO_XMM, MO_XMM, MO_NADA}, largura = {128, 128, 0}, flags = FL_NADA as u8, molde = "minsd %0, %1"},
+    FormaX64{id = FX_MAXSD_XX, mnemonico = FE_SSE_MAXSDRR, nops = 2, tipo = {MO_XMM, MO_XMM, MO_NADA}, largura = {128, 128, 0}, flags = FL_NADA as u8, molde = "maxsd %0, %1"},
+    FormaX64{id = FX_ADDPS_XX, mnemonico = FE_SSE_ADDPSRR, nops = 2, tipo = {MO_XMM, MO_XMM, MO_NADA}, largura = {128, 128, 0}, flags = FL_NADA as u8, molde = "addps %0, %1"},
+    FormaX64{id = FX_SUBPS_XX, mnemonico = FE_SSE_SUBPSRR, nops = 2, tipo = {MO_XMM, MO_XMM, MO_NADA}, largura = {128, 128, 0}, flags = FL_NADA as u8, molde = "subps %0, %1"},
+    FormaX64{id = FX_MULPS_XX, mnemonico = FE_SSE_MULPSRR, nops = 2, tipo = {MO_XMM, MO_XMM, MO_NADA}, largura = {128, 128, 0}, flags = FL_NADA as u8, molde = "mulps %0, %1"},
+    FormaX64{id = FX_DIVPS_XX, mnemonico = FE_SSE_DIVPSRR, nops = 2, tipo = {MO_XMM, MO_XMM, MO_NADA}, largura = {128, 128, 0}, flags = FL_NADA as u8, molde = "divps %0, %1"},
+    FormaX64{id = FX_ADDPD_XX, mnemonico = FE_SSE_ADDPDRR, nops = 2, tipo = {MO_XMM, MO_XMM, MO_NADA}, largura = {128, 128, 0}, flags = FL_NADA as u8, molde = "addpd %0, %1"},
+    FormaX64{id = FX_SUBPD_XX, mnemonico = FE_SSE_SUBPDRR, nops = 2, tipo = {MO_XMM, MO_XMM, MO_NADA}, largura = {128, 128, 0}, flags = FL_NADA as u8, molde = "subpd %0, %1"},
+    FormaX64{id = FX_MULPD_XX, mnemonico = FE_SSE_MULPDRR, nops = 2, tipo = {MO_XMM, MO_XMM, MO_NADA}, largura = {128, 128, 0}, flags = FL_NADA as u8, molde = "mulpd %0, %1"},
+    FormaX64{id = FX_DIVPD_XX, mnemonico = FE_SSE_DIVPDRR, nops = 2, tipo = {MO_XMM, MO_XMM, MO_NADA}, largura = {128, 128, 0}, flags = FL_NADA as u8, molde = "divpd %0, %1"},
+    FormaX64{id = FX_SHUFPS_XXI, mnemonico = FE_SSE_SHUFPSRRI, nops = 3, tipo = {MO_XMM, MO_XMM, MO_IMED}, largura = {128, 128, 0}, flags = FL_NADA as u8, molde = "shufps %0, %1, %2"},
+    FormaX64{id = FX_UNPCKLPD_XX, mnemonico = FE_SSE_UNPCKLPDRR, nops = 2, tipo = {MO_XMM, MO_XMM, MO_NADA}, largura = {128, 128, 0}, flags = FL_NADA as u8, molde = "unpcklpd %0, %1"},
+}
+
+// C: nativo/x64/x64_codificar.c:184
+proc recusar_x0902(erro: ^common.Diag, mi: ^MInstr, texto: str) -> bool {
+    let msg_1 = format(f"codificador x64 recusou {texto}", alloc = heap)
+    defer delete(msg_1)
+    return common.diag_relatar(erro, common.X0902, mi.pos, msg_1)
+}
+
+// C: nativo/x64/x64_codificar.c:190
+proc memoria_aceita(f: ^FormaX64, o: ^MOperando, i: u8) -> bool {
+    if (o.escala != 0) and (((common.c2f_s2u_32(o.base) == (X64_RIP as u32)) or (common.c2f_s2u_32(o.indice) == (X64_RSP as u32))) or (common.c2f_s2u_32(o.indice) > (X64_R15 as u32))) {
+        return false
+    }
+    if (((o.escala != 0) and (o.desloc == 0)) and (common.c2f_s2u_32(o.base) != (X64_RIP as u32))) and ((common.c2f_s2u_32(o.base) & 7) == 5) {
+        return false
+    }
+    if common.c2f_s2u_32(o.base) == (X64_RIP as u32) {
+        return common.c2f_e_i32(f.flags as i32, X64_FL_RIP) != 0
+    }
+    return (common.c2f_s2u_32(o.base) <= (X64_R15 as u32)) and (((f.largura or_else {})[i] == 0) or ((o.largura as i32) == ((f.largura or_else {})[i] as i32)))
+}
+
+// C: nativo/x64/x64_codificar.c:201
+proc operando_aceito(f: ^FormaX64, o: ^MOperando, i: u8) -> bool {
+    if common.c2f_s2u_32(o.tipo) != common.c2f_s2u_32(f.tipo[i]) {
+        return false
+    }
+    if common.c2f_s2u_32(o.tipo) == (MO_XMM as u32) {
+        return common.c2f_s2u_32(o.base) <= (X64_R15 as u32)
+    }
+    if common.c2f_s2u_32(o.tipo) == (MO_REG as u32) {
+        return (common.c2f_s2u_32(o.base) <= (X64_R15 as u32)) and ((o.largura as i32) == ((f.largura or_else {})[i] as i32))
+    }
+    if common.c2f_s2u_32(o.tipo) == (MO_MEM as u32) {
+        return memoria_aceita(f, o, i)
+    }
+    return true
+}
+
+// C: nativo/x64/x64_codificar.c:214
+proc forma_aceita(f: ^FormaX64, mi: ^MInstr) -> bool {
+    if (mi.nops as i32) != (f.nops as i32) {
+        return false
+    }
+    if (common.c2f_e_i32(f.flags as i32, X64_FL_CC) != 0) and (common.c2f_s2u_32(mi.cond) > (X64_CC_G as u32)) {
+        return false
+    }
+    var i: u8 = 0
+    while (i as i32) < (f.nops as i32) {
+        if not operando_aceito(f, &mi.op[i], i) {
+            return false
+        }
+        i += 1
+    }
+    return true
+}
+
+// C: nativo/x64/x64_codificar.c:227
+proc mnemonico_da_forma(f: ^FormaX64, mi: ^MInstr) -> u64 {
+    var mnemonico: u64 = f.mnemonico
+    if common.c2f_e_i32(f.flags as i32, X64_FL_CC) != 0 {
+        mnemonico = mnemonico | common.c2f_s2u_64(mi.cond as i64)
+    }
+    if common.c2f_e_i32(f.flags as i32, X64_FL_REL32) != 0 {
+        mnemonico = mnemonico | 4294967296
+    }
+    return mnemonico
+}
+
+// C: nativo/x64/x64_codificar.c:239 (OperandoParaFe). dst virou endereco: o rel32 usa so a diferenca de enderecos.
+proc operando_mem_para_fe(o: ^MOperando) -> i64 {
+    var base: i64 = FE_AX + (o.base as i64)
+    if o.base == X64_RIP {
+        base = FE_IP
+    }
+    if o.escala != 0 {
+        return fe_mem(base, o.escala as i64, FE_AX + (o.indice as i64), o.desloc as i64)
+    }
+    return fe_mem(base, 0, 0, o.desloc as i64)
+}
+
+// C: nativo/x64/x64_codificar.c:239 (OperandoParaFe). Tipo fora dos casos do C devolve 0.
+proc operando_para_fe(f: ^FormaX64, o: ^MOperando, endereco: i64) -> i64 {
+    if o.tipo == MO_REG {
+        return FE_AX + (o.base as i64)
+    }
+    if o.tipo == MO_XMM {
+        return FE_XMM0 + (o.base as i64)
+    }
+    if o.tipo == MO_MEM {
+        return operando_mem_para_fe(o)
+    }
+    if o.tipo == MO_IMED {
+        return o.imed
+    }
+    if (o.tipo == MO_BLOCO) or (o.tipo == MO_SIMBOLO) {
+        var salto: i64 = X64_REL32_BASE_JMP as i64
+        if common.c2f_e_i32(f.flags as i32, X64_FL_CC) != 0 {
+            salto = X64_REL32_BASE_JCC as i64
+        }
+        return endereco + salto + (o.desloc as i64)
+    }
+    return 0
+}
+
+// C: nativo/x64/x64_codificar.c:262
+proc tem_rip(mi: ^MInstr) -> bool {
+    var i: u8 = 0
+    while (i as i32) < (mi.nops as i32) {
+        if (common.c2f_s2u_32(mi.op[i].tipo) == (MO_MEM as u32)) and (common.c2f_s2u_32(mi.op[i].base) == (X64_RIP as u32)) {
+            return true
+        }
+        i += 1
+    }
+    return false
+}
+
+// C: nativo/x64/x64_codificar.c:274
+proc imediato_colide_com_registrador(mi: ^MInstr) -> bool {
+    return (((mi.nops == 2) and (common.c2f_s2u_32(mi.op[1].tipo) == (MO_IMED as u32))) and (mi.op[1].imed >= (X64_IMED_COLIDE_MIN as i64))) and (mi.op[1].imed <= (X64_IMED_COLIDE_MAX as i64))
+}
+
+// C: nativo/x64/x64_codificar.c:279 (OperandosParaFe). Devolve os 3 FeOp; o C enchia um vetor de saida.
+proc operandos_para_fe(f: ^FormaX64, mi: ^MInstr, endereco: i64) -> [3]i64 {
+    var ops: [3]i64 = {0, 0, 0}
+    var i: u8 = 0
+    while (i as i32) < (mi.nops as i32) {
+        ops[i] = operando_para_fe(f, &mi.op[i], endereco)
+        i += 1
+    }
+    // o fadec le o imm8 como inteiro com sinal: 0x80..0xFF entram como o byte negativo de mesmo padrao de bits
+    if f.id == FX_SHUFPS_XXI {
+        ops[2] = transmute(common.c2f_trunc_u8(common.c2f_s2u_64(mi.op[2].imed)), to = i8) as i64
+    }
+    return ops
+}
+
+// C2F-13: dst fundido em tam (len). Depois de codificar: regrava o imm32 real quando houve substituto e zera o disp32 de RIP.
+// C: nativo/x64/x64_codificar.c:288
+proc ajustar_bytes_codificados(mi: ^MInstr, dst: []u8, colide: bool) {
+    let fim = len(dst)
+    if colide {
+        let real = common.c2f_trunc_i32(common.c2f_s2u_64(mi.op[1].imed))
+        common.c2f_gravar_u32_le(dst, fim - (X64_DISP_RIP_BYTES as int), common.c2f_s2u_32(real))
+    }
+    if tem_rip(mi) {
+        var k: int = 0
+        while k < (X64_DISP_RIP_BYTES as int) {
+            dst[fim - (X64_DISP_RIP_BYTES as int) + k] = 0
+            k += 1
+        }
+    }
+}
+
+// Endereco de um rawptr como inteiro: transmute nao aceita ponteiro, entao le os 8 bytes do proprio rawptr
+// (variavel local) pelo tipo apontado ^i64, como (p as rawptr) as ^T.
+proc endereco_de(p: rawptr) -> i64 {
+    var bits: rawptr = p
+    let lido = (&bits as rawptr) as ^i64
+    return lido^
+}
+
+// C: nativo/x64/x64_codificar.c:298. Recusa (X0902) com o molde da forma; sucesso grava o tamanho em tam^.
+// F2: `formas` e a copia unica de FORMAS_X64 (X64Ctx.formas); LIMITE: 5 parametros, o 1o evita remontar a const a cada instrucao.
+proc x64_codificar_instr(formas: []FormaX64, mi: ^MInstr, dst: []u8, tam: ^u32, erro: ^common.Diag) -> bool {
+    if (mi.forma as i32) >= FX_QTD {
+        return recusar_x0902(erro, mi, "uma forma fora da tabela FORMAS_X64")
+    }
+    var f: FormaX64 = formas[mi.forma as int]
+    if not forma_aceita(&f, mi) {
+        return recusar_x0902(erro, mi, f.molde or_else "")
+    }
+    let inicio = endereco_de(&dst[0] as rawptr)
+    let ops = operandos_para_fe(&f, mi, inicio)
+    let colide = imediato_colide_com_registrador(mi)
+    var imed_op = ops[1]
+    if colide {
+        imed_op = X64_IMED_SUBSTITUTO as i64
+    }
+    var cursor: rawptr = &dst[0] as rawptr
+    let mnem = mnemonico_da_forma(&f, mi)
+    if fe_enc64_impl(&cursor as rawptr, mnem, ops[0], imed_op, ops[2], 0) != 0 {
+        return recusar_x0902(erro, mi, f.molde or_else "")
+    }
+    let usados = endereco_de(cursor) - inicio
+    tam^ = usados as u32
+    ajustar_bytes_codificados(mi, dst[0..<(usados as int)], colide)
+    return true
+}
+
+// Teste: codifica mi com x64_codificar_instr e compara tamanho e bytes com o esperado (bytes do oraculo C).
+proc teste_codificar_bytes(mi: ^MInstr, esperado: []u8) -> bool {
+    var erro: common.Diag = common.Diag{tem = false}
+    var dst: [16]u8 = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
+    var tam: u32 = 0
+    let tabela = FORMAS_X64
+    var formas = make([dynamic]FormaX64, alloc = heap, cap = 137)
+    defer delete(formas)
+    for k in 0..<137 {
+        append(&formas, item = tabela[k])
+    }
+    if not x64_codificar_instr(formas[..], mi, dst[0..<16], &tam, &erro) {
+        return false
+    }
+    if (tam as int) != len(esperado) {
+        return false
+    }
+    var i: int = 0
+    while i < len(esperado) {
+        if dst[i] != esperado[i] {
+            return false
+        }
+        i += 1
+    }
+    return true
+}
+
+test "x64_codificar: ret, mov rax,rcx, add rax,imm32, add com imediato colidente (517), jmp e je rel32 batem com o C" {
+    let zero = MOperando{tipo = MO_NADA, largura = 0, base = 0, desloc = 0, imed = 0, simbolo = 0, indice = 0, escala = 0}
+    var mi = MInstr{forma = FX_RET as u16, cond = 0, nops = 0, op = {zero, zero, zero}, pos = 0, bir = 0}
+    var ret_esp: [1]u8 = {0xC3}
+    expect(teste_codificar_bytes(&mi, ret_esp[0..<1]))
+
+    mi = MInstr{forma = FX_MOV64_RR as u16, cond = 0, nops = 2, op = {MOperando{tipo = MO_REG, largura = 64, base = X64_RAX, desloc = 0, imed = 0, simbolo = 0, indice = 0, escala = 0}, MOperando{tipo = MO_REG, largura = 64, base = X64_RCX, desloc = 0, imed = 0, simbolo = 0, indice = 0, escala = 0}, zero}, pos = 0, bir = 0}
+    var mov_esp: [3]u8 = {0x48, 0x89, 0xC8}
+    expect(teste_codificar_bytes(&mi, mov_esp[0..<3]))
+
+    mi = MInstr{forma = FX_ADD64_RI as u16, cond = 0, nops = 2, op = {MOperando{tipo = MO_REG, largura = 64, base = X64_RAX, desloc = 0, imed = 0, simbolo = 0, indice = 0, escala = 0}, MOperando{tipo = MO_IMED, largura = 0, base = 0, desloc = 0, imed = 4096, simbolo = 0, indice = 0, escala = 0}, zero}, pos = 0, bir = 0}
+    var add_esp: [6]u8 = {0x48, 0x05, 0x00, 0x10, 0x00, 0x00}
+    expect(teste_codificar_bytes(&mi, add_esp[0..<6]))
+
+    mi = MInstr{forma = FX_ADD64_RI as u16, cond = 0, nops = 2, op = {MOperando{tipo = MO_REG, largura = 64, base = X64_RAX, desloc = 0, imed = 0, simbolo = 0, indice = 0, escala = 0}, MOperando{tipo = MO_IMED, largura = 0, base = 0, desloc = 0, imed = 517, simbolo = 0, indice = 0, escala = 0}, zero}, pos = 0, bir = 0}
+    var colide_esp: [6]u8 = {0x48, 0x05, 0x05, 0x02, 0x00, 0x00}
+    expect(teste_codificar_bytes(&mi, colide_esp[0..<6]))
+
+    mi = MInstr{forma = FX_JMP_REL32 as u16, cond = 0, nops = 1, op = {MOperando{tipo = MO_BLOCO, largura = 0, base = 0, desloc = 16, imed = 0, simbolo = 0, indice = 0, escala = 0}, zero, zero}, pos = 0, bir = 0}
+    var jmp_esp: [5]u8 = {0xE9, 0x10, 0x00, 0x00, 0x00}
+    expect(teste_codificar_bytes(&mi, jmp_esp[0..<5]))
+
+    mi = MInstr{forma = FX_JCC_REL32 as u16, cond = X64_CC_E, nops = 1, op = {MOperando{tipo = MO_BLOCO, largura = 0, base = 0, desloc = 16, imed = 0, simbolo = 0, indice = 0, escala = 0}, zero, zero}, pos = 0, bir = 0}
+    var je_esp: [6]u8 = {0x0F, 0x84, 0x10, 0x00, 0x00, 0x00}
+    expect(teste_codificar_bytes(&mi, je_esp[0..<6]))
+}

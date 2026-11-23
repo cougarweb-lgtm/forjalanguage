@@ -1,0 +1,332 @@
+// semantic/sem_allocator.fj - porte de compiler/semantic/sem_allocator.c
+// sha256 de semantic/sem_allocator.c: aa25a1290c168c5897ed98f9149d3e02bf9c2ccd3bd0105ef1b2a80b4edd1b3d
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "common"
+import "frontend"
+
+const ALLOCATOR_CAMPOS: i32 = 1
+const TEXTO_CAUSA: i32 = 256
+const ID_ALOCADOR_HEAP: i32 = 1
+const ID_ALOCADOR_FRAME: i32 = 2
+
+// C: semantic/sem_allocator.c:25
+// C2F-13: o retorno `Campo *` (FATIA de ALLOCATOR_CAMPOS) vira []frontend.Campo (assinatura alterada dentro do lote)
+proc campos_do_allocator(s: ^Semantica) -> []frontend.Campo {
+    let campos = s4_arena_fatia_campo(s, ALLOCATOR_CAMPOS as int)
+    campos[0].nome = s.nome_id
+    campos[0].tipo.forma = frontend.TR_NOME as u8
+    campos[0].tipo.nome = frontend.SYM_U32
+    campos[0].tipo.erro = -1
+    campos[0].tipo.tipo = TIPO_U32 as u32
+    return campos
+}
+
+// C: semantic/sem_allocator.c:37
+proc sem_allocator_garantir(s: ^Semantica) {
+    let y: ^Simbolo = &(s.globais or_else {})[frontend.SYM_ALLOCATOR]
+    if (s.tipo_allocator != 0) or (y.categoria != (SIM_NENHUM as u8)) {
+        return
+    }
+    let d: ^frontend.Decl = s4_novo_decl(s)
+    d.tipo_no = frontend.D_STRUCT as u8
+    d.nome = frontend.SYM_ALLOCATOR
+    d.chave = d.nome
+    d.simbolo = -1
+    d.publico = true
+    d.campos = campos_do_allocator(s)
+    d.ncampos = ALLOCATOR_CAMPOS as u32
+    d.indice = s.qtd_struct as i32
+    s.qtd_struct += 1
+    s.decl_allocator = d
+    s.tipo_allocator = tipo_struct(&s.tipos, frontend.SYM_ALLOCATOR)
+    y^ = Simbolo{categoria = SIM_STRUCT as u8, indice = d.indice, decl = d, tipo = s.tipo_allocator, envenenado = 0}
+}
+
+// C: semantic/sem_allocator.c:57
+proc erro_de_allocator(s: ^Semantica, pos: u32, causa: str, dica: str) -> bool {
+    let msg_1 = format(f"{causa}", alloc = heap)
+    defer delete(msg_1)
+    _ = sem_erro(s, common.E0336, pos, msg_1)
+    let msg_2 = format(f"{dica}", alloc = heap)
+    defer delete(msg_2)
+    _ = common.diag_sugerir(&(s.diag as ^common.Diag).sug, common.DIAG_SO_DICA, msg_2)
+    return false
+}
+
+// C: semantic/sem_allocator.c:65
+proc sem_allocator_conferir_param(s: ^Semantica, d: ^frontend.Decl, p: ^frontend.Param, i: u32) -> bool {
+    if not sem_eh_allocator(s, p.tipo.tipo) {
+        return true
+    }
+    if p.padrao != none {
+        return erro_de_allocator(s, (p.padrao as ^frontend.Expr).pos, "o parametro 'alloc: Allocator' nao tem valor padrao: o chamador sempre escolhe o alocador (heap, frame, uma Arena ou o seu alloc)", "tire o valor padrao: o parametro e so alloc: Allocator")
+    }
+    if p.nome != s.nome_alloc {
+        // C2F-32: snprintf(causa, TEXTO_CAUSA, ...) corta em 255 bytes
+        let causa_inteira = format(f"o parametro '{sem_nome_texto(s, p.nome)}' e um Allocator e precisa se chamar 'alloc' (alloc: Allocator)", alloc = heap)
+        defer delete(causa_inteira)
+        let causa = causa_inteira[0..<min(len(causa_inteira), (TEXTO_CAUSA as int) - 1)]
+        return erro_de_allocator(s, p.pos, causa, "renomeie o parametro Allocator para alloc")
+    }
+    if (i + 1) != d.nparams {
+        return erro_de_allocator(s, p.pos, "o parametro 'alloc: Allocator' vem por ultimo na lista de parametros do proc", "mova alloc: Allocator para o fim da lista de parametros")
+    }
+    return true
+}
+
+// C: semantic/sem_allocator.c:85
+proc sem_allocator_fora_de_parametro(s: ^Semantica, t: ?^frontend.TipoRef) -> bool {
+    if s.alocador_permitido == t {
+        return true
+    }
+    return sem_allocator_nome_fora_de_parametro(s, (t as ^frontend.TipoRef).pos)
+}
+
+// C: semantic/sem_allocator.c:92
+proc sem_allocator_nome_fora_de_parametro(s: ^Semantica, pos: u32) -> bool {
+    return erro_de_allocator(s, pos, "o tipo Allocator so existe como parametro 'alloc: Allocator' de proc; aqui ele aparece fora de parametro (let, var, campo, retorno, ^Allocator, ?Allocator, array, lista, map ou tipo proc)", "receba o alocador como ultimo parametro alloc: Allocator e repasse-o, sem guarda-lo nem devolve-lo")
+}
+
+// C: semantic/sem_allocator.c:98
+proc sem_allocator_ler_campo(s: ^Semantica, e: ^frontend.Expr) -> bool {
+    return erro_de_allocator(s, e.pos_op, "nao se le o campo '.id' de um Allocator: o handle e do runtime e o alocador so se repassa (alloc = alloc)", "repasse o proprio alloc (alloc = alloc) no lugar de ler o .id")
+}
+
+// C: semantic/sem_allocator.c:104
+proc sem_allocator_literal(s: ^Semantica, e: ^frontend.Expr) -> bool {
+    return erro_de_allocator(s, e.pos_op, "nao se escreve o literal Allocator{...}: o valor vem do chamador (heap, frame, uma Arena ou o alloc dele)", "receba alloc: Allocator como ultimo parametro e peca ao chamador o alocador")
+}
+
+// C: semantic/sem_allocator.c:111
+proc sem_allocator_valor_solto(s: ^Semantica, e: ^frontend.Expr) -> bool {
+    return erro_de_allocator(s, e.pos, "o Allocator nao se guarda nem se usa como valor: so se repassa no rotulo 'alloc = alloc' de uma chamada (new, make, format, clone ou proc com alloc: Allocator)", "tire o alloc daqui e escreva alloc = alloc na chamada que precisa do alocador")
+}
+
+// C: semantic/sem_allocator.c:123
+proc no_criado(s: ^Semantica, tipo_no: i32, perto: ?^frontend.Expr) -> ^frontend.Expr {
+    let e: ^frontend.Expr = s4_novo_expr(s)
+    e.tipo_no = tipo_no as u8
+    e.pos = (perto as ^frontend.Expr).pos
+    e.pos_op = e.pos
+    return e
+}
+
+// C: semantic/sem_allocator.c:133
+proc inteiro_do_id(s: ^Semantica, perto: ?^frontend.Expr, id: i32) -> ^frontend.Expr {
+    let e: ^frontend.Expr = no_criado(s, frontend.EX_INT, perto)
+    e.op = 1
+    e.ref = frontend.REF_COMPONENTE as u8
+    e.ref_id = id
+    e.tipo = TIPO_U32 as u32
+    return e
+}
+
+// C: semantic/sem_allocator.c:144
+proc literal_do_allocator(s: ^Semantica, perto: ?^frontend.Expr, id: ^frontend.Expr) -> ^frontend.Expr {
+    let lit: ^frontend.Expr = no_criado(s, frontend.EX_LITERAL_STRUCT, perto)
+    lit.nome = frontend.SYM_ALLOCATOR
+    lit.ref = frontend.REF_STRUCT as u8
+    lit.ref_id = (s.decl_allocator as ^frontend.Decl).indice
+    lit.tipo = s.tipo_allocator
+    lit.nargs = 1
+    let args = frontend.arena_fatia_arg(s.arena as ^common.Arena, 1)
+    args[0] = frontend.Arg{nome = s.nome_id, pos_nome = (perto as ^frontend.Expr).pos, valor = id, indice = 0}
+    lit.args = args
+    return lit
+}
+
+// C: semantic/sem_allocator.c:158
+proc arena_como_allocator(s: ^Semantica, chamada: ^frontend.Expr, g: ^frontend.Arg) -> bool {
+    let campo: ^frontend.Expr = no_criado(s, frontend.EX_CAMPO, g.valor)
+    campo.a = g.valor
+    campo.nome = s.nome_id
+    chamada.alocacao = frontend.ALOC_ARENA as u8
+    g.valor = literal_do_allocator(s, campo, campo)
+    return sem_checar(s, campo, TIPO_VAZIO as u32)
+}
+
+// C: semantic/sem_allocator.c:169
+proc converter_valor_do_arg(s: ^Semantica, chamada: ^frontend.Expr, g: ^frontend.Arg) -> bool {
+    let v: ?^frontend.Expr = g.valor
+    s.alocador_lendo = (v as ^frontend.Expr).tipo_no == (frontend.EX_NOME as u8)
+    let lido: bool = sem_checar(s, v, TIPO_VAZIO as u32)
+    s.alocador_lendo = false
+    if not lido {
+        return false
+    }
+    if sem_eh_allocator(s, (v as ^frontend.Expr).tipo) {
+        chamada.alocacao = frontend.ALOC_PARAM as u8
+        return true
+    }
+    let k: ^TipoInfo = tipo_de(&s.tipos, (v as ^frontend.Expr).tipo)
+    var tern_1: u32 = (v as ^frontend.Expr).tipo
+    if k.classe == (TC_PONTEIRO as u8) {
+        tern_1 = k.a
+    }
+    let base: u32 = tern_1
+    if (s.tipo_pool != 0) and (base == s.tipo_pool) {
+        let msg_1 = format(f"Pool so serve new: um proc com 'alloc: Allocator' recebe heap, frame, uma Arena ou o seu alloc", alloc = heap)
+        defer delete(msg_1)
+        return sem_erro(s, common.E0310, (v as ^frontend.Expr).pos, msg_1)
+    }
+    if (s.tipo_arena == 0) or (base != s.tipo_arena) {
+        return true
+    }
+    return arena_como_allocator(s, chamada, g)
+}
+
+// C: semantic/sem_allocator.c:191
+proc sem_allocator_converter_arg(s: ^Semantica, chamada: ^frontend.Expr, g: ^frontend.Arg) -> bool {
+    let v: ?^frontend.Expr = g.valor
+    let aloc: u8 = sem_alocacao_do_nome(s, v)
+    if aloc == (frontend.ALOC_ESCOPO as u8) {
+        let msg_1 = format(f"a alocacao de scope nao pode ser entregue a proc do usuario na v1: use heap, frame, uma Arena ou o seu alloc", alloc = heap)
+        defer delete(msg_1)
+        return sem_erro(s, common.E0316, (v as ^frontend.Expr).pos, msg_1)
+    }
+    if aloc == (frontend.ALOC_NENHUM as u8) {
+        return converter_valor_do_arg(s, chamada, g)
+    }
+    chamada.alocacao = aloc
+    var tern_1: i32 = ID_ALOCADOR_FRAME
+    if aloc == (frontend.ALOC_HEAP as u8) {
+        tern_1 = ID_ALOCADOR_HEAP
+    }
+    g.valor = literal_do_allocator(s, v, inteiro_do_id(s, v, tern_1))
+    return true
+}
+
+// C: semantic/sem_allocator.c:206
+proc char_de_nome(c: u8) -> bool {
+    return (((c == 95) or ((common.c2f_char_i32(c) >= 48) and (common.c2f_char_i32(c) <= 57))) or ((common.c2f_char_i32(c) >= 97) and (common.c2f_char_i32(c) <= 122))) or ((common.c2f_char_i32(c) >= 65) and (common.c2f_char_i32(c) <= 90)) // '_' '0' '9' 'a' 'z' 'A' 'Z'
+}
+
+// C: semantic/sem_allocator.c:212
+proc pos_da_insercao_do_alloc(s: ^Semantica, e: ^frontend.Expr) -> u32 {
+    if e.nargs > 0 {
+        return (e.args or_else {})[e.nargs - 1].pos_fim
+    }
+    let t: []u8 = (s.fonte as ^common.Fonte).texto
+    var i: u32 = e.pos_op
+    while char_de_nome(t[i]) {
+        i += 1
+    }
+    while (t[i] == 32) or (t[i] == 9) { // ' ' '\t'
+        i += 1
+    }
+    var tern_1: u32 = 0
+    if t[i] == 40 {
+        tern_1 = i + 1
+    }
+    return tern_1 // '('
+}
+
+// C: semantic/sem_allocator.c:224
+proc sem_allocator_inserir_no_migrar(s: ^Semantica, e: ^frontend.Expr, faltante: ^frontend.Param) -> bool {
+    if ((s.diag as ^common.Diag).trocas == none) or (not sem_eh_allocator(s, faltante.tipo.tipo)) {
+        return false
+    }
+    let pos: u32 = pos_da_insercao_do_alloc(s, e)
+    if pos == 0 {
+        return false
+    }
+    var tern_1: str = "alloc = heap"
+    if e.nargs > 0 {
+        tern_1 = ", alloc = heap"
+    }
+    var lit_1 = common.RenTroca{off = pos, tam = 0, classe = common.REN_ARGUMENTO_NOVO, antigo = "", novo = tern_1}
+    let arg_1: ^common.RenTroca = &lit_1
+    let arg_2: ^common.Diag = s.diag as ^common.Diag
+    common.renomeado_notar(arg_2, arg_1)
+    e.alocacao = frontend.ALOC_HEAP as u8
+    return true
+}
+
+// C: semantic/sem_allocator.c:236
+proc sem_allocator_origem_da_chamada(s: ^Semantica, e: ^frontend.Expr) {
+    if e.alocacao == (frontend.ALOC_NENHUM as u8) {
+        return
+    }
+    var valor: u32 = e.tipo
+    if common.c2f_s2u_32(tipo_classe_de(&s.tipos, valor)) == (TC_RESULTADO as u32) {
+        valor = tipo_de(&s.tipos, valor).a
+    }
+    let classe: i32 = tipo_classe_de(&s.tipos, valor)
+    if (((valor == (TIPO_TEXTO as u32)) or (common.c2f_s2u_32(classe) == (TC_PONTEIRO as u32))) or (common.c2f_s2u_32(classe) == (TC_ANULAVEL as u32))) or (common.c2f_b2i32(sem_colecao_dona(s, valor)) != 0) {
+        return
+    }
+    e.alocacao = frontend.ALOC_NENHUM as u8
+}
+
+// G3 S4: texto + 4 zeros de sentinela (como a Fonte real) para os test de sem_allocator
+proc sem_allocator_teste_fonte(texto: str) -> common.Fonte {
+    var f: common.Fonte = common.Fonte{}
+    f.dono_texto = make([dynamic]u8, alloc = heap)
+    append(&f.dono_texto, items = as_bytes(texto))
+    var zeros: [4]u8 = {0, 0, 0, 0}
+    append(&f.dono_texto, items = zeros[..])
+    f.texto = f.dono_texto[0..<len(f.dono_texto)]
+    return f
+}
+
+// G3 S4: posicao da insercao do `alloc = heap` do migrar para uma chamada em `texto` com pos_op = op
+proc sem_allocator_teste_pos(texto: str, op: u32) -> u32 {
+    var f: common.Fonte = sem_allocator_teste_fonte(texto)
+    defer delete(f.dono_texto)
+    var sv: Semantica = Semantica{}
+    sv.fonte = &f
+    var e: frontend.Expr = frontend.Expr{pos_op = op}
+    return pos_da_insercao_do_alloc(&sv, &e)
+}
+
+// G3 S4 (prova da lista estatica "nenhuma"): fronteiras de [A-Za-z0-9_] e o 0xC3 de UTF-8 (nao e letra de nome)
+test "sem_allocator: char_de_nome" {
+    expect(char_de_nome(95) and char_de_nome(48) and char_de_nome(57) and char_de_nome(97) and char_de_nome(122) and char_de_nome(65) and char_de_nome(90))
+    expect(not char_de_nome(47) and not char_de_nome(58) and not char_de_nome(64) and not char_de_nome(91) and not char_de_nome(96) and not char_de_nome(123))
+    expect(not char_de_nome(0) and not char_de_nome(32) and not char_de_nome(40) and not char_de_nome(195) and not char_de_nome(255))
+}
+
+// G3 S4: nos criados na arena (no_criado, inteiro_do_id) e o campo `id` do Allocator (campos_do_allocator)
+test "sem_allocator: nos e campos na arena" {
+    var arena: common.Arena = common.Arena{}
+    defer common.arena_liberar(&arena)
+    var sv: Semantica = Semantica{}
+    sv.arena = &arena
+    sv.nome_id = 7
+    var perto: frontend.Expr = frontend.Expr{pos = 42}
+    let n = no_criado(&sv, frontend.EX_INT, &perto)
+    expect(n.tipo_no == (frontend.EX_INT as u8) and n.pos == 42 and n.pos_op == 42)
+    let i = inteiro_do_id(&sv, &perto, 9)
+    expect(i.tipo_no == (frontend.EX_INT as u8) and i.op == 1 and i.ref == (frontend.REF_COMPONENTE as u8) and i.ref_id == 9 and i.tipo == (TIPO_U32 as u32) and i.pos == 42)
+    expect(n != i)
+    let campos = campos_do_allocator(&sv)
+    expect(len(campos) == (ALLOCATOR_CAMPOS as int) and campos[0].nome == 7 and campos[0].tipo.forma == (frontend.TR_NOME as u8))
+    expect(campos[0].tipo.nome == frontend.SYM_U32 and campos[0].tipo.erro == -1 and campos[0].tipo.tipo == (TIPO_U32 as u32))
+}
+
+// G3 S4 (prova da lista estatica "nenhuma"): acha o '(' depois do nome e de brancos; 0 quando nao ha '(' ou o texto acaba
+test "sem_allocator: pos_da_insercao_do_alloc" {
+    expect(sem_allocator_teste_pos("foo (x)", 0) == 5)
+    expect(sem_allocator_teste_pos("foo(x)", 0) == 4)
+    expect(sem_allocator_teste_pos("foo \t (x)", 0) == 7)
+    expect(sem_allocator_teste_pos("foo x", 0) == 0)
+    expect(sem_allocator_teste_pos("a_1B(", 0) == 5)
+    expect(sem_allocator_teste_pos("foo", 0) == 0)
+    expect(sem_allocator_teste_pos("foo (x)", 2) == 5)
+    expect(sem_allocator_teste_pos("foo (x)", 4) == 5)
+    expect(sem_allocator_teste_pos("foo (x)", 3) == 5)
+    expect(sem_allocator_teste_pos("", 0) == 0)
+    var f: common.Fonte = sem_allocator_teste_fonte("f(a, b)")
+    defer delete(f.dono_texto)
+    var sv: Semantica = Semantica{}
+    sv.fonte = &f
+    var args = make([dynamic]frontend.Arg, alloc = heap)
+    defer delete(args)
+    append(&args, item = frontend.Arg{pos_fim = 3})
+    append(&args, item = frontend.Arg{pos_fim = 6})
+    var e: frontend.Expr = frontend.Expr{pos_op = 0, nargs = 2}
+    e.args = args[0..<len(args)]
+    expect(pos_da_insercao_do_alloc(&sv, &e) == 6)
+}

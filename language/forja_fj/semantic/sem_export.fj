@@ -1,0 +1,1028 @@
+// semantic/sem_export.fj - porte de compiler/semantic/sem_export.c
+// sha256 de semantic/sem_export.c: 907f345dc0bd7bd06e07a9c9284e6e8a8109792430496ed056e6b3abc225904d
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "common"
+import "frontend"
+
+const NOMES_PROIBIDOS: [79]str = {"auto", "break", "case", "char", "const", "continue", "default", "do", "double", "else", "enum", "extern", "float", "for", "goto", "if", "inline", "int", "long", "register", "restrict", "return", "short", "signed", "sizeof", "static", "struct", "switch", "typedef", "union", "unsigned", "void", "volatile", "while", "bool", "true", "false", "int8_t", "int16_t", "int32_t", "int64_t", "uint8_t", "uint16_t", "uint32_t", "uint64_t", "size_t", "main", "printf", "fprintf", "snprintf", "sprintf", "puts", "putchar", "scanf", "fopen", "fclose", "fread", "fwrite", "malloc", "calloc", "realloc", "free", "exit", "abort", "atexit", "system", "getenv", "memcpy", "memmove", "memset", "memcmp", "strlen", "strcmp", "strcpy", "setjmp", "longjmp", "abs", "rand", "srand"}
+const MOTIVO_ARENA_POOL: str = "Arena e Pool nao atravessam a fronteira C: cada DLL tem o seu proprio alocador (o handle so vale na Forja que o criou); use a Arena dentro do proc e devolva o resultado por ^T alocado com alloc = heap"
+const MOTIVO_ALLOCATOR: str = "Allocator nao atravessa a fronteira C: e o alocador do runtime da Forja (cada DLL tem o seu); tire o parametro alloc: Allocator do proc exportado e aloque dentro dele com alloc = heap"
+const MOTIVO_PROC_EXPORT: str = "tipo proc(...) nao sai pela DLL: o .h nao tem ponteiro de funcao da Forja; exporte o proc e deixe o chamador guardar o endereco"
+const EXTENSOES: [4]str = {".dll", ".a", ".lib", ".so"} // static const char *const EXTENSOES[] de ExtensaoDeBiblioteca (G3: tabela local do C vira const do arquivo)
+
+// snprintf(buf, cap, "%s", texto) e devolve o que ficou em buf: corte em cap - 1 bytes. Texto de motivo sem dono que o libere = alloc frame (R-S8), como o char * de buf do C.
+proc motivo_em_buffer(buf: []u8, cap: u64, texto: str) -> str {
+    let janela: []u8 = buf[0..<(cap as int)]
+    _ = common.c2f_snprintf(janela, texto)
+    return from_bytes(janela[0..<common.c2f_strlen_b(janela)], alloc = frame)
+}
+
+// C: semantic/sem_export.c:53
+proc nome_proibido(nome: str) -> bool {
+    for k in (0 as u64)..<(632 / 8) { // C2F: sizeof NOMES_PROIBIDOS C2F: sizeof NOMES_PROIBIDOS [ 0 ]
+        if nome == NOMES_PROIBIDOS[k] {
+            return true
+        }
+    }
+    return common.c2f_prefixo_igual(nome, "fj_", 3) or common.c2f_prefixo_igual(nome, "forja_", 6)
+}
+
+// C: semantic/sem_export.c:73
+proc eh_arena_ou_pool(s: ^Semantica, t: u32) -> bool {
+    return ((s.tipo_arena != 0) and (t == s.tipo_arena)) or ((s.tipo_pool != 0) and (t == s.tipo_pool))
+}
+
+// C: semantic/sem_export.c:80
+proc motivo_do_campo(s: ^Semantica, t: u32, devolvido: bool, buf: []u8, cap: u64) -> ?str {
+    var t_v: u32 = t
+    if eh_arena_ou_pool(s, t_v) {
+        return MOTIVO_ARENA_POOL
+    }
+    if (common.c2f_s2u_32(tipo_classe_de(&s.tipos, t_v)) == (TC_STRUCT as u32)) and (not s.abi_foreign) {
+        return "struct dentro de struct ainda nao sai no .h"
+    }
+    if (common.c2f_s2u_32(tipo_classe_de(&s.tipos, t_v)) == (TC_ARRAY as u32)) and (common.c2f_b2i32(s.abi_foreign) != 0) {
+        while common.c2f_s2u_32(tipo_classe_de(&s.tipos, t_v)) == (TC_ARRAY as u32) {
+            t_v = tipo_de(&s.tipos, t_v).a
+        }
+    }
+    return motivo_fora_da_abi(s, t_v, devolvido, buf, cap)
+}
+
+// C: semantic/sem_export.c:91
+proc motivo_da_struct(s: ^Semantica, tipo: u32, devolvido: bool, buf: []u8, cap: u64) -> ?str {
+    let est: ?^frontend.Decl = sem_decl_da_struct(s, tipo)
+    if est == none {
+        return "struct sem declaracao"
+    }
+    for k in (0 as u32)..<(est as ^frontend.Decl).ncampos {
+        let campo: ^frontend.Campo = &((est as ^frontend.Decl).campos or_else {})[k]
+        var interno: [256]u8 = {}
+        let motivo: ?str = motivo_do_campo(s, campo.tipo.tipo, devolvido, interno[..], 256)
+        if motivo == none {
+            continue
+        }
+        let motivo_texto: str = motivo or_else ""
+        let campo_tipo = sem_descrever_str(s, campo.tipo.tipo)
+        defer delete(campo_tipo)
+        let texto = format(f"o campo '{sem_nome_texto(s, campo.nome)}' e {campo_tipo}: {motivo_texto}", alloc = heap)
+        defer delete(texto)
+        return motivo_em_buffer(buf, cap, texto)
+    }
+    return none
+}
+
+// C: semantic/sem_export.c:109
+proc motivo_do_proc(s: ^Semantica, tipo: u32, buf: []u8, cap: u64) -> ?str {
+    let n: u32 = tipo_proc_qtd(&s.tipos, tipo)
+    let ret: u32 = tipo_de(&s.tipos, tipo).a
+    for k in (0 as u32)..=n {
+        var t: u32 = ret
+        if k < n {
+            t = tipo_proc_param(&s.tipos, tipo, k)
+        }
+        if (k == n) and (ret == (TIPO_VAZIO as u32)) {
+            break
+        }
+        var interno: [256]u8 = {}
+        let motivo: ?str = motivo_fora_da_abi(s, t, false, interno[..], 256)
+        if motivo == none {
+            continue
+        }
+        let motivo_texto: str = motivo or_else ""
+        let texto = sem_descrever_str(s, t)
+        defer delete(texto)
+        if k < n {
+            let msg_1 = format(f"o parametro {k + 1} do callback e {texto}: {motivo_texto}", alloc = heap)
+            defer delete(msg_1)
+            return motivo_em_buffer(buf, cap, msg_1)
+        }
+        let msg_2 = format(f"o retorno do callback e {texto}: {motivo_texto}", alloc = heap)
+        defer delete(msg_2)
+        return motivo_em_buffer(buf, cap, msg_2)
+    }
+    return none
+}
+
+// C: semantic/sem_export.c:129
+proc motivo_fora_da_abi(s: ^Semantica, tipo: u32, devolvido: bool, buf: []u8, cap: u64) -> ?str {
+    let info: ^TipoInfo = tipo_de(&s.tipos, tipo)
+    let classe: i32 = info.classe as i32
+    if classe == TC_BOOL or classe == TC_I32 or classe == TC_INT or classe == TC_REAL or classe == TC_ENUM or classe == TC_RAWPTR or classe == TC_I8 or classe == TC_I16 or classe == TC_U8 or classe == TC_U16 or classe == TC_U32 or classe == TC_UINT or classe == TC_F64 {
+        return none
+    } else if classe == TC_CSTR {
+        if devolvido {
+            return "cstr devolvido so sai com return format_c(..., alloc = heap) direto; dentro de struct nao atravessa"
+        }
+        return none
+    } else if classe == TC_TEXTO {
+        return "use cstr"
+    } else if classe == TC_STRUCT {
+        if eh_arena_ou_pool(s, tipo) {
+            return MOTIVO_ARENA_POOL
+        }
+        if sem_eh_allocator(s, tipo) {
+            return MOTIVO_ALLOCATOR
+        }
+        return motivo_da_struct(s, tipo, devolvido, buf, cap)
+    } else if classe == TC_ARRAY {
+        return "array nao atravessa a fronteira C nesta versao: passe o 1o elemento e o tamanho (dados: ^T, n: u64) e chame com &a[0] e len(a) as u64"
+    } else if classe == TC_FATIA {
+        return "fatia nao atravessa a fronteira C: passe dados: ^T e n: u64 (&s[0], len(s) as u64)"
+    } else if classe == TC_DINAMICO {
+        return "lista [dynamic]T nao atravessa a fronteira C: passe dados: ^T e n: u64 (&l[0], len(l) as u64); a memoria continua da Forja"
+    } else if classe == TC_UNIAO {
+        return "union nao atravessa a fronteira C: passe um enum com a variante e o valor em parametros separados"
+    } else if classe == TC_OPCIONAL {
+        if tipo_opcional_nicho(&s.tipos, tipo) {
+            return motivo_fora_da_abi(s, TIPO_CSTR as u32, devolvido, buf, cap)
+        }
+        return "?T nao atravessa a fronteira C: use ?^T (ponteiro ou none) ou devolva bool e grave o valor por ^T"
+    } else if classe == TC_TUPLA {
+        return "retorno multiplo nao atravessa a fronteira C: devolva uma struct ou grave por ponteiro (^T)"
+    } else if classe == TC_PROC {
+        return motivo_do_proc(s, tipo, buf, cap)
+    } else if classe == TC_MAPA {
+        return "map nao atravessa a fronteira C: a caixa JSON de DLL chega em versao futura; exporte procs que consultam o map"
+    } else if classe == TC_BIT_SET {
+        return "bit_set nao atravessa a fronteira C nesta versao (a caixa JSON de DLL chega em versao futura): passe os membros como bool ou monte um u64 com has(s, key = ...)"
+    } else if classe == TC_SOA {
+        return "soa nao atravessa a fronteira C: passe cada coluna como dados: ^T e n: u64 (&a.campo[0], len(a) as u64); a caixa JSON de DLL chega em versao futura"
+    } else if classe == TC_MATRIZ {
+        return "matrix nao atravessa a fronteira C nesta versao (a caixa JSON de DLL chega em versao futura): passe ^f32 de &m[0, 0] (ordem por coluna, R*C elementos)"
+    } else if classe == TC_PONTEIRO or classe == TC_ANULAVEL {
+        if eh_arena_ou_pool(s, info.a) {
+            return MOTIVO_ARENA_POOL
+        }
+        if tipo_classe_de(&s.tipos, info.a) == TC_STRUCT {
+            return none // opaca no .h
+        }
+        return motivo_fora_da_abi(s, info.a, false, buf, cap)
+    }
+    return "tipo sem forma fixa em C"
+}
+
+// C: semantic/sem_export.c:172
+proc sem_motivo_do_proc(s: ^Semantica, tipo: u32, buf: []u8, cap: u64) -> ?str {
+    return motivo_do_proc(s, tipo, buf, cap)
+}
+
+// C: semantic/sem_export.c:179
+proc parametro_exportavel(s: ^Semantica, d: ^frontend.Decl, p: ^frontend.Param) -> bool {
+    var buf: [256]u8 = {}
+    var motivo: ?str = none
+    if tipo_classe_de(&s.tipos, p.tipo.tipo) == TC_PROC {
+        motivo = MOTIVO_PROC_EXPORT
+    } else {
+        motivo = motivo_fora_da_abi(s, p.tipo.tipo, false, buf[..], 256)
+    }
+    if motivo == none {
+        return true
+    }
+    let motivo_texto: str = motivo or_else ""
+    let tipo = sem_descrever_str(s, p.tipo.tipo)
+    defer delete(tipo)
+    let msg_1 = format(f"o parametro '{sem_nome_texto(s, p.nome)}' do proc exportado '{sem_nome_texto(s, d.nome)}' tem tipo '{tipo}', que nao atravessa a fronteira C: {motivo_texto}", alloc = heap)
+    defer delete(msg_1)
+    return sem_erro(s, common.E0901, p.pos, msg_1)
+}
+
+// C: semantic/sem_export.c:191
+proc retorno_exportavel(s: ^Semantica, d: ^frontend.Decl) -> bool {
+    var buf: [256]u8 = {}
+    if not d.tem_retorno {
+        return true
+    }
+    if (d.retorno.tipo == (TIPO_CSTR as u32)) or ((tipo_classe_de(&s.tipos, d.retorno.tipo) == TC_OPCIONAL) and tipo_opcional_nicho(&s.tipos, d.retorno.tipo)) {
+        return true // D20: os returns sao conferidos em SemReturn
+    }
+    var motivo: ?str = none
+    if tipo_classe_de(&s.tipos, d.retorno.tipo) == TC_PROC {
+        motivo = MOTIVO_PROC_EXPORT
+    } else {
+        motivo = motivo_fora_da_abi(s, d.retorno.tipo, true, buf[..], 256)
+    }
+    if motivo == none {
+        return true
+    }
+    let motivo_texto: str = motivo or_else ""
+    let tipo = sem_descrever_str(s, d.retorno.tipo)
+    defer delete(tipo)
+    let msg_1 = format(f"o retorno do proc exportado '{sem_nome_texto(s, d.nome)}' tem tipo '{tipo}', que nao atravessa a fronteira C: {motivo_texto}", alloc = heap)
+    defer delete(msg_1)
+    return sem_erro(s, common.E0901, d.retorno.pos, msg_1)
+}
+
+// C: semantic/sem_export.c:208
+proc sem_checar_exportado(s: ^Semantica, d: ^frontend.Decl) -> bool {
+    if not d.exportado {
+        return true
+    }
+    if nome_proibido(sem_nome_texto(s, d.nome)) {
+        let msg_1 = format(f"o nome '{sem_nome_texto(s, d.nome)}' nao pode ser exportado: e palavra ou nome do C, ou comeca com fj_ ou forja_", alloc = heap)
+        defer delete(msg_1)
+        return sem_erro(s, common.E0902, d.pos, msg_1)
+    }
+    var i: u32 = 0
+    while i < d.nparams {
+        if not parametro_exportavel(s, d, &(d.params or_else {})[i]) {
+            return false
+        }
+        i += 1
+    }
+    return retorno_exportavel(s, d)
+}
+
+// C: semantic/sem_export.c:224
+proc caractere_invalido_de_biblioteca(nome: str, tam: u32) -> i32 {
+    for k in (0 as u32)..<tam {
+        let c: u8 = nome[k]
+        let alnum: bool = ((((c as i32) >= 65) and ((c as i32) <= 90)) or (((c as i32) >= 97) and ((c as i32) <= 122))) or (((c as i32) >= 48) and ((c as i32) <= 57)) // 'A' 'Z' 'a' 'z' '0' '9'
+        let outro: bool = (((c == 95) or (c == 46)) or (c == 43)) or (c == 45) // '_' '.' '+' '-'
+        if (not alnum) and (not ((k > 0) and (common.c2f_b2i32(outro) != 0))) {
+            return transmute(k, to = i32)
+        }
+    }
+    return -1
+}
+
+// C: semantic/sem_export.c:236
+proc extensao_de_biblioteca(nome: str, tam: u32) -> u32 {
+    for k in 0..<len(EXTENSOES) {
+        let ext: str = EXTENSOES[k]
+        let t: u32 = len(ext) as u32
+        if tam > t {
+            // strcmp(nome + tam - t, ext) == 0: o resto do nome (ate o NUL) e igual a extensao
+            var igual: bool = common.c2f_nul_em(nome, tam as int) == 0 // o NUL depois da extensao
+            for i in 0..<len(ext) {
+                if common.c2f_nul_em(nome, (tam - t) as int + i) != ext[i] {
+                    igual = false
+                }
+            }
+            if igual {
+                return t
+            }
+        }
+    }
+    return 0
+}
+
+// C: semantic/sem_export.c:247
+proc nome_de_biblioteca_valido(s: ^Semantica, d: ?^frontend.Decl) -> bool {
+    let dd: ^frontend.Decl = d as ^frontend.Decl
+    let nome: str = sem_nome_texto(s, dd.nome)
+    let tam: u32 = common.interner_tam(nomes_da_sem(s), dd.nome)
+    if tam == 0 {
+        return sem_erro(s, common.E0905, dd.pos, "o nome da biblioteca esta vazio: escreva link \"m\"")
+    }
+    if tam > 64 {
+        return sem_erro(s, common.E0905, dd.pos, "o nome da biblioteca passa de 64 bytes")
+    }
+    let ruim: i32 = caractere_invalido_de_biblioteca(nome, tam)
+    if ruim >= 0 {
+        let c: u8 = nome[ruim]
+        var visivel: u8 = 63 // '?'
+        if (c >= 32) and (c <= 126) { // 0x20 0x7E
+            visivel = c
+        }
+        let texto_c = common.c2f_byte_texto(visivel)
+        defer delete(texto_c)
+        let msg_1 = format(f"o nome da biblioteca '{nome}' tem o caractere '{texto_c}', que nao vale: so letras, digitos, '_', '.', '+' e '-' (o 1o e letra ou digito); caminho e pasta nao entram: a biblioteca fica na pasta do .fj ou nas pastas do gcc", alloc = heap)
+        defer delete(msg_1)
+        return sem_erro(s, common.E0905, dd.pos, msg_1)
+    }
+    let ext: u32 = extensao_de_biblioteca(nome, tam)
+    if ext > 0 {
+        let sem_extensao = common.c2f_cortar(nome, (tam - ext) as int)
+        defer delete(sem_extensao)
+        let msg_2 = format(f"escreva so o nome, sem extensao: link \"{sem_extensao}\"", alloc = heap)
+        defer delete(msg_2)
+        return sem_erro(s, common.E0905, dd.pos, msg_2)
+    }
+    return true
+}
+
+// C: semantic/sem_export.c:265
+proc tipo_de_foreign_atravessa(s: ^Semantica, tipo: u32, pos: u32, oque: str, proc_c: str) -> bool {
+    var buf: [256]u8 = {}
+    s.abi_foreign = true
+    let motivo: ?str = motivo_fora_da_abi(s, tipo, false, buf[..], 256)
+    s.abi_foreign = false
+    if motivo == none {
+        return true
+    }
+    let motivo_texto: str = motivo or_else ""
+    let texto = sem_descrever_str(s, tipo)
+    defer delete(texto)
+    let msg_1 = format(f"{oque} do proc foreign '{proc_c}' tem tipo '{texto}', que nao atravessa a fronteira C: {motivo_texto}", alloc = heap)
+    defer delete(msg_1)
+    return sem_erro(s, common.E0904, pos, msg_1)
+}
+
+// C: semantic/sem_export.c:277
+proc erro_simbolo_c_de_alias(s: ^Semantica, nome: i32, pos: u32) -> bool {
+    let msg_1 = format(f"'{sem_nome_texto(s, nome)}' e o simbolo C de um proc foreign com alias; so outro proc foreign sem alias pode ter esse nome (os aliases e ele ligam o mesmo simbolo C); use outro nome", alloc = heap)
+    defer delete(msg_1)
+    _ = sem_erro(s, common.E0202, pos, msg_1)
+    sem_sugerir_renomear_proc(s, nome, pos)
+    return false
+}
+
+// C: semantic/sem_export.c:285
+proc simbolo_c_eh_identificador(texto: str, tam: u32) -> bool {
+    if tam == 0 {
+        return false
+    }
+    let c0: u8 = texto[0]
+    let letra: bool = ((c0 >= 65) and (c0 <= 90)) or ((c0 >= 97) and (c0 <= 122)) // isalpha em locale C
+    if not (letra or (c0 == 95)) { // '_'
+        return false
+    }
+    for i in (1 as u32)..<tam {
+        if not char_de_nome(texto[i]) { // isalnum(c) || c == '_'
+            return false
+        }
+    }
+    return true
+}
+
+// C: semantic/sem_export.c:295
+proc slot_do_simbolo_c(s: ^Semantica, modulo: u8, simbolo: i32, criar: bool) -> ?^u8 {
+    var por_modulo: u64 = 1
+    if s.qtd_modulos > 1 {
+        por_modulo = s.qtd_modulos as u64
+    }
+    if s.simbolo_c_usado == none {
+        if not criar {
+            return none
+        }
+        s.simbolo_c_usado = common.arena_fatia_u8(s.arena as ^common.Arena, ((s.qtd_nomes as u64) * por_modulo) as int) // a arena vem zerada
+    }
+    var base: u64 = 0
+    if s.qtd_modulos > 1 {
+        base = (modulo as u64) * (s.qtd_nomes as u64)
+    }
+    return &(s.simbolo_c_usado or_else {})[base + common.c2f_s2u_64(simbolo as i64)]
+}
+
+// C: semantic/sem_export.c:305
+proc sem_simbolo_c_eh_alias(s: ^Semantica, modulo: u8, nome: i32) -> bool {
+    let usado: ?^u8 = slot_do_simbolo_c(s, modulo, nome, false)
+    return (usado != none) and ((usado as ^u8)^ != 0)
+}
+
+// C: semantic/sem_export.c:313
+proc conferir_alias_do_simbolo(s: ^Semantica, d: ^frontend.Decl) -> bool {
+    let texto: str = sem_nome_texto(s, d.simbolo)
+    if not simbolo_c_eh_identificador(texto, common.interner_tam(nomes_da_sem(s), d.simbolo)) {
+        let msg_1 = format(f"o simbolo C \"{texto}\" nao e um identificador C (letras, digitos e '_', sem comecar por digito)", alloc = heap)
+        defer delete(msg_1)
+        return sem_erro(s, common.E0905, d.pos_simbolo, msg_1)
+    }
+    if d.simbolo == d.nome {
+        return true
+    }
+    let y: ^Simbolo = &(s.globais or_else {})[d.simbolo]
+    if (d.modulo == 0) and (y.categoria != (SIM_NENHUM as u8)) and (y.categoria != (SIM_PROC_EMBUTIDO as u8)) and (not simbolo_eh_foreign_direto(y)) { // IA1-L8: so a raiz tem nome Forja sem prefixo; 0.45.0: o proc foreign sem alias do mesmo simbolo C nao colide (liga o mesmo simbolo)
+        let msg_2 = format(f"o simbolo C \"{texto}\" ja e o nome de um tipo, constante ou proc da Forja que nao e foreign (o alias e esse nome ligariam coisas diferentes)", alloc = heap)
+        defer delete(msg_2)
+        _ = sem_erro(s, common.E0202, d.pos_simbolo, msg_2)
+        sem_sugerir_so_dica(s, common.E0202, "renomeie o tipo, a constante ou o proc da Forja que usa o simbolo C do alias")
+        return false
+    }
+    let usado: ^u8 = slot_do_simbolo_c(s, d.modulo, d.simbolo, true) as ^u8 // 0.45.0: varios aliases do mesmo simbolo C valem (a assinatura e conferida por ABI em conferir_assinatura_do_simbolo_c)
+    usado^ = 1
+    return true
+}
+
+// 0.45.0: o global y e um proc foreign declarado pelo proprio nome do simbolo C (sem alias)
+proc simbolo_eh_foreign_direto(y: ^Simbolo) -> bool {
+    if y.decl == none {
+        return false
+    }
+    let dy: ^frontend.Decl = y.decl as ^frontend.Decl
+    return dy.externo and (dy.simbolo < 0)
+}
+
+// C: semantic/sem_export.c:337
+proc ponteiro_opaco_equivalente(s: ^Semantica, a: u32, b: u32) -> bool {
+    let ka: ^TipoInfo = tipo_de(&s.tipos, a)
+    let kb: ^TipoInfo = tipo_de(&s.tipos, b)
+    if (ka.classe as i32) != (kb.classe as i32) {
+        return false
+    }
+    if (ka.classe != (TC_PONTEIRO as u8)) and (ka.classe != (TC_ANULAVEL as u8)) {
+        return false
+    }
+    return (common.c2f_b2i32(sem_tipo_eh_opaco(s, ka.a)) != 0) and (common.c2f_b2i32(sem_tipo_eh_opaco(s, kb.a)) != 0)
+}
+
+// 0.45.0: classe de ABI de um tipo na fronteira C: inteiro por tamanho (ponteiro, cstr, rawptr e proc contam como inteiro de 64 bits), f32 e f64 a parte; -1 = sem classe (struct, enum...: vale a regra de tipo igual)
+proc classe_abi_do_tipo(s: ^Semantica, t: u32) -> i32 {
+    if tipo_eh_familia_ponteiro(&s.tipos, t) or (tipo_classe_de(&s.tipos, t) == TC_PROC) or tipo_opcional_nicho(&s.tipos, t) {
+        return 164
+    }
+    if tipo_eh_inteiro(t) {
+        return 100 + (tipo_largura_bits(&s.tipos, t) as i32)
+    }
+    if t == (TIPO_F64 as u32) {
+        return 2
+    }
+    if tipo_eh_real(&s.tipos, t) {
+        return 1
+    }
+    return -1
+}
+
+// C: semantic/sem_export.c:347 (0.45.0: compativel de ABI no lugar de tipo identico)
+proc tipo_igual_abi(s: ^Semantica, a: u32, b: u32) -> bool {
+    if a == b {
+        return true
+    }
+    let ca: i32 = classe_abi_do_tipo(s, a)
+    let cb: i32 = classe_abi_do_tipo(s, b)
+    if (ca >= 0) and (cb >= 0) {
+        return ca == cb
+    }
+    return common.c2f_b2i32(ponteiro_opaco_equivalente(s, a, b)) != 0
+}
+
+// C: semantic/sem_export.c:352
+proc assinaturas_iguais(s: ^Semantica, a: ?^frontend.Decl, b: ^frontend.Decl) -> bool {
+    if ((a as ^frontend.Decl).nparams != b.nparams) or (common.c2f_b2i32((a as ^frontend.Decl).tem_retorno) != common.c2f_b2i32(b.tem_retorno)) {
+        return false
+    }
+    var i: u32 = 0
+    while i < (a as ^frontend.Decl).nparams {
+        if not tipo_igual_abi(s, ((a as ^frontend.Decl).params or_else {})[i].tipo.tipo, (b.params or_else {})[i].tipo.tipo) {
+            return false
+        }
+        i += 1
+    }
+    return (not (a as ^frontend.Decl).tem_retorno) or (common.c2f_b2i32(tipo_igual_abi(s, (a as ^frontend.Decl).retorno.tipo, b.retorno.tipo)) != 0)
+}
+
+// C: semantic/sem_export.c:362
+proc conferir_assinatura_do_simbolo_c(s: ^Semantica, d: ^frontend.Decl) -> bool {
+    var simbolo: i32 = d.nome
+    if d.simbolo >= 0 {
+        simbolo = d.simbolo
+    }
+    if s.simbolo_c_decl == none {
+        s.simbolo_c_decl = frontend.arena_fatia_ptr_decl(s.arena as ^common.Arena, s.qtd_nomes as int)
+    }
+    let tabela: []?^frontend.Decl = s.simbolo_c_decl or_else {}
+    let antes: ?^frontend.Decl = tabela[simbolo]
+    if antes == none {
+        tabela[simbolo] = d
+        return true
+    }
+    if (antes == d) or assinaturas_iguais(s, antes, d) { // 0.45.0: tambem dentro do mesmo modulo, por ABI
+        return true
+    }
+    let texto: str = sem_nome_texto(s, simbolo)
+    var onde: str = "o arquivo raiz"
+    if (antes as ^frontend.Decl).modulo != 0 {
+        onde = sem_nome_texto(s, modulos_da_sem(s).itens[(antes as ^frontend.Decl).modulo].apelido)
+    }
+    var pos_erro: u32 = d.pos
+    if d.simbolo >= 0 {
+        pos_erro = d.pos_simbolo
+    }
+    let msg_1 = format(f"o simbolo C \"{texto}\" ja e declarado como proc '{sem_nome_texto(s, (antes as ^frontend.Decl).nome)}' ({onde}) com outra assinatura; o mesmo simbolo C declarado mais de uma vez exige a mesma aridade e a mesma ABI (inteiros do mesmo tamanho, ponteiro como inteiro de 64 bits, f32 e f64 a parte)", alloc = heap)
+    defer delete(msg_1)
+    _ = sem_erro(s, common.E0202, pos_erro, msg_1)
+    sem_sugerir_so_dica(s, common.E0202, "copie a assinatura do proc foreign que ja declara esse simbolo C, ou use outro simbolo")
+    return false
+}
+
+// C: semantic/sem_export.c:382
+proc sem_checar_externo(s: ^Semantica, d: ^frontend.Decl) -> bool {
+    let nome: str = sem_nome_texto(s, d.nome)
+    var simbolo: str = nome // v1.10: o que vai ao C
+    if d.simbolo >= 0 {
+        simbolo = sem_nome_texto(s, d.simbolo)
+    }
+    s.tem_externo = true
+    var da_std: bool = false // foreign interno da std: forja_* vale (D13)
+    if d.modulo != 0 {
+        da_std = modulos_da_sem(s).itens[d.modulo].origem == (frontend.MOD_STD as u8)
+    }
+    if (simbolo == "main") or common.c2f_prefixo_igual(simbolo, "fj_", 3) or ((not da_std) and common.c2f_prefixo_igual(simbolo, "forja_", 6)) {
+        var pos_erro: u32 = d.pos
+        if d.simbolo >= 0 {
+            pos_erro = d.pos_simbolo
+        }
+        let msg_1 = format(f"o proc foreign '{simbolo}' colidiria com o C gerado: 'main' e nomes que comecam com fj_ ou forja_ sao do compilador", alloc = heap)
+        defer delete(msg_1)
+        return sem_erro(s, common.E0905, pos_erro, msg_1)
+    }
+    if (d.simbolo >= 0) and (not conferir_alias_do_simbolo(s, d)) {
+        return false
+    }
+    for i in (0 as u32)..<d.nparams {
+        let param: ^frontend.Param = &(d.params or_else {})[i]
+        let oque_inteiro = format(f"o parametro '{sem_nome_texto(s, param.nome)}'", alloc = heap)
+        defer delete(oque_inteiro)
+        let oque = common.c2f_cortar(oque_inteiro, 95) // char oque[96]
+        defer delete(oque)
+        if not tipo_de_foreign_atravessa(s, param.tipo.tipo, param.pos, oque, nome) {
+            return false
+        }
+    }
+    if d.tem_retorno and (not tipo_de_foreign_atravessa(s, d.retorno.tipo, d.retorno.pos, "o retorno", nome)) {
+        return false
+    }
+    return conferir_assinatura_do_simbolo_c(s, d)
+}
+
+// C: semantic/sem_export.c:404
+proc conferir_so_na_raiz(s: ^Semantica, d: ?^frontend.Decl) -> bool {
+    let dd: ^frontend.Decl = d as ^frontend.Decl
+    if dd.modulo == 0 {
+        return true
+    }
+    if dd.exportado {
+        return sem_erro(s, common.E1004, dd.pos, "'export' so vale no arquivo raiz (a DLL exporta os procs do arquivo que o forja recebe)")
+    }
+    if (dd.tipo_no == (frontend.D_PROC as u8)) and (dd.nome == frontend.SYM_MAIN) {
+        let msg_1 = format(f"'main' so vale no arquivo raiz; este arquivo e o modulo \"{sem_nome_texto(s, modulos_da_sem(s).itens[dd.modulo].caminho)}\"", alloc = heap)
+        defer delete(msg_1)
+        return sem_erro(s, common.E1004, dd.pos, msg_1)
+    }
+    return true
+}
+
+// C: semantic/sem_export.c:419
+proc sem_checar_modificadores(s: ^Semantica, categorias: ^u32) -> bool {
+    var presentes: u32 = 0
+    var d: ?^frontend.Decl = (s.programa as ^frontend.Programa).primeira
+    while d != none {
+        presentes = presentes | (1 << (common.c2f_s2u_32(((d as ^frontend.Decl).tipo_no as i32)) & 31))
+        if ((common.c2f_b2i32((d as ^frontend.Decl).externo) != 0) or ((d as ^frontend.Decl).tipo_no == (frontend.D_LINK as u8))) and (common.c2f_b2i32((d as ^frontend.Decl).exportado) != 0) {
+            let msg_1 = format(f"'export' nao vale em foreign: quem exporta e a Forja, por 'pub export proc'; 'pub foreign' deixa os procs visiveis a quem importa o modulo", alloc = heap)
+            defer delete(msg_1)
+            return sem_erro(s, common.E0906, (d as ^frontend.Decl).pos, msg_1)
+        }
+        if not conferir_so_na_raiz(s, d) {
+            return false
+        }
+        if ((d as ^frontend.Decl).tipo_no == (frontend.D_LINK as u8)) and (not nome_de_biblioteca_valido(s, d)) {
+            return false
+        }
+        if (common.c2f_b2i32((d as ^frontend.Decl).exportado) != 0) and (not (d as ^frontend.Decl).publico) {
+            let msg_2 = format(f"'export' precisa de 'pub' antes: escreva 'pub export proc {sem_nome_texto(s, (d as ^frontend.Decl).nome)}'", alloc = heap)
+            defer delete(msg_2)
+            return sem_erro(s, common.E0903, (d as ^frontend.Decl).pos, msg_2)
+        }
+        if (common.c2f_b2i32((d as ^frontend.Decl).exportado) != 0) and ((d as ^frontend.Decl).tipo_no != (frontend.D_PROC as u8)) {
+            let msg_3 = format(f"'export' so vale em proc; esta declaracao nao e um proc", alloc = heap)
+            defer delete(msg_3)
+            return sem_erro(s, common.E0903, (d as ^frontend.Decl).pos, msg_3)
+        }
+        if (common.c2f_b2i32((d as ^frontend.Decl).publico) != 0) and ((d as ^frontend.Decl).tipo_no == (frontend.D_TEST as u8)) {
+            let msg_4 = format(f"'pub' nao vale em test", alloc = heap)
+            defer delete(msg_4)
+            return sem_erro(s, common.E0903, (d as ^frontend.Decl).pos, msg_4)
+        }
+        d = (d as ^frontend.Decl).prox
+    }
+    categorias^ = presentes
+    return true
+}
+
+// G3 S7: funcoes puras do export: lista de nomes proibidos (79 entradas do C), caracteres/extensao de biblioteca, identificador de simbolo C e corte do buffer de motivo
+test "sem_export: nomes proibidos, biblioteca, identificador e buffer" {
+    expect(len(NOMES_PROIBIDOS) == 79 and NOMES_PROIBIDOS[0] == "auto" and NOMES_PROIBIDOS[34] == "bool" and NOMES_PROIBIDOS[46] == "main" and NOMES_PROIBIDOS[78] == "srand")
+    var todos: bool = true
+    for k in 0..<len(NOMES_PROIBIDOS) {
+        if not nome_proibido(NOMES_PROIBIDOS[k]) {
+            todos = false
+        }
+    }
+    expect(todos)
+    expect(nome_proibido("fj_x") and nome_proibido("fj_") and nome_proibido("forja_y") and nome_proibido("forja_"))
+    expect(not nome_proibido("foo") and not nome_proibido("fj") and not nome_proibido("forja") and not nome_proibido("Auto") and not nome_proibido("main2") and not nome_proibido("") and not nome_proibido("fjx") and not nome_proibido("forjax"))
+    expect(caractere_invalido_de_biblioteca("m", 1) == -1 and caractere_invalido_de_biblioteca("-m", 2) == 0 and caractere_invalido_de_biblioteca("m x", 3) == 1)
+    expect(caractere_invalido_de_biblioteca("9lib", 4) == -1 and caractere_invalido_de_biblioteca("ab/", 3) == 2 and caractere_invalido_de_biblioteca("ab/", 2) == -1)
+    expect(caractere_invalido_de_biblioteca("a-b_c.d+e", 9) == -1 and caractere_invalido_de_biblioteca(".a", 2) == 0 and caractere_invalido_de_biblioteca("_a", 2) == 0 and caractere_invalido_de_biblioteca("a@", 2) == 1)
+    expect(caractere_invalido_de_biblioteca("Z9", 2) == -1 and caractere_invalido_de_biblioteca("a{", 2) == 1 and caractere_invalido_de_biblioteca("a[", 2) == 1 and caractere_invalido_de_biblioteca("a:", 2) == 1)
+    expect(extensao_de_biblioteca("foo.dll", 7) == 4 and extensao_de_biblioteca("foo.a", 5) == 2 and extensao_de_biblioteca("foo.lib", 7) == 4 and extensao_de_biblioteca("foo.so", 6) == 3)
+    expect(extensao_de_biblioteca(".dll", 4) == 0 and extensao_de_biblioteca(".a", 2) == 0 and extensao_de_biblioteca("x.lib.a", 7) == 2 and extensao_de_biblioteca("m.DLL", 5) == 0)
+    expect(extensao_de_biblioteca("m", 1) == 0 and extensao_de_biblioteca("m.dl", 4) == 0 and extensao_de_biblioteca("m.dlla", 6) == 0 and extensao_de_biblioteca("m.dl.a", 6) == 2 and extensao_de_biblioteca("m.so", 4) == 3)
+    expect(simbolo_c_eh_identificador("abc", 3) and simbolo_c_eh_identificador("_x9", 3) and simbolo_c_eh_identificador("A", 1) and not simbolo_c_eh_identificador("", 0))
+    expect(not simbolo_c_eh_identificador("9x", 2) and not simbolo_c_eh_identificador("a-b", 3) and not simbolo_c_eh_identificador("a b", 3) and simbolo_c_eh_identificador("ab-", 2))
+    var buf: [16]u8 = {}
+    expect(motivo_em_buffer(buf[..], 16, "curto") == "curto")
+    expect(motivo_em_buffer(buf[..], 6, "abcdefghij") == "abcde" and motivo_em_buffer(buf[..], 16, "") == "")
+    expect(motivo_em_buffer(buf[..], 16, "123456789012345678") == "123456789012345")
+}
+
+// G3 S7: texto exato (copiado do C) do ultimo diagnostico
+proc sem_export_teste_diag(dg: ^common.Diag, codigo: i32, off: u32, causa: str) -> bool {
+    return dg.tem and (dg.codigo == codigo) and (dg.off == off) and ((dg.causa or_else "") == causa)
+}
+
+// G3 S7: motivo_fora_da_abi por classe, campos de struct, callback, procs exportados e retorno, com Semantica e tipos montados a mao
+test "sem_export: motivos da ABI e procs exportados" {
+    var arena: common.Arena = common.Arena{}
+    var nomes: common.Interner = common.Interner{}
+    var dims: DimTabela = DimTabela{}
+    var dg: common.Diag = common.Diag{}
+    var sv: Semantica = Semantica{}
+    common.interner_iniciar(&nomes, &arena)
+    dim_iniciar(&dims)
+    sv.nomes = slice_from(&nomes, len = 1)
+    sv.arena = &arena
+    sv.diag = &dg
+    tipos_iniciar(&sv.tipos, &nomes, &dims)
+    let n_foo = common.internar(&nomes, "Foo", 3)
+    let n_bar = common.internar(&nomes, "Bar", 3)
+    let n_nest = common.internar(&nomes, "Nest", 4)
+    let n_arrs = common.internar(&nomes, "ArrS", 4)
+    let n_arena = common.internar(&nomes, "Arena", 5)
+    let n_alloc = common.internar(&nomes, "Allocator", 9)
+    let n_uni = common.internar(&nomes, "Uni", 3)
+    let n_enu = common.internar(&nomes, "Cor", 3)
+    let n_a = common.internar(&nomes, "a", 1)
+    let n_b = common.internar(&nomes, "b", 1)
+    let n_p = common.internar(&nomes, "p", 1)
+    let n_ok = common.internar(&nomes, "ok", 2)
+    let n_main = common.internar(&nomes, "main", 4)
+    let n_fjx = common.internar(&nomes, "fj_zz", 5)
+    expect(len(nomes.nomes) < 120)
+    var gl = make([dynamic]Simbolo, alloc = heap)
+    defer delete(gl)
+    for _k in 0..<128 {
+        append(&gl, item = Simbolo{})
+    }
+    sv.globais = gl[0..<len(gl)]
+    sv.qtd_nomes = 128
+    var f1: common.Fonte = sem_allocator_teste_fonte("0123456789012345678901234567890123456789")
+    defer delete(f1.dono_texto)
+    sv.fonte = &f1
+    let ti: u32 = TIPO_INT as u32
+    let tt: u32 = TIPO_TEXTO as u32
+    let tc: u32 = TIPO_CSTR as u32
+    let t_foo: u32 = tipo_struct(&sv.tipos, n_foo)
+    let t_bar: u32 = tipo_struct(&sv.tipos, n_bar)
+    let t_nest: u32 = tipo_struct(&sv.tipos, n_nest)
+    let t_arrs: u32 = tipo_struct(&sv.tipos, n_arrs)
+    let t_arena: u32 = tipo_struct(&sv.tipos, n_arena)
+    let t_alloc: u32 = tipo_struct(&sv.tipos, n_alloc)
+    let arr4: u32 = tipo_array(&sv.tipos, ti, 4)
+    let d_foo: ^frontend.Decl = s4_novo_decl(&sv)
+    let d_bar: ^frontend.Decl = s4_novo_decl(&sv)
+    let d_nest: ^frontend.Decl = s4_novo_decl(&sv)
+    let d_arrs: ^frontend.Decl = s4_novo_decl(&sv)
+    let c_foo = s4_arena_fatia_campo(&sv, 2)
+    c_foo[0].nome = n_a
+    c_foo[0].tipo.tipo = ti
+    c_foo[1].nome = n_b
+    c_foo[1].tipo.tipo = TIPO_I32 as u32
+    d_foo.campos = c_foo
+    d_foo.ncampos = 2
+    let c_bar = s4_arena_fatia_campo(&sv, 2)
+    c_bar[0].nome = n_a
+    c_bar[0].tipo.tipo = ti
+    c_bar[1].nome = n_b
+    c_bar[1].tipo.tipo = tt
+    d_bar.campos = c_bar
+    d_bar.ncampos = 2
+    let c_nest = s4_arena_fatia_campo(&sv, 1)
+    c_nest[0].nome = n_a
+    c_nest[0].tipo.tipo = t_foo
+    d_nest.campos = c_nest
+    d_nest.ncampos = 1
+    let c_arrs = s4_arena_fatia_campo(&sv, 1)
+    c_arrs[0].nome = n_a
+    c_arrs[0].tipo.tipo = arr4
+    d_arrs.campos = c_arrs
+    d_arrs.ncampos = 1
+    let globais = sv.globais or_else {}
+    globais[n_foo] = Simbolo{categoria = SIM_STRUCT as u8, indice = 0, decl = d_foo, tipo = t_foo, envenenado = 0}
+    globais[n_bar] = Simbolo{categoria = SIM_STRUCT as u8, indice = 1, decl = d_bar, tipo = t_bar, envenenado = 0}
+    globais[n_nest] = Simbolo{categoria = SIM_STRUCT as u8, indice = 2, decl = d_nest, tipo = t_nest, envenenado = 0}
+    globais[n_arrs] = Simbolo{categoria = SIM_STRUCT as u8, indice = 3, decl = d_arrs, tipo = t_arrs, envenenado = 0}
+    sv.tipo_arena = t_arena
+    sv.tipo_allocator = t_alloc
+    var buf: [256]u8 = {}
+    expect(motivo_fora_da_abi(&sv, ti, false, buf[..], 256) == none and motivo_fora_da_abi(&sv, TIPO_BOOL as u32, false, buf[..], 256) == none and motivo_fora_da_abi(&sv, TIPO_F32 as u32, true, buf[..], 256) == none)
+    expect(motivo_fora_da_abi(&sv, tc, false, buf[..], 256) == none and (motivo_fora_da_abi(&sv, tc, true, buf[..], 256) or_else "") == "cstr devolvido so sai com return format_c(..., alloc = heap) direto; dentro de struct nao atravessa")
+    expect((motivo_fora_da_abi(&sv, tt, false, buf[..], 256) or_else "") == "use cstr")
+    expect((motivo_fora_da_abi(&sv, arr4, false, buf[..], 256) or_else "") == "array nao atravessa a fronteira C nesta versao: passe o 1o elemento e o tamanho (dados: ^T, n: u64) e chame com &a[0] e len(a) as u64")
+    expect((motivo_fora_da_abi(&sv, tipo_fatia(&sv.tipos, ti), false, buf[..], 256) or_else "") == "fatia nao atravessa a fronteira C: passe dados: ^T e n: u64 (&s[0], len(s) as u64)")
+    expect((motivo_fora_da_abi(&sv, tipo_dinamico(&sv.tipos, ti), false, buf[..], 256) or_else "") == "lista [dynamic]T nao atravessa a fronteira C: passe dados: ^T e n: u64 (&l[0], len(l) as u64); a memoria continua da Forja")
+    expect((motivo_fora_da_abi(&sv, tipo_uniao(&sv.tipos, n_uni), false, buf[..], 256) or_else "") == "union nao atravessa a fronteira C: passe um enum com a variante e o valor em parametros separados")
+    expect(motivo_fora_da_abi(&sv, tipo_enum(&sv.tipos, n_enu), false, buf[..], 256) == none)
+    expect((motivo_fora_da_abi(&sv, tipo_opcional(&sv.tipos, ti), false, buf[..], 256) or_else "") == "?T nao atravessa a fronteira C: use ?^T (ponteiro ou none) ou devolva bool e grave o valor por ^T")
+    let opc_c: u32 = tipo_opcional(&sv.tipos, tc)
+    expect(motivo_fora_da_abi(&sv, opc_c, false, buf[..], 256) == none and (motivo_fora_da_abi(&sv, opc_c, true, buf[..], 256) or_else "") == "cstr devolvido so sai com return format_c(..., alloc = heap) direto; dentro de struct nao atravessa")
+    var elems: [2]u32 = {ti, tt}
+    expect((motivo_fora_da_abi(&sv, tipo_tupla(&sv.tipos, elems[..]), false, buf[..], 256) or_else "") == "retorno multiplo nao atravessa a fronteira C: devolva uma struct ou grave por ponteiro (^T)")
+    expect((motivo_fora_da_abi(&sv, tipo_mapa(&sv.tipos, tt, ti), false, buf[..], 256) or_else "") == "map nao atravessa a fronteira C: a caixa JSON de DLL chega em versao futura; exporte procs que consultam o map")
+    expect((motivo_fora_da_abi(&sv, tipo_resultado(&sv.tipos, ti, tt), false, buf[..], 256) or_else "") == "tipo sem forma fixa em C")
+    expect((motivo_fora_da_abi(&sv, tipo_bit_set(&sv.tipos, tipo_enum(&sv.tipos, n_enu), 3), false, buf[..], 256) or_else "") == "bit_set nao atravessa a fronteira C nesta versao (a caixa JSON de DLL chega em versao futura): passe os membros como bool ou monte um u64 com has(s, key = ...)")
+    expect((motivo_fora_da_abi(&sv, tipo_matriz(&sv.tipos, TIPO_F32 as u32, 2, 2), false, buf[..], 256) or_else "") == "matrix nao atravessa a fronteira C nesta versao (a caixa JSON de DLL chega em versao futura): passe ^f32 de &m[0, 0] (ordem por coluna, R*C elementos)")
+    expect((motivo_fora_da_abi(&sv, tipo_soa(&sv.tipos, t_foo), false, buf[..], 256) or_else "") == "soa nao atravessa a fronteira C: passe cada coluna como dados: ^T e n: u64 (&a.campo[0], len(a) as u64); a caixa JSON de DLL chega em versao futura")
+    expect((motivo_fora_da_abi(&sv, t_arena, false, buf[..], 256) or_else "") == MOTIVO_ARENA_POOL and (motivo_fora_da_abi(&sv, tipo_ponteiro(&sv.tipos, t_arena), false, buf[..], 256) or_else "") == MOTIVO_ARENA_POOL)
+    expect((motivo_fora_da_abi(&sv, tipo_anulavel(&sv.tipos, t_arena), false, buf[..], 256) or_else "") == MOTIVO_ARENA_POOL)
+    expect((motivo_fora_da_abi(&sv, t_alloc, false, buf[..], 256) or_else "") == "Allocator nao atravessa a fronteira C: e o alocador do runtime da Forja (cada DLL tem o seu); tire o parametro alloc: Allocator do proc exportado e aloque dentro dele com alloc = heap")
+    expect(motivo_fora_da_abi(&sv, tipo_ponteiro(&sv.tipos, t_foo), false, buf[..], 256) == none and motivo_fora_da_abi(&sv, tipo_ponteiro(&sv.tipos, t_bar), false, buf[..], 256) == none)
+    expect(motivo_fora_da_abi(&sv, tipo_ponteiro(&sv.tipos, ti), false, buf[..], 256) == none and (motivo_fora_da_abi(&sv, tipo_ponteiro(&sv.tipos, tt), false, buf[..], 256) or_else "") == "use cstr")
+    expect(motivo_fora_da_abi(&sv, tipo_anulavel(&sv.tipos, t_foo), false, buf[..], 256) == none)
+    // struct: campo a campo
+    expect(motivo_fora_da_abi(&sv, t_foo, false, buf[..], 256) == none)
+    expect((motivo_fora_da_abi(&sv, t_bar, false, buf[..], 256) or_else "") == "o campo 'b' e str: use cstr")
+    var curto: [20]u8 = {}
+    expect((motivo_fora_da_abi(&sv, t_bar, false, curto[..], 20) or_else "") == "o campo 'b' e str: ") // cap 20 = 19 bytes
+    expect((motivo_fora_da_abi(&sv, t_nest, false, buf[..], 256) or_else "") == "o campo 'a' e Foo: struct dentro de struct ainda nao sai no .h")
+    expect((motivo_fora_da_abi(&sv, t_arrs, false, buf[..], 256) or_else "") == "o campo 'a' e [4]int: array nao atravessa a fronteira C nesta versao: passe o 1o elemento e o tamanho (dados: ^T, n: u64) e chame com &a[0] e len(a) as u64")
+    sv.abi_foreign = true
+    expect(motivo_fora_da_abi(&sv, t_nest, false, buf[..], 256) == none and motivo_fora_da_abi(&sv, t_arrs, false, buf[..], 256) == none)
+    sv.abi_foreign = false
+    expect((motivo_da_struct(&sv, ti, false, buf[..], 256) or_else "") == "struct sem declaracao")
+    // callback
+    var p_ok: [2]u32 = {ti, TIPO_BOOL as u32}
+    var a_ok: ProcAssinatura = ProcAssinatura{params = p_ok[..], nomes = none, n = 2, retorno = ti}
+    let proc_ok: u32 = tipo_proc(&sv.tipos, &a_ok)
+    var p_txt: [2]u32 = {ti, tt}
+    var a_txt: ProcAssinatura = ProcAssinatura{params = p_txt[..], nomes = none, n = 2, retorno = ti}
+    let proc_txt: u32 = tipo_proc(&sv.tipos, &a_txt)
+    var a_ret: ProcAssinatura = ProcAssinatura{params = p_ok[..], nomes = none, n = 2, retorno = tt}
+    let proc_ret: u32 = tipo_proc(&sv.tipos, &a_ret)
+    var a_vazio: ProcAssinatura = ProcAssinatura{params = p_ok[..], nomes = none, n = 2, retorno = TIPO_VAZIO as u32}
+    let proc_vazio: u32 = tipo_proc(&sv.tipos, &a_vazio)
+    expect(motivo_fora_da_abi(&sv, proc_ok, false, buf[..], 256) == none and motivo_fora_da_abi(&sv, proc_vazio, false, buf[..], 256) == none and sem_motivo_do_proc(&sv, proc_ok, buf[..], 256) == none)
+    expect((motivo_fora_da_abi(&sv, proc_txt, false, buf[..], 256) or_else "") == "o parametro 2 do callback e str: use cstr")
+    expect((sem_motivo_do_proc(&sv, proc_ret, buf[..], 256) or_else "") == "o retorno do callback e str: use cstr")
+    // procs exportados
+    var ps = make([dynamic]frontend.Param, alloc = heap)
+    defer delete(ps)
+    append(&ps, item = frontend.Param{})
+    ps[0].nome = n_p
+    ps[0].pos = 7
+    ps[0].tipo.tipo = ti
+    var d: frontend.Decl = frontend.Decl{}
+    d.exportado = true
+    d.nome = n_ok
+    d.pos = 3
+    d.params = ps[0..<1]
+    d.nparams = 1
+    expect(sem_checar_exportado(&sv, &d) and not dg.tem)
+    d.exportado = false
+    d.nome = n_main
+    expect(sem_checar_exportado(&sv, &d) and not dg.tem)
+    d.exportado = true
+    expect(not sem_checar_exportado(&sv, &d) and sem_export_teste_diag(&dg, common.E0902, 3, "o nome 'main' nao pode ser exportado: e palavra ou nome do C, ou comeca com fj_ ou forja_"))
+    dg = common.Diag{}
+    d.nome = n_fjx
+    expect(not sem_checar_exportado(&sv, &d) and sem_export_teste_diag(&dg, common.E0902, 3, "o nome 'fj_zz' nao pode ser exportado: e palavra ou nome do C, ou comeca com fj_ ou forja_"))
+    dg = common.Diag{}
+    d.nome = n_ok
+    ps[0].tipo.tipo = tt
+    expect(not sem_checar_exportado(&sv, &d) and sem_export_teste_diag(&dg, common.E0901, 7, "o parametro 'p' do proc exportado 'ok' tem tipo 'str', que nao atravessa a fronteira C: use cstr"))
+    dg = common.Diag{}
+    ps[0].tipo.tipo = proc_ok
+    expect(not sem_checar_exportado(&sv, &d) and sem_export_teste_diag(&dg, common.E0901, 7, "o parametro 'p' do proc exportado 'ok' tem tipo 'proc(int, bool) -> int', que nao atravessa a fronteira C: tipo proc(...) nao sai pela DLL: o .h nao tem ponteiro de funcao da Forja; exporte o proc e deixe o chamador guardar o endereco"))
+    dg = common.Diag{}
+    ps[0].tipo.tipo = ti
+    d.tem_retorno = true
+    d.retorno.tipo = tc
+    d.retorno.pos = 11
+    expect(sem_checar_exportado(&sv, &d) and not dg.tem)
+    d.retorno.tipo = opc_c
+    expect(sem_checar_exportado(&sv, &d) and not dg.tem)
+    d.retorno.tipo = ti
+    expect(sem_checar_exportado(&sv, &d) and not dg.tem)
+    d.retorno.tipo = tt
+    expect(not sem_checar_exportado(&sv, &d) and sem_export_teste_diag(&dg, common.E0901, 11, "o retorno do proc exportado 'ok' tem tipo 'str', que nao atravessa a fronteira C: use cstr"))
+    dg = common.Diag{}
+    d.retorno.tipo = proc_ok
+    expect(not retorno_exportavel(&sv, &d) and len(dg.causa or_else "") > 0)
+    tipos_liberar(&sv.tipos)
+    dim_liberar(&dims)
+    common.interner_liberar(&nomes)
+    common.arena_liberar(&arena)
+}
+
+// G3 S7: biblioteca de link, export/foreign/test nos modificadores, so na raiz, slots e alias de simbolo C, foreign e assinatura (os ramos E0202 chamam rel_e0202, stub do S8: conferidos por leitura)
+test "sem_export: biblioteca, modificadores, so na raiz, slots e foreign" {
+    var arena: common.Arena = common.Arena{}
+    var nomes: common.Interner = common.Interner{}
+    var dims: DimTabela = DimTabela{}
+    var dg: common.Diag = common.Diag{}
+    var sv: Semantica = Semantica{}
+    common.interner_iniciar(&nomes, &arena)
+    dim_iniciar(&dims)
+    sv.nomes = slice_from(&nomes, len = 1)
+    sv.arena = &arena
+    sv.diag = &dg
+    tipos_iniciar(&sv.tipos, &nomes, &dims)
+    let n_m = common.internar(&nomes, "m", 1)
+    let n_vazio = common.internar(&nomes, "", 0)
+    let n_longo = common.internar(&nomes, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", 65)
+    let n_64 = common.internar(&nomes, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", 64)
+    let n_msp = common.internar(&nomes, "m x", 3)
+    let n_mdll = common.internar(&nomes, "m.dll", 5)
+    let n_tab = common.internar(&nomes, "m\t", 2)
+    let n_trac = common.internar(&nomes, "-m", 2)
+    let n_ok = common.internar(&nomes, "ok", 2)
+    let n_x = common.internar(&nomes, "x", 1)
+    let n_main = common.internar(&nomes, "main", 4)
+    let n_fjz = common.internar(&nomes, "fj_zz", 5)
+    let n_forja = common.internar(&nomes, "forja_y", 7)
+    let n_sx = common.internar(&nomes, "sx", 2)
+    let n_9x = common.internar(&nomes, "9x", 2)
+    let n_cam = common.internar(&nomes, "lib/x.fj", 8)
+    expect(len(nomes.nomes) < 120)
+    var gl = make([dynamic]Simbolo, alloc = heap)
+    defer delete(gl)
+    for _k in 0..<128 {
+        append(&gl, item = Simbolo{})
+    }
+    sv.globais = gl[0..<len(gl)]
+    sv.qtd_nomes = 128
+    var f1: common.Fonte = sem_allocator_teste_fonte("0123456789012345678901234567890123456789")
+    defer delete(f1.dono_texto)
+    sv.fonte = &f1
+    var mods = make([dynamic]frontend.Modulos, alloc = heap)
+    defer delete(mods)
+    append(&mods, item = frontend.Modulos{})
+    mods[0].itens[1].caminho = n_cam
+    mods[0].itens[2].origem = frontend.MOD_STD as u8
+    sv.modulos = mods[0..<1]
+    let dl: ^frontend.Decl = s4_novo_decl(&sv)
+    dl.tipo_no = frontend.D_LINK as u8
+    dl.pos = 9
+    // nome de biblioteca
+    dl.nome = n_m
+    expect(nome_de_biblioteca_valido(&sv, dl) and not dg.tem)
+    dl.nome = n_64
+    expect(nome_de_biblioteca_valido(&sv, dl) and not dg.tem)
+    dl.nome = n_vazio
+    expect(not nome_de_biblioteca_valido(&sv, dl) and sem_export_teste_diag(&dg, common.E0905, 9, "o nome da biblioteca esta vazio: escreva link \"m\""))
+    dg = common.Diag{}
+    dl.nome = n_longo
+    expect(not nome_de_biblioteca_valido(&sv, dl) and sem_export_teste_diag(&dg, common.E0905, 9, "o nome da biblioteca passa de 64 bytes"))
+    dg = common.Diag{}
+    let resto: str = "que nao vale: so letras, digitos, '_', '.', '+' e '-' (o 1o e letra ou digito); caminho e pasta nao entram: a biblioteca fica na pasta do .fj ou nas pastas do gcc"
+    dl.nome = n_msp
+    let esp_msp = format(f"o nome da biblioteca 'm x' tem o caractere ' ', {resto}", alloc = frame)
+    expect(not nome_de_biblioteca_valido(&sv, dl) and sem_export_teste_diag(&dg, common.E0905, 9, esp_msp))
+    dg = common.Diag{}
+    dl.nome = n_tab
+    let esp_tab = format(f"o nome da biblioteca 'm\t' tem o caractere '?', {resto}", alloc = frame)
+    expect(not nome_de_biblioteca_valido(&sv, dl) and sem_export_teste_diag(&dg, common.E0905, 9, esp_tab))
+    dg = common.Diag{}
+    dl.nome = n_trac
+    let esp_trac = format(f"o nome da biblioteca '-m' tem o caractere '-', {resto}", alloc = frame)
+    expect(not nome_de_biblioteca_valido(&sv, dl) and sem_export_teste_diag(&dg, common.E0905, 9, esp_trac))
+    dg = common.Diag{}
+    dl.nome = n_mdll
+    expect(not nome_de_biblioteca_valido(&sv, dl) and sem_export_teste_diag(&dg, common.E0905, 9, "escreva so o nome, sem extensao: link \"m\""))
+    dg = common.Diag{}
+    // so na raiz
+    let dr: ^frontend.Decl = s4_novo_decl(&sv)
+    dr.pos = 4
+    dr.nome = n_ok
+    expect(conferir_so_na_raiz(&sv, dr) and not dg.tem)
+    dr.modulo = 1
+    expect(conferir_so_na_raiz(&sv, dr) and not dg.tem)
+    dr.exportado = true
+    expect(not conferir_so_na_raiz(&sv, dr) and sem_export_teste_diag(&dg, common.E1004, 4, "'export' so vale no arquivo raiz (a DLL exporta os procs do arquivo que o forja recebe)"))
+    dg = common.Diag{}
+    dr.exportado = false
+    dr.tipo_no = frontend.D_PROC as u8
+    dr.nome = frontend.SYM_MAIN
+    expect(not conferir_so_na_raiz(&sv, dr) and sem_export_teste_diag(&dg, common.E1004, 4, "'main' so vale no arquivo raiz; este arquivo e o modulo \"lib/x.fj\""))
+    dg = common.Diag{}
+    // modificadores
+    let m1: ^frontend.Decl = s4_novo_decl(&sv)
+    let m2: ^frontend.Decl = s4_novo_decl(&sv)
+    let m3: ^frontend.Decl = s4_novo_decl(&sv)
+    m1.tipo_no = frontend.D_PROC as u8
+    m1.publico = true
+    m1.exportado = true
+    m1.nome = n_ok
+    m1.prox = m2
+    m2.tipo_no = frontend.D_TEST as u8
+    m2.prox = m3
+    m3.tipo_no = frontend.D_LINK as u8
+    m3.nome = n_m
+    var prog: frontend.Programa = frontend.Programa{primeira = m1, ultima = m3}
+    sv.programa = &prog
+    var cats: u32 = 0
+    expect(sem_checar_modificadores(&sv, &cats) and cats == 224 and not dg.tem)
+    m1.externo = true
+    m1.pos = 5
+    expect(not sem_checar_modificadores(&sv, &cats) and sem_export_teste_diag(&dg, common.E0906, 5, "'export' nao vale em foreign: quem exporta e a Forja, por 'pub export proc'; 'pub foreign' deixa os procs visiveis a quem importa o modulo"))
+    dg = common.Diag{}
+    m1.externo = false
+    m1.publico = false
+    expect(not sem_checar_modificadores(&sv, &cats) and sem_export_teste_diag(&dg, common.E0903, 5, "'export' precisa de 'pub' antes: escreva 'pub export proc ok'"))
+    dg = common.Diag{}
+    m1.publico = true
+    m1.tipo_no = frontend.D_STRUCT as u8
+    expect(not sem_checar_modificadores(&sv, &cats) and sem_export_teste_diag(&dg, common.E0903, 5, "'export' so vale em proc; esta declaracao nao e um proc"))
+    dg = common.Diag{}
+    m1.tipo_no = frontend.D_PROC as u8
+    m2.publico = true
+    m2.pos = 6
+    expect(not sem_checar_modificadores(&sv, &cats) and sem_export_teste_diag(&dg, common.E0903, 6, "'pub' nao vale em test"))
+    dg = common.Diag{}
+    m2.publico = false
+    m3.nome = n_mdll
+    m3.pos = 7
+    expect(not sem_checar_modificadores(&sv, &cats) and sem_export_teste_diag(&dg, common.E0905, 7, "escreva so o nome, sem extensao: link \"m\""))
+    dg = common.Diag{}
+    m3.nome = n_m
+    m1.modulo = 1
+    expect(not sem_checar_modificadores(&sv, &cats) and sem_export_teste_diag(&dg, common.E1004, 5, "'export' so vale no arquivo raiz (a DLL exporta os procs do arquivo que o forja recebe)"))
+    dg = common.Diag{}
+    // slots do simbolo C
+    expect(slot_do_simbolo_c(&sv, 0, n_ok, false) == none and not sem_simbolo_c_eh_alias(&sv, 0, n_ok))
+    let slot0: ^u8 = slot_do_simbolo_c(&sv, 0, n_ok, true) as ^u8
+    expect(slot0^ == 0 and not sem_simbolo_c_eh_alias(&sv, 0, n_ok))
+    slot0^ = 1
+    expect(sem_simbolo_c_eh_alias(&sv, 0, n_ok) and not sem_simbolo_c_eh_alias(&sv, 0, n_x))
+    sv.qtd_modulos = 3
+    sv.simbolo_c_usado = none
+    let slot2: ^u8 = slot_do_simbolo_c(&sv, 2, n_ok, true) as ^u8
+    slot2^ = 1
+    expect(sem_simbolo_c_eh_alias(&sv, 2, n_ok) and not sem_simbolo_c_eh_alias(&sv, 1, n_ok) and not sem_simbolo_c_eh_alias(&sv, 0, n_ok))
+    sv.qtd_modulos = 0
+    sv.simbolo_c_usado = none
+    // alias do simbolo C
+    let da: ^frontend.Decl = s4_novo_decl(&sv)
+    da.nome = n_ok
+    da.pos_simbolo = 12
+    da.simbolo = n_9x
+    expect(not conferir_alias_do_simbolo(&sv, da) and sem_export_teste_diag(&dg, common.E0905, 12, "o simbolo C \"9x\" nao e um identificador C (letras, digitos e '_', sem comecar por digito)"))
+    dg = common.Diag{}
+    da.simbolo = n_ok
+    expect(conferir_alias_do_simbolo(&sv, da) and not dg.tem and not sem_simbolo_c_eh_alias(&sv, 0, n_ok))
+    da.simbolo = n_sx
+    expect(conferir_alias_do_simbolo(&sv, da) and not dg.tem and sem_simbolo_c_eh_alias(&sv, 0, n_sx))
+    expect(conferir_alias_do_simbolo(&sv, da) and not dg.tem) // 0.45.0: varios aliases do mesmo simbolo C valem
+    // 0.45.0: compatibilidade de ABI (inteiro por tamanho, ponteiro = inteiro de 64 bits, f32 e f64 a parte)
+    expect(tipo_igual_abi(&sv, TIPO_INT as u32, TIPO_UINT as u32) and tipo_igual_abi(&sv, TIPO_RAWPTR as u32, TIPO_INT as u32) and tipo_igual_abi(&sv, TIPO_CSTR as u32, TIPO_UINT as u32))
+    expect(not tipo_igual_abi(&sv, TIPO_I32 as u32, TIPO_INT as u32) and not tipo_igual_abi(&sv, TIPO_F32 as u32, TIPO_I32 as u32) and not tipo_igual_abi(&sv, TIPO_F32 as u32, TIPO_F64 as u32))
+    // foreign
+    sv.simbolo_c_usado = none
+    let df: ^frontend.Decl = s4_novo_decl(&sv)
+    df.nome = n_ok
+    df.simbolo = -1
+    df.pos = 14
+    expect(sem_checar_externo(&sv, df) and sv.tem_externo and not dg.tem)
+    df.nome = n_main
+    expect(not sem_checar_externo(&sv, df) and sem_export_teste_diag(&dg, common.E0905, 14, "o proc foreign 'main' colidiria com o C gerado: 'main' e nomes que comecam com fj_ ou forja_ sao do compilador"))
+    dg = common.Diag{}
+    df.nome = n_forja
+    expect(not sem_checar_externo(&sv, df) and sem_export_teste_diag(&dg, common.E0905, 14, "o proc foreign 'forja_y' colidiria com o C gerado: 'main' e nomes que comecam com fj_ ou forja_ sao do compilador"))
+    dg = common.Diag{}
+    df.modulo = 2
+    expect(sem_checar_externo(&sv, df) and not dg.tem)
+    df.modulo = 0
+    df.nome = n_ok
+    df.simbolo = n_fjz
+    df.pos_simbolo = 15
+    expect(not sem_checar_externo(&sv, df) and sem_export_teste_diag(&dg, common.E0905, 15, "o proc foreign 'fj_zz' colidiria com o C gerado: 'main' e nomes que comecam com fj_ ou forja_ sao do compilador"))
+    dg = common.Diag{}
+    df.simbolo = -1
+    var pf = make([dynamic]frontend.Param, alloc = heap)
+    defer delete(pf)
+    append(&pf, item = frontend.Param{})
+    pf[0].nome = n_x
+    pf[0].pos = 16
+    pf[0].tipo.tipo = TIPO_TEXTO as u32
+    df.params = pf[0..<1]
+    df.nparams = 1
+    expect(not sem_checar_externo(&sv, df) and not sv.abi_foreign and sem_export_teste_diag(&dg, common.E0904, 16, "o parametro 'x' do proc foreign 'ok' tem tipo 'str', que nao atravessa a fronteira C: use cstr"))
+    dg = common.Diag{}
+    pf[0].tipo.tipo = TIPO_INT as u32
+    expect(sem_checar_externo(&sv, df) and not dg.tem)
+    df.tem_retorno = true
+    df.retorno.tipo = TIPO_TEXTO as u32
+    df.retorno.pos = 17
+    expect(not sem_checar_externo(&sv, df) and sem_export_teste_diag(&dg, common.E0904, 17, "o retorno do proc foreign 'ok' tem tipo 'str', que nao atravessa a fronteira C: use cstr"))
+    dg = common.Diag{}
+    df.retorno.tipo = TIPO_INT as u32
+    expect(sem_checar_externo(&sv, df) and not dg.tem)
+    // mesma assinatura em outro modulo e no mesmo: aceita
+    let dm: ^frontend.Decl = s4_novo_decl(&sv)
+    dm.nome = n_ok
+    dm.simbolo = -1
+    dm.modulo = 1
+    dm.params = pf[0..<1]
+    dm.nparams = 1
+    dm.tem_retorno = true
+    dm.retorno.tipo = TIPO_INT as u32
+    expect(conferir_assinatura_do_simbolo_c(&sv, dm) and conferir_assinatura_do_simbolo_c(&sv, df) and not dg.tem)
+    tipos_liberar(&sv.tipos)
+    dim_liberar(&dims)
+    common.interner_liberar(&nomes)
+    common.arena_liberar(&arena)
+}

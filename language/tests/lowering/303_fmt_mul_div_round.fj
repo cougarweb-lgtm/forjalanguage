@@ -1,0 +1,160 @@
+// IA1-S2g (D-FMT): std:fmt, mul_div_round(a, num, den, rounding) = round(a * num / den) EXATO (intermediario de 128 bits), nos 5 modos (half_up, half_even, half_down, up, down) com `rounding` obrigatorio. Cada linha: a num den e o resultado nos 5 modos (ovf = MoneyError.overflow).
+// Bordas: empates exatos (x.5) nos dois sinais, den negativo, a = 0, a * num acima de 2^63 e 2^64, o menor int (-2^63) como resultado valido e como estouro, e 4000 trincas sorteadas (xorshift64*) por modo com contagem de estouros e hash. O oraculo Python independente (scratchpad, sem o forja) calcula tudo com inteiros grandes e Fraction.
+import "std:fmt" as fmt
+
+const MODOS: [5]fmt.Rounding = {fmt.Rounding.half_up, fmt.Rounding.half_even, fmt.Rounding.half_down, fmt.Rounding.up, fmt.Rounding.down}
+const MAIOR: int = 9223372036854775807
+const MENOR: int = -9223372036854775807 - 1
+const MODULO_HASH: int = 1000003
+const SEMENTE: u64 = 88172645463325252
+const MULTIPLICADOR: u64 = 2685821657736338717
+const SORTEIOS: int = 4000
+
+struct Sorteio {
+    estado: u64 = 0
+}
+
+// xorshift64*: proximo u64 da sequencia.
+proc proximo(s: ^Sorteio) -> u64 {
+    var x = s.estado
+    x = x ~ (x >> 12)
+    x = x ~ (x << 25)
+    x = x ~ (x >> 27)
+    s.estado = x
+    return wrapping_mul(x, b = MULTIPLICADOR)
+}
+
+// Inteiro de 0 a 63 bits de comprimento sorteado, com sinal sorteado.
+proc sorteia_int(s: ^Sorteio) -> int {
+    let bruto = proximo(s)
+    let largura = proximo(s) % 64
+    let valor = (bruto >> largura) >> 1
+    let sinal = proximo(s) & 1
+    if sinal == 1 {
+        return -(valor as int)
+    }
+    return valor as int
+}
+
+// Uma linha: a num den e o resultado nos 5 modos.
+proc linha(a: int, num: int, den: int) {
+    var buf = make([dynamic]u8, alloc = heap, cap = 128)
+    defer delete(buf)
+    format(f"{a} {num} {den}", into = &buf)
+    for modo in MODOS {
+        switch r in fmt.mul_div_round(a, num, den, rounding = modo) {
+        case int:
+            format(f"|{r}", into = &buf)
+        case fmt.MoneyError:
+            append(&buf, item = "|ovf")
+        }
+    }
+    let texto = to_str(&buf)
+    print(texto)
+    delete(texto)
+}
+
+// Empates, sinais e fracoes pequenas.
+proc bordas_pequenas() {
+    linha(5, 1, 2)
+    linha(-5, 1, 2)
+    linha(5, -1, 2)
+    linha(-5, -1, 2)
+    linha(5, 1, -2)
+    linha(1, 1, 2)
+    linha(3, 1, 2)
+    linha(7, 1, 2)
+    linha(-1, 1, 2)
+    linha(-3, 1, 2)
+    linha(-7, 1, 2)
+    linha(2, 1, 2)
+    linha(0, 5, 3)
+    linha(7, 0, 3)
+    linha(0, 1, 2)
+    linha(10, 3, 3)
+    linha(10, 1, 3)
+    linha(-10, 1, 3)
+    linha(11, 1, 3)
+    linha(2, 1, 3)
+    linha(1, 2, 3)
+    linha(1, 1, 1)
+    linha(12345, 1, 1000)
+    linha(-12345, 1, 1000)
+    linha(25, 1, 10)
+    linha(35, 1, 10)
+    linha(15, 1, 10)
+    linha(-25, 1, 10)
+    linha(5, 1, 10)
+    linha(-5, 1, 10)
+    linha(2500, 1075, 10000)
+    linha(999, 15, 100)
+    linha(100, 15, 100)
+}
+
+// Produto acima de 64 bits, menor int e estouro.
+proc bordas_grandes() {
+    linha(MAIOR, MAIOR, MAIOR)
+    linha(MAIOR, 2, 2)
+    linha(MAIOR, 2, 1)
+    linha(MAIOR, MAIOR, 1)
+    linha(MENOR, 1, 1)
+    linha(MENOR, -1, 1)
+    linha(MENOR, 1, -1)
+    linha(MENOR, -1, -1)
+    linha(MENOR, MENOR, MENOR)
+    linha(MAIOR, MENOR, MAIOR)
+    linha(MENOR, MAIOR, MAIOR)
+    linha(MAIOR, MAIOR, MAIOR - 1)
+    linha(-MAIOR, MAIOR, MAIOR - 1)
+    linha(MENOR, 3, 2)
+    linha(MENOR, 1, 2)
+    linha(MENOR, 1, 3)
+    linha(MENOR, MENOR, MAIOR)
+    linha(MAIOR, MENOR, MENOR)
+    linha(MENOR, 5, MAIOR)
+    linha(4611686018427387904, 2, 1)
+    linha(4611686018427387904, -2, 1)
+    linha(4611686018427387903, 2, 1)
+    linha(3037000500, 3037000500, 1)
+    linha(3037000499, 3037000499, 1)
+    linha(4294967296, 4294967296, 1)
+    linha(4294967296, 4294967296, 2)
+    linha(4294967296, -4294967296, 2)
+    linha(4294967296, 4294967296, 3)
+    linha(MAIOR, 1, MAIOR)
+    linha(1, MAIOR, MAIOR)
+    linha(MAIOR, 1, 2)
+    linha(-MAIOR, 1, 2)
+    linha(MAIOR, MAIOR, 2)
+}
+
+// 4000 trincas sorteadas no modo de indice `indice`: estouros e hash dos resultados.
+proc sorteio_modo(indice: int) {
+    var s = Sorteio{estado = SEMENTE}
+    var estouros = 0
+    var hash = 0
+    for _k in 0..<SORTEIOS {
+        let a = sorteia_int(&s)
+        let num = sorteia_int(&s)
+        var den = sorteia_int(&s)
+        if den == 0 {
+            den = 1
+        }
+        switch r in fmt.mul_div_round(a, num, den, rounding = MODOS[indice]) {
+        case int:
+            hash = (hash * 31 + (r % MODULO_HASH) + MODULO_HASH) % MODULO_HASH
+        case fmt.MoneyError:
+            estouros += 1
+            hash = (hash * 31 + 7) % MODULO_HASH
+        }
+    }
+    print(f"modo {indice}: {SORTEIOS} casos, {estouros} estouros, hash {hash}")
+}
+
+proc main() {
+    bordas_pequenas()
+    bordas_grandes()
+    for i in 0..<5 {
+        sorteio_modo(i)
+    }
+}

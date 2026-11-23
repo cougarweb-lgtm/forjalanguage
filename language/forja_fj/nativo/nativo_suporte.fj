@@ -1,0 +1,134 @@
+// nativo/nativo_suporte.fj - porte de compiler/nativo/nativo_suporte.c
+// sha256 de nativo/nativo_suporte.c: eadf65efd316712ab1a8fcfd222915a068f97fc00210eb687a0fd20bf1612032
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "common"
+import "nativo/bir"
+import "nativo/fmt" as pefmt
+import "nativo/x64"
+
+const SUPORTE_VERSAO: str = "0.2.0"
+
+// C: nativo/nativo_suporte.c:24
+proc campo_texto_2(b: ^[dynamic]u8, nome: str, valor: str) {
+    format(f"\"{nome}\": ", into = b)
+    json_texto(b, valor, len(valor) as u64)
+}
+
+// C: nativo/nativo_suporte.c:31
+proc anexar_alvos(b: ^[dynamic]u8) {
+    append(b, item = "\"alvos\": [")
+    var k: u32 = 0
+    while k < alvo_qtd() {
+        let a: ?^x64.Alvo = alvo_por_indice(k)
+        if (a as ^x64.Alvo).formato == pefmt.IMAGEM_WASM {
+            break // o wasm entra na listagem quando gerar (W2); o wasm e sempre o ultimo da tabela
+        }
+        var tern_1: str = "{"
+        if k > 0 {
+            tern_1 = ", {"
+        }
+        append(b, item = tern_1)
+        campo_texto_2(b, "nome", ((a as ^x64.Alvo).nome or_else ""))
+        var tern_2: str = "pe"
+        if common.c2f_s2u_32((a as ^x64.Alvo).formato) == (pefmt.IMAGEM_ELF as u32) {
+            tern_2 = "elf"
+        }
+        var tern_3: str = ""
+        if common.c2f_b2i32((a as ^x64.Alvo).dll) != 0 {
+            tern_3 = ", \"dll\""
+        }
+        var tern_4: str = "false"
+        if (a as ^x64.Alvo).sem_escritor == none {
+            tern_4 = "true"
+        }
+        format(f", \"formato\": \"{tern_2}\", \"gera\": [\"exe\", \"test\"{tern_3}], \"escritor\": {tern_4}}}", into = b)
+        k += 1
+    }
+    append(b, item = "]"[0..<1])
+}
+
+// C: nativo/nativo_suporte.c:45
+proc anexar_regra(b: ^[dynamic]u8, r: ^bir.BirRegra) {
+    let recusado: bool = (r.estado as i32) != bir.BR_SUPORTADO
+    let op_nome: str = bir.bir_nome_do_op(r.op)
+    let variante: str = r.variante or_else ""
+    let marco: str = r.marco or_else ""
+    append(b, item = "{")
+    campo_texto_2(b, "op", op_nome)
+    append(b, item = ", ")
+    campo_texto_2(b, "variante", variante)
+    var estado: str = "suportado"
+    if recusado {
+        estado = "recusado"
+    }
+    format(f", \"estado\": \"{estado}\", \"marco\": \"{marco}\"", into = b)
+    if recusado {
+        format(f", \"codigo\": \"X0001\", \"motivo\": \"{op_nome} {variante} ainda nao suportado no backend nativo (marco {marco})\"", into = b)
+    }
+    append(b, item = "}"[0..<1])
+}
+
+// C: nativo/nativo_suporte.c:60
+pub proc nativo_suporte_tabela() -> i32 {
+    var saida: [dynamic]u8 = make([dynamic]u8, alloc = heap)
+    defer delete(saida)
+    format(f"{{\"suporte_versao\": \"{SUPORTE_VERSAO}\", \"alvo\": \"{NATIVO_ALVO_PADRAO}\", ", into = &saida)
+    anexar_alvos(&saida)
+    append(&saida, item = ", \"regras\": [")
+    var k: u32 = 0
+    while k < bir.REGRAS_IR_QTD_2 {
+        if k > 0 {
+            append(&saida, item = ", ")
+        }
+        var regra: bir.BirRegra = bir.bir_regra_por_indice(k)
+        anexar_regra(&saida, &regra)
+        k += 1
+    }
+    append(&saida, item = "]}\n")
+    let saida_std: ^common.Saida = common.c2f_saida_stdout()
+    common.c2f_saida_escrever(saida_std, saida[..])
+    _ = common.c2f_saida_fechar(saida_std)
+    return 0
+}
+
+// C: nativo/nativo_suporte.c:79
+proc anexar_ocorrencia(b: ^[dynamic]u8, p: ^NativoPedido, o: ^bir.BirOcorrencia) {
+    let pos: common.FontePosicao = common.fonte_localizar_no_arquivo(p.fonte, o.pos)
+    append(b, item = "{\"codigo\": \"X0001\", \"arquivo\": ")
+    json_caminho(b, pos.caminho)
+    format(f", \"linha\": {pos.linha}, \"coluna\": {pos.coluna}, ", into = b)
+    campo_texto_2(b, "causa", (o.causa or_else ""))
+    _ = nativo_anexar_ir(b, p, o.pos, (o.causa or_else ""))
+    append(b, item = "}"[0..<1])
+}
+
+// C: nativo/nativo_suporte.c:91
+pub proc nativo_suporte_programa(pedido: ^NativoPedido) -> i32 {
+    var entrada: bir.BirEntrada = bir.BirEntrada{ir = pedido.ir, tipos = pedido.tipos, nomes = pedido.nomes, fonte = pedido.fonte, modo = pedido.modo}
+    var ocorrencias: [dynamic]bir.BirOcorrencia = make([dynamic]bir.BirOcorrencia, alloc = heap)
+    defer delete(ocorrencias)
+    bir.bir_varrer_suporte(&entrada, &ocorrencias)
+    var saida: [dynamic]u8 = make([dynamic]u8, alloc = heap)
+    defer delete(saida)
+    format(f"{{\"suporte_versao\": \"{SUPORTE_VERSAO}\", \"alvo\": \"{NATIVO_ALVO_PADRAO}\", ", into = &saida)
+    anexar_alvos(&saida)
+    append(&saida, item = ", \"arquivo\": ")
+    json_caminho(&saida, (pedido.fonte as ^common.Fonte).caminho)
+    let total: u64 = len(ocorrencias) as u64
+    format(f", \"total\": {total}, \"ocorrencias\": [", into = &saida)
+    var k: u64 = 0
+    while k < total {
+        if k > 0 {
+            append(&saida, item = ", ")
+        }
+        anexar_ocorrencia(&saida, pedido, &ocorrencias[k])
+        k += 1
+    }
+    append(&saida, item = "]}\n")
+    let saida_std: ^common.Saida = common.c2f_saida_stdout()
+    common.c2f_saida_escrever(saida_std, saida[..])
+    _ = common.c2f_saida_fechar(saida_std)
+    return 0
+}

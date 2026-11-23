@@ -1,0 +1,348 @@
+// std:net - UDP e TCP IPv4 (M5 P53; TCP no R9). API em ingles (ADR-39); o corpo chama o runtime direto (forja_net_*, rt_net_win.c / rt_net_linux.c).
+// Versao: 0.3.0. Changelog: 0.3.0 - R9: TCP: TcpSocket, TcpListener, tcp_connect, tcp_listen, tcp_accept, tcp_send (envia tudo ou erro), tcp_recv (0 = o outro lado fechou), tcp_close, tcp_listener_close, tcp_local_addr (do TcpListener); NetError ganha conexao_recusada e fechado_pelo_outro (ao fim do enum). IPv4 literal; sem resolucao de nomes. 0.2.0 - M5 P54: NetError.datagrama_maior (WSAEMSGSIZE: o resto do datagrama e descartado); ECONNRESET do ICMP vira timeout no recv (mapeado no runtime; SIO_UDP_CONNRESET pendente). 0.1.0 - M5 P53: UdpSocket, udp_bind, udp_send_to, udp_recv_from, udp_local_addr, udp_close e NetError sobre ws2_32 (Windows). Linux = X0003 (M5c-b/P60). Corte: TCP, IPv6, resolucao de nomes.
+// Posse: UdpSocket e um handle de 1 palavra (0 = fechado); udp_close zera. Texto de udp_local_addr e de udp_recv_from vem do alocador que o chamador passou: quem recebe da delete.
+// Endereco "a.b.c.d:porta" (IPv4); porta 0 = porta efemera. timeout_ms: < 0 espera sem limite, 0 nao espera, > 0 espera esse tempo.
+
+foreign {
+    proc forja_net_ligar(endereco: u64, erro: ^i32) -> u64
+    proc forja_net_local(h: u64, saida: ^u64) -> i32
+    proc forja_net_enviar(h: u64, destino: u64, dados: ^u8, n: i64) -> i64
+    proc forja_net_esperar(h: u64, ms: i32) -> i32
+    proc forja_net_receber(h: u64, destino: ^u8, cap: i64, origem: ^u64) -> i64
+    proc forja_net_fechar(h: u64) -> i32
+    proc forja_net_tcp_ouvir(endereco: u64, backlog: i32, erro: ^i32) -> u64
+    proc forja_net_tcp_aceitar(h: u64, erro: ^i32) -> u64
+    proc forja_net_tcp_conectar(endereco: u64, ms: i32, erro: ^i32) -> u64
+    proc forja_net_tcp_enviar(h: u64, dados: ^u8, n: i64) -> i64
+    proc forja_net_tcp_receber(h: u64, destino: ^u8, cap: i64) -> i64
+    proc forja_net_tcp_esperar(h: u64, ms: i32) -> i32
+}
+
+const ERRO_ENDERECO_INVALIDO: i32 = 1
+const ERRO_PORTA_EM_USO: i32 = 2
+const ERRO_TIMEOUT: i32 = 3
+const ERRO_FALHA_SOCKET: i32 = 4
+const ERRO_FALHA_ENVIO: i32 = 5
+const ERRO_FALHA_RECEBIMENTO: i32 = 6
+const ERRO_FECHADO: i32 = 7
+const ERRO_DATAGRAMA_MAIOR: i32 = 8
+const ERRO_CONEXAO_RECUSADA: i32 = 9
+const ERRO_FECHADO_PELO_OUTRO: i32 = 10
+const BASE_OCTETO: int = 256
+const PORTA_MAXIMA: int = 65535
+const PARTES_IP: int = 4
+const DIGITOS_MAXIMOS: int = 5
+
+// Erro tipado do std:net. fechado = socket ja fechado (ou usado depois de udp_close/tcp_close). conexao_recusada = ninguem escuta no destino do tcp_connect.
+// fechado_pelo_outro = o outro lado derrubou a conexao TCP (reset) no meio de um tcp_send ou tcp_recv.
+pub enum NetError { endereco_invalido, porta_em_uso, timeout, falha_socket, falha_envio, falha_recebimento, fechado, datagrama_maior, conexao_recusada, fechado_pelo_outro }
+
+// Handle de uma conexao TCP (de tcp_connect ou de tcp_accept). Valor zero = fechado.
+pub struct TcpSocket {
+    h: u64 = 0
+}
+
+// Handle de um socket TCP em escuta (tcp_listen). Valor zero = fechado.
+pub struct TcpListener {
+    h: u64 = 0
+}
+
+// Handle de um socket UDP. Valor zero = fechado.
+pub struct UdpSocket {
+    h: u64 = 0
+}
+
+// Resultado de udp_recv_from: quantos bytes entraram em buf e o remetente em texto ("a.b.c.d:porta", dono do alocador).
+pub struct UdpRecebido {
+    quantos: int = 0
+    de: str = ""
+}
+
+// Traduz o codigo de erro do runtime (ERRO_* acima) para o NetError.
+proc erro_de(codigo: i32) -> NetError {
+    if codigo == ERRO_PORTA_EM_USO {
+        return NetError.porta_em_uso
+    }
+    if codigo == ERRO_TIMEOUT {
+        return NetError.timeout
+    }
+    if codigo == ERRO_FALHA_SOCKET {
+        return NetError.falha_socket
+    }
+    if codigo == ERRO_FALHA_ENVIO {
+        return NetError.falha_envio
+    }
+    if codigo == ERRO_FALHA_RECEBIMENTO {
+        return NetError.falha_recebimento
+    }
+    if codigo == ERRO_FECHADO {
+        return NetError.fechado
+    }
+    if codigo == ERRO_DATAGRAMA_MAIOR {
+        return NetError.datagrama_maior
+    }
+    if codigo == ERRO_CONEXAO_RECUSADA {
+        return NetError.conexao_recusada
+    }
+    if codigo == ERRO_FECHADO_PELO_OUTRO {
+        return NetError.fechado_pelo_outro
+    }
+    return NetError.endereco_invalido
+}
+
+// Le "a.b.c.d:porta" e devolve o pacote ip * 65536 + porta (o formato que o runtime recebe). Qualquer outra forma = endereco_invalido.
+proc ler_endereco(texto: str) -> u64 ! NetError {
+    var partes: [5]int = {0, 0, 0, 0, 0}
+    var parte = 0
+    var digitos = 0
+    var i = 0
+    while i < len(texto) {
+        let c = texto[i]
+        if c >= 48 and c <= 57 {
+            digitos += 1
+            if digitos > DIGITOS_MAXIMOS {
+                return NetError.endereco_invalido
+            }
+            partes[parte] = partes[parte] * 10 + ((c - 48) as int)
+        } else if c == 46 and parte < 3 and digitos > 0 {
+            parte += 1
+            digitos = 0
+        } else if c == 58 and parte == 3 and digitos > 0 {
+            parte += 1
+            digitos = 0
+        } else {
+            return NetError.endereco_invalido
+        }
+        i += 1
+    }
+    if parte != 4 or digitos == 0 {
+        return NetError.endereco_invalido
+    }
+    return confirmar_pacote(partes)
+}
+
+// Confere os 4 octetos (0..255) e a porta (0..65535) de partes[0..5) e monta o pacote.
+proc confirmar_pacote(partes: [5]int) -> u64 ! NetError {
+    var i = 0
+    while i < 4 {
+        if partes[i] >= BASE_OCTETO {
+            return NetError.endereco_invalido
+        }
+        i += 1
+    }
+    if partes[4] > PORTA_MAXIMA {
+        return NetError.endereco_invalido
+    }
+    let ip = ((partes[0] * BASE_OCTETO + partes[1]) * BASE_OCTETO + partes[2]) * BASE_OCTETO + partes[3]
+    let pacote = ip * (PORTA_MAXIMA + 1) + partes[4]
+    return pacote as u64
+}
+
+// Texto "a.b.c.d:porta" de um pacote, num str do alocador do chamador.
+proc texto_de(pacote: u64, alloc: Allocator) -> str {
+    let p = pacote as int
+    let ip = p / (PORTA_MAXIMA + 1)
+    let porta = p % (PORTA_MAXIMA + 1)
+    let a = ip / (BASE_OCTETO * BASE_OCTETO * BASE_OCTETO)
+    let b = ip / (BASE_OCTETO * BASE_OCTETO) % BASE_OCTETO
+    let c = ip / BASE_OCTETO % BASE_OCTETO
+    let d = ip % BASE_OCTETO
+    return format(f"{a}.{b}.{c}.{d}:{porta}", alloc = alloc)
+}
+
+// Abre um socket UDP ligado ao endereco ("127.0.0.1:0" = porta efemera). Porta em uso = porta_em_uso.
+pub proc udp_bind(addr: str) -> UdpSocket ! NetError {
+    let pacote = try ler_endereco(addr)
+    var erro: i32 = 0
+    let h = forja_net_ligar(pacote, erro = &erro)
+    if h == 0 {
+        return erro_de(erro)
+    }
+    return UdpSocket{h = h}
+}
+
+// Envia data ao destino "a.b.c.d:porta". Devolve os bytes enviados.
+pub proc udp_send_to(s: ^UdpSocket, dest: str, data: []u8) -> int ! NetError {
+    if s.h == 0 {
+        return NetError.fechado
+    }
+    let destino = try ler_endereco(dest)
+    var vazio: [1]u8 = {0}
+    var enviados: i64 = 0
+    if len(data) == 0 {
+        enviados = forja_net_enviar(s.h, destino, dados = &vazio[0], n = 0 as i64)
+    } else {
+        enviados = forja_net_enviar(s.h, destino, dados = &data[0], n = len(data) as i64)
+    }
+    if enviados < 0 {
+        return erro_de((0 - enviados) as i32)
+    }
+    return enviados as int
+}
+
+// Espera ate timeout_ms um datagrama e le em buf. Expirar = timeout (nao e panico). Remetente em texto, do alocador alloc.
+pub proc udp_recv_from(s: ^UdpSocket, buf: []u8, timeout_ms: i32, alloc: Allocator) -> UdpRecebido ! NetError {
+    if s.h == 0 {
+        return NetError.fechado
+    }
+    if len(buf) == 0 {
+        return NetError.falha_recebimento
+    }
+    let pronto = forja_net_esperar(s.h, ms = timeout_ms)
+    if pronto == 0 {
+        return NetError.timeout
+    }
+    if pronto < 0 {
+        return erro_de(0 - pronto)
+    }
+    var origem: u64 = 0
+    let lidos = forja_net_receber(s.h, destino = &buf[0], cap = len(buf) as i64, origem = &origem)
+    if lidos < 0 {
+        return erro_de((0 - lidos) as i32)
+    }
+    return UdpRecebido{quantos = lidos as int, de = texto_de(origem, alloc)}
+}
+
+// Endereco local do socket ("127.0.0.1:porta"), do alocador alloc.
+pub proc udp_local_addr(s: ^UdpSocket, alloc: Allocator) -> str ! NetError {
+    if s.h == 0 {
+        return NetError.fechado
+    }
+    var pacote: u64 = 0
+    let erro = forja_net_local(s.h, saida = &pacote)
+    if erro != 0 {
+        return erro_de(erro)
+    }
+    return texto_de(pacote, alloc)
+}
+
+// Fecha o socket e zera o handle. Fechar de novo = fechado (nao derruba o processo).
+pub proc udp_close(s: ^UdpSocket) -> ?NetError {
+    if s.h == 0 {
+        return NetError.fechado
+    }
+    let erro = forja_net_fechar(s.h)
+    s.h = 0
+    if erro != 0 {
+        return erro_de(erro)
+    }
+    return none
+}
+
+// Conecta ao destino "a.b.c.d:porta" esperando ate timeout_ms (< 0 sem limite). Ninguem escutando = conexao_recusada; prazo estourado = timeout.
+pub proc tcp_connect(addr: str, timeout_ms: i32) -> TcpSocket ! NetError {
+    let pacote = try ler_endereco(addr)
+    var erro: i32 = 0
+    let h = forja_net_tcp_conectar(pacote, ms = timeout_ms, erro = &erro)
+    if h == 0 {
+        return erro_de(erro)
+    }
+    return TcpSocket{h = h}
+}
+
+// Abre um socket TCP em escuta em addr ("127.0.0.1:0" = porta efemera). backlog = tamanho da fila de conexoes pendentes. Porta em uso = porta_em_uso.
+pub proc tcp_listen(addr: str, backlog: i32 = 16) -> TcpListener ! NetError {
+    let pacote = try ler_endereco(addr)
+    var erro: i32 = 0
+    let h = forja_net_tcp_ouvir(pacote, backlog, erro = &erro)
+    if h == 0 {
+        return erro_de(erro)
+    }
+    return TcpListener{h = h}
+}
+
+// Espera ate timeout_ms (< 0 sem limite, 0 nao espera) uma conexao e a aceita. Expirar = timeout.
+pub proc tcp_accept(l: ^TcpListener, timeout_ms: i32) -> TcpSocket ! NetError {
+    if l.h == 0 {
+        return NetError.fechado
+    }
+    let pronto = forja_net_tcp_esperar(l.h, ms = timeout_ms)
+    if pronto == 0 {
+        return NetError.timeout
+    }
+    if pronto < 0 {
+        return erro_de(0 - pronto)
+    }
+    var erro: i32 = 0
+    let h = forja_net_tcp_aceitar(l.h, erro = &erro)
+    if h == 0 {
+        return erro_de(erro)
+    }
+    return TcpSocket{h = h}
+}
+
+// Envia todos os bytes de data (bloqueia ate o sistema aceitar tudo) e devolve len(data); ou erro (fechado_pelo_outro se a conexao caiu).
+pub proc tcp_send(s: ^TcpSocket, data: []u8) -> int ! NetError {
+    if s.h == 0 {
+        return NetError.fechado
+    }
+    if len(data) == 0 {
+        return 0
+    }
+    let enviados = forja_net_tcp_enviar(s.h, dados = &data[0], n = len(data) as i64)
+    if enviados < 0 {
+        return erro_de((0 - enviados) as i32)
+    }
+    return enviados as int
+}
+
+// Espera ate timeout_ms dados e le ate len(buf) bytes em buf. Devolve quantos entraram; 0 = o outro lado fechou a conexao. Expirar = timeout.
+pub proc tcp_recv(s: ^TcpSocket, buf: []u8, timeout_ms: i32) -> int ! NetError {
+    if s.h == 0 {
+        return NetError.fechado
+    }
+    if len(buf) == 0 {
+        return NetError.falha_recebimento
+    }
+    let pronto = forja_net_tcp_esperar(s.h, ms = timeout_ms)
+    if pronto == 0 {
+        return NetError.timeout
+    }
+    if pronto < 0 {
+        return erro_de(0 - pronto)
+    }
+    let lidos = forja_net_tcp_receber(s.h, destino = &buf[0], cap = len(buf) as i64)
+    if lidos < 0 {
+        return erro_de((0 - lidos) as i32)
+    }
+    return lidos as int
+}
+
+// Endereco local do socket em escuta ("127.0.0.1:porta"), do alocador alloc: com porta 0 no tcp_listen, e aqui que se descobre a porta.
+pub proc tcp_local_addr(l: ^TcpListener, alloc: Allocator) -> str ! NetError {
+    if l.h == 0 {
+        return NetError.fechado
+    }
+    var pacote: u64 = 0
+    let erro = forja_net_local(l.h, saida = &pacote)
+    if erro != 0 {
+        return erro_de(erro)
+    }
+    return texto_de(pacote, alloc)
+}
+
+// Fecha a conexao e zera o handle. Fechar de novo = fechado.
+pub proc tcp_close(s: ^TcpSocket) -> ?NetError {
+    if s.h == 0 {
+        return NetError.fechado
+    }
+    let erro = forja_net_fechar(s.h)
+    s.h = 0
+    if erro != 0 {
+        return erro_de(erro)
+    }
+    return none
+}
+
+// Fecha o socket em escuta e zera o handle. Fechar de novo = fechado.
+pub proc tcp_listener_close(l: ^TcpListener) -> ?NetError {
+    if l.h == 0 {
+        return NetError.fechado
+    }
+    let erro = forja_net_fechar(l.h)
+    l.h = 0
+    if erro != 0 {
+        return erro_de(erro)
+    }
+    return none
+}

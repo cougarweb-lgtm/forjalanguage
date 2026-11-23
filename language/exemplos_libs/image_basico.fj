@@ -1,0 +1,186 @@
+// Exemplo da std:image (vendor\image 0.1.0, stb_image 2.34 em vendor\libstbi.a).
+// Sem argumentos: decodifica o PNG 2x2 e o GIF 2x2 embutidos e faz os casos negativos.
+// Com `-- <pasta>`: decodifica png_rgba.png, png_paleta.png, png16.png, gif_estatico.gif e jpeg.jpg dessa pasta (fixtures do oraculo), depois os negativos.
+// Saida deterministica: image_basico.esperado (so o modo sem argumentos).
+// VERIFICAR: python language\exemplos_libs\oraculos\image.py --verificar --forja <forja.exe absoluto>
+
+import "vendor:image/image"
+import "std:os"
+import "std:file"
+import "std:path"
+import "std:sha"
+
+// Nome curto do erro, para a saida do exemplo.
+proc nome_erro(erro: image.ImageError) -> str {
+    switch erro {
+    case image.ImageError.invalid_data:
+        return "invalid_data"
+    case image.ImageError.unsupported:
+        return "unsupported"
+    case image.ImageError.too_large:
+        return "too_large"
+    case image.ImageError.out_of_memory:
+        return "out_of_memory"
+    }
+    return "desconhecido"
+}
+
+// SHA-256 dos pixels em hexadecimal, impresso na mesma linha do rotulo e das dimensoes.
+proc imprimir_rgba(rotulo: str, largura: i32, altura: i32, pixels: []u8) {
+    let digest = sha.sha256(pixels)
+    var hex = make([dynamic]u8, alloc = heap)
+    defer delete(hex)
+    for b in digest {
+        format(f"{b:02x}", into = &hex)
+    }
+    let texto = to_str(&hex)
+    defer delete(texto)
+    print(f"{rotulo} rgba {largura} {altura} 4 {texto}")
+}
+
+// Linhas de um PNG ou GIF que decodifica: "<rotulo> info w h c" e "<rotulo> rgba w h 4 sha256".
+proc imprimir_imagem(rotulo: str, dados: []u8) {
+    switch cabecalho in image.info(dados) {
+    case image.ImageInfo:
+        print(f"{rotulo} info {cabecalho.width} {cabecalho.height} {cabecalho.channels}")
+    case image.ImageError:
+        print(f"{rotulo} info {nome_erro(cabecalho)}")
+        return
+    }
+    switch img in image.decode(dados) {
+    case image.Image:
+        imprimir_rgba(rotulo, img.width, img.height, image.pixels(img))
+        image.free(img)
+    case image.ImageError:
+        print(f"{rotulo} rgba {nome_erro(img)}")
+    }
+}
+
+// JPEG: stb e libjpeg-turbo divergem na IDCT, entao so largura, altura e canais entram na saida.
+// Os pixels RGB vao para jpeg_stb_rgb.bin na pasta, para o oraculo medir PSNR (informacao, nao aceite).
+proc imprimir_jpeg(pasta: str, dados: []u8) {
+    switch cabecalho in image.info(dados) {
+    case image.ImageInfo:
+        print(f"jpeg info {cabecalho.width} {cabecalho.height} {cabecalho.channels}")
+    case image.ImageError:
+        print(f"jpeg info {nome_erro(cabecalho)}")
+        return
+    }
+    switch img in image.decode(dados, want_channels = 3) {
+    case image.Image:
+        print(f"jpeg rgb {img.width} {img.height} 3")
+        let destino = path.join2(pasta, "jpeg_stb_rgb.bin", alloc = heap)
+        defer delete(destino)
+        _ = file.write_all(destino, image.pixels(img))
+        image.free(img)
+    case image.ImageError:
+        print(f"jpeg rgb {nome_erro(img)}")
+    }
+}
+
+// Le um fixture da pasta e imprime as linhas dele (JPEG tem tratamento proprio).
+proc imprimir_fixture(pasta: str, nome: str, rotulo: str) {
+    let caminho = path.join2(pasta, nome, alloc = heap)
+    defer delete(caminho)
+    switch lido in file.read_all(caminho, alloc = heap) {
+    case [dynamic]u8:
+        defer delete(lido)
+        if rotulo == "jpeg" {
+            imprimir_jpeg(pasta, lido[..])
+        } else {
+            imprimir_imagem(rotulo, lido[..])
+        }
+    case file.FileError:
+        print(f"{rotulo} leitura falhou")
+    }
+}
+
+proc imprimir_fixtures(pasta: str) {
+    imprimir_fixture(pasta, "png_rgba.png", "png_rgba")
+    imprimir_fixture(pasta, "png_paleta.png", "png_paleta")
+    imprimir_fixture(pasta, "png16.png", "png16")
+    imprimir_fixture(pasta, "gif_estatico.gif", "gif_estatico")
+    imprimir_fixture(pasta, "jpeg.jpg", "jpeg")
+}
+
+// Bytes pseudoaleatorios deterministicos (LCG de Park-Miller/ANSI C; mesma formula do oraculo).
+proc bytes_aleatorios() -> [256]u8 {
+    var saida: [256]u8 = {}
+    var semente: int = 12345
+    for i in 0..<256 {
+        semente = (semente * 1103515245 + 12345) % 2147483648
+        saida[i] = ((semente / 65536) % 256) as u8
+    }
+    return saida
+}
+
+// Casos negativos: cada um tem de ser recusado com o erro certo, sem travar.
+proc imprimir_negativos(png: []u8) {
+    var aleatorio = bytes_aleatorios()
+    switch truncado in image.decode(png[0..<40]) {
+    case image.Image:
+        image.free(truncado)
+        print("png_truncado aceito")
+    case image.ImageError:
+        print(f"png_truncado {nome_erro(truncado)}")
+    }
+    switch sorteado in image.decode(aleatorio[..]) {
+    case image.Image:
+        image.free(sorteado)
+        print("aleatorio aceito")
+    case image.ImageError:
+        print(f"aleatorio {nome_erro(sorteado)}")
+    }
+    switch vazio in image.info(png[0..<0]) {
+    case image.ImageInfo:
+        print("vazio aceito")
+    case image.ImageError:
+        print(f"vazio {nome_erro(vazio)}")
+    }
+    // Cabecalho forjado: IHDR com largura e altura 20000 (0x4E20); a stb recusa acima de 16384 antes de alocar.
+    var forjado: [80]u8 = {}
+    for i in 0..<80 {
+        forjado[i] = png[i]
+    }
+    forjado[16] = 0
+    forjado[17] = 0
+    forjado[18] = 0x4E
+    forjado[19] = 0x20
+    forjado[20] = 0
+    forjado[21] = 0
+    forjado[22] = 0x4E
+    forjado[23] = 0x20
+    switch cabecalho in image.info(forjado[..]) {
+    case image.ImageInfo:
+        print("png_forjado_info aceito")
+    case image.ImageError:
+        print(f"png_forjado_info {nome_erro(cabecalho)}")
+    }
+    switch img in image.decode(forjado[..]) {
+    case image.Image:
+        image.free(img)
+        print("png_forjado_decode aceito")
+    case image.ImageError:
+        print(f"png_forjado_decode {nome_erro(img)}")
+    }
+    switch canais in image.decode(png[..], want_channels = 5) {
+    case image.Image:
+        image.free(canais)
+        print("png_canais_5 aceito")
+    case image.ImageError:
+        print(f"png_canais_5 {nome_erro(canais)}")
+    }
+}
+
+proc main() {
+    var png: [80]u8 = {0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x02, 0x08, 0x06, 0x00, 0x00, 0x00, 0x72, 0xB6, 0x0D, 0x24, 0x00, 0x00, 0x00, 0x17, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x63, 0xF8, 0xCF, 0xC0, 0xF0, 0x9F, 0xE1, 0x3F, 0x43, 0x03, 0x23, 0x98, 0xFE, 0xCF, 0xE0, 0x00, 0x00, 0x3D, 0x23, 0x06, 0xBC, 0x3A, 0x2B, 0xE2, 0xC0, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82}
+    var gif: [46]u8 = {0x47, 0x49, 0x46, 0x38, 0x37, 0x61, 0x02, 0x00, 0x02, 0x00, 0x81, 0x00, 0x00, 0xFF, 0x00, 0x00, 0x00, 0x00, 0xFF, 0x00, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x2C, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x02, 0x00, 0x00, 0x08, 0x07, 0x00, 0x01, 0x04, 0x10, 0x10, 0x20, 0x20, 0x00, 0x3B}
+    let args = os.args()
+    if len(args) >= 2 {
+        imprimir_fixtures(args[1])
+    } else {
+        imprimir_imagem("png", png[..])
+        imprimir_imagem("gif", gif[..])
+    }
+    imprimir_negativos(png[..])
+}

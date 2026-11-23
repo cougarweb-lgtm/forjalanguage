@@ -1,0 +1,819 @@
+// ir/layout.fj - porte de compiler/ir/layout.c, compiler/ir/layout.h
+// sha256 de ir/layout.c: 91f0fa32443529d2cb154a97434ee1dfaa54e96df63047d50f82c7c48f5ee95a
+// sha256 de ir/layout.h: 4d030159f4226995d97db1523383ae182953e2a48a8c0c6d04467c3d76164a08
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "common"
+import "semantic"
+
+struct LayoutMembro {
+    tam: u32
+    ali: u32
+}
+
+pub struct LayoutTipo {
+    tam: u32
+    ali: u32
+    qtd: u32
+    offs: ?[]u32
+    membros: ?[]LayoutMembro
+    pronto: bool
+}
+
+pub struct Layouts {
+    tipos: ?[]LayoutTipo
+    qtd: u32
+}
+
+struct Forma {
+    tam: u32
+    ali: u32
+}
+
+struct LayoutCtx {
+    tipos: ?^semantic.Tipos
+    prog: ?^IrPrograma
+    saida: ?^Layouts
+    arena: ?^common.Arena
+}
+
+struct Membros {
+    dono: ?^LayoutTipo
+    n: u32
+    fim: u32
+    ali: u32
+    ok: bool
+}
+
+struct Conferencia {
+    lt: ?^LayoutTipo
+    d: ?^common.Diag
+    nome: ?str
+}
+
+pub const LAYOUT_MAPA_OFF_CHAVES: u32 = 0
+pub const LAYOUT_MAPA_OFF_VALORES: u32 = 8
+pub const LAYOUT_MAPA_OFF_LEN: u32 = 24
+pub const LAYOUT_MAPA_OFF_EPOCA: u32 = 48
+const CONFERIR_NOME_MAX: i32 = 96
+const FORMA_NENHUMA: Forma = Forma{tam = 0, ali = 1}
+const FORMA_UM_BYTE: Forma = Forma{tam = 1, ali = 1}
+const FORMA_U32: Forma = Forma{tam = 4, ali = 4}
+const FORMA_I64: Forma = Forma{tam = 8, ali = 8}
+const FORMA_PONTEIRO: Forma = Forma{tam = 8, ali = 8}
+const FORMA_MAPA: Forma = Forma{tam = 56, ali = 8}
+// C: ir/layout.c:26 TAMANHO_ESCALAR (tabela por classe; fora dela = 0 = sem forma)
+proc tamanho_escalar(classe: i32) -> u32 {
+    if (classe == semantic.TC_BOOL) or (classe == semantic.TC_I8) or (classe == semantic.TC_U8) {
+        return 1
+    }
+    if (classe == semantic.TC_I16) or (classe == semantic.TC_U16) {
+        return 2
+    }
+    if (classe == semantic.TC_I32) or (classe == semantic.TC_U32) or (classe == semantic.TC_REAL) or (classe == semantic.TC_ENUM) {
+        return 4
+    }
+    if (classe == semantic.TC_INT) or (classe == semantic.TC_UINT) or (classe == semantic.TC_F64) or (classe == semantic.TC_PONTEIRO) {
+        return 8
+    }
+    if (classe == semantic.TC_ANULAVEL) or (classe == semantic.TC_CSTR) or (classe == semantic.TC_RAWPTR) or (classe == semantic.TC_PROC) {
+        return 8
+    }
+    return 0
+}
+
+// C: ir/layout.c:331 CALCULO_DE (classe -> tag de chamar_calc_fn; 0 = escalar, sem calculo proprio)
+proc calc_fn_de_classe(classe: i32) -> u16 {
+    if classe == semantic.TC_STRUCT {
+        return CALC_FN_CALCULAR_STRUCT
+    }
+    if classe == semantic.TC_UNIAO {
+        return CALC_FN_CALCULAR_UNIAO
+    }
+    if classe == semantic.TC_RESULTADO {
+        return CALC_FN_CALCULAR_RESULTADO
+    }
+    if classe == semantic.TC_OPCIONAL {
+        return CALC_FN_CALCULAR_OPCIONAL
+    }
+    if classe == semantic.TC_TUPLA {
+        return CALC_FN_CALCULAR_TUPLA
+    }
+    if classe == semantic.TC_ARRAY {
+        return CALC_FN_CALCULAR_ARRAY
+    }
+    if classe == semantic.TC_MATRIZ {
+        return CALC_FN_CALCULAR_MATRIZ
+    }
+    if (classe == semantic.TC_FATIA) or (classe == semantic.TC_TEXTO) {
+        return CALC_FN_CALCULAR_PONTEIRO_E_LEN
+    }
+    if classe == semantic.TC_DINAMICO {
+        return CALC_FN_CALCULAR_DINAMICO
+    }
+    if classe == semantic.TC_MAPA {
+        return CALC_FN_CALCULAR_MAPA
+    }
+    if classe == semantic.TC_BIT_SET {
+        return CALC_FN_CALCULAR_BIT_SET
+    }
+    if classe == semantic.TC_SOA {
+        return CALC_FN_CALCULAR_SOA
+    }
+    return 0
+}
+
+pub proc arena_fatia_layout_membro(a: ^common.Arena, n: int) -> []LayoutMembro {
+    var l = make([dynamic]LayoutMembro, alloc = common.arena_mem(a), cap = n)
+    for i in 0..<n {
+        append(&l, item = LayoutMembro{})
+    }
+    return l[..]
+}
+
+pub proc arena_fatia_layout_tipo(a: ^common.Arena, n: int) -> []LayoutTipo {
+    var l = make([dynamic]LayoutTipo, alloc = common.arena_mem(a), cap = n)
+    for i in 0..<n {
+        append(&l, item = LayoutTipo{})
+    }
+    return l[..]
+}
+
+pub const CALC_FN_CALCULAR_STRUCT: u16 = 1
+pub const CALC_FN_CALCULAR_UNIAO: u16 = 2
+pub const CALC_FN_CALCULAR_RESULTADO: u16 = 3
+pub const CALC_FN_CALCULAR_OPCIONAL: u16 = 4
+pub const CALC_FN_CALCULAR_TUPLA: u16 = 5
+pub const CALC_FN_CALCULAR_ARRAY: u16 = 6
+pub const CALC_FN_CALCULAR_MATRIZ: u16 = 7
+pub const CALC_FN_CALCULAR_PONTEIRO_E_LEN: u16 = 8
+pub const CALC_FN_CALCULAR_DINAMICO: u16 = 9
+pub const CALC_FN_CALCULAR_MAPA: u16 = 10
+pub const CALC_FN_CALCULAR_BIT_SET: u16 = 11
+pub const CALC_FN_CALCULAR_SOA: u16 = 12
+pub proc chamar_calc_fn(tag: u16, c: ^LayoutCtx, id: u32) {
+    if tag == 1 {
+        calcular_struct(c, id)
+        return
+    }
+    if tag == 2 {
+        calcular_uniao(c, id)
+        return
+    }
+    if tag == 3 {
+        calcular_resultado(c, id)
+        return
+    }
+    if tag == 4 {
+        calcular_opcional(c, id)
+        return
+    }
+    if tag == 5 {
+        calcular_tupla(c, id)
+        return
+    }
+    if tag == 6 {
+        calcular_array(c, id)
+        return
+    }
+    if tag == 7 {
+        calcular_matriz(c, id)
+        return
+    }
+    if tag == 8 {
+        calcular_ponteiro_e_len(c, id)
+        return
+    }
+    if tag == 9 {
+        calcular_dinamico(c, id)
+        return
+    }
+    if tag == 10 {
+        calcular_mapa(c, id)
+        return
+    }
+    if tag == 11 {
+        calcular_bit_set(c, id)
+        return
+    }
+    if tag == 12 {
+        calcular_soa(c, id)
+        return
+    }
+    // C nao tem fallback (tag fora de CALCULO_DE nao chega aqui); na Forja vira falha interna com a tag
+    let msg_tag = format(f"layout: tag de calculo {tag} desconhecida", alloc = heap)
+    defer delete(msg_tag)
+    common.falha_interna(msg_tag)
+}
+
+// C: ir/layout.c:50
+proc alinhar_para(valor: u32, ali: u32) -> u32 {
+    return (((valor + ali) - 1) / ali) * ali
+}
+
+// C: ir/layout.c:55
+proc fixar_forma(c: ^LayoutCtx, id: u32, f: Forma) {
+    let lt: ^LayoutTipo = &((c.saida as ^Layouts).tipos or_else {})[id]
+    lt.tam = f.tam
+    var tern_1: u32 = 1
+    if f.ali != 0 {
+        tern_1 = f.ali
+    }
+    lt.ali = tern_1
+    lt.qtd = 0
+    lt.offs = none
+    lt.membros = none
+    lt.pronto = true
+}
+
+// C: ir/layout.c:67
+proc calcular_escalar(c: ^LayoutCtx, id: u32) {
+    let classe: i32 = semantic.tipo_classe_de(c.tipos as ^semantic.Tipos, id)
+    let tam: u32 = tamanho_escalar(classe)
+    fixar_forma(c, id, Forma{tam = tam, ali = tam})
+}
+
+// C: ir/layout.c:74
+proc forma_de(c: ^LayoutCtx, id: u32) -> Forma {
+    var lt: ?^LayoutTipo = none
+    calcular(c, id)
+    lt = &((c.saida as ^Layouts).tipos or_else {})[id]
+    return Forma{tam = (lt as ^LayoutTipo).tam, ali = (lt as ^LayoutTipo).ali}
+}
+
+// C: ir/layout.c:83
+proc membros_iniciar(m: ^Membros, c: ^LayoutCtx, id: u32, qtd: u32) {
+    let lt: ^LayoutTipo = &((c.saida as ^Layouts).tipos or_else {})[id]
+    lt.qtd = qtd
+    lt.offs = common.arena_fatia_u32(c.arena as ^common.Arena, qtd as int)
+    lt.membros = arena_fatia_layout_membro(c.arena as ^common.Arena, qtd as int)
+    m.dono = lt
+    m.n = 0
+    m.fim = 0
+    m.ali = 1
+    m.ok = true
+}
+
+// C: ir/layout.c:97
+proc membro_forma(m: ^Membros, f: Forma) {
+    m.fim = alinhar_para(m.fim, f.ali)
+    let ptr_1: ^LayoutTipo = m.dono as ^LayoutTipo
+    let p_1 = ptr_1.membros or_else {}
+    p_1[m.n] = LayoutMembro{tam = f.tam, ali = f.ali}
+    let ptr_2: ^LayoutTipo = m.dono as ^LayoutTipo
+    let antes_1: u32 = m.n
+    m.n += 1
+    let p_2 = ptr_2.offs or_else {}
+    p_2[antes_1] = m.fim
+    m.fim += f.tam
+    if f.ali > m.ali {
+        m.ali = f.ali
+    }
+    if f.tam == 0 {
+        m.ok = false
+    }
+}
+
+// C: ir/layout.c:107
+proc membro_de_tipo(m: ^Membros, c: ^LayoutCtx, id: u32) {
+    membro_forma(m, forma_de(c, id))
+}
+
+// C: ir/layout.c:113
+proc membros_fechar(m: ^Membros) {
+    let lt: ?^LayoutTipo = m.dono
+    let ptr_1: ^LayoutTipo = lt as ^LayoutTipo
+    ptr_1.pronto = true
+    if not m.ok {
+        let ptr_2: ^LayoutTipo = lt as ^LayoutTipo
+        ptr_2.tam = 0
+        let ptr_3: ^LayoutTipo = lt as ^LayoutTipo
+        ptr_3.ali = 1
+        return
+    }
+    let ptr_4: ^LayoutTipo = lt as ^LayoutTipo
+    ptr_4.tam = alinhar_para(m.fim, m.ali)
+    let ptr_5: ^LayoutTipo = lt as ^LayoutTipo
+    ptr_5.ali = m.ali
+}
+
+// C: ir/layout.c:128
+proc membros_de_lista(m: ^Membros) {
+    membro_forma(m, FORMA_I64)
+    membro_forma(m, FORMA_I64)
+    membro_forma(m, FORMA_U32)
+    membro_forma(m, FORMA_U32)
+}
+
+// C: ir/layout.c:137
+proc forma_da_uniao(c: ^LayoutCtx, u: ?^IrUniao) -> Forma {
+    var f: Forma = Forma{tam = 0, ali = 1}
+    var k: u32 = 0
+    while k < (u as ^IrUniao).nvariantes {
+        let v: Forma = forma_de(c, ((u as ^IrUniao).variantes or_else {})[k])
+        if v.tam == 0 {
+            return FORMA_NENHUMA
+        }
+        if v.tam > f.tam {
+            f.tam = v.tam
+        }
+        if v.ali > f.ali {
+            f.ali = v.ali
+        }
+        k += 1
+    }
+    f.tam = alinhar_para(f.tam, f.ali)
+    return f
+}
+
+// C: ir/layout.c:152
+proc calcular_struct(c: ^LayoutCtx, id: u32) {
+    let s: ?^IrStruct = layout_estrutura(c.tipos as ^semantic.Tipos, c.prog as ^IrPrograma, id)
+    var m: Membros = Membros{}
+    if (s == none) or (common.c2f_b2i32((s as ^IrStruct).opaco) != 0) {
+        fixar_forma(c, id, FORMA_NENHUMA)
+        return
+    }
+    var tern_1: u32 = (s as ^IrStruct).ncampos
+    if (s as ^IrStruct).ncampos == 0 {
+        tern_1 = 1
+    }
+    membros_iniciar(&m, c, id, tern_1)
+    if (s as ^IrStruct).ncampos == 0 {
+        membro_forma(&m, FORMA_UM_BYTE)
+    }
+    for k in (0 as u32)..<(s as ^IrStruct).ncampos {
+        membro_de_tipo(&m, c, ((s as ^IrStruct).campos or_else {})[k].tipo)
+    }
+    membros_fechar(&m)
+}
+
+// C: ir/layout.c:167
+proc calcular_uniao(c: ^LayoutCtx, id: u32) {
+    let u: ?^IrUniao = layout_uniao(c.tipos as ^semantic.Tipos, c.prog as ^IrPrograma, id)
+    var m: Membros = Membros{}
+    if u == none {
+        fixar_forma(c, id, FORMA_NENHUMA)
+        return
+    }
+    membros_iniciar(&m, c, id, 2)
+    membro_forma(&m, FORMA_U32)
+    membro_forma(&m, forma_da_uniao(c, u))
+    membros_fechar(&m)
+}
+
+// C: ir/layout.c:183
+proc calcular_resultado(c: ^LayoutCtx, id: u32) {
+    let info: ^semantic.TipoInfo = semantic.tipo_de(c.tipos as ^semantic.Tipos, id)
+    let tem_valor: bool = common.c2f_s2u_32(semantic.tipo_classe_de(c.tipos as ^semantic.Tipos, info.a)) != (semantic.TC_VAZIO as u32)
+    var m: Membros = Membros{}
+    var tern_1: i32 = 2
+    if common.c2f_b2i32(tem_valor) != 0 {
+        tern_1 = 3
+    }
+    membros_iniciar(&m, c, id, common.c2f_s2u_32(tern_1))
+    membro_forma(&m, FORMA_UM_BYTE)
+    if tem_valor {
+        membro_de_tipo(&m, c, info.a)
+    }
+    membro_de_tipo(&m, c, info.b)
+    membros_fechar(&m)
+}
+
+// C: ir/layout.c:197
+proc calcular_opcional(c: ^LayoutCtx, id: u32) {
+    var m: Membros = Membros{}
+    if semantic.tipo_opcional_nicho(c.tipos as ^semantic.Tipos, id) {
+        fixar_forma(c, id, FORMA_PONTEIRO)
+        return
+    }
+    membros_iniciar(&m, c, id, 2)
+    membro_forma(&m, FORMA_UM_BYTE)
+    membro_de_tipo(&m, c, semantic.tipo_de(c.tipos as ^semantic.Tipos, id).a)
+    membros_fechar(&m)
+}
+
+// C: ir/layout.c:211
+proc calcular_tupla(c: ^LayoutCtx, id: u32) {
+    let n: u32 = semantic.tipo_tupla_qtd(c.tipos as ^semantic.Tipos, id)
+    var m: Membros = Membros{}
+    membros_iniciar(&m, c, id, n)
+    for k in (0 as u32)..<n {
+        membro_de_tipo(&m, c, semantic.tipo_tupla_elemento(c.tipos as ^semantic.Tipos, id, k))
+    }
+    membros_fechar(&m)
+}
+
+// C: ir/layout.c:222
+proc calcular_vetor_unico(c: ^LayoutCtx, id: u32, elemento: u32, n: u32) {
+    let e: Forma = forma_de(c, elemento)
+    var m: Membros = Membros{}
+    membros_iniciar(&m, c, id, 1)
+    membro_forma(&m, Forma{tam = e.tam * n, ali = e.ali})
+    membros_fechar(&m)
+}
+
+// C: ir/layout.c:232
+proc calcular_array(c: ^LayoutCtx, id: u32) {
+    let info: ^semantic.TipoInfo = semantic.tipo_de(c.tipos as ^semantic.Tipos, id)
+    calcular_vetor_unico(c, id, info.a, info.b)
+}
+
+// C: ir/layout.c:239
+proc calcular_matriz(c: ^LayoutCtx, id: u32) {
+    let n: u32 = semantic.tipo_matriz_linhas(c.tipos as ^semantic.Tipos, id) * semantic.tipo_matriz_colunas(c.tipos as ^semantic.Tipos, id)
+    calcular_vetor_unico(c, id, semantic.tipo_de(c.tipos as ^semantic.Tipos, id).a, n)
+}
+
+// C: ir/layout.c:247
+proc calcular_ponteiro_e_len(c: ^LayoutCtx, id: u32) {
+    var m: Membros = Membros{}
+    membros_iniciar(&m, c, id, 2)
+    membro_forma(&m, FORMA_PONTEIRO)
+    membro_forma(&m, FORMA_I64)
+    membros_fechar(&m)
+}
+
+// C: ir/layout.c:258
+proc calcular_dinamico(c: ^LayoutCtx, id: u32) {
+    var m: Membros = Membros{}
+    membros_iniciar(&m, c, id, 5)
+    membro_forma(&m, FORMA_PONTEIRO)
+    membros_de_lista(&m)
+    membros_fechar(&m)
+}
+
+// C: ir/layout.c:268
+proc calcular_mapa(c: ^LayoutCtx, id: u32) {
+    fixar_forma(c, id, FORMA_MAPA)
+}
+
+// C: ir/layout.c:274
+proc tamanho_bit_set(membros: u32) -> u32 {
+    if membros <= 8 {
+        return 1
+    }
+    if membros <= 16 {
+        return 2
+    }
+    if membros <= 32 {
+        return 4
+    }
+    return 8
+}
+
+// C: ir/layout.c:282
+proc calcular_bit_set(c: ^LayoutCtx, id: u32) {
+    let tam: u32 = tamanho_bit_set(semantic.tipo_de(c.tipos as ^semantic.Tipos, id).b)
+    fixar_forma(c, id, Forma{tam = tam, ali = tam})
+}
+
+// C: ir/layout.c:290
+proc calcular_soa_fixa(c: ^LayoutCtx, id: u32, s: ?^IrStruct, n: u32) {
+    var m: Membros = Membros{}
+    membros_iniciar(&m, c, id, (s as ^IrStruct).ncampos)
+    var k: u32 = 0
+    while k < (s as ^IrStruct).ncampos {
+        let e: Forma = forma_de(c, ((s as ^IrStruct).campos or_else {})[k].tipo)
+        membro_forma(&m, Forma{tam = e.tam * n, ali = e.ali})
+        k += 1
+    }
+    membros_fechar(&m)
+}
+
+// C: ir/layout.c:304
+proc calcular_soa_dinamica(c: ^LayoutCtx, id: u32, s: ?^IrStruct) {
+    var m: Membros = Membros{}
+    membros_iniciar(&m, c, id, 5)
+    membro_forma(&m, Forma{tam = 8 * (s as ^IrStruct).ncampos, ali = 8})
+    membros_de_lista(&m)
+    membros_fechar(&m)
+}
+
+// C: ir/layout.c:314
+proc calcular_soa(c: ^LayoutCtx, id: u32) {
+    let base: u32 = semantic.tipo_de(c.tipos as ^semantic.Tipos, id).a
+    let arg_1: u32 = semantic.tipo_de(c.tipos as ^semantic.Tipos, base).a
+    let arg_2: ^IrPrograma = c.prog as ^IrPrograma
+    let arg_3: ^semantic.Tipos = c.tipos as ^semantic.Tipos
+    let s: ?^IrStruct = layout_estrutura(arg_3, arg_2, arg_1)
+    if (s == none) or (common.c2f_b2i32((s as ^IrStruct).opaco) != 0) {
+        fixar_forma(c, id, FORMA_NENHUMA)
+        return
+    }
+    if common.c2f_s2u_32(semantic.tipo_classe_de(c.tipos as ^semantic.Tipos, base)) == (semantic.TC_ARRAY as u32) {
+        calcular_soa_fixa(c, id, s, semantic.tipo_de(c.tipos as ^semantic.Tipos, base).b)
+        return
+    }
+    calcular_soa_dinamica(c, id, s)
+}
+
+// C: ir/layout.c:347
+proc calcular(c: ^LayoutCtx, id: u32) {
+    let lt: ^LayoutTipo = &((c.saida as ^Layouts).tipos or_else {})[id]
+    if lt.pronto {
+        return
+    }
+    let classe: i32 = semantic.tipo_classe_de(c.tipos as ^semantic.Tipos, id)
+    let tag: u16 = calc_fn_de_classe(classe)
+    if tag == 0 {
+        calcular_escalar(c, id)
+        return
+    }
+    chamar_calc_fn(tag, c, id)
+}
+
+// C: ir/layout.c:357
+pub proc layout_estrutura(t: ^semantic.Tipos, p: ^IrPrograma, id: u32) -> ?^IrStruct {
+    let nome: i32 = transmute(semantic.tipo_de(t, id).a, to = i32)
+    if p.indice_struct_pronto and nome >= 0 {
+        return layout_estrutura_indexada(p, nome)
+    }
+    return layout_estrutura_linear(p, nome)
+}
+
+// F2: busca linear (a 1a struct com o nome). Vale antes do indice e para nome negativo.
+proc layout_estrutura_linear(p: ^IrPrograma, nome: i32) -> ?^IrStruct {
+    let structs = p.structs or_else {}
+    for k in (0 as u32)..<p.nstructs {
+        if structs[k].nome == nome {
+            return &structs[k]
+        }
+    }
+    return none
+}
+
+// F2: busca pelo indice por nome. Nome fora da faixa indexada nao existe em nenhuma struct.
+proc layout_estrutura_indexada(p: ^IrPrograma, nome: i32) -> ?^IrStruct {
+    let indice: []i32 = p.indice_struct or_else {}
+    if (nome as int) >= len(indice) {
+        return none
+    }
+    let marca: i32 = indice[nome as int]
+    if marca == 0 {
+        return none
+    }
+    let structs: []IrStruct = p.structs or_else {}
+    return &structs[(marca - 1) as int]
+}
+
+// F2: monta o indice por nome 1x, quando os nomes das structs ja estao preenchidos (preencher_structs_e_enums).
+// Nomes negativos nao entram: layout_estrutura os acha pela busca linear.
+pub proc layout_indexar_structs(p: ^IrPrograma, a: ^common.Arena) {
+    let structs: []IrStruct = p.structs or_else {}
+    var maior: i32 = -1
+    for k in 0..<p.nstructs {
+        if structs[k as int].nome > maior {
+            maior = structs[k as int].nome
+        }
+    }
+    let indice: []i32 = common.arena_fatia_i32(a, (maior + 1) as int)
+    for k in 0..<p.nstructs {
+        let nome: i32 = structs[k as int].nome
+        if nome >= 0 {
+            if indice[nome as int] == 0 {
+                indice[nome as int] = (k + 1) as i32
+            }
+        }
+    }
+    p.indice_struct = indice
+    p.indice_struct_pronto = true
+}
+
+// C: ir/layout.c:367
+pub proc layout_uniao(t: ^semantic.Tipos, p: ^IrPrograma, id: u32) -> ?^IrUniao {
+    let nome: i32 = transmute(semantic.tipo_de(t, id).a, to = i32)
+    let unioes = p.unioes or_else {}
+    for k in (0 as u32)..<p.nunioes {
+        if unioes[k].nome == nome {
+            return &unioes[k]
+        }
+    }
+    return none
+}
+
+// C: ir/layout.c:377
+pub proc layout_calcular(t: ^semantic.Tipos, p: ^IrPrograma, a: ^common.Arena, saida: ^Layouts) {
+    var c = LayoutCtx{tipos = t, prog = p, saida = saida, arena = a}
+    saida.qtd = (len(t.itens) as u64) as u32
+    saida.tipos = arena_fatia_layout_tipo(a, saida.qtd as int)
+    var id: u32 = 1
+    while id < saida.qtd {
+        calcular(&c, id)
+        id += 1
+    }
+}
+
+// C: ir/layout.c:386
+proc layout_de(l: ^Layouts, id: u32) -> ^LayoutTipo {
+    if id >= l.qtd {
+        let msg_1 = format(f"layout: tipo {id} fora da tabela", alloc = heap)
+        defer delete(msg_1)
+        common.falha_interna(msg_1)
+    }
+    return &(l.tipos or_else {})[id]
+}
+
+// C: ir/layout.c:392
+pub proc layout_tamanho(l: ^Layouts, id: u32) -> u32 {
+    let lt: ^LayoutTipo = layout_de(l, id)
+    if lt.tam == 0 {
+        let msg_1 = format(f"layout: tipo {id} sem forma em C", alloc = heap)
+        defer delete(msg_1)
+        common.falha_interna(msg_1)
+    }
+    return lt.tam
+}
+
+// C: ir/layout.c:400
+pub proc layout_alinhamento(l: ^Layouts, id: u32) -> u32 {
+    let lt: ^LayoutTipo = layout_de(l, id)
+    if lt.tam == 0 {
+        let msg_1 = format(f"layout: tipo {id} sem forma em C", alloc = heap)
+        defer delete(msg_1)
+        common.falha_interna(msg_1)
+    }
+    return lt.ali
+}
+
+// C: ir/layout.c:408
+pub proc layout_offset_campo(l: ^Layouts, id: u32, k: u32) -> u32 {
+    let lt: ^LayoutTipo = layout_de(l, id)
+    if k >= lt.qtd {
+        let msg_1 = format(f"layout: tipo {id} sem o membro {k}", alloc = heap)
+        defer delete(msg_1)
+        common.falha_interna(msg_1)
+    }
+    return (lt.offs or_else {})[k]
+}
+
+// C: ir/layout.c:416
+pub proc layout_qtd_membros(l: ^Layouts, id: u32) -> u32 {
+    return layout_de(l, id).qtd
+}
+
+// C: ir/layout.c:432
+proc potencia_de_dois(n: u32) -> bool {
+    return (n != 0) and ((n & (n - 1)) == 0)
+}
+
+// C: ir/layout.c:437
+proc membro_coerente(cf: ^Conferencia, k: u32) -> bool {
+    let m: ^LayoutMembro = &((cf.lt as ^LayoutTipo).membros or_else {})[k]
+    let off: u32 = ((cf.lt as ^LayoutTipo).offs or_else {})[k]
+    if (not potencia_de_dois(m.ali)) or ((off % m.ali) != 0) {
+        let txt_1 = cf.nome or_else "(null)"
+        let msg_1 = format(f"layout de '{txt_1}', campo {k}: offset {off} B nao e multiplo do alinhamento {m.ali} B (potencia de 2)", alloc = heap)
+        defer delete(msg_1)
+        return common.diag_relatar(cf.d as ^common.Diag, common.X0906, 0, msg_1)
+    }
+    if (off + m.tam) > (cf.lt as ^LayoutTipo).tam {
+        let txt_2 = cf.nome or_else "(null)"
+        let msg_2 = format(f"layout de '{txt_2}', campo {k}: offset {off} B + {m.tam} B passa do tamanho {(cf.lt as ^LayoutTipo).tam} B", alloc = heap)
+        defer delete(msg_2)
+        return common.diag_relatar(cf.d as ^common.Diag, common.X0906, 0, msg_2)
+    }
+    return true
+}
+
+// C: ir/layout.c:451
+proc tipo_coerente(cf: ^Conferencia) -> bool {
+    if (not potencia_de_dois((cf.lt as ^LayoutTipo).ali)) or (((cf.lt as ^LayoutTipo).tam % (cf.lt as ^LayoutTipo).ali) != 0) {
+        let txt_1 = cf.nome or_else "(null)"
+        let msg_1 = format(f"layout de '{txt_1}': tamanho {(cf.lt as ^LayoutTipo).tam} B incoerente com o alinhamento {(cf.lt as ^LayoutTipo).ali} B (potencia de 2 que divide o tamanho)", alloc = heap)
+        defer delete(msg_1)
+        return common.diag_relatar(cf.d as ^common.Diag, common.X0906, 0, msg_1)
+    }
+    var k: u32 = 0
+    while k < (cf.lt as ^LayoutTipo).qtd {
+        if not membro_coerente(cf, k) {
+            return false
+        }
+        k += 1
+    }
+    return true
+}
+
+// C: ir/layout.c:463
+proc nome_legivel(t: ^semantic.Tipos, id: u32, cf: ^Conferencia) {
+    var texto: [dynamic]u8 = make([dynamic]u8, alloc = heap)
+    defer delete(texto)
+    semantic.tipo_anexar_texto(t, id, &texto)
+    if len(texto) == 0 {
+        cf.nome = "?"
+        return
+    }
+    // snprintf do C corta em CONFERIR_NOME_MAX - 1 bytes; o nome vive no frame (texto sem dono em struct)
+    var cabe: int = len(texto)
+    if cabe > ((CONFERIR_NOME_MAX as int) - 1) {
+        cabe = (CONFERIR_NOME_MAX as int) - 1
+    }
+    cf.nome = from_bytes(texto[0..<cabe], alloc = frame)
+}
+
+// C: ir/layout.c:472
+pub proc layout_conferir(l: ^Layouts, t: ^semantic.Tipos, d: ^common.Diag) -> bool {
+    var cf: Conferencia = Conferencia{d = d}
+    var id: u32 = 1
+    while id < l.qtd {
+        cf.lt = &(l.tipos or_else {})[id]
+        if (cf.lt as ^LayoutTipo).tam == 0 {
+            id += 1
+            continue
+        }
+        nome_legivel(t, id, &cf)
+        if not tipo_coerente(&cf) {
+            return false
+        }
+        id += 1
+    }
+    return true
+}
+
+// Valores do C (TAMANHO_ESCALAR, CALCULO_DE, AlinharPara, PotenciaDeDois, TamanhoBitSet) calculados a mao.
+test "layout: tamanho dos escalares segue TAMANHO_ESCALAR do C" {
+    expect(tamanho_escalar(semantic.TC_BOOL) == 1 and tamanho_escalar(semantic.TC_I8) == 1 and tamanho_escalar(semantic.TC_U8) == 1)
+    expect(tamanho_escalar(semantic.TC_I16) == 2 and tamanho_escalar(semantic.TC_U16) == 2)
+    expect(tamanho_escalar(semantic.TC_I32) == 4 and tamanho_escalar(semantic.TC_ENUM) == 4 and tamanho_escalar(semantic.TC_REAL) == 4)
+    expect(tamanho_escalar(semantic.TC_INT) == 8 and tamanho_escalar(semantic.TC_PROC) == 8 and tamanho_escalar(semantic.TC_RAWPTR) == 8)
+    expect(tamanho_escalar(semantic.TC_VAZIO) == 0 and tamanho_escalar(semantic.TC_VENENO) == 0 and tamanho_escalar(semantic.TC_STRUCT) == 0)
+}
+
+test "layout: despacho de calculo por classe segue CALCULO_DE do C" {
+    expect(calc_fn_de_classe(semantic.TC_STRUCT) == CALC_FN_CALCULAR_STRUCT)
+    expect(calc_fn_de_classe(semantic.TC_TEXTO) == CALC_FN_CALCULAR_PONTEIRO_E_LEN and calc_fn_de_classe(semantic.TC_FATIA) == CALC_FN_CALCULAR_PONTEIRO_E_LEN)
+    expect(calc_fn_de_classe(semantic.TC_SOA) == CALC_FN_CALCULAR_SOA and calc_fn_de_classe(semantic.TC_BIT_SET) == CALC_FN_CALCULAR_BIT_SET)
+    expect(calc_fn_de_classe(semantic.TC_MATRIZ) == CALC_FN_CALCULAR_MATRIZ and calc_fn_de_classe(semantic.TC_OPCIONAL) == CALC_FN_CALCULAR_OPCIONAL)
+    expect(calc_fn_de_classe(semantic.TC_INT) == 0 and calc_fn_de_classe(semantic.TC_ENUM) == 0)
+}
+
+test "layout: alinhamento, potencia de dois e tamanho do bit_set" {
+    expect(alinhar_para(0, 8) == 0 and alinhar_para(1, 8) == 8 and alinhar_para(12, 8) == 16 and alinhar_para(16, 4) == 16)
+    expect(potencia_de_dois(1) and potencia_de_dois(8) and not potencia_de_dois(0) and not potencia_de_dois(6))
+    expect(tamanho_bit_set(1) == 1 and tamanho_bit_set(8) == 1 and tamanho_bit_set(9) == 2 and tamanho_bit_set(16) == 2)
+    expect(tamanho_bit_set(17) == 4 and tamanho_bit_set(32) == 4 and tamanho_bit_set(33) == 8)
+}
+
+test "layout: indice de structs segue a busca linear (1a ocorrencia)" {
+    var a = common.Arena{}
+    var p = IrPrograma{}
+    var lista = make([dynamic]IrStruct, alloc = common.arena_mem(&a), cap = 4)
+    for k in 0..<4 {
+        append(&lista, item = IrStruct{})
+    }
+    p.structs = lista[..]
+    p.nstructs = 4
+    let structs: []IrStruct = p.structs or_else {}
+    structs[0].nome = 5
+    structs[1].nome = -1
+    structs[2].nome = 5
+    structs[3].nome = 2
+    layout_indexar_structs(&p, &a)
+    expect(p.indice_struct_pronto)
+    var nome: i32 = 0
+    while nome < 8 {
+        let linear = layout_estrutura_linear(&p, nome)
+        let indexada = layout_estrutura_indexada(&p, nome)
+        expect((linear == none) == (indexada == none))
+        if linear != none {
+            expect((linear as ^IrStruct) == (indexada as ^IrStruct))
+        }
+        nome += 1
+    }
+    expect((layout_estrutura_indexada(&p, 5) as ^IrStruct) == &structs[0])
+    common.arena_liberar(&a)
+}
+
+test "layout: membros da struct fecham offset, tamanho e alinhamento como o C" {
+    var a: common.Arena = common.Arena{}
+    defer common.arena_liberar(&a)
+    var saida: Layouts = Layouts{}
+    saida.tipos = arena_fatia_layout_tipo(&a, 4)
+    var c: LayoutCtx = LayoutCtx{saida = &saida, arena = &a}
+    var m: Membros = Membros{}
+    membros_iniciar(&m, &c, 1, 2)
+    membro_forma(&m, FORMA_U32)
+    membro_forma(&m, FORMA_I64)
+    membros_fechar(&m)
+    let lt: ^LayoutTipo = &(saida.tipos or_else {})[1]
+    expect(lt.tam == 16 and lt.ali == 8 and lt.qtd == 2 and lt.pronto)
+    expect((lt.offs or_else {})[0] == 0 and (lt.offs or_else {})[1] == 8)
+    var m3: Membros = Membros{}
+    membros_iniciar(&m3, &c, 3, 1)
+    membro_forma(&m3, FORMA_NENHUMA)
+    membros_fechar(&m3)
+    let sem_forma: ^LayoutTipo = &(saida.tipos or_else {})[3]
+    expect(sem_forma.tam == 0 and sem_forma.ali == 1 and sem_forma.pronto)
+}
+
+test "layout: fixar_forma com alinhamento zero vira 1" {
+    var a: common.Arena = common.Arena{}
+    defer common.arena_liberar(&a)
+    var saida: Layouts = Layouts{}
+    saida.tipos = arena_fatia_layout_tipo(&a, 4)
+    var c: LayoutCtx = LayoutCtx{saida = &saida, arena = &a}
+    fixar_forma(&c, 2, Forma{tam = 0, ali = 0})
+    let lt: ^LayoutTipo = &(saida.tipos or_else {})[2]
+    expect(lt.tam == 0 and lt.ali == 1 and lt.pronto and lt.qtd == 0)
+}

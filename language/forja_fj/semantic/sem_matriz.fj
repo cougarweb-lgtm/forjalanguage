@@ -1,0 +1,427 @@
+// semantic/sem_matriz.fj - porte de compiler/semantic/sem_matriz.c
+// sha256 de semantic/sem_matriz.c: 26dc4cd09583b56383e248a0af51c4b334dada7205b6ff245b1328e0334aa25f
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "common"
+import "frontend"
+
+// C: semantic/sem_matriz.c:10
+proc resolver_matriz(s: ^Semantica, t: ?^frontend.TipoRef, base: ^u32) -> bool {
+    // TipoRef.alvo (TipoRef * no C) chega como fatia de 1 elemento: o objeto e o [0]
+    let tr: ^frontend.TipoRef = t as ^frontend.TipoRef
+    let alvo_ref: ^frontend.TipoRef = &(tr.alvo or_else {})[0]
+    if not sem_resolver_tipo_ref(s, alvo_ref) {
+        return false
+    }
+    let alvo: u32 = alvo_ref.tipo
+    if (alvo != (TIPO_F32 as u32)) and (alvo != (TIPO_F64 as u32)) {
+        let tipo = sem_descrever_str(s, alvo)
+        defer delete(tipo)
+        let msg_1 = format(f"matrix guarda f32 ou f64 (recebeu {tipo})", alloc = heap)
+        defer delete(msg_1)
+        return sem_erro(s, common.E0321, alvo_ref.pos, msg_1)
+    }
+    let nome: u32 = common.c2f_s2u_32(tr.nome)
+    base^ = tipo_matriz(&s.tipos, alvo, nome >> 4, nome & 15)
+    return true
+}
+
+// C: semantic/sem_matriz.c:24
+proc sem_literal_matriz(s: ^Semantica, e: ^frontend.Expr, ctx: u32) -> bool {
+    let elemento: u32 = tipo_de(&s.tipos, ctx).a
+    let esperado: u32 = tipo_matriz_linhas(&s.tipos, ctx) * tipo_matriz_colunas(&s.tipos, ctx)
+    if (e.nargs != 0) and (e.nargs != esperado) {
+        let tipo = sem_descrever_str(s, ctx)
+        defer delete(tipo)
+        let nargs: u32 = e.nargs
+        let msg_1 = format(f"o literal tem {nargs} elementos e {tipo} pede {esperado} (escritos por linhas) ou {{}} para zero", alloc = heap)
+        defer delete(msg_1)
+        return sem_erro(s, common.E0321, e.pos, msg_1)
+    }
+    for i in (0 as u32)..<e.nargs {
+        let v: ?^frontend.Expr = (e.args or_else {})[i].valor
+        if (not sem_checar(s, v, elemento)) or (not sem_coagir(s, v, elemento, (v as ^frontend.Expr).pos)) {
+            return false
+        }
+    }
+    e.tipo = ctx
+    return true
+}
+
+// C: semantic/sem_matriz.c:43
+proc conferir_indice_da_matriz(s: ^Semantica, x: ?^frontend.Expr, limite: u32, matriz: u32) -> bool {
+    var negativo: bool = false
+    var mag: u64 = 0
+    if not sem_checar(s, x, TIPO_INT as u32) {
+        return false
+    }
+    if not tipo_eh_inteiro((x as ^frontend.Expr).tipo) {
+        return sem_erro_do_inteiro(s, x, "o indice")
+    }
+    if not sem_inteiro_constante(s, x, &negativo, &mag) {
+        return true
+    }
+    if (negativo and (mag != 0)) or (mag >= (limite as u64)) {
+        let tipo = sem_descrever_str(s, matriz)
+        defer delete(tipo)
+        let msg_1 = format(f"indice constante fora de 0..<{limite} em {tipo}", alloc = heap)
+        defer delete(msg_1)
+        return sem_erro(s, common.E0321, (x as ^frontend.Expr).pos, msg_1)
+    }
+    return true
+}
+
+// C: semantic/sem_matriz.c:59
+proc sem_indice_matriz(s: ^Semantica, e: ^frontend.Expr) -> bool {
+    if not sem_checar(s, e.a, TIPO_VAZIO as u32) {
+        return false
+    }
+    let matriz: u32 = (e.a as ^frontend.Expr).tipo
+    if common.c2f_s2u_32(tipo_classe_de(&s.tipos, matriz)) != (TC_MATRIZ as u32) {
+        let msg_1 = format(f"indice duplo a[i, j] so existe em matrix", alloc = heap)
+        defer delete(msg_1)
+        return sem_erro(s, common.E0308, e.pos_op, msg_1)
+    }
+    let arg_1: u32 = matriz
+    let arg_2: u32 = tipo_matriz_linhas(&s.tipos, matriz)
+    let arg_3: ?^frontend.Expr = e.b
+    let arg_4: ^Semantica = s
+    if not conferir_indice_da_matriz(arg_4, arg_3, arg_2, arg_1) {
+        return false
+    }
+    let arg_5: u32 = matriz
+    let arg_6: u32 = tipo_matriz_colunas(&s.tipos, matriz)
+    let arg_7: ?^frontend.Expr = (e.args or_else {})[0].valor
+    let arg_8: ^Semantica = s
+    if not conferir_indice_da_matriz(arg_8, arg_7, arg_6, arg_5) {
+        return false
+    }
+    e.tipo = tipo_de(&s.tipos, matriz).a
+    return true
+}
+
+// C: semantic/sem_matriz.c:73
+proc produto_de_matrizes(s: ^Semantica, e: ^frontend.Expr, ta: u32, tb: u32) -> bool {
+    let colunas_a: u32 = tipo_matriz_colunas(&s.tipos, ta)
+    let linhas_b: u32 = tipo_matriz_linhas(&s.tipos, tb)
+    let texto_a = sem_descrever_str(s, ta)
+    defer delete(texto_a)
+    let texto_b = sem_descrever_str(s, tb)
+    defer delete(texto_b)
+    if tipo_de(&s.tipos, ta).a != tipo_de(&s.tipos, tb).a {
+        let msg_1 = format(f"produto de {texto_a} por {texto_b}: o elemento precisa ser o mesmo", alloc = heap)
+        defer delete(msg_1)
+        return sem_erro(s, common.E0321, e.pos_op, msg_1)
+    }
+    if colunas_a != linhas_b {
+        let msg_2 = format(f"produto de {texto_a} por {texto_b}: as colunas da 1a ({colunas_a}) precisam ser as linhas da 2a ({linhas_b})", alloc = heap)
+        defer delete(msg_2)
+        return sem_erro(s, common.E0321, e.pos_op, msg_2)
+    }
+    e.tipo = tipo_matriz(&s.tipos, tipo_de(&s.tipos, ta).a, tipo_matriz_linhas(&s.tipos, ta), tipo_matriz_colunas(&s.tipos, tb))
+    return true
+}
+
+// C: semantic/sem_matriz.c:91
+proc produto_por_vetor(s: ^Semantica, e: ^frontend.Expr, matriz: u32, vetor: u32) -> bool {
+    let k: ^TipoInfo = tipo_de(&s.tipos, matriz)
+    let v: ^TipoInfo = tipo_de(&s.tipos, vetor)
+    let colunas: u32 = tipo_matriz_colunas(&s.tipos, matriz)
+    if (v.a == k.a) and (v.b == colunas) {
+        e.tipo = tipo_array(&s.tipos, k.a, tipo_matriz_linhas(&s.tipos, matriz))
+        return true
+    }
+    let texto_m = sem_descrever_str(s, matriz)
+    defer delete(texto_m)
+    let texto_v = sem_descrever_str(s, vetor)
+    defer delete(texto_v)
+    let texto_t = sem_descrever_str(s, k.a)
+    defer delete(texto_t)
+    let msg_1 = format(f"produto de {texto_m} por {texto_v}: o vetor precisa ser [{colunas}]{texto_t}", alloc = heap)
+    defer delete(msg_1)
+    return sem_erro(s, common.E0321, e.pos_op, msg_1)
+}
+
+// C: semantic/sem_matriz.c:107
+proc produto_por_escalar(s: ^Semantica, e: ^frontend.Expr, matriz: u32, escalar: u32) -> bool {
+    let elemento: u32 = tipo_de(&s.tipos, matriz).a
+    if escalar == elemento {
+        e.tipo = matriz
+        return true
+    }
+    let texto_m = sem_descrever_str(s, matriz)
+    defer delete(texto_m)
+    let texto_t = sem_descrever_str(s, elemento)
+    defer delete(texto_t)
+    let texto_e = sem_descrever_str(s, escalar)
+    defer delete(texto_e)
+    let msg_1 = format(f"o escalar de {texto_m} precisa ser {texto_t} (recebeu {texto_e})", alloc = heap)
+    defer delete(msg_1)
+    return sem_erro(s, common.E0321, e.pos_op, msg_1)
+}
+
+// C: semantic/sem_matriz.c:122
+proc produto_da_matriz(s: ^Semantica, e: ^frontend.Expr, ta: u32, tb: u32) -> bool {
+    let ca: i32 = tipo_classe_de(&s.tipos, ta)
+    let cb: i32 = tipo_classe_de(&s.tipos, tb)
+    if (common.c2f_s2u_32(ca) == (TC_MATRIZ as u32)) and (common.c2f_s2u_32(cb) == (TC_MATRIZ as u32)) {
+        return produto_de_matrizes(s, e, ta, tb)
+    }
+    if (common.c2f_s2u_32(ca) == (TC_MATRIZ as u32)) and (common.c2f_s2u_32(cb) == (TC_ARRAY as u32)) {
+        return produto_por_vetor(s, e, ta, tb)
+    }
+    if common.c2f_s2u_32(ca) == (TC_ARRAY as u32) {
+        let msg_1 = format(f"vetor * matrix nao existe: escreva transpose(m) * v", alloc = heap)
+        defer delete(msg_1)
+        return sem_erro(s, common.E0321, e.pos_op, msg_1)
+    }
+    if common.c2f_s2u_32(ca) == (TC_MATRIZ as u32) {
+        return produto_por_escalar(s, e, ta, tb)
+    }
+    return produto_por_escalar(s, e, tb, ta)
+}
+
+// C: semantic/sem_matriz.c:133
+proc sem_conta_matriz(s: ^Semantica, e: ^frontend.Expr) -> bool {
+    let ta: u32 = (e.a as ^frontend.Expr).tipo
+    let tb: u32 = (e.b as ^frontend.Expr).tipo
+    if (e.op >= (frontend.OP_BIT_E as u8)) and (e.op <= (frontend.OP_DESLOCA_DIR as u8)) {
+        let msg_1 = format(f"matrix nao tem operador de bits", alloc = heap)
+        defer delete(msg_1)
+        return sem_erro(s, common.E0321, e.pos_op, msg_1)
+    }
+    if (e.op == (frontend.OP_DIV as u8)) or (e.op == (frontend.OP_RESTO as u8)) {
+        let msg_2 = format(f"matrix tem + - e *; para dividir multiplique pelo inverso do escalar", alloc = heap)
+        defer delete(msg_2)
+        return sem_erro(s, common.E0321, e.pos_op, msg_2)
+    }
+    if e.op == (frontend.OP_MUL as u8) {
+        return produto_da_matriz(s, e, ta, tb)
+    }
+    if ta == tb {
+        e.tipo = ta
+        return true
+    }
+    let texto_a = sem_descrever_str(s, ta)
+    defer delete(texto_a)
+    let texto_b = sem_descrever_str(s, tb)
+    defer delete(texto_b)
+    let msg_3 = format(f"soma ou subtracao de {texto_a} com {texto_b}: as duas precisam ser do mesmo tipo", alloc = heap)
+    defer delete(msg_3)
+    return sem_erro(s, common.E0321, e.pos_op, msg_3)
+}
+
+// C: semantic/sem_matriz.c:154
+proc sem_chamar_transpose(s: ^Semantica, e: ^frontend.Expr) -> bool {
+    if not sem_ligar_embutido(s, e, s.params_transpose[..]) {
+        return false
+    }
+    let v: ^frontend.Expr = (e.args or_else {})[0].valor as ^frontend.Expr
+    if not sem_checar(s, v, TIPO_VAZIO as u32) {
+        return false
+    }
+    if tipo_classe_de(&s.tipos, v.tipo) != TC_MATRIZ {
+        let tipo = sem_descrever_str(s, v.tipo)
+        defer delete(tipo)
+        let msg_1 = format(f"transpose pede matrix (tipo {tipo})", alloc = heap)
+        defer delete(msg_1)
+        return sem_erro(s, common.E0321, v.pos, msg_1)
+    }
+    e.tipo = tipo_matriz(&s.tipos, tipo_de(&s.tipos, v.tipo).a, tipo_matriz_colunas(&s.tipos, v.tipo), tipo_matriz_linhas(&s.tipos, v.tipo))
+    return true
+}
+
+// G3 S5: testes dirigidos (so existem em `forja test`)
+test "sem_matriz: resolver_matriz e sem_literal_matriz" {
+    var c = S5Cena{}
+    s5_cena_montar(&c, {})
+    var alvo: [1]frontend.TipoRef = {frontend.TipoRef{nome = s5_nome(&c, "f32"), erro = -1, pos = 12}}
+    var t = frontend.TipoRef{forma = frontend.TR_MATRIZ as u8, alvo = alvo[..], erro = -1, nome = 35}
+    var base: u32 = 0
+    expect(resolver_matriz(&c.sv, &t, &base) and base == tipo_matriz(&c.sv.tipos, TIPO_F32 as u32, 2, 3))
+    alvo[0].nome = s5_nome(&c, "f64")
+    t.nome = 68
+    expect(resolver_matriz(&c.sv, &t, &base) and base == tipo_matriz(&c.sv.tipos, TIPO_F64 as u32, 4, 4))
+    alvo[0].nome = s5_nome(&c, "int")
+    expect(not resolver_matriz(&c.sv, &t, &base))
+    expect(c.diag.codigo == common.E0321 and c.diag.off == 12 and (c.diag.causa or_else "") == "matrix guarda f32 ou f64 (recebeu int)")
+    // literal: 0 elementos (zero), todos, quantidade errada
+    let f32t: u32 = TIPO_F32 as u32
+    let m22: u32 = tipo_matriz(&c.sv.tipos, f32t, 2, 2)
+    var e = frontend.Expr{tipo_no = frontend.EX_LITERAL_ARRAY as u8, pos = 9}
+    expect(sem_literal_matriz(&c.sv, &e, m22) and e.tipo == m22)
+    var folhas = make([dynamic]frontend.Expr, alloc = heap)
+    var args = make([dynamic]frontend.Arg, alloc = heap)
+    for k in 0..<3 {
+        append(&folhas, item = s5_folha(f32t, false))
+    }
+    s5_ligar_args(&e, &folhas, &args)
+    expect(not sem_literal_matriz(&c.sv, &e, m22))
+    let descr = sem_descrever_str(&c.sv, m22)
+    defer delete(descr)
+    let esperado = format(f"o literal tem 3 elementos e {descr} pede 4 (escritos por linhas) ou {{}} para zero", alloc = heap)
+    defer delete(esperado)
+    expect(c.diag.codigo == common.E0321 and c.diag.off == 9 and (c.diag.causa or_else "") == esperado)
+    append(&folhas, item = s5_folha(f32t, false))
+    delete(args)
+    args = make([dynamic]frontend.Arg, alloc = heap)
+    e.nargs = 0
+    s5_ligar_args(&e, &folhas, &args)
+    e.tipo = 0
+    expect(sem_literal_matriz(&c.sv, &e, m22) and e.tipo == m22)
+    delete(folhas)
+    delete(args)
+    s5_cena_liberar(&c)
+}
+
+test "sem_matriz: conferir_indice_da_matriz e sem_indice_matriz" {
+    var c = S5Cena{}
+    s5_cena_montar(&c, {})
+    let f32t: u32 = TIPO_F32 as u32
+    let m23: u32 = tipo_matriz(&c.sv.tipos, f32t, 2, 3)
+    let descr = sem_descrever_str(&c.sv, m23)
+    defer delete(descr)
+    // indice vivo e constantes dentro, no limite, negativo e -0
+    var vivo = s5_folha(TIPO_INT as u32, false)
+    expect(conferir_indice_da_matriz(&c.sv, &vivo, 2, m23))
+    var lit = s5_inteiro(1, 40)
+    expect(conferir_indice_da_matriz(&c.sv, &lit, 2, m23))
+    lit = s5_inteiro(2, 41)
+    expect(not conferir_indice_da_matriz(&c.sv, &lit, 2, m23))
+    let esperado = format(f"indice constante fora de 0..<2 em {descr}", alloc = heap)
+    defer delete(esperado)
+    expect(c.diag.codigo == common.E0321 and c.diag.off == 41 and (c.diag.causa or_else "") == esperado)
+    var uno = s5_inteiro(1, 51)
+    var neg = frontend.Expr{tipo_no = frontend.EX_UNARIO as u8, op = frontend.OP_NEGAR as u8, a = &uno, pos = 50, flexivel = true}
+    uno.flexivel = true
+    expect(not conferir_indice_da_matriz(&c.sv, &neg, 2, m23))
+    expect(c.diag.off == 50 and (c.diag.causa or_else "") == esperado)
+    uno = s5_inteiro(0, 51)
+    uno.flexivel = true
+    expect(conferir_indice_da_matriz(&c.sv, &neg, 2, m23))
+    // m[i, j]: linhas em e.b e colunas em args[0]
+    var fm = s5_folha(m23, false)
+    var i = s5_inteiro(1, 60)
+    var j = s5_inteiro(2, 61)
+    var args = make([dynamic]frontend.Arg, alloc = heap)
+    append(&args, item = frontend.Arg{nome = -1, valor = &j, indice = 0})
+    var e = frontend.Expr{tipo_no = frontend.EX_INDICE as u8, a = &fm, b = &i, args = args[..], nargs = 1, pos = 4, pos_op = 6}
+    expect(sem_indice_matriz(&c.sv, &e) and e.tipo == f32t)
+    j = s5_inteiro(3, 61)
+    expect(not sem_indice_matriz(&c.sv, &e))
+    let esperado_col = format(f"indice constante fora de 0..<3 em {descr}", alloc = heap)
+    defer delete(esperado_col)
+    expect(c.diag.off == 61 and (c.diag.causa or_else "") == esperado_col)
+    j = s5_inteiro(2, 61)
+    i = s5_inteiro(2, 60)
+    e.tipo = 0
+    expect(not sem_indice_matriz(&c.sv, &e))
+    expect(c.diag.off == 60 and (c.diag.causa or_else "") == esperado)
+    // a base nao e matrix
+    fm = s5_folha(TIPO_I32 as u32, false)
+    expect(not sem_indice_matriz(&c.sv, &e))
+    expect(c.diag.codigo == common.E0308 and c.diag.off == 6 and (c.diag.causa or_else "") == "indice duplo a[i, j] so existe em matrix")
+    delete(args)
+    s5_cena_liberar(&c)
+}
+
+test "sem_matriz: sem_conta_matriz (produtos, soma, operadores) e sem_chamar_transpose" {
+    var pre: [1]str = {"transpose"}
+    var c = S5Cena{}
+    s5_cena_montar(&c, pre[..])
+    let f32t: u32 = TIPO_F32 as u32
+    let m23: u32 = tipo_matriz(&c.sv.tipos, f32t, 2, 3)
+    let m34: u32 = tipo_matriz(&c.sv.tipos, f32t, 3, 4)
+    let m24: u32 = tipo_matriz(&c.sv.tipos, f32t, 2, 4)
+    let m32: u32 = tipo_matriz(&c.sv.tipos, f32t, 3, 2)
+    let m23d: u32 = tipo_matriz(&c.sv.tipos, TIPO_F64 as u32, 3, 4)
+    let v3: u32 = tipo_array(&c.sv.tipos, f32t, 3)
+    let d23 = sem_descrever_str(&c.sv, m23)
+    defer delete(d23)
+    let d34 = sem_descrever_str(&c.sv, m34)
+    defer delete(d34)
+    let d34d = sem_descrever_str(&c.sv, m23d)
+    defer delete(d34d)
+    let dv3 = sem_descrever_str(&c.sv, v3)
+    defer delete(dv3)
+    var fa = s5_folha(m23, false)
+    var fb = s5_folha(m34, false)
+    var e = frontend.Expr{tipo_no = frontend.EX_BINARIO as u8, op = frontend.OP_MUL as u8, a = &fa, b = &fb, pos = 4, pos_op = 6}
+    // matriz * matriz
+    expect(sem_conta_matriz(&c.sv, &e) and e.tipo == m24)
+    fb = s5_folha(m23, false)
+    expect(not sem_conta_matriz(&c.sv, &e))
+    let colunas = format(f"produto de {d23} por {d23}: as colunas da 1a (3) precisam ser as linhas da 2a (2)", alloc = heap)
+    defer delete(colunas)
+    expect(c.diag.codigo == common.E0321 and c.diag.off == 6 and (c.diag.causa or_else "") == colunas)
+    fb = s5_folha(m23d, false)
+    expect(not sem_conta_matriz(&c.sv, &e))
+    let elemento = format(f"produto de {d23} por {d34d}: o elemento precisa ser o mesmo", alloc = heap)
+    defer delete(elemento)
+    expect((c.diag.causa or_else "") == elemento)
+    // matriz * vetor
+    fb = s5_folha(v3, false)
+    expect(sem_conta_matriz(&c.sv, &e) and e.tipo == tipo_array(&c.sv.tipos, f32t, 2))
+    fb = s5_folha(tipo_array(&c.sv.tipos, f32t, 4), false)
+    expect(not sem_conta_matriz(&c.sv, &e))
+    let d4 = sem_descrever_str(&c.sv, tipo_array(&c.sv.tipos, f32t, 4))
+    defer delete(d4)
+    let vetor = format(f"produto de {d23} por {d4}: o vetor precisa ser [3]f32", alloc = heap)
+    defer delete(vetor)
+    expect((c.diag.causa or_else "") == vetor)
+    // vetor * matriz nao existe
+    fa = s5_folha(v3, false)
+    fb = s5_folha(m34, false)
+    expect(not sem_conta_matriz(&c.sv, &e))
+    expect((c.diag.causa or_else "") == "vetor * matrix nao existe: escreva transpose(m) * v")
+    // matriz * escalar e escalar * matriz
+    fa = s5_folha(m23, false)
+    fb = s5_folha(f32t, false)
+    expect(sem_conta_matriz(&c.sv, &e) and e.tipo == m23)
+    fa = s5_folha(f32t, false)
+    fb = s5_folha(m23, false)
+    e.tipo = 0
+    expect(sem_conta_matriz(&c.sv, &e) and e.tipo == m23)
+    fa = s5_folha(m23, false)
+    fb = s5_folha(TIPO_F64 as u32, false)
+    expect(not sem_conta_matriz(&c.sv, &e))
+    let escalar = format(f"o escalar de {d23} precisa ser f32 (recebeu f64)", alloc = heap)
+    defer delete(escalar)
+    expect((c.diag.causa or_else "") == escalar)
+    // soma/subtracao: mesmo tipo
+    fb = s5_folha(m23, false)
+    e.op = frontend.OP_SOMA as u8
+    e.tipo = 0
+    expect(sem_conta_matriz(&c.sv, &e) and e.tipo == m23)
+    e.op = frontend.OP_SUB as u8
+    e.tipo = 0
+    expect(sem_conta_matriz(&c.sv, &e) and e.tipo == m23)
+    fb = s5_folha(m32, false)
+    expect(not sem_conta_matriz(&c.sv, &e))
+    let d32 = sem_descrever_str(&c.sv, m32)
+    defer delete(d32)
+    let soma = format(f"soma ou subtracao de {d23} com {d32}: as duas precisam ser do mesmo tipo", alloc = heap)
+    defer delete(soma)
+    expect((c.diag.causa or_else "") == soma)
+    // operadores que a matrix nao tem
+    e.op = frontend.OP_DIV as u8
+    expect(not sem_conta_matriz(&c.sv, &e) and (c.diag.causa or_else "") == "matrix tem + - e *; para dividir multiplique pelo inverso do escalar")
+    e.op = frontend.OP_RESTO as u8
+    expect(not sem_conta_matriz(&c.sv, &e) and (c.diag.causa or_else "") == "matrix tem + - e *; para dividir multiplique pelo inverso do escalar")
+    e.op = frontend.OP_BIT_E as u8
+    expect(not sem_conta_matriz(&c.sv, &e) and (c.diag.causa or_else "") == "matrix nao tem operador de bits")
+    e.op = frontend.OP_DESLOCA_DIR as u8
+    expect(not sem_conta_matriz(&c.sv, &e) and (c.diag.causa or_else "") == "matrix nao tem operador de bits")
+    // transpose
+    var um: [1]u32 = {m23}
+    var ch = S5Chamada{}
+    s5_chamada_montar(&ch, s5_nome(&c, "transpose"), um[..])
+    expect(sem_chamar_transpose(&c.sv, &ch.e) and ch.e.tipo == m32)
+    expect(sem_chamar_v19(&c.sv, &ch.e, frontend.EMB_TRANSPOSE) and ch.e.tipo == m32)
+    ch.folhas[0].tipo = TIPO_I32 as u32
+    expect(not sem_chamar_transpose(&c.sv, &ch.e))
+    expect(c.diag.codigo == common.E0321 and c.diag.off == 100 and (c.diag.causa or_else "") == "transpose pede matrix (tipo i32)")
+    s5_chamada_liberar(&ch)
+    s5_cena_liberar(&c)
+}

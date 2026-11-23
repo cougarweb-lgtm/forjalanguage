@@ -1,0 +1,822 @@
+// nativo/bir/bir_validar.fj - porte de compiler/nativo/bir/bir_validar.c
+// sha256 de nativo/bir/bir_validar.c: a42f0df781210d970c3a3c0b121f955214edd7ceb8c63625349b5bb02a5a2542
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "common"
+
+struct Validador {
+    p: ?^BirPrograma
+    f: ?^BirFuncao
+    i: ?^BirInstr
+    erro: ?^common.Diag
+    bloco: u32
+    indice: u32
+}
+
+struct FatoGuarda {
+    vreg: u32
+    bloco: u32
+    cond: u8
+    imed: i64
+}
+
+const REPROVA_CAUSA_MAX: i32 = 300
+const COND_INVERSA: [10]u8 = {1, 0, 5, 4, 3, 2, 9, 8, 7, 6}
+
+// C: nativo/bir/bir_validar.c:48
+proc reprova(v: ^Validador, causa: str) -> bool {
+    var tern_1: u32 = 0
+    if (v.i != none) and ((v.i as ^BirInstr).pos != BIR_SEM_POS) {
+        tern_1 = (v.i as ^BirInstr).pos
+    }
+    let txt_1 = (v.p as ^BirPrograma).simbolos[(v.f as ^BirFuncao).simbolo].nome or_else "(null)"
+    let msg_1 = format(f"BIR invalida na funcao {txt_1}: {causa}", alloc = heap)
+    defer delete(msg_1)
+    return common.diag_relatar(v.erro as ^common.Diag, common.X0904, tern_1, msg_1)
+}
+
+// C: nativo/bir/bir_validar.c:54
+proc eh_terminador(op: u8) -> bool {
+    return (((op == (BIR_SALTA as u8)) or (op == (BIR_DESVIA as u8))) or (op == (BIR_RETORNA as u8))) or (op == (BIR_ARMADILHA as u8))
+}
+
+// C: nativo/bir/bir_validar.c:59
+proc eh_conta_ov_3(op: u8) -> bool {
+    return ((op as i32) >= BIR_ADD_OV) and ((op as i32) <= BIR_NEG_OV)
+}
+
+// C: nativo/bir/bir_validar.c:65
+proc agregado_invalido(o: ^BirOperando) -> bool {
+    return (o.tam != 0) and ((o.tipo != (BO_VREG as u8)) or (o.classe != (BC_I64 as u8)))
+}
+
+// C: nativo/bir/bir_validar.c:70
+proc operando_valido(v: ^Validador, o: ^BirOperando) -> bool {
+    if agregado_invalido(o) {
+        return false
+    }
+    if o.tipo == (BO_VREG as u8) {
+        return (o.id < (v.f as ^BirFuncao).nvregs) and ((((v.f as ^BirFuncao).classe_vreg or_else {})[o.id] as i32) == (o.classe as i32))
+    }
+    if o.tipo == (BO_IMED as u8) {
+        return o.classe != (BC_NADA as u8)
+    }
+    if o.tipo == (BO_SIMBOLO as u8) {
+        return o.id < (v.p as ^BirPrograma).nsimbolos
+    }
+    return o.tipo == (BO_NADA as u8)
+}
+
+// C: nativo/bir/bir_validar.c:83
+proc destino_valido(v: ^Validador) -> bool {
+    let i: ?^BirInstr = v.i
+    if (i as ^BirInstr).dst == BIR_SEM_VREG {
+        return false
+    }
+    return ((i as ^BirInstr).dst < (v.f as ^BirFuncao).nvregs) and ((((v.f as ^BirFuncao).classe_vreg or_else {})[(i as ^BirInstr).dst] as i32) == ((i as ^BirInstr).classe as i32))
+}
+
+// C: nativo/bir/bir_validar.c:93
+proc mascara_de_sinal_valida(v: ^Validador) -> bool {
+    let i: ?^BirInstr = v.i
+    var s: ?^BirSimbolo = none
+    if ((i as ^BirInstr).b.tipo != (BO_SIMBOLO as u8)) or ((i as ^BirInstr).b.id >= (v.p as ^BirPrograma).nsimbolos) {
+        return false
+    }
+    s = &(v.p as ^BirPrograma).simbolos[(i as ^BirInstr).b.id]
+    return (((s as ^BirSimbolo).tipo == (BS_DADO as u8)) and ((s as ^BirSimbolo).tam == 16)) and ((s as ^BirSimbolo).alinhamento >= 16)
+}
+
+// C: nativo/bir/bir_validar.c:104
+proc classe_real(classe: u8) -> bool {
+    return bir_classe_eh_real(classe as i32)
+}
+
+// C: nativo/bir/bir_validar.c:110
+proc op_tambem_em_real(op: u8) -> bool {
+    let sw_1 = op as i32
+    if sw_1 == BIR_CONST or sw_1 == BIR_COPIA or sw_1 == BIR_NEG or sw_1 == BIR_ADD or sw_1 == BIR_SUB or sw_1 == BIR_MUL or sw_1 == BIR_DIV or sw_1 == BIR_CMP {
+        return true
+    } else {
+        return false
+    }
+    return false
+}
+
+// C: nativo/bir/bir_validar.c:119
+proc classe_real_permitida(i: ?^BirInstr) -> bool {
+    return (not ((common.c2f_b2i32(classe_real((i as ^BirInstr).classe)) != 0) or (common.c2f_b2i32(classe_real((i as ^BirInstr).a.classe)) != 0))) or (common.c2f_b2i32(op_tambem_em_real((i as ^BirInstr).op)) != 0)
+}
+
+// C: nativo/bir/bir_validar.c:125
+proc largura_unaria_valida(v: ^Validador) -> bool {
+    let i: ?^BirInstr = v.i
+    let sw_1 = (i as ^BirInstr).op as i32
+    if sw_1 == BIR_CONST {
+        return ((i as ^BirInstr).a.tipo == (BO_IMED as u8)) and (((i as ^BirInstr).a.classe as i32) == ((i as ^BirInstr).classe as i32))
+    } else if sw_1 == BIR_EXT_S or sw_1 == BIR_EXT_Z {
+        return ((i as ^BirInstr).a.classe as i32) < ((i as ^BirInstr).classe as i32)
+    } else if sw_1 == BIR_TRUNC {
+        return ((i as ^BirInstr).a.classe as i32) > ((i as ^BirInstr).classe as i32)
+    } else if sw_1 == BIR_NEG {
+        if (common.c2f_b2i32(classe_real((i as ^BirInstr).classe)) != 0) and (not mascara_de_sinal_valida(v)) {
+            return false
+        }
+    } else {
+    }
+    return ((i as ^BirInstr).a.classe as i32) == ((i as ^BirInstr).classe as i32)
+}
+
+// C: nativo/bir/bir_validar.c:144
+proc conta_unaria_valida(v: ^Validador) -> bool {
+    let i: ?^BirInstr = v.i
+    if ((not destino_valido(v)) or ((i as ^BirInstr).a.tipo == (BO_NADA as u8))) or ((i as ^BirInstr).a.tipo == (BO_SIMBOLO as u8)) {
+        return false
+    }
+    if not classe_real_permitida(i) {
+        return false
+    }
+    return largura_unaria_valida(v)
+}
+
+// C: nativo/bir/bir_validar.c:156
+proc comparacao_valida(i: ?^BirInstr) -> bool {
+    return (((i as ^BirInstr).classe == (BC_I8 as u8)) and (((i as ^BirInstr).aux as i32) <= BCOND_FGE)) and (common.c2f_b2i32(classe_real((i as ^BirInstr).a.classe)) == common.c2f_b2i32(((i as ^BirInstr).aux as i32) >= BCOND_FEQ))
+}
+
+// C: nativo/bir/bir_validar.c:161
+proc operandos_binarios_validos(v: ^Validador) -> bool {
+    let i: ?^BirInstr = v.i
+    return (((common.c2f_b2i32(destino_valido(v)) != 0) and ((i as ^BirInstr).a.tipo != (BO_NADA as u8))) and ((i as ^BirInstr).b.tipo != (BO_NADA as u8))) and (((i as ^BirInstr).a.classe as i32) == ((i as ^BirInstr).b.classe as i32))
+}
+
+// C: nativo/bir/bir_validar.c:168
+proc conta_binaria_valida(v: ^Validador) -> bool {
+    let i: ?^BirInstr = v.i
+    if not operandos_binarios_validos(v) {
+        return false
+    }
+    if (common.c2f_b2i32(classe_real((i as ^BirInstr).a.classe)) != 0) and (not op_tambem_em_real((i as ^BirInstr).op)) {
+        return false
+    }
+    if (i as ^BirInstr).op == (BIR_CMP as u8) {
+        return comparacao_valida(i)
+    }
+    return ((i as ^BirInstr).a.classe as i32) == ((i as ^BirInstr).classe as i32)
+}
+
+// C: nativo/bir/bir_validar.c:182
+proc raiz_valida(v: ^Validador) -> bool {
+    let i: ?^BirInstr = v.i
+    if (((not destino_valido(v)) or (not classe_real((i as ^BirInstr).classe))) or (((i as ^BirInstr).a.classe as i32) != ((i as ^BirInstr).classe as i32))) or ((i as ^BirInstr).b.tipo != (BO_NADA as u8)) {
+        return false
+    }
+    return ((i as ^BirInstr).a.tipo == (BO_VREG as u8)) or ((i as ^BirInstr).a.tipo == (BO_IMED as u8))
+}
+
+// C: nativo/bir/bir_validar.c:193
+proc seleciona_operando_simples(o: ^BirOperando) -> bool {
+    return (((o.tipo == (BO_VREG as u8)) or (o.tipo == (BO_IMED as u8))) and (o.tam == 0)) and (o.extensao == (BE_NENHUMA as u8))
+}
+
+// C: nativo/bir/bir_validar.c:198
+proc seleciona_valida(v: ^Validador) -> bool {
+    let i: ?^BirInstr = v.i
+    var maximo: bool = false
+    var primeiro: ?^BirOperando = none
+    var segundo: ?^BirOperando = none
+    if ((((not destino_valido(v)) or ((i as ^BirInstr).classe == (BC_NADA as u8))) or ((i as ^BirInstr).nargs != 2)) or ((i as ^BirInstr).args == none)) or (((i as ^BirInstr).aux as i32) > BCOND_FGE) {
+        return false
+    }
+    if (((not operando_valido(v, &((i as ^BirInstr).args or_else {})[0])) or (not operando_valido(v, &((i as ^BirInstr).args or_else {})[1]))) or ((((i as ^BirInstr).args or_else {})[0].classe as i32) != (((i as ^BirInstr).args or_else {})[1].classe as i32))) or (((i as ^BirInstr).args or_else {})[0].classe == (BC_NADA as u8)) {
+        return false
+    }
+    if (common.c2f_b2i32(classe_real(((i as ^BirInstr).args or_else {})[0].classe)) != common.c2f_b2i32(((i as ^BirInstr).aux as i32) >= BCOND_FEQ)) or (common.c2f_b2i32(classe_real(((i as ^BirInstr).args or_else {})[0].classe)) != common.c2f_b2i32(classe_real((i as ^BirInstr).classe))) {
+        return false
+    }
+    if (((not seleciona_operando_simples(&(i as ^BirInstr).a)) or (not seleciona_operando_simples(&(i as ^BirInstr).b))) or (not seleciona_operando_simples(&((i as ^BirInstr).args or_else {})[0]))) or (not seleciona_operando_simples(&((i as ^BirInstr).args or_else {})[1])) {
+        return false
+    }
+    if (((i as ^BirInstr).a.classe as i32) != ((i as ^BirInstr).classe as i32)) or (((i as ^BirInstr).b.classe as i32) != ((i as ^BirInstr).classe as i32)) {
+        return false
+    }
+    return (not classe_real((i as ^BirInstr).classe)) or (common.c2f_b2i32(bir_seleciona_min_max(i, &maximo, &primeiro, &segundo)) != 0)
+}
+
+// C: nativo/bir/bir_validar.c:218
+proc inteiro_para_real_valido(i: ?^BirInstr) -> bool {
+    if (((i as ^BirInstr).aux as i32) > BIR_SEM_SINAL) or (((i as ^BirInstr).a.classe != (BC_I32 as u8)) and ((i as ^BirInstr).a.classe != (BC_I64 as u8))) {
+        return false
+    }
+    return ((i as ^BirInstr).a.classe == (BC_I32 as u8)) or ((i as ^BirInstr).aux == (BIR_SINAL as u8))
+}
+
+// C: nativo/bir/bir_validar.c:225
+proc destino_real_com_origem_valida(v: ^Validador) -> bool {
+    let i: ?^BirInstr = v.i
+    return ((common.c2f_b2i32(destino_valido(v)) != 0) and (common.c2f_b2i32(classe_real((i as ^BirInstr).classe)) != 0)) and (((i as ^BirInstr).a.tipo == (BO_VREG as u8)) or ((i as ^BirInstr).a.tipo == (BO_IMED as u8)))
+}
+
+// C: nativo/bir/bir_validar.c:232
+proc conversao_real_valida(v: ^Validador) -> bool {
+    let i: ?^BirInstr = v.i
+    if not destino_real_com_origem_valida(v) {
+        return false
+    }
+    if (i as ^BirInstr).op == (BIR_F_PARA_F as u8) {
+        return (common.c2f_b2i32(classe_real((i as ^BirInstr).a.classe)) != 0) and (((i as ^BirInstr).a.classe as i32) != ((i as ^BirInstr).classe as i32))
+    }
+    return inteiro_para_real_valido(i)
+}
+
+// C: nativo/bir/bir_validar.c:243
+proc conta_ov_valida(v: ^Validador) -> bool {
+    let i: ?^BirInstr = v.i
+    if ((not conta_binaria_valida(v)) or (((i as ^BirInstr).aux as i32) > BIR_SEM_SINAL)) or ((i as ^BirInstr).alvo[0] >= (v.f as ^BirFuncao).nblocos) {
+        return false
+    }
+    return (v.f as ^BirFuncao).blocos[(i as ^BirInstr).alvo[0]].frio
+}
+
+// C: nativo/bir/bir_validar.c:254
+proc bits_da_classe(classe: u8) -> u32 {
+    if classe == (BC_I8 as u8) {
+        return 8
+    }
+    if classe == (BC_I16 as u8) {
+        return 16
+    }
+    if classe == (BC_I32 as u8) {
+        return 32
+    }
+    return 64
+}
+
+// C: nativo/bir/bir_validar.c:260
+proc sem_sinal_na_classe(imed: i64, classe: u8) -> u64 {
+    let bits: u32 = bits_da_classe(classe)
+    var tern_1: u64 = common.c2f_s2u_64(imed) & ((1 << ((bits as u64) & 63)) - 1)
+    if bits == 64 {
+        tern_1 = common.c2f_s2u_64(imed)
+    }
+    return tern_1
+}
+
+// C: nativo/bir/bir_validar.c:267
+proc eh_deslocamento_2(op: u8) -> bool {
+    return (op == (BIR_SHL as u8)) or (op == (BIR_SHR as u8))
+}
+
+// C: nativo/bir/bir_validar.c:272
+proc imediato_seguro(i: ?^BirInstr) -> bool {
+    let valor: u64 = sem_sinal_na_classe((i as ^BirInstr).b.imed, (i as ^BirInstr).classe)
+    if eh_deslocamento_2((i as ^BirInstr).op) {
+        return valor < (bits_da_classe((i as ^BirInstr).classe) as u64)
+    }
+    if (i as ^BirInstr).aux == (BIR_SEM_SINAL as u8) {
+        return valor != 0
+    }
+    return (valor != 0) and (valor != sem_sinal_na_classe(-1, (i as ^BirInstr).classe))
+}
+
+// C: nativo/bir/bir_validar.c:283
+proc sem_definicao_de(bloco: ^BirBloco, ate: u32, vreg: u32) -> bool {
+    for k in (0 as u32)..<ate {
+        if bloco.instrs[k].dst == vreg {
+            return false
+        }
+    }
+    return true
+}
+
+// C: nativo/bir/bir_validar.c:293
+proc aresta_para(i: ^BirInstr, ramo: u8, alvo: u32) -> bool {
+    if ramo == 1 {
+        return (i.op == (BIR_DESVIA as u8)) and (i.alvo[1] == alvo)
+    }
+    return (((i.op == (BIR_SALTA as u8)) or (i.op == (BIR_DESVIA as u8))) or (common.c2f_b2i32(eh_conta_ov_3(i.op)) != 0)) and (i.alvo[0] == alvo)
+}
+
+// C: nativo/bir/bir_validar.c:302
+proc aresta_unica(f: ^BirFuncao, alvo: u32, origem: ^u32, ramo: ^u8) -> bool {
+    var arestas: u32 = 0
+    var b: u32 = 0
+    while (b < f.nblocos) and (alvo != 0) {
+        var k: u32 = 0
+        while k < f.blocos[b].n {
+            var r: u8 = 0
+            while (r as i32) < 2 {
+                if not aresta_para(&f.blocos[b].instrs[k], r, alvo) {
+                    r += 1
+                    continue
+                }
+                arestas += 1
+                origem^ = b
+                ramo^ = r
+                r += 1
+            }
+            k += 1
+        }
+        b += 1
+    }
+    return arestas == 1
+}
+
+// C: nativo/bir/bir_validar.c:321
+proc cmp_com_imediato_do_desvia(cmp: ^BirInstr, desvia: ^BirInstr) -> bool {
+    if (((desvia.op != (BIR_DESVIA as u8)) or (cmp.op != (BIR_CMP as u8))) or (cmp.dst != desvia.a.id)) or ((cmp.aux as u64) >= 10) { // C2F: sizeof COND_INVERSA
+        return false
+    }
+    return (cmp.a.tipo == (BO_VREG as u8)) and (cmp.b.tipo == (BO_IMED as u8))
+}
+
+// C: nativo/bir/bir_validar.c:329
+proc fato_da_aresta(f: ^BirFuncao, origem: u32, ramo: u8, fato: ^FatoGuarda) -> bool {
+    let bloco: ^BirBloco = &f.blocos[origem]
+    var desvia: ?^BirInstr = none
+    var cmp: ?^BirInstr = none
+    if bloco.n < 2 {
+        return false
+    }
+    desvia = &bloco.instrs[bloco.n - 1]
+    cmp = &bloco.instrs[bloco.n - 2]
+    if not cmp_com_imediato_do_desvia(cmp as ^BirInstr, desvia as ^BirInstr) {
+        return false
+    }
+    var tern_1: i32 = 0
+    if ramo == 0 {
+        tern_1 = (cmp as ^BirInstr).aux as i32
+    } else {
+        tern_1 = COND_INVERSA[(cmp as ^BirInstr).aux] as i32
+    }
+    fato^ = FatoGuarda{vreg = (cmp as ^BirInstr).a.id, bloco = origem, cond = tern_1 as u8, imed = (cmp as ^BirInstr).b.imed}
+    return true
+}
+
+// C: nativo/bir/bir_validar.c:344
+proc fato_de_entrada(f: ^BirFuncao, bloco: u32, fato: ^FatoGuarda) -> bool {
+    var origem: u32 = 0
+    var ramo: u8 = 0
+    return (common.c2f_b2i32(aresta_unica(f, bloco, &origem, &ramo)) != 0) and (common.c2f_b2i32(fato_da_aresta(f, origem, ramo, fato)) != 0)
+}
+
+// C: nativo/bir/bir_validar.c:353
+proc fato_limita_contador(fato: ^FatoGuarda, classe: u8) -> bool {
+    let k: u64 = sem_sinal_na_classe(fato.imed, classe)
+    return ((fato.cond == (BCOND_LT_U as u8)) and (k <= (bits_da_classe(classe) as u64))) or ((fato.cond == (BCOND_LE_U as u8)) and (k < (bits_da_classe(classe) as u64)))
+}
+
+// C: nativo/bir/bir_validar.c:360
+proc fato_nao_zero(fato: ^FatoGuarda) -> bool {
+    return ((fato.cond == (BCOND_NE as u8)) or (fato.cond == (BCOND_GT_U as u8))) and (fato.imed == 0)
+}
+
+// C: nativo/bir/bir_validar.c:366
+proc guarda_com_sinal(v: ^Validador, menos_um: ^FatoGuarda) -> bool {
+    let teste: ^BirBloco = &(v.f as ^BirFuncao).blocos[menos_um.bloco]
+    var zero: FatoGuarda = FatoGuarda{}
+    if (menos_um.cond != (BCOND_NE as u8)) or (sem_sinal_na_classe(menos_um.imed, (v.i as ^BirInstr).classe) != sem_sinal_na_classe(-1, (v.i as ^BirInstr).classe)) {
+        return false
+    }
+    if not sem_definicao_de(teste, teste.n, menos_um.vreg) {
+        return false
+    }
+    return ((common.c2f_b2i32(fato_de_entrada(v.f as ^BirFuncao, menos_um.bloco, &zero)) != 0) and (zero.vreg == menos_um.vreg)) and (common.c2f_b2i32(fato_nao_zero(&zero)) != 0)
+}
+
+// C: nativo/bir/bir_validar.c:379
+proc fato_do_divisor(v: ^Validador, fato: ^FatoGuarda) -> bool {
+    let i: ?^BirInstr = v.i
+    if ((i as ^BirInstr).b.tipo != (BO_VREG as u8)) or (not sem_definicao_de(&(v.f as ^BirFuncao).blocos[v.bloco], v.indice, (i as ^BirInstr).b.id)) {
+        return false
+    }
+    return (common.c2f_b2i32(fato_de_entrada(v.f as ^BirFuncao, v.bloco, fato)) != 0) and (fato.vreg == (i as ^BirInstr).b.id)
+}
+
+// C: nativo/bir/bir_validar.c:388
+proc guarda_valida(v: ^Validador) -> bool {
+    let i: ?^BirInstr = v.i
+    var fato: FatoGuarda = FatoGuarda{}
+    if (i as ^BirInstr).b.tipo == (BO_IMED as u8) {
+        return imediato_seguro(i)
+    }
+    if not fato_do_divisor(v, &fato) {
+        return false
+    }
+    if eh_deslocamento_2((i as ^BirInstr).op) {
+        return fato_limita_contador(&fato, (i as ^BirInstr).classe)
+    }
+    var tern_1: i32 = 0
+    if (i as ^BirInstr).aux == (BIR_SEM_SINAL as u8) {
+        tern_1 = common.c2f_b2i32(fato_nao_zero(&fato))
+    } else {
+        tern_1 = common.c2f_b2i32(guarda_com_sinal(v, &fato))
+    }
+    return tern_1 != 0
+}
+
+// C: nativo/bir/bir_validar.c:402
+proc conta_guardada_valida(v: ^Validador) -> bool {
+    let i: ?^BirInstr = v.i
+    if not conta_binaria_valida(v) {
+        return false
+    }
+    if (common.c2f_b2i32(classe_real((i as ^BirInstr).a.classe)) != 0) or ((i as ^BirInstr).a.classe == (BC_V128 as u8)) {
+        return (i as ^BirInstr).op == (BIR_DIV as u8)
+    }
+    if (((i as ^BirInstr).op == (BIR_DIV as u8)) or ((i as ^BirInstr).op == (BIR_REM as u8))) and (((i as ^BirInstr).aux as i32) > BIR_SEM_SINAL) {
+        return false
+    }
+    return guarda_valida(v)
+}
+
+// C: nativo/bir/bir_validar.c:415
+proc argumentos_validos(v: ^Validador) -> bool {
+    let i: ?^BirInstr = v.i
+    if ((i as ^BirInstr).nargs > 0) and ((i as ^BirInstr).args == none) {
+        return false
+    }
+    var k: u32 = 0
+    while k < (i as ^BirInstr).nargs {
+        if (not operando_valido(v, &((i as ^BirInstr).args or_else {})[k])) or (((i as ^BirInstr).args or_else {})[k].tipo == (BO_NADA as u8)) {
+            return false
+        }
+        k += 1
+    }
+    return true
+}
+
+// C: nativo/bir/bir_validar.c:429
+proc alvo_da_chamada_valido(v: ^Validador) -> bool {
+    let i: ?^BirInstr = v.i
+    var s: ?^BirSimbolo = none
+    if (i as ^BirInstr).op == (BIR_CHAMA_IND as u8) {
+        return (((i as ^BirInstr).b.tipo == (BO_VREG as u8)) and ((i as ^BirInstr).b.classe == (BC_I64 as u8))) and ((i as ^BirInstr).b.tam == 0)
+    }
+    if (i as ^BirInstr).simbolo >= (v.p as ^BirPrograma).nsimbolos {
+        return false
+    }
+    s = &(v.p as ^BirPrograma).simbolos[(i as ^BirInstr).simbolo]
+    return ((s as ^BirSimbolo).tipo != (BS_TEXTO as u8)) and ((s as ^BirSimbolo).tipo != (BS_DADO as u8))
+}
+
+// C: nativo/bir/bir_validar.c:442
+proc eh_chamada(op: u8) -> bool {
+    return (op == (BIR_CHAMA as u8)) or (op == (BIR_CHAMA_IND as u8))
+}
+
+// C: nativo/bir/bir_validar.c:448
+proc retorno_agregado_valido(i: ?^BirInstr) -> bool {
+    return (((common.c2f_b2i32(eh_chamada((i as ^BirInstr).op)) != 0) and ((i as ^BirInstr).a.tam != 0)) and ((i as ^BirInstr).dst == BIR_SEM_VREG)) and ((i as ^BirInstr).classe == (BC_NADA as u8))
+}
+
+// C: nativo/bir/bir_validar.c:453
+proc chamada_valida(v: ^Validador) -> bool {
+    let i: ?^BirInstr = v.i
+    if (not alvo_da_chamada_valido(v)) or (not argumentos_validos(v)) {
+        return false
+    }
+    if (i as ^BirInstr).a.tipo != (BO_NADA as u8) {
+        return retorno_agregado_valido(i)
+    }
+    if (common.c2f_b2i32(eh_chamada((i as ^BirInstr).op)) != 0) and ((i as ^BirInstr).dst != BIR_SEM_VREG) {
+        return destino_valido(v)
+    }
+    return true
+}
+
+// C: nativo/bir/bir_validar.c:466
+proc desvia_valido(v: ^Validador) -> bool {
+    let i: ?^BirInstr = v.i
+    return ((((i as ^BirInstr).alvo[0] < (v.f as ^BirFuncao).nblocos) and ((i as ^BirInstr).alvo[1] < (v.f as ^BirFuncao).nblocos)) and ((i as ^BirInstr).a.tipo == (BO_VREG as u8))) and ((i as ^BirInstr).a.classe == (BC_I8 as u8))
+}
+
+// C: nativo/bir/bir_validar.c:473
+proc retorna_valido(v: ^Validador) -> bool {
+    let i: ?^BirInstr = v.i
+    var tern_1: i32 = common.c2f_b2i32((((i as ^BirInstr).a.tipo != (BO_NADA as u8)) and (((i as ^BirInstr).a.classe as i32) == ((v.f as ^BirFuncao).retorno as i32))) and ((i as ^BirInstr).a.tam == (v.f as ^BirFuncao).retorno_tam))
+    if (v.f as ^BirFuncao).retorno == (BC_NADA as u8) {
+        tern_1 = common.c2f_b2i32((i as ^BirInstr).a.tipo == (BO_NADA as u8))
+    }
+    return tern_1 != 0
+}
+
+// C: nativo/bir/bir_validar.c:481
+proc terminador_valido(v: ^Validador) -> bool {
+    let i: ?^BirInstr = v.i
+    let sw_1 = (i as ^BirInstr).op as i32
+    if sw_1 == BIR_SALTA {
+        return (i as ^BirInstr).alvo[0] < (v.f as ^BirFuncao).nblocos
+    } else if sw_1 == BIR_DESVIA {
+        return desvia_valido(v)
+    } else if sw_1 == BIR_RETORNA {
+        return retorna_valido(v)
+    } else {
+        return chamada_valida(v)
+    }
+    return false
+}
+
+// C: nativo/bir/bir_validar.c:493
+proc end_simbolo_valido(v: ^Validador) -> bool {
+    let i: ?^BirInstr = v.i
+    return (((common.c2f_b2i32(destino_valido(v)) != 0) and ((i as ^BirInstr).classe == (BC_I64 as u8))) and ((i as ^BirInstr).a.tipo == (BO_SIMBOLO as u8))) and ((i as ^BirInstr).a.id < (v.p as ^BirPrograma).nsimbolos)
+}
+
+// C: nativo/bir/bir_validar.c:501
+proc forma_de_operacao(v: ^Validador, op: u8) -> bool {
+    let sw_1 = op as i32
+    if sw_1 == BIR_RAIZ {
+        return raiz_valida(v)
+    } else if sw_1 == BIR_SELECIONA {
+        return seleciona_valida(v)
+    } else if sw_1 == BIR_SPLAT {
+        return (common.c2f_b2i32(destino_valido(v)) != 0) and ((v.i as ^BirInstr).b.tipo == (BO_NADA as u8))
+    } else if sw_1 == BIR_END_SIMBOLO {
+        return end_simbolo_valido(v)
+    } else if sw_1 == BIR_CHAMA or sw_1 == BIR_CHAMA_IND {
+        return chamada_valida(v)
+    } else if sw_1 == BIR_ADD_OV or sw_1 == BIR_SUB_OV or sw_1 == BIR_MUL_OV or sw_1 == BIR_NEG_OV {
+        return conta_ov_valida(v)
+    } else if sw_1 == BIR_SALTA or sw_1 == BIR_DESVIA or sw_1 == BIR_RETORNA or sw_1 == BIR_ARMADILHA {
+        return terminador_valido(v)
+    } else if sw_1 == BIR_CONST or sw_1 == BIR_COPIA or sw_1 == BIR_NEG or sw_1 == BIR_EXT_S or sw_1 == BIR_EXT_Z or sw_1 == BIR_TRUNC or sw_1 == BIR_NOT {
+        return conta_unaria_valida(v)
+    } else if sw_1 == BIR_I_PARA_F or sw_1 == BIR_F_PARA_F {
+        return conversao_real_valida(v)
+    } else if sw_1 == BIR_DIV or sw_1 == BIR_REM or sw_1 == BIR_SHL or sw_1 == BIR_SHR {
+        return conta_guardada_valida(v)
+    } else {
+        return conta_binaria_valida(v)
+    }
+    return false
+}
+
+// C: nativo/bir/bir_validar.c:530
+proc forma_valida(v: ^Validador) -> bool {
+    let op: u8 = (v.i as ^BirInstr).op
+    if (op as i32) >= BIR_QTD {
+        return false
+    }
+    if (op as i32) >= BIR_END_SLOT {
+        return bir_memoria_valida(v.f as ^BirFuncao, v.i)
+    }
+    return forma_de_operacao(v, op)
+}
+
+// C: nativo/bir/bir_validar.c:542
+proc usa_vetor(i: ^BirInstr) -> bool {
+    if ((i.classe == (BC_V128 as u8)) or (i.a.classe == (BC_V128 as u8))) or (i.b.classe == (BC_V128 as u8)) {
+        return true
+    }
+    var k: u32 = 0
+    while (k < i.nargs) and (i.args != none) {
+        if (i.args or_else {})[k].classe == (BC_V128 as u8) {
+            return true
+        }
+        k += 1
+    }
+    return false
+}
+
+// C: nativo/bir/bir_validar.c:554
+proc conta_vetorial_permitida(i: ^BirInstr) -> bool {
+    let forma_real: bool = (i.aux == (BVEC_4XF32 as u8)) or (i.aux == (BVEC_2XF64 as u8))
+    return (((((common.c2f_b2i32(forma_real) != 0) and (i.classe == (BC_V128 as u8))) and (i.a.tipo == (BO_VREG as u8))) and (i.b.tipo == (BO_VREG as u8))) and (i.a.classe == (BC_V128 as u8))) and (i.b.classe == (BC_V128 as u8))
+}
+
+// C: nativo/bir/bir_validar.c:562
+proc splat_permitido(i: ^BirInstr) -> bool {
+    var tern_1: i32 = BC_F64
+    if i.aux == (BVEC_4XF32 as u8) {
+        tern_1 = BC_F32
+    }
+    let origem: u8 = tern_1 as u8
+    if (i.aux != (BVEC_4XF32 as u8)) and (i.aux != (BVEC_2XF64 as u8)) {
+        return false
+    }
+    return (((i.classe == (BC_V128 as u8)) and (i.a.tipo == (BO_VREG as u8))) and ((i.a.classe as i32) == (origem as i32))) and (i.b.tipo == (BO_NADA as u8))
+}
+
+// C: nativo/bir/bir_validar.c:572
+proc vetor_permitido(i: ^BirInstr) -> bool {
+    if (i.aux as i32) >= BVEC_QTD {
+        return false
+    }
+    let sw_1 = i.op as i32
+    if sw_1 == BIR_COPIA {
+        return i.a.tipo == (BO_VREG as u8)
+    } else if sw_1 == BIR_CARREGA {
+        return true
+    } else if sw_1 == BIR_GRAVA {
+        return i.b.tipo == (BO_VREG as u8)
+    } else if sw_1 == BIR_SPLAT {
+        return splat_permitido(i)
+    } else if sw_1 == BIR_ADD or sw_1 == BIR_SUB or sw_1 == BIR_MUL or sw_1 == BIR_DIV {
+        return conta_vetorial_permitida(i)
+    } else {
+        return false
+    }
+    return false
+}
+
+// C: nativo/bir/bir_validar.c:586
+// C: nativo/bir/bir_validar.c:586 (causas com format heap + defer delete; o reprova copia a causa no Diag)
+proc instr_valida(v: ^Validador, i: ^BirInstr, ultima: bool) -> bool {
+    v.i = i
+    if (not operando_valido(v, &i.a)) or (not operando_valido(v, &i.b)) {
+        let causa_op: str = format(f"operando invalido em op {i.op}", alloc = heap)
+        defer delete(causa_op)
+        return reprova(v, causa_op)
+    }
+    if usa_vetor(i) and (not vetor_permitido(i)) {
+        let causa_vetor: str = format(f"classe v128 so em copia, carrega, grava, splat e add/sub/mul/div de f32/f64 com forma valida (op {i.op}; chamada e retorno de v128 ainda nao suportados)", alloc = heap)
+        defer delete(causa_vetor)
+        return reprova(v, causa_vetor)
+    }
+    if not forma_valida(v) {
+        let causa_forma: str = format(f"forma invalida em op {i.op}", alloc = heap)
+        defer delete(causa_forma)
+        return reprova(v, causa_forma)
+    }
+    if eh_terminador(i.op) != ultima {
+        let causa_term: str = texto_terminador(ultima, i.op)
+        defer delete(causa_term)
+        return reprova(v, causa_term)
+    }
+    return true
+}
+
+// C: nativo/bir/bir_validar.c:586 (ramo do terminador: a causa depende de ser o ultimo da lista); texto heap, quem chama libera.
+proc texto_terminador(ultima: bool, op: u8) -> str {
+    if ultima {
+        return format(f"bloco termina em op {op}, que nao e terminador", alloc = heap)
+    }
+    return format(f"terminador op {op} no meio do bloco", alloc = heap)
+}
+
+// ---------------------------------------------------------------- testes (puros: largura da classe, mascara e imediato seguro)
+
+test "bir_validar_bits_da_classe" {
+    expect(bits_da_classe(BC_I8 as u8) == 8)
+    expect(bits_da_classe(BC_I16 as u8) == 16)
+    expect(bits_da_classe(BC_I32 as u8) == 32)
+    expect(bits_da_classe(BC_I64 as u8) == 64)
+    expect(bits_da_classe(BC_F64 as u8) == 64)
+}
+
+test "bir_validar_sem_sinal_na_classe" {
+    expect(sem_sinal_na_classe(-1, BC_I8 as u8) == 255)
+    expect(sem_sinal_na_classe(-1, BC_I16 as u8) == 65535)
+    expect(sem_sinal_na_classe(-1, BC_I32 as u8) == 4294967295)
+    expect(sem_sinal_na_classe(-1, BC_I64 as u8) == ~(0 as u64))
+    expect(sem_sinal_na_classe(-5, BC_I32 as u8) == 4294967291)
+    expect(sem_sinal_na_classe(5, BC_I8 as u8) == 5)
+}
+
+test "bir_validar_imediato_seguro" {
+    var soma = BirInstr{}
+    soma.op = BIR_ADD as u8
+    soma.aux = BIR_SINAL as u8
+    soma.classe = BC_I32 as u8
+    soma.b = op_imed(0, BC_I32 as u8)
+    expect(not imediato_seguro(&soma))
+    soma.b = op_imed(5, BC_I32 as u8)
+    expect(imediato_seguro(&soma))
+    soma.b = op_imed(-1, BC_I32 as u8)
+    expect(not imediato_seguro(&soma))
+    soma.aux = BIR_SEM_SINAL as u8
+    expect(imediato_seguro(&soma))
+    var desloca = BirInstr{}
+    desloca.op = BIR_SHL as u8
+    desloca.classe = BC_I8 as u8
+    desloca.b = op_imed(7, BC_I8 as u8)
+    expect(imediato_seguro(&desloca))
+    desloca.b = op_imed(8, BC_I8 as u8)
+    expect(not imediato_seguro(&desloca))
+}
+
+// C: nativo/bir/bir_validar.c:610
+proc bloco_valido(v: ^Validador, indice: u32) -> bool {
+    let f: ^BirFuncao = v.f as ^BirFuncao
+    let b: ^BirBloco = &f.blocos[indice]
+    v.i = none
+    if b.n == 0 {
+        let causa_vazio: str = format(f"bloco b{indice} vazio", alloc = heap)
+        defer delete(causa_vazio)
+        return reprova(v, causa_vazio)
+    }
+    v.bloco = indice
+    var k: u32 = 0
+    while k < b.n {
+        v.indice = k
+        if not instr_valida(v, &b.instrs[k], (k + 1) == b.n) {
+            return false
+        }
+        k += 1
+    }
+    return true
+}
+
+// C: nativo/bir/bir_validar.c:630
+proc simbolo_de_funcao_valido(v: ^Validador) -> bool {
+    let f: ?^BirFuncao = v.f
+    return ((f as ^BirFuncao).simbolo < (v.p as ^BirPrograma).nsimbolos) and ((v.p as ^BirPrograma).simbolos[(f as ^BirFuncao).simbolo].tipo == (BS_FUNCAO as u8))
+}
+
+// C: nativo/bir/bir_validar.c:637
+proc entrada_da_funcao_valida(f: ^BirFuncao) -> bool {
+    return ((f.nblocos != 0) and (not f.blocos[0].frio)) and (f.nparams <= f.nvregs)
+}
+
+// C: nativo/bir/bir_validar.c:642
+proc blocos_da_funcao_validos(v: ^Validador) -> bool {
+    var b: u32 = 0
+    while b < (v.f as ^BirFuncao).nblocos {
+        if not bloco_valido(v, b) {
+            return false
+        }
+        b += 1
+    }
+    return true
+}
+
+// C: nativo/bir/bir_validar.c:651
+proc funcao_valida(v: ^Validador) -> bool {
+    let f: ?^BirFuncao = v.f
+    v.i = none
+    if not simbolo_de_funcao_valido(v) {
+        let msg_1 = format(f"BIR invalida: simbolo {(f as ^BirFuncao).simbolo} nao e uma funcao", alloc = heap)
+        defer delete(msg_1)
+        return common.diag_relatar(v.erro as ^common.Diag, common.X0904, 0, msg_1)
+    }
+    if not entrada_da_funcao_valida(f as ^BirFuncao) {
+        return reprova(v, "funcao sem bloco de entrada valido")
+    }
+    if not bir_slots_validos(f as ^BirFuncao) {
+        return reprova(v, "slot com tamanho zero ou alinhamento que nao e potencia de 2 ate 16")
+    }
+    if not bir_agregados_validos(f as ^BirFuncao) {
+        return reprova(v, "parametro ou retorno agregado fora da classe BC_I64")
+    }
+    if (f as ^BirFuncao).retorno == (BC_V128 as u8) {
+        return reprova(v, "retorno v128 ainda nao suportado")
+    }
+    var k: u32 = 0
+    while k < (f as ^BirFuncao).nparams {
+        if ((f as ^BirFuncao).classe_vreg or_else {})[k] == (BC_V128 as u8) {
+            return reprova(v, "parametro v128 ainda nao suportado")
+        }
+        k += 1
+    }
+    return blocos_da_funcao_validos(v)
+}
+
+// C: nativo/bir/bir_validar.c:673
+proc texto_do_simbolo_valido(s: ^BirSimbolo) -> bool {
+    // Forja: o texto do simbolo e um str de exatamente `tam` bytes (o C guarda tam + o NUL final no buffer; o NUL volta na emissao). Invariante equivalente: len == tam.
+    return (s.tipo != (BS_TEXTO as u8)) or ((s.bytes != none) and ((len(s.bytes or_else "") as u64) == (s.tam as u64)))
+}
+
+// C: nativo/bir/bir_validar.c:678
+proc dado_do_simbolo_valido(s: ^BirSimbolo) -> bool {
+    return (s.tipo != (BS_DADO as u8)) or (((s.bytes != none) and (s.alinhamento != 0)) and ((s.alinhamento & (s.alinhamento - 1)) == 0))
+}
+
+// C: nativo/bir/bir_validar.c:683
+proc nome_do_simbolo_valido(s: ^BirSimbolo) -> bool {
+    return ((s.tipo == (BS_TEXTO as u8)) or (s.tipo == (BS_DADO as u8))) or (s.nome != none)
+}
+
+// C: nativo/bir/bir_validar.c:688
+proc simbolos_validos(p: ^BirPrograma, erro: ^common.Diag) -> bool {
+    var k: u32 = 0
+    while k < p.nsimbolos {
+        let s: ^BirSimbolo = &p.simbolos[k]
+        if ((not texto_do_simbolo_valido(s)) or (not dado_do_simbolo_valido(s))) or (not nome_do_simbolo_valido(s)) {
+            let msg_1 = format(f"BIR invalida: simbolo s{k} sem nome, sem NUL final ou com alinhamento invalido", alloc = heap)
+            defer delete(msg_1)
+            return common.diag_relatar(erro, common.X0904, 0, msg_1)
+        }
+        k += 1
+    }
+    return true
+}
+
+// C: nativo/bir/bir_validar.c:699
+pub proc bir_validar(programa: ^BirPrograma, erro: ^common.Diag) -> bool {
+    var v: Validador = Validador{p = programa, erro = erro}
+    if not simbolos_validos(programa, erro) {
+        return false
+    }
+    var k: u32 = 0
+    while k < programa.nfuncoes {
+        v.f = &(programa.funcoes or_else {})[k]
+        if not funcao_valida(&v) {
+            return false
+        }
+        k += 1
+    }
+    return true
+}

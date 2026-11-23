@@ -1,0 +1,698 @@
+// driver/migrar_nomes.fj - porte de compiler/driver/migrar_nomes.c, compiler/driver/migrar_nomes.h
+// sha256 de driver/migrar_nomes.c: c2c4e70ab297b8c5b2082732279a2733a62101fbc1c218f71546f24706a703c0
+// sha256 de driver/migrar_nomes.h: d03bf91d24b0044d1b2c0cac18bcd0c7971bc9d8f031c284df9d71394df07321
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.2.0
+// Changelog: 0.2.0 - G3 V5-G1: corpo real dos stubs. Assinaturas privadas trocadas: texto_de_2 devolve o texto do token (view no fonte, sem destino);
+//            adicionar recebe Renome por valor; lembrar_forma recebe o texto ja fatiado; palavra_depois/qualificado_solto/palavra_solta usam posicoes em str;
+//            caminho_do_import devolve str; tipo_do_qualificador so devolve o tipo (modulo_do_qualificador devolve o modulo). Varredura sem ?: e, arena e listas sao ponteiros.
+
+import "common"
+import "frontend"
+
+struct NomeTroca {
+    off: u32
+    tam: u32
+    classe: i32
+    antigo: ?str
+    novo: ?str
+}
+
+struct NomesEntrada {
+    texto: ?str
+    tokens: ?[]frontend.Token
+    ntokens: u64
+    ini: u32
+    fim: u32
+}
+
+struct Frame {
+    chamado: ?str
+    modulo: ?str
+}
+
+struct Varredura {
+    e: ^NomesEntrada
+    arena: ^common.Arena
+    trocas: ^[dynamic]NomeTroca
+    duvidas: ^[dynamic]NomeTroca
+    pilha: [32]Frame
+    topo: i32
+    importados: [8]str
+    nimportados: i32
+}
+
+struct Renome {
+    token: i32
+    classe: i32
+    antigo: ?str
+    novo: ?str
+}
+
+struct Renomes {
+    itens: [3]Renome
+    n: i32
+    duvida: bool
+}
+
+const NOME_MAX: i32 = 96
+const CAMINHO_MAX_3: i32 = 192
+const FRAMES_MAX: i32 = 32
+const IMPORTADOS_MAX: i32 = 8
+const Q_NENHUM: i32 = 0
+const Q_STD: i32 = 1
+const Q_VENDOR: i32 = 2
+
+// C: driver/migrar_nomes.c:35 (isalnum na C locale: so ASCII, mais '_')
+proc eh_palavra(c: u8) -> bool {
+    return ((c >= 48) and (c <= 57)) or ((c >= 65) and (c <= 90)) or ((c >= 97) and (c <= 122)) or (c == 95)
+}
+
+// C: driver/migrar_nomes.c:41 (ModuloDaTabela): o escopo de REN_PROC igual a modulo; none se nao ha
+proc modulo_da_tabela(modulo: str) -> ?str {
+    var k: u64 = 0
+    while k < common.renomeados_contagem() {
+        // C2F-N2: renomeado_por_indice entrega copia no heap; le os campos (str literais) e apaga
+        let r: ^common.Renomeado = (common.renomeado_por_indice(k) as ^common.Renomeado)
+        let escopo: str = r.escopo or_else ""
+        let eh_proc: bool = r.classe == common.REN_PROC
+        delete(r)
+        if eh_proc and (escopo == modulo) {
+            return escopo
+        }
+        k += 1
+    }
+    return none
+}
+
+// C: driver/migrar_nomes.c:52 (MembroDeStdFile): o que std:file exporta (pub); eram ingleses antes da renomeacao, a tabela nao tem linha para eles
+proc membro_de_std_file(nome: str) -> bool {
+    return (nome == "read_all") or (nome == "write_all") or (nome == "FileError")
+}
+
+// C: driver/migrar_nomes.c:62 (TipoDoQualificador, parte do nome): o qualificador como ele esta hoje (novo, ou o proprio se nao esta na tabela)
+// C2F-N2: renomeado_buscar entrega copia no heap; quem so consulta apaga a copia depois de ler (os str sao literais da tabela)
+proc tem_renomeado(classe: i32, antigo: str) -> bool {
+    let r: ?^common.Renomeado = common.renomeado_buscar(classe, antigo)
+    if r == none {
+        return false
+    }
+    let rr: ^common.Renomeado = r as ^common.Renomeado
+    delete(rr)
+    return true
+}
+
+proc qualificador_novo(q: str) -> str {
+    let antigo: ?^common.Renomeado = common.renomeado_buscar(common.REN_QUALIFICADOR, q)
+    if antigo == none {
+        return q
+    }
+    let aa: ^common.Renomeado = antigo as ^common.Renomeado
+    let novo: str = aa.novo or_else q
+    delete(aa)
+    return novo
+}
+
+// C: driver/migrar_nomes.c:62 (o modulo de vendor do qualificador: vendor:x/x na tabela); none se nao e vendor
+proc modulo_do_qualificador(q: str) -> ?str {
+    let novo: str = qualificador_novo(q)
+    let caminho: str = format(f"vendor:{novo}/{novo}", alloc = heap)
+    let achado: ?str = modulo_da_tabela(caminho)
+    delete(caminho)
+    return achado
+}
+
+// C: driver/migrar_nomes.c:62 (TipoDoQualificador): Q_STD para file, Q_VENDOR para pacote da tabela, Q_NENHUM para o resto
+proc tipo_do_qualificador(q: str) -> i32 {
+    if qualificador_novo(q) == "file" {
+        return Q_STD
+    }
+    if modulo_do_qualificador(q) != none {
+        return Q_VENDOR
+    }
+    return Q_NENHUM
+}
+
+// C: driver/migrar_nomes.c:76
+proc entrada_do_membro(modulo: str, nome: str, era: ^bool) -> ?^common.Renomeado {
+    let r: ?^common.Renomeado = common.renomeado_achar(common.REN_PROC, modulo, nome, era)
+    var tern_1: ?^common.Renomeado = none
+    if r != none {
+        tern_1 = r
+    } else {
+        tern_1 = common.renomeado_achar(common.REN_TIPO, modulo, nome, era)
+    }
+    return tern_1
+}
+
+// C: driver/migrar_nomes.c:83
+proc somar(out: ^Renomes, token: i32, classe: i32, antigo: str, novo: str) {
+    let antes_1: i32 = out.n
+    out.n += 1
+    out.itens[antes_1] = Renome{token = token, classe = classe, antigo = antigo, novo = novo}
+}
+
+// C: driver/migrar_nomes.c:89 (AvaliarMembroDeEnum): o membro x do enum tipo_novo do modulo, antigo ou novo
+proc avaliar_membro_de_enum(modulo: str, tipo_novo: str, x: ?str, token: i32, out: ^Renomes) {
+    var palavras: [2]str = {modulo, tipo_novo}
+    var era: bool = false
+    let r: ?^common.Renomeado = common.renomeado_achar_em(common.REN_MEMBRO, palavras[..], x, &era)
+    if r != none {
+        let rr: ^common.Renomeado = r as ^common.Renomeado
+        if era {
+            somar(out, token, common.REN_MEMBRO, rr.antigo or_else "", rr.novo or_else "")
+        }
+        delete(rr)
+    }
+}
+
+// C: driver/migrar_nomes.c:99 (AvaliarTipoDireto): tipo sem qualificador so vale troca se o que vem depois do ponto e membro dele
+proc avaliar_tipo_direto(nome: str, m: str, out: ^Renomes) {
+    var t: ?^common.Renomeado = common.renomeado_buscar(common.REN_TIPO, nome)
+    let antigo: bool = t != none
+    var era: bool = false
+    if t == none {
+        t = common.renomeado_buscar_novo(common.REN_TIPO, nome)
+    }
+    if t == none {
+        return
+    }
+    let tr: ^common.Renomeado = t as ^common.Renomeado
+    var palavras: [2]str = {tr.escopo or_else "", tr.novo or_else ""}
+    let membro: ?^common.Renomeado = common.renomeado_achar_em(common.REN_MEMBRO, palavras[..], m, &era)
+    if membro != none {
+        let mb: ^common.Renomeado = membro as ^common.Renomeado
+        if antigo {
+            somar(out, 0, common.REN_TIPO, tr.antigo or_else "", tr.novo or_else "")
+        }
+        if era {
+            somar(out, 1, common.REN_MEMBRO, mb.antigo or_else "", mb.novo or_else "")
+        }
+        delete(mb)
+    }
+    delete(tr)
+}
+
+// C: driver/migrar_nomes.c:118 (AvaliarQualificado): as formas antigas de q.m[.x]; importou = o texto importa o modulo antigo de q
+proc avaliar_qualificado(q: str, m: str, x: ?str, importou: bool, out: ^Renomes) {
+    let tipo: i32 = tipo_do_qualificador(q)
+    var era: bool = false
+    var membro: ?^common.Renomeado = none
+    out.n = 0
+    out.duvida = false
+    if tipo == Q_NENHUM {
+        avaliar_tipo_direto(q, m, out)
+        return
+    }
+    let modulo: str = modulo_do_qualificador(q) or_else ""
+    if tipo == Q_VENDOR {
+        membro = entrada_do_membro(modulo, m, &era)
+    }
+    let qual: ?^common.Renomeado = common.renomeado_buscar(common.REN_QUALIFICADOR, q)
+    if qual != none {
+        let qr: ^common.Renomeado = qual as ^common.Renomeado
+        let qr_antigo: str = qr.antigo or_else ""
+        let qr_novo: str = qr.novo or_else ""
+        delete(qr)
+        if (membro != none) or ((tipo == Q_STD) and membro_de_std_file(m)) or importou {
+            somar(out, 0, common.REN_QUALIFICADOR, qr_antigo, qr_novo)
+        } else {
+            out.duvida = true
+        }
+    }
+    if membro == none {
+        return
+    }
+    let mb: ^common.Renomeado = membro as ^common.Renomeado
+    let mb_classe: i32 = mb.classe
+    let mb_antigo: str = mb.antigo or_else ""
+    let mb_novo: str = mb.novo or_else ""
+    delete(mb)
+    if era {
+        somar(out, 1, mb_classe, mb_antigo, mb_novo)
+    }
+    if (mb_classe == common.REN_TIPO) and (x != none) {
+        avaliar_membro_de_enum(modulo, mb_novo, x, 2, out)
+    }
+}
+
+// C: driver/migrar_nomes.c:143 (TokenEm): o token k, ou none se k passa do fim
+proc token_em_3(v: ^Varredura, k: u64) -> ?^frontend.Token {
+    var tern_1: ?^frontend.Token = none
+    if k < v.e.ntokens {
+        tern_1 = &((v.e.tokens or_else {})[k])
+    }
+    return tern_1
+}
+
+// C: driver/migrar_nomes.c:148 (TipoDe)
+proc tipo_de(v: ^Varredura, k: u64, tipo: i32) -> bool {
+    let t: ?^frontend.Token = token_em_3(v, k)
+    return (t != none) and (((t as ^frontend.Token).tipo as u32) == common.c2f_s2u_32(tipo))
+}
+
+// C: driver/migrar_nomes.c:156 (TextoDe): texto do identificador k (view no fonte); none se nao e identificador ou e longo demais
+proc texto_de_2(v: ^Varredura, k: u64) -> ?str {
+    let t: ?^frontend.Token = token_em_3(v, k)
+    if t == none {
+        return none
+    }
+    let tok: ^frontend.Token = t as ^frontend.Token
+    if ((tok.tipo as i32) != frontend.TK_IDENT) or ((tok.len_c as int) >= (NOME_MAX as int)) {
+        return none
+    }
+    let ini: u64 = tok.off as u64
+    let fim: u64 = ini + (tok.len_c as u64)
+    let fonte: str = v.e.texto or_else ""
+    return fonte[ini..<fim]
+}
+
+// C: driver/migrar_nomes.c:166 (Adicionar): troca da forma no texto do arquivo, com o deslocamento atraso e o tamanho tam
+proc adicionar(v: ^Varredura, t: ^frontend.Token, atraso: u32, tam: u32, r: Renome) {
+    if (t.off < v.e.ini) or (t.off >= v.e.fim) {
+        return
+    }
+    append(v.trocas, item = NomeTroca{off = t.off + atraso, tam = tam, classe = r.classe, antigo = r.antigo, novo = r.novo})
+}
+
+// C: driver/migrar_nomes.c:175 (Lembrar): guarda o apelido de um import antigo (ate IMPORTADOS_MAX)
+proc lembrar(v: ^Varredura, apelido: str) {
+    if v.nimportados < IMPORTADOS_MAX {
+        v.importados[v.nimportados] = apelido
+        v.nimportados += 1
+    }
+}
+
+// C: driver/migrar_nomes.c:180 (Importou)
+proc importou(v: ^Varredura, q: str) -> bool {
+    for k in (0 as i32)..<v.nimportados {
+        if v.importados[k] == q {
+            return true
+        }
+    }
+    return false
+}
+
+// C: driver/migrar_nomes.c:188 (UltimoSegmento): o que vem depois do ultimo '/' ou ':'
+proc ultimo_segmento_2(texto: str) -> str {
+    var inicio: int = len(texto)
+    while (inicio > 0) and (texto[inicio - 1] != 47) and (texto[inicio - 1] != 58) {
+        inicio -= 1
+    }
+    return texto[inicio..<len(texto)]
+}
+
+// C: driver/migrar_nomes.c:197 (CaminhoDoImport): o caminho entre aspas do token de texto (cru); no maximo CAMINHO_MAX-1 bytes, para antes de aspas e de LF
+proc caminho_do_import(v: ^Varredura, t: ^frontend.Token) -> str {
+    let fonte: str = v.e.texto or_else ""
+    let ini: int = (t.off as int) + 1
+    var fim: int = ini
+    while (fim < len(fonte)) and ((fim - ini) < ((CAMINHO_MAX_3 as int) - 1)) and (fonte[fim] != 34) and (fonte[fim] != 10) {
+        fim += 1
+    }
+    return fonte[ini..<fim]
+}
+
+// C: driver/migrar_nomes.c:209 (ImportAntigo): import "caminho" antigo (modulo inteiro) ou so a pasta do pacote de vendor
+proc import_antigo(v: ^Varredura, k: u64) {
+    let t: ^frontend.Token = (token_em_3(v, k) as ^frontend.Token)
+    let caminho: str = caminho_do_import(v, t)
+    let r: ?^common.Renomeado = common.renomeado_buscar(common.REN_MODULO, caminho)
+    if r != none {
+        let rr: ^common.Renomeado = r as ^common.Renomeado
+        let antigo_mod: str = rr.antigo or_else ""
+        adicionar(v, t, 1, len(caminho) as u32, Renome{token = 0, classe = common.REN_MODULO, antigo = rr.antigo, novo = rr.novo})
+        lembrar(v, ultimo_segmento_2(antigo_mod))
+        delete(rr)
+        return
+    }
+    if (len(caminho) < 7) or (caminho[0..<7] != "vendor:") {
+        return
+    }
+    let resto: str = caminho[7..<len(caminho)]
+    var tam_pasta: int = 0
+    while (tam_pasta < len(resto)) and (resto[tam_pasta] != 47) {
+        tam_pasta += 1
+    }
+    if tam_pasta >= (NOME_MAX as int) {
+        return
+    }
+    var era: bool = false
+    let pasta: str = resto[0..<tam_pasta]
+    let rp: ?^common.Renomeado = common.renomeado_achar(common.REN_PACOTE, "import", pasta, &era)
+    if rp != none {
+        let rpp: ^common.Renomeado = rp as ^common.Renomeado
+        // 8 = a aspa de abertura + "vendor:" (7 bytes) antes da pasta
+        if era {
+            adicionar(v, t, 8, tam_pasta as u32, Renome{token = 0, classe = common.REN_PACOTE, antigo = rpp.antigo, novo = rpp.novo})
+        }
+        delete(rpp)
+    }
+}
+
+// C: driver/migrar_nomes.c:233 (LerImports): os imports primeiro, para o apelido antigo valer no texto todo
+proc ler_imports(v: ^Varredura) {
+    var k: u64 = 0
+    while (k + 1) < v.e.ntokens {
+        if (((v.e.tokens or_else {})[k].tipo == (frontend.KW_IMPORT as u8)) and ((v.e.tokens or_else {})[k + 1].tipo == (frontend.TK_TEXTO as u8))) {
+            import_antigo(v, k + 1)
+        }
+        k += 1
+    }
+}
+
+// C: driver/migrar_nomes.c:240 (FrameDaChamada): nome simples (make, transmute) ou modulo do qualificador de vendor (db.open)
+proc frame_da_chamada(v: ^Varredura, k: u64) -> Frame {
+    let nome: ?str = texto_de_2(v, k)
+    if nome == none {
+        return Frame{chamado = none, modulo = none}
+    }
+    if (k >= 2) and tipo_de(v, k - 1, frontend.TK_DOT) and (texto_de_2(v, k - 2) != none) {
+        let qualificador: str = texto_de_2(v, k - 2) or_else ""
+        if tipo_do_qualificador(qualificador) != Q_VENDOR {
+            return Frame{chamado = none, modulo = none}
+        }
+        return Frame{chamado = none, modulo = modulo_do_qualificador(qualificador)}
+    }
+    return Frame{chamado = nome, modulo = none}
+}
+
+// C: driver/migrar_nomes.c:253 (EmpilharChamada)
+proc empilhar_chamada(v: ^Varredura, k: u64) {
+    var tern_1: Frame = Frame{chamado = none, modulo = none}
+    if k > 0 {
+        tern_1 = frame_da_chamada(v, k - 1)
+    }
+    let f: Frame = tern_1
+    if v.topo < FRAMES_MAX {
+        v.pilha[v.topo] = f
+    }
+    v.topo += 1
+}
+
+// C: driver/migrar_nomes.c:261 (FrameAtual)
+proc frame_atual(v: ^Varredura) -> ?^Frame {
+    var tern_1: ?^Frame = none
+    if (v.topo > 0) and (v.topo <= FRAMES_MAX) {
+        tern_1 = &v.pilha[v.topo - 1]
+    }
+    return tern_1
+}
+
+// C: driver/migrar_nomes.c:267 (ValorDoAlocador): alloc = escopo vira scope, se o valor acaba a expressao do argumento
+proc valor_do_alocador(v: ^Varredura, k: u64) {
+    let fim: bool = tipo_de(v, k + 3, frontend.TK_COMMA) or tipo_de(v, k + 3, frontend.TK_RPAREN) or tipo_de(v, k + 3, frontend.TK_NL) or tipo_de(v, k + 3, frontend.TK_EOF)
+    if not tipo_de(v, k + 1, frontend.TK_ASSIGN) {
+        return
+    }
+    let valor: ?str = texto_de_2(v, k + 2)
+    if (valor == none) or (not fim) {
+        return
+    }
+    let r: ?^common.Renomeado = common.renomeado_buscar(common.REN_VALOR_ALOCADOR, valor or_else "")
+    if r == none {
+        return
+    }
+    let rr: ^common.Renomeado = r as ^common.Renomeado
+    let t: ^frontend.Token = (token_em_3(v, k + 2) as ^frontend.Token)
+    adicionar(v, t, 0, t.len_c as u32, Renome{token = 0, classe = rr.classe, antigo = rr.antigo, novo = rr.novo})
+    delete(rr)
+}
+
+// C: driver/migrar_nomes.c:279 (Rotulo): rotulo 'nome =' de chamada simples (tabela de rotulos) ou de vendor (rotulos do modulo)
+proc rotulo(v: ^Varredura, k: u64) {
+    let f: ?^Frame = frame_atual(v)
+    let nome: ?str = texto_de_2(v, k)
+    if (f == none) or (nome == none) {
+        return
+    }
+    let fr: ^Frame = f as ^Frame
+    var era: bool = false
+    var r: ?^common.Renomeado = none
+    if fr.modulo != none {
+        r = common.renomeado_achar(common.REN_PARAM, fr.modulo, nome or_else "", &era)
+    } else if fr.chamado != none {
+        r = common.renomeado_achar(common.REN_ROTULO, fr.chamado, nome or_else "", &era)
+    }
+    if r == none {
+        return
+    }
+    let rr: ^common.Renomeado = r as ^common.Renomeado
+    let t: ^frontend.Token = (token_em_3(v, k) as ^frontend.Token)
+    let classe_rr: i32 = rr.classe
+    let antigo_rr: str = rr.antigo or_else ""
+    if era {
+        adicionar(v, t, 0, t.len_c as u32, Renome{token = 0, classe = rr.classe, antigo = rr.antigo, novo = rr.novo})
+    }
+    delete(rr)
+    if (classe_rr == common.REN_ROTULO) and (antigo_rr == "em") {
+        valor_do_alocador(v, k)
+    }
+}
+
+// C: driver/migrar_nomes.c:294 (RegistrarDuvida): qualificador antigo com membro desconhecido, sem import: vai para a revisao manual
+proc registrar_duvida(v: ^Varredura, k: u64) {
+    let q: ^frontend.Token = (token_em_3(v, k) as ^frontend.Token)
+    let m: ^frontend.Token = (token_em_3(v, k + 2) as ^frontend.Token)
+    if (q.off < v.e.ini) or (q.off >= v.e.fim) {
+        return
+    }
+    append(v.duvidas, item = NomeTroca{off = q.off, tam = m.off + (m.len_c as u32) - q.off, classe = common.REN_QUALIFICADOR, antigo = none, novo = none})
+}
+
+// C: driver/migrar_nomes.c:303 (Qualificado): q.m[.x] com q no token k
+proc qualificado(v: ^Varredura, k: u64) {
+    let q_opt: ?str = texto_de_2(v, k)
+    let m_opt: ?str = texto_de_2(v, k + 2)
+    if (q_opt == none) or (m_opt == none) {
+        return
+    }
+    let q: str = q_opt or_else ""
+    let m: str = m_opt or_else ""
+    var x: ?str = none
+    if tipo_de(v, k + 3, frontend.TK_DOT) {
+        x = texto_de_2(v, k + 4)
+    }
+    var ren: Renomes = Renomes{}
+    avaliar_qualificado(q, m, x, importou(v, q), &ren)
+    for i in (0 as i32)..<ren.n {
+        let t: ^frontend.Token = (token_em_3(v, k + 2 * (ren.itens[i].token as u64)) as ^frontend.Token)
+        adicionar(v, t, 0, t.len_c as u32, ren.itens[i])
+    }
+    if ren.duvida {
+        registrar_duvida(v, k)
+    }
+}
+
+// C: driver/migrar_nomes.c:319 (AbreArgumento): o identificador abre um argumento (depois de '(', ',' ou fim de linha)
+proc abre_argumento(v: ^Varredura, k: u64) -> bool {
+    return (k > 0) and (tipo_de(v, k - 1, frontend.TK_LPAREN) or tipo_de(v, k - 1, frontend.TK_COMMA) or tipo_de(v, k - 1, frontend.TK_NL))
+}
+
+// C: driver/migrar_nomes.c:324 (VerIdentificador)
+proc ver_identificador(v: ^Varredura, k: u64) {
+    if tipo_de(v, k + 1, frontend.TK_ASSIGN) and abre_argumento(v, k) {
+        rotulo(v, k)
+    } else if tipo_de(v, k + 1, frontend.TK_DOT) and tipo_de(v, k + 2, frontend.TK_IDENT) and (not ((k > 0) and tipo_de(v, k - 1, frontend.TK_DOT))) {
+        qualificado(v, k)
+    }
+}
+
+// C: driver/migrar_nomes.c:330 (NomesDoCodigo): as formas antigas de um texto que parseia, por token
+proc nomes_do_codigo(e: ^NomesEntrada, arena: ^common.Arena, trocas: ^[dynamic]NomeTroca, duvidas: ^[dynamic]NomeTroca) {
+    var v: Varredura = Varredura{e = e, arena = arena, trocas = trocas, duvidas = duvidas}
+    ler_imports(&v)
+    var k: u64 = 0
+    while k < e.ntokens {
+        let tipo: i32 = (e.tokens or_else {})[k].tipo as i32
+        if common.c2f_s2u_32(tipo) == (frontend.TK_LPAREN as u32) {
+            empilhar_chamada(&v, k)
+        } else if (common.c2f_s2u_32(tipo) == (frontend.TK_RPAREN as u32)) and (v.topo > 0) {
+            v.topo -= 1
+        } else if common.c2f_s2u_32(tipo) == (frontend.TK_IDENT as u32) {
+            ver_identificador(&v, k)
+        }
+        k += 1
+    }
+}
+
+// C: driver/migrar_nomes.c:346 (LembrarForma): copia o texto na Arena e so guarda se ainda nao esta na lista
+proc lembrar_forma(arena: ^common.Arena, formas: ^[dynamic]str, texto: str) {
+    var k: u64 = 0
+    while k < (len(formas) as u64) {
+        if formas[k] == texto {
+            return
+        }
+        k += 1
+    }
+    append(formas, item = from_bytes(as_bytes(texto), alloc = common.arena_mem(arena)))
+}
+
+// strstr: posicao da primeira ocorrencia de trecho em texto; -1 se nao ha
+proc posicao_do_trecho(texto: str, trecho: str) -> int {
+    let n: int = len(trecho)
+    var i: int = 0
+    while (i + n) <= len(texto) {
+        if texto[i..<(i + n)] == trecho {
+            return i
+        }
+        i += 1
+    }
+    return -1
+}
+
+// strcspn(s, "\" \t\r\n"): bytes ate o primeiro separador (aspas, espaco, tab, CR, LF) ou o fim
+proc tamanho_ate_separador(s: str) -> int {
+    var n: int = 0
+    while n < len(s) {
+        let c: u8 = s[n]
+        if (c == 34) or (c == 32) or (c == 9) or (c == 13) or (c == 10) {
+            return n
+        }
+        n += 1
+    }
+    return n
+}
+
+// C: driver/migrar_nomes.c:356 (ModulosSoltos): caminhos antigos de modulo e pastas antigas de pacote em qualquer lugar do texto
+proc modulos_soltos(texto: str, arena: ^common.Arena, formas: ^[dynamic]str) {
+    var k: u64 = 0
+    while k < common.renomeados_contagem() {
+        let r: ^common.Renomeado = (common.renomeado_por_indice(k) as ^common.Renomeado)
+        let antigo: str = r.antigo or_else ""
+        let classe_r: i32 = r.classe
+        delete(r)
+        var achou: int = -1
+        if classe_r == common.REN_MODULO {
+            achou = posicao_do_trecho(texto, antigo)
+        }
+        if classe_r == common.REN_PACOTE {
+            let pacote: str = format(f"vendor:{antigo}/", alloc = heap)
+            achou = posicao_do_trecho(texto, pacote)
+            delete(pacote)
+        }
+        if achou >= 0 {
+            let resto: str = texto[achou..<len(texto)]
+            lembrar_forma(arena, formas, resto[0..<tamanho_ate_separador(resto)])
+        }
+        k += 1
+    }
+}
+
+// C: driver/migrar_nomes.c:374 (PalavraDepois): a palavra logo depois do ponto na posicao ponto; none se nao ha
+proc palavra_depois(texto: str, ponto: int) -> ?str {
+    let ini: int = ponto + 1
+    var fim: int = ini
+    while (fim < len(texto)) and eh_palavra(texto[fim]) {
+        fim += 1
+    }
+    if fim == ini {
+        return none
+    }
+    return texto[ini..<fim]
+}
+
+// C: driver/migrar_nomes.c:384 (QualificadoSolto): palavra.m[.x] solta; q termina em fim_q (o ponto)
+proc qualificado_solto(texto: str, fim_q: int, q: str, arena: ^common.Arena, formas: ^[dynamic]str) {
+    if (fim_q >= len(texto)) or (texto[fim_q] != 46) {
+        return
+    }
+    let m_opt: ?str = palavra_depois(texto, fim_q)
+    if m_opt == none {
+        return
+    }
+    let m: str = m_opt or_else ""
+    if len(m) >= (NOME_MAX as int) {
+        return
+    }
+    let ponto_x: int = fim_q + 1 + len(m)
+    var x: ?str = none
+    if (ponto_x < len(texto)) and (texto[ponto_x] == 46) {
+        x = palavra_depois(texto, ponto_x)
+    }
+    var xs: ?str = none
+    if (x != none) and (len(x or_else "") < (NOME_MAX as int)) {
+        xs = x
+    }
+    var ren: Renomes = Renomes{}
+    avaliar_qualificado(q, m, xs, false, &ren)
+    if ren.n > 0 {
+        lembrar_forma(arena, formas, texto[(fim_q - len(q))..<(fim_q + 1 + len(m))])
+    }
+}
+
+// C: driver/migrar_nomes.c:404 (PalavraSolta): rotulo, valor de alocador, rotulo de vendor seguido de '=' ou o inicio de q.m
+proc palavra_solta(texto: str, ini: int, fim: int, arena: ^common.Arena, formas: ^[dynamic]str) {
+    if (fim - ini) >= (NOME_MAX as int) {
+        return
+    }
+    let palavra: str = texto[ini..<fim]
+    if tem_renomeado(common.REN_ROTULO, palavra) or tem_renomeado(common.REN_VALOR_ALOCADOR, palavra) {
+        lembrar_forma(arena, formas, palavra)
+        return
+    }
+    var depois: int = fim
+    while (depois < len(texto)) and ((texto[depois] == 32) or (texto[depois] == 9)) {
+        depois += 1
+    }
+    let igual: bool = (depois < len(texto)) and (texto[depois] == 61) and ((depois + 1 >= len(texto)) or (texto[depois + 1] != 61))
+    if igual and tem_renomeado(common.REN_PARAM, palavra) {
+        lembrar_forma(arena, formas, palavra)
+        return
+    }
+    qualificado_solto(texto, fim, palavra, arena, formas)
+}
+
+test "migrar_nomes: classes de caractere, segmento e corte do separador" {
+    expect(eh_palavra(97))
+    expect(eh_palavra(90))
+    expect(eh_palavra(95))
+    expect(eh_palavra(57))
+    expect(not eh_palavra(32))
+    expect(not eh_palavra(46))
+    expect(not eh_palavra(200))
+    expect(ultimo_segmento_2("vendor:banco/banco") == "banco")
+    expect(ultimo_segmento_2("std:file") == "file")
+    expect(ultimo_segmento_2("abc") == "abc")
+    expect(tamanho_ate_separador("abc def") == 3)
+    expect(tamanho_ate_separador("ab\"c") == 2)
+    expect(tamanho_ate_separador("xyz") == 3)
+}
+
+test "migrar_nomes: posicao do trecho e palavra depois do ponto" {
+    expect(posicao_do_trecho("aXbvendor:x", "vendor:") == 3)
+    expect(posicao_do_trecho("abc", "zz") == -1)
+    expect(posicao_do_trecho("abc", "") == 0)
+    expect((palavra_depois("a.bc.d", 1) or_else "") == "bc")
+    expect(palavra_depois("a.", 1) == none)
+    expect((palavra_depois("a.b", 1) or_else "") == "b")
+}
+
+test "migrar_nomes: std:file e qualificador sem tabela" {
+    expect(membro_de_std_file("read_all"))
+    expect(membro_de_std_file("write_all"))
+    expect(membro_de_std_file("FileError"))
+    expect(not membro_de_std_file("read_lines"))
+    expect(tipo_do_qualificador("file") == Q_STD)
+    expect(tipo_do_qualificador("zzz_nao_existe") == Q_NENHUM)
+}
+
+// C: driver/migrar_nomes.c:424 (NomesSoltos): as formas antigas num texto qualquer, cada uma uma vez; so a lista, nunca troca
+proc nomes_soltos(texto: str, tam: u64, arena: ^common.Arena, formas: ^[dynamic]str) {
+    let total: int = tam as int
+    var i: int = 0
+    modulos_soltos(texto, arena, formas)
+    while i < total {
+        let ini: int = i
+        while (i < total) and eh_palavra(texto[i]) {
+            i += 1
+        }
+        if i == ini {
+            i += 1
+            continue
+        }
+        if (ini == 0) or (texto[ini - 1] != 46) {
+            palavra_solta(texto, ini, i, arena, formas)
+        }
+    }
+}

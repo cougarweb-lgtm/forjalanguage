@@ -1,0 +1,503 @@
+// semantic/sem_array.fj - porte de compiler/semantic/sem_array.c
+// sha256 de semantic/sem_array.c: 7e5b0b1106351488d9e468cefa60fd9fe761e323bfb2d5e219cc3bcdab319e6e
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "common"
+import "frontend"
+
+struct LimiteConst {
+    conhecido: bool
+    valor: u64
+}
+
+// C: semantic/sem_array.c:21
+proc sem_elemento_de(s: ^Semantica, colecao: u32, forma: ^i32) -> u32 {
+    let k: ^TipoInfo = tipo_de(&s.tipos, colecao)
+    forma^ = FORMA_NENHUMA
+    if (k.classe == (TC_STRUCT as u8)) and (k.b != 0) {
+        forma^ = FORMA_ARRAY
+        return tipo_lista_fixa_elemento(&s.tipos, colecao)
+    }
+    if (k.classe == (TC_PONTEIRO as u8)) and (common.c2f_b2i32(tipo_eh_lista_fixa(&s.tipos, k.a)) != 0) {
+        forma^ = FORMA_PONTEIRO_ARRAY
+        return tipo_lista_fixa_elemento(&s.tipos, k.a)
+    }
+    if (k.classe == (TC_PONTEIRO as u8)) and (common.c2f_s2u_32(tipo_classe_de(&s.tipos, k.a)) == (TC_ARRAY as u32)) {
+        forma^ = FORMA_PONTEIRO_ARRAY
+        return tipo_de(&s.tipos, k.a).a
+    }
+    if (k.classe == (TC_PONTEIRO as u8)) and (common.c2f_s2u_32(tipo_classe_de(&s.tipos, k.a)) == (TC_DINAMICO as u32)) {
+        forma^ = FORMA_PONTEIRO_DINAMICO
+        return tipo_de(&s.tipos, k.a).a
+    }
+    if k.classe == (TC_ARRAY as u8) {
+        forma^ = FORMA_ARRAY
+    }
+    if k.classe == (TC_FATIA as u8) {
+        forma^ = FORMA_FATIA
+    }
+    if k.classe == (TC_DINAMICO as u8) {
+        forma^ = FORMA_DINAMICO
+    }
+    var tern_1: u32 = k.a
+    if common.c2f_s2u_32(forma^) == (FORMA_NENHUMA as u32) {
+        tern_1 = frontend.TIPO_NAO_RESOLVIDO as u32
+    }
+    return tern_1
+}
+
+// C: semantic/sem_array.c:48
+proc sem_tamanho_de(s: ^Semantica, colecao: u32) -> u32 {
+    var k: ?^TipoInfo = tipo_de(&s.tipos, colecao)
+    if (k as ^TipoInfo).classe == (TC_PONTEIRO as u8) {
+        k = tipo_de(&s.tipos, (k as ^TipoInfo).a)
+    }
+    if ((k as ^TipoInfo).classe == (TC_STRUCT as u8)) and ((k as ^TipoInfo).b != 0) {
+        k = tipo_de(&s.tipos, (k as ^TipoInfo).b)
+    }
+    var tern_1: u32 = 0
+    if (k as ^TipoInfo).classe == (TC_ARRAY as u8) {
+        tern_1 = (k as ^TipoInfo).b
+    }
+    return tern_1
+}
+
+// C: semantic/sem_array.c:57
+proc sem_tipo_sem_zero(s: ^Semantica, t: u32) -> bool {
+    let k: ^TipoInfo = tipo_de(&s.tipos, t)
+    if ((k.classe == (TC_PONTEIRO as u8)) or (k.classe == (TC_UNIAO as u8))) or (k.classe == (TC_PROC as u8)) {
+        return true
+    }
+    return (k.classe == (TC_ARRAY as u8)) and (common.c2f_b2i32(sem_tipo_sem_zero(s, k.a)) != 0)
+}
+
+// C: semantic/sem_array.c:67
+proc erro_de_base(s: ^Semantica, e: ^frontend.Expr, acao: str) -> bool {
+    let k: ^TipoInfo = tipo_de(&s.tipos, (e.a as ^frontend.Expr).tipo)
+    if (k.classe == (TC_ANULAVEL as u8)) and (tipo_classe_de(&s.tipos, k.a) == TC_ARRAY) {
+        let tipo_1 = sem_descrever_str(s, k.a)
+        defer delete(tipo_1)
+        let msg_1 = format(f"{acao} '?{tipo_1}' pode estar em none: converta com 'p as ^{tipo_1}' antes", alloc = heap)
+        defer delete(msg_1)
+        return sem_erro(s, common.E0306, e.pos_op, msg_1)
+    }
+    let tipo_2 = sem_descrever_str(s, (e.a as ^frontend.Expr).tipo)
+    defer delete(tipo_2)
+    let msg_2 = format(f"{acao} pede array, fatia, lista, str ou ponteiro para eles (tipo {tipo_2})", alloc = heap)
+    defer delete(msg_2)
+    return sem_erro(s, common.E0308, e.pos_op, msg_2)
+}
+
+// C: semantic/sem_array.c:80
+proc conferir_indice_constante(s: ^Semantica, e: ^frontend.Expr, forma: i32) -> bool {
+    var negativo: bool = false
+    var mag: u64 = 0
+    let indice: ?^frontend.Expr = e.b
+    if not sem_inteiro_constante(s, indice, &negativo, &mag) {
+        return true
+    }
+    if negativo and (mag != 0) {
+        let msg_1 = format(f"indice negativo (-{mag})", alloc = heap)
+        defer delete(msg_1)
+        return sem_erro(s, common.E0421, (indice as ^frontend.Expr).pos, msg_1)
+    }
+    if (not forma_tem_tamanho_fixo(forma)) or (mag < (sem_tamanho_de(s, (e.a as ^frontend.Expr).tipo) as u64)) {
+        return true
+    }
+    let tipo = sem_descrever_str(s, (e.a as ^frontend.Expr).tipo)
+    defer delete(tipo)
+    let tam: u32 = sem_tamanho_de(s, (e.a as ^frontend.Expr).tipo)
+    let msg_2 = format(f"indice {mag} fora de {tipo} (0..<{tam})", alloc = heap)
+    defer delete(msg_2)
+    return sem_erro(s, common.E0421, (indice as ^frontend.Expr).pos, msg_2)
+}
+
+// C: semantic/sem_array.c:95
+proc indice_do_texto(s: ^Semantica, e: ^frontend.Expr) -> bool {
+    if not sem_checar(s, e.b, TIPO_INT as u32) {
+        return false
+    }
+    if not tipo_eh_inteiro((e.b as ^frontend.Expr).tipo) {
+        return sem_erro_do_inteiro(s, e.b, "o indice")
+    }
+    if not conferir_indice_constante(s, e, FORMA_FATIA) {
+        return false
+    }
+    e.tipo = TIPO_U8 as u32
+    return true
+}
+
+// C: semantic/sem_array.c:104
+proc sem_indice(s: ^Semantica, e: ^frontend.Expr) -> bool {
+    var forma: i32 = 0
+    if common.c2f_b2i32(e.nargs != 0) != 0 {
+        return sem_indice_duplo(s, e)
+    }
+    if not sem_checar(s, e.a, TIPO_VAZIO as u32) {
+        return false
+    }
+    let elemento: u32 = sem_elemento_de(s, (e.a as ^frontend.Expr).tipo, &forma)
+    if common.c2f_s2u_32(forma) == (FORMA_NENHUMA as u32) {
+        if (e.a as ^frontend.Expr).tipo == (TIPO_TEXTO as u32) {
+            return indice_do_texto(s, e)
+        }
+        if (common.c2f_b2i32(tipos_tem_v19(&s.tipos)) != 0) and (common.c2f_b2i32(sem_eh_tipo_v19(s, (e.a as ^frontend.Expr).tipo)) != 0) {
+            return sem_indice_v19(s, e)
+        }
+        return erro_de_base(s, e, "indexar")
+    }
+    if not sem_checar(s, e.b, TIPO_INT as u32) {
+        return false
+    }
+    if not tipo_eh_inteiro((e.b as ^frontend.Expr).tipo) {
+        return sem_erro_do_inteiro(s, e.b, "o indice")
+    }
+    if not conferir_indice_constante(s, e, forma) {
+        return false
+    }
+    e.tipo = elemento
+    return true
+}
+
+// C: semantic/sem_array.c:127
+proc ler_limite(s: ^Semantica, limite: ?^frontend.Expr, c: ^LimiteConst) -> bool {
+    var negativo: bool = false
+    var mag: u64 = 0
+    if not sem_checar(s, limite, TIPO_INT as u32) {
+        return false
+    }
+    if not tipo_eh_inteiro((limite as ^frontend.Expr).tipo) {
+        return sem_erro_do_inteiro(s, limite, "o limite da fatia")
+    }
+    c.conhecido = sem_inteiro_constante(s, limite, &negativo, &mag)
+    if not c.conhecido {
+        return true
+    }
+    if (common.c2f_b2i32(negativo) != 0) and (mag != 0) {
+        let msg_1 = format(f"limite negativo (-{mag})", alloc = heap)
+        defer delete(msg_1)
+        return sem_erro(s, common.E0421, (limite as ^frontend.Expr).pos, msg_1)
+    }
+    c.valor = mag
+    return true
+}
+
+// C: semantic/sem_array.c:141
+proc limite_fora_do_array(e: ^frontend.Expr, valor: u64, n: u64) -> bool {
+    var tern_1: i32 = common.c2f_b2i32(valor > n)
+    if e.op == (frontend.FATIA_INCL as u8) {
+        tern_1 = common.c2f_b2i32(valor >= n)
+    }
+    return tern_1 != 0
+}
+
+// C: semantic/sem_array.c:147
+proc inicio_depois_do_fim(e: ^frontend.Expr, inicio: u64, fim: u64) -> bool {
+    var tern_1: i32 = common.c2f_b2i32(inicio > fim)
+    if e.op == (frontend.FATIA_INCL as u8) {
+        tern_1 = common.c2f_b2i32((inicio > 0) and ((inicio - 1) > fim))
+    }
+    return tern_1 != 0
+}
+
+// C: semantic/sem_array.c:152
+proc conferir_limites_constantes(s: ^Semantica, e: ^frontend.Expr, forma: i32, lim: [2]LimiteConst) -> bool {
+    let n: u64 = sem_tamanho_de(s, (e.a as ^frontend.Expr).tipo) as u64
+    var sinal: str = "..<"
+    if e.op == (frontend.FATIA_INCL as u8) {
+        sinal = "..="
+    }
+    let tipo = sem_descrever_str(s, (e.a as ^frontend.Expr).tipo)
+    defer delete(tipo)
+    let args = e.args or_else {}
+    if forma_tem_tamanho_fixo(forma) {
+        for k in 0..<2 {
+            var fora: bool = false
+            if lim[k].conhecido {
+                if k == 0 {
+                    fora = lim[k].valor > n
+                } else {
+                    fora = limite_fora_do_array(e, lim[k].valor, n)
+                }
+            }
+            if fora {
+                let msg_1 = format(f"limite {lim[k].valor} da fatia fora de {tipo} (0..={n as u32})", alloc = heap)
+                defer delete(msg_1)
+                return sem_erro(s, common.E0421, (args[k].valor as ^frontend.Expr).pos, msg_1)
+            }
+        }
+    }
+    if lim[0].conhecido and lim[1].conhecido and inicio_depois_do_fim(e, lim[0].valor, lim[1].valor) {
+        let msg_2 = format(f"fatia {lim[0].valor}{sinal}{lim[1].valor}: o inicio passa do fim", alloc = heap)
+        defer delete(msg_2)
+        return sem_erro(s, common.E0421, (args[0].valor as ^frontend.Expr).pos, msg_2)
+    }
+    return true
+}
+
+// C: semantic/sem_array.c:171
+proc limites_da_fatia(s: ^Semantica, e: ^frontend.Expr, forma: i32) -> bool {
+    var lim: [2]LimiteConst = {LimiteConst{conhecido = false, valor = 0}, LimiteConst{conhecido = false, valor = 0}}
+    let args = e.args or_else {}
+    if (not ler_limite(s, args[0].valor, &lim[0])) or (not ler_limite(s, args[1].valor, &lim[1])) {
+        return false
+    }
+    return conferir_limites_constantes(s, e, forma, lim)
+}
+
+// C: semantic/sem_array.c:178
+proc sem_fatia(s: ^Semantica, e: ^frontend.Expr) -> bool {
+    var forma: i32 = 0
+    if not sem_checar(s, e.a, TIPO_VAZIO as u32) {
+        return false
+    }
+    let elemento: u32 = sem_elemento_de(s, (e.a as ^frontend.Expr).tipo, &forma)
+    if (common.c2f_s2u_32(forma) == (FORMA_NENHUMA as u32)) and ((e.a as ^frontend.Expr).tipo != (TIPO_TEXTO as u32)) {
+        return erro_de_base(s, e, "fatiar")
+    }
+    if common.c2f_s2u_32(forma) == (FORMA_NENHUMA as u32) {
+        if (e.op != (frontend.FATIA_INTEIRA as u8)) and (not limites_da_fatia(s, e, FORMA_FATIA)) {
+            return false
+        }
+        e.tipo = TIPO_TEXTO as u32
+        return true
+    }
+    if (common.c2f_s2u_32(forma) == (FORMA_ARRAY as u32)) and (not sem_lvalor_mutavel_de(s, e.a, "fatiar um array pede 'var': a fatia altera os elementos")) {
+        return false
+    }
+    if (common.c2f_s2u_32(forma) == (FORMA_DINAMICO as u32)) and (not sem_lvalor_mutavel_de(s, e.a, "fatiar uma lista pede 'var': a fatia altera os elementos")) {
+        return false
+    }
+    if (e.op != (frontend.FATIA_INTEIRA as u8)) and (not limites_da_fatia(s, e, forma)) {
+        return false
+    }
+    e.tipo = tipo_fatia(&s.tipos, elemento)
+    return true
+}
+
+// C: semantic/sem_array.c:199
+proc literal_vazio(s: ^Semantica, e: ^frontend.Expr, ctx: u32, elemento: u32) -> bool {
+    let com_proc: bool = sem_proc_sem_zero(s, elemento)
+    if (not com_proc) and (not sem_tipo_sem_zero(s, elemento)) {
+        return true
+    }
+    let tipo = sem_descrever_str(s, ctx)
+    defer delete(tipo)
+    let tam: u32 = tipo_de(&s.tipos, ctx).b
+    if com_proc {
+        let msg_1 = format(f"'{{}}' de {tipo}: o elemento tem campo proc, que nao tem valor zero; escreva os {tam} elementos com o proc em cada um", alloc = heap)
+        defer delete(msg_1)
+        return sem_erro(s, common.E0911, e.pos, msg_1)
+    }
+    let msg_2 = format(f"'{{}}' de {tipo}: o elemento nao tem valor zero (^T e union nao tem); escreva os {tam} elementos", alloc = heap)
+    defer delete(msg_2)
+    return sem_erro(s, common.E0309, e.pos, msg_2)
+}
+
+// C: semantic/sem_array.c:213
+proc elementos_do_literal(s: ^Semantica, e: ^frontend.Expr, elemento: u32) -> bool {
+    var i: u32 = 0
+    while i < e.nargs {
+        let v: ?^frontend.Expr = (e.args or_else {})[i].valor
+        if (not sem_checar(s, v, elemento)) or (not sem_coagir(s, v, elemento, (v as ^frontend.Expr).pos)) {
+            return false
+        }
+        if (not sem_conferir_movimento(s, v)) or (not sem_conferir_posse(s, v, PONTO_GUARDA)) {
+            return false
+        }
+        i += 1
+    }
+    return true
+}
+
+// C: semantic/sem_array.c:223
+proc sem_literal_array(s: ^Semantica, e: ^frontend.Expr, ctx_ent: u32) -> bool {
+    let ctx: u32 = sem_ctx_sem_opcional(s, ctx_ent)
+    let k: ^TipoInfo = tipo_de(&s.tipos, ctx)
+    if (k.classe == (TC_STRUCT as u8)) and (k.b != 0) {
+        return sem_literal_lista_fixa(s, e, ctx) // v1.11 L15a
+    }
+    if k.classe == (TC_FATIA as u8) {
+        if e.nargs != 0 {
+            let msg_1 = format(f"fatia nao tem literal com elementos: declare o array e fatie (a[..])", alloc = heap)
+            defer delete(msg_1)
+            return sem_erro(s, common.E0309, e.pos, msg_1)
+        }
+        e.tipo = ctx
+        return true
+    }
+    if k.classe == (TC_DINAMICO as u8) {
+        let msg_2 = format(f"lista dinamica nasce de make: make([dynamic]T, alloc = heap); '{{}}' nao cria lista", alloc = heap)
+        defer delete(msg_2)
+        return sem_erro(s, common.E0309, e.pos, msg_2)
+    }
+    if k.classe != (TC_ARRAY as u8) {
+        if k.classe >= (TC_MAPA as u8) {
+            return sem_literal_v19(s, e, ctx)
+        }
+        let msg_3 = format(f"o literal de array precisa do tipo pelo contexto: let a: [3]int = {{1, 2, 3}}", alloc = heap)
+        defer delete(msg_3)
+        return sem_erro(s, common.E0309, e.pos, msg_3)
+    }
+    if (e.nargs == 0) and (not literal_vazio(s, e, ctx, k.a)) {
+        return false
+    }
+    if (e.nargs != 0) and (e.nargs != k.b) {
+        let tipo = sem_descrever_str(s, ctx)
+        defer delete(tipo)
+        let nargs: u32 = e.nargs
+        let n: u32 = k.b
+        let msg_4 = format(f"o literal tem {nargs} elementos e o tipo {tipo} pede {n}", alloc = heap)
+        defer delete(msg_4)
+        return sem_erro(s, common.E0309, e.pos, msg_4)
+    }
+    if not elementos_do_literal(s, e, k.a) {
+        return false
+    }
+    e.tipo = ctx
+    return true
+}
+
+// G3 S5: testes dirigidos (so existem em `forja test`)
+test "sem_array: erro_de_base e conferir_indice_constante" {
+    var c = S5Cena{}
+    s5_cena_montar(&c, {})
+    let a3: u32 = tipo_array(&c.sv.tipos, TIPO_I32 as u32, 3)
+    var base = s5_folha(tipo_anulavel(&c.sv.tipos, a3), false)
+    var e = frontend.Expr{tipo_no = frontend.EX_INDICE as u8, a = &base, pos = 4, pos_op = 6}
+    expect(not erro_de_base(&c.sv, &e, "indexar"))
+    expect(c.diag.codigo == common.E0306 and c.diag.off == 6 and (c.diag.causa or_else "") == "indexar '?[3]i32' pode estar em none: converta com 'p as ^[3]i32' antes")
+    base = s5_folha(TIPO_I32 as u32, false)
+    expect(not erro_de_base(&c.sv, &e, "fatiar"))
+    expect(c.diag.codigo == common.E0308 and c.diag.off == 6 and (c.diag.causa or_else "") == "fatiar pede array, fatia, lista, str ou ponteiro para eles (tipo i32)")
+    // indice constante: dentro, fora, negativo, -0, nao constante, forma sem tamanho fixo
+    base = s5_folha(a3, false)
+    var lit = s5_inteiro(2, 30)
+    e.b = &lit
+    expect(conferir_indice_constante(&c.sv, &e, FORMA_ARRAY))
+    lit = s5_inteiro(3, 31)
+    expect(not conferir_indice_constante(&c.sv, &e, FORMA_ARRAY))
+    expect(c.diag.codigo == common.E0421 and c.diag.off == 31 and (c.diag.causa or_else "") == "indice 3 fora de [3]i32 (0..<3)")
+    expect(not conferir_indice_constante(&c.sv, &e, FORMA_PONTEIRO_ARRAY))
+    expect(conferir_indice_constante(&c.sv, &e, FORMA_FATIA) and conferir_indice_constante(&c.sv, &e, FORMA_DINAMICO))
+    var neg = frontend.Expr{tipo_no = frontend.EX_UNARIO as u8, op = frontend.OP_NEGAR as u8, a = &lit, pos = 40}
+    lit = s5_inteiro(1, 41)
+    e.b = &neg
+    expect(not conferir_indice_constante(&c.sv, &e, FORMA_FATIA))
+    expect(c.diag.codigo == common.E0421 and c.diag.off == 40 and (c.diag.causa or_else "") == "indice negativo (-1)")
+    lit = s5_inteiro(0, 42)
+    expect(conferir_indice_constante(&c.sv, &e, FORMA_ARRAY))
+    var vivo = s5_folha(TIPO_INT as u32, false)
+    e.b = &vivo
+    expect(conferir_indice_constante(&c.sv, &e, FORMA_ARRAY))
+    s5_cena_liberar(&c)
+}
+
+test "sem_array: limites_da_fatia e conferir_limites_constantes (E0421)" {
+    var c = S5Cena{}
+    s5_cena_montar(&c, {})
+    let a3: u32 = tipo_array(&c.sv.tipos, TIPO_I32 as u32, 3)
+    var base = s5_folha(a3, false)
+    var l0 = s5_inteiro(1, 50)
+    var l1 = s5_inteiro(3, 60)
+    var args = make([dynamic]frontend.Arg, alloc = heap)
+    append(&args, item = frontend.Arg{nome = -1, valor = &l0, indice = 0})
+    append(&args, item = frontend.Arg{nome = -1, valor = &l1, indice = 1})
+    var e = frontend.Expr{tipo_no = frontend.EX_FATIA as u8, a = &base, args = args[..], nargs = 2, pos = 4, pos_op = 6}
+    expect(limites_da_fatia(&c.sv, &e, FORMA_ARRAY))
+    // 1..<4 em [3]: o fim 4 passa de 3
+    l1 = s5_inteiro(4, 61)
+    expect(not limites_da_fatia(&c.sv, &e, FORMA_ARRAY))
+    expect(c.diag.codigo == common.E0421 and c.diag.off == 61 and (c.diag.causa or_else "") == "limite 4 da fatia fora de [3]i32 (0..=3)")
+    expect(limites_da_fatia(&c.sv, &e, FORMA_FATIA))
+    // 4..<2: inicio passa do fim (forma sem tamanho fixo, so o teste do inicio/fim)
+    l0 = s5_inteiro(4, 50)
+    l1 = s5_inteiro(2, 60)
+    expect(not limites_da_fatia(&c.sv, &e, FORMA_DINAMICO))
+    expect(c.diag.codigo == common.E0421 and c.diag.off == 50 and (c.diag.causa or_else "") == "fatia 4..<2: o inicio passa do fim")
+    // inicio 4 > n=3 em array: o inicio sozinho ja esta fora (limite 4 da fatia)
+    l1 = s5_inteiro(4, 60)
+    expect(not limites_da_fatia(&c.sv, &e, FORMA_ARRAY))
+    expect(c.diag.off == 50 and (c.diag.causa or_else "") == "limite 4 da fatia fora de [3]i32 (0..=3)")
+    // inclusiva: 0..=3 em [3] passa (indice 3 nao existe); 0..=2 passa
+    e.op = frontend.FATIA_INCL as u8
+    l0 = s5_inteiro(0, 50)
+    l1 = s5_inteiro(3, 60)
+    expect(not limites_da_fatia(&c.sv, &e, FORMA_ARRAY))
+    expect(c.diag.off == 60 and (c.diag.causa or_else "") == "limite 3 da fatia fora de [3]i32 (0..=3)")
+    l1 = s5_inteiro(2, 60)
+    expect(limites_da_fatia(&c.sv, &e, FORMA_ARRAY))
+    // inclusiva 3..=1: (3 - 1) > 1; 3..=2 passa; 0..=0 passa (inicio 0 nao entra na conta)
+    l0 = s5_inteiro(3, 50)
+    l1 = s5_inteiro(1, 60)
+    expect(not limites_da_fatia(&c.sv, &e, FORMA_DINAMICO))
+    expect(c.diag.off == 50 and (c.diag.causa or_else "") == "fatia 3..=1: o inicio passa do fim")
+    l1 = s5_inteiro(2, 60)
+    expect(limites_da_fatia(&c.sv, &e, FORMA_DINAMICO))
+    l0 = s5_inteiro(0, 50)
+    l1 = s5_inteiro(0, 60)
+    expect(limites_da_fatia(&c.sv, &e, FORMA_DINAMICO))
+    // limite negativo: -1
+    var uno = s5_inteiro(1, 71)
+    var neg = frontend.Expr{tipo_no = frontend.EX_UNARIO as u8, op = frontend.OP_NEGAR as u8, a = &uno, pos = 70}
+    args[0].valor = &neg
+    expect(not limites_da_fatia(&c.sv, &e, FORMA_ARRAY))
+    expect(c.diag.codigo == common.E0421 and c.diag.off == 70 and (c.diag.causa or_else "") == "limite negativo (-1)")
+    // limite nao constante: so confere o que da
+    var vivo = s5_folha(TIPO_INT as u32, false)
+    args[0].valor = &vivo
+    expect(limites_da_fatia(&c.sv, &e, FORMA_ARRAY))
+    delete(args)
+    s5_cena_liberar(&c)
+}
+
+test "sem_array: literal_vazio e sem_literal_array" {
+    var c = S5Cena{}
+    s5_cena_montar(&c, {})
+    let i32t: u32 = TIPO_I32 as u32
+    let a3: u32 = tipo_array(&c.sv.tipos, i32t, 3)
+    let p2: u32 = tipo_array(&c.sv.tipos, tipo_ponteiro(&c.sv.tipos, i32t), 2)
+    var pa = ProcAssinatura{n = 0, retorno = TIPO_VAZIO as u32}
+    let proc_t: u32 = tipo_proc(&c.sv.tipos, &pa)
+    let pr2: u32 = tipo_array(&c.sv.tipos, proc_t, 2)
+    var e = frontend.Expr{tipo_no = frontend.EX_LITERAL_ARRAY as u8, pos = 9}
+    expect(literal_vazio(&c.sv, &e, a3, i32t))
+    expect(not literal_vazio(&c.sv, &e, p2, tipo_ponteiro(&c.sv.tipos, i32t)))
+    expect(c.diag.codigo == common.E0309 and c.diag.off == 9 and (c.diag.causa or_else "") == "'{}' de [2]^i32: o elemento nao tem valor zero (^T e union nao tem); escreva os 2 elementos")
+    expect(not literal_vazio(&c.sv, &e, pr2, proc_t))
+    expect(c.diag.codigo == common.E0911 and (c.diag.causa or_else "") == "'{}' de [2]proc(): o elemento tem campo proc, que nao tem valor zero; escreva os 2 elementos com o proc em cada um")
+    // sem_literal_array: vazio, com N certo, N errado, fatia, lista, tipo sem forma
+    expect(sem_literal_array(&c.sv, &e, a3) and e.tipo == a3)
+    expect(not sem_literal_array(&c.sv, &e, p2))
+    expect(c.diag.codigo == common.E0309)
+    var folhas = make([dynamic]frontend.Expr, alloc = heap)
+    var args = make([dynamic]frontend.Arg, alloc = heap)
+    for k in 0..<3 {
+        append(&folhas, item = s5_folha(i32t, false))
+    }
+    s5_ligar_args(&e, &folhas, &args)
+    e.tipo = 0
+    expect(sem_literal_array(&c.sv, &e, a3) and e.tipo == a3)
+    e.nargs = 2
+    expect(not sem_literal_array(&c.sv, &e, a3))
+    expect(c.diag.codigo == common.E0309 and c.diag.off == 9 and (c.diag.causa or_else "") == "o literal tem 2 elementos e o tipo [3]i32 pede 3")
+    e.nargs = 3
+    let fatia: u32 = tipo_fatia(&c.sv.tipos, i32t)
+    expect(not sem_literal_array(&c.sv, &e, fatia))
+    expect((c.diag.causa or_else "") == "fatia nao tem literal com elementos: declare o array e fatie (a[..])")
+    e.nargs = 0
+    e.tipo = 0
+    expect(sem_literal_array(&c.sv, &e, fatia) and e.tipo == fatia)
+    e.nargs = 3
+    expect(not sem_literal_array(&c.sv, &e, tipo_dinamico(&c.sv.tipos, i32t)))
+    expect((c.diag.causa or_else "") == "lista dinamica nasce de make: make([dynamic]T, alloc = heap); '{}' nao cria lista")
+    expect(not sem_literal_array(&c.sv, &e, TIPO_INT as u32))
+    expect((c.diag.causa or_else "") == "o literal de array precisa do tipo pelo contexto: let a: [3]int = {1, 2, 3}")
+    // contexto opcional: o ?[3]i32 vira [3]i32
+    e.tipo = 0
+    expect(sem_literal_array(&c.sv, &e, tipo_opcional(&c.sv.tipos, a3)) and e.tipo == a3)
+    delete(folhas)
+    delete(args)
+    s5_cena_liberar(&c)
+}

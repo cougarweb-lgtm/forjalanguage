@@ -1,0 +1,974 @@
+// nativo/obj/bibliotecas.fj - porte de compiler/nativo/obj/bibliotecas.c, compiler/nativo/obj/bibliotecas.h
+// sha256 de nativo/obj/bibliotecas.c: 47493aff6f073d2bc538eeb3dfae2683dc5332f468cdfe051d8b3be74e1443a8
+// sha256 de nativo/obj/bibliotecas.h: 87f214eb0d23beedd4be0345613fe308c99d58b05f104582a2d6d5aa95117955
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "common"
+import "std:file"
+import "nativo/fmt" as pefmt
+
+pub struct BibliotecasProvedor {
+    objeto: ?^Objeto
+    traz_imports: bool
+}
+
+pub struct BibliotecasPedido {
+    busca: ?^BibliotecaBusca
+    links: ?[]str
+    qtd_links: u32
+    simbolos: ?[]str
+    qtd_simbolos: u32
+    provedores: ?[]BibliotecasProvedor
+    qtd_provedores: u32
+}
+
+pub struct BibliotecaLida {
+    caminho: ?str
+    hash: u64
+}
+
+pub struct BibliotecasResolvidas {
+    memoria: common.Arena
+    tabelas: [17]ImportTabela
+    qtd_tabelas: u32
+    link_falho: ?str
+    simbolo_faltando: i32
+    procurei_em: [dynamic]u8
+    lidas: [dynamic]BibliotecaLida
+    tem_estaticas: bool
+    selecao: EstaticaSelecao
+    celulas: [dynamic]str
+    simbolo_faltando_nome: ?str
+    estaticas: [dynamic]EstaticaArquivo
+    libmem: TerceirosLibmem
+    provedores_usados: u32
+}
+
+struct DllLida {
+    link: ?str
+    caminho: ?str
+    nome_dll: ?str
+    exp: PeExportacoes
+    indisp: PeExportacoes
+}
+
+struct Resolucao {
+    pedido: ?^BibliotecasPedido
+    saida: ?^BibliotecasResolvidas
+    erro: ?^common.Diag
+    dlls: [dynamic]DllLida
+    explicitas: u32
+    dono: ?[]i32
+    estaticas: [dynamic]EstaticaArquivo
+    vistas: [dynamic]str
+    ultima_estatica: ?str
+    lista: ?[]str
+    qtd_lista: u32
+}
+
+struct BibImplicita {
+    link: ?str
+    outra_grafia: ?str
+}
+
+struct ImplibEmLeitura {
+    r: ?^Resolucao
+    link: ?str
+    caminho: ?str
+    desde: u32
+}
+
+const BIBS_TAM_BLOCO: u32 = 65536
+const BIBS_PREFIXO_IMP: str = "__imp_"
+const BIBS_TAM_PREFIXO_IMP: u32 = 6
+// C2F:? tabela BIBS_IMPLICITAS (const BibImplicita[2]): ponteiro nao nulo
+const BIBS_NOMES_TIPO: [8]str = {"uma DLL", "um executavel", "uma import library MSVC", "uma import library GNU", "uma biblioteca estatica (ar)", "um objeto /GL", "de formato desconhecido", "um ELF dinamico (.so)"}
+const BIBS_MOTIVO_INDISP: [3]str = {"", "e um dado exportado (Type DATA), nao uma funcao; o backend nativo importa so funcoes", "e importado so por ordinal; o backend nativo importa por nome"}
+
+// C: nativo/obj/bibliotecas.c:82
+proc bibs_ler_arquivo(caminho: str, bytes: ^[dynamic]u8) -> bool {
+    switch r in file.open(caminho, file.OpenMode.read) {
+    case file.File:
+        var arq: file.File = r
+        defer file.close(&arq)
+        return bibs_ler_arquivo_aberto(&arq, bytes)
+    case file.FileError:
+        return false
+    }
+    return false
+}
+
+// o corpo de bibs_ler_arquivo depois do fopen (o C faz tudo na mesma funcao; separado so para o switch do open); erro de leitura = falso, como o ferror do C
+proc bibs_ler_arquivo_aberto(arq: ^file.File, bytes: ^[dynamic]u8) -> bool {
+    var bloco: [65536]u8 = {}
+    while true {
+        let lidos: int = file.read(arq, bloco[..]) or_else -1
+        if lidos < 0 {
+            return false
+        }
+        if lidos == 0 {
+            break
+        }
+        append(bytes, items = bloco[0..<lidos])
+    }
+    return true
+}
+
+// C: nativo/obj/bibliotecas.c:98
+// Ultima parte depois de '\' ou '/' (a ultima barra ganha, como no laco do C)
+proc bibs_nome_do_arquivo(caminho: str) -> str {
+    var nome: str = caminho
+    let bytes = as_bytes(caminho)
+    var k: u64 = 0
+    while k < (len(bytes) as u64) {
+        if (bytes[k] == 92) or (bytes[k] == 47) {
+            nome = caminho[((k as int) + 1)..<len(caminho)]
+        }
+        k += 1
+    }
+    return nome
+}
+
+// C: nativo/obj/bibliotecas.c:111
+proc bibs_achar(r: ^Resolucao, link: str, achada: ^BibliotecaAchada) -> bool {
+    if biblioteca_achar((r.pedido as ^BibliotecasPedido).busca, link, achada) {
+        return true
+    }
+    let ptr_1: ^BibliotecasResolvidas = r.saida as ^BibliotecasResolvidas
+    ptr_1.link_falho = link
+    append(&ptr_1.procurei_em, items = achada.procurei_em[..])
+    let msg_1 = format(f"biblioteca do 'link' \"{link}\" nao encontrada", alloc = heap)
+    defer delete(msg_1)
+    return common.diag_relatar(r.erro as ^common.Diag, common.X0102, 0, msg_1)
+}
+
+// C: nativo/obj/bibliotecas.c:121
+proc bibs_tipo_ligavel(tipo: i32) -> bool {
+    let sw_1 = common.c2f_s2u_32(tipo)
+    if sw_1 == (BIB_DLL as u32) or sw_1 == (BIB_EXE as u32) or sw_1 == (BIB_IMPORT_MSVC as u32) or sw_1 == (BIB_IMPORT_GNU as u32) or sw_1 == (BIB_ESTATICA_AR as u32) {
+        return true
+    } else if sw_1 == (BIB_OBJETO_GL as u32) or sw_1 == (BIB_DESCONHECIDO as u32) or sw_1 == (BIB_ELF_DINAMICO as u32) {
+    }
+    return false
+}
+
+// C: nativo/obj/bibliotecas.c:139
+proc bibs_tipo_aceito(r: ^Resolucao, link: str, achada: ^BibliotecaAchada) -> bool {
+    if bibs_tipo_ligavel(achada.tipo) {
+        return true
+    }
+    let ptr_1: ^BibliotecasResolvidas = r.saida as ^BibliotecasResolvidas
+    ptr_1.link_falho = link
+    if common.c2f_s2u_32(achada.tipo) == (BIB_OBJETO_GL as u32) {
+        let txt_1 = achada.caminho or_else "(null)"
+        let msg_1 = format(f"biblioteca '{txt_1}' (link \"{link}\") e um objeto /GL (IL do compilador); o backend nativo nao o liga", alloc = heap)
+        defer delete(msg_1)
+        return common.diag_relatar(r.erro as ^common.Diag, common.X0105, 0, msg_1)
+    }
+    if common.c2f_s2u_32(achada.tipo) == (BIB_ELF_DINAMICO as u32) {
+        let txt_2 = achada.caminho or_else "(null)"
+        let msg_2 = format(f"ELF dinamico: S14 (biblioteca '{txt_2}', link \"{link}\"): o alvo Linux liga so a estatica lib<x>.a do vendor\\linux", alloc = heap)
+        defer delete(msg_2)
+        return common.diag_relatar(r.erro as ^common.Diag, common.X0003, 0, msg_2)
+    }
+    let txt_3 = achada.caminho or_else "(null)"
+    let msg_3 = format(f"biblioteca '{txt_3}' (link \"{link}\") e {BIBS_NOMES_TIPO[achada.tipo]}; o backend nativo liga DLL, executavel, import library e estatica (ar)", alloc = heap)
+    defer delete(msg_3)
+    return common.diag_relatar(r.erro as ^common.Diag, common.X0103, 0, msg_3)
+}
+
+// C: nativo/obj/bibliotecas.c:153
+proc bibs_anotar_lida(r: ^Resolucao, caminho: str, bytes: ^[dynamic]u8) {
+    let s: ^BibliotecasResolvidas = r.saida as ^BibliotecasResolvidas
+    let caminho_copia: str = from_bytes(as_bytes(caminho)[0..<len(caminho)], alloc = common.arena_mem(&s.memoria))
+    let hash_lido: u64 = common.hash64(bytes^[..], (len(bytes^) as u64), common.HASH64_SEMENTE)
+    append(&s.lidas, item = BibliotecaLida{caminho = caminho_copia, hash = hash_lido})
+}
+
+// C: nativo/obj/bibliotecas.c:162
+proc bibs_ler_bytes(r: ^Resolucao, link: str, caminho: str, bytes: ^[dynamic]u8) -> bool {
+    if bibs_ler_arquivo(caminho, bytes) {
+        bibs_anotar_lida(r, caminho, bytes)
+        return true
+    }
+    let ptr_1: ^BibliotecasResolvidas = r.saida as ^BibliotecasResolvidas
+    ptr_1.link_falho = link
+    let msg_1 = format(f"nao consegui ler a biblioteca '{caminho}' (link \"{link}\")", alloc = heap)
+    defer delete(msg_1)
+    return common.diag_relatar(r.erro as ^common.Diag, common.X0105, 0, msg_1)
+}
+
+// C: nativo/obj/bibliotecas.c:173
+proc bibs_relatar_leitura(r: ^Resolucao, link: str, caminho: str, lido: ^common.Diag) -> bool {
+    let ptr_1: ^BibliotecasResolvidas = r.saida as ^BibliotecasResolvidas
+    ptr_1.link_falho = link
+    let txt_1 = lido.causa or_else "(null)"
+    let msg_1 = format(f"biblioteca '{caminho}' (link \"{link}\"): {txt_1}", alloc = heap)
+    defer delete(msg_1)
+    return common.diag_relatar(r.erro as ^common.Diag, common.X0105, 0, msg_1)
+}
+
+// C: nativo/obj/bibliotecas.c:179
+proc bibs_ler_exportacoes(r: ^Resolucao, link: str, caminho: str, exp: ^PeExportacoes) -> bool {
+    var bytes: [dynamic]u8 = make([dynamic]u8, alloc = heap)
+    var lido: common.Diag = common.Diag{}
+    var sentinela: [1]u8 = {0}
+    var inicio: ^u8 = &sentinela[0]
+    if not bibs_ler_bytes(r, link, caminho, &bytes) {
+        delete(bytes)
+        return false
+    }
+    if len(bytes) > 0 {
+        inicio = &bytes[0]
+    }
+    let ok: bool = pe_ler_exportacoes(inicio, (len(bytes) as u64), exp, &lido)
+    delete(bytes)
+    if ok {
+        return true
+    }
+    return bibs_relatar_leitura(r, link, caminho, &lido)
+}
+
+// C: nativo/obj/bibliotecas.c:193
+proc bibs_nova_dll(r: ^Resolucao, link: str, caminho: str) -> ^DllLida {
+    append(&r.dlls, item = DllLida{})
+    let d: ^DllLida = &r.dlls[len(r.dlls) - 1]
+    d^ = DllLida{link = link}
+    d.caminho = from_bytes(as_bytes(caminho)[0..<len(caminho)], alloc = common.arena_mem(&(r.saida as ^BibliotecasResolvidas).memoria))
+    d.exp.itens = make([dynamic]PeExportacao, alloc = heap)
+    d.indisp.itens = make([dynamic]PeExportacao, alloc = heap)
+    return d
+}
+
+// C: nativo/obj/bibliotecas.c:205
+proc bibs_adicionar_pe(r: ^Resolucao, link: str, achada: ^BibliotecaAchada) -> bool {
+    let d: ^DllLida = bibs_nova_dll(r, link, (achada.caminho or_else ""))
+    d.nome_dll = bibs_nome_do_arquivo((d.caminho or_else ""))
+    if not bibs_ler_exportacoes(r, link, (d.caminho or_else ""), &d.exp) {
+        return false
+    }
+    if (common.c2f_s2u_32(achada.tipo) == (BIB_EXE as u32)) and ((len(d.exp.itens) as u64) == 0) {
+        let ptr_1: ^BibliotecasResolvidas = r.saida as ^BibliotecasResolvidas
+        ptr_1.link_falho = link
+        let txt_1 = d.caminho or_else "(null)"
+        let msg_1 = format(f"o executavel '{txt_1}' (link \"{link}\") nao exporta nenhum simbolo", alloc = heap)
+        defer delete(msg_1)
+        return common.diag_relatar(r.erro as ^common.Diag, common.X0105, 0, msg_1)
+    }
+    return true
+}
+
+// C: nativo/obj/bibliotecas.c:228
+proc bibs_dll_do_implib(l: ^ImplibEmLeitura, e: ^ImplibEntrada) -> ^DllLida {
+    let r: ^Resolucao = l.r as ^Resolucao
+    var k: u64 = (l.desde as u64)
+    while k < (len(r.dlls) as u64) {
+        let d: ^DllLida = &r.dlls[k]
+        if (d.nome_dll or_else "") == (e.dll or_else "") {
+            return d
+        }
+        k += 1
+    }
+    let nova: ^DllLida = bibs_nova_dll(r, (l.link or_else ""), (l.caminho or_else ""))
+    let nome_dll_texto: str = e.dll or_else ""
+    nova.nome_dll = from_bytes(as_bytes(nome_dll_texto)[0..<len(nome_dll_texto)], alloc = common.arena_mem(&(r.saida as ^BibliotecasResolvidas).memoria))
+    return nova
+}
+
+// C: nativo/obj/bibliotecas.c:243
+// Codigo vai para exp; so o tipo de dado/ordinal (indisp). Texto do nome na arena da propria tabela.
+proc bibs_guardar_entrada(d: ^DllLida, e: ^ImplibEntrada) {
+    var alvo: ^PeExportacoes = &d.indisp
+    if e.tipo == IMPLIB_CODIGO {
+        alvo = &d.exp
+    }
+    let nome_entrada: str = e.nome or_else ""
+    append(&alvo.itens, item = PeExportacao{})
+    let x: ^PeExportacao = &alvo.itens[len(alvo.itens) - 1]
+    x.nome = from_bytes(as_bytes(nome_entrada)[0..<len(nome_entrada)], alloc = common.arena_mem(&alvo.textos))
+    x.ordinal = common.c2f_s2u_32(e.tipo)
+}
+
+// C: nativo/obj/bibliotecas.c:253
+proc bibs_adicionar_implib(r: ^Resolucao, link: str, achada: ^BibliotecaAchada) -> bool {
+    var bytes: [dynamic]u8 = make([dynamic]u8, alloc = heap)
+    var lido: common.Diag = common.Diag{}
+    var ent: ImplibEntradas = ImplibEntradas{}
+    var sentinela: [1]u8 = {0}
+    var inicio: ^u8 = &sentinela[0]
+    let caminho: str = achada.caminho or_else ""
+    if not bibs_ler_bytes(r, link, caminho, &bytes) {
+        delete(bytes)
+        return false
+    }
+    if len(bytes) > 0 {
+        inicio = &bytes[0]
+    }
+    let ok: bool = implib_ler(inicio, (len(bytes) as u64), &ent, &lido)
+    delete(bytes)
+    var leitura: ImplibEmLeitura = ImplibEmLeitura{r = r, link = link, caminho = caminho, desde = (len(r.dlls) as u32)}
+    var i: u64 = 0
+    while ok and (i < (len(ent.itens) as u64)) {
+        let e: ^ImplibEntrada = &ent.itens[i]
+        bibs_guardar_entrada(bibs_dll_do_implib(&leitura, e), e)
+        i += 1
+    }
+    implib_liberar(&ent)
+    if ok {
+        return true
+    }
+    return bibs_relatar_leitura(r, link, caminho, &lido)
+}
+
+// C: nativo/obj/bibliotecas.c:273
+// Os bytes vao para a arena da saida (n + 1, como o ArenaCopiarTexto do C: o ultimo byte fica zero).
+proc bibs_ler_estatica(r: ^Resolucao, link: str, caminho: str, arq: ^EstaticaArquivo) -> bool {
+    var bytes: [dynamic]u8 = make([dynamic]u8, alloc = heap)
+    if not bibs_ler_bytes(r, link, caminho, &bytes) {
+        delete(bytes)
+        return false
+    }
+    let s: ^BibliotecasResolvidas = r.saida as ^BibliotecasResolvidas
+    let n: u64 = (len(bytes) as u64)
+    var copia: []u8 = common.arena_fatia_u8(&s.memoria, (len(bytes) + 1))
+    var k: u64 = 0
+    while k < n {
+        copia[k] = bytes[k]
+        k += 1
+    }
+    arq.nome = from_bytes(as_bytes(caminho)[0..<len(caminho)], alloc = common.arena_mem(&s.memoria))
+    arq.bytes = &copia[0]
+    arq.n = n
+    arq.link = from_bytes(as_bytes(link)[0..<len(link)], alloc = common.arena_mem(&s.memoria))
+    delete(bytes)
+    return true
+}
+
+// C: nativo/obj/bibliotecas.c:288
+proc bibs_reaproveitar_estatica(r: ^Resolucao, caminho: str, arq: ^EstaticaArquivo) -> bool {
+    var k: u64 = 0
+    while k < (len(r.estaticas) as u64) {
+        let e: ^EstaticaArquivo = &r.estaticas[k]
+        if (e.nome or_else "") == caminho {
+            arq^ = e^
+            return true
+        }
+        k += 1
+    }
+    return false
+}
+
+// C: nativo/obj/bibliotecas.c:301
+proc bibs_adicionar_estatica(r: ^Resolucao, link: str, achada: ^BibliotecaAchada) -> bool {
+    var novo: EstaticaArquivo = EstaticaArquivo{nome = none}
+    r.ultima_estatica = link
+    if (not bibs_reaproveitar_estatica(r, (achada.caminho or_else ""), &novo)) and (not bibs_ler_estatica(r, link, (achada.caminho or_else ""), &novo)) {
+        return false
+    }
+    append(&r.estaticas, item = EstaticaArquivo{})
+    r.estaticas[len(r.estaticas) - 1] = novo
+    return true
+}
+
+// C: nativo/obj/bibliotecas.c:312
+proc bibs_adicionar_achada(r: ^Resolucao, link: str, achada: ^BibliotecaAchada) -> bool {
+    if not bibs_tipo_aceito(r, link, achada) {
+        return false
+    }
+    if common.c2f_s2u_32(achada.tipo) == (BIB_ESTATICA_AR as u32) {
+        return bibs_adicionar_estatica(r, link, achada)
+    }
+    if (common.c2f_s2u_32(achada.tipo) == (BIB_IMPORT_MSVC as u32)) or (common.c2f_s2u_32(achada.tipo) == (BIB_IMPORT_GNU as u32)) {
+        return bibs_adicionar_implib(r, link, achada)
+    }
+    return bibs_adicionar_pe(r, link, achada)
+}
+
+// C: nativo/obj/bibliotecas.c:323
+proc bibs_adicionar_dll(r: ^Resolucao, link: str) -> bool {
+    var achada: BibliotecaAchada = BibliotecaAchada{}
+    let ok: bool = (common.c2f_b2i32(bibs_achar(r, link, &achada)) != 0) and (common.c2f_b2i32(bibs_adicionar_achada(r, link, &achada)) != 0)
+    biblioteca_liberar(&achada)
+    return ok
+}
+
+// C: nativo/obj/bibliotecas.c:334
+// O comparador do bsearch, com str no lugar do rawptr (o C compara com strcmp; so o sinal importa)
+proc bibs_compara_nome(chave: str, item: str) -> i32 {
+    return common.c2f_strcmp(chave, item)
+}
+
+// Busca binaria no lugar do bsearch do C: mesma sondagem (meio = lo + (hi - lo) / 2) e mesma comparacao; -1 se nao acha. A tabela vem ordenada pelo nome.
+proc bibs_buscar_nome(itens: []PeExportacao, nome: str) -> i64 {
+    var lo: i64 = 0
+    var hi: i64 = (len(itens) as i64) - 1
+    while lo <= hi {
+        let meio: i64 = lo + ((hi - lo) / 2)
+        let cmp: i32 = bibs_compara_nome(nome, (itens[(meio as u64)].nome or_else ""))
+        if cmp == 0 {
+            return meio
+        }
+        if cmp < 0 {
+            hi = meio - 1
+        } else {
+            lo = meio + 1
+        }
+    }
+    return -1
+}
+
+// C: nativo/obj/bibliotecas.c:339
+proc bibs_exporta(r: ^Resolucao, k: u32, simbolo: str) -> bool {
+    let d: ^DllLida = &r.dlls[(k as u64)]
+    if len(d.exp.itens) == 0 {
+        return false
+    }
+    return bibs_buscar_nome(d.exp.itens[..], simbolo) >= 0
+}
+
+// C: nativo/obj/bibliotecas.c:349
+proc bibs_dono_de(r: ^Resolucao, simbolo: str) -> i32 {
+    var k: u32 = r.explicitas
+    while k > 0 {
+        if bibs_exporta(r, k - 1, simbolo) {
+            return transmute(k - 1, to = i32)
+        }
+        k -= 1
+    }
+    var k_2: u32 = r.explicitas
+    while (k_2 as u64) < (len(r.dlls) as u64) {
+        if bibs_exporta(r, k_2, simbolo) {
+            return transmute(k_2, to = i32)
+        }
+        k_2 += 1
+    }
+    return -1
+}
+
+// C: nativo/obj/bibliotecas.c:367
+proc bibs_indisponivel(r: ^Resolucao, simbolo: str, dona: ^?^DllLida) -> ?^PeExportacao {
+    var k: u64 = 0
+    while k < (len(r.dlls) as u64) {
+        let d: ^DllLida = &r.dlls[k]
+        if len(d.indisp.itens) > 0 {
+            let pos: i64 = bibs_buscar_nome(d.indisp.itens[..], simbolo)
+            if pos >= 0 {
+                dona^ = d
+                return &d.indisp.itens[(pos as u64)]
+            }
+        }
+        k += 1
+    }
+    return none
+}
+
+// C: nativo/obj/bibliotecas.c:382
+proc bibs_simbolo_indisponivel(r: ^Resolucao, simbolo: str, x: ?^PeExportacao, dona: ?^DllLida) -> bool {
+    let ptr_1: ^BibliotecasResolvidas = r.saida as ^BibliotecasResolvidas
+    ptr_1.link_falho = (dona as ^DllLida).link
+    let txt_1 = (dona as ^DllLida).caminho or_else "(null)"
+    let txt_2 = (dona as ^DllLida).link or_else "(null)"
+    let msg_1 = format(f"o simbolo '{simbolo}' da import library '{txt_1}' (link \"{txt_2}\") {BIBS_MOTIVO_INDISP[(x as ^PeExportacao).ordinal]}", alloc = heap)
+    defer delete(msg_1)
+    return common.diag_relatar(r.erro as ^common.Diag, common.X0105, 0, msg_1)
+}
+
+// C: nativo/obj/bibliotecas.c:389
+proc bibs_posicao_no_pedido(r: ^Resolucao, simbolo: str) -> i32 {
+    for k in (0 as u32)..<(r.pedido as ^BibliotecasPedido).qtd_simbolos {
+        if ((r.pedido as ^BibliotecasPedido).simbolos or_else {})[k] == simbolo {
+            return transmute(k, to = i32)
+        }
+    }
+    return -1
+}
+
+// C: nativo/obj/bibliotecas.c:398
+proc bibs_simbolo_faltando(r: ^Resolucao, j: u32) -> bool {
+    let nome: str = (r.lista or_else {})[j]
+    var dona: ?^DllLida = none
+    let indisp: ?^PeExportacao = bibs_indisponivel(r, nome, &dona)
+    if indisp != none {
+        return bibs_simbolo_indisponivel(r, nome, indisp, dona)
+    }
+    let s: ^BibliotecasResolvidas = r.saida as ^BibliotecasResolvidas
+    var k: u64 = 0
+    while k < (len(r.dlls) as u64) {
+        let d: ^DllLida = &r.dlls[k]
+        var repetida: bool = false
+        if k > 0 {
+            let anterior: ^DllLida = &r.dlls[k - 1]
+            repetida = (anterior.caminho or_else "") == (d.caminho or_else "")
+        }
+        if not repetida {
+            append(&s.procurei_em, items = as_bytes(d.caminho or_else ""))
+            append(&s.procurei_em, items = as_bytes("\n"))
+        }
+        k += 1
+    }
+    s.simbolo_faltando = bibs_posicao_no_pedido(r, nome)
+    s.simbolo_faltando_nome = from_bytes(as_bytes(nome)[0..<len(nome)], alloc = common.arena_mem(&s.memoria))
+    let msg_1 = format(f"simbolo '{nome}' nao encontrado nas bibliotecas do 'link'", alloc = heap)
+    defer delete(msg_1)
+    return common.diag_relatar(r.erro as ^common.Diag, common.X0101, 0, msg_1)
+}
+
+// C: nativo/obj/bibliotecas.c:418
+proc bibs_achar_donos(r: ^Resolucao) -> bool {
+    let s: ^BibliotecasResolvidas = r.saida as ^BibliotecasResolvidas
+    var donos: []i32 = common.arena_fatia_i32(&s.memoria, ((r.qtd_lista as u64) + 1) as int)
+    r.dono = donos
+    let lista: []str = (r.lista or_else {})
+    var j: u32 = 0
+    while j < r.qtd_lista {
+        donos[j] = bibs_dono_de(r, lista[j])
+        if donos[j] < 0 {
+            return bibs_simbolo_faltando(r, j)
+        }
+        j += 1
+    }
+    return true
+}
+
+// C: nativo/obj/bibliotecas.c:431
+proc bibs_montar_tabela(r: ^Resolucao, k: u32) -> bool {
+    let s: ^BibliotecasResolvidas = r.saida as ^BibliotecasResolvidas
+    let dono: []i32 = (r.dono or_else {})
+    let lista: []str = (r.lista or_else {})
+    let alvo: i32 = transmute(k, to = i32)
+    var qtd: u32 = 0
+    var j: u64 = 0
+    while j < (r.qtd_lista as u64) {
+        if dono[j] == alvo {
+            qtd += 1
+        }
+        j += 1
+    }
+    if qtd == 0 {
+        return true
+    }
+    if s.qtd_tabelas == (pefmt.IMAGEM_MAX_DLLS as u32) {
+        let msg_1 = format(f"mais de {pefmt.IMAGEM_MAX_DLLS} DLLs com import nos 'link' do programa (teto do ligador nativo)", alloc = heap)
+        defer delete(msg_1)
+        return common.diag_relatar(r.erro as ^common.Diag, common.X0109, 0, msg_1)
+    }
+    var nomes: []str = common.arena_fatia_str(&s.memoria, (qtd as int))
+    var pos: u64 = 0
+    j = 0
+    while j < (r.qtd_lista as u64) {
+        if dono[j] == alvo {
+            nomes[pos] = from_bytes(as_bytes(lista[j])[0..<len(lista[j])], alloc = common.arena_mem(&s.memoria))
+            pos += 1
+        }
+        j += 1
+    }
+    let d: ^DllLida = &r.dlls[(k as u64)]
+    s.tabelas[(s.qtd_tabelas as u64)] = ImportTabela{dll = d.nome_dll, simbolos = nomes, qtd = qtd}
+    s.qtd_tabelas += 1
+    return true
+}
+
+// C: nativo/obj/bibliotecas.c:452
+proc bibs_liberar_dlls(r: ^Resolucao) {
+    var k: u32 = 0
+    while (k as u64) < (len(r.dlls) as u64) {
+        pe_exportacoes_liberar(&r.dlls[k as u64].exp)
+        pe_exportacoes_liberar(&r.dlls[k as u64].indisp)
+        k += 1
+    }
+    delete(r.dlls)
+}
+
+// C: nativo/obj/bibliotecas.c:461
+proc bibs_pediu_link(r: ^Resolucao, nome: ?str) -> bool {
+    var k: u32 = 0
+    while (nome != none) and (k < (r.pedido as ^BibliotecasPedido).qtd_links) {
+        if ((r.pedido as ^BibliotecasPedido).links or_else {})[k] == (nome or_else "") {
+            return true
+        }
+        k += 1
+    }
+    return false
+}
+
+// C: nativo/obj/bibliotecas.c:470
+proc bibs_adicionar_implicitas(r: ^Resolucao) -> bool {
+    var ok: bool = true
+    let busca: ?^BibliotecaBusca = (r.pedido as ^BibliotecasPedido).busca
+    if busca != none {
+        if (busca as ^BibliotecaBusca).elf {
+            return true
+        }
+    }
+    let implicitas: [2]BibImplicita = {BibImplicita{link = "c", outra_grafia = "m"}, BibImplicita{link = "kernel32", outra_grafia = none}}
+    var k: u64 = 0
+    while ok and (k < (len(implicitas) as u64)) {
+        let b: BibImplicita = implicitas[k]
+        if (not bibs_pediu_link(r, b.link)) and (not bibs_pediu_link(r, b.outra_grafia)) {
+            ok = bibs_adicionar_dll(r, (b.link or_else ""))
+        }
+        k += 1
+    }
+    return ok
+}
+
+// C: nativo/obj/bibliotecas.c:486
+proc bibs_eh_libc_da_semente(r: ^Resolucao, link: str) -> bool {
+    let b: ?^BibliotecaBusca = (r.pedido as ^BibliotecasPedido).busca
+    if ((b == none) or (not (b as ^BibliotecaBusca).elf)) or ((b as ^BibliotecaBusca).semente == none) {
+        return false
+    }
+    return (((link == "c") or (link == "m")) or (link == "msvcrt")) or (link == "ucrt")
+}
+
+// C: nativo/obj/bibliotecas.c:496
+proc bibs_adicionar_links(r: ^Resolucao) -> bool {
+    var ok: bool = true
+    var k: u32 = 0
+    while (common.c2f_b2i32(ok) != 0) and (k < (r.pedido as ^BibliotecasPedido).qtd_links) {
+        if not bibs_eh_libc_da_semente(r, ((r.pedido as ^BibliotecasPedido).links or_else {})[k]) {
+            ok = bibs_adicionar_dll(r, ((r.pedido as ^BibliotecasPedido).links or_else {})[k])
+        }
+        k += 1
+    }
+    return ok
+}
+
+// C: nativo/obj/bibliotecas.c:508
+proc bibs_adicionar_semente(r: ^Resolucao) -> bool {
+    if (((r.pedido as ^BibliotecasPedido).busca == none) or (((r.pedido as ^BibliotecasPedido).busca as ^BibliotecaBusca).semente == none)) or ((r.pedido as ^BibliotecasPedido).qtd_simbolos == 0) {
+        return true
+    }
+    return bibs_adicionar_dll(r, "c")
+}
+
+// C: nativo/obj/bibliotecas.c:515
+proc bibs_montar_tabelas(r: ^Resolucao) -> bool {
+    var k: u32 = 0
+    while (k as u64) < (len(r.dlls) as u64) {
+        if not bibs_montar_tabela(r, k) {
+            return false
+        }
+        k += 1
+    }
+    return true
+}
+
+// C: nativo/obj/bibliotecas.c:526
+proc bibs_ja_tratada(r: ^Resolucao, nome: str) -> bool {
+    for k in (0 as u64)..<(len(r.vistas) as u64) {
+        if r.vistas[k] == nome {
+            return true
+        }
+    }
+    return bibs_pediu_link(r, nome)
+}
+
+// C: nativo/obj/bibliotecas.c:536
+proc bibs_dependencia(r: ^Resolucao, nome: str, membro: str, novas: ^u32) -> bool {
+    var achada: BibliotecaAchada = BibliotecaAchada{}
+    var ok: bool = false
+    if bibs_ja_tratada(r, nome) {
+        return true
+    }
+    append(&r.vistas, item = "")
+    r.vistas[len(r.vistas) - 1] = nome
+    if bibs_coberta(nome) {
+        return true
+    }
+    if not biblioteca_achar((r.pedido as ^BibliotecasPedido).busca, nome, &achada) {
+        biblioteca_liberar(&achada)
+        let ptr_1: ^BibliotecasResolvidas = r.saida as ^BibliotecasResolvidas
+        ptr_1.link_falho = nome
+        let msg_1 = format(f"biblioteca '{nome}' pedida pelo .drectve do membro '{membro}' nao encontrada nas pastas de busca", alloc = heap)
+        defer delete(msg_1)
+        return common.diag_relatar(r.erro as ^common.Diag, common.X0108, 0, msg_1)
+    }
+    ok = bibs_adicionar_achada(r, nome, &achada)
+    biblioteca_liberar(&achada)
+    novas^ += 1
+    return ok
+}
+
+// C: nativo/obj/bibliotecas.c:557
+proc bibs_dependencias_do_membro(r: ^Resolucao, m: ^EstaticaMembro, novas: ^u32) -> bool {
+    if ar_eh_elf(m.dados as ^u8, m.tam) {
+        return true
+    }
+    var nomes: [dynamic]str = make([dynamic]str, alloc = heap)
+    var destino: CoffDestinoNomes = CoffDestinoNomes{arena = &(r.saida as ^BibliotecasResolvidas).memoria, lista = &nomes}
+    var lido: common.Diag = common.Diag{}
+    var ok: bool = coff_bibliotecas_do_membro(m.dados as ^u8, m.tam, &destino, &lido)
+    if not ok {
+        let saida_alvo: ^BibliotecasResolvidas = r.saida as ^BibliotecasResolvidas
+        saida_alvo.link_falho = r.ultima_estatica
+        let erro_alvo: ^common.Diag = r.erro as ^common.Diag
+        erro_alvo^ = lido
+    }
+    var k: u64 = 0
+    let nome_membro: str = m.nome or_else ""
+    while ok and (k < (len(nomes) as u64)) {
+        ok = bibs_dependencia(r, nomes[k], nome_membro, novas)
+        k += 1
+    }
+    delete(nomes)
+    return ok
+}
+
+// C: nativo/obj/bibliotecas.c:578
+proc bibs_selecionar(r: ^Resolucao) -> bool {
+    let s: ^BibliotecasResolvidas = r.saida as ^BibliotecasResolvidas
+    let pedido: ^BibliotecasPedido = r.pedido as ^BibliotecasPedido
+    var ped: EstaticaPedido = EstaticaPedido{arquivos = r.estaticas[..], qtd_arquivos = (len(r.estaticas) as u32), raizes = pedido.simbolos, qtd_raizes = pedido.qtd_simbolos}
+    if s.tem_estaticas {
+        estatica_liberar(&s.selecao)
+    }
+    s.tem_estaticas = true
+    if estatica_selecionar(&ped, &s.selecao, r.erro as ^common.Diag) {
+        return true
+    }
+    s.link_falho = r.ultima_estatica
+    return false
+}
+
+// C: nativo/obj/bibliotecas.c:593
+proc bibs_resolver_estaticas(r: ^Resolucao) -> bool {
+    var novas: u32 = 0
+    if (len(r.estaticas) as u64) == 0 {
+        return true
+    }
+    while true {
+        novas = 0
+        if not bibs_selecionar(r) {
+            return false
+        }
+        var k: u64 = 0
+        while k < (len((r.saida as ^BibliotecasResolvidas).selecao.membros) as u64) {
+            if not bibs_dependencias_do_membro(r, &(r.saida as ^BibliotecasResolvidas).selecao.membros[k], &novas) {
+                return false
+            }
+            k += 1
+        }
+        if not (novas > 0) {
+            break
+        }
+    }
+    return true
+}
+
+// C: nativo/obj/bibliotecas.c:611
+proc bibs_na_lista(r: ^Resolucao, nome: str) -> bool {
+    for k in (0 as u32)..<r.qtd_lista {
+        if (r.lista or_else {})[k] == nome {
+            return true
+        }
+    }
+    return false
+}
+
+// C: nativo/obj/bibliotecas.c:620
+proc bibs_eh_pendente(sel: ^EstaticaSelecao, nome: str) -> bool {
+    for k in (0 as u64)..<(len(sel.pendentes) as u64) {
+        if sel.pendentes[k] == nome {
+            return true
+        }
+    }
+    return false
+}
+
+// C: nativo/obj/bibliotecas.c:630
+proc bibs_simbolo_do_pendente(pendente: str) -> str {
+    if common.c2f_prefixo_igual(pendente, BIBS_PREFIXO_IMP, (BIBS_TAM_PREFIXO_IMP as int)) {
+        return pendente[(BIBS_TAM_PREFIXO_IMP as int)..<len(pendente)]
+    }
+    return pendente
+}
+
+// C: nativo/obj/bibliotecas.c:638
+proc bibs_montar_celulas(r: ^Resolucao) {
+    let p: ?^BibliotecasPedido = r.pedido
+    var k: u32 = 0
+    while k < (p as ^BibliotecasPedido).qtd_simbolos {
+        if not bibs_eh_pendente(&(r.saida as ^BibliotecasResolvidas).selecao, ((p as ^BibliotecasPedido).simbolos or_else {})[k]) {
+            let ptr_1: ^BibliotecasResolvidas = r.saida as ^BibliotecasResolvidas
+            append(&ptr_1.celulas, item = "")
+            ptr_1.celulas[len(ptr_1.celulas) - 1] = from_bytes(as_bytes(((p as ^BibliotecasPedido).simbolos or_else {})[k])[0..<len(((p as ^BibliotecasPedido).simbolos or_else {})[k])], alloc = common.arena_mem(&(r.saida as ^BibliotecasResolvidas).memoria))
+        }
+        k += 1
+    }
+}
+
+// C: nativo/obj/bibliotecas.c:649
+proc bibs_provedor_define(o: ^Objeto, nome: str) -> bool {
+    let i: i64 = obj_achar_simbolo(o, nome)
+    var s: ?^ObjSimbolo = none
+    if i < 0 {
+        return false
+    }
+    s = &o.simbolos[common.c2f_s2u_64(i)]
+    return (common.c2f_b2i32((s as ^ObjSimbolo).global) != 0) and ((s as ^ObjSimbolo).secao >= 0)
+}
+
+// C: nativo/obj/bibliotecas.c:661
+proc bibs_provedor_de(r: ^Resolucao, nome: str) -> i32 {
+    if common.c2f_prefixo_igual(nome, BIBS_PREFIXO_IMP, 6) or (bibs_posicao_no_pedido(r, nome) >= 0) {
+        return -1
+    }
+    var k: u32 = 0
+    while k < (r.pedido as ^BibliotecasPedido).qtd_provedores {
+        if bibs_provedor_define(((r.pedido as ^BibliotecasPedido).provedores or_else {})[k].objeto as ^Objeto, nome) {
+            return transmute(k, to = i32)
+        }
+        k += 1
+    }
+    return -1
+}
+
+// C: nativo/obj/bibliotecas.c:672
+proc bibs_poe_na_lista(r: ^Resolucao, escrita: []str, nome: str) {
+    if not bibs_na_lista(r, nome) {
+        let antes_1: u32 = r.qtd_lista
+        r.qtd_lista += 1
+        escrita[antes_1] = nome
+    }
+}
+
+// C: nativo/obj/bibliotecas.c:679
+proc bibs_imports_do_provedor(r: ^Resolucao, escrita: []str, o: ^Objeto) {
+    var i: u64 = 0
+    while i < (len(o.simbolos) as u64) {
+        let s: ^ObjSimbolo = &o.simbolos[i]
+        let nome_simbolo: str = s.nome or_else ""
+        if (s.secao == OBJ_SECAO_INDEFINIDA) and common.c2f_prefixo_igual(nome_simbolo, BIBS_PREFIXO_IMP, (BIBS_TAM_PREFIXO_IMP as int)) {
+            bibs_poe_na_lista(r, escrita, nome_simbolo[(BIBS_TAM_PREFIXO_IMP as int)..<len(nome_simbolo)])
+        }
+        i += 1
+    }
+}
+
+// C: nativo/obj/bibliotecas.c:689
+proc bibs_imports_dos_provedores(r: ^Resolucao, escrita: []str) {
+    var k: u32 = 0
+    while k < (r.pedido as ^BibliotecasPedido).qtd_provedores {
+        if ((((r.saida as ^BibliotecasResolvidas).provedores_usados >> (k & 31)) & 1) != 0) and (common.c2f_b2i32(((r.pedido as ^BibliotecasPedido).provedores or_else {})[k].traz_imports) != 0) {
+            bibs_imports_do_provedor(r, escrita, ((r.pedido as ^BibliotecasPedido).provedores or_else {})[k].objeto as ^Objeto)
+        }
+        k += 1
+    }
+}
+
+// C: nativo/obj/bibliotecas.c:698
+proc bibs_capacidade_da_lista(r: ^Resolucao) -> u64 {
+    var capacidade: u64 = (len((r.saida as ^BibliotecasResolvidas).selecao.pendentes) as u64) + 1
+    for k in (0 as u32)..<(r.pedido as ^BibliotecasPedido).qtd_provedores {
+        capacidade += len((((r.pedido as ^BibliotecasPedido).provedores or_else {})[k].objeto as ^Objeto).simbolos) as u64
+    }
+    return capacidade
+}
+
+// C: nativo/obj/bibliotecas.c:707
+proc bibs_montar_lista_com_estaticas(r: ^Resolucao) {
+    let s: ^BibliotecasResolvidas = r.saida as ^BibliotecasResolvidas
+    let escrita: []str = common.arena_fatia_str(&s.memoria, (bibs_capacidade_da_lista(r) as int))
+    r.lista = escrita
+    bibs_montar_celulas(r)
+    let bit: u32 = 1
+    var k: u64 = 0
+    while k < (len(s.selecao.pendentes) as u64) {
+        let pendente: str = s.selecao.pendentes[k]
+        let provedor: i32 = bibs_provedor_de(r, pendente)
+        if provedor >= 0 {
+            s.provedores_usados = s.provedores_usados | (bit << ((provedor as u32) & 31))
+        } else {
+            bibs_poe_na_lista(r, escrita, bibs_simbolo_do_pendente(pendente))
+        }
+        k += 1
+    }
+    bibs_imports_dos_provedores(r, escrita)
+}
+
+// C: nativo/obj/bibliotecas.c:726
+proc bibs_montar_lista(r: ^Resolucao) {
+    if (r.saida as ^BibliotecasResolvidas).tem_estaticas {
+        bibs_montar_lista_com_estaticas(r)
+        return
+    }
+    r.lista = (r.pedido as ^BibliotecasPedido).simbolos
+    r.qtd_lista = (r.pedido as ^BibliotecasPedido).qtd_simbolos
+}
+
+// C: nativo/obj/bibliotecas.c:737
+proc bibs_resolver_tudo(r: ^Resolucao) -> bool {
+    if ((not bibs_adicionar_links(r)) or (not bibs_adicionar_semente(r))) or (not bibs_resolver_estaticas(r)) {
+        return false
+    }
+    r.explicitas = (len(r.dlls) as u64) as u32
+    bibs_montar_lista(r)
+    if (r.qtd_lista > 0) and (not bibs_adicionar_implicitas(r)) {
+        return false
+    }
+    return (common.c2f_b2i32(bibs_achar_donos(r)) != 0) and (common.c2f_b2i32(bibs_montar_tabelas(r)) != 0)
+}
+
+// C: nativo/obj/bibliotecas.c:748
+pub proc bibliotecas_resolver(pedido: ^BibliotecasPedido, saida: ^BibliotecasResolvidas, erro: ^common.Diag) -> bool {
+    var r: Resolucao = Resolucao{pedido = pedido, saida = saida, erro = erro}
+    saida^ = BibliotecasResolvidas{simbolo_faltando = -1}
+    saida.lidas = make([dynamic]BibliotecaLida, alloc = heap)
+    saida.celulas = make([dynamic]str, alloc = heap)
+    saida.procurei_em = make([dynamic]u8, alloc = heap)
+    r.dlls = make([dynamic]DllLida, alloc = heap)
+    r.estaticas = make([dynamic]EstaticaArquivo, alloc = heap)
+    r.vistas = make([dynamic]str, alloc = heap)
+    let ok: bool = bibs_resolver_tudo(&r)
+    bibs_liberar_dlls(&r)
+    saida.estaticas = make([dynamic]EstaticaArquivo, alloc = heap)
+    var k: u64 = 0
+    while k < (len(r.estaticas) as u64) {
+        append(&saida.estaticas, item = r.estaticas[k])
+        k += 1
+    }
+    delete(r.estaticas)
+    delete(r.vistas)
+    return ok
+}
+
+// C: nativo/obj/bibliotecas.c:766
+pub proc bibliotecas_liberar(saida: ^BibliotecasResolvidas) {
+    if saida.tem_estaticas {
+        estatica_liberar(&saida.selecao)
+    }
+    common.arena_liberar(&saida.memoria)
+    delete(saida.procurei_em)
+    delete(saida.lidas)
+    delete(saida.celulas)
+    delete(saida.estaticas)
+}
+
+test "bibliotecas_nome_do_arquivo" {
+    expect(bibs_nome_do_arquivo("C:\\pasta\\ucrtbase.dll") == "ucrtbase.dll")
+    expect(bibs_nome_do_arquivo("lib/x.a") == "x.a")
+    expect(bibs_nome_do_arquivo("sem_barra") == "sem_barra")
+    expect(bibs_nome_do_arquivo("fim\\") == "")
+}
+
+test "bibliotecas_compara_nome_e_simbolo_pendente" {
+    expect(bibs_compara_nome("abc", "abd") < 0)
+    expect(bibs_compara_nome("abd", "abc") > 0)
+    expect(bibs_compara_nome("ab", "abc") < 0)
+    expect(bibs_compara_nome("abc", "abc") == 0)
+    expect(bibs_simbolo_do_pendente("__imp_printf") == "printf")
+    expect(bibs_simbolo_do_pendente("memcpy") == "memcpy")
+    expect(bibs_simbolo_do_pendente("__imp") == "__imp")
+}
+
+test "bibliotecas_buscar_nome_como_bsearch" {
+    var tab: [5]PeExportacao = {PeExportacao{nome = "a"}, PeExportacao{nome = "bb"}, PeExportacao{nome = "ccc"}, PeExportacao{nome = "dddd"}, PeExportacao{nome = "e"}}
+    expect(bibs_buscar_nome(tab[..], "a") == 0)
+    expect(bibs_buscar_nome(tab[..], "bb") == 1)
+    expect(bibs_buscar_nome(tab[..], "dddd") == 3)
+    expect(bibs_buscar_nome(tab[..], "e") == 4)
+    expect(bibs_buscar_nome(tab[..], "b") == -1)
+    expect(bibs_buscar_nome(tab[..], "zz") == -1)
+}

@@ -1,0 +1,207 @@
+// driver/migrar_pasta.fj - porte de compiler/driver/migrar_pasta.c, compiler/driver/migrar_pasta.h
+// sha256 de driver/migrar_pasta.c: e71f40f9e0704d706b1e237939ea8064508c0aa783bbff28b56aa2fa6f9f621f
+// sha256 de driver/migrar_pasta.h: 7c82cd26987f8ddcd0f31db14212b4a79f427a1229841b7c263efe783cdd6470
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.2.0
+// Changelog: 0.2.0 - G3 V5-G1: corpo real. FindFirstFileA/FindNextFileA -> file.read_dir (C2F-C1, sem "." e ".."); qsort por nome sem caixa -> sort_by com o desempate strcmp (C2F-B0);
+//            GetFileAttributesA -> file.stat, com o link seguido (read_dir/open); JuntarCaminho sem buffer: devolve o texto (heap) e caminho_cabe faz o teste de tamanho.
+
+import "common"
+import "std:file"
+
+const CAMINHO_MAX_4: i32 = 1024
+
+// C: driver/migrar_pasta.c:12 (PREFIXOS: "language_", ".git", "backup")
+// _strnicmp(nome, prefixo, strlen(prefixo)) == 0; nome mais curto que o prefixo nunca casa
+proc comeca_sem_caixa(nome: str, prefixo: str) -> bool {
+    if len(nome) < len(prefixo) {
+        return false
+    }
+    return common.c2f_stricmp(nome[0..<len(prefixo)], prefixo) == 0
+}
+
+// C: driver/migrar_pasta.c:18
+proc pasta_ignorada(nome: str) -> bool {
+    return comeca_sem_caixa(nome, "language_") or comeca_sem_caixa(nome, ".git") or comeca_sem_caixa(nome, "backup")
+}
+
+// C: driver/migrar_pasta.c:27
+proc tem_extensao_fj(nome: str) -> bool {
+    let n: int = len(nome)
+    return (n > 3) and (common.c2f_stricmp(nome[(n - 3)..<n], ".fj") == 0)
+}
+
+// C: driver/migrar_pasta.c:35 (comparador do qsort)
+// C2F-B0: sem caixa; empate (so a caixa muda) pelos bytes. Nomes de uma pasta sao unicos, entao a ordem e total.
+proc compara_nomes(a: ^file.DirEntry, b: ^file.DirEntry) -> i32 {
+    let c: i32 = common.c2f_stricmp(a.name, b.name)
+    if c != 0 {
+        return c
+    }
+    return common.c2f_strcmp(a.name, b.name)
+}
+
+// C2F-B0: o par `_menor` do sort_by
+proc compara_nomes_menor(a: ^file.DirEntry, b: ^file.DirEntry) -> bool {
+    return compara_nomes(a, b) < 0
+}
+
+// C: driver/migrar_pasta.c:44 (JuntarCaminho, teste de tamanho)
+// Resultado (sem o NUL) tem de caber em tam - 1, como o snprintf do C: len < tam
+proc caminho_cabe(pasta: str, nome: str, tam: int) -> bool {
+    var sep: int = 1
+    if termina_em_barra(pasta) {
+        sep = 0
+    }
+    return (len(pasta) + sep + len(nome)) < tam
+}
+
+// C: JuntarCaminho: "pasta\nome", sem barra dobrada se a pasta ja termina em barra. Texto de heap: quem recebe faz delete.
+proc juntar_caminho(pasta: str, nome: str) -> str {
+    if termina_em_barra(pasta) {
+        return format(f"{pasta}{nome}", alloc = heap)
+    }
+    return format(f"{pasta}\\{nome}", alloc = heap)
+}
+
+// C: driver/migrar_pasta.c:44 (a barra do fim so vale se a pasta nao esta vazia)
+proc termina_em_barra(texto: str) -> bool {
+    let n: int = len(texto)
+    return (n > 0) and ((texto[n - 1] == 92) or (texto[n - 1] == 47))
+}
+
+// C: driver/migrar_pasta.c (copia do caminho na Arena: a lista guarda so texto da Arena)
+proc acrescentar_caminho(caminho: str, arena: ^common.Arena, lista: ^[dynamic]str) {
+    append(lista, item = from_bytes(as_bytes(caminho), alloc = common.arena_mem(arena)))
+}
+
+// C: atalho de pasta (reparse point com DIRECTORY). O sistema abre a pasta pelo link, entao read_dir sem erro = pasta por link.
+proc atalho_de_pasta(caminho: str) -> bool {
+    switch achados in file.read_dir(caminho, alloc = heap) {
+    case file.DirList:
+        delete(achados.items)
+        delete(achados.data)
+        return true
+    case file.FileError:
+        return false
+    }
+    return false
+}
+
+// C: driver/migrar_pasta.c:52
+// C2F-EXTERNO: fd virou file.DirEntry (kind vem do runtime sem seguir link). Link de pasta nao desce e nao entra; o resto entra se for *.fj.
+proc visitar_entrada(pasta: str, entrada: file.DirEntry, arena: ^common.Arena, lista: ^[dynamic]str) {
+    if not caminho_cabe(pasta, entrada.name, (CAMINHO_MAX_4 as int)) {
+        return
+    }
+    let caminho: str = juntar_caminho(pasta, entrada.name)
+    if entrada.kind == file.FileKind.dir {
+        if not pasta_ignorada(entrada.name) {
+            listar_pasta(caminho, arena, lista)
+        }
+    } else if not ((entrada.kind == file.FileKind.link) and atalho_de_pasta(caminho)) and tem_extensao_fj(entrada.name) {
+        acrescentar_caminho(caminho, arena, lista)
+    }
+    delete(caminho)
+}
+
+// C: driver/migrar_pasta.c:66
+// C2F-C1: FindFirstFileA/FindNextFileA -> file.read_dir (sem "." e ".."); o qsort vira sort_by (C2F-B0). Pasta que nao abre (ou que nao cabe pasta\*) e pulada em silencio, como no C.
+proc listar_pasta(pasta: str, arena: ^common.Arena, lista: ^[dynamic]str) {
+    if not caminho_cabe(pasta, "*", (CAMINHO_MAX_4 as int)) {
+        return
+    }
+    switch achados in file.read_dir(pasta, alloc = heap) {
+    case file.DirList:
+        sort_by(achados.items[..], less = compara_nomes_menor)
+        for i in 0..<len(achados.items) {
+            visitar_entrada(pasta, achados.items[i], arena, lista)
+        }
+        delete(achados.items)
+        delete(achados.data)
+    case file.FileError:
+        return
+    }
+}
+
+// C: driver/migrar_pasta.c (ramo de link na raiz): GetFileAttributesA segue o link.
+// Abre como pasta (read_dir) -> lista; abre como arquivo -> entra; quebrado -> false (nao existe, como no C).
+proc coletar_link(entrada: str, arena: ^common.Arena, lista: ^[dynamic]str) -> bool {
+    if atalho_de_pasta(entrada) {
+        listar_pasta(entrada, arena, lista)
+        return true
+    }
+    switch r in file.open(entrada, file.OpenMode.read) {
+    case file.File:
+        var arq: file.File = r
+        file.close(&arq)
+        acrescentar_caminho(entrada, arena, lista)
+        return true
+    case file.FileError:
+        return false
+    }
+    return false
+}
+
+test "migrar_pasta: pasta_ignorada e tem_extensao_fj (caixa e prefixo como o C)" {
+    expect(pasta_ignorada("language_x"))
+    expect(pasta_ignorada("LANGUAGE_X"))
+    expect(pasta_ignorada(".git"))
+    expect(pasta_ignorada(".GIT_bak"))
+    expect(pasta_ignorada("backup_2024"))
+    expect(not pasta_ignorada("lang"))
+    expect(not pasta_ignorada("bac"))
+    expect(not pasta_ignorada("src"))
+    expect(tem_extensao_fj("a.fj"))
+    expect(tem_extensao_fj("A.FJ"))
+    expect(not tem_extensao_fj(".fj"))
+    expect(not tem_extensao_fj("a.fjx"))
+    expect(not tem_extensao_fj("a.c"))
+}
+
+test "migrar_pasta: ordem do qsort (sem caixa, desempate por bytes)" {
+    var a: file.DirEntry = file.DirEntry{name = "b.fj", kind = file.FileKind.file}
+    var b: file.DirEntry = file.DirEntry{name = "A.fj", kind = file.FileKind.file}
+    var c: file.DirEntry = file.DirEntry{name = "a.fj", kind = file.FileKind.file}
+    expect(compara_nomes_menor(&b, &a))
+    expect(not compara_nomes_menor(&a, &b))
+    expect(compara_nomes(&b, &c) < 0)
+    expect(compara_nomes(&c, &b) > 0)
+    expect(compara_nomes(&b, &b) == 0)
+    expect(compara_nomes_menor(&b, &c))
+}
+
+test "migrar_pasta: juntar_caminho e caminho_cabe (barra so quando falta)" {
+    let j1: str = juntar_caminho("C:\\x", "y.fj")
+    expect(j1 == "C:\\x\\y.fj")
+    delete(j1)
+    let j2: str = juntar_caminho("C:\\x\\", "y.fj")
+    expect(j2 == "C:\\x\\y.fj")
+    delete(j2)
+    expect(caminho_cabe("C:\\x", "y.fj", 1024))
+    expect(caminho_cabe("C:\\x\\", "y.fj", 1024))
+    expect(caminho_cabe("C:\\x", "*", 7))
+    expect(not caminho_cabe("C:\\x", "*", 6))
+    expect(caminho_cabe("C:\\x\\", "*", 7))
+    expect(not caminho_cabe("C:\\x\\", "*", 6))
+}
+
+// C: driver/migrar_pasta.c:86
+// Arquivo entra como esta (sem olhar a extensao); pasta vira os *.fj dela; false = a entrada nao existe.
+proc migrar_coletar(entrada: str, arena: ^common.Arena, lista: ^[dynamic]str) -> bool {
+    switch info in file.stat(entrada) {
+    case file.FileInfo:
+        if info.kind == file.FileKind.dir {
+            listar_pasta(entrada, arena, lista)
+            return true
+        }
+        if info.kind == file.FileKind.link {
+            return coletar_link(entrada, arena, lista)
+        }
+        acrescentar_caminho(entrada, arena, lista)
+        return true
+    case file.FileError:
+        return false
+    }
+    return false
+}

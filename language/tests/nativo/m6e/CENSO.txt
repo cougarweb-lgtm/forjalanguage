@@ -1,0 +1,140 @@
+CENSO M6e - P93a (16/11/2026). Base: forja 0.19.5, copia em %TEMP%\p93a\forja_p93a.exe (sha256 2b27c79b...a4a5c, igual a compiler\forja.exe).
+Raiz de todos os comandos: C:\ENGINE_GAME3D\language. Os achados sao de leitura (grep/forja check); nada foi alterado em compiler\ nem runtime\.
+Achados que bloqueiam ou pedem decisao estao em "DECISOES E BLOQUEIOS" no fim. Scripts do censo: tests\nativo\m6e\censo_e0913.py (c2) e tests\nativo\m6e\censo_c5_offsets.c (c5).
+
+== c1: programas que esperam R0008 de delete duplo ==
+Comando: grep -rl "R0008" tests ; grep -n "R0008" <arquivos>; leitura de cada .fj candidato.
+Congelados (tests\dourado, examples, benchmark\corpus\dourado|gerado, tests\lowering): nenhum espera R0008 de delete pelo mesmo nome.
+NAO congelados que esperam R0008 de delete duplo pelo mesmo nome (conserto no P93b, por ponteiro guardado em estrutura, ver E0317 abaixo):
+  tests\nativo\m2\memoria\liberar_duplo.fj        delete(p) 2x no mesmo nome (ja e R0008 e fica)  -> troca por campo
+  tests\nativo\m6\mem\delete_duplo.fj            delete(p) no fim (dourado do P70, verificar_mem 27/27) -> troca por campo
+  tests\cli\delete_duplo.fj                       run: CasoDeleteDuploDev (cli_casos_frontend.py:212) e benchmark\ia_first\verificar_limites_b10.py:40 -> troca por campo
+NAO afetados (nao e delete pelo mesmo nome, ou o zero nao alcanca):
+  tests\cli\cli_casos_ffi.py:414,446    forja_liberar chamado 2x pelo ctypes: o zero e do slot local do proc; o ponteiro do Python continua valido -> R0008 segue
+  tests\nativo\m2\memoria\pool_r0008.fj  delete(p, alloc = b) com b errado; p nao e usado depois (zera p sem efeito)
+  tests\nativo\m2\memoria\frame_reset_r0008.fj, m2\v19b\mapa_frame_r0008.fj, tests\receitas\frame.fj, tests\lowering\144_*  uso depois de frame_reset (nao delete)
+  tests\nativo\m6\mem\handle_desconhecido.fj, release_handle.fj, m6c\handle\*  untrack_handle (nao delete)
+  tests\nativo\rt\teste_rt_aloc.c, teste_rt_mapa.c, verificar_rt_nativo.py  chamadas C diretas ao runtime (fora do IR)
+  benchmark\ia_first\tarefas\R\R0x\motor\mundo_tick.fj  so comentario (uso depois de frame_reset)
+  std\mem.fj:88  comentario do untrack_handle
+Fixtures NOVAS desta suite (tests\nativo\m6e\zera\delete_duplo_mesmo_nome.fj) substituem o caso: hoje saem R0008 (exit 101), o esperado e exit 0.
+
+== c2: candidatos a E0913 (emprestimo de elemento/fatia/get_ptr/for &x + mutacao da mesma colecao no mesmo proc) ==
+Comando: python tests\nativo\m6e\censo_e0913.py  (saida: 33 linhas; lista completa gravada na sessao de P93a)
+Heuristica textual por proc (nao e fluxo). Resultado: 33 linhas, 28 com usado_depois=laco (for &x, mutacao depois do laco), 5 com usado_depois=nao, 0 com usado_depois=sim.
+Congelados nas 33 (conferidos a mao, nenhum vai dar E0913):
+  tests\lowering\141_lista_basica.fj     for &x (l.16) e delete(l) (l.31) FORA do laco; p=t (l.29) nao e usado depois do delete -> ok para E0913
+                                          ATENCAO (bloqueio, c2b abaixo): append(&l, item = 5) depois de delete(l) (l.33) -> R0007 com D-M6e-2
+  tests\lowering\149_lista_de_listas.fj  for &linha (l.19) e delete(grade) (l.27) FORA do laco -> ok
+  tests\lowering\172_mapa.fj             p = get_ptr(&m, ...) (l.14), remove(&m) (l.17), p nao aparece depois -> ok
+  tests\lowering\315_fmt_date_pattern.fj (fora da lista) delete(r) so no ramo str; ramo DateError usa r como erro -> ok
+Nao congelados (livres), para o conserto do P93g se o E0913 real acertar:
+  tests\semantica\ok_14_memoria.fj       controle ok_: for &x e delete(l)/delete(grade) fora do laco -> nao deve dar E0913 (passa)
+  tests\nativo\m2\memoria\lista_fatia.fj  p=u nao usado depois do remove -> ok
+  benchmark\ia_first\reescritos_l6\E21.fj, referencias\forja\E21\prog.fj, referencias\forja\C_forja\CF09\prog.fj,
+  benchmark\ia_first\tarefas\{P,R}\*\motor\mundo.fj (22 copias): for &t in m^.tabelas com delete(m^.tabelas) fora do laco -> falso positivo
+Conclusao: nenhum CONGELADO com E0913 real. PARA do c2 NAO disparado.
+
+== c2b (achado extra): congelado que muda com D-M6e-2 (append depois de delete do mesmo nome) ==
+Comando: python tests\nativo\m6e\censo_e0913.py ; Usos depois do delete pelo mesmo nome (varredura textual, scratch de P93a, mesmo criterio):
+  tests\lowering\141_lista_basica.fj   delete(l) l.31; append(&l, item = 5) l.33; print(l[0]) espera "5" (.esperado ultima linha = 5) -> VIRA R0007 "lista sem alocador", exit 101
+  tests\lowering\161_lista_e_texto_na_arena.fj  delete(l) l.13; print(len(l)) espera 0 -> ok (len zera); sem append depois -> ok
+  tests\lowering\315_fmt_date_pattern.fj  ok (ver c2)
+Bloqueio: 141 e congelado e o contrato so tratou R0008 e E0913. Decidir antes do P93c (troca do append por uso ou aceitar a mudanca de expectativa).
+
+== c2c (achado): E0317 - copia de ponteiro heap nao compila ==
+Comando: forja check tests\nativo\m6e\pilhas\delete_duplo_copia.fj (versao com let q = p) -> E0317 "'p' e dono de memoria de heap: copiar cria dois donos; entregue (proc, return, campo) ou use &p".
+O contrato (D-M6e-2, D-M6e-4, P93a pilhas\ e guarda\) assume "let q = p". Hoje nao compila. As fixtures usam ponteiro guardado em estrutura (struct Caixa { p: ^int }; Caixa{p = p}), que a spec aceita como entrega (campo). Ajustar no P93b/P93c o texto do R0008 e a doc: "copia" -> "ponteiro guardado em estrutura". Verificado: forja check e run dos 2 modelos (campo) compilam; run mostra R0008 no 2o delete.
+
+== c3: leituras de cap() em testes ==
+Comando: grep -rn "\bcap(" tests --include=*.fj  (5 arquivos, 9 linhas)
+  tests\lowering\222_lista_gestao_int.fj  l.11 print(cap(l)) ; l.14,17,59 print(cap(l) >= 10)
+  tests\lowering\246_builder_append_laco.fj  l.27 print(cap(buf))
+  tests\lowering\247_builder_to_str_reuso.fj  l.8, l.13 print(cap(buf))
+  tests\lowering\230_lista_mutadores_f64.fj  l.42 print(cap(c) >= 20)
+  tests\semantica\ok_L9_lista_embutidos_nomeados.fj  l.27 print(cap(l) >= 8)
+Efeito: so com --guarda-memoria (crescimento exato, cap = len). Sem a opcao nada muda. Os prints numericos (222:11, 246:27, 247:8 e :13) e os >= (222, 230, ok_L9) so entram na suite com guarda, se entrarem.
+
+== c4: limites de mapeamento (Linux) e blocos vivos ==
+Comando: timeout 60 wsl -d alpine-build -- cat /proc/sys/vm/max_map_count  -> 65530 (a linha de aviso do WSL sobre virtualizacao aninhada e so ruido)
+  Postonet: servidor de producao (contrato_m5); NAO medido daqui. Pendente com acesso.
+  threads_t0 (tests\runtime\threads_t0\threads_t0.fj, 54 l.; nativo\linux\threads\threads_t0.fj): 8 fios; cada volta aloca v e s no heap e os libera na mesma volta (delete(s); delete(v)); frame_reset por volta. Pico de blocos heap vivos ~ 8 Carga + 2 por fio + 2 vetores = ~26. Com guarda (2 mapeamentos por bloco) ~52 << 65530. R-M6e-5 nao pega esse teste.
+
+== c5: OFFSETS por programa C compilado (censo_c5_offsets.c) ==
+Comando Windows: gcc -O0 -o c5_win.exe tests\nativo\m6e\censo_c5_offsets.c  (MinGW GCC 16.1 do WinLibs) ; rodar.
+Comando WSL: wsl -d alpine-build -- gcc -O0 -static -o c5_linux censo_c5_offsets.c && ./c5_linux  (gcc 15.2, musl x86_64).
+Saida Windows (CONFIRMADO vs ABI x64):
+  EXCEPTION_RECORD.ExceptionCode=0 ; EXCEPTION_RECORD.ExceptionInformation[1]=40 ; CONTEXT.Rip=248 ; CONTEXT.Rsp=152 ; CONTEXT.Rbp=160
+Saida musl x86_64 (CONFIRMADO):
+  siginfo_t.si_addr=16 ; REG_RIP=16 ; REG_RSP=15 ; REG_RBP=10 ; ucontext_t.uc_mcontext.gregs=40 ; gregs[REG_RIP]=168 ; gregs[REG_RSP]=160 ; gregs[REG_RBP]=120
+Nenhum offset divergiu do esperado: PARA do c5 NAO disparado.
+
+== c6: quem le ou grava o cabecalho da FRT1 (10 palavras -> 12 no P93d) ==
+Comando: grep -rn "RASTRO_CABECALHO_PALAVRAS\|FRT1\|RT_PILHA_MAGIA\|CABECALHO" compiler runtime tests benchmark tools  (C:\CLAUDE_AGI\tools: sem ocorrencia de FRT1)
+  compiler\nativo\x64\x64_rastro.c:15 (RASTRO_CABECALHO_PALAVRAS 10u) e :141 (off_funcoes = palavras*4)  -> ESCRITOR, muda no P93d
+  compiler\nativo\dbg\dbg.h:1,29 e compiler\nativo\x64\x64_gerar.c:192  -> fonte do DbgPrograma (subtabela de linhas do P93d)
+  compiler\nativo\nativo.c  (chamadas da colheita de rastreio; checar no P93d)
+  runtime\nativo\rt_pilha.c:20-22 (comentario do cabecalho: magia, tam_texto, nfuncoes, ncalls, off_funcoes, off_calls, main_*), :35 RT_PILHA_MAGIA, :42-43 RtRastroFuncao/RtRastroChamada  -> LEITOR, muda no P93d (indices novos [10] flags, [11] off_linhas)
+  tests\nativo\obj\gerar_obj.c:139 (programa montado a mao leva FRT1 vazia de 10 palavras) -> ESCRITOR em tests, muda no P93d
+  tests\nativo\x64\gerar_x64.c:34 (tabela FRT1 com rastreio em dev) -> conferir no P93d
+  tests\nativo\m6\CENSO.txt  (doc)
+  benchmark\ia_first\verificar_rastreio_b12.py e tests\cli\cli_casos_rastreio.py: NAO leem palavras do cabecalho (grep sem "cabecalho|palavra|magia|struct"); conferem pela saida do programa.
+
+== c7: folga de linhas dos arquivos a tocar (limite 800; C tocado) ==
+Comando: wc -l <arquivo>   (lista da pasta compiler\ e runtime\ abaixo, linhas atuais)
+  compiler\ir\lower_memoria.c 307 (folga 493)
+  compiler\semantic\sem_memoria.c 680 (120)
+  compiler\common\diag.c 738 (62)
+  compiler\common\diag.h 184 (616)
+  compiler\common\diag_corrige.c 689 (111)
+  compiler\driver\main.c 773 (27)  -> linha da opcao so se couber; senao main_opcoes.c
+  compiler\driver\main_opcoes.c 168 (632)
+  compiler\driver\main_uso.c 53 (747)
+  compiler\driver\rcode_runtime.c 190 (610)
+  compiler\nativo\obj\libmem.c 250 (550)
+  compiler\frontend\parser_decl.c 531 (269)
+  compiler\nativo\x64\x64_rastro.c 165 (635)
+  compiler\nativo\nativo.c 797 (3)  -> NAO CRESCE (regra do contrato)
+  compiler\nativo\fmt\pe_escrever.c 799 (1)  -> NAO CRESCE
+  compiler\nativo\nativo_biblioteca.c 506 (294)
+  compiler\semantic\sem_interno.h 532 (268); semantic.h 234; sem_lista.c 496 (304); sem_mapa.c 184 (616); sem_stmt.c 458 (342)
+  runtime\nativo\rt_rastreio.c 679 (121)  -> NAO CRESCE (so chamadas; o novo vai em rt_guarda.c)
+  runtime\nativo\rt_aloc.c 684 (116)      -> NAO CRESCE (so #ifdef FORJA_DEV)
+  runtime\nativo\rt_pilha.c 377 (423); rt_sys.h 153 (647); rt_sys_win.c 232 (568); rt_sys_linux.c 271 (529); rt_libmem.c 550 (250)
+
+== DECISOES E BLOQUEIOS (para o main) ==
+B1 (DECISAO) tests\lowering\141_lista_basica.fj (CONGELADO) faz append depois de delete(l): com D-M6e-2 vira R0007. Escolher: (a) aceitar e trocar o esperado do 141 (congelado), ou (b) trocar o append do teste por um uso que nao aparece no contrato. Nao alterei nada.
+B2 (RESOLVIDO, ERRATA E2 do contrato, P93a') o campo novo do R0008 chama-se "bloco":"heap"|"lista"|"arena", logo depois de "causa". "tipo":"runtime" continua igual em todo R-code. verificar_m6e.py 0.1.1 confere "bloco".
+B3 (RESOLVIDO, ERRATA E3, P93a') "let q = p" de heap e E0317 hoje. O conserto por campo (struct) esta validado; o contrato e os textos do R0008 dizem "ponteiro guardado em estrutura (campo) ou liberado dentro de outro proc". Texto de diag.c/spec a trocar no P93b/P93c.
+B4 (CONTRATO) E0913 em tests\semantica: err_* usam a posicao do USO de p (ou do for &x na mutacao, regra 3). Convencao a confirmar no P93g; o .esperado.jsonl ja a usa.
+
+== CUSTO_BASE (tests\nativo\m6e\CUSTO_BASE.txt) - REGRAVADO no P93a' (ERRATA E5, medir_custo_base.py 0.2.0) ==
+custo_aloc (N=25000000 new+delete; M=25000 listas x 1000 appends): run dev 2.889 s | run release 1.088 s | razao 2.6553x (ABBA 9 pares, mediana). Checksum 312500324962500.
+corpus_200000: build dev 0.478 s | forja check dev 0.057 s (mediana de 9).
+Gates: razao <= 2.7881x; run release custo_aloc <= 1.142 s; forja check dev <= 0.06 s (CHECK gravado 0.057).
+Antes (versao 0.1.0, corpus_200000 run): razao 1.708x, nao vale mais. Calibracao: N=20M/M=20k deu release 0.88 s (abaixo de 1 s); N=25M/M=25k deu 1.13-1.17 s na calibracao e 1.088 s na medicao.
+Medicao: nenhuma outra trilha pesada rodou durante a medicao (o selftest e os checks vieram depois).
+
+== FIXTURES (tests\nativo\m6e\...) - estado HOJE (copia 0.19.5), verificar_m6e.py --grupo tudo --alvo ambos ==
+Resultado: estatico 4/9 ok (os 4 ok_ passam; os 5 err_ nao dao E0913) ; tudo 2/30 ok (controles: guarda_ok sem guarda, e o que ja passa).
+Falha hoje como previsto:
+  zera\delete_zera.fj              stdout 'false' (esperado 'true')
+  zera\delete_duplo_mesmo_nome.fj  R0008 exit 101 (esperado exit 0, "7","ok")
+  zera\lista_zera.fj               CONTROLE (ERRATA E1, P93a'): sai 0 com 3,0,0,1, sem R0009 (ver secao P93a' abaixo)
+  pilhas\delete_duplo_copia.fj     R0008 sem pilha_alocacao/pilha_delete, tipo 'runtime'
+  pilhas\append_no_morto.fj        APAGADO (P93a', ver abaixo: E0311)
+  append\lista_movida_sem_guarda.fj stdout '1' (esperado 0xDD = -2459565876494606883)
+  guarda\* (9)                     exit 2 "opcao desconhecida" (--guarda-memoria nao existe)
+  zera\release_zera_a x _b         exe release DIFERENTES (esperado iguais byte a byte)
+  semantica\err_emprestimo_* (5)   sem E0913 (esperado E0913 na posicao do .esperado.jsonl)
+Passam hoje (controles, nao devem mudar): semantica\ok_emprestimo_* (4), guarda\guarda_ok.fj sem a opcao (stdout 10000/9999/42).
+Obs.: guarda\teste_guarda e alem_do_fim e thread_uso so rodam no Windows (alvo linux = 'so windows' na tabela).
+
+== P93a' (ERRATA E1..E5, 16/11/2026) - o que mudou ==
+E1 zera\lista_zera.fj virou CONTROLE: sai 0 com 3,0,0,1 e sem R0009 (rodado no forja 0.19.5, sha256 2b27c79b...). Fixture e verificar_m6e.py ja refletem isso.
+E1 pilhas\append_no_morto.fj APAGADO. Motivo (achado de semantica): a lista passada por valor a proc (`proc esvazia(l: [dynamic]int)`) da E0311 "parametro nao recebe lista por valor: use ^[dynamic]T ou []T". Comando: forja check tests\nativo\m6e\pilhas\append_no_morto.fj (versao com l: [dynamic]int). Com ^[dynamic]T, delete(l^) zera a lista do chamador pelo endereco (ERRATA E1: inviavel). A causa "lista" fica em guarda\lista_movida (R0008 tipo/bloco lista).
+E1 zera\release_zera_a/_b ja usavam so ponteiro (?^int / ^int): nenhuma alteracao. Par segue como oraculo D-M6e-10(1).
+E2 verificar_m6e.py 0.1.1: o campo conferido do R0008 e "bloco" (depois de "causa"); "tipo" continua "runtime". Sem esperado .jsonl de R0008 neste diretorio.
+E3 texto "copia (let q = p)" nao aparece em verificar_m6e.py nem nos esperados de m6e; ficou so no historico (c2c) e no comentario de pilhas\delete_duplo_copia.fj e guarda\uso_apos_delete.fj (fora da lista desta etapa; trocar no P93b).
+E5 tests\nativo\m6e\custo\custo_aloc.fj NOVO (N e M em const CUSTO_N/CUSTO_M; itens em CUSTO_ITENS=1000); medir_custo_base.py 0.2.0 le as constantes e grava o checksum.
+Aceite P93a': verificar_m6e.py --selftest PASSOU; custo_aloc exit 0 em dev e release; CUSTO_BASE regravado.

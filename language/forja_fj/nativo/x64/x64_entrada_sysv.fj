@@ -1,0 +1,151 @@
+// nativo/x64/x64_entrada_sysv.fj - porte de compiler/nativo/x64/x64_entrada_sysv.c
+// sha256 de nativo/x64/x64_entrada_sysv.c: 48560531e4920256af4b35e81ef21807e1b084a702e2d8c7c66083c9bdc52284
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "nativo/bir"
+import "nativo/obj"
+
+struct RegArgumento {
+    x64: i32
+    abi: i32
+}
+
+const ENTRADA_FRAME: u32 = 176
+const ENTRADA_ARGS_PILHA: i32 = 16
+const ENTRADA_XMM_ARG: u32 = 8
+const REGS_ARGUMENTO_2: [6]RegArgumento = {RegArgumento{x64 = 7, abi = 2}, RegArgumento{x64 = 6, abi = 3}, RegArgumento{x64 = 2, abi = 1}, RegArgumento{x64 = 1, abi = 4}, RegArgumento{x64 = 8, abi = 5}, RegArgumento{x64 = 9, abi = 6}}
+// C2F:? tabela JMP_REL32 (const char[5]): inteiro -23 fora de u8
+
+// C: nativo/x64/x64_entrada_sysv.c:27
+proc no_bloco(desloc: u32) -> MOperando {
+    return m_mem(X64_RSP, transmute(ABI_WIN_SOMBRA + desloc, to = i32), 64)
+}
+
+// C: nativo/x64/x64_entrada_sysv.c:32
+proc guardar_argumentos(c: ^X64Ctx) -> bool {
+    for k in (0 as u32)..<bir.ABI_SYSV_REGS_INT {
+        let arg_1: MOperando = m_reg(REGS_ARGUMENTO_2[k].x64, 64)
+        let arg_2: MOperando = no_bloco(bir.abi_sysv_bloco_arg(REGS_ARGUMENTO_2[k].abi))
+        if not x64_emitir(c, mi2(FX_MOV64_MR as u16, arg_2, arg_1)) {
+            return false
+        }
+    }
+    for j in (0 as u32)..<ENTRADA_XMM_ARG {
+        let arg_3: MOperando = m_xmm(j as u8)
+        let arg_4: MOperando = no_bloco(bir.abi_sysv_bloco_arg(transmute((bir.ABI_SYSV_XMM0 as u32) + j, to = i32)))
+        if not x64_emitir(c, mi2(FX_MOVSD_MX as u16, arg_4, arg_3)) {
+            return false
+        }
+    }
+    return true
+}
+
+// C: nativo/x64/x64_entrada_sysv.c:46
+proc chamar_wrapper(c: ^X64Ctx, entrada: ^bir.BirEntradaSysv) -> bool {
+    if not x64_emitir(c, mi2(FX_LEA64_RM as u16, m_reg(X64_RCX, 64), no_bloco(0))) {
+        return false
+    }
+    if not x64_emitir(c, mi2(FX_LEA64_RM as u16, m_reg(X64_RDX, 64), m_mem(X64_RBP, ENTRADA_ARGS_PILHA, 64))) {
+        return false
+    }
+    return x64_emitir(c, mi1(FX_CALL_REL32 as u16, m_simbolo(c.obj_sim[entrada.wrapper])))
+}
+
+// C: nativo/x64/x64_entrada_sysv.c:54
+proc recarregar_retorno(c: ^X64Ctx) -> bool {
+    if not x64_emitir(c, mi2(FX_MOV64_RM as u16, m_reg(X64_RAX, 64), no_bloco(bir.abi_sysv_bloco_ret(bir.ABI_SYSV_RAX)))) {
+        return false
+    }
+    if not x64_emitir(c, mi2(FX_MOV64_RM as u16, m_reg(X64_RDX, 64), no_bloco(bir.abi_sysv_bloco_ret(bir.ABI_SYSV_RDX)))) {
+        return false
+    }
+    if not x64_emitir(c, mi2(FX_MOVSD_XM as u16, m_xmm(0), no_bloco(bir.abi_sysv_bloco_ret(bir.ABI_SYSV_XMM0)))) {
+        return false
+    }
+    return x64_emitir(c, mi2(FX_MOVSD_XM as u16, m_xmm(1), no_bloco(bir.abi_sysv_bloco_ret(bir.ABI_SYSV_XMM1))))
+}
+
+// C: nativo/x64/x64_entrada_sysv.c:72
+proc emitir_entrada_win64(c: ^X64Ctx, entrada: ^bir.BirEntradaSysv) {
+    // jmp rel32 em bytes crus (E9 + 4 zeros), com a relocacao que o X64Emitir poria
+    let texto: ^obj.ObjSecao = secao_texto(c)
+    x64_padding(c)
+    append(&texto.bytes, item = (0xE9 as u8))
+    for k in (0 as u32)..<4 {
+        append(&texto.bytes, item = (0 as u8))
+    }
+    obj.obj_relocar(c.o as ^obj.Objeto, obj.ObjAlvoReloc{secao = c.texto, off = x64_offset(c) - 4}, obj.ObjCorrecao{tipo = obj.OR_REL32, simbolo = c.obj_sim[entrada.win64], adendo = 0})
+    x64_padding(c)
+}
+
+// C: nativo/x64/x64_entrada_sysv.c:83
+proc gerar_entrada(c: ^X64Ctx, entrada: ^bir.BirEntradaSysv) -> bool {
+    let p: ^bir.BirPrograma = c.p as ^bir.BirPrograma
+    if entrada.win64 != bir.BIR_SEM_SIMBOLO {
+        emitir_entrada_win64(c, entrada)
+    }
+    _ = obj.obj_simbolo_definir(c.o as ^obj.Objeto, p.simbolos[entrada.stub].nome, c.texto as i32, x64_offset(c))
+    // mesma ordem e curto-circuito do C: para no 1o passo que falha
+    var ok: bool = x64_emitir(c, mi1(FX_PUSH64_R as u16, m_reg(X64_RBP, 64)))
+    if ok {
+        ok = x64_emitir(c, mi2(FX_MOV64_RR as u16, m_reg(X64_RBP, 64), m_reg(X64_RSP, 64)))
+    }
+    if ok {
+        ok = x64_emitir(c, mi2(FX_SUB64_RI as u16, m_reg(X64_RSP, 64), m_imed(ENTRADA_FRAME as i64)))
+    }
+    if ok {
+        ok = guardar_argumentos(c)
+    }
+    if ok {
+        ok = chamar_wrapper(c, entrada)
+    }
+    if ok {
+        ok = recarregar_retorno(c)
+    }
+    if ok {
+        ok = x64_emitir(c, mi2(FX_LEA64_RM as u16, m_reg(X64_RSP, 64), m_mem(X64_RBP, 0, 64)))
+    }
+    if ok {
+        ok = x64_emitir(c, mi1(FX_POP64_R as u16, m_reg(X64_RBP, 64)))
+    }
+    if ok {
+        ok = x64_emitir(c, mi0(FX_RET as u16))
+    }
+    x64_padding(c)
+    return ok
+}
+
+test "x64_entrada_sysv_tabela_regs_argumento_ordem_do_c" {
+    // RDI, RSI, RDX, RCX, R8, R9 com o indice do bloco SysV (ordem do C)
+    expect(REGS_ARGUMENTO_2[0].x64 == X64_RDI)
+    expect(REGS_ARGUMENTO_2[0].abi == bir.ABI_SYSV_RDI)
+    expect(REGS_ARGUMENTO_2[2].x64 == X64_RDX)
+    expect(REGS_ARGUMENTO_2[2].abi == bir.ABI_SYSV_RDX)
+    expect(REGS_ARGUMENTO_2[3].x64 == X64_RCX)
+    expect(REGS_ARGUMENTO_2[5].x64 == X64_R9)
+    expect(REGS_ARGUMENTO_2[5].abi == bir.ABI_SYSV_R9)
+}
+
+test "x64_entrada_sysv_no_bloco_fica_acima_da_sombra" {
+    let m: MOperando = no_bloco(16)
+    expect(m.base == X64_RSP)
+    expect(m.desloc == 48)
+}
+
+// C: nativo/x64/x64_entrada_sysv.c:99
+proc x64_gerar_entradas_sysv(c: ^X64Ctx) -> bool {
+    let lista: ?^AlvoListagem = c.lista
+    let n: u32 = (c.p as ^bir.BirPrograma).nentradas_sysv
+    var ok: bool = true
+    c.f = none
+    c.instr = c.instr[0..<0]
+    c.lista = none
+    var k: u32 = 0
+    while ok and (k < n) {
+        ok = gerar_entrada(c, &((c.p as ^bir.BirPrograma).entradas_sysv or_else {})[k])
+        k += 1
+    }
+    c.lista = lista
+    return ok
+}

@@ -1,0 +1,211 @@
+// nativo/optimizer/numeracao_morto.fj - porte de compiler/nativo/optimizer/numeracao_morto.c
+// sha256 de nativo/optimizer/numeracao_morto.c: 42eb3c309b80dd5935d6f5996bed24bc9205f5d5b16191216a86b49750793149
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "common"
+import "nativo/bir"
+
+const PASSADAS_MAX: u32 = 4
+
+// C: nativo/optimizer/numeracao_morto.c:20
+proc eh_pura_removivel(op: u8) -> bool {
+    let sw_1 = op as i32
+    if sw_1 == bir.BIR_CONST or sw_1 == bir.BIR_COPIA or sw_1 == bir.BIR_ADD or sw_1 == bir.BIR_SUB or sw_1 == bir.BIR_MUL or sw_1 == bir.BIR_AND or sw_1 == bir.BIR_OR or sw_1 == bir.BIR_XOR or sw_1 == bir.BIR_NEG or sw_1 == bir.BIR_NOT or sw_1 == bir.BIR_EXT_S or sw_1 == bir.BIR_EXT_Z or sw_1 == bir.BIR_TRUNC or sw_1 == bir.BIR_DIV or sw_1 == bir.BIR_REM or sw_1 == bir.BIR_SHL or sw_1 == bir.BIR_SHR or sw_1 == bir.BIR_I_PARA_F or sw_1 == bir.BIR_F_PARA_F or sw_1 == bir.BIR_RAIZ or sw_1 == bir.BIR_SELECIONA {
+        return true
+    } else {
+        return false
+    }
+    return false
+}
+
+// C: nativo/optimizer/numeracao_morto.c:32
+proc eh_acesso_de_base(i: ^bir.BirInstr) -> bool {
+    return ((i.op == (bir.BIR_CARREGA as u8)) or (i.op == (bir.BIR_GRAVA as u8))) and (i.a.tipo == (bir.BO_VREG as u8))
+}
+
+// C: nativo/optimizer/numeracao_morto.c:38
+// C2F-INDECIDIVEL: tirada
+proc outro_acesso_vivo(bloco: ^bir.BirBloco, tirada: []u32, j: u32) -> bool {
+    let base: u32 = bloco.instrs[j].a.id
+    var k: u32 = 0
+    while k < bloco.n {
+        let outro: ^bir.BirInstr = &bloco.instrs[k]
+        if (((k != j) and (not (tirada[k] != 0))) and (common.c2f_b2i32(eh_acesso_de_base(outro)) != 0)) and (outro.a.id == base) {
+            return true
+        }
+        k += 1
+    }
+    return false
+}
+
+// C: nativo/optimizer/numeracao_morto.c:53
+proc carga_removivel(c: ^NumCtx, bloco: ^bir.BirBloco, tirada: []u32, j: u32) -> bool {
+    let i: ^bir.BirInstr = &bloco.instrs[j]
+    if i.a.tipo != (bir.BO_VREG as u8) {
+        return false
+    }
+    let base: NumBase = num_base_de(c, i.a.id)
+    return (base.slot == 1) or outro_acesso_vivo(bloco, tirada, j)
+}
+
+// C: nativo/optimizer/numeracao_morto.c:63
+proc removivel_sem_uso(c: ^NumCtx, bloco: ^bir.BirBloco, tirada: []u32, j: u32) -> bool {
+    let op: u8 = bloco.instrs[j].op
+    if op == (bir.BIR_CARREGA as u8) {
+        return carga_removivel(c, bloco, tirada, j)
+    }
+    return eh_pura_removivel(op)
+}
+
+// C: nativo/optimizer/numeracao_morto.c:72
+// C2F-13: usos fundido em nvregs (len)
+// O5: nvregs explicito (C: f->nvregs); passo -1 soma 0xFFFFFFFF com wrapping, como o uint32_t do C.
+proc usar(usos: []u32, nvregs: u32, o: ^bir.BirOperando, passo: i32) {
+    if (o.tipo == (bir.BO_VREG as u8)) and (o.id < nvregs) {
+        usos[o.id] = wrapping_add(usos[o.id], common.c2f_s2u_32(passo))
+    }
+}
+
+// C: nativo/optimizer/numeracao_morto.c:78
+// C2F-INDECIDIVEL: tirada, inicio
+proc contar_usos(f: ^bir.BirFuncao, usos: []u32, tirada: []u32, inicio: []u32) {
+    var b: u32 = 0
+    while b < f.nblocos {
+        let bloco: ^bir.BirBloco = &f.blocos[b]
+        var j: u32 = 0
+        while j < bloco.n {
+            if tirada[inicio[b] + j] == 0 {
+                let ins: ^bir.BirInstr = &bloco.instrs[j]
+                usar(usos, f.nvregs, &ins.a, 1)
+                usar(usos, f.nvregs, &ins.b, 1)
+                let args = ins.args or_else {}
+                var k: u32 = 0
+                while k < ins.nargs {
+                    usar(usos, f.nvregs, &args[k], 1)
+                    k += 1
+                }
+            }
+            j += 1
+        }
+        b += 1
+    }
+}
+
+// C: nativo/optimizer/numeracao_morto.c:95
+// C2F-INDECIDIVEL: usos, tirada, inicio
+// Uma passada, de tras para frente (o consumidor sai antes do produtor): marca em tirada e desconta os operandos.
+proc marcar_passada(c: ^NumCtx, usos: []u32, tirada: []u32, inicio: []u32) -> u32 {
+    let f: ^bir.BirFuncao = c.f as ^bir.BirFuncao
+    var marcadas: u32 = 0
+    var b: u32 = f.nblocos
+    while b > 0 {
+        b -= 1
+        let bloco: ^bir.BirBloco = &f.blocos[b]
+        let ini_b: u32 = inicio[b]
+        let tirada_bloco = tirada[(ini_b as int)..<((ini_b + bloco.n) as int)]
+        var j: u32 = bloco.n
+        while j > 0 {
+            j -= 1
+            let ins: ^bir.BirInstr = &bloco.instrs[j]
+            if (tirada[ini_b + j] != 0) or (ins.dst == bir.BIR_SEM_VREG) or (ins.dst >= f.nvregs) or (usos[ins.dst] != 0) or (not removivel_sem_uso(c, bloco, tirada_bloco, j)) {
+                continue
+            }
+            tirada[ini_b + j] = 1
+            marcadas += 1
+            usar(usos, f.nvregs, &ins.a, -1)
+            usar(usos, f.nvregs, &ins.b, -1)
+        }
+    }
+    return marcadas
+}
+
+// C: nativo/optimizer/numeracao_morto.c:115
+// C2F-INDECIDIVEL: tirada, inicio
+proc compactar_3(f: ^bir.BirFuncao, tirada: []u32, inicio: []u32) {
+    var b: u32 = 0
+    while b < f.nblocos {
+        let bloco: ^bir.BirBloco = &f.blocos[b]
+        var m: u32 = 0
+        var j: u32 = 0
+        while j < bloco.n {
+            if not (tirada[inicio[b] + j] != 0) {
+                let antes_1: u32 = m
+                m += 1
+                bloco.instrs[antes_1] = bloco.instrs[j]
+            }
+            j += 1
+        }
+        bloco.n = m
+        b += 1
+    }
+}
+
+// C: nativo/optimizer/numeracao_morto.c:129
+// O5: tirada e uma fatia de u32 por instrucao (C: bytes); a temp reserva total + 1 palavras.
+proc num_remover_mortos(f: ^bir.BirFuncao, c: ^NumCtx) -> u32 {
+    var total: u32 = 0
+    var tirados: u32 = 0
+    let inicio = num_temp(c, (f.nblocos as u64) + 1, 0)
+    let usos = num_temp(c, (f.nvregs as u64) + 1, 0)
+    var b: u32 = 0
+    while b < f.nblocos {
+        inicio[b] = total
+        total += f.blocos[b].n
+        b += 1
+    }
+    let tirada = num_temp(c, (total as u64) + 1, 0)
+    contar_usos(f, usos, tirada, inicio)
+    var passada: u32 = 0
+    while passada < PASSADAS_MAX {
+        let nova: u32 = marcar_passada(c, usos, tirada, inicio)
+        tirados += nova
+        if nova == 0 {
+            break
+        }
+        passada += 1
+    }
+    if tirados > 0 {
+        compactar_3(f, tirada, inicio)
+    }
+    return tirados
+}
+
+test "morto_usar_conta_so_vreg_valido" {
+    var arena = common.Arena{}
+    let usos = common.arena_fatia_u32(&arena, 3)
+    var op = bir.BirOperando{tipo = bir.BO_VREG as u8, id = 1}
+    usar(usos, 2, &op, 1)
+    expect(usos[1] == 1)
+    op.id = 2
+    usar(usos, 2, &op, 1)
+    expect(usos[2] == 0)
+    op.id = 1
+    usar(usos, 2, &op, -1)
+    expect(usos[1] == 0)
+    common.arena_liberar(&arena)
+}
+
+test "morto_cascata_remove_ate_o_uso_do_c" {
+    var f = bir.BirFuncao{}
+    f.nvregs = 3
+    f.nblocos = 1
+    f.blocos = make([dynamic]bir.BirBloco, alloc = heap, cap = 1)
+    append(&f.blocos, item = bir.BirBloco{})
+    f.blocos[0].instrs = make([dynamic]bir.BirInstr, alloc = heap, cap = 4)
+    append(&f.blocos[0].instrs, item = bir.BirInstr{op = bir.BIR_CONST as u8, dst = 0, a = bir.BirOperando{tipo = bir.BO_IMED as u8, imed = 5}})
+    append(&f.blocos[0].instrs, item = bir.BirInstr{op = bir.BIR_ADD as u8, dst = 1, a = bir.BirOperando{tipo = bir.BO_VREG as u8, id = 0}, b = bir.BirOperando{tipo = bir.BO_IMED as u8, imed = 1}})
+    append(&f.blocos[0].instrs, item = bir.BirInstr{op = bir.BIR_CONST as u8, dst = 2, a = bir.BirOperando{tipo = bir.BO_IMED as u8, imed = 9}})
+    append(&f.blocos[0].instrs, item = bir.BirInstr{op = bir.BIR_RETORNA as u8, dst = bir.BIR_SEM_VREG, a = bir.BirOperando{tipo = bir.BO_VREG as u8, id = 2}})
+    f.blocos[0].n = 4
+    f.blocos[0].cap = 4
+    var c = NumCtx{}
+    num_preparar(&c, 64)
+    c.f = &f
+    let tirados = num_remover_mortos(&f, &c)
+    expect(tirados == 2)
+    expect(f.blocos[0].n == 2 and f.blocos[0].instrs[0].dst == 2 and f.blocos[0].instrs[1].op == (bir.BIR_RETORNA as u8))
+    num_fatos_liberar(&c)
+    delete(f.blocos[0].instrs)
+    delete(f.blocos)
+}

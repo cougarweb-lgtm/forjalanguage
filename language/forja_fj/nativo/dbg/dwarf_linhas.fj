@@ -1,0 +1,134 @@
+// nativo/dbg/dwarf_linhas.fj - porte de compiler/nativo/dbg/dwarf_linhas.c
+// sha256 de nativo/dbg/dwarf_linhas.c: 86f24ad97b82017d9b7582e34b16e2a1e26bc2b05bd85e175329636b7558dfde
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+struct DwarfPendente {
+    off: u64
+    proc_c: u64
+}
+
+const DWARF_VERSAO_LINHA: i32 = 4
+const DWARF_LINHA_BASE: i32 = -5
+const DWARF_LINHA_RANGE: i32 = 14
+const DWARF_OPCODE_BASE: i32 = 13
+const DW_LNS_COPY: i32 = 1
+const DW_LNS_ADVANCE_PC: i32 = 2
+const DW_LNS_ADVANCE_LINE: i32 = 3
+const DW_LNS_SET_FILE: i32 = 4
+const DW_LNE_END_SEQUENCE: i32 = 1
+const DW_LNE_SET_ADDRESS: i32 = 2
+const DW_LNE_TAM_SET_ADDRESS: i32 = 9
+const DWARF_BYTES_POR_PROC: i32 = 24
+const DWARF_BYTES_POR_LINHA: i32 = 4
+const DWARF_ARGS_OPCODE: [12]u8 = {0, 1, 1, 1, 1, 0, 0, 0, 1, 0, 0, 1}
+
+// C: nativo/dbg/dwarf_linhas.c:33
+proc dwarf_cabecalho_linhas(x: ^DwarfCtx, b: ^[dynamic]u8) {
+    var hdr_pos: u64 = 0
+    dwarf_bytes_u16(b, DWARF_VERSAO_LINHA as u16)
+    hdr_pos = len(b^) as u64
+    dwarf_bytes_u32(b, 0)
+    dwarf_bytes_u8(b, 1)
+    dwarf_bytes_u8(b, 1)
+    dwarf_bytes_u8(b, 1)
+    dwarf_bytes_u8(b, 251)
+    dwarf_bytes_u8(b, DWARF_LINHA_RANGE as u8)
+    dwarf_bytes_u8(b, DWARF_OPCODE_BASE as u8)
+    for k in (0 as u64)..<12 { // C2F: sizeof DWARF_ARGS_OPCODE
+        dwarf_bytes_u8(b, DWARF_ARGS_OPCODE[k])
+    }
+    dwarf_bytes_u8(b, 0)
+    var i: u64 = 0
+    while i < (len(x.arquivos) as u64) {
+        dwarf_bytes_texto(b, x.arquivos[i])
+        dwarf_bytes_uleb(b, 0)
+        dwarf_bytes_uleb(b, 0)
+        dwarf_bytes_uleb(b, 0)
+        i += 1
+    }
+    dwarf_bytes_u8(b, 0)
+    dwarf_patch_u32(b, hdr_pos, (((len(b^) as u64) - hdr_pos) - 4) as u32)
+}
+
+// C: nativo/dbg/dwarf_linhas.c:59
+proc dwarf_avanca_pc(corpo: ^[dynamic]u8, delta: u64) {
+    dwarf_bytes_u8(corpo, DW_LNS_ADVANCE_PC as u8)
+    dwarf_bytes_uleb(corpo, delta)
+}
+
+// C: nativo/dbg/dwarf_linhas.c:65
+proc dwarf_linhas_do_proc(x: ^DwarfCtx, corpo: ^[dynamic]u8, pend: ^[dynamic]DwarfPendente, indice: u64) {
+    let p: ^DbgProc = &(x.d as ^DbgPrograma).procs[indice]
+    var arquivo: u32 = 1
+    var linha: u32 = 1
+    var atual: u32 = p.inicio
+    var q: ?^DwarfPendente = none
+    dwarf_bytes_u8(corpo, 0)
+    dwarf_bytes_uleb(corpo, DW_LNE_TAM_SET_ADDRESS as u64)
+    dwarf_bytes_u8(corpo, DW_LNE_SET_ADDRESS as u8)
+    append(pend, item = DwarfPendente{})
+    q = &pend[len(pend^) - 1]
+    let ptr_1: ^DwarfPendente = q as ^DwarfPendente
+    ptr_1.off = len(corpo^) as u64
+    let ptr_2: ^DwarfPendente = q as ^DwarfPendente
+    ptr_2.proc_c = indice
+    dwarf_bytes_u64(corpo, 0)
+    var k: u32 = p.linha_ini
+    while k < (p.linha_ini + p.nlinhas) {
+        let l: ^DbgLinha = &(x.d as ^DbgPrograma).linhas[k as u64]
+        var nova_linha: u32 = 0
+        let nova_arq: u32 = dwarf_arquivo_de(x, l.pos, &nova_linha)
+        if nova_arq != arquivo {
+            dwarf_bytes_u8(corpo, DW_LNS_SET_FILE as u8)
+            dwarf_bytes_uleb(corpo, nova_arq as u64)
+            arquivo = nova_arq
+        }
+        if l.off > atual {
+            dwarf_avanca_pc(corpo, (l.off - atual) as u64)
+            atual = l.off
+        }
+        if nova_linha != linha {
+            dwarf_bytes_u8(corpo, DW_LNS_ADVANCE_LINE as u8)
+            dwarf_bytes_sleb(corpo, (nova_linha as i64) - (linha as i64))
+            linha = nova_linha
+        }
+        dwarf_bytes_u8(corpo, DW_LNS_COPY as u8)
+        k += 1
+    }
+    if p.fim > atual {
+        dwarf_avanca_pc(corpo, (p.fim - atual) as u64)
+    }
+    dwarf_bytes_u8(corpo, 0)
+    dwarf_bytes_uleb(corpo, 1)
+    dwarf_bytes_u8(corpo, DW_LNE_END_SEQUENCE as u8)
+}
+
+// C: nativo/dbg/dwarf_linhas.c:105
+// C: nativo/dbg/dwarf_linhas.c:105
+// Cabecalho (com a tabela de arquivos) e, depois, as sequencias de todos os procs; os enderecos sao relocados depois do cabecalho.
+proc dwarf_escrever_linhas(x: ^DwarfCtx) {
+    let sec: ^[dynamic]u8 = dwarf_buf_secao(x, x.sec_linha)
+    let programa: ^DbgPrograma = x.d as ^DbgPrograma
+    var corpo = make([dynamic]u8, alloc = heap)
+    defer delete(corpo)
+    var pend = make([dynamic]DwarfPendente, alloc = heap)
+    defer delete(pend)
+    let tam_pos: u64 = len(sec^) as u64
+    var i: u64 = 0
+    while i < (len(programa.procs) as u64) {
+        dwarf_linhas_do_proc(x, &corpo, &pend, i)
+        i += 1
+    }
+    dwarf_bytes_u32(sec, 0)
+    dwarf_cabecalho_linhas(x, sec)
+    let base: u64 = len(sec^) as u64
+    append(sec, items = corpo[..])
+    dwarf_patch_u32(sec, tam_pos, ((len(sec^) as u64) - tam_pos - 4) as u32)
+    i = 0
+    while i < (len(pend) as u64) {
+        let q: DwarfPendente = pend[i]
+        dwarf_relocar_proc(x, x.sec_linha, base + q.off, q.proc_c)
+        i += 1
+    }
+}

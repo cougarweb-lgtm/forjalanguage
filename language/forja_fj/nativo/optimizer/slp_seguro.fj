@@ -1,0 +1,267 @@
+// nativo/optimizer/slp_seguro.fj - porte de compiler/nativo/optimizer/slp_seguro.c
+// sha256 de nativo/optimizer/slp_seguro.c: 4c2caac5e8f8612a6f7e47c7fcea7ccd228c5f4e89294892b270457d812950c2
+// gerado por c2forja esqueleto 0.3.2
+// Versao: 0.1.0
+
+import "common"
+import "nativo/bir"
+
+const BYTES_2: [8]u8 = {0, 1, 2, 4, 8, 4, 8, 16}
+
+// C: nativo/optimizer/slp_seguro.c:18
+proc falhar_2(pl: ^SlpPlano, motivo: str) -> bool {
+    if pl.motivo == none {
+        pl.motivo = motivo
+    }
+    return false
+}
+
+// C: nativo/optimizer/slp_seguro.c:25
+proc tamanho_da_classe(classe: u8) -> u32 {
+    if (classe as u32) < (len(BYTES_2) as u32) {
+        return BYTES_2[classe] as u32
+    }
+    return 0
+}
+
+// C: nativo/optimizer/slp_seguro.c:32
+proc pode_sobrepor(x: ^SlpAcesso, y: ^SlpAcesso) -> bool {
+    if slp_mesma_chave(&x.chave, &y.chave) {
+        return (x.desloc < (y.desloc + (y.tam as i64))) and (y.desloc < (x.desloc + (x.tam as i64)))
+    }
+    return (x.chave.tipo == (SB_VREG as u8)) or (y.chave.tipo == (SB_VREG as u8))
+}
+
+// C: nativo/optimizer/slp_seguro.c:39
+proc acesso_de(c: ^SlpCtx, pos: u32, escrita: bool) -> SlpAcesso {
+    let i: ^bir.BirInstr = &(c.f as ^bir.BirFuncao).blocos[c.bloco].instrs[pos]
+    let chave: SlpChave = slp_chave_base(c, i.a.id, pos)
+    var tern_1: i32 = i.classe as i32
+    if common.c2f_b2i32(escrita) != 0 {
+        tern_1 = i.b.classe as i32
+    }
+    return SlpAcesso{pos = pos, chave = chave, desloc = (i.desloc as i64) + (chave.off as i64), tam = tamanho_da_classe(tern_1 as u8), escrita = escrita}
+}
+
+// C: nativo/optimizer/slp_seguro.c:49
+proc contagem_fecha(c: ^SlpCtx, pl: ^SlpPlano) -> bool {
+    let blk: ^bir.BirBloco = &(c.f as ^bir.BirFuncao).blocos[c.bloco]
+    let nd: []u32 = c.ndefs or_else {}
+    var k: u32 = 0
+    while k < pl.nsomem {
+        let v: u32 = blk.instrs[pl.somem[k]].dst
+        var defs: u32 = 0
+        var lidos: u32 = 0
+        var j: u32 = 0
+        while j < pl.nsomem {
+            if blk.instrs[pl.somem[j]].dst == v {
+                defs += 1
+            }
+            j += 1
+        }
+        j = 0
+        while j < pl.nlidos {
+            if pl.lidos[j] == v {
+                lidos += 1
+            }
+            j += 1
+        }
+        if (nd[v] != defs) or (c.nleit[v] != lidos) {
+            return falhar_2(pl, "uso_externo")
+        }
+        k += 1
+    }
+    return true
+}
+
+// C: nativo/optimizer/slp_seguro.c:67
+proc pendentes_iguais(c: ^SlpCtx, pl: ^SlpPlano, ultima_loja: u32) -> bool {
+    let blk: ^bir.BirBloco = &(c.f as ^bir.BirFuncao).blocos[c.bloco]
+    var k: u32 = 0
+    while k < pl.npend {
+        var desde: u32 = 0
+        if pl.pend[k].def != SLP_SEM {
+            desde = pl.pend[k].def + 1
+        }
+        for q in desde..=ultima_loja {
+            if blk.instrs[q].dst == pl.pend[k].vreg {
+                return falhar_2(pl, "valor_redefinido")
+            }
+        }
+        k += 1
+    }
+    return true
+}
+
+// C: nativo/optimizer/slp_seguro.c:83
+// C2F-INDECIDIVEL: acessos
+proc reunir_acessos(c: ^SlpCtx, pl: ^SlpPlano, acessos: []SlpAcesso) -> u32 {
+    var n: u32 = 0
+    var k: u32 = 0
+    while k < pl.nsomem {
+        if (c.f as ^bir.BirFuncao).blocos[c.bloco].instrs[pl.somem[k]].op == (bir.BIR_CARREGA as u8) {
+            let antes_1: u32 = n
+            n += 1
+            acessos[antes_1] = acesso_de(c, pl.somem[k], false)
+        }
+        k += 1
+    }
+    var l: u32 = 0
+    while l < pl.lanes {
+        let antes_2: u32 = n
+        n += 1
+        acessos[antes_2] = acesso_de(c, pl.loja[l], true)
+        l += 1
+    }
+    return n
+}
+
+// C: nativo/optimizer/slp_seguro.c:97
+// C2F-13: acessos fundido em n (len)
+proc ordem_interna_preservada(acessos: []SlpAcesso) -> bool {
+    for x in (0 as u32)..<(len(acessos) as u32) {
+        for y in (0 as u32)..<(len(acessos) as u32) {
+            if (((not acessos[x].escrita) and (common.c2f_b2i32(acessos[y].escrita) != 0)) and (acessos[x].pos > acessos[y].pos)) and (common.c2f_b2i32(pode_sobrepor(&acessos[x], &acessos[y])) != 0) {
+                return false
+            }
+        }
+    }
+    return true
+}
+
+// C: nativo/optimizer/slp_seguro.c:110
+// C2F-13: acessos fundido em n (len)
+proc pode_cruzar(c: ^SlpCtx, i: ^bir.BirInstr, q: u32, acessos: []SlpAcesso) -> bool {
+    var o: SlpAcesso = SlpAcesso{}
+    let sw_1 = i.op as i32
+    if sw_1 == bir.BIR_CHAMA or sw_1 == bir.BIR_CHAMA_IND or sw_1 == bir.BIR_ARMADILHA or sw_1 == bir.BIR_ADD_OV or sw_1 == bir.BIR_SUB_OV or sw_1 == bir.BIR_MUL_OV or sw_1 == bir.BIR_NEG_OV or sw_1 == bir.BIR_COPIA_MEM or sw_1 == bir.BIR_ZERA_MEM {
+        return false
+    } else if sw_1 == bir.BIR_GRAVA or sw_1 == bir.BIR_CARREGA {
+        o = acesso_de(c, q, i.op == (bir.BIR_GRAVA as u8))
+        for k in (0 as u32)..<(len(acessos) as u32) {
+            if ((common.c2f_b2i32(o.escrita) != 0) or (common.c2f_b2i32(acessos[k].escrita) != 0)) and (common.c2f_b2i32(pode_sobrepor(&o, &acessos[k])) != 0) {
+                return false
+            }
+        }
+        return true
+    } else {
+        return true
+    }
+    return false
+}
+
+// C: nativo/optimizer/slp_seguro.c:133
+proc intervalo_livre(c: ^SlpCtx, pl: ^SlpPlano, baixo: u32, alto: u32, acessos: []SlpAcesso) -> bool {
+    let blk: ^bir.BirBloco = &(c.f as ^bir.BirFuncao).blocos[c.bloco]
+    var do_grupo = make([dynamic]u8, alloc = heap, cap = (blk.n as int) + 1)
+    defer delete(do_grupo)
+    var z: u32 = 0
+    while z <= blk.n {
+        append(&do_grupo, item = 0)
+        z += 1
+    }
+    let marcas: []u8 = do_grupo[..]
+    var k: u32 = 0
+    while k < pl.nsomem {
+        marcas[pl.somem[k]] = 1
+        k += 1
+    }
+    var l: u32 = 0
+    while l < pl.lanes {
+        marcas[pl.loja[l]] = 1
+        l += 1
+    }
+    var ok: bool = true
+    var q: u32 = baixo
+    while (q <= alto) and ok {
+        ok = (marcas[q] != 0) or pode_cruzar(c, &blk.instrs[q], q, acessos)
+        q += 1
+    }
+    if ok {
+        return true
+    }
+    return falhar_2(pl, "chama_trap_ou_alias")
+}
+
+// C: nativo/optimizer/slp_seguro.c:151
+proc tem_carga_vetorial(pl: ^SlpPlano) -> bool {
+    for k in (0 as u32)..<pl.nno {
+        if pl.no[k].tipo == (SN_CARGA as u8) {
+            return true
+        }
+    }
+    return false
+}
+
+// C: nativo/optimizer/slp_seguro.c:162
+proc slp_conferir_plano(c: ^SlpCtx, pl: ^SlpPlano) -> bool {
+    var acessos: [132]SlpAcesso = {}
+    var ultima_loja: u32 = 0
+    var ultima_conta: u32 = 0
+    var baixo: u32 = 4294967295
+    if (pl.nsomem == 0) or (not tem_carga_vetorial(pl)) {
+        return falhar_2(pl, "sem_carga_vetorial")
+    }
+    if not contagem_fecha(c, pl) {
+        return false
+    }
+    var l: u32 = 0
+    while l < pl.lanes {
+        if pl.loja[l] > ultima_loja {
+            ultima_loja = pl.loja[l]
+        }
+        if pl.loja[l] < baixo {
+            baixo = pl.loja[l]
+        }
+        l += 1
+    }
+    var k: u32 = 0
+    while k < pl.nsomem {
+        if pl.somem[k] > ultima_conta {
+            ultima_conta = pl.somem[k]
+        }
+        if pl.somem[k] < baixo {
+            baixo = pl.somem[k]
+        }
+        k += 1
+    }
+    if ultima_conta >= ultima_loja {
+        return falhar_2(pl, "ordem")
+    }
+    if not pendentes_iguais(c, pl, ultima_loja) {
+        return false
+    }
+    let n: u32 = reunir_acessos(c, pl, acessos[..])
+    let reunidos: []SlpAcesso = acessos[0..<(n as int)]
+    if not ordem_interna_preservada(reunidos) {
+        return falhar_2(pl, "alias")
+    }
+    return intervalo_livre(c, pl, baixo, ultima_loja, reunidos)
+}
+
+test "slp_tamanho_da_classe_bytes_do_c" {
+    expect(tamanho_da_classe(bir.BC_NADA as u8) == 0)
+    expect(tamanho_da_classe(bir.BC_I8 as u8) == 1)
+    expect(tamanho_da_classe(bir.BC_I32 as u8) == 4)
+    expect(tamanho_da_classe(bir.BC_I64 as u8) == 8)
+    expect(tamanho_da_classe(bir.BC_F32 as u8) == 4)
+    expect(tamanho_da_classe(bir.BC_F64 as u8) == 8)
+    expect(tamanho_da_classe(bir.BC_V128 as u8) == 16)
+    expect(tamanho_da_classe(9) == 0)
+}
+
+test "slp_pode_sobrepor_faixas_do_mesmo_slot" {
+    var x = SlpAcesso{pos = 1, chave = SlpChave{tipo = SB_SLOT as u8, id = 1, def = 0, off = 0}, desloc = 0, tam = 4, escrita = false}
+    var y = SlpAcesso{pos = 2, chave = SlpChave{tipo = SB_SLOT as u8, id = 1, def = 0, off = 0}, desloc = 2, tam = 4, escrita = true}
+    var z = SlpAcesso{pos = 3, chave = SlpChave{tipo = SB_SLOT as u8, id = 1, def = 0, off = 0}, desloc = 8, tam = 4, escrita = true}
+    expect(pode_sobrepor(&x, &y))
+    expect(not pode_sobrepor(&x, &z))
+}
+
+test "slp_pode_sobrepor_base_distinta_sem_vreg_nao_sobrepoe" {
+    var x = SlpAcesso{pos = 1, chave = SlpChave{tipo = SB_SLOT as u8, id = 1, def = 0, off = 0}, desloc = 0, tam = 4, escrita = false}
+    var y = SlpAcesso{pos = 2, chave = SlpChave{tipo = SB_SIMBOLO as u8, id = 1, def = 0, off = 0}, desloc = 0, tam = 4, escrita = true}
+    expect(not pode_sobrepor(&x, &y))
+    var v = SlpAcesso{pos = 3, chave = SlpChave{tipo = SB_VREG as u8, id = 5, def = 0, off = 0}, desloc = 0, tam = 4, escrita = true}
+    expect(pode_sobrepor(&x, &v))
+}

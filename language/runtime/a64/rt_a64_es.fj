@@ -1,0 +1,458 @@
+// runtime/a64/rt_a64_es.fj - std:file (leitura e gravacao de arquivo inteiro) e procs de SO do alvo aarch64-linux em Forja (A3.3h): modulo std:a64_es
+// Versao: 0.5.1
+// Changelog: 0.5.1 - J1a: proc_pasta_temp le TMPDIR por std:a64_proc (proc_ambiente saiu de rt_a64.fj).
+//            0.5.0 - A3.3h: proc_pasta_temp (TMPDIR via proc_ambiente do rt_a64, senao /tmp; sem barra final).
+//            0.4.0 - A3.3h: proc_caminho_exe (AT_EXECFN do auxv a partir do sp guardado, senao argv[0] com barra; -1 se nao achado).
+//            0.3.0 - A3.3h: proc_caminho_absoluto (caminho lexico: getcwd + es_juntar, como rt_os_absoluto do x64); scratch de 16 KiB.
+//            0.2.0 - A3.3h: arquivo_abrir_ler, arquivo_criar, arquivo_tamanho, arquivo_ler, arquivo_gravar e arquivo_fechar (read_all/write_all) sobre openat/read/write/fstat/close;
+//                    os_cpu_count (sched_getaffinity), os_mem_available (sysinfo, freeram * mem_unit) e proc_pasta_atual (getcwd); es_scratch = bloco de 16 KiB do heap
+//                    para as structs do kernel (stat, sysinfo, mascara, cwd), alocado 1x e guardado no estado.
+//            0.1.0 - A-E1: encanamento (registro em frontend\modulos_std.fj, injecao no alvo a64 pelo driver); sem procs.
+// Layout do stat do aarch64 (asm-generic, 128 B): st_mode u32 em 16, st_nlink u32 em 20, st_size em 48, st_mtime em 88 (ns em 96).
+// Handle de arquivo = fd + 1 (nunca 0), como o x64. Erro em ^i32 gravado pelo host; pontos sem erro devolvem -1.
+// Os handles de fs_* (tabela de 32) ficam em rt_a64_es_fs.fj.
+
+import "std:wasm_rt" as wasm_rt
+import "std:a64_rt" as host
+import "std:a64_proc" as procs
+
+foreign {
+    proc sys_chamar = "forja_rt_syscall"(num: int, a0: int, a1: int, a2: int, a3: int, a4: int, a5: int) -> int
+}
+
+// syscalls do aarch64 (asm-generic/unistd.h)
+const ES_SYS_GETCWD: int = 17
+const ES_SYS_OPENAT: int = 56
+const ES_SYS_CLOSE: int = 57
+const ES_SYS_READ: int = 63
+const ES_SYS_WRITE: int = 64
+const ES_SYS_FSTAT: int = 80
+const ES_SYS_SCHED_GETAFFINITY: int = 123
+const ES_SYS_SYSINFO: int = 179
+const ES_AT_FDCWD: int = -100
+// flags de open (iguais no x86_64 e no aarch64: asm-generic/fcntl.h)
+const ES_O_LER: int = 524288
+const ES_O_GRAVAR: int = 524865
+const ES_O_CRIAR: int = 524481
+const ES_MODO_NOVO: int = 438
+// errno positivos
+const ES_EPERM: int = 1
+const ES_ENOENT: int = 2
+const ES_EINTR: int = 4
+const ES_EACCES: int = 13
+const ES_EISDIR: int = 21
+const ES_ENOTDIR: int = 20
+const ES_EROFS: int = 30
+const ES_ENAMETOOLONG: int = 36
+// codigos neutros do runtime (FileError do std:file: nao existe, sem permissao, outro)
+const ES_ARQ_NAO_EXISTE: i32 = 1
+const ES_ARQ_SEM_PERMISSAO: i32 = 2
+const ES_ARQ_OUTRO: i32 = 3
+const ES_ERRO_OUTRO_OS: int = -3
+const ES_RET_EINTR: int = -4
+const ES_LOTE_MAX: int = 1073741824
+// tipo do st_mode e campos do stat/sysinfo do aarch64
+const ES_S_IFMT: uint = 61440
+const ES_S_IFREG: uint = 32768
+const ES_S_IFDIR: uint = 16384
+const ES_MASCARA_32: uint = 4294967295
+const ES_OFF_MODO: uint = 16
+const ES_OFF_TAMANHO: uint = 48
+const ES_OFF_SYSINFO: uint = 256
+const ES_OFF_SYS_LIVRE: uint = 40
+const ES_OFF_SYS_UNIDADE: uint = 104
+// bloco de scratch (es_scratch): stat em 0, sysinfo em 256, mascara de CPUs em 512 (4096 bits), cwd em 1024 (PATH_MAX)
+const ES_OFF_STAT: uint = 0
+const ES_OFF_MASCARA: uint = 512
+const ES_TAM_MASCARA: uint = 512
+const ES_OFF_CWD: uint = 1024
+const ES_TAM_CWD: uint = 4096
+const ES_SCRATCH_BYTES: uint = 16384
+// caminho absoluto (proc_caminho_absoluto): saida de ate 8 KiB depois do cwd (o caminho passado do limite e -3)
+const ES_OFF_ABS: uint = 8192
+const ES_TAM_ABS: uint = 8192
+const ES_BARRA: uint = 47
+const ES_PONTO: uint = 46
+// slot do estado (rt_ponteiro_de: 1..4095) com o endereco do scratch; livre (rt_a64.fj e rt_a64_mem.fj usam 1024..1127)
+const ES_SLOT_SCRATCH: uint = 1136
+const BITS_POR_PALAVRA: uint = 8
+const MASCARA_BYTE: uint = 255
+const PALAVRAS_MASCARA: uint = 64
+
+// texto do fonte das falhas internas deste modulo
+proc texto_std() -> cstr {
+    return "std:file"
+}
+
+// Bloco de 8 KiB do heap para as structs do kernel: alocado na 1a vez e guardado no estado (nao ha free, entao nao vaza por chamada)
+pub proc es_scratch() -> uint {
+    var base: uint = wasm_rt.memoria_ler_u64(ES_SLOT_SCRATCH)
+    if base == 0 {
+        base = wasm_rt.heap_alocar(ES_SCRATCH_BYTES)
+        if base == 0 {
+            host.falha_r0007_texto("sem memoria para o bloco de std:file", ES_SCRATCH_BYTES as int, transmute(texto_std() as rawptr, to = int), 0)
+        }
+        wasm_rt.memoria_escrever_u64(ES_SLOT_SCRATCH, base)
+    }
+    return base
+}
+
+// Grava um i32 (4 bytes, pode estar desalinhado): so codigos nao negativos
+pub proc es_grava_i32(endereco: uint, valor: int) {
+    var k: uint = 0
+    while k < 4 {
+        wasm_rt.memoria_escrever_u8(endereco + k, ((valor as uint) >> (k * BITS_POR_PALAVRA)) & MASCARA_BYTE)
+        k += 1
+    }
+}
+
+// -errno do kernel -> codigo neutro (a tabela de sysl_arquivo_classificar do x64)
+pub proc es_classificar(retorno: int) -> i32 {
+    let e: int = 0 - retorno
+    if (e == ES_ENOENT) or (e == ES_ENOTDIR) or (e == ES_ENAMETOOLONG) {
+        return ES_ARQ_NAO_EXISTE
+    }
+    if (e == ES_EACCES) or (e == ES_EPERM) or (e == ES_EROFS) or (e == ES_EISDIR) {
+        return ES_ARQ_SEM_PERMISSAO
+    }
+    return ES_ARQ_OUTRO
+}
+
+// Formato (S_IFMT) do fd pelo fstat, ou 0 se o fstat falha
+pub proc es_formato_fd(fd: int) -> uint {
+    let base: uint = es_scratch()
+    let r: int = sys_chamar(ES_SYS_FSTAT, fd, base as int, 0, 0, 0, 0)
+    if r != 0 {
+        return 0
+    }
+    let modo: uint = wasm_rt.memoria_ler_u64(base + ES_OFF_MODO) & ES_MASCARA_32
+    return modo & ES_S_IFMT
+}
+
+// openat(AT_FDCWD, caminho, flags, modo): fd >= 0 ou -errno
+pub proc es_abrir(caminho: uint, flags: int, modo: int) -> int {
+    return sys_chamar(ES_SYS_OPENAT, ES_AT_FDCWD, caminho as int, flags, modo, 0, 0)
+}
+
+// Abre o arquivo para ler (o handle e fd + 1); pasta aberta para leitura = sem permissao, como o Windows. Falha grava o codigo em erro.
+pub proc arquivo_abrir_ler(caminho: uint, erro: uint) -> uint {
+    let fd: int = es_abrir(caminho, ES_O_LER, ES_MODO_NOVO)
+    if fd < 0 {
+        es_grava_i32(erro, es_classificar(fd) as int)
+        return 0
+    }
+    if es_formato_fd(fd) == ES_S_IFDIR {
+        _ = sys_chamar(ES_SYS_CLOSE, fd, 0, 0, 0, 0, 0)
+        es_grava_i32(erro, ES_ARQ_SEM_PERMISSAO as int)
+        return 0
+    }
+    return (fd + 1) as uint
+}
+
+// Cria (ou zera) o arquivo para gravar: O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC
+pub proc arquivo_criar(caminho: uint, erro: uint) -> uint {
+    let fd: int = es_abrir(caminho, ES_O_GRAVAR, ES_MODO_NOVO)
+    if fd < 0 {
+        es_grava_i32(erro, es_classificar(fd) as int)
+        return 0
+    }
+    return (fd + 1) as uint
+}
+
+// Tamanho de arquivo regular; qualquer outra coisa ou falha = -1 (so uma dica de capacidade)
+pub proc arquivo_tamanho(arquivo: uint) -> int {
+    let fd: int = (arquivo as int) - 1
+    if es_formato_fd(fd) != ES_S_IFREG {
+        return -1
+    }
+    let base: uint = es_scratch()
+    return wasm_rt.memoria_ler_u64(base + ES_OFF_TAMANHO) as int
+}
+
+// Le ate quantos bytes (um lote de no maximo 1 GiB, EINTR repete): quantos leu, 0 = fim ou -1 em falha
+pub proc arquivo_ler(arquivo: uint, destino: uint, quantos: int) -> int {
+    if quantos <= 0 {
+        return 0
+    }
+    var lote: int = quantos
+    if lote > ES_LOTE_MAX {
+        lote = ES_LOTE_MAX
+    }
+    let fd: int = (arquivo as int) - 1
+    var r: int = sys_chamar(ES_SYS_READ, fd, destino as int, lote, 0, 0, 0)
+    while r == ES_RET_EINTR {
+        r = sys_chamar(ES_SYS_READ, fd, destino as int, lote, 0, 0, 0)
+    }
+    if r < 0 {
+        return -1
+    }
+    return r
+}
+
+// Grava os quantos bytes em lotes de 1 GiB (write parcial repete): quantos gravou, ou -1 na primeira falha
+pub proc arquivo_gravar(arquivo: uint, origem: uint, quantos: int) -> int {
+    let fd: int = (arquivo as int) - 1
+    var feito: int = 0
+    while feito < quantos {
+        var lote: int = quantos - feito
+        if lote > ES_LOTE_MAX {
+            lote = ES_LOTE_MAX
+        }
+        let r: int = sys_chamar(ES_SYS_WRITE, fd, (origem as int) + feito, lote, 0, 0, 0)
+        if r == ES_RET_EINTR {
+            continue
+        }
+        if r <= 0 {
+            return -1
+        }
+        feito += r
+    }
+    return feito
+}
+
+// close do handle: 0, ou -1 se o kernel recusou
+pub proc arquivo_fechar(arquivo: uint) -> i32 {
+    let r: int = sys_chamar(ES_SYS_CLOSE, (arquivo as int) - 1, 0, 0, 0, 0, 0)
+    if r == 0 {
+        return 0
+    }
+    return -1
+}
+
+// Quantos processadores o processo pode usar: bits de sched_getaffinity (mascara de 4096 bits zerada antes); erro ou zero = 1
+pub proc os_cpu_count() -> int {
+    let base: uint = es_scratch()
+    var k: uint = 0
+    while k < (ES_TAM_MASCARA / 8) {
+        wasm_rt.memoria_escrever_u64(base + ES_OFF_MASCARA + (k * 8), 0)
+        k += 1
+    }
+    let r: int = sys_chamar(ES_SYS_SCHED_GETAFFINITY, 0, ES_TAM_MASCARA as int, (base + ES_OFF_MASCARA) as int, 0, 0, 0)
+    if r < 0 {
+        return 1
+    }
+    var bits: int = 0
+    k = 0
+    while k < PALAVRAS_MASCARA {
+        bits += host.rt_conta_bits(wasm_rt.memoria_ler_u64(base + ES_OFF_MASCARA + (k * 8)) as u64)
+        k += 1
+    }
+    if bits == 0 {
+        return 1
+    }
+    return bits
+}
+
+// RAM livre em bytes: sysinfo, freeram * mem_unit (unidade 0 vale 1); falha = -3 (outro, como o x64)
+pub proc os_mem_available() -> int {
+    let base: uint = es_scratch()
+    let r: int = sys_chamar(ES_SYS_SYSINFO, (base + ES_OFF_SYSINFO) as int, 0, 0, 0, 0, 0)
+    if r < 0 {
+        return ES_ERRO_OUTRO_OS
+    }
+    let livre: uint = wasm_rt.memoria_ler_u64(base + ES_OFF_SYSINFO + ES_OFF_SYS_LIVRE)
+    var unidade: uint = wasm_rt.memoria_ler_u64(base + ES_OFF_SYSINFO + ES_OFF_SYS_UNIDADE) & ES_MASCARA_32
+    if unidade == 0 {
+        unidade = 1
+    }
+    return (livre * unidade) as int
+}
+
+// Pasta atual (getcwd): copia para destino com NUL quando cabe (n > tamanho); devolve o tamanho sem o NUL, ou -3 se falhar
+pub proc proc_pasta_atual(destino: uint, n: int) -> int {
+    let base: uint = es_scratch()
+    let r: int = sys_chamar(ES_SYS_GETCWD, (base + ES_OFF_CWD) as int, ES_TAM_CWD as int, 0, 0, 0, 0)
+    if r <= 0 {
+        return ES_ERRO_OUTRO_OS
+    }
+    let tam: int = r - 1
+    if n > tam {
+        var k: uint = 0
+        while k < (tam as uint) {
+            wasm_rt.memoria_escrever_u8(destino + k, wasm_rt.memoria_ler_u8(base + ES_OFF_CWD + k))
+            k += 1
+        }
+        wasm_rt.memoria_escrever_u8(destino + (tam as uint), 0)
+    }
+    return tam
+}
+
+// Tamanho de texto NUL-terminado
+proc es_strlen(endereco: uint) -> uint {
+    var k: uint = 0
+    while wasm_rt.memoria_ler_u8(endereco + k) != 0 {
+        k += 1
+    }
+    return k
+}
+
+// Anexa um componente (n bytes em inicio) a saida: "." some, ".." tira o ultimo componente, o resto entra com barra antes
+proc es_juntar_componente(saida: uint, len: uint, inicio: uint, n: uint) -> uint {
+    if (n == 1) and (wasm_rt.memoria_ler_u8(inicio) == ES_PONTO) {
+        return len
+    }
+    if (n == 2) and (wasm_rt.memoria_ler_u8(inicio) == ES_PONTO) and (wasm_rt.memoria_ler_u8(inicio + 1) == ES_PONTO) {
+        var recuo: uint = len
+        while (recuo > 0) and (wasm_rt.memoria_ler_u8(saida + recuo - 1) != ES_BARRA) {
+            recuo -= 1
+        }
+        if recuo > 0 {
+            recuo -= 1
+        }
+        return recuo
+    }
+    wasm_rt.memoria_escrever_u8(saida + len, ES_BARRA)
+    var k: uint = 0
+    while k < n {
+        wasm_rt.memoria_escrever_u8(saida + len + 1 + k, wasm_rt.memoria_ler_u8(inicio + k))
+        k += 1
+    }
+    return len + 1 + n
+}
+
+// Junta o texto (NUL-terminado) a saida: barra inicial recomeca da raiz; barras repetidas e componentes vazios saem
+proc es_juntar(saida: uint, len: uint, texto: uint) -> uint {
+    var atual: uint = len
+    var p: uint = texto
+    if wasm_rt.memoria_ler_u8(p) == ES_BARRA {
+        atual = 0
+    }
+    while wasm_rt.memoria_ler_u8(p) != 0 {
+        while wasm_rt.memoria_ler_u8(p) == ES_BARRA {
+            p += 1
+        }
+        let inicio: uint = p
+        while (wasm_rt.memoria_ler_u8(p) != 0) and (wasm_rt.memoria_ler_u8(p) != ES_BARRA) {
+            p += 1
+        }
+        if p == inicio {
+            continue
+        }
+        atual = es_juntar_componente(saida, atual, inicio, p - inicio)
+    }
+    return atual
+}
+
+// getcwd no bloco destino: tamanho sem o NUL, ou -3
+proc es_cwd(destino: uint) -> int {
+    let r: int = sys_chamar(ES_SYS_GETCWD, destino as int, ES_TAM_CWD as int, 0, 0, 0, 0)
+    if r <= 0 {
+        return ES_ERRO_OUTRO_OS
+    }
+    return r - 1
+}
+
+// Caminho lexico absoluto (relativo parte da pasta atual; sem disco e sem symlink): copia para destino com NUL quando cabe; devolve o tamanho, ou -3
+pub proc proc_caminho_absoluto(caminho: uint, destino: uint, n: int) -> int {
+    let base: uint = es_scratch()
+    var len: uint = 0
+    if wasm_rt.memoria_ler_u8(caminho) != ES_BARRA {
+        let tam_cwd: int = es_cwd(base + ES_OFF_CWD)
+        if tam_cwd < 0 {
+            return tam_cwd
+        }
+        len = es_juntar(base + ES_OFF_ABS, 0, base + ES_OFF_CWD)
+    }
+    if (len + es_strlen(caminho) + 2) > ES_TAM_ABS {
+        return ES_ERRO_OUTRO_OS
+    }
+    len = es_juntar(base + ES_OFF_ABS, len, caminho)
+    if len == 0 {
+        wasm_rt.memoria_escrever_u8(base + ES_OFF_ABS, ES_BARRA)
+        len = 1
+    }
+    if n > (len as int) {
+        var k: uint = 0
+        while k < len {
+            wasm_rt.memoria_escrever_u8(destino + k, wasm_rt.memoria_ler_u8(base + ES_OFF_ABS + k))
+            k += 1
+        }
+        wasm_rt.memoria_escrever_u8(destino + len, 0)
+    }
+    return len as int
+}
+
+// argv/envp/auxv: o sp que o _start guardou (rt_a64.fj, A64_EST_ARGS_SP); 0 no .so
+const ES_SLOT_ARGS_SP: uint = 1040
+const ES_AT_EXECFN: uint = 31
+const ES_NAO_ACHADO: int = -1
+
+// Anda pelo envp (ate o NULL) e pelo auxv (ate AT_NULL) e devolve o valor de AT_EXECFN, ou 0
+proc es_execfn(envp: uint) -> uint {
+    var p: uint = envp
+    while wasm_rt.memoria_ler_u64(p) != 0 {
+        p += 8
+    }
+    p += 8
+    while wasm_rt.memoria_ler_u64(p) != 0 {
+        if wasm_rt.memoria_ler_u64(p) == ES_AT_EXECFN {
+            return wasm_rt.memoria_ler_u64(p + 8)
+        }
+        p += 16
+    }
+    return 0
+}
+
+proc es_tem_barra(texto: uint) -> bool {
+    var p: uint = texto
+    while wasm_rt.memoria_ler_u8(p) != 0 {
+        if wasm_rt.memoria_ler_u8(p) == ES_BARRA {
+            return true
+        }
+        p += 1
+    }
+    return false
+}
+
+// Executavel: AT_EXECFN do auxv (o que o kernel recebeu no execve), senao argv[0] se tiver barra; -1 se nao achado. Sai pelo caminho absoluto
+pub proc proc_caminho_exe(destino: uint, n: int) -> int {
+    let sp: uint = wasm_rt.memoria_ler_u64(ES_SLOT_ARGS_SP)
+    if sp == 0 {
+        return ES_NAO_ACHADO
+    }
+    let argc: uint = wasm_rt.memoria_ler_u64(sp)
+    var exe: uint = es_execfn(sp + 8 + (8 * (argc + 1)))
+    if exe == 0 {
+        if argc > 0 {
+            let argv0: uint = wasm_rt.memoria_ler_u64(sp + 8)
+            if es_tem_barra(argv0) {
+                exe = argv0
+            }
+        }
+    }
+    if exe == 0 {
+        return ES_NAO_ACHADO
+    }
+    if wasm_rt.memoria_ler_u8(exe) == 0 {
+        return ES_NAO_ACHADO
+    }
+    return proc_caminho_absoluto(exe, destino, n)
+}
+
+// Pasta temporaria: TMPDIR vivo se nao vazio, senao /tmp; sem a barra final (exceto a raiz)
+pub proc proc_pasta_temp(destino: uint, n: int) -> int {
+    let nome: cstr = "TMPDIR"
+    var pasta: uint = procs.proc_ambiente(transmute(nome as rawptr, to = uint))
+    if pasta != 0 {
+        if wasm_rt.memoria_ler_u8(pasta) == 0 {
+            pasta = 0
+        }
+    }
+    if pasta == 0 {
+        let padrao: cstr = "/tmp"
+        pasta = transmute(padrao as rawptr, to = uint)
+    }
+    var tam: uint = es_strlen(pasta)
+    while (tam > 1) and (wasm_rt.memoria_ler_u8(pasta + tam - 1) == ES_BARRA) {
+        tam -= 1
+    }
+    if n > (tam as int) {
+        var k: uint = 0
+        while k < tam {
+            wasm_rt.memoria_escrever_u8(destino + k, wasm_rt.memoria_ler_u8(pasta + k))
+            k += 1
+        }
+        wasm_rt.memoria_escrever_u8(destino + tam, 0)
+    }
+    return tam as int
+}

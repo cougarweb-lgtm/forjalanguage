@@ -1,0 +1,477 @@
+// std:fmt, pedaco parse (parte do modulo std:fmt: veja fmt.fj)
+// Versao: 0.1.0. Changelog: 0.1.0 - IA1-S2f: ParseError, parse_number, parse_integer, parse_fixed, parse_money e parse_percent.
+// Leitura ESTRITA por regiao, o inverso de number/integer/fixed/money/percent: sem trim (espaco sobrando = invalid), sinal "-" opcional ("+" nao existe), milhar certo ou nenhum (grouping), decimal so com o separador da regiao e ao menos 1 algarismo depois. "1e5" e invalid.
+// Milhar: grupos de group_size algarismos (o 1o de 1 a group_size) e, quando ha separador, o numero tem de ter ao menos group_size + min_group_digits algarismos inteiros (es-ES e pt-PT: "1234" vale, "1.234" nao, "12.345" vale). Sem milhar escrito vale qualquer tamanho. No lugar de U+0020 do group_sep o parse aceita tambem U+00A0 e U+202F.
+// Erros: empty (texto vazio), invalid (byte fora do formato, sinal sem numero, casa decimal sem algarismo, sobra de texto, mais casas que scale), grouping (milhar errado), overflow (nao cabe em i64 / f64).
+// Posicao: `at: ?^int = none` (ultimo parametro, nomeado) recebe, SO quando ha erro, o offset em bytes do 1o byte ruim (em overflow, o inicio do numero; em "mais casas que scale", a 1a casa a mais).
+// parse_fixed e parse_money fazem conta INTEIRA exata (sem f64): "1.223,3" com scale 2 = 122330; parse_integer e parse_fixed com scale 0. parse_money: simbolo OU codigo da regiao opcional, no lado da regiao, com ou sem 1 espaco; "-" antes de tudo ("-R$ 1,00") ou parenteses "(R$ 1,00)" = negativo (so aqui). parse_percent exige o "%" ("12,5%" ou "12,5 %" = 0.125) e desloca o expoente em texto, sem dividir o f64.
+// parse_number e parse_percent normalizam o texto para ASCII (ponto decimal, sem milhar) e chamam parse_float de std:text.
+pub enum ParseError { empty, invalid, grouping, overflow }
+
+const DIGIT_NINE: u8 = 57
+const SPACE: u8 = 32
+const PERCENT_SIGN: u8 = 37
+const PAREN_OPEN: u8 = 40
+const PAREN_CLOSE: u8 = 41
+const NBSP_LEAD: u8 = 0xC2
+const NBSP_TRAIL: u8 = 0xA0
+const NNBSP_LEAD: u8 = 0xE2
+const NNBSP_MID: u8 = 0x80
+const NNBSP_TRAIL: u8 = 0xAF
+const SCAN_OK: int = 0
+const SCAN_EMPTY: int = 1
+const SCAN_INVALID: int = 2
+const SCAN_GROUPING: int = 3
+const SCAN_OVERFLOW: int = 4
+// Menor int, e o menor valor acumulado que ainda aceita mais um algarismo sem estourar (MIN_INT / 10).
+const MIN_INT: int = -9223372036854775807 - 1
+const ACC_LIMIT: int = -922337203685477580
+
+// Estado de uma leitura. O valor inteiro e acumulado NEGATIVO (o menor int nao tem oposto) e so vira positivo no fim.
+struct Scan {
+    pos: int = 0
+    limit: int = 0
+    start: int = 0
+    num_end: int = 0
+    at: int = 0
+    int_digits: int = 0
+    frac_digits: int = 0
+    group_cur: int = 0
+    groups: int = 0
+    negative: bool = false
+    overflow: bool = false
+    value: int = 0
+    real: f64 = 0.0
+}
+
+// Como a regiao escreve a moeda: o simbolo e o codigo (qualquer um e aceito) e o lado.
+struct Cur {
+    symbol: str
+    code: str
+    before: bool
+}
+
+// Byte de s em i, ou 0 fora de [0, limit).
+proc byte_at(s: str, i: int, limit: int) -> u8 {
+    if i < 0 or i >= limit {
+        return 0
+    }
+    return s[i]
+}
+
+proc is_digit(b: u8) -> bool {
+    return b >= DIGIT_ZERO and b <= DIGIT_NINE
+}
+
+// Tamanho de text em s a partir de i (0 = nao esta la, ou text vazio).
+proc match_text(s: str, i: int, limit: int, text: str) -> int {
+    let n = len(text)
+    if n == 0 or i < 0 or i + n > limit {
+        return 0
+    }
+    if s[i..<(i + n)] == text {
+        return n
+    }
+    return 0
+}
+
+// Tamanho do espaco em i: U+0020 (1 byte), U+00A0 (2) ou U+202F (3); 0 se nao e espaco.
+proc space_len(s: str, i: int, limit: int) -> int {
+    let b = byte_at(s, i, limit)
+    if b == SPACE {
+        return 1
+    }
+    if b == NBSP_LEAD and byte_at(s, i + 1, limit) == NBSP_TRAIL {
+        return 2
+    }
+    if b == NNBSP_LEAD and byte_at(s, i + 1, limit) == NNBSP_MID and byte_at(s, i + 2, limit) == NNBSP_TRAIL {
+        return 3
+    }
+    return 0
+}
+
+// Tamanho do separador sep em i: o U+0020 do group_sep vale por qualquer dos 3 espacos.
+proc sep_len(s: str, i: int, limit: int, sep: str) -> int {
+    if sep == " " {
+        return space_len(s, i, limit)
+    }
+    return match_text(s, i, limit, sep)
+}
+
+// Soma o algarismo ao valor acumulado negativo; estouro vira o sinal sc.overflow (e para de acumular).
+proc push_digit(sc: ^Scan, digit: int) {
+    if sc.overflow {
+        return
+    }
+    if sc.value < ACC_LIMIT {
+        sc.overflow = true
+        return
+    }
+    let shifted = sc.value * DECIMAL_BASE
+    if shifted < MIN_INT + digit {
+        sc.overflow = true
+        return
+    }
+    sc.value = shifted - digit
+}
+
+// Consome o algarismo em sc.pos: vai para o texto normalizado e para o valor.
+proc take_digit(s: str, sc: ^Scan, buf: ^[dynamic]u8) {
+    let b = s[sc.pos]
+    append(buf, item = b)
+    push_digit(sc, (b - DIGIT_ZERO) as int)
+    sc.pos += 1
+}
+
+// Tamanho do separador de milhar em sc.pos, se ele e seguido de algarismo; 0 = o numero acaba ali (ou a regiao nao tem milhar).
+proc group_sep_here(s: str, spec: Spec, sc: ^Scan) -> int {
+    if spec.group_size == 0 {
+        return 0
+    }
+    let n = sep_len(s, sc.pos, sc.limit, spec.group_sep)
+    if n == 0 or not is_digit(byte_at(s, sc.pos + n, sc.limit)) {
+        return 0
+    }
+    return n
+}
+
+// Fecha o grupo que acabou num separador: o 1o tem de 1 a group_size algarismos, os outros exatamente group_size. false = grouping.
+proc close_group(spec: Spec, sc: ^Scan) -> bool {
+    if sc.groups == 0 {
+        return sc.group_cur >= 1 and sc.group_cur <= spec.group_size
+    }
+    return sc.group_cur == spec.group_size
+}
+
+// Confere o ultimo grupo e o tamanho minimo de um numero com milhar escrito.
+proc check_last_group(spec: Spec, sc: ^Scan) -> int {
+    if sc.groups == 0 {
+        return SCAN_OK
+    }
+    if sc.group_cur != spec.group_size or sc.int_digits < spec.group_size + spec.min_group_digits {
+        sc.at = sc.pos
+        return SCAN_GROUPING
+    }
+    return SCAN_OK
+}
+
+// Parte inteira: algarismos e separadores de milhar certos; para no 1o byte que nao e nenhum dos dois.
+proc scan_int_part(s: str, spec: Spec, sc: ^Scan, buf: ^[dynamic]u8) -> int {
+    while sc.pos < sc.limit {
+        if is_digit(s[sc.pos]) {
+            take_digit(s, sc, buf)
+            sc.int_digits += 1
+            sc.group_cur += 1
+            continue
+        }
+        let n = group_sep_here(s, spec, sc)
+        if n == 0 {
+            break
+        }
+        if not close_group(spec, sc) {
+            sc.at = sc.pos
+            return SCAN_GROUPING
+        }
+        sc.groups += 1
+        sc.group_cur = 0
+        sc.pos += n
+    }
+    return check_last_group(spec, sc)
+}
+
+// Parte decimal, se houver: separador da regiao e ao menos 1 algarismo. O texto normalizado leva "." (ASCII).
+proc scan_frac_part(s: str, spec: Spec, sc: ^Scan, buf: ^[dynamic]u8) -> int {
+    let n = sep_len(s, sc.pos, sc.limit, spec.decimal_sep)
+    if n > 0 {
+        sc.pos += n
+        append(buf, item = DOT)
+        while sc.pos < sc.limit and is_digit(s[sc.pos]) {
+            take_digit(s, sc, buf)
+            sc.frac_digits += 1
+        }
+        if sc.frac_digits == 0 {
+            sc.at = sc.pos
+            return SCAN_INVALID
+        }
+    }
+    sc.num_end = sc.pos
+    return SCAN_OK
+}
+
+// O numero (sem sinal) em sc.pos: ao menos 1 algarismo inteiro, milhar certo, decimais opcionais.
+proc scan_number(s: str, spec: Spec, sc: ^Scan, buf: ^[dynamic]u8) -> int {
+    sc.start = sc.pos
+    if not is_digit(byte_at(s, sc.pos, sc.limit)) {
+        sc.at = sc.pos
+        return SCAN_INVALID
+    }
+    let code = scan_int_part(s, spec, sc, buf)
+    if code != SCAN_OK {
+        return code
+    }
+    return scan_frac_part(s, spec, sc, buf)
+}
+
+// Sinal "-" opcional em sc.pos.
+proc read_sign(s: str, sc: ^Scan) {
+    if byte_at(s, sc.pos, sc.limit) == MINUS_SIGN {
+        sc.negative = true
+        sc.pos += 1
+    }
+}
+
+// Fecha a conta inteira: casas a mais que scale = invalid, completa com zeros, aplica o sinal e acusa o estouro.
+proc seal_value(sc: ^Scan, scale: int) -> int {
+    if sc.frac_digits > scale {
+        sc.at = sc.num_end - (sc.frac_digits - scale)
+        return SCAN_INVALID
+    }
+    for _k in sc.frac_digits..<scale {
+        push_digit(sc, 0)
+    }
+    if not sc.negative {
+        if sc.value == MIN_INT {
+            sc.overflow = true
+        } else {
+            sc.value = -sc.value
+        }
+    }
+    if sc.overflow {
+        sc.at = sc.start
+        return SCAN_OVERFLOW
+    }
+    return SCAN_OK
+}
+
+// Leitura de parse_fixed/parse_integer: sinal, numero, nada depois; resultado em sc.value.
+proc run_fixed(s: str, loc: Locale, scale: int, sc: ^Scan) -> int {
+    check_scale(scale)
+    let spec = make_spec(loc, decimals = 0, rounding = Rounding.down, shift = 0)
+    sc.limit = len(s)
+    if len(s) == 0 {
+        return SCAN_EMPTY
+    }
+    read_sign(s, sc)
+    var buf = make([dynamic]u8, alloc = heap, cap = 24)
+    defer delete(buf)
+    let code = scan_number(s, spec, sc, &buf)
+    if code != SCAN_OK {
+        return code
+    }
+    if sc.pos != sc.limit {
+        sc.at = sc.pos
+        return SCAN_INVALID
+    }
+    return seal_value(sc, scale)
+}
+
+// Tamanho do simbolo ou do codigo da moeda em i (0 = nenhum dos dois).
+proc match_currency(s: str, cur: Cur, i: int, limit: int) -> int {
+    let n = match_text(s, i, limit, cur.symbol)
+    if n > 0 {
+        return n
+    }
+    return match_text(s, i, limit, cur.code)
+}
+
+// Pula, em sc.pos, o simbolo ou o codigo da moeda e 1 espaco depois dele (ambos opcionais).
+proc skip_currency_before(s: str, cur: Cur, sc: ^Scan) {
+    let n = match_currency(s, cur, sc.pos, sc.limit)
+    if n > 0 {
+        sc.pos += n
+        sc.pos += space_len(s, sc.pos, sc.limit)
+    }
+}
+
+// Depois do numero: nada, ou (regiao com a moeda depois) 1 espaco opcional e o simbolo ou o codigo; e o fim do texto.
+proc check_money_tail(s: str, cur: Cur, sc: ^Scan) -> int {
+    if not cur.before {
+        let space = space_len(s, sc.pos, sc.limit)
+        let n = match_currency(s, cur, sc.pos + space, sc.limit)
+        if n > 0 {
+            sc.pos += space + n
+        }
+    }
+    if sc.pos != sc.limit {
+        sc.at = sc.pos
+        return SCAN_INVALID
+    }
+    return SCAN_OK
+}
+
+// Sinal ou parenteses de parse_money: "(" ... ")" = negativo (e fecha o limite antes do ")"); senao "-" opcional.
+proc open_money(s: str, sc: ^Scan) -> int {
+    if s[0] != PAREN_OPEN {
+        read_sign(s, sc)
+        return SCAN_OK
+    }
+    if len(s) < 3 or s[len(s) - 1] != PAREN_CLOSE {
+        sc.at = len(s)
+        if len(s) < 3 {
+            sc.at = 1
+        }
+        return SCAN_INVALID
+    }
+    sc.negative = true
+    sc.pos = 1
+    sc.limit = len(s) - 1
+    return SCAN_OK
+}
+
+// Leitura de parse_money; resultado em sc.value.
+proc run_money(s: str, loc: Locale, scale: int, sc: ^Scan) -> int {
+    check_scale(scale)
+    let spec = make_spec(loc, decimals = 0, rounding = Rounding.down, shift = 0)
+    sc.limit = len(s)
+    if len(s) == 0 {
+        return SCAN_EMPTY
+    }
+    var code = open_money(s, sc)
+    if code != SCAN_OK {
+        return code
+    }
+    let cur = Cur{symbol = loc.currency_symbol, code = loc.currency_code, before = loc.currency_before}
+    if cur.before {
+        skip_currency_before(s, cur, sc)
+    }
+    var buf = make([dynamic]u8, alloc = heap, cap = 24)
+    defer delete(buf)
+    code = scan_number(s, spec, sc, &buf)
+    if code != SCAN_OK {
+        return code
+    }
+    code = check_money_tail(s, cur, sc)
+    if code != SCAN_OK {
+        return code
+    }
+    return seal_value(sc, scale)
+}
+
+// Depois do numero de um percentual: 1 espaco opcional e o "%".
+proc scan_percent_tail(s: str, sc: ^Scan) -> int {
+    let i = sc.pos + space_len(s, sc.pos, sc.limit)
+    if byte_at(s, i, sc.limit) != PERCENT_SIGN {
+        sc.at = i
+        return SCAN_INVALID
+    }
+    sc.pos = i + 1
+    return SCAN_OK
+}
+
+// Entrega o texto normalizado a parse_float de std:text; so estouro pode falhar (o formato ja foi conferido).
+proc convert_real(buf: ^[dynamic]u8, sc: ^Scan) -> int {
+    let norm = to_str(buf)
+    defer delete(norm)
+    var code = SCAN_OK
+    switch r in tx.parse_float(norm) {
+    case f64:
+        sc.real = r
+    case tx.ParseError:
+        sc.at = sc.start
+        code = SCAN_OVERFLOW
+    }
+    return code
+}
+
+// Leitura de parse_number (percent = false) e parse_percent (percent = true); resultado em sc.real.
+proc run_real(s: str, loc: Locale, percent: bool, sc: ^Scan) -> int {
+    let spec = make_spec(loc, decimals = 0, rounding = Rounding.down, shift = 0)
+    sc.limit = len(s)
+    if len(s) == 0 {
+        return SCAN_EMPTY
+    }
+    read_sign(s, sc)
+    var buf = make([dynamic]u8, alloc = heap, cap = 32)
+    defer delete(buf)
+    if sc.negative {
+        append(&buf, item = "-")
+    }
+    var code = scan_number(s, spec, sc, &buf)
+    if code == SCAN_OK and percent {
+        code = scan_percent_tail(s, sc)
+    }
+    if code != SCAN_OK {
+        return code
+    }
+    if sc.pos != sc.limit {
+        sc.at = sc.pos
+        return SCAN_INVALID
+    }
+    if percent {
+        append(&buf, item = "e-2")
+    }
+    return convert_real(&buf, sc)
+}
+
+proc error_of(code: int) -> ParseError {
+    if code == SCAN_EMPTY {
+        return ParseError.empty
+    }
+    if code == SCAN_GROUPING {
+        return ParseError.grouping
+    }
+    if code == SCAN_OVERFLOW {
+        return ParseError.overflow
+    }
+    return ParseError.invalid
+}
+
+// Grava em at (se foi pedido) o offset do 1o byte ruim.
+proc report_at(at: ?^int, offset: int) {
+    switch p in at {
+    case ^int:
+        p^ = offset
+    case none:
+    }
+}
+
+proc int_result(code: int, sc: ^Scan, at: ?^int) -> int ! ParseError {
+    if code != SCAN_OK {
+        report_at(at, offset = sc.at)
+        return error_of(code)
+    }
+    return sc.value
+}
+
+proc real_result(code: int, sc: ^Scan, at: ?^int) -> f64 ! ParseError {
+    if code != SCAN_OK {
+        report_at(at, offset = sc.at)
+        return error_of(code)
+    }
+    return sc.real
+}
+
+// O numero de s na regiao loc ("1.234,5" em PT_BR = 1234.5); at recebe a posicao do erro.
+pub proc parse_number(s: str, loc: Locale, at: ?^int = none) -> f64 ! ParseError {
+    var sc = Scan{}
+    let code = run_real(s, loc, false, &sc)
+    return real_result(code, &sc, at)
+}
+
+// O inteiro de s na regiao loc ("1.234" em PT_BR = 1234; "1,5" = invalid).
+pub proc parse_integer(s: str, loc: Locale, at: ?^int = none) -> int ! ParseError {
+    var sc = Scan{}
+    let code = run_fixed(s, loc, 0, &sc)
+    return int_result(code, &sc, at)
+}
+
+// O numero de s como inteiro com scale casas implicitas, exato ("1.223,34" scale 2 = 122334; "1.223,3" = 122330; "1,001" = invalid). scale fora de 0..9 = panic R0003.
+pub proc parse_fixed(s: str, loc: Locale, scale: int = 2, at: ?^int = none) -> int ! ParseError {
+    var sc = Scan{}
+    let code = run_fixed(s, loc, scale, &sc)
+    return int_result(code, &sc, at)
+}
+
+// Dinheiro de s como inteiro com scale casas implicitas, exato: "R$ 1.223,34", "-R$ 1.223,34", "(R$ 1.223,34)", "1.223,34" e "BRL 1.223,34" valem 122334 (com o sinal). scale fora de 0..9 = panic R0003.
+pub proc parse_money(s: str, loc: Locale, scale: int = 2, at: ?^int = none) -> int ! ParseError {
+    var sc = Scan{}
+    let code = run_money(s, loc, scale, &sc)
+    return int_result(code, &sc, at)
+}
+
+// A porcentagem de s como fracao ("12,5%" e "12,5 %" = 0.125).
+pub proc parse_percent(s: str, loc: Locale, at: ?^int = none) -> f64 ! ParseError {
+    var sc = Scan{}
+    let code = run_real(s, loc, true, &sc)
+    return real_result(code, &sc, at)
+}
