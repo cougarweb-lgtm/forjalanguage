@@ -22,7 +22,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-LANG = Path(r"C:\Users\Cougar\Documents\TEMPO\DESENVOLVIMENTO\FORJA\language")
+LANG = Path(r"C:\Users\USUARIO\Documents\TEMPO\DESENVOLVIMENTO\FORJA\language")
 RECEITAS_PADRAO = LANG / "tests" / "receitas"
 DOC_PADRAO = LANG / "doc" / "receitas.txt"
 SAIDA_MEM_PADRAO = Path(tempfile.gettempdir()) / "ia1_doc_mem"

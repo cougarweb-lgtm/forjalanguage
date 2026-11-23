@@ -26,8 +26,8 @@ from pathlib import Path
 
 from ia_comum import Metrica
 
-LANG = Path(r"C:\Users\Cougar\Documents\TEMPO\DESENVOLVIMENTO\FORJA\language")
-EXEMPLOS = Path(r"C:\Users\Cougar\Documents\TEMPO\DESENVOLVIMENTO\FORJA\examples")
+LANG = Path(r"C:\Users\USUARIO\Documents\TEMPO\DESENVOLVIMENTO\FORJA\language")
+EXEMPLOS = Path(r"C:\Users\USUARIO\Documents\TEMPO\DESENVOLVIMENTO\FORJA\examples")
 PASTAS_DE_FIXTURES = ("sintaxe", "semantica", "dourado", "regressao")
 LISTA_CORRIGIVEL = {"E0001", "E0101", "E0102", "E0201", "E0202", "E0310", "E0311", "E0502", "E0707", "E0708", "E0709", "E1003",
                     "E1001", "E1006", "E0110", "E0307", "F0001", "E0913"}

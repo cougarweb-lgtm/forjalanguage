@@ -3,7 +3,7 @@
 com --checagem nao e sim, e exige o mesmo stdout, o mesmo stderr e o mesmo codigo de saida (inclusive R0005/R0006 exatos depois de print dentro de laco).
 
 Uso:
-    python verificar_alocador.py --forja C:/Users/Cougar/Documents/TEMPO/DESENVOLVIMENTO/FORJA/language/compiler/forja.exe [--sem-manifesto] [--contra C:/.../forja_base.exe]
+    python verificar_alocador.py --forja C:/Users/USUARIO/Documents/TEMPO/DESENVOLVIMENTO/FORJA/language/compiler/forja.exe [--sem-manifesto] [--contra C:/.../forja_base.exe]
     python -I verificar_alocador.py --selftest
 Saida final: "OK: N/N casos iguais" (ou "FALHOU: ..."); exit 0 verde, 1 divergencia, 2 erro de uso.
 

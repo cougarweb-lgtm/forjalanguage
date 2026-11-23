@@ -5,7 +5,7 @@ import datetime
 import os
 import urllib.parse
 
-PastaMime = r"C:\Users\Cougar\Documents\TEMPO\DESENVOLVIMENTO\FORJA\language\tests\rede\mime"
+PastaMime = r"C:\Users\USUARIO\Documents\TEMPO\DESENVOLVIMENTO\FORJA\language\tests\rede\mime"
 CRLF = b"\r\n"
 ANEXO = bytes(range(256)) * 3
 DIAS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]

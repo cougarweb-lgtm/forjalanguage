@@ -16,7 +16,7 @@ from ctypes import wintypes
 from dataclasses import dataclass
 from pathlib import Path
 
-RAIZ = Path("C:/Users/Cougar/Documents/TEMPO/DESENVOLVIMENTO/FORJA/language/benchmark")
+RAIZ = Path("C:/Users/USUARIO/Documents/TEMPO/DESENVOLVIMENTO/FORJA/language/benchmark")
 PASTA_RESULTADOS = RAIZ / "resultados"
 GERADOR = RAIZ / "corpus" / "gerador" / "gerar_corpus.py"
 TAMANHOS = (20000, 200000)
@@ -27,9 +27,9 @@ JOB_INFO_EXTENDIDO = 9  # JobObjectExtendedLimitInformation
 MB = 1024 * 1024
 TEMPOS_CAMPOS = ("lex_ns", "parse_ns", "check_ns", "emit_ns", "total_ns", "linhas")
 CANDIDATOS = {
-    "c": ("C:/Users/Cougar/Documents/TEMPO/DESENVOLVIMENTO/FORJA/language/benchmark/c/forja.exe",),
-    "cpp": ("C:/Users/Cougar/Documents/TEMPO/DESENVOLVIMENTO/FORJA/language/benchmark/cpp/forja.exe",),
-    "py": (sys.executable, "C:/Users/Cougar/Documents/TEMPO/DESENVOLVIMENTO/FORJA/language/benchmark/py/forja.py"),
+    "c": ("C:/Users/USUARIO/Documents/TEMPO/DESENVOLVIMENTO/FORJA/language/benchmark/c/forja.exe",),
+    "cpp": ("C:/Users/USUARIO/Documents/TEMPO/DESENVOLVIMENTO/FORJA/language/benchmark/cpp/forja.exe",),
+    "py": (sys.executable, "C:/Users/USUARIO/Documents/TEMPO/DESENVOLVIMENTO/FORJA/language/benchmark/py/forja.py"),
 }
 KERNEL = ctypes.WinDLL("kernel32", use_last_error=True)
 NTDLL = ctypes.WinDLL("ntdll", use_last_error=True)

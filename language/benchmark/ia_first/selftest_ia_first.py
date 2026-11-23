@@ -137,7 +137,7 @@ def VariantesPlantadas(Celula):
             "bash_sobe": Fora([Uso("Bash", {"command": 'cd "%s" && cat ../x' % Raiz}, 2)]),
             "leitura_fora": Fora([Uso("Read", {"file_path": "C:/ENGINE_GAME3D/CLAUDE.md"}, 2)]),
             "ferramenta_mcp": Fora([Uso("mcp__mem_search__mem_get", {"id": "MEM-X"}, 2)]),
-            "bash_fora": Fora([Uso("Bash", {"command": "ls C:/Users/Cougar/Documents/TEMPO/DESENVOLVIMENTO/FORJA/language"}, 2)]),
+            "bash_fora": Fora([Uso("Bash", {"command": "ls C:/Users/USUARIO/Documents/TEMPO/DESENVOLVIMENTO/FORJA/language"}, 2)]),
             "grep_sem_path": Fora([Uso("Grep", {"pattern": "proc"}, 2)]),
             "marca_injetada": Fora([Registro("user", [{"type": "tool_result", "content": "texto do MEM-FORJA-GUIA-NUCLEO"}], 2)])}
 

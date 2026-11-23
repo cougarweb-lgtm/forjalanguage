@@ -25,7 +25,7 @@ import tempfile
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-LANG = Path(r"C:\Users\Cougar\Documents\TEMPO\DESENVOLVIMENTO\FORJA\language")
+LANG = Path(r"C:\Users\USUARIO\Documents\TEMPO\DESENVOLVIMENTO\FORJA\language")
 DOC_PADRAO = LANG / "doc"
 SAIDA_PADRAO = Path(tempfile.gettempdir()) / "ia1_doc_mem"
 FORJA_PADRAO = Path(tempfile.gettempdir()) / "forja_b01_main" / "forja.exe"

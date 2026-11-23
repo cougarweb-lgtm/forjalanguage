@@ -23,7 +23,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "nativo" / "rapido"))
 import oraculo_congelado as Oraculo  # noqa: E402
 
-TESTES = Path(r"C:\Users\Cougar\Documents\TEMPO\DESENVOLVIMENTO\FORJA\language\tests")
+TESTES = Path(r"C:\Users\USUARIO\Documents\TEMPO\DESENVOLVIMENTO\FORJA\language\tests")
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 PASTA_ESPERADOS = Path(__file__).resolve().parents[1] / "esperados"  # tests\cli\esperados: o x64 congelado do caso (3)
 CAMPOS_DO_X64 = ("alvo", "etapa")

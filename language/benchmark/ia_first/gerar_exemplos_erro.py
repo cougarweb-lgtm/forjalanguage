@@ -22,7 +22,7 @@ import sys
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-LANG = Path(r"C:\Users\Cougar\Documents\TEMPO\DESENVOLVIMENTO\FORJA\language")
+LANG = Path(r"C:\Users\USUARIO\Documents\TEMPO\DESENVOLVIMENTO\FORJA\language")
 PASTAS = [LANG / "tests" / "sintaxe", LANG / "tests" / "semantica"]
 SAIDA_PADRAO = LANG / "doc" / "exemplos.txt"
 PADRAO_NOME = re.compile(r"^err_(E\d{4})_.*\.fj$")

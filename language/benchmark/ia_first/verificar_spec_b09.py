@@ -22,7 +22,7 @@ import sys
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-LANG = Path(r"C:\Users\Cougar\Documents\TEMPO\DESENVOLVIMENTO\FORJA\language")
+LANG = Path(r"C:\Users\USUARIO\Documents\TEMPO\DESENVOLVIMENTO\FORJA\language")
 DOC = LANG / "doc"
 PASTAS = [LANG / "tests" / "sintaxe", LANG / "tests" / "semantica"]
 GERADOR = LANG / "tests" / "ia_first" / "gerar_exemplos_erro.py"

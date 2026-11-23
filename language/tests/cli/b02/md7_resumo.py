@@ -10,7 +10,7 @@ import sys
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-TESTES = Path(r"C:\Users\Cougar\Documents\TEMPO\DESENVOLVIMENTO\FORJA\language\tests")
+TESTES = Path(r"C:\Users\USUARIO\Documents\TEMPO\DESENVOLVIMENTO\FORJA\language\tests")
 CHAVES = ["codigo", "arquivo", "linha", "coluna", "causa", "sugestao"]
 META_MEDIA = 250
 

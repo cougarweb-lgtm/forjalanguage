@@ -27,7 +27,7 @@ import sys
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-LANG = Path(r"C:\Users\Cougar\Documents\TEMPO\DESENVOLVIMENTO\FORJA\language")
+LANG = Path(r"C:\Users\USUARIO\Documents\TEMPO\DESENVOLVIMENTO\FORJA\language")
 sys.path.insert(0, str(LANG / "tests"))  # rcode_normalizar (P69)
 from rcode_normalizar import NormalizarLinhasR  # noqa: E402
 CLI = LANG / "tests" / "cli"

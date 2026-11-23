@@ -29,7 +29,7 @@ from pathlib import Path
 VERSAO = "1.1.0"
 MENSAGEM_GERAR_APOSENTADO = ("ERRO: --gerar foi aposentado na 0.21.0 F3: o gerador do C saiu com o backend C (D0730 congelou o binario gcc de referencia). "
                              "Kernel novo precisa de .esperado.txt de fonte independente, nunca do proprio x64.")
-FORJA_PADRAO = "C:/Users/Cougar/Documents/TEMPO/DESENVOLVIMENTO/FORJA/language/compiler/forja.exe"
+FORJA_PADRAO = "C:/Users/USUARIO/Documents/TEMPO/DESENVOLVIMENTO/FORJA/language/compiler/forja.exe"
 MARCA_N = "@N@"
 FATIAS_ESPERADAS = ("F1", "F2", "F3", "F4", "F5", "F6", "F7", "F8")
 

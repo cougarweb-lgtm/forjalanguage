@@ -28,7 +28,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-LANG = Path(r"C:\Users\Cougar\Documents\TEMPO\DESENVOLVIMENTO\FORJA\language")
+LANG = Path(r"C:\Users\USUARIO\Documents\TEMPO\DESENVOLVIMENTO\FORJA\language")
 CLI = LANG / "tests" / "cli"
 B12 = "b12"
 REFERENCIA_PADRAO = Path(os.environ.get("TEMP", ".")) / "forja_i2_final" / "forja.exe"

@@ -3,7 +3,7 @@
 # Objetivo: P32(a) do contrato_m5_resto (D-R4). Gera libc.a, crt1.o, rcrt1.o, crti.o, crtn.o
 #   FORA do forja.exe (a semente vai para third\musl\x86_64\). Nao toca compiler\ nem runtime\.
 # Uso (dentro do WSL alpine-build, por harness):
-#   sh /mnt/c/Users/Cougar/Documents/TEMPO/DESENVOLVIMENTO/FORJA/language/tests/nativo/linux/musl/construir_musl.sh <musl-1.2.6.tar.gz> <pasta_saida>
+#   sh /mnt/c/Users/USUARIO/Documents/TEMPO/DESENVOLVIMENTO/FORJA/language/tests/nativo/linux/musl/construir_musl.sh <musl-1.2.6.tar.gz> <pasta_saida>
 #   sh .../construir_musl.sh --selftest   (prova que a conferencia de sha256 aceita o certo e recusa o errado)
 # Versao: 0.1.0
 # Changelog:

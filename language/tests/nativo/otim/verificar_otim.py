@@ -10,8 +10,8 @@ Para cada alvo (casos de tests\\lowering amostrados de forma deterministica + os
 Os passes validos vem da propria mensagem de erro do forja ('--sem-otim: passo desconhecido ... (validos: tudo, a, b)').
 
 Uso:
-    python verificar_otim.py --forja C:/Users/Cougar/Documents/TEMPO/DESENVOLVIMENTO/FORJA/language/compiler/forja.exe [--amostra 40] [--passe NOME] [--jobs N]
-    python verificar_otim.py --forja C:/Users/Cougar/Documents/TEMPO/DESENVOLVIMENTO/FORJA/language/compiler/forja.exe --contra <forja_base.exe> [--amostra 40] [--jobs N]
+    python verificar_otim.py --forja C:/Users/USUARIO/Documents/TEMPO/DESENVOLVIMENTO/FORJA/language/compiler/forja.exe [--amostra 40] [--passe NOME] [--jobs N]
+    python verificar_otim.py --forja C:/Users/USUARIO/Documents/TEMPO/DESENVOLVIMENTO/FORJA/language/compiler/forja.exe --contra <forja_base.exe> [--amostra 40] [--jobs N]
     python verificar_otim.py --selftest
 Saida final: "OK: N/N alvos iguais" (ou "FALHOU: ..."), exit 0 verde, 1 com divergencia, 2 em erro de uso.
 --contra: compila os mesmos alvos com o forja novo e com o forja BASE congelado (amostra + benches em --release; os benches tambem em dev) e
@@ -59,7 +59,7 @@ PastaGuarda = PastaAqui / "guarda"
 PastaCostura = PastaAqui / "costura"
 PastaCurto = PastaAqui / "curto"
 PastaOrigem = PastaAqui / "origem"
-FORJA_PADRAO = "C:/Users/Cougar/Documents/TEMPO/DESENVOLVIMENTO/FORJA/language/compiler/forja.exe"
+FORJA_PADRAO = "C:/Users/USUARIO/Documents/TEMPO/DESENVOLVIMENTO/FORJA/language/compiler/forja.exe"
 AMOSTRA_PADRAO = 40
 TIMEOUT_BUILD = 120
 TIMEOUT_EXEC = 60

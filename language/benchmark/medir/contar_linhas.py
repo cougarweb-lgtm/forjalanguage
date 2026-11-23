@@ -12,7 +12,7 @@ import tempfile
 import tokenize
 from pathlib import Path
 
-RAIZ_PADRAO = Path("C:/Users/Cougar/Documents/TEMPO/DESENVOLVIMENTO/FORJA/language/benchmark")
+RAIZ_PADRAO = Path("C:/Users/USUARIO/Documents/TEMPO/DESENVOLVIMENTO/FORJA/language/benchmark")
 PADROES = {
     "c": ("*.c", "*.h"),
     "cpp": ("*.cpp", "*.hpp"),

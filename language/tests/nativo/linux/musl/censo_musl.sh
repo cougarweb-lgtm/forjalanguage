@@ -31,7 +31,7 @@ censo() {
 
 selftest() {
     d=$(mktemp -d) || return 1
-    censo /mnt/c/Users/Cougar/Documents/TEMPO/DESENVOLVIMENTO/FORJA/language/third/musl/x86_64/crt1.o "$d/s.txt" || return 1
+    censo /mnt/c/Users/USUARIO/Documents/TEMPO/DESENVOLVIMENTO/FORJA/language/third/musl/x86_64/crt1.o "$d/s.txt" || return 1
     if grep -q '^ *[0-9][0-9]* R_X86_64_' "$d/s.txt" && grep -q '== fim' "$d/s.txt"; then
         echo "PASSOU selftest censo"
     else

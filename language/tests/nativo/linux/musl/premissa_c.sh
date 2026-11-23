@@ -2,14 +2,14 @@
 # premissa_c.sh - prova a premissa (c) do D-R2/D-R3: ld liga crt1.o + main.o (SysV, chama ms_abi) + pthread_create x6 + libc.a.
 # Objetivo: o musl e o unico dono do processo (TLS, errno por thread); roda no WSL alpine-build e sai 0 so com PASSOU.
 # Uso (dentro do WSL alpine-build):
-#   sh /mnt/c/Users/Cougar/Documents/TEMPO/DESENVOLVIMENTO/FORJA/language/tests/nativo/linux/musl/premissa_c.sh
+#   sh /mnt/c/Users/USUARIO/Documents/TEMPO/DESENVOLVIMENTO/FORJA/language/tests/nativo/linux/musl/premissa_c.sh
 #   --selftest: mesma prova (o proprio teste e a verificacao).
 # Versao: 0.1.0
 # Changelog:
 #   0.1.0 (2026-11-14) primeira versao: gcc -c do premissa_c.c, ld -static com crt1/crti/crtn + libc.a da semente, 3 execucoes.
 # Depende de: gcc, ld (binutils), musl libc.a da pasta third\musl\x86_64 (P32a).
 
-BASE=/mnt/c/Users/Cougar/Documents/TEMPO/DESENVOLVIMENTO/FORJA/language
+BASE=/mnt/c/Users/USUARIO/Documents/TEMPO/DESENVOLVIMENTO/FORJA/language
 FONTE=$BASE/tests/nativo/linux/musl/premissa_c.c
 SEMENTE=$BASE/third/musl/x86_64
 

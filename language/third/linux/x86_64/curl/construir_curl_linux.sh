@@ -1,6 +1,6 @@
 #!/bin/sh
 # construir_curl_linux.sh - gera libcurl.a ESTATICO para o alvo x86_64-linux (R10a do contrato_rede, D-REDE-7).
-# Uso (no WSL, distro alpine-build): sh construir_curl_linux.sh [/mnt/c/Users/Cougar/Documents/TEMPO/DESENVOLVIMENTO/FORJA/language]
+# Uso (no WSL, distro alpine-build): sh construir_curl_linux.sh [/mnt/c/Users/USUARIO/Documents/TEMPO/DESENVOLVIMENTO/FORJA/language]
 # Entrada (so leitura, sha256 conferido): vendor/net/curl/curl-8.23.0.tar.gz, vendor/net/mbedtls/mbedtls-3.6.8.tar.bz2,
 #   vendor/net/curl_ponte.c/.h, vendor/net/curl/include.
 # Saida: third/linux/x86_64/curl/libcurl.a (libcurl 8.23.0 + mbedcrypto + mbedx509 + mbedtls + curl_ponte.o) e a copia em vendor/linux/libcurl.a.
@@ -13,7 +13,7 @@
 #            0.1.0 (19/11/2026) R10a: primeira versao.
 set -eu
 
-RAIZ="${1:-/mnt/c/Users/Cougar/Documents/TEMPO/DESENVOLVIMENTO/FORJA/language}"
+RAIZ="${1:-/mnt/c/Users/USUARIO/Documents/TEMPO/DESENVOLVIMENTO/FORJA/language}"
 CURL_TAR="$RAIZ/vendor/net/curl/curl-8.23.0.tar.gz"
 CURL_SHA="e3de77cfa6367083c776a26647fc9f633b538c06c3baa73d931a252ac8f72b49"
 MBED_TAR="$RAIZ/vendor/net/mbedtls/mbedtls-3.6.8.tar.bz2"

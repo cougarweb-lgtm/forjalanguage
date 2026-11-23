@@ -26,7 +26,7 @@ import tempfile
 from pathlib import Path
 
 VERSAO = "1.0.2"
-FORJA_PADRAO = "C:/Users/Cougar/Documents/TEMPO/DESENVOLVIMENTO/FORJA/language/compiler/forja.exe"
+FORJA_PADRAO = "C:/Users/USUARIO/Documents/TEMPO/DESENVOLVIMENTO/FORJA/language/compiler/forja.exe"
 PASTA_BENCH = Path(__file__).resolve().parents[1] / "bench"
 VERSOES_FORJA = ("0.19.8", "0.20.0", "0.20.1", "0.20.2", "0.20.3", "0.20.4")  # fallback so se o forja nao roda; com forja, a versao vem de `forja --versao`
 TIMEOUT_VERSAO = 30

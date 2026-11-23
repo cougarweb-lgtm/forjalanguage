@@ -3,7 +3,7 @@
 import collections, glob, os, subprocess, sys, tempfile
 from concurrent.futures import ThreadPoolExecutor
 E0, E1 = sys.argv[1], sys.argv[2]
-RAIZ = 'C:/Users/Cougar/Documents/TEMPO/DESENVOLVIMENTO/FORJA'
+RAIZ = 'C:/Users/USUARIO/Documents/TEMPO/DESENVOLVIMENTO/FORJA'
 CR, LF = bytes([13]), bytes([10])
 GLOBAIS = [['--versao'], ['--ajuda'], [], ['explicar'], ['explicar', 'E0101'], ['explicar', 'E0101', '--json'], ['explicar', 'R0006'], ['explicar', 'ZZZ'],
            ['explicar', '--lista'], ['explicar', '--lista', '--json'], ['explicar', '--exemplos'], ['explicar', 'E0101', '--exemplos'],

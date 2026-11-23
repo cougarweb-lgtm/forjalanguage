@@ -2,7 +2,7 @@
 import os, subprocess, sys, time
 from concurrent.futures import ThreadPoolExecutor
 Forja, Base, Rotulo = sys.argv[1], sys.argv[2], sys.argv[3]
-T = 'C:/Users/Cougar/Documents/TEMPO/DESENVOLVIMENTO/FORJA/language/tests'
+T = 'C:/Users/USUARIO/Documents/TEMPO/DESENVOLVIMENTO/FORJA/language/tests'
 Lista = [('consultar', 'consultar/verificar_consultar.py'), ('mapa', 'consultar/verificar_mapa.py'), ('editar', 'editar/verificar_editar.py'),
          ('editar_i5', 'editar/verificar_editar_i5.py'), ('fmt', 'fmt/verificar_fmt.py'), ('cli', 'cli/verificar_cli.py'),
          ('ligar', 'ligar/verificar_ligar.py'), ('interop', 'interop/verificar_interop.py'), ('projeto', 'projeto/verificar_projeto.py')]

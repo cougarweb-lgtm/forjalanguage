@@ -5,7 +5,7 @@ e que `forja spec` + o cartao citam (3) todo operador do lexer (tokens de operad
 A lista de embutidos NAO e mantida a mao: sai do enum EmbutidoId de compiler\\frontend\\ast.h (EMB_FOO -> `foo`, que e o nome no fonte), entao um embutido
 novo sem doc reprova sozinho. A citacao conta como palavra inteira (`sort` nao casa com `sort_by`).
 
-Uso: python -I tests\\doc\\verificar_cobertura_doc.py --forja C:/Users/Cougar/Documents/TEMPO/DESENVOLVIMENTO/FORJA/language/compiler/forja.exe
+Uso: python -I tests\\doc\\verificar_cobertura_doc.py --forja C:/Users/USUARIO/Documents/TEMPO/DESENVOLVIMENTO/FORJA/language/compiler/forja.exe
      python -I tests\\doc\\verificar_cobertura_doc.py --selftest
 Saida: uma linha por falta ("FALTA modulo std:x" / "FALTA embutido x" / "FALTA operador x" / "FALTA opcao --x") e "verificar_cobertura_doc: N falha(s)"; exit 0 so com N = 0.
 Versao: 1.1.0

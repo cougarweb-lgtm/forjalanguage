@@ -13,7 +13,7 @@
 #   --sem-gerar  nao roda 'tree-sitter generate' (usa src/parser.c ja gerado)
 #   --detalhe    imprime a linha com erro de cada arquivo que falhar
 # Depende de: tree_sitter (pip), gcc (MinGW), node + tree-sitter-cli local (npm install, na propria pasta).
-# Criterio de validade: C:\Users\Cougar\Documents\TEMPO\DESENVOLVIMENTO\FORJA\language\compiler\forja.exe check <arq> com saida 0 (err_* ficam de fora sozinhos);
+# Criterio de validade: C:\Users\USUARIO\Documents\TEMPO\DESENVOLVIMENTO\FORJA\language\compiler\forja.exe check <arq> com saida 0 (err_* ficam de fora sozinhos);
 #   arquivo dentro de pasta 'mods' ou de language\std: forja ast <arq> com saida 0.
 # Reversao: apagar a pasta tree-sitter-forja e as linhas "forja" do indexador.py do CodeGraph.
 
@@ -26,8 +26,8 @@ from pathlib import Path
 
 PASTA = Path(__file__).resolve().parent
 DLL = PASTA / "build" / "forja.dll"
-FORJA_EXE = Path(r"C:\Users\Cougar\Documents\TEMPO\DESENVOLVIMENTO\FORJA\language\compiler\forja.exe")
-RAIZ_PROJETO = Path(r"C:\Users\Cougar\Documents\TEMPO\DESENVOLVIMENTO\FORJA")
+FORJA_EXE = Path(r"C:\Users\USUARIO\Documents\TEMPO\DESENVOLVIMENTO\FORJA\language\compiler\forja.exe")
+RAIZ_PROJETO = Path(r"C:\Users\USUARIO\Documents\TEMPO\DESENVOLVIMENTO\FORJA")
 PASTA_STD = RAIZ_PROJETO / "language" / "std"
 PASTAS_FJ = [RAIZ_PROJETO / "language" / "tests", PASTA_STD, RAIZ_PROJETO / "examples", RAIZ_PROJETO / "benchmark"]
 

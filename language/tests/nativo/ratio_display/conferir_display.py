@@ -6,7 +6,7 @@ um gerador so, f64 primeiro e f32 no passo seguinte; nao finitos pulados sem con
 numpy.format_float_positional(x, unique=True, trim='-') e compara a saida do programa em tres modos:
 dev x64 (forja run), release x64 (forja run --release) e ELF linux via WSL (forja build --target x86_64-linux + wsl_lote).
 
-Uso:       python conferir_display.py --forja C:/Users/Cougar/Documents/TEMPO/DESENVOLVIMENTO/FORJA/language/compiler/forja.exe [--modos dev,release,elf] [--gravar-sha]
+Uso:       python conferir_display.py --forja C:/Users/USUARIO/Documents/TEMPO/DESENVOLVIMENTO/FORJA/language/compiler/forja.exe [--modos dev,release,elf] [--gravar-sha]
 Selftest:  python conferir_display.py --selftest   (sem forja e sem WSL; exit 0 = verde)
 Reversao:  apagar esta pasta tests\\nativo\\ratio_display.
 
@@ -234,7 +234,7 @@ def Principal():
     if Args.selftest:
         return Selftest()
     if not Args.forja or not Path(Args.forja).is_absolute() or not Path(Args.forja).is_file():
-        print("conferir_display: --forja ABSOLUTO e obrigatorio (ex.: C:/Users/Cougar/Documents/TEMPO/DESENVOLVIMENTO/FORJA/language/compiler/forja.exe)")
+        print("conferir_display: --forja ABSOLUTO e obrigatorio (ex.: C:/Users/USUARIO/Documents/TEMPO/DESENVOLVIMENTO/FORJA/language/compiler/forja.exe)")
         return 2
     Forja = Path(Args.forja)
     Modos = [M.strip() for M in Args.modos.split(",") if M.strip()]

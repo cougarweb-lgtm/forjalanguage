@@ -19,7 +19,7 @@ import sys
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-RAIZ = Path(r"C:\Users\Cougar\Documents\TEMPO\DESENVOLVIMENTO\FORJA")
+RAIZ = Path(r"C:\Users\USUARIO\Documents\TEMPO\DESENVOLVIMENTO\FORJA")
 LANG = RAIZ / "language"
 COPIAR_FIEL = Path(r"C:\CLAUDE_AGI\tools\copiar_fiel\copiar_fiel.py")
 NIVEIS = ("rapido", "padrao", "completo")
